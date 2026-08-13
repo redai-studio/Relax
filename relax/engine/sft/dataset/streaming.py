@@ -5,6 +5,7 @@
 import asyncio
 import json
 import threading
+import time
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Callable, Iterable, Optional
@@ -474,7 +475,7 @@ class SFTStreamingDataset:
 
     async def get_batch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
         if self._prefetch is not None:
-            return self._get_batch_prefetch(n)
+            return await self._get_batch_prefetch_async(n)
         return await self._get_batch_async_gather(n)
 
     def get_batch_in_order(self, start: int, n: int) -> list[ProcessedSample]:
@@ -626,6 +627,59 @@ class SFTStreamingDataset:
             )
         return samples, crossed_epoch
 
+    async def _get_batch_prefetch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
+        self._raise_if_failed()
+        samples: list[ProcessedSample] = []
+        crossed_epoch = False
+        max_attempts = max(n * 10, 32)
+        attempts = 0
+        prefetch_wait_timeout_s = 300.0
+        prefetch_wait_poll_s = 0.02
+        assert self._prefetch is not None
+        while len(samples) < n and attempts < max_attempts:
+            indices, epoch_crossed = self.index_manager.get_next_indices(1)
+            attempts += 1
+            if epoch_crossed and not crossed_epoch:
+                crossed_epoch = True
+                remaining = self.index_manager.indices[self.index_manager.position :]
+                self._prefetch.set_index_order(list(remaining))
+                logger.info(
+                    f"SFTStreamingDataset: epoch boundary crossed, prefetch re-primed "
+                    f"(epoch={self.index_manager.current_epoch}, remaining={len(remaining)})"
+                )
+            idx = indices[0]
+            found, sample = self._prefetch.get_cached(idx)
+            wait_started = time.monotonic()
+            while not found:
+                self._raise_if_failed()
+                if not self._prefetch.is_alive:
+                    raise RuntimeError(
+                        f"SFTStreamingDataset: prefetch worker exited before sample idx={idx} was cached "
+                        f"(cache_size={self._prefetch.cache_size})"
+                    )
+                if time.monotonic() - wait_started >= prefetch_wait_timeout_s:
+                    raise TimeoutError(
+                        f"SFTStreamingDataset: timed out waiting for prefetched sample idx={idx} "
+                        f"after {prefetch_wait_timeout_s:.1f}s "
+                        f"(cache_size={self._prefetch.cache_size}, prefetch_alive={self._prefetch.is_alive})"
+                    )
+                await asyncio.sleep(prefetch_wait_poll_s)
+                found, sample = self._prefetch.get_cached(idx, record_miss=False)
+            if sample is None:
+                # Cached None means the background worker processed this index
+                # and decided it should be skipped. Surface any latched error;
+                # otherwise keep refilling the batch.
+                self._raise_if_failed()
+            else:
+                samples.append(sample)
+        self._raise_if_failed()
+        if len(samples) < n:
+            logger.warning(
+                f"SFTStreamingDataset.get_batch_async (prefetch): returned {len(samples)}/{n} samples "
+                f"after {attempts} attempts."
+            )
+        return samples, crossed_epoch
+
     def _get_batch_inline(self, n: int) -> tuple[list[ProcessedSample], bool]:
         self._raise_if_failed()
         samples: list[ProcessedSample] = []
@@ -723,15 +777,13 @@ class SFTStreamingDataset:
                 f"exceeds per-GPU capacity {self.capacity}; skipping."
             )
             return None
-        rendered_text = (
-            render_to_text(
+        rendered_text = None
+        if has_multimodal_content(sample):
+            rendered_text = render_to_text(
                 sample,
                 tokenizer=self.tokenizer,
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,
             )
-            if has_multimodal_content(sample)
-            else None
-        )
         return _RenderedSample(
             idx=idx,
             sample=sample,
@@ -959,8 +1011,8 @@ def pack_samples_for_tq(
 ) -> Optional[dict]:
     if not samples:
         return None
-    tokens = [s.tokens.tolist() for s in samples]
-    loss_masks = [s.loss_mask.tolist() for s in samples]
+    tokens = [s.tokens for s in samples]
+    loss_masks = [s.loss_mask for s in samples]
     total_lengths = [s.total_length for s in samples]
     has_mm = force_multimodal_field or any(s.multimodal_train_inputs is not None for s in samples)
     is_classification = any(s.classification_label is not None for s in samples)

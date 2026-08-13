@@ -3,6 +3,7 @@
 """Qwen chat-template compatibility patches for SFT."""
 
 import hashlib
+import re
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any
@@ -23,6 +24,72 @@ _QWEN_PRESERVE_HISTORY_GATE = (
 _QWEN38_PRESERVE_HISTORY_GATE = (
     "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}"
 )
+_QWEN_VISIBLE_THINKING_SET = (
+    "{%- set relax_has_visible_thinking = (preserve_thinking is defined and preserve_thinking is true) "
+    "or (loop.index0 > ns.last_query_index) %}"
+)
+_QWEN_ASSISTANT_RENDER_BLOCK = "\n".join(
+    (
+        f"        {_QWEN_PRESERVE_HISTORY_GATE}",
+        "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' + content }}",
+        "        {%- endif %}",
+    )
+)
+_QWEN_ASSISTANT_GENERATION_RENDER_BLOCK = "\n".join(
+    (
+        f"        {_QWEN_VISIBLE_THINKING_SET}",
+        "        {%- if relax_has_visible_thinking %}",
+        "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' }}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' }}",
+        "        {%- endif %}",
+        "        {%- generation %}",
+        "        {%- if relax_has_visible_thinking %}",
+        "            {{- reasoning_content + '\\n</think>\\n\\n' + content }}",
+        "        {%- else %}",
+        "            {{- content }}",
+        "        {%- endif %}",
+    )
+)
+_QWEN_ASSISTANT_END = "        {{- '<|im_end|>\\n' }}"
+_QWEN_ASSISTANT_GENERATION_END = "\n".join((_QWEN_ASSISTANT_END, "        {%- endgeneration %}"))
+_QWEN_COMPACT_VISIBLE_THINKING_SET = (
+    "{%- set relax_has_visible_thinking = "
+    "((preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index)) "
+    "and (loop.last or (not loop.last and reasoning_content)) %}"
+)
+_QWEN_COMPACT_ASSISTANT_RENDER_BLOCK = "\n".join(
+    (
+        f"        {_QWEN_PRESERVE_HISTORY_GATE}",
+        "            {%- if loop.last or (not loop.last and reasoning_content) %}",
+        "                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}",
+        "            {%- else %}",
+        "                {{- '<|im_start|>' + message.role + '\\n' + content }}",
+        "            {%- endif %}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' + content }}",
+        "        {%- endif %}",
+    )
+)
+_QWEN_COMPACT_ASSISTANT_GENERATION_RENDER_BLOCK = "\n".join(
+    (
+        f"        {_QWEN_COMPACT_VISIBLE_THINKING_SET}",
+        "        {%- if relax_has_visible_thinking %}",
+        "            {{- '<|im_start|>' + message.role + '\\n<think>\\n' }}",
+        "        {%- else %}",
+        "            {{- '<|im_start|>' + message.role + '\\n' }}",
+        "        {%- endif %}",
+        "        {%- generation %}",
+        "        {%- if relax_has_visible_thinking %}",
+        "            {{- reasoning_content.strip('\\n') + '\\n</think>\\n\\n' + content.lstrip('\\n') }}",
+        "        {%- else %}",
+        "            {{- content }}",
+        "        {%- endif %}",
+    )
+)
+_GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
 _PATCH_NAME = "qwen_history_thinking"
 
 
@@ -65,6 +132,17 @@ def _has_learnable_historical_thinking(sample: CanonicalSample) -> bool:
     )
 
 
+def _assistant_generation_mask_matches_sample(sample: CanonicalSample) -> bool:
+    """Whether marking every rendered assistant block preserves learn flags."""
+    for message in sample.messages:
+        if message.role == "assistant":
+            if not message.learn:
+                return False
+        elif message.learn:
+            return False
+    return True
+
+
 @lru_cache(maxsize=32)
 def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     """Backport Qwen3.6's preserve gate to the exact Qwen3.5 gate."""
@@ -90,6 +168,32 @@ def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     )
 
 
+@lru_cache(maxsize=32)
+def _patch_qwen_generation_markers(template: str) -> tuple[str, bool]:
+    """Add HF generation markers around Qwen assistant output when safe."""
+    if _GENERATION_MARKER_RE.search(template):
+        return template, False
+
+    render_blocks = (
+        (_QWEN_ASSISTANT_RENDER_BLOCK, _QWEN_ASSISTANT_GENERATION_RENDER_BLOCK),
+        (_QWEN_COMPACT_ASSISTANT_RENDER_BLOCK, _QWEN_COMPACT_ASSISTANT_GENERATION_RENDER_BLOCK),
+    )
+    for render_block, generation_render_block in render_blocks:
+        render_count = template.count(render_block)
+        if render_count != 1:
+            continue
+
+        render_pos = template.find(render_block)
+        patched = template[:render_pos] + generation_render_block + template[render_pos + len(render_block) :]
+        end_pos = patched.find(_QWEN_ASSISTANT_END, render_pos + len(generation_render_block))
+        if end_pos < 0:
+            return template, False
+        patched = patched[:end_pos] + _QWEN_ASSISTANT_GENERATION_END + patched[end_pos + len(_QWEN_ASSISTANT_END) :]
+        return patched, patched != template
+
+    return template, False
+
+
 def try_patch_qwen_chat_template(
     sample: CanonicalSample,
     template: str | None,
@@ -111,6 +215,10 @@ def try_patch_qwen_chat_template(
     # Explicit booleans are hard overrides; missing/null enables sample-aware auto-preserve.
     if preserve_thinking is None and _has_learnable_historical_thinking(sample):
         resolved_kwargs["preserve_thinking"] = True
+
+    if _assistant_generation_mask_matches_sample(sample):
+        patched_template, generation_changed = _patch_qwen_generation_markers(patched_template)
+        changed = changed or generation_changed
 
     return TemplatePatchResult(
         template=patched_template,

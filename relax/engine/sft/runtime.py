@@ -7,6 +7,7 @@ These are the bits previously duplicated as ``_sft_*`` private functions in
 here keeps the dispatchers in those files to one-line calls.
 """
 
+import os
 import random
 from argparse import Namespace
 
@@ -83,6 +84,36 @@ def should_use_sft_chunked(args: Namespace) -> bool:
 
 def sft_partition_id(args: Namespace, step: int) -> str:
     return f"sft_{step}" if is_sft_mode(args) else f"train_{step}"
+
+
+def sft_tq_num_shards(args: Namespace) -> int:
+    """Number of TQ shard partitions per SFT step.
+
+    Kept as an env knob while this path is experimental so launch scripts can
+    do A/B tests without adding a public CLI surface.
+    """
+    if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
+        return 1
+    raw_value = os.environ.get("RELAX_SFT_TQ_SHARDS", "1")
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 1
+
+
+def sft_partition_ids(args: Namespace, step: int) -> list[str]:
+    base_partition_id = sft_partition_id(args, step)
+    num_shards = sft_tq_num_shards(args)
+    if num_shards == 1:
+        return [base_partition_id]
+    return [f"{base_partition_id}_shard_{shard_id}_of_{num_shards}" for shard_id in range(num_shards)]
+
+
+def sft_logical_partition_id(partition_id: str) -> str:
+    marker = "_shard_"
+    if partition_id.startswith("sft_") and marker in partition_id:
+        return partition_id.split(marker, 1)[0]
+    return partition_id
 
 
 def sft_task_name(args: Namespace, *, component: str = "actor") -> str:

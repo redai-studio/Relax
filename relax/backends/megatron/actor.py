@@ -33,7 +33,9 @@ from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
     is_sft_mode,
     sft_partition_id,
+    sft_partition_ids,
     sft_task_name,
+    sft_tq_num_shards,
     should_run_sft_eval,
     should_run_sft_predict,
     should_skip_mtp_only_weight_management,
@@ -830,11 +832,12 @@ class MegatronTrainRayActor(TrainRayActor):
             try:
                 if should_run_eval:
                     if dist.get_rank() == 0:
-                        run(
-                            self.data_system_client.async_clear_partition(
-                                partition_id=sft_partition_id(self.args, rollout_id)
+                        for partition_id in sft_partition_ids(self.args, rollout_id):
+                            run(
+                                self.data_system_client.async_clear_partition(
+                                    partition_id=partition_id,
+                                )
                             )
-                        )
                     dist.barrier(group=get_gloo_group())
                     run_sft_eval(self, rollout_id)
 
@@ -1174,23 +1177,72 @@ class MegatronTrainRayActor(TrainRayActor):
         # backoff can turn a small producer skew into multi-second stalls.
         dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
         batch_size = self._sft_prepack_local_batch_size()
-        partition_id = sft_partition_id(self.args, rollout_id)
-        sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
-        rollout_data, _batch_meta = get_data_from_transfer_queue(
-            args=self.args,
-            tq_client=self.data_system_client,
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            task_name=task_name,
-            sampling_config=sampling_config,
-            batch_index=0,
-            broadcast_pp=False,
-            per_rank_fetch=True,
-            post_process=False,
-            synchronize_per_rank_fetch=False,
-        )
-        return rollout_data
+        partition_ids = sft_partition_ids(self.args, rollout_id)
+        num_shards = sft_tq_num_shards(self.args)
+        if len(partition_ids) != num_shards:
+            raise RuntimeError(
+                f"SFT shard partition mismatch for rollout_id={rollout_id}: "
+                f"partition_ids={partition_ids}, num_shards={num_shards}."
+            )
+
+        if num_shards <= 1:
+            partition_id = partition_ids[0]
+            sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
+            rollout_data, _batch_meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+                synchronize_per_rank_fetch=False,
+            )
+            return rollout_data
+
+        if batch_size % num_shards != 0:
+            raise ValueError(
+                "RELAX_SFT_TQ_SHARDS requires each DP local SFT batch to be divisible by shard count, "
+                f"got local_batch_size={batch_size}, num_shards={num_shards}."
+            )
+
+        # Avoid partially consuming shard 0 while shard N is not produced yet.
+        partitions = run(self.data_system_client.async_get_partition_list())
+        if partitions is None or any(partition_id not in partitions for partition_id in partition_ids):
+            return None
+
+        shard_batch_size = batch_size // num_shards
+        shard_batches: list[RolloutBatch] = []
+        for shard_id, partition_id in enumerate(partition_ids):
+            sampling_config = {"dp_rank": dp_rank, "task_name": task_name}
+            rollout_data, _batch_meta = get_data_from_transfer_queue(
+                args=self.args,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=shard_batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+                broadcast_pp=False,
+                per_rank_fetch=True,
+                post_process=False,
+                synchronize_per_rank_fetch=False,
+            )
+            if rollout_data is None:
+                if shard_id > 0:
+                    raise RuntimeError(
+                        f"SFT shard fetch split for rollout_id={rollout_id}: shard {shard_id} returned no data "
+                        "after earlier shards were consumed. Check producer partition readiness."
+                    )
+                return None
+            shard_batches.append(rollout_data)
+
+        return concat_rollout_batches(shard_batches)
 
     def _pack_sft_prepack_window(
         self,

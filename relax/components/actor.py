@@ -14,7 +14,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
+from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
@@ -163,10 +163,11 @@ class Actor(Base):
             if self._done_event is not None:
                 await self._done_event.wait()
             return
-        self.data_system_client.reset_consumption(
-            partition_id=sft_partition_id(self.config, self.step),
-            task_name=sft_task_name(self.config, component="actor"),
-        )
+        for partition_id in sft_partition_ids(self.config, self.step):
+            self.data_system_client.reset_consumption(
+                partition_id=partition_id,
+                task_name=sft_task_name(self.config, component="actor"),
+            )
         # Create an asyncio.Event bound to the current event loop so the
         # background thread can signal completion without blocking the loop.
         loop = asyncio.get_running_loop()
@@ -219,11 +220,8 @@ class Actor(Base):
                 self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
 
                 if did_train:
-                    run(
-                        self.data_system_client.async_clear_partition(
-                            partition_id=sft_partition_id(self.config, local_step)
-                        )
-                    )
+                    for partition_id in sft_partition_ids(self.config, local_step):
+                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
                     self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
                 try:
@@ -249,9 +247,9 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
-        partition_id = sft_partition_id(self.config, self.step)
+        partition_ids = sft_partition_ids(self.config, self.step)
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if partition_list is None or partition_id not in partition_list:
+        if partition_list is None or any(partition_id not in partition_list for partition_id in partition_ids):
             time.sleep(1)
             return False
 
@@ -354,10 +352,10 @@ class Actor(Base):
 
         try:
             # Check if rollout data is available for this step
-            partition_id = sft_partition_id(self.config, step)
+            partition_ids = sft_partition_ids(self.config, step)
             partition_list = run(self.data_system_client.async_get_partition_list())
 
-            if partition_list is not None and partition_id in partition_list:
+            if partition_list is not None and all(partition_id in partition_list for partition_id in partition_ids):
                 self._logger.info(f"Data available for step {step}, executing training")
 
                 # Execute training
@@ -365,12 +363,13 @@ class Actor(Base):
 
                 # Only clear partition data if clear_data is True
                 if clear_data and did_train:
-                    run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                    self._logger.info(f"Cleared data partition: {partition_id}")
+                    for partition_id in partition_ids:
+                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                    self._logger.info(f"Cleared data partitions: {partition_ids}")
                 elif clear_data:
-                    self._logger.info(f"Skipped clearing partition after skipped actor step: {partition_id}")
+                    self._logger.info(f"Skipped clearing partitions after skipped actor step: {partition_ids}")
                 else:
-                    self._logger.info(f"Keeping data partition (clear_data=False): {partition_id}")
+                    self._logger.info(f"Keeping data partitions (clear_data=False): {partition_ids}")
 
                 metrics["data_consumed"] = True
                 metrics["elapsed_time"] = time.time() - start_time
@@ -379,7 +378,7 @@ class Actor(Base):
                 self._logger.warning(f"No data available for step {step}, skipping training")
                 metrics["data_consumed"] = False
                 metrics["success"] = True
-                metrics["message"] = f"No data in partition {partition_id}"
+                metrics["message"] = f"No data in partitions {partition_ids}"
 
         except Exception as e:
             self._logger.error(f"Training failed at step {step}: {e}")

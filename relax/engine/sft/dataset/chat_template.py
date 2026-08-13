@@ -12,6 +12,7 @@ Two paths (spec §7.5):
 
 import hashlib
 import re
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -60,6 +61,10 @@ def _render_with_assistant_mask(
     apply_chat_template_kwargs: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
+    apply_chat_template_kwargs = _thread_local_chat_template_kwargs(
+        tokenizer,
+        apply_chat_template_kwargs,
+    )
     result = tokenizer.apply_chat_template(
         _to_chat_messages(sample),
         tools=sample.tools,
@@ -78,6 +83,22 @@ def _render_with_assistant_mask(
     if masks.dim() == 2:
         masks = masks.squeeze(0)
     return input_ids.long(), masks.long()
+
+
+def _thread_local_chat_template_kwargs(tokenizer, apply_chat_template_kwargs: dict | None) -> dict:
+    """Avoid sharing HF AssistantTracker state across prefetch threads.
+
+    Transformers caches compiled Jinja templates by the template string. The
+    compiled environment owns the ``AssistantTracker`` used by
+    ``return_assistant_tokens_mask=True``, and that tracker is not thread-safe.
+    Appending a Jinja comment makes each prefetch thread use a distinct
+    compiled environment without changing rendered text.
+    """
+    kwargs = dict(apply_chat_template_kwargs or {})
+    template = kwargs.get("chat_template") or getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str):
+        kwargs["chat_template"] = f"{template}{{# relax_thread={threading.get_ident()} #}}"
+    return kwargs
 
 
 _THINK_OPEN = "<think>\n"

@@ -2,6 +2,7 @@
 
 """Unit tests for SFT producer component (loop-only, no Ray runtime)."""
 
+import asyncio
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -54,6 +55,8 @@ def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
         start_rollout_id=0,
         seed=42,
         max_staleness=0,
+        sft_async_prepack=False,
+        custom_dataset_class_path=None,
     )
 
 
@@ -125,8 +128,7 @@ def test_sft_component_imports_without_ray():
     from relax.components.sft import SFT  # noqa: F401
 
 
-@pytest.mark.asyncio
-async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
+def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     from relax.components.sft import SFT
 
     _patch_pipeline_dependencies(monkeypatch)
@@ -155,7 +157,7 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     sft._init_data_pipeline()
-    await sft._produce_one_step()
+    asyncio.run(sft._produce_one_step())
     assert fake_client.async_put.await_count == 1
     args_call, kwargs_call = fake_client.async_put.call_args
     pushed_data = kwargs_call.get("data")
@@ -167,9 +169,51 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     assert kwargs_call.get("custom_meta") == [{"total_lengths": 8}] * 4
 
 
-@pytest.mark.asyncio
+def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
+    from relax.components.sft import SFT, _sft_train_partitions_in_flight
+
+    _patch_pipeline_dependencies(monkeypatch)
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: False)
+
+    fake_client = MagicMock()
+    fake_client.async_put = AsyncMock(return_value=None)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+
+    args = _make_args(global_batch_size=4)
+    args.sft_async_prepack = True
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft.role = "sft"
+    sft._healthy = True
+    sft.step = 0
+    sft.data_system_client = fake_client
+    sft._dataset = None
+    sft._eval_dataset = None
+    sft._eval_indices = None
+    sft._train_size = 0
+    sft._tokenizer = None
+    sft._processor_pool = None
+    sft._logger_instance = None
+    sft._stop_event = MagicMock()
+    sft._stop_event.is_set = MagicMock(return_value=False)
+    sft._runtime_env = None
+
+    sft._init_data_pipeline()
+    asyncio.run(sft._produce_one_step())
+
+    assert fake_client.async_put.await_count == 2
+    seen_partitions = [c.kwargs.get("partition_id") for c in fake_client.async_put.call_args_list]
+    assert seen_partitions == ["sft_0_shard_0_of_2", "sft_0_shard_1_of_2"]
+    seen_meta = [c.kwargs.get("custom_meta") for c in fake_client.async_put.call_args_list]
+    assert seen_meta == [[{"total_lengths": 8}] * 2, [{"total_lengths": 8}] * 2]
+    assert _sft_train_partitions_in_flight(seen_partitions) == 1
+
+
 @pytest.mark.parametrize("returned_count", [0, 3])
-async def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_count):
+def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_count):
     from relax.components.sft import SFT
 
     fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
@@ -200,14 +244,13 @@ async def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_cou
     sft._init_data_pipeline()
 
     with pytest.raises(RuntimeError, match=rf"dataset returned {returned_count}/4 samples"):
-        await sft._produce_one_step()
+        asyncio.run(sft._produce_one_step())
 
     fake_client.async_put.assert_not_awaited()
     assert sft.step == 0
 
 
-@pytest.mark.asyncio
-async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
+def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     from relax.components.sft import SFT
 
     _patch_pipeline_dependencies(monkeypatch)
@@ -234,14 +277,13 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        asyncio.run(sft._maybe_produce_eval())
 
     fake_client.async_put.assert_not_awaited()
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("n_real", [1, 3, 4, 5, 8])
-async def test_classification_eval_pads_without_dropping_real_samples(n_real):
+def test_classification_eval_pads_without_dropping_real_samples(n_real):
     from relax.components.sft import SFT
 
     samples = [
@@ -273,7 +315,7 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     sft._build_eval_batches = MagicMock(return_value=samples)
     sft._wait_for_partition_drained = AsyncMock(return_value=True)
 
-    await sft._maybe_produce_eval()
+    asyncio.run(sft._maybe_produce_eval())
 
     expected_chunks = (n_real + 3) // 4
     assert fake_client.async_put.await_count == expected_chunks
@@ -283,8 +325,7 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
 
 
-@pytest.mark.asyncio
-async def test_sft_loop_advances_step(monkeypatch):
+def test_sft_loop_advances_step(monkeypatch):
     from relax.components.sft import SFT
 
     _patch_pipeline_dependencies(monkeypatch)
@@ -315,15 +356,14 @@ async def test_sft_loop_advances_step(monkeypatch):
     sft._init_data_pipeline()
 
     for _ in range(3):
-        await sft._produce_one_step()
+        asyncio.run(sft._produce_one_step())
     assert sft.step == 3
     assert fake_client.async_put.await_count == 3
     seen_partitions = [c.kwargs.get("partition_id") for c in fake_client.async_put.call_args_list]
     assert seen_partitions == ["sft_0", "sft_1", "sft_2"]
 
 
-@pytest.mark.asyncio
-async def test_sft_resume_only_produces_remaining_steps():
+def test_sft_resume_only_produces_remaining_steps():
     from relax.components.sft import SFT
 
     SFTCls = SFT.func_or_class
@@ -338,15 +378,14 @@ async def test_sft_resume_only_produces_remaining_steps():
 
     sft._produce_one_step = AsyncMock(side_effect=_produce_one_step)
 
-    await sft._async_run()
+    asyncio.run(sft._async_run())
 
     assert sft.step == 5
     assert sft._produce_one_step.await_count == 3
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("start_step", [5, 6])
-async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
+def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     from relax.components.sft import SFT
 
     SFTCls = SFT.func_or_class
@@ -357,6 +396,6 @@ async def test_sft_resume_at_or_after_end_produces_nothing(start_step):
     sft._stop_event.is_set = MagicMock(return_value=False)
     sft._produce_one_step = AsyncMock()
 
-    await sft._async_run()
+    asyncio.run(sft._async_run())
 
     sft._produce_one_step.assert_not_awaited()

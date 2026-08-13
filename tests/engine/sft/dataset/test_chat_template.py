@@ -109,6 +109,8 @@ def test_render_uses_assistant_mask_when_template_supports_it():
     # Verify return_assistant_tokens_mask was requested
     call_kwargs = tok.apply_chat_template.call_args.kwargs
     assert call_kwargs.get("return_assistant_tokens_mask") is True
+    assert call_kwargs["chat_template"].startswith(tok.chat_template)
+    assert "relax_thread=" in call_kwargs["chat_template"]
 
 
 def test_render_falls_back_when_no_generation_marker(capsys):

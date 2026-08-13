@@ -7,6 +7,8 @@ Run with: pytest tests/utils/data/test_streaming_dataset.py -v
 import json
 import os
 import tempfile
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -280,6 +282,71 @@ class TestSampleBuffer:
 
         assert len(buffer) == 0
         assert buffer.get(0) is None
+
+
+class TestPrefetchBuffer:
+    """Tests for PrefetchBuffer race behavior."""
+
+    def test_chunk_size_is_clamped_to_cache_capacity(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        def process_fn(idx: int) -> str:
+            return f"sample-{idx}"
+
+        buffer = PrefetchBuffer(process_fn, chunk_size=8, max_cached=1, num_workers=1)
+        buffer.set_index_order([0])
+        try:
+            assert buffer.wait_for(0, timeout=2)
+            found, sample = buffer.get_cached(0)
+            assert found is True
+            assert sample == "sample-0"
+        finally:
+            buffer.stop()
+
+    def test_missed_inflight_index_is_not_stored_as_stale_cache(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        background_started = threading.Event()
+        release_background = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def process_fn(idx: int) -> str:
+            thread_name = threading.current_thread().name
+            with calls_lock:
+                calls.append((idx, thread_name))
+            if idx == 0 and thread_name.startswith("pf"):
+                background_started.set()
+                assert release_background.wait(timeout=2)
+            return f"sample-{idx}-{thread_name}"
+
+        buffer = PrefetchBuffer(process_fn, chunk_size=1, max_cached=4, num_workers=1)
+        buffer.set_index_order([0, 1])
+        try:
+            assert background_started.wait(timeout=2)
+
+            sample = buffer.get(0)
+            assert sample.startswith("sample-0-")
+
+            release_background.set()
+            for _ in range(200):
+                with buffer._lock:
+                    cached_keys = set(buffer._cache)
+                    stale_drops = buffer._prefetch_stale_drops
+                if 1 in cached_keys and stale_drops:
+                    break
+                time.sleep(0.01)
+
+            with buffer._lock:
+                assert 0 not in buffer._cache
+                assert 1 in buffer._cache
+                assert buffer._prefetch_stale_drops == 1
+
+            assert any(idx == 0 and name.startswith("pf") for idx, name in calls)
+            assert any(idx == 0 and not name.startswith("pf") for idx, name in calls)
+        finally:
+            release_background.set()
+            buffer.stop()
 
 
 class TestIndexManager:

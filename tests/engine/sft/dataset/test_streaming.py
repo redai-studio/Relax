@@ -18,6 +18,7 @@ from relax.engine.sft.dataset.streaming import (
     _expand_loss_mask_via_alignment,
     pack_samples_for_tq,
 )
+from relax.utils.utils import dict_to_tensordict
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -216,8 +217,8 @@ def test_pack_samples_for_tq_marks_samples_as_sft(tmp_path: Path):
 
     assert batch is not None
     assert batch["response_lengths"] == batch["total_lengths"]
-    assert batch["response_lengths"][0] == len(batch["tokens"][0])
-    assert sum(batch["loss_masks"][0]) == len("A")
+    assert batch["response_lengths"][0] == batch["tokens"][0].numel()
+    assert int(batch["loss_masks"][0].sum().item()) == len("A")
     ds.stop()
 
 
@@ -457,10 +458,30 @@ def _make_text_only_sample() -> ProcessedSample:
 
 def test_pack_samples_for_tq_omits_multimodal_field_for_text_only_batch():
     # Default behaviour: an all-text batch carries no multimodal key.
-    batch = pack_samples_for_tq([_make_text_only_sample()])
+    sample = _make_text_only_sample()
+    batch = pack_samples_for_tq([sample])
 
     assert batch is not None
+    assert batch["tokens"][0] is sample.tokens
+    assert batch["loss_masks"][0] is sample.loss_mask
     assert "multimodal_train_inputs" not in batch
+
+
+def test_dict_to_tensordict_preserves_tensor_list_as_nested_tensor():
+    batch = {
+        "tokens": [torch.tensor([1, 2, 3]), torch.tensor([4, 5])],
+        "loss_masks": [torch.tensor([0, 1, 1]), torch.tensor([1, 1])],
+        "total_lengths": [3, 2],
+        "response_lengths": [3, 2],
+    }
+
+    td = dict_to_tensordict(batch, batch_size=2)
+
+    assert td["tokens"].is_nested
+    assert td["loss_masks"].is_nested
+    assert [tensor.tolist() for tensor in td["tokens"]] == [[1, 2, 3], [4, 5]]
+    assert [tensor.tolist() for tensor in td["loss_masks"]] == [[0, 1, 1], [1, 1]]
+    assert td["total_lengths"].tolist() == [3, 2]
 
 
 def test_pack_samples_for_tq_forces_multimodal_field_for_text_only_batch():
@@ -790,6 +811,114 @@ def test_streaming_dataset_invalid_multimodal_skip_refills_batch(tmp_path: Path,
         assert [sample.source_idx for sample in samples] == [1]
         assert "SFTStreamingDataset[invalid-multimodal=skip]" in caplog.text
         assert "sample idx=0, sample_id='invalid-image-url'" in caplog.text
+    finally:
+        ds.stop()
+
+
+def test_streaming_dataset_async_prefetch_waits_without_foreground_fallback(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {"messages": [{"role": "assistant", "content": "A"}]},
+            {"messages": [{"role": "assistant", "content": "B"}]},
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        seed=0,
+        prefetch_max_cached=0,
+    )
+    ds.shuffle(0)
+    ds.index_manager.position = 0
+    first_idx = ds.index_manager.indices[0]
+
+    class _FakePrefetch:
+        cache_size = 1
+        is_alive = True
+
+        def __init__(self) -> None:
+            self.get_called = False
+            self.get_cached_calls = 0
+
+        def get(self, idx: int):  # noqa: ARG002
+            self.get_called = True
+            raise AssertionError("async prefetch path must not use synchronous fallback")
+
+        def get_cached(self, idx: int, *, record_miss: bool = True):  # noqa: ARG002
+            self.get_cached_calls += 1
+            if self.get_cached_calls == 1:
+                return False, None
+            return True, ProcessedSample(
+                tokens=torch.tensor([1], dtype=torch.long),
+                loss_mask=torch.tensor([1], dtype=torch.long),
+                total_length=1,
+                multimodal_train_inputs=None,
+                source_idx=idx,
+            )
+
+        def set_index_order(self, indices: list[int]) -> None:  # noqa: ARG002
+            raise AssertionError("test should not re-prime prefetch")
+
+        def stop(self) -> None:
+            pass
+
+    prefetch = _FakePrefetch()
+    ds._prefetch = prefetch
+
+    try:
+        samples, crossed = asyncio.run(ds.get_batch_async(1))
+        assert crossed is False
+        assert [item.source_idx for item in samples] == [first_idx]
+        assert prefetch.get_called is False
+        assert prefetch.get_cached_calls == 2
+    finally:
+        ds.stop()
+
+
+def test_streaming_dataset_async_prefetch_raises_when_worker_exits(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {"messages": [{"role": "assistant", "content": "A"}]},
+            {"messages": [{"role": "assistant", "content": "B"}]},
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        seed=0,
+        prefetch_max_cached=0,
+    )
+    ds.shuffle(0)
+    ds.index_manager.position = 0
+
+    class _DeadPrefetch:
+        cache_size = 0
+        is_alive = False
+
+        def get_cached(self, idx: int, *, record_miss: bool = True):  # noqa: ARG002
+            return False, None
+
+        def wait_for(self, idx: int, timeout: float | None = None):  # noqa: ARG002
+            return False
+
+        def stop(self) -> None:
+            pass
+
+    ds._prefetch = _DeadPrefetch()
+
+    try:
+        with pytest.raises(RuntimeError, match="prefetch worker exited"):
+            asyncio.run(ds.get_batch_async(1))
     finally:
         ds.stop()
 
