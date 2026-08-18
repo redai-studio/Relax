@@ -1,0 +1,191 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_word_wrap_column",
+            "description": "Set the number of columns at which the editor will word wrap.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "column": {
+                        "type": "integer",
+                        "description": "The column number where lines should wrap, e.g. 80 or 120."
+                    }
+                },
+                "required": [
+                    "column"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_auto_save_delay",
+            "description": "Set the auto save delay in milliseconds.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "Delay before auto save in milliseconds."
+                    }
+                },
+                "required": [
+                    "delay_ms"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_focus_editor_on_break",
+            "description": "Set the Debug: Focus Editor On Break setting to true or false.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "boolean",
+                        "description": "True to enable focus on editor when debugger breaks, false to disable."
+                    }
+                },
+                "required": [
+                    "value"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_color_theme",
+            "description": "Change the editor color theme.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "theme_name": {
+                        "type": "string",
+                        "description": "The name of the theme to apply, e.g. 'Default Dark+'."
+                    }
+                },
+                "required": [
+                    "theme_name"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_wrap_tabs",
+            "description": "Enable or disable wrap tabs in the editor.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "boolean",
+                        "description": "True to enable wrap tabs, false to disable."
+                    }
+                },
+                "required": [
+                    "value"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.add_files_exclude",
+            "description": "Add a glob pattern to the Files: Exclude setting.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to exclude, e.g. '**/__pycache__'."
+                    }
+                },
+                "required": [
+                    "pattern"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.set_python_diagnostics_override",
+            "description": "Override severity for a specific Python analysis diagnostic rule.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule": {
+                        "type": "string",
+                        "description": "Diagnostic rule ID, e.g. 'reportMissingImports'."
+                    },
+                    "severity": {
+                        "type": "string",
+                        "description": "Severity level, e.g. 'info', 'warning', 'error', or 'none'."
+                    }
+                },
+                "required": [
+                    "rule",
+                    "severity"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.search_text",
+            "description": "Open VSCode search panel, input the search term, and execute search in either all files or current file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to search for."
+                    },
+                    "all_files": {
+                        "type": "boolean",
+                        "description": "True to search in all files, false to search only in the current file. Default is True."
+                    }
+                },
+                "required": [
+                    "text"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "VSCodeTools.replace_text",
+            "description": "Open VSCode search and replace panel, input search and replacement text, and execute replacement in either all files or current file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_text": {
+                        "type": "string",
+                        "description": "The text to search for."
+                    },
+                    "replace_text": {
+                        "type": "string",
+                        "description": "The text to replace matches with."
+                    },
+                    "all_files": {
+                        "type": "boolean",
+                        "description": "True to replace in all files, false to replace only in the current file. Default is True."
+                    }
+                },
+                "required": [
+                    "search_text",
+                    "replace_text"
+                ]
+            }
+        }
+    }
+]

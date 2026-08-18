@@ -1,0 +1,28 @@
+# mcp_tools — vendored MCP server + tools
+
+The MCP server injected into the OSWorld guest VM for the hybrid (GUI + MCP)
+action space. This is the tool set behind the paper's headline numbers.
+
+```
+mcp/
+  mcp_server/
+    server.py            # FastMCP server
+    launch_server.sh
+    tools/
+      package/           # executable tool implementations (calc, impress, writer, code, chrome, vlc, os)
+      apis/              # tool JSON schemas (mirror of ../tools/tools_registry.json)
+  osworld_mcp_client.py  # client injected into the VM
+```
+
+## How it's used
+
+`MCP_SRC_ROOT` (default `./mcp_tools`, see `configs/env.example.sh`) points here;
+`OSWorld-main/desktop_env/desktop_env.py::_inject_mcp_files` copies
+`mcp/mcp_server/` and `mcp/osworld_mcp_client.py` into the guest at boot. Set
+`MCP_SRC_ROOT=0` to fall back to a stock OSWorld-MCP checkout instead.
+
+## Attribution
+
+Derived from [OSWorld-MCP](https://github.com/xlang-ai/OSWorld) (Apache-2.0),
+extended with this project's own tools (the `*_ours` and `*_ljt` packages).
+Redistributed under Apache-2.0; retains OSWorld-MCP's terms.

@@ -1,0 +1,392 @@
+[
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.open_shell",
+			"description": "Open a new terminal directly.",
+			"parameters": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.set_default_terminal_size",
+			"description": "Persists the given number of columns × rows as the default GNOME-Terminal window size using gsettings/dconf.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"columns": {
+						"type": "integer",
+						"description": "Number of text columns (width) to set as default"
+					},
+					"rows": {
+						"type": "integer",
+						"description": "Number of text rows (height) to set as default"
+					}
+				},
+				"required": ["columns", "rows"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.get_volume",
+			"description": "Returns the current output volume (percentage) of the default PulseAudio / PipeWire sink.",
+			"parameters": { "type": "object", "properties": {}, "required": [] }
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.set_volume",
+			"description": "Sets the output volume of the default PulseAudio / PipeWire sink to the desired percentage (0-100).",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"percent": {
+						"type": "integer",
+						"description": "Desired volume percentage (0-150). Values above 100 boost the volume."
+					}
+				},
+				"required": ["percent"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.get_text_scale",
+			"description": "Returns the current GNOME text-scaling factor (1.0 = default size).",
+			"parameters": { "type": "object", "properties": {}, "required": [] }
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.change_text_scale",
+			"description": "Changes the text-scaling factor and returns the previous value so it can be restored later.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"new_scale": {
+						"type": "number",
+						"description": "Desired scaling factor (0.5–3.0)."
+					}
+				},
+				"required": ["new_scale"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.copy_matching_files_with_hierarchy",
+			"description": "Copies all files matching a pattern (default '*osworld.py') from the specified root directory to a destination directory, preserving the original directory hierarchy.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"root_dir": {
+						"type": "string",
+						"description": "Root directory to start searching from. Default: '.'"
+					},
+					"dest_dir": {
+						"type": "string",
+						"description": "Destination directory (relative to root_dir) where the files will be copied. Default: 'fails'"
+					},
+					"pattern": {
+						"type": "string",
+						"description": "Unix shell-style wildcard pattern used to match files. Default: '*failed.ipynb'"
+					},
+					"dry_run": {
+						"type": "boolean",
+						"description": "If true, only list the copy operations without actually copying files. Default: false"
+					}
+				},
+				"required": []
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.search_files",
+			"description": "Recursively search all files under the given folder whose names contain the provided keyword (case-insensitive). Returns a list of absolute paths.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"keyword": {
+						"type": "string",
+						"description": "Substring to look for (case-insensitive)."
+					},
+					"root_dir": {
+						"type": "string",
+						"description": "Root directory to start searching from. Default: '.'"
+					}
+				},
+				"required": ["keyword"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.get_trash_directory",
+			"description": "Returns the absolute path to the user Trash 'files' directory (e.g. /home/user/.local/share/Trash/files).",
+			"parameters": {
+				"type": "object",
+				"properties": {},
+				"required": []
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.restore_file",
+			"description": "Restore the specified file from the user Trash back to its original location.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"file_name": {
+						"type": "string",
+						"description": "Exact file basename as it appears in ~/.local/share/Trash/files (e.g., 'holiday_poster.png')."
+					}
+				},
+				"required": ["file_name"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.configure_auto_lock",
+			"description": "Configures the GNOME automatic-lock behaviour (idle timeout, lock enable/disable, additional delay).",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"idle_delay_seconds": {
+						"type": "integer",
+						"description": "Time in seconds of inactivity before the screensaver starts (e.g. 300 for 5 min)."
+					},
+					"lock_delay_seconds": {
+						"type": "integer",
+						"description": "Additional delay in seconds before the screen locks after the screensaver becomes active.",
+						"default": 0
+					},
+					"enable_lock": {
+						"type": "boolean",
+						"description": "Whether the screen should lock (true) or just blank (false) after the idle delay.",
+						"default": true
+					}
+				},
+				"required": ["idle_delay_seconds"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.rename_directory",
+			"description": "Safely renames a folder on the local filesystem.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"old_path": {
+						"type": "string",
+						"description": "Absolute or '~'-relative path of the directory to rename."
+					},
+					"new_path": {
+						"type": "string",
+						"description": "Absolute or '~'-relative path representing the new name/location."
+					},
+					"create_intermediate": {
+						"type": "boolean",
+						"description": "Whether to create the parent directory of `new_path` if it doesn’t exist (default: false)."
+					}
+				},
+				"required": ["old_path", "new_path"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.set_do_not_disturb",
+			"description": "Enable or disable the GNOME/Ubuntu Do Not Disturb mode (hide/show notification banners).",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"enable": {
+						"type": "boolean",
+						"description": "True  -> turn ON Do Not Disturb (hide banners). False -> turn OFF Do Not Disturb (show banners)."
+					}
+				},
+				"required": ["enable"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "UnifiedTools.get_do_not_disturb_status",
+			"description": "Returns the current Do Not Disturb state (true = ON, false = OFF, null = unknown).",
+			"parameters": { "type": "object", "properties": {}, "required": [] }
+		}
+	},
+
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.remove_image_background",
+			"description": "Remove the background of an input image and save a new image file with transparency. Works best with PNG output for preserving transparency.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"image_path": {
+						"type": "string",
+						"description": "Absolute or relative path to the local source image file. Supported formats include PNG, JPG, and others."
+					},
+					"output_path": {
+						"type": "string",
+						"description": "Absolute or relative path where the background-removed image will be saved. Recommended to use PNG to retain transparency (e.g., './output/clean.png')."
+					}
+				},
+				"required": ["image_path", "output_path"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.convert_image_format",
+			"description": "Convert an input image file to a specified format (PNG, JPG, or PDF). Optionally flattens transparency for JPG output to avoid format incompatibility.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"image_path": {
+						"type": "string",
+						"description": "Absolute or relative path to the local source image file to be converted."
+					},
+					"output_format": {
+						"type": "string",
+						"enum": ["png", "jpg", "pdf"],
+						"description": "Desired output format. Valid values are: 'png', 'jpg', or 'pdf'. Case-insensitive but should be provided in lowercase for consistency."
+					},
+					"output_path": {
+						"type": "string",
+						"description": "Path where the converted file will be saved, including file name and extension matching the output_format."
+					}
+				},
+				"required": ["image_path", "output_format", "output_path"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.git_operation",
+			"description": "Execute a git command (clone, add, commit, pull, push, etc.) on a given repository path. For 'clone' operation, repo_path can be the target folder.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"repo_path": {
+						"type": "string",
+						"description": "Path to a local git repository. For 'clone', this is the destination folder path (can be omitted for clone into current working directory)."
+					},
+					"operation": {
+						"type": "string",
+						"description": "The git subcommand to run, e.g., 'clone', 'add', 'commit', 'pull', 'push'."
+					},
+					"arguments": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						},
+						"description": "Additional arguments for the git command. For example: for commit: ['-m', 'Commit message']."
+					}
+				},
+				"required": ["operation"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.ffmpeg_video_to_gif",
+			"description": "Use ffmpeg to extract a portion of a video file and save it as an animated GIF. Requires ffmpeg to be installed on the system.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"video_path": {
+						"type": "string",
+						"description": "Absolute or relative path to the video file."
+					},
+					"start_time": {
+						"type": "string",
+						"description": "Start time of the clip. Can be 'HH:MM:SS' format or seconds as a number string, e.g., '00:01:05' or '65'."
+					},
+					"duration": {
+						"type": "string",
+						"description": "Duration of the GIF content. Can be 'HH:MM:SS' format or seconds as a number string, e.g., '00:00:10' or '10'."
+					},
+					"output_path": {
+						"type": "string",
+						"description": "Output path and filename for the GIF file, e.g., './output/clip.gif'."
+					}
+				},
+				"required": ["video_path", "start_time", "duration", "output_path"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.git_set_user_info",
+			"description": "Configure git user.name and user.email, either globally or for a specific local repository.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"username": {
+						"type": "string",
+						"description": "The git username to set (git config user.name)."
+					},
+					"email": {
+						"type": "string",
+						"description": "The git email to set (git config user.email)."
+					},
+					"repo_path": {
+						"type": "string",
+						"description": "Optional path to a git repository. If omitted and is_global is False, current working directory is used."
+					},
+					"is_global": {
+						"type": "boolean",
+						"description": "Whether to set username and email as global settings for all repositories. If true, repo_path is ignored."
+					}
+				},
+				"required": ["username", "email", "is_global"]
+			}
+		}
+	},
+	{
+		"type": "function",
+		"function": {
+			"name": "SystemTools.calculator",
+			"description": "Simple calculator.",
+			"parameters": {
+				"type": "object",
+				"properties": {
+					"expression": {
+						"type": "string",
+						"description": "A single-line safe Python arithmetic expression to evaluate."
+					}
+				},
+				"required": ["expression"]
+			}
+		}
+	}
+]

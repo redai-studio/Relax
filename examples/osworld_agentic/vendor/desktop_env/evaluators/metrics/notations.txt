@@ -1,0 +1,368 @@
+basic_os:
+
+check_gnome_favorite_apps(apps_str: str, rule)
+explainations:
+Checks whether the GNOME favorites (application .desktop entries) match the expected list, ignoring order but requiring the same set and the same count.
+example:
+check_gnome_favorite_apps(
+    "['thunderbird.desktop', 'vim.desktop', 'google-chrome.desktop']",
+    {"expected": ['vim.desktop', 'google-chrome.desktop', 'thunderbird.desktop']}
+)  # => 1
+
+is_utc_0(timedatectl_output: str)
+explainations:
+Checks whether the system time zone offset reported by timedatectl is +0000 (UTC+0).
+example:
+out = """Local time: Thu 2024-01-25 12:56:06 WET
+Universal time: Thu 2024-01-25 12:56:06 UTC
+RTC time: Thu 2024-01-25 12:56:05
+Time zone: Atlantic/Faroe (WET, +0000)
+System clock synchronized: yes
+NTP service: inactive
+RTC in local TZ: no
+"""
+is_utc_0(out)  # => 1
+
+check_text_enlarged(scaling_factor_str: str)
+explainations:
+Checks whether the UI text scaling factor is greater than 1.0 (i.e., text is enlarged).
+example:
+check_text_enlarged("1.25")  # => 1
+
+check_moved_jpgs
+explainations:
+Compares the set of child file names in a directory listing against an expected list (order doesn’t matter, counts must match).
+example:
+directory = {
+    "children": [
+        {"name": "cat.jpg"}, {"name": "dog.jpg"}, {"name": "bird.jpg"}
+    ]
+}
+check_moved_jpgs(directory, {"expected": ["dog.jpg", "bird.jpg", "cat.jpg"]})  # => 1
+
+is_in_vm_clickboard(config: dict, terminal_output: str)
+explainations:
+Checks whether the terminal output contains the expected substring(s). If expected is a list, all items must appear in the output.
+example:
+terminal = "Clipboard is enabled. Host -> Guest copy works. Guest -> Host copy works."
+is_in_vm_clickboard({"expected": "Clipboard is enabled"}, terminal)  # => 1
+
+
+
+
+chrome:
+
+is_expected_active_tab(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> float
+explainations:
+Checks if active tab URL equals rule['url'] using compare_urls. Returns 1/0.
+examples:
+is_expected_active_tab({"url": "https://example.com/a"}, {"type": "url", "url": "https://example.com/a"})  # 1
+
+is_expected_active_tab_approximate(active_tab_info: Dict[str, str], rule: Dict[str, Any]) -> float
+explainations:
+Compares URLs after stripping query strings. Returns 1/0.
+examples:
+is_expected_active_tab_approximate({"url": "https://ex.com/page?a=1"}, {"type": "url", "url": "https://ex.com/page?b=2"})  # 1
+
+is_expected_url_pattern_match(result, rules) -> float
+explainations:
+Applies all regex patterns in rules["expected"] to the URL; all must match. Returns 1/0.
+examples:
+is_expected_url_pattern_match("https://ex.com/search?q=python&lang=en",
+                              {"expected": [r"search", r"q=python", r"lang=en"]})  # 1
+
+is_expected_installed_extensions(installed_extensions, expected) -> float
+explainations:
+Returns 1 if all expected extensions are installed; else 0.
+examples:
+is_expected_installed_extensions(["adblock", "vimium", "darkreader"], {"expected": ["vimium"]})
+
+is_expected_tabs(open_tabs: List[Dict[str, str]], rule: Dict[str, Any]) -> float
+explainations:
+Checks if open tab URLs equal rule['urls'] (order-sensitive with are_lists_equal). Returns 1/0.
+examples:
+open_tabs = [{"url": "https://a.com"}, {"url": "https://b.com"}]
+is_expected_tabs(open_tabs, {"type": "url", "urls": ["https://a.com", "https://b.com"]})  # 1
+
+is_expected_bookmarks(bookmarks: List[str], rule: Dict[str, Any]) -> float
+explainations:
+Validates bookmark bar: folder names, website URLs, or the “Liked Authors” folder URLs (matching one combination). Returns 1/0.
+examples:
+bookmarks = {
+  "bookmark_bar": {
+    "children": [
+      {"type":"folder","name":"Work","children":[]},
+      {"type":"url","url":"https://a.com"},
+      {"type":"url","url":"https://b.com"},
+      {"type":"folder","name":"Liked Authors",
+       "children":[{"type":"url","url":"https://author1.com"},
+                   {"type":"url","url":"https://author2.com"}]}
+]}}
+is_expected_bookmarks(bookmarks, {"type":"bookmark_bar_folders_names","names":["Work","Liked Authors"]})  # 1
+
+is_expected_search_query(active_tab_info: Dict[str, str], rules: Dict[str, Any]) -> float
+explainations:
+Regex-match rules['expect']['pattern'] against active_tab_info['url']. Returns 1/0.
+examples:
+is_expected_search_query({"url":"https://google.com/search?q=linux+chrome"},
+                         {"expect":{"pattern": r"q=linux\+chrome"}})  # 1
+
+compare_pdfs(pdf1_path: Union[str, List[str]], pdf2_path: Union[str, List[str]])
+explainations:
+Compares PDF text content; returns similarity score in [0,1], averaging across pairs.
+examples:
+compare_pdfs("pred.pdf", "gold.pdf")                                      # e.g., 0.92
+
+compare_pdf_images(pdf1_path: str, pdf2_path: str, kwargs) -> float
+explainations:
+Compares embedded images via perceptual hash; returns fraction of matched images [0,1].
+examples:
+compare_pdf_images("pred2.pdf", "gold2.pdf")  # e.g., 0.5
+
+compare_archive(pred_path: str, gold_path: str, kwargs) -> float
+explainations:
+Unpacks archives, ensures same filenames, compares each by file_type (text/pdf/docx/ppt/image/csv/table/audio/video), returns average score [0,1].
+examples:
+compare_archive("pred.zip", "gold.zip", file_type="text")                         # e.g., 0.97
+
+compare_htmls(html_path1: str, html_path2: str, options) -> float
+explainations:
+Compares HTML structure/text/attributes; ignore_sdnum option; returns 1 if identical, else 0.
+examples:
+compare_htmls("pred.html", "gold.html", ignore_sdnum=True)           # 1 或 0
+
+is_cookie_deleted(cookie_data, rule) -> float
+explainations:
+For type='domains', returns 1 if no cookies for any given domains; else 0.
+examples:
+cookie_data = [(None, ".example.com", {}), (None, ".abc.com", {})]
+is_cookie_deleted(cookie_data, {"type":"domains","domains":["https://example.com"]})  # 0
+is_cookie_deleted(cookie_data, {"type":"domains","domains":["https://none.com"]})     # 1
+
+is_shortcut_on_desktop(shortcuts: Dict[str, str], rule)
+explainations:
+Scans .desktop contents for Name= or Exec= per rule; returns 1/0.
+examples:
+shortcuts = {
+  "/home/u/Desktop/app.desktop": "Name=My App\nExec=/usr/bin/myapp\n",
+  "/home/u/Desktop/site.desktop": "Name=Site\nExec=/usr/bin/chrome https://a.com\n"
+}
+is_shortcut_on_desktop(shortcuts, {"type":"name","name":"My App"})         # 1
+is_shortcut_on_desktop(shortcuts, {"type":"name","name":"Other"})          # 0
+
+check_history_deleted(history_data, rule)
+explainations:
+For type='keywords', returns 1 if none of the keywords appear in history domains; else 0.
+examples:
+history = [("news.example.com", {}), ("video.site.com", {})]
+check_history_deleted(history, {"type":"keywords","keywords":["video"]})  # 0
+check_history_deleted(history, {"type":"keywords","keywords":["bank"]})   # 1
+
+check_enabled_experiments(enabled_experiments, rule)
+explainations:
+Extract names before @ and compare list to rule['names'] (order matters). Returns 1/0.
+examples:
+enabled = ["SmoothScroll@Enabled", "ReaderMode@Disabled"]
+check_enabled_experiments(enabled, {"type":"names","names":["SmoothScroll","ReaderMode"]})  # 1
+check_enabled_experiments(enabled, {"type":"names","names":["ReaderMode","SmoothScroll"]})  # 0
+
+check_font_size(font_size, rule)
+explainations:
+Exact match or within (min,max) range on default_font_size. Returns 1/0.
+examples:
+font = {"default_font_size": 16}
+check_font_size(font, {"type":"value","value":16})               # 1
+check_font_size(font, {"type":"value","value":14})               # 0
+check_font_size(font, {"type":"range","min":12,"max":18})        # 1
+
+is_added_to_steam_cart(active_tab_info, rule)
+explainations:
+Returns 1 if all rule['items'] substrings appear in active_tab_info['content']; else 0.
+examples:
+page = {"content": "Added to your cart. Item: Portal 2. Subtotal: $19.99"}
+is_added_to_steam_cart(page, {"items": ["Added to your cart", "Portal 2"]})  # 1
+is_added_to_steam_cart(page, {"items": ["Half-Life 3"]})                     # 0
+
+
+
+
+
+docs
+
+find_default_font(config_file_path, rules)
+explainations:
+Check Writer default font equals rules["font_name"]. Return 1/0.
+examples:
+find_default_font("/path/registrymodifications.xcu", {"font_name": "Liberation Serif"})  # -> 1 或 0
+
+contains_page_break(docx_file, rules)
+explainations:
+Count page breaks; if page_break_count given, must match; return 1 if present.
+examples:
+contains_page_break("a.docx", {"page_break_count": 2})  # -> 1 或 0
+contains_page_break("a.docx", {})                       # -> 1(有分页) / 0(无分页)
+
+compare_docx_files(file1, file2, **options)
+explainations:
+Compare DOCX/ODT text with options (ignore_blanks/ignore_case/ignore_order/content_only/fuzzy_match/delete_empty_lines); returns 1/0 or similarity [0,1].
+examples:
+compare_docx_files("p.docx", "g.docx")                                        # -> 1/0
+compare_docx_files("p.docx","g.docx", content_only=True, fuzzy_match=True)    # -> 0.87(示例)
+
+compare_init_lines(file1, file2)
+explainations:
+Exact per-paragraph equality. Return 1/0.
+examples:
+compare_init_lines("p.docx", "g.docx")  # -> 1/0
+
+compare_docx_tables(docx_file1, docx_file2)
+explainations:
+Same number/shape of tables and identical cell texts. Return 1/0.
+examples:
+compare_docx_tables("p.docx", "g.docx")  # -> 1/0
+
+compare_docx_images(docx_file1, docx_file2)
+explainations:
+Extract images and require same count and byte-equality. Return 1/0.
+examples:
+compare_docx_images("p.docx", "g.docx")  # -> 1/0
+
+compare_image_text(image_path, rule)
+explainations:
+OCR image; return 1 if extracted text contains rule['text'].
+examples:
+compare_image_text("shot.png", {"type": "text", "text": "ls"})  # -> 1/0
+
+compare_line_spacing(docx_file1, docx_file2)
+explainations:
+After text equality, require identical paragraph line spacing.
+examples:
+compare_line_spacing("p.docx", "g.docx")  # -> 1/0
+
+compare_insert_equation(docx_file1, docx_file2)
+explainations:
+Return 1 if both docs contain an equation object in matched runs.
+examples:
+compare_insert_equation("p.docx", "g.docx")  # -> 1/0
+
+compare_font_names(docx_file, rules)
+explainations:
+All runs’ font name equals rules["font_name"].
+examples:
+compare_font_names("a.docx", {"font_name": "Times New Roman"})  # -> 1/0
+
+compare_subscript_contains(docx_file1, docx_file2)
+explainations:
+Return 1 if any matched runs are both subscript.
+examples:
+compare_subscript_contains("p.docx", "g.docx")  # -> 1/0
+
+has_page_numbers_in_footers(docx_file)
+explainations:
+All section footers contain digits (page numbers).
+examples:
+has_page_numbers_in_footers("a.docx")  # -> 1/0
+
+is_first_line_centered(docx_file)
+explainations:
+First paragraph is centered. Return 1/0.
+examples:
+is_first_line_centered("a.docx")  # -> 1/0
+
+check_file_exists(directory, filename)
+explainations:
+Check if file path exists. Return 1/0.
+examples:
+check_file_exists("/tmp", "report.docx")  # -> 1/0
+
+check_tabstops(docx_file1, docx_file2, **kwargs) -> float
+explainations:
+Compare tab stops (alignment/position) and optionally word counts split by tabs; return score in [0,1].
+examples:
+check_tabstops("p.docx", "g.docx")                                       # -> 1.0/0.x
+check_tabstops("p.docx","g.docx", word_number_split_by_tabstop=3,index=0) # -> 1.0/0.x
+
+compare_contains_image(docx_file1, docx_file2)
+explainations:
+Check image-presence consistency across runs. Return 1/0.
+examples:
+compare_contains_image("p.docx", "g.docx")  # -> 1/0
+
+evaluate_colored_words_in_tables(file_path1, file_path2, **kwargs)
+explainations:
+In tables: vowels → red, non-vowels → blue; within threshold. Return 1/0.
+examples:
+evaluate_colored_words_in_tables("a.docx", "gold.docx", threshold=3.5)  # -> 1/0
+
+check_highlighted_words(file_path1, file_path2)
+explainations:
+After text match, ensure no yellow-highlighted spans. Return 1 if none.
+examples:
+check_highlighted_words("a.odt", "gold.odt")
+
+evaluate_strike_through_last_paragraph(file_path1, file_path2)
+explainations:
+Last paragraph: all runs struck through. Return 1/0.
+examples:
+evaluate_strike_through_last_paragraph("a.docx", "gold.docx")  # -> 1/0
+
+evaluate_conversion(file_path)
+explainations:
+Ensure no ALL-CAPS text remains. Return 1/0.
+examples:
+evaluate_conversion("a.docx")  # -> 1/0
+
+evaluate_spacing(file_path)
+explainations:
+First three paragraphs line spacing == 1.0, 2.0, 1.5.
+examples:
+evaluate_spacing("a.docx")  # -> 1/0
+
+check_italic_font_size_14(path1, path2)
+explainations:
+All italic runs have 14pt size. Return 1/0.
+examples:
+check_italic_font_size_14("a.docx", "gold.docx")  # -> 1/0
+
+evaluate_alignment(docx_path)
+explainations:
+Sentences (≥3 words) follow “first 3 words … rest” alignment pattern. Return 1/0.
+examples:
+evaluate_alignment("a.docx")  # -> 1/0
+
+check_no_duplicates(initial_file, processed_file)
+explainations:
+No duplicate train_ids; set and count match initial file. Return 1/0.
+examples:
+check_no_duplicates("init.docx", "processed.docx")  # -> 1/0
+
+compare_docx_lines(file1, file2)
+explainations:
+Compare sets of non-empty lines. Return 1/0.
+examples:
+compare_docx_lines("p.docx", "g.docx")  # -> 1/0
+
+compare_docx_files_and_ignore_new_lines(file1, file2, **options)
+explainations:
+Compare after removing blanks/normalizing whitespace. Return 1/0.
+examples:
+compare_docx_files_and_ignore_new_lines("p.docx", "g.docx")                     # -> 1/0
+compare_docx_files_and_ignore_new_lines("p.docx","g.docx", ignore_blanks=False) # -> 1/0
+
+compare_references(file1, file2, **options)
+explainations:
+Compare references section with fuzzy average; normalize vs base. Return [0,1].
+examples:
+compare_references("p.docx", "g.docx")                                  # -> 0~1
+compare_references("p.docx","g.docx", reference_indicator="Bibliography",
+                   reference_base_result=0.6)                            # -> 0~1
+
+compare_unique_train_records(processed_file, expected_files, **kwargs)
+explainations:
+With [gold, initial]: processed ⊆ initial, no dup IDs, IDs match gold, counts match gold. Return 1/0.
+examples:
+compare_unique_train_records("proc.docx", ["gold.docx","init.docx"])  # -> 1/0
+
+
+
+

@@ -1,0 +1,19 @@
+{
+  "upstream": {
+    "url": "https://github.com/redai-infra/hybrid-routing-agent",
+    "commit": "a54d59c8049a0cd7192d95863155e133a1ba41ea",
+    "fetched_at": "2026-08-18",
+    "license": "Apache-2.0"
+  },
+  "vendored_paths": {
+    "vendor/desktop_env": "OSWorld-main/desktop_env",
+    "vendor/mm_agents": "OSWorld-main/mm_agents",
+    "vendor/mcp_tools": "mcp_tools",
+    "vendor/agents": "agents",
+    "tools/tools_registry.json": "tools/tools_registry.json",
+    "vendor/UPSTREAM_PATCHES.md": "OSWorld-main/PATCHES.md",
+    "vendor/OSWorld-LICENSE": "OSWorld-main/LICENSE",
+    "vendor/hybrid-routing-agent-LICENSE": "LICENSE"
+  },
+  "local_patches": []
+}

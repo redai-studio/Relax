@@ -1,0 +1,120 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "CalcToolsPlus.scale_first_sheet_and_export_pdf",
+            "description": "Scales the first sheet of a spreadsheet to a specified number of pages (default 1×1) and exports it to PDF.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pages_x": {
+                        "type": "integer",
+                        "description": "Number of horizontal pages to scale the first sheet to. Default is 1."
+                    },
+                    "pages_y": {
+                        "type": "integer",
+                        "description": "Number of vertical pages to scale the first sheet to. Default is 1."
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path where the exported PDF will be saved, including '.pdf' extension."
+                    }
+                },
+                "required": [
+                    "output_path"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "CalcToolsPlus.fill_blank_down",
+            "description": "Forward-fills blank (empty / NaN) cells in the specified columns of the active sheet in LibreOffice Calc with the value from the cell above. Keeps header row unchanged.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "columns": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "Optional list of column letters to process (e.g., ['A', 'C']). If omitted, all columns will be forward-filled."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "CalcToolsPlus.copy_cells_between_sheets",
+            "description": "Copy cells from a specified rectangular source range in the current active Calc sheet to another sheet, starting from a given top-left position. Preserves values, formatting, and formulas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_range": {
+                        "type": "string",
+                        "description": "The cell address range in A1 notation to copy from the active sheet. Must be a contiguous block (e.g., 'A1:C3'). Requests larger than 10000 cells will be rejected."
+                    },
+                    "target_sheet_name": {
+                        "type": "string",
+                        "description": "The exact name of the target sheet where the copied range will be pasted. Case-sensitive as per sheet tab name."
+                    },
+                    "target_start_cell": {
+                        "type": "string",
+                        "description": "The destination top-left cell in the target sheet, given in A1 notation (e.g., 'E5')."
+                    }
+                },
+                "required": [
+                    "source_range",
+                    "target_sheet_name",
+                    "target_start_cell"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "CalcToolsPlus.format_numbers_to_human_readable",
+            "description": "Convert all numeric values in a given range into human-readable strings using 'M' for millions and 'B' for billions, rounded to one decimal place using half-up rounding. Non-numeric cells will be ignored.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cell_range": {
+                        "type": "string",
+                        "description": "A1-style range (e.g., 'B2:D10') within the current active sheet to format."
+                    }
+                },
+                "required": [
+                    "cell_range"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "CalcToolsPlus.auto_fill_down",
+            "description": "Perform an Excel-like autofill down operation in the current sheet. The filled values will either repeat a detected pattern (cyclic fill) or continue an arithmetic progression (simple series) if the starting range contains numbers in sequence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_range": {
+                        "type": "string",
+                        "description": "The initial seed range (A1-style, e.g., 'A1:A3') to use for determining the autofill pattern. This is located in the current active sheet."
+                    },
+                    "rows_to_fill": {
+                        "type": "integer",
+                        "description": "The number of additional rows to fill downward, starting after the source_range's last row. Must be a positive integer."
+                    }
+                },
+                "required": [
+                    "source_range",
+                    "rows_to_fill"
+                ]
+            }
+        }
+    }
+]

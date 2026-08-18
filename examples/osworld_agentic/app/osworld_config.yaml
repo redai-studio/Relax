@@ -1,0 +1,53 @@
+# OSWorld agentic session config (P0/P1).
+#
+# The training launcher selects the config file via OSWORLD_CONFIG_PATH; the
+# session subprocess in app/agent.py reads it verbatim. Numbers here mirror
+# hybrid-routing-agent's `outcome_only_rl` recipe unless noted.
+
+# Session control ────────────────────────────────────────────────────────────
+max_turns: 50                 # HybridAgent hard step cap (matches upstream 50)
+step_pause_s: 2               # DesktopEnv.step(pause=...) — screen catchup
+max_image_history_length: 2   # 2-image history for both variants (upstream)
+max_reward_image_history_length: 1
+
+# Context-management policy — the switch between outcome_only_rl and context_rl.
+#   "baseline"            → every step gets a full screenshot (outcome_only_rl)
+#   "skip_on_mcp_success" → skip screenshot after a successful MCP call
+#   "skip_on_no_change"   → skip screenshot when byte-identical to previous
+context_policy: baseline
+
+# Sampling ───────────────────────────────────────────────────────────────────
+# repetition_penalty must be 1.0 during train rollouts (on-policy sampling
+# assumption). Eval scripts should override to 1.05.
+temperature: 0.8
+top_p: 0.9
+max_tokens: 4096
+repetition_penalty: 1.0
+
+# Stop token ids for Qwen3-VL family (matches deepeyes_v2_config.yaml).
+# 248059 = </tool_call>, 248046 = <|im_end|>
+stop_token_ids:
+  - 248059
+  - 248046
+
+# LLM transport ──────────────────────────────────────────────────────────────
+# Long timeout because a single Relax rollout can queue behind KV-cache
+# offload / restore in colocate mode. Bounded retries so we don't zombie-loop
+# after SIGTERM (pitfall f8489f91).
+llm_call_timeout_s: 600
+max_llm_call_retries: 3
+llm_call_backoff_s: 5
+
+# VM ─────────────────────────────────────────────────────────────────────────
+provider_name: docker
+snapshot_name: init_state
+screen_width: 1920
+screen_height: 1080
+headless: true
+require_a11y_tree: false      # a11y tree is heavy; unused by the hybrid agent
+
+# Tool retrieval ─────────────────────────────────────────────────────────────
+# Live MCP tool list from the VM is preferred; the local BM25 retriever kicks
+# in only if the VM-side server didn't respond in time.
+tool_retriever_backend: bm25
+tool_retriever_top_k: 18

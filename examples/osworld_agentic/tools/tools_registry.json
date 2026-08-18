@@ -1,0 +1,1713 @@
+{
+  "code": [
+    {
+      "name": "launch_vscode",
+      "description": "Launches Visual Studio Code with the specified file path or directory",
+      "params": {
+        "path": {
+          "type": "string",
+          "description": "The file path or directory to open in VS Code"
+        }
+      }
+    },
+    {
+      "name": "compare_files",
+      "description": "Compares two files in VSCode",
+      "params": {
+        "file1": {
+          "type": "string",
+          "description": "The path to the first file"
+        },
+        "file2": {
+          "type": "string",
+          "description": "The path to the second file"
+        }
+      }
+    },
+    {
+      "name": "add_folder",
+      "description": "Adds a folder to the last active window in VSCode",
+      "params": {
+        "folder": {
+          "type": "string",
+          "description": "The folder path to add"
+        }
+      }
+    },
+    {
+      "name": "goto_file",
+      "description": "Opens a file at a specific line and character position",
+      "params": {
+        "file_path": {
+          "type": "string",
+          "description": "The file path to open"
+        },
+        "line": {
+          "type": "integer",
+          "description": "The line number to navigate to",
+          "default": 1
+        },
+        "character": {
+          "type": "integer",
+          "description": "The character position to navigate to",
+          "default": 1
+        }
+      }
+    },
+    {
+      "name": "remove_folder",
+      "description": "Removes a folder from the last active window in VSCode",
+      "params": {
+        "folder": {
+          "type": "string",
+          "description": "The folder path to remove"
+        }
+      }
+    },
+    {
+      "name": "install_extension",
+      "description": "Installs an extension or updates it in VSCode",
+      "params": {
+        "extension_id": {
+          "type": "string",
+          "description": "The identifier of the extension"
+        },
+        "pre_release": {
+          "type": "boolean",
+          "description": "Whether to install the pre-release version",
+          "default": false
+        }
+      }
+    },
+    {
+      "name": "uninstall_extension",
+      "description": "Uninstalls an extension from VSCode",
+      "params": {
+        "extension_id": {
+          "type": "string",
+          "description": "The identifier of the extension"
+        }
+      }
+    },
+    {
+      "name": "list_extensions",
+      "description": "Lists installed extensions in VSCode",
+      "params": {
+        "show_versions": {
+          "type": "boolean",
+          "description": "Whether to show extension versions",
+          "default": false
+        },
+        "category": {
+          "type": "string",
+          "description": "The category to filter extensions by"
+        }
+      }
+    },
+    {
+      "name": "update_extensions",
+      "description": "Updates all installed extensions in VSCode to the latest version",
+      "params": {}
+    },
+    {
+      "name": "disable_extension",
+      "description": "Disables a specific extension for the next instance of VSCode",
+      "params": {
+        "extension_id": {
+          "type": "string",
+          "description": "The identifier of the extension"
+        }
+      }
+    },
+    {
+      "name": "toggle_sync",
+      "description": "Toggles synchronization on or off in VSCode",
+      "params": {
+        "state": {
+          "type": "string",
+          "description": "The state to set ('on' or 'off')",
+          "enum": [
+            "on",
+            "off"
+          ]
+        }
+      }
+    }
+  ],
+  "code2": [
+    {
+      "name": "set_word_wrap_column",
+      "description": "Set the number of columns at which the editor will word wrap.",
+      "params": {
+        "column": {
+          "type": "integer",
+          "description": "The column number where lines should wrap, e.g. 80 or 120."
+        }
+      }
+    },
+    {
+      "name": "set_auto_save_delay",
+      "description": "Set the auto save delay in milliseconds.",
+      "params": {
+        "delay_ms": {
+          "type": "integer",
+          "description": "Delay before auto save in milliseconds."
+        }
+      }
+    },
+    {
+      "name": "set_focus_editor_on_break",
+      "description": "Set the Debug: Focus Editor On Break setting to true or false.",
+      "params": {
+        "value": {
+          "type": "boolean",
+          "description": "True to enable focus on editor when debugger breaks, false to disable."
+        }
+      }
+    },
+    {
+      "name": "set_color_theme",
+      "description": "Change the editor color theme.",
+      "params": {
+        "theme_name": {
+          "type": "string",
+          "description": "The name of the theme to apply, e.g. 'Default Dark+'."
+        }
+      }
+    },
+    {
+      "name": "set_wrap_tabs",
+      "description": "Enable or disable wrap tabs in the editor.",
+      "params": {
+        "value": {
+          "type": "boolean",
+          "description": "True to enable wrap tabs, false to disable."
+        }
+      }
+    },
+    {
+      "name": "add_files_exclude",
+      "description": "Add a glob pattern to the Files: Exclude setting.",
+      "params": {
+        "pattern": {
+          "type": "string",
+          "description": "Glob pattern to exclude, e.g. '**/__pycache__'."
+        }
+      }
+    },
+    {
+      "name": "set_python_diagnostics_override",
+      "description": "Override severity for a specific Python analysis diagnostic rule.",
+      "params": {
+        "rule": {
+          "type": "string",
+          "description": "Diagnostic rule ID, e.g. 'reportMissingImports'."
+        },
+        "severity": {
+          "type": "string",
+          "description": "Severity level, e.g. 'info', 'warning', 'error', or 'none'."
+        }
+      }
+    },
+    {
+      "name": "search_text",
+      "description": "Open VSCode search panel, input the search term, and execute search in either all files or current file.",
+      "params": {
+        "text": {
+          "type": "string",
+          "description": "The text to search for."
+        },
+        "all_files": {
+          "type": "boolean",
+          "description": "True to search in all files, false to search only in the current file. Default is True."
+        }
+      }
+    },
+    {
+      "name": "replace_text",
+      "description": "Open VSCode search and replace panel, input search and replacement text, and execute replacement in either all files or current file.",
+      "params": {
+        "search_text": {
+          "type": "string",
+          "description": "The text to search for."
+        },
+        "replace_text": {
+          "type": "string",
+          "description": "The text to replace matches with."
+        },
+        "all_files": {
+          "type": "boolean",
+          "description": "True to replace in all files, false to replace only in the current file. Default is True."
+        }
+      }
+    }
+  ],
+  "libreoffice_calc": [
+    {
+      "name": "get_workbook_info",
+      "description": "Get workbook information, including file path, file name, sheets and active sheet.",
+      "params": {}
+    },
+    {
+      "name": "save",
+      "description": "Save the current workbook to its current location",
+      "params": {}
+    },
+    {
+      "name": "get_column_data",
+      "description": "Get all data from the specified column.",
+      "params": {
+        "column_name": {
+          "type": "string",
+          "description": "Name of the column to read (e.g. 'A', 'B', etc.)"
+        }
+      }
+    },
+    {
+      "name": "switch_active_sheet",
+      "description": "Switch to the specified sheet and make it active. Creates new sheet if it doesn't exist.",
+      "params": {
+        "sheet_name": {
+          "type": "string",
+          "description": "Name of the sheet to switch to or create"
+        }
+      }
+    },
+    {
+      "name": "set_column_values",
+      "description": "Set values to the specified column, cannot be used to set formulas.",
+      "params": {
+        "column_name": {
+          "type": "string",
+          "description": "Name of the column (e.g. 'A', 'B', etc.) to write to"
+        },
+        "data": {
+          "type": "array",
+          "description": "List of values to write to the column"
+        },
+        "start_index": {
+          "type": "integer",
+          "description": "The index of the first row to write to, default is 2 (skip the first row)"
+        }
+      }
+    },
+    {
+      "name": "highlight_range",
+      "description": "Highlight the specified range with the specified color.",
+      "params": {
+        "range_str": {
+          "type": "string",
+          "description": "Range to highlight, in the format of 'A1:B10'"
+        },
+        "color": {
+          "type": "integer",
+          "description": "Color to highlight with, default is 0xFF0000 (red)"
+        }
+      }
+    },
+    {
+      "name": "transpose_range",
+      "description": "Transpose the specified range and paste it to the target cell.",
+      "params": {
+        "source_range": {
+          "type": "string",
+          "description": "Range to transpose, in the format of 'A1:B10'"
+        },
+        "target_cell": {
+          "type": "string",
+          "description": "Target cell to paste the transposed data, in the format of 'A1'"
+        }
+      }
+    },
+    {
+      "name": "export_to_csv",
+      "description": "Export the current document to a CSV file with the same path and name as the original file.",
+      "params": {}
+    },
+    {
+      "name": "sort_column",
+      "description": "Sort the data in the specified column in ascending or descending order.",
+      "params": {
+        "column_name": {
+          "type": "string",
+          "description": "The name of the column to sort (e.g. 'A', 'B', etc.)"
+        },
+        "ascending": {
+          "type": "boolean",
+          "description": "Whether to sort in ascending order (default True)"
+        },
+        "start_index": {
+          "type": "integer",
+          "description": "The index of the first row to sort, default is 2 (skip the first row)"
+        }
+      }
+    },
+    {
+      "name": "hide_row_data",
+      "description": "Hide rows that contain the specified value.",
+      "params": {
+        "value": {
+          "type": "string",
+          "description": "The value to hide rows for, default is 'N/A'"
+        }
+      }
+    },
+    {
+      "name": "reorder_columns",
+      "description": "Reorder the columns in the sheet according to the specified order.",
+      "params": {
+        "column_order": {
+          "type": "array",
+          "description": "A list of column names in the desired order (e.g. ['A', 'B', 'C'])"
+        }
+      }
+    },
+    {
+      "name": "create_pivot_table",
+      "description": "Create a pivot table in the active worksheet based on data from the source sheet.",
+      "params": {
+        "source_sheet": {
+          "type": "string",
+          "description": "Name of the source sheet containing the data"
+        },
+        "table_name": {
+          "type": "string",
+          "description": "Name for the new pivot table"
+        },
+        "row_fields": {
+          "type": "array",
+          "description": "List of fields to use as row labels (e.g. ['A', 'B', 'C'])"
+        },
+        "col_fields": {
+          "type": "array",
+          "description": "List of fields to use as column labels (e.g. ['A', 'B', 'C'])"
+        },
+        "value_fields": {
+          "type": "array",
+          "description": "List of fields to use as values (e.g. ['A', 'B', 'C'])"
+        },
+        "aggregation_function": {
+          "type": "string",
+          "description": "Aggregation function to use (sum, count, average, min, max), default is 'sum'"
+        },
+        "target_cell": {
+          "type": "string",
+          "description": "Target cell for the pivot table, default is 'A1'"
+        }
+      }
+    },
+    {
+      "name": "merge_cells",
+      "description": "Merge cells in the specified range.",
+      "params": {
+        "range_str": {
+          "type": "string",
+          "description": "Range of cells to merge, in format 'A1:B10'"
+        }
+      }
+    },
+    {
+      "name": "set_cell_value",
+      "description": "Set a value to a specific cell in the active worksheet.",
+      "params": {
+        "cell": {
+          "type": "string",
+          "description": "Cell reference (e.g., 'A1')"
+        },
+        "value": {
+          "type": "string",
+          "description": "Value to set. For formulas, start with '=' and use commas as parameter separators (e.g., '=SUMIF(A1:A3,\"Alice\",B1:B3)')."
+        }
+      }
+    },
+    {
+      "name": "format_range",
+      "description": "Apply formatting to the specified range in the active worksheet.",
+      "params": {
+        "range_str": {
+          "type": "string",
+          "description": "Range to format, in the format of 'A1:B10'"
+        },
+        "background_color": {
+          "type": "string",
+          "description": "Background color in hex format (e.g., '#0000ff')"
+        },
+        "font_color": {
+          "type": "string",
+          "description": "Font color in hex format (e.g., '#ffffff')"
+        },
+        "bold": {
+          "type": "boolean",
+          "description": "Whether to make the text bold"
+        },
+        "alignment": {
+          "type": "string",
+          "description": "Text alignment (left, center, right)"
+        }
+      }
+    },
+    {
+      "name": "create_chart",
+      "description": "Create a chart in the active worksheet based on the specified data range.",
+      "params": {
+        "chart_type": {
+          "type": "string",
+          "description": "Type of chart (bar, column, line, pie, scatter, area)"
+        },
+        "data_range": {
+          "type": "string",
+          "description": "Range containing the data for the chart. Supports a single contiguous range (e.g., 'A1:B10'), multiple non-contiguous ranges separated by commas (e.g., 'A1:A10,C1:C10'), and cross-sheet references (e.g., 'Sheet1.A1:C11'). Cross-sheet and non-contiguous ranges can be combined (e.g., 'Sheet1.A1:A10,Sheet1.C1:C10')."
+        },
+        "title": {
+          "type": "string",
+          "description": "Title for the chart"
+        },
+        "x_axis_title": {
+          "type": "string",
+          "description": "Title for the X axis"
+        },
+        "y_axis_title": {
+          "type": "string",
+          "description": "Title for the Y axis"
+        }
+      }
+    },
+    {
+      "name": "freeze_panes",
+      "description": "Freeze rows and/or columns in the active worksheet.",
+      "params": {
+        "rows": {
+          "type": "integer",
+          "description": "Number of rows to freeze from the top"
+        },
+        "columns": {
+          "type": "integer",
+          "description": "Number of columns to freeze from the left"
+        }
+      }
+    },
+    {
+      "name": "rename_sheet",
+      "description": "Rename a worksheet in the workbook.",
+      "params": {
+        "old_name": {
+          "type": "string",
+          "description": "Current name of the worksheet"
+        },
+        "new_name": {
+          "type": "string",
+          "description": "New name for the worksheet"
+        }
+      }
+    },
+    {
+      "name": "copy_sheet",
+      "description": "Create a copy of an existing worksheet in the workbook.",
+      "params": {
+        "source_sheet": {
+          "type": "string",
+          "description": "Name of the worksheet to copy"
+        },
+        "new_sheet_name": {
+          "type": "string",
+          "description": "Name for the new worksheet copy (optional)"
+        }
+      }
+    },
+    {
+      "name": "reorder_sheets",
+      "description": "Change the order of worksheets in the workbook.",
+      "params": {
+        "sheet_name": {
+          "type": "string",
+          "description": "Name of the worksheet to move"
+        },
+        "position": {
+          "type": "integer",
+          "description": "New position index (0-based) for the worksheet"
+        }
+      }
+    },
+    {
+      "name": "set_number_format",
+      "description": "Apply a specific number format to a range of cells.",
+      "params": {
+        "range_str": {
+          "type": "string",
+          "description": "Range to format, in the format of 'A1:B10'"
+        },
+        "format_type": {
+          "type": "string",
+          "description": "Type of number format (general, number, currency, accounting, date, time, percentage, fraction, scientific, text)"
+        },
+        "decimal_places": {
+          "type": "integer",
+          "description": "Number of decimal places to display (optional)"
+        }
+      }
+    },
+    {
+      "name": "adjust_column_width",
+      "description": "Adjust the width of specified columns.",
+      "params": {
+        "columns": {
+          "type": "string",
+          "description": "Column range to adjust (e.g., 'A:C')"
+        },
+        "width": {
+          "type": "number",
+          "description": "Width to set (in characters)"
+        },
+        "autofit": {
+          "type": "boolean",
+          "description": "Whether to autofit columns to content"
+        }
+      }
+    },
+    {
+      "name": "adjust_row_height",
+      "description": "Adjust the height of specified rows.",
+      "params": {
+        "rows": {
+          "type": "string",
+          "description": "Row range to adjust (e.g., '1:10')"
+        },
+        "height": {
+          "type": "number",
+          "description": "Height to set (in points)"
+        },
+        "autofit": {
+          "type": "boolean",
+          "description": "Whether to autofit rows to content"
+        }
+      }
+    },
+    {
+      "name": "export_to_pdf",
+      "description": "Export the current document or specified sheets to PDF.",
+      "params": {
+        "file_path": {
+          "type": "string",
+          "description": "Path where to save the PDF file, default is the same path as the original file"
+        },
+        "sheets": {
+          "type": "array",
+          "description": "List of sheet names to include in PDF, default is all sheets"
+        },
+        "open_after_export": {
+          "type": "boolean",
+          "description": "Whether to open the PDF after export, default is False"
+        }
+      }
+    },
+    {
+      "name": "set_zoom_level",
+      "description": "Adjust the zoom level of the current worksheet.",
+      "params": {
+        "zoom_percentage": {
+          "type": "integer",
+          "description": "Zoom level as a percentage (e.g., 75 for 75%, 100 for normal size, 150 for zoomed in). Valid range is typically 10-400."
+        }
+      }
+    },
+    {
+      "name": "env_info",
+      "description": "Get content of the specified or active sheet, including its name, headers, and data. It should be called first to obtain the information before other tools that depend on the results are invoked.",
+      "params": {
+        "sheet_name": {
+          "type": "string",
+          "description": "Name of the sheet to read. If omitted or null, uses the active sheet."
+        }
+      }
+    }
+  ],
+  "libreoffice_calc2": [
+    {
+      "name": "scale_first_sheet_and_export_pdf",
+      "description": "Scales the first sheet of a spreadsheet to a specified number of pages (default 1×1) and exports it to PDF.",
+      "params": {
+        "pages_x": {
+          "type": "integer",
+          "description": "Number of horizontal pages to scale the first sheet to. Default is 1."
+        },
+        "pages_y": {
+          "type": "integer",
+          "description": "Number of vertical pages to scale the first sheet to. Default is 1."
+        },
+        "output_path": {
+          "type": "string",
+          "description": "Absolute or relative file path where the exported PDF will be saved, including '.pdf' extension."
+        }
+      }
+    },
+    {
+      "name": "fill_blank_down",
+      "description": "Forward-fills blank (empty / NaN) cells in the specified columns of the active sheet in LibreOffice Calc with the value from the cell above. Keeps header row unchanged.",
+      "params": {
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional list of column letters to process (e.g., ['A', 'C']). If omitted, all columns will be forward-filled."
+        }
+      }
+    },
+    {
+      "name": "copy_cells_between_sheets",
+      "description": "Copy cells from a specified rectangular source range in the current active Calc sheet to another sheet, starting from a given top-left position. Preserves values, formatting, and formulas.",
+      "params": {
+        "source_range": {
+          "type": "string",
+          "description": "The cell address range in A1 notation to copy from the active sheet. Must be a contiguous block (e.g., 'A1:C3')."
+        },
+        "target_sheet_name": {
+          "type": "string",
+          "description": "The exact name of the target sheet where the copied range will be pasted. Case-sensitive as per sheet tab name."
+        },
+        "target_start_cell": {
+          "type": "string",
+          "description": "The destination top-left cell in the target sheet, given in A1 notation (e.g., 'E5')."
+        }
+      }
+    },
+    {
+      "name": "format_numbers_to_human_readable",
+      "description": "Convert all numeric values in a given range into human-readable strings using 'M' for millions and 'B' for billions, rounded to one decimal place using half-up rounding. Non-numeric cells will be ignored.",
+      "params": {
+        "cell_range": {
+          "type": "string",
+          "description": "A1-style range (e.g., 'B2:D10') within the current active sheet to format."
+        }
+      }
+    },
+    {
+      "name": "auto_fill_down",
+      "description": "Perform an Excel-like autofill down operation in the current sheet. The filled values will either repeat a detected pattern (cyclic fill) or continue an arithmetic progression (simple series) if the starting range contains numbers in sequence.",
+      "params": {
+        "source_range": {
+          "type": "string",
+          "description": "The initial seed range (A1-style, e.g., 'A1:A3') to use for determining the autofill pattern. This is located in the current active sheet."
+        },
+        "rows_to_fill": {
+          "type": "integer",
+          "description": "The number of additional rows to fill downward, starting after the source_range's last row. Must be a positive integer."
+        }
+      }
+    }
+  ],
+  "libreoffice_impress": [
+    {
+      "name": "save",
+      "description": "Save the current presentation to its current location",
+      "params": {}
+    },
+    {
+      "name": "go_to_slide",
+      "description": "Navigates to a specific slide in the presentation based on its index.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to navigate to (1-based indexing)"
+        }
+      }
+    },
+    {
+      "name": "get_slide_count",
+      "description": "Gets the total number of slides in the current presentation.",
+      "params": {}
+    },
+    {
+      "name": "set_slide_font",
+      "description": "Sets the font style for all text elements in a specific slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing)"
+        },
+        "font_name": {
+          "type": "string",
+          "description": "The name of the font to apply (e.g., 'Arial', 'Times New Roman', 'Calibri')"
+        }
+      }
+    },
+    {
+      "name": "write_text",
+      "description": "writes text to a specific textbox on a slide",
+      "params": {
+        "content": {
+          "type": "string",
+          "description": "The text content of the note to add"
+        },
+        "page_index": {
+          "type": "integer",
+          "description": "The index of the slide to add a note to (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        },
+        "bold": {
+          "type": "boolean",
+          "description": "Whether to make the text bold, default is false"
+        },
+        "italic": {
+          "type": "boolean",
+          "description": "Whether to make the text italic, default is false"
+        },
+        "size": {
+          "type": "integer",
+          "description": "The size of the text. If None, uses the box's current font size."
+        },
+        "append": {
+          "type": "boolean",
+          "description": "Whether to append the text, default is False. If you want to observe some formats(like a bullet at the beginning) or keep the original text, you should set up it."
+        }
+      }
+    },
+    {
+      "name": "set_style",
+      "description": "Sets the style properties for the specified textbox on a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        },
+        "bold": {
+          "type": "boolean",
+          "description": "Whether to make the title text bold"
+        },
+        "italic": {
+          "type": "boolean",
+          "description": "Whether to make the title text italic"
+        },
+        "underline": {
+          "type": "boolean",
+          "description": "Whether to underline the title text"
+        }
+      }
+    },
+    {
+      "name": "configure_auto_save",
+      "description": "Enables or disables auto-save functionality for the current document and sets the auto-save interval.",
+      "params": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether to enable (true) or disable (false) auto-save"
+        },
+        "interval_minutes": {
+          "type": "number",
+          "description": "The interval in minutes between auto-saves (minimum 1 minute)"
+        }
+      }
+    },
+    {
+      "name": "set_background_color",
+      "description": "Sets the background color for the specified textbox on a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide containing the textbox (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        },
+        "color": {
+          "type": "string",
+          "description": "The color to apply to the textbox (e.g., 'red', 'green', 'blue', 'yellow', or hex color code)"
+        }
+      }
+    },
+    {
+      "name": "set_text_color",
+      "description": "Sets the text color for the specified textbox on a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        },
+        "color": {
+          "type": "string",
+          "description": "The color to apply to the title text (e.g., 'red', 'green', 'blue', 'black', or hex color code)"
+        }
+      }
+    },
+    {
+      "name": "delete_content",
+      "description": "Deletes the specified textbox from a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        }
+      }
+    },
+    {
+      "name": "set_slide_orientation",
+      "description": "Changes the orientation of slides in the presentation between portrait (upright) and landscape (sideways).",
+      "params": {
+        "orientation": {
+          "type": "string",
+          "description": "The desired orientation for the slides",
+          "enum": [
+            "portrait",
+            "landscape"
+          ]
+        }
+      }
+    },
+    {
+      "name": "position_box",
+      "description": "Positions a textbox or image on a slide at a specific location or predefined position.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide containing the box (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the box to position (0-based indexing)"
+        },
+        "position": {
+          "type": "string",
+          "description": "Predefined position on the slide (left, right, center, top, bottom)",
+          "enum": [
+            "left",
+            "right",
+            "center",
+            "top",
+            "bottom",
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right"
+          ]
+        }
+      }
+    },
+    {
+      "name": "insert_file",
+      "description": "Inserts a video or audio file into the current or specified slide in the presentation.",
+      "params": {
+        "file_path": {
+          "type": "string",
+          "description": "The full path to the file to be inserted"
+        },
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to insert the file into (1-based indexing). If not provided, inserts into the current slide."
+        },
+        "position": {
+          "type": "object",
+          "description": "The position coordinates for the file",
+          "properties": {
+            "x": {
+              "type": "number",
+              "description": "The x-coordinate (horizontal position) as a percentage of slide width"
+            },
+            "y": {
+              "type": "number",
+              "description": "The y-coordinate (vertical position) as a percentage of slide height"
+            }
+          }
+        },
+        "size": {
+          "type": "object",
+          "description": "The size dimensions for the file",
+          "properties": {
+            "width": {
+              "type": "number",
+              "description": "The width as a percentage of slide width"
+            },
+            "height": {
+              "type": "number",
+              "description": "The height as a percentage of slide height"
+            }
+          }
+        },
+        "autoplay": {
+          "type": "boolean",
+          "description": "Whether the video or audio should automatically play when the slide is shown"
+        }
+      }
+    },
+    {
+      "name": "set_slide_background",
+      "description": "Sets the background color or image for a specific slide or all slides.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing). If not provided, applies to all slides."
+        },
+        "color": {
+          "type": "string",
+          "description": "The background color to apply (e.g., 'red', 'green', 'blue', or hex color code)"
+        },
+        "image_path": {
+          "type": "string",
+          "description": "Path to an image file to use as background. If provided, overrides color."
+        }
+      }
+    },
+    {
+      "name": "save_as",
+      "description": "Saves the current document to a specified location with a given filename.",
+      "params": {
+        "file_path": {
+          "type": "string",
+          "description": "The full path where the file should be saved, including the filename and extension"
+        },
+        "overwrite": {
+          "type": "boolean",
+          "description": "Whether to overwrite the file if it already exists (default: false)"
+        }
+      }
+    },
+    {
+      "name": "insert_image",
+      "description": "Inserts an image to a specific slide in the presentation.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to add the image to (1-based indexing)"
+        },
+        "image_path": {
+          "type": "string",
+          "description": "The full path to the image file to be added"
+        },
+        "width": {
+          "type": "number",
+          "description": "The width of the image in centimeters"
+        },
+        "height": {
+          "type": "number",
+          "description": "The height of the image in centimeters"
+        },
+        "position": {
+          "type": "object",
+          "description": "The position coordinates for the image",
+          "properties": {
+            "x": {
+              "type": "number",
+              "description": "The x-coordinate (horizontal position) as a percentage of slide width"
+            },
+            "y": {
+              "type": "number",
+              "description": "The y-coordinate (vertical position) as a percentage of slide height"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "set_text_strikethrough",
+      "description": "Applies or removes strike-through formatting to specific text content in a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide containing the text (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox containing the text (0-based indexing)"
+        },
+        "line_numbers": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          },
+          "description": "The line numbers to apply strike-through formatting to (1-based indexing)"
+        },
+        "apply": {
+          "type": "boolean",
+          "description": "Whether to apply (true) or remove (false) strike-through formatting"
+        }
+      }
+    },
+    {
+      "name": "set_textbox_alignment",
+      "description": "Sets the text alignment for the specified textbox on a slide.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to modify (1-based indexing)"
+        },
+        "box_index": {
+          "type": "integer",
+          "description": "The index of the textbox to modify (0-based indexing)"
+        },
+        "alignment": {
+          "type": "string",
+          "description": "The text alignment to apply to the title",
+          "enum": [
+            "left",
+            "center",
+            "right",
+            "justify"
+          ]
+        }
+      }
+    },
+    {
+      "name": "export_to_image",
+      "description": "Exports the current presentation or a specific slide to an image file format (PNG, JPEG, etc.).",
+      "params": {
+        "file_path": {
+          "type": "string",
+          "description": "The full path where the image file should be saved, including the filename and extension"
+        },
+        "format": {
+          "type": "string",
+          "description": "The image format to export to (e.g., 'png', 'jpeg', 'gif')",
+          "enum": [
+            "png",
+            "jpeg",
+            "jpg",
+            "gif",
+            "bmp",
+            "tiff"
+          ]
+        },
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the specific slide to export (1-based indexing). If not provided, exports the entire presentation as a series of images."
+        }
+      }
+    },
+    {
+      "name": "duplicate_slide",
+      "description": "Creates a duplicate of a specific slide and places it after a given position in the presentation.",
+      "params": {
+        "slide_index": {
+          "type": "integer",
+          "description": "The index of the slide to duplicate (1-based indexing)"
+        },
+        "target_position": {
+          "type": "integer",
+          "description": "The position (1-based index) after which the duplicated slide will be placed."
+        }
+      }
+    },
+    {
+      "name": "env_info",
+      "description": "Get the content of the specified pages. If no page indices are provided, returns the content of all pages. It should be called first to obtain the information before other tools that depend on the results are invoked.",
+      "params": {
+        "page_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "description": "Page index (1-based indexing, consistent with all other tools)."
+          },
+          "description": "List of page indices to retrieve. If null or omitted, all pages are returned."
+        }
+      }
+    }
+  ],
+  "libreoffice_impress2": [
+    {
+      "name": "convert_to_docx",
+      "description": "Reads the currently active LibreOffice/Apache OpenOffice Impress document, transfers all text slide-by-slide into a new Writer document, and optionally saves it as a .docx file.",
+      "params": {
+        "output_path": {
+          "type": "string",
+          "description": "Absolute or relative path (including the .docx filename) where the resulting document should be saved. If omitted, the Writer document will remain open in memory without being stored to disk."
+        }
+      }
+    }
+  ],
+  "libreoffice_writer": [
+    {
+      "name": "save",
+      "description": "Save the current document to its current location",
+      "params": {}
+    },
+    {
+      "name": "write_text",
+      "description": "Write text at the current cursor position in the document.",
+      "params": {
+        "text": {
+          "type": "string",
+          "description": "The text to write at the current cursor position."
+        },
+        "bold": {
+          "type": "boolean",
+          "description": "Optional. Whether to write the text in bold."
+        },
+        "italic": {
+          "type": "boolean",
+          "description": "Optional. Whether to write the text in italic."
+        },
+        "size": {
+          "type": "number",
+          "description": "Optional. The size of the text."
+        }
+      }
+    },
+    {
+      "name": "set_color",
+      "description": "Changes the color of matched text in the document for specified paragraphs. NOTE: If the task only requires coloring text within a specific region (e.g., only inside a table, or only in the body), you MUST specify paragraph_indices to limit the scope. If paragraph_indices is not provided, the color change applies to ALL paragraphs in the document, which may produce unintended results.",
+      "params": {
+        "pattern": {
+          "type": "string",
+          "description": "The pattern to match in the document, should be a regular expression"
+        },
+        "color": {
+          "type": "number",
+          "description": "The color to apply, should be a hex color code, like 0x000000 for black"
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs. Use env_info() first to identify the correct paragraph indices for your target region (e.g., table rows, specific sections), then pass those indices here to avoid unintentionally modifying content outside the target region.",
+          "items": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "name": "find_and_replace",
+      "description": "Finds all occurrences of a specified text pattern and replaces them with another text in the document.",
+      "params": {
+        "pattern": {
+          "type": "string",
+          "description": "The pattern to match in the document, should be a regular expression"
+        },
+        "replacement": {
+          "type": "string",
+          "description": "The text to replace the found text with."
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs."
+        }
+      }
+    },
+    {
+      "name": "set_font",
+      "description": "Changes the font of text in the document or specified paragraphs.",
+      "params": {
+        "font_name": {
+          "type": "string",
+          "description": "The name of the font to apply (e.g., 'Times New Roman', 'Arial', 'Calibri')"
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs."
+        }
+      }
+    },
+    {
+      "name": "set_line_spacing",
+      "description": "Sets the line spacing for specified paragraphs in the document.",
+      "params": {
+        "spacing_value": {
+          "type": "number",
+          "description": "The line spacing value to apply (1.0 for single spacing, 2.0 for double spacing, etc.)."
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs."
+        }
+      }
+    },
+    {
+      "name": "insert_formula_at_cursor",
+      "description": "Inserts a formula at the current cursor position in the document.",
+      "params": {
+        "formula": {
+          "type": "string",
+          "description": "The formula to insert at the current cursor position."
+        }
+      }
+    },
+    {
+      "name": "insert_image_at_cursor",
+      "description": "Inserts an image at the current cursor position in the document.",
+      "params": {
+        "image_path": {
+          "type": "string",
+          "description": "Full path to the image file to insert"
+        },
+        "width": {
+          "type": "integer",
+          "description": "Optional. Width to display the image in pixels. If not specified, uses the original image width."
+        },
+        "height": {
+          "type": "integer",
+          "description": "Optional. Height to display the image in pixels. If not specified, uses the original image height."
+        }
+      }
+    },
+    {
+      "name": "set_font_size",
+      "description": "Changes the font size of specified text in the document.",
+      "params": {
+        "font_size": {
+          "type": "number",
+          "description": "The font size to apply (in points)."
+        },
+        "pattern": {
+          "type": "string",
+          "description": "The pattern to match in the document, should be a regular expression"
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs."
+        }
+      }
+    },
+    {
+      "name": "export_to_pdf",
+      "description": "Exports the current document to PDF format.",
+      "params": {
+        "output_path": {
+          "type": "string",
+          "description": "Optional. The full path where the PDF should be saved. If not provided, uses the same location as the original document with .pdf extension."
+        },
+        "output_filename": {
+          "type": "string",
+          "description": "Optional. The filename to use for the PDF. If not provided, uses the original document's filename with .pdf extension."
+        },
+        "include_comments": {
+          "type": "boolean",
+          "description": "Optional. Whether to include comments in the exported PDF. Defaults to false."
+        },
+        "quality": {
+          "type": "string",
+          "description": "Optional. The quality of the PDF export ('standard', 'high', 'print'). Defaults to 'standard'."
+        }
+      }
+    },
+    {
+      "name": "set_paragraph_alignment",
+      "description": "Sets the text alignment for specified paragraphs in the document.",
+      "params": {
+        "alignment": {
+          "type": "string",
+          "description": "The alignment to apply ('left', 'center', 'right', 'justify')."
+        },
+        "paragraph_indices": {
+          "type": "array",
+          "description": "Optional. Indices of paragraphs to modify (0-based indexing). If not provided, applies to all paragraphs."
+        }
+      }
+    },
+    {
+      "name": "set_default_font",
+      "description": "Sets the default font for new text in the document without changing existing text.",
+      "params": {
+        "font_name": {
+          "type": "string",
+          "description": "The name of the font to set as default (e.g., 'Times New Roman', 'Arial', 'Calibri')"
+        },
+        "font_size": {
+          "type": "number",
+          "description": "Optional. The default font size in points."
+        }
+      }
+    },
+    {
+      "name": "add_page_numbers",
+      "description": "Adds page numbers to the document at the specified position.",
+      "params": {
+        "position": {
+          "type": "string",
+          "description": "Position of the page numbers ('bottom_left', 'bottom_center', 'bottom_right', 'top_left', 'top_center', 'top_right')"
+        },
+        "start_number": {
+          "type": "integer",
+          "description": "Optional. The starting page number. Defaults to 1."
+        },
+        "format": {
+          "type": "string",
+          "description": "Optional. Format of the page numbers (e.g., '1', 'Page 1', '1 of N'). Defaults to simple number format."
+        }
+      }
+    },
+    {
+      "name": "insert_page_break",
+      "description": "Inserts a page break at the current cursor position, creating a new blank page after the current one.",
+      "params": {
+        "position": {
+          "type": "string",
+          "description": "Optional. Specifies where to insert the page break: 'at_cursor' for current cursor position, 'end_of_document' for end of document. Defaults to 'at_cursor'."
+        }
+      }
+    },
+    {
+      "name": "env_info",
+      "description": "Retrieve all paragraphs, truncate each to at most 500 characters, and return them concatenated as a single formatted string. It should be called first to obtain the information before other tools that depend on the results are invoked.",
+      "params": {}
+    }
+  ],
+  "os": [
+    {
+      "name": "open_shell",
+      "description": "Open a new terminal directly.",
+      "params": {}
+    },
+    {
+      "name": "set_default_terminal_size",
+      "description": "Persists the given number of columns × rows as the default GNOME-Terminal window size using gsettings/dconf.",
+      "params": {
+        "columns": {
+          "type": "integer",
+          "description": "Number of text columns (width) to set as default"
+        },
+        "rows": {
+          "type": "integer",
+          "description": "Number of text rows (height) to set as default"
+        }
+      }
+    },
+    {
+      "name": "get_volume",
+      "description": "Returns the current output volume (percentage) of the default PulseAudio / PipeWire sink.",
+      "params": {}
+    },
+    {
+      "name": "set_volume",
+      "description": "Sets the output volume of the default PulseAudio / PipeWire sink to the desired percentage (0-100).",
+      "params": {
+        "percent": {
+          "type": "integer",
+          "description": "Desired volume percentage (0-150). Values above 100 boost the volume."
+        }
+      }
+    },
+    {
+      "name": "get_text_scale",
+      "description": "Returns the current GNOME text-scaling factor (1.0 = default size).",
+      "params": {}
+    },
+    {
+      "name": "change_text_scale",
+      "description": "Changes the text-scaling factor and returns the previous value so it can be restored later.",
+      "params": {
+        "new_scale": {
+          "type": "number",
+          "description": "Desired scaling factor (0.5–3.0)."
+        }
+      }
+    },
+    {
+      "name": "copy_matching_files_with_hierarchy",
+      "description": "Copies all files matching a pattern (default '*osworld.py') from the specified root directory to a destination directory, preserving the original directory hierarchy.",
+      "params": {
+        "root_dir": {
+          "type": "string",
+          "description": "Root directory to start searching from. Default: '.'"
+        },
+        "dest_dir": {
+          "type": "string",
+          "description": "Destination directory (relative to root_dir) where the files will be copied. Default: 'fails'"
+        },
+        "pattern": {
+          "type": "string",
+          "description": "Unix shell-style wildcard pattern used to match files. Default: '*failed.ipynb'"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "description": "If true, only list the copy operations without actually copying files. Default: false"
+        }
+      }
+    },
+    {
+      "name": "search_files",
+      "description": "Recursively search all files under the given folder whose names contain the provided keyword (case-insensitive). Returns a list of absolute paths.",
+      "params": {
+        "keyword": {
+          "type": "string",
+          "description": "Substring to look for (case-insensitive)."
+        },
+        "root_dir": {
+          "type": "string",
+          "description": "Root directory to start searching from. Default: '.'"
+        }
+      }
+    },
+    {
+      "name": "get_trash_directory",
+      "description": "Returns the absolute path to the user Trash 'files' directory (e.g. /home/user/.local/share/Trash/files).",
+      "params": {}
+    },
+    {
+      "name": "restore_file",
+      "description": "Restore the specified file from the user Trash back to its original location.",
+      "params": {
+        "file_name": {
+          "type": "string",
+          "description": "Exact file basename as it appears in ~/.local/share/Trash/files (e.g., 'holiday_poster.png')."
+        }
+      }
+    },
+    {
+      "name": "configure_auto_lock",
+      "description": "Configures the GNOME automatic-lock behaviour (idle timeout, lock enable/disable, additional delay).",
+      "params": {
+        "idle_delay_seconds": {
+          "type": "integer",
+          "description": "Time in seconds of inactivity before the screensaver starts (e.g. 300 for 5 min)."
+        },
+        "lock_delay_seconds": {
+          "type": "integer",
+          "description": "Additional delay in seconds before the screen locks after the screensaver becomes active.",
+          "default": 0
+        },
+        "enable_lock": {
+          "type": "boolean",
+          "description": "Whether the screen should lock (true) or just blank (false) after the idle delay.",
+          "default": true
+        }
+      }
+    },
+    {
+      "name": "rename_directory",
+      "description": "Safely renames a folder on the local filesystem.",
+      "params": {
+        "old_path": {
+          "type": "string",
+          "description": "Absolute or '~'-relative path of the directory to rename."
+        },
+        "new_path": {
+          "type": "string",
+          "description": "Absolute or '~'-relative path representing the new name/location."
+        },
+        "create_intermediate": {
+          "type": "boolean",
+          "description": "Whether to create the parent directory of `new_path` if it doesn’t exist (default: false)."
+        }
+      }
+    },
+    {
+      "name": "set_do_not_disturb",
+      "description": "Enable or disable the GNOME/Ubuntu Do Not Disturb mode (hide/show notification banners).",
+      "params": {
+        "enable": {
+          "type": "boolean",
+          "description": "True  -> turn ON Do Not Disturb (hide banners). False -> turn OFF Do Not Disturb (show banners)."
+        }
+      }
+    },
+    {
+      "name": "get_do_not_disturb_status",
+      "description": "Returns the current Do Not Disturb state (true = ON, false = OFF, null = unknown).",
+      "params": {}
+    },
+    {
+      "name": "remove_image_background",
+      "description": "Remove the background of an input image and save a new image file with transparency. Works best with PNG output for preserving transparency.",
+      "params": {
+        "image_path": {
+          "type": "string",
+          "description": "Absolute or relative path to the local source image file. Supported formats include PNG, JPG, and others."
+        },
+        "output_path": {
+          "type": "string",
+          "description": "Absolute or relative path where the background-removed image will be saved. Recommended to use PNG to retain transparency (e.g., './output/clean.png')."
+        }
+      }
+    },
+    {
+      "name": "convert_image_format",
+      "description": "Convert an input image file to a specified format (PNG, JPG, or PDF). Optionally flattens transparency for JPG output to avoid format incompatibility.",
+      "params": {
+        "image_path": {
+          "type": "string",
+          "description": "Absolute or relative path to the local source image file to be converted."
+        },
+        "output_format": {
+          "type": "string",
+          "enum": [
+            "png",
+            "jpg",
+            "pdf"
+          ],
+          "description": "Desired output format. Valid values are: 'png', 'jpg', or 'pdf'. Case-insensitive but should be provided in lowercase for consistency."
+        },
+        "output_path": {
+          "type": "string",
+          "description": "Path where the converted file will be saved, including file name and extension matching the output_format."
+        }
+      }
+    },
+    {
+      "name": "git_operation",
+      "description": "Execute a git command (clone, add, commit, pull, push, etc.) on a given repository path. For 'clone' operation, repo_path can be the target folder.",
+      "params": {
+        "repo_path": {
+          "type": "string",
+          "description": "Path to a local git repository. For 'clone', this is the destination folder path (can be omitted for clone into current working directory)."
+        },
+        "operation": {
+          "type": "string",
+          "description": "The git subcommand to run, e.g., 'clone', 'add', 'commit', 'pull', 'push'."
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional arguments for the git command. For example: for commit: ['-m', 'Commit message']."
+        }
+      }
+    },
+    {
+      "name": "ffmpeg_video_to_gif",
+      "description": "Use ffmpeg to extract a portion of a video file and save it as an animated GIF. Requires ffmpeg to be installed on the system.",
+      "params": {
+        "video_path": {
+          "type": "string",
+          "description": "Absolute or relative path to the video file."
+        },
+        "start_time": {
+          "type": "string",
+          "description": "Start time of the clip. Can be 'HH:MM:SS' format or seconds as a number string, e.g., '00:01:05' or '65'."
+        },
+        "duration": {
+          "type": "string",
+          "description": "Duration of the GIF content. Can be 'HH:MM:SS' format or seconds as a number string, e.g., '00:00:10' or '10'."
+        },
+        "output_path": {
+          "type": "string",
+          "description": "Output path and filename for the GIF file, e.g., './output/clip.gif'."
+        }
+      }
+    },
+    {
+      "name": "git_set_user_info",
+      "description": "Configure git user.name and user.email, either globally or for a specific local repository.",
+      "params": {
+        "username": {
+          "type": "string",
+          "description": "The git username to set (git config user.name)."
+        },
+        "email": {
+          "type": "string",
+          "description": "The git email to set (git config user.email)."
+        },
+        "repo_path": {
+          "type": "string",
+          "description": "Optional path to a git repository. If omitted and is_global is False, current working directory is used."
+        },
+        "is_global": {
+          "type": "boolean",
+          "description": "Whether to set username and email as global settings for all repositories. If true, repo_path is ignored."
+        }
+      }
+    },
+    {
+      "name": "calculator",
+      "description": "Simple calculator.",
+      "params": {
+        "expression": {
+          "type": "string",
+          "description": "A single-line safe Python arithmetic expression to evaluate."
+        }
+      }
+    }
+  ],
+  "vlc": [
+    {
+      "name": "get_playlist",
+      "description": "Gets the current VLC playlist with track information including name, URI and duration.",
+      "params": {}
+    },
+    {
+      "name": "play",
+      "description": "Starts playing the current media in VLC player.",
+      "params": {}
+    },
+    {
+      "name": "pause",
+      "description": "Pauses the currently playing media in VLC player.",
+      "params": {}
+    },
+    {
+      "name": "next",
+      "description": "Switches to the next media item in the VLC playlist.",
+      "params": {}
+    },
+    {
+      "name": "previous",
+      "description": "Switches to the previous media item in the VLC playlist.",
+      "params": {}
+    },
+    {
+      "name": "add_to_playlist",
+      "description": "Adds a media file to the VLC playlist.",
+      "params": {
+        "uri": {
+          "type": "string",
+          "description": "The URI of the media file to add to the playlist, start with 'file://' or 'https://'"
+        }
+      }
+    },
+    {
+      "name": "get_current_time",
+      "description": "Gets the current playback time position of the playing media in seconds.",
+      "params": {}
+    },
+    {
+      "name": "get_media_duration",
+      "description": "Gets the total duration of the currently playing media file in seconds.",
+      "params": {}
+    },
+    {
+      "name": "toggle_fullscreen",
+      "description": "Toggles fullscreen mode for the currently playing video in the media player. If the video is not in fullscreen mode, it will be expanded to fill the entire screen. If it's already in fullscreen mode, it will return to windowed mode.",
+      "params": {
+        "enable": {
+          "type": "boolean",
+          "description": "Optional parameter to explicitly set fullscreen mode. If true, forces fullscreen mode. If false, exits fullscreen mode. If not provided, the current state is toggled."
+        }
+      }
+    },
+    {
+      "name": "get_settings",
+      "description": "Gets the current settings of the VLC player.",
+      "params": {}
+    },
+    {
+      "name": "set_settings",
+      "description": "Sets the settings for the VLC player.",
+      "params": {
+        "field": {
+          "type": "string",
+          "description": "The name of the setting to set. i.e. input-record-path: the path to the recording folder, qt-bgcone: disable/enable splash cone icon (in 0/1), qt-max-volume: set max volume (in number), qt-minimal-view: hide/show bottom toolbar (in 0/1), global-key-play-pause: disable/enable play&pause key (in 0/1)"
+        },
+        "value": {
+          "type": "string",
+          "description": "The value to set for the specified setting, set 0/1 for boolean values"
+        }
+      }
+    },
+    {
+      "name": "get_media_files",
+      "description": "Gets the media files for the specified path.",
+      "params": {
+        "path": {
+          "type": "string",
+          "description": "The path to the media files"
+        },
+        "suffix": {
+          "type": "array",
+          "description": "The suffix of the media files, default is ['mp4', 'avi', 'mkv', 'mov', 'mp3', 'm4a', 'wav']"
+        }
+      }
+    }
+  ]
+}

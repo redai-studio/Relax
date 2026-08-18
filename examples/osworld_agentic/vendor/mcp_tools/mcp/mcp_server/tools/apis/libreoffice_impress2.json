@@ -1,0 +1,19 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "PresentationToolsUNO.convert_to_docx",
+      "description": "Reads the currently active LibreOffice/Apache OpenOffice Impress document, transfers all text slide-by-slide into a new Writer document, and optionally saves it as a .docx file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "output_path": {
+            "type": "string",
+            "description": "Absolute or relative path (including the .docx filename) where the resulting document should be saved. If omitted, the Writer document will remain open in memory without being stored to disk."
+          }
+        },
+        "required": []
+      }
+    }
+  }
+]
