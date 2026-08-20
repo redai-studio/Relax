@@ -348,6 +348,21 @@ class TestPrefetchBuffer:
             release_background.set()
             buffer.stop()
 
+    def test_wait_for_returns_false_when_no_thread_started(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        buffer = PrefetchBuffer(lambda idx: f"sample-{idx}", chunk_size=1, max_cached=1, num_workers=1)
+        result = []
+
+        waiter = threading.Thread(target=lambda: result.append(buffer.wait_for(0, timeout=None)), daemon=True)
+        waiter.start()
+        try:
+            waiter.join(timeout=0.5)
+            assert not waiter.is_alive()
+            assert result == [False]
+        finally:
+            buffer.stop()
+
 
 class TestIndexManager:
     """Tests for IndexManager class."""

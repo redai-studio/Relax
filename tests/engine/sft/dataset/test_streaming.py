@@ -880,6 +880,61 @@ def test_streaming_dataset_async_prefetch_waits_without_foreground_fallback(tmp_
         ds.stop()
 
 
+def test_streaming_dataset_async_prefetch_reprimes_current_epoch_boundary_index(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {"messages": [{"role": "assistant", "content": "A"}]},
+            {"messages": [{"role": "assistant", "content": "B"}]},
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=None,
+        capacity=None,
+        prompt_key="messages",
+        seed=0,
+        prefetch_max_cached=0,
+    )
+    ds.shuffle(0)
+    ds.index_manager.position = len(ds.index_manager.indices)
+
+    class _FakePrefetch:
+        cache_size = 0
+        is_alive = True
+
+        def __init__(self) -> None:
+            self.index_orders: list[list[int]] = []
+
+        def set_index_order(self, indices: list[int]) -> None:
+            self.index_orders.append(list(indices))
+
+        def get_cached(self, idx: int, *, record_miss: bool = True):  # noqa: ARG002
+            return True, ProcessedSample(
+                tokens=torch.tensor([1], dtype=torch.long),
+                loss_mask=torch.tensor([1], dtype=torch.long),
+                total_length=1,
+                multimodal_train_inputs=None,
+                source_idx=idx,
+            )
+
+        def stop(self) -> None:
+            pass
+
+    prefetch = _FakePrefetch()
+    ds._prefetch = prefetch
+
+    try:
+        samples, crossed = asyncio.run(ds.get_batch_async(3))
+        assert crossed is True
+        assert len(prefetch.index_orders) == 2
+        assert [order[0] for order in prefetch.index_orders] == [samples[0].source_idx, samples[2].source_idx]
+    finally:
+        ds.stop()
+
+
 def test_streaming_dataset_async_prefetch_raises_when_worker_exits(tmp_path: Path):
     path = tmp_path / "train.jsonl"
     _write_jsonl(

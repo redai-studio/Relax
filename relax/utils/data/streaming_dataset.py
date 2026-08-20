@@ -611,7 +611,7 @@ class PrefetchBuffer:
         with self._cache_updated:
             while idx not in self._cache and not self._stop.is_set():
                 thread = self._thread
-                if thread is not None and not thread.is_alive():
+                if thread is None or not thread.is_alive():
                     break
                 if deadline is None:
                     self._cache_updated.wait()

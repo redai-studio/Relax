@@ -601,16 +601,16 @@ class SFTStreamingDataset:
         while len(samples) < n and attempts < max_attempts:
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             attempts += 1
-            if epoch_crossed and not crossed_epoch:
+            idx = indices[0]
+            if epoch_crossed:
                 crossed_epoch = True
-                remaining = self.index_manager.indices[self.index_manager.position :]
+                remaining = [idx, *self.index_manager.indices[self.index_manager.position :]]
                 assert self._prefetch is not None
-                self._prefetch.set_index_order(list(remaining))
+                self._prefetch.set_index_order(remaining)
                 logger.info(
                     f"SFTStreamingDataset: epoch boundary crossed, prefetch re-primed "
                     f"(epoch={self.index_manager.current_epoch}, remaining={len(remaining)})"
                 )
-            idx = indices[0]
             assert self._prefetch is not None
             sample = self._prefetch.get(idx)
             if sample is None:
@@ -639,15 +639,15 @@ class SFTStreamingDataset:
         while len(samples) < n and attempts < max_attempts:
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             attempts += 1
-            if epoch_crossed and not crossed_epoch:
+            idx = indices[0]
+            if epoch_crossed:
                 crossed_epoch = True
-                remaining = self.index_manager.indices[self.index_manager.position :]
-                self._prefetch.set_index_order(list(remaining))
+                remaining = [idx, *self.index_manager.indices[self.index_manager.position :]]
+                self._prefetch.set_index_order(remaining)
                 logger.info(
                     f"SFTStreamingDataset: epoch boundary crossed, prefetch re-primed "
                     f"(epoch={self.index_manager.current_epoch}, remaining={len(remaining)})"
                 )
-            idx = indices[0]
             found, sample = self._prefetch.get_cached(idx)
             wait_started = time.monotonic()
             while not found:
