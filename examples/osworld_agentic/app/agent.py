@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
 from app.env_osworld import OSWorldEnv, StepObs, parse_mcp_action
 from app.hybrid_agent import (
     ContextLengthExceededError,
@@ -70,9 +69,7 @@ def _extract_task_config(session_input: dict[str, Any]) -> dict[str, Any]:
     meta = session_input.get("metadata") or {}
     if isinstance(meta.get("task_config"), dict):
         return meta["task_config"]
-    raise ValueError(
-        "session input contains no `task_config` — did prepare_data.py run?"
-    )
+    raise ValueError("session input contains no `task_config` — did prepare_data.py run?")
 
 
 async def _predict_one_step(
@@ -89,7 +86,10 @@ async def _predict_one_step(
         "tool_list": obs.tool_list,
     }
     return await asyncio.to_thread(
-        agent.predict, instruction, obs_dict, step_idx=step_idx,
+        agent.predict,
+        instruction,
+        obs_dict,
+        step_idx=step_idx,
     )
 
 
@@ -104,7 +104,7 @@ async def run_session(
 
     env = OSWorldEnv(
         task_config=task_config,
-        provider_name=config.get("provider_name", "docker"),
+        provider_name=config.get("provider_name", "nex"),
         snapshot_name=config.get("snapshot_name", "init_state"),
         screen_width=int(config.get("screen_width", 1920)),
         screen_height=int(config.get("screen_height", 1080)),
@@ -118,9 +118,7 @@ async def run_session(
         model=os.environ.get("OPENAI_MODEL", "model"),
         max_steps=max_turns,
         max_image_history_length=int(config.get("max_image_history_length", 2)),
-        max_reward_image_history_length=int(
-            config.get("max_reward_image_history_length", 1)
-        ),
+        max_reward_image_history_length=int(config.get("max_reward_image_history_length", 1)),
         max_tokens=int(config.get("max_tokens", 4096)),
         top_p=float(config.get("top_p", 0.9)),
         temperature=float(config.get("temperature", 0.8)),
@@ -150,7 +148,10 @@ async def run_session(
         for step_idx in range(max_turns):
             try:
                 response, pyautogui_actions, info = await _predict_one_step(
-                    agent, instruction, obs, step_idx=step_idx,
+                    agent,
+                    instruction,
+                    obs,
+                    step_idx=step_idx,
                 )
             except SessionDiscardedError:
                 stop_reason = "discarded_by_pipeline"

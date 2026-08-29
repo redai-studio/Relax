@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """OSWorld environment adapter.
 
-Thin async facade over the vendored `desktop_env.DesktopEnv`:
-- Owns exactly one Docker VM (via `provider_name="docker"`) for the session.
+Thin async facade over the nex-OSWorld `desktop_env.DesktopEnv`:
+- Owns exactly one nex sandbox (via `provider_name="nex"`) for the session.
 - Runs blocking VM RPC calls in a worker thread so the asyncio event loop
   stays responsive.
 - Exposes primitives the session driver needs: `reset`, `exec_pyautogui`,
@@ -28,15 +28,24 @@ from typing import Any, Optional
 
 from PIL import Image
 
+
 # Make the vendored trees importable without polluting site-packages.
 _VENDOR_ROOT = Path(__file__).resolve().parent.parent / "vendor"
-for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "desktop_env", _VENDOR_ROOT / "mm_agents",
-           _VENDOR_ROOT / "mcp_tools", _VENDOR_ROOT / "agents"):
+for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "agents"):
     p_str = str(_p)
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
 
+# desktop_env is NOT vendored: it comes from the nex-enabled OSWorld checkout
+# (providers/nex + MCP-aware DesktopEnv). Appended so vendor mm_agents still wins.
+_OSWORLD_REPO = os.environ.get("OSWORLD_REPO", "")
+if not _OSWORLD_REPO:
+    raise RuntimeError("OSWORLD_REPO must point at the OSWorld-main-nex checkout")
+if _OSWORLD_REPO not in sys.path:
+    sys.path.append(_OSWORLD_REPO)
+
 from desktop_env.desktop_env import DesktopEnv  # noqa: E402
+
 
 logger = logging.getLogger("osworld_agentic.env")
 
@@ -44,6 +53,7 @@ logger = logging.getLogger("osworld_agentic.env")
 @dataclass
 class StepObs:
     """Post-step observation surfaced back to the agent driver."""
+
     screenshot_bytes: bytes
     cur_app: Optional[str] = None
     app_info: Optional[str] = None
@@ -60,7 +70,7 @@ class OSWorldEnv:
         self,
         *,
         task_config: dict[str, Any],
-        provider_name: str = "docker",
+        provider_name: str = "nex",
         snapshot_name: str = "init_state",
         screen_width: int = 1920,
         screen_height: int = 1080,
@@ -74,16 +84,15 @@ class OSWorldEnv:
         self.screen_size = (screen_width, screen_height)
         self.headless = headless
         self.require_a11y_tree = require_a11y_tree
-        self.cache_dir = cache_dir or os.environ.get(
-            "OSWORLD_CACHE_DIR", "/tmp/osworld_cache"
-        )
+        self.cache_dir = cache_dir or os.environ.get("OSWORLD_CACHE_DIR", "/tmp/osworld_cache")
         self._env: Optional[DesktopEnv] = None
         self._lock = asyncio.Lock()
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
     async def reset(self) -> StepObs:
-        """Boot the VM (first call) and reset it to the task's initial state."""
+        """Boot the VM (first call) and reset it to the task's initial
+        state."""
         async with self._lock:
             return await asyncio.to_thread(self._reset_sync)
 
@@ -99,6 +108,7 @@ class OSWorldEnv:
                 headless=self.headless,
                 require_a11y_tree=self.require_a11y_tree,
                 os_type="Ubuntu",
+                enable_proxy=True,
             )
         obs = self._env.reset(task_config=self.task_config)
         return self._pack_obs(obs, done=False, exec_ok=True, exec_result={})
@@ -201,13 +211,14 @@ class OSWorldEnv:
 
 
 def parse_mcp_action(action: str) -> Optional[tuple[str, dict[str, Any]]]:
-    """Parse ``MCP:<tool>:<json>`` produced by HybridAgentLocal into (name, params).
+    """Parse ``MCP:<tool>:<json>`` produced by HybridAgentLocal into (name,
+    params).
 
     Returns ``None`` if the string is not an MCP action.
     """
     if not isinstance(action, str) or not action.startswith("MCP:"):
         return None
-    body = action[len("MCP:"):]
+    body = action[len("MCP:") :]
     tool, _, arg_json = body.partition(":")
     try:
         params = json.loads(arg_json) if arg_json else {}

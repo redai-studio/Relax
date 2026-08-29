@@ -12,7 +12,6 @@
 #   1. Convert data:   python3 examples/osworld_agentic/scripts/prepare_data.py \
 #                        --input-dir /path/to/evaluation_examples \
 #                        --output-dir ${DATA_DIR}/osworld/data
-#   2. Stage the VM:   bash examples/osworld_agentic/scripts/prepare_vm.sh
 #   3. Set env vars:   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
 #                      SAVE_DIR=/path/to/save bash $0
 
@@ -65,6 +64,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF
   "env_vars": {
     "OSWORLD_CONFIG_PATH": "${SCRIPT_DIR}/app/osworld_config.yaml",
     "OSWORLD_CACHE_DIR": "${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}",
+    "OSWORLD_REPO": "${OSWORLD_REPO}",
     "OSWORLD_MCP_BONUS": "${OSWORLD_MCP_BONUS:-0}",
     "OPENAI_MODEL": "Qwen3-VL-8B-Thinking"
   }
@@ -89,6 +89,7 @@ ROLLOUT_ARGS=(
         "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
         "OSWORLD_CONFIG_PATH=${SCRIPT_DIR}/app/osworld_config.yaml"
         "OSWORLD_CACHE_DIR=${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}"
+      "OSWORLD_REPO=${OSWORLD_REPO}"
         "OSWORLD_MCP_BONUS=${OSWORLD_MCP_BONUS:-0}"
         "OPENAI_MODEL=Qwen3-VL-8B-Thinking"
     # OSWorld sessions are long (up to 50 turns × ~5-15s each ≈ 5-15 min).

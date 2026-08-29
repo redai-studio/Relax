@@ -39,7 +39,7 @@ max_llm_call_retries: 3
 llm_call_backoff_s: 5
 
 # VM ─────────────────────────────────────────────────────────────────────────
-provider_name: docker
+provider_name: nex
 snapshot_name: init_state
 screen_width: 1920
 screen_height: 1080

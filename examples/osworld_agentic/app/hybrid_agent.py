@@ -23,20 +23,22 @@ from typing import Any
 
 import httpx
 
+
 _VENDOR_ROOT = Path(__file__).resolve().parent.parent / "vendor"
-for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "desktop_env", _VENDOR_ROOT / "mm_agents",
-           _VENDOR_ROOT / "mcp_tools", _VENDOR_ROOT / "agents"):
+for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "agents"):
     p_str = str(_p)
     if p_str not in sys.path:
         sys.path.insert(0, p_str)
 
 from mm_agents.hybrid_agent_local import HybridAgentLocal  # noqa: E402
 
+
 logger = logging.getLogger("osworld_agentic.hybrid_agent")
 
 
 class SessionDiscardedError(RuntimeError):
-    """Relax pipeline dropped this session mid-flight (sync-mode tail discard)."""
+    """Relax pipeline dropped this session mid-flight (sync-mode tail
+    discard)."""
 
 
 class ContextLengthExceededError(RuntimeError):
@@ -73,15 +75,13 @@ class RelaxHybridAgent(HybridAgentLocal):
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
         if not base_url:
-            raise RuntimeError(
-                "OPENAI_BASE_URL is not set. run_agent_app.sh should export "
-                "it from RELAX_BASE_URL."
-            )
+            raise RuntimeError("OPENAI_BASE_URL is not set. run_agent_app.sh should export it from RELAX_BASE_URL.")
         self._base_url = base_url
         self._api_key = os.environ.get("OPENAI_API_KEY", "")
 
     def call_llm(self, payload: dict[str, Any], model: str) -> str:  # noqa: D401
-        """Send `payload` to Relax's chat completions endpoint and return content."""
+        """Send `payload` to Relax's chat completions endpoint and return
+        content."""
         url = f"{self._base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -100,14 +100,18 @@ class RelaxHybridAgent(HybridAgentLocal):
         for attempt in range(self._max_llm_call_retries):
             try:
                 resp = httpx.post(
-                    url, headers=headers, json=payload,
+                    url,
+                    headers=headers,
+                    json=payload,
                     timeout=self._llm_call_timeout_s,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = f"transport: {exc}"
                 logger.warning(
                     "call_llm attempt %d/%d transport error: %s",
-                    attempt + 1, self._max_llm_call_retries, exc,
+                    attempt + 1,
+                    self._max_llm_call_retries,
+                    exc,
                 )
                 time.sleep(self._backoff_seconds)
                 continue
@@ -117,8 +121,7 @@ class RelaxHybridAgent(HybridAgentLocal):
                 # generic 400 (transient / retry). Relax reports the former via
                 # `{"error": {"code": "context_length_exceeded"}}`; fall back on
                 # substring match for older service versions.
-                if self._is_error_code(resp, "context_length_exceeded") \
-                        or "context length" in resp.text.lower():
+                if self._is_error_code(resp, "context_length_exceeded") or "context length" in resp.text.lower():
                     raise ContextLengthExceededError(resp.text[:400])
 
             if resp.status_code == 404 and self._is_error_code(resp, "session_discarded"):
@@ -130,7 +133,9 @@ class RelaxHybridAgent(HybridAgentLocal):
                 last_error = f"HTTP {resp.status_code}: {resp.text[:400]}"
                 logger.warning(
                     "call_llm attempt %d/%d bad status: %s",
-                    attempt + 1, self._max_llm_call_retries, last_error,
+                    attempt + 1,
+                    self._max_llm_call_retries,
+                    last_error,
                 )
                 time.sleep(self._backoff_seconds)
                 continue
@@ -146,21 +151,21 @@ class RelaxHybridAgent(HybridAgentLocal):
                 self._output_toks_per_step.append(int(usage.get("completion_tokens", 0)))
                 if finish_reason not in ("stop", "length"):
                     logger.info(
-                        "call_llm finish_reason=%s (accepting content)", finish_reason,
+                        "call_llm finish_reason=%s (accepting content)",
+                        finish_reason,
                     )
                 return content
 
             last_error = f"empty content (finish_reason={finish_reason})"
             logger.warning(
                 "call_llm attempt %d/%d %s",
-                attempt + 1, self._max_llm_call_retries, last_error,
+                attempt + 1,
+                self._max_llm_call_retries,
+                last_error,
             )
             time.sleep(self._backoff_seconds)
 
-        raise RuntimeError(
-            f"call_llm failed after {self._max_llm_call_retries} attempts to {url}: "
-            f"{last_error}"
-        )
+        raise RuntimeError(f"call_llm failed after {self._max_llm_call_retries} attempts to {url}: {last_error}")
 
     @staticmethod
     def _is_error_code(resp: httpx.Response, code: str) -> bool:

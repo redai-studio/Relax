@@ -6,6 +6,9 @@
 
 ______________________________________________________________________
 
+> 接 nex sandbox 后, 原第 5 条 (docker 冷启动风暴) 和第 8 条 (qcow2 缓存被 /tmp 清掉)
+> 已经不存在, 直接删掉了; 其余编号保持不变, 方便对照上游文档。
+
 ## 1. `RELAX_BASE_URL` 末尾斜杠 → 404
 
 **症状**：session 干净启动、又干净退出，reward=0，
@@ -46,8 +49,7 @@ ______________________________________________________________________
 "启动 X 脚本但堆栈显示用了 Y adapter" 之类的错配。
 
 **根因**：`relax/utils/arguments.py` 的 `--agent-env` 用 `nargs="+"`，不是
-`action="append"`。argparse 默认行为是**后值覆盖前值**——多次 `--agent-env
-"K=v"` 只有最后一次生效，前面的全被静默丢弃。
+`action="append"`。argparse 默认行为是**后值覆盖前值**——多次 `--agent-env "K=v"` 只有最后一次生效，前面的全被静默丢弃。
 
 **做法**：所有 KV 必须放在**同一个** `--agent-env` flag 后面：
 
@@ -83,22 +85,6 @@ engine 数**才能均匀（生日悖论）。
 
 ______________________________________________________________________
 
-## 5. Session 冷启动风暴 → `--agentic-prepare-pool-size`
-
-**症状**：rollout 0 时刻 Docker daemon CPU 100%、大量 container 同时
-`docker run`，前几十秒每个 session 都 timeout。
-
-**根因**：OSWorld 每个 session 都要新起一个 QEMU 容器 + 挂 qcow2 + 等 VM
-guest 就绪，冷启动 30–40s。若 Relax 一次性把整批 session 全放出去，Docker /
-KVM 会同时被踩爆。
-
-**做法**：`--agentic-prepare-pool-size N`（当前默认 8）把并发准备数量夹
-住。N 具体取值看 host 上 CPU + Docker daemon 承受能力：8–16 是 8 卡机的
-经验区间。生产真的 100+ 并发的话建议加大 qcow2 拷贝到 tmpfs（见
-`scripts/prepare_vm.sh` 的 `OSWORLD_STAGE_TMPFS=1`）。
-
-______________________________________________________________________
-
 ## 6. 长任务和 SIGTERM 僵尸
 
 **症状**：`prepare_gate_blocked_ir_count` 一路涨，rollout 卡在 248/256 之
@@ -126,26 +112,13 @@ ______________________________________________________________________
 
 ## 7. 用 `tee` 做 per-session 日志会累积僵尸
 
-**症状**：跑到几百个 session 后 host 上 PID 用尽 / `fork: retry: Resource
-temporarily unavailable`。
+**症状**：跑到几百个 session 后 host 上 PID 用尽 / `fork: retry: Resource temporarily unavailable`。
 
 **根因**：`tee` 在进程替换里创建的 tee 子进程，session 主进程退出后 tee
 不一定被回收；OSWorld 用的容器 PID 1 通常是 `sleep`，不会收养/reap 孤儿。
 
 **做法**：`run_agent_app.sh` 已强制用 `exec >> "$FILE" 2>&1`（纯
 append），千万别改回 `2>&1 | tee -a`。
-
-______________________________________________________________________
-
-## 8. VM cache 位置：`/tmp` 会被清
-
-**症状**：训练跑了一两天，再次启动时 qcow2 消失、每个 session 都在重新
-下载。
-
-**根因**：`/tmp` 在多数 host 上有 tmpfs / systemd-tmpfiles 定期清理。
-
-**做法**：`OSWORLD_CACHE_DIR` 指到持久盘（比如 `${DATA_DIR}/osworld_cache`）
-或者 `/dev/shm/osworld`（后者需要显式 `OSWORLD_STAGE_TMPFS=1`）。
 
 ______________________________________________________________________
 
@@ -177,5 +150,19 @@ ______________________________________________________________________
    `agent_turns=1` = 客户端进 loop 但每次都退 = HybridAgentLocal 解析失败
    或 stop token 不对。
 3. `nvidia-smi`：只集中在某几张卡 → 坑 #4。
-4. `docker ps -a | grep osworld`：一堆 exited container 或 CPU 100% → 坑
-   #5，调小 pool size。
+4. 沙箱侧失败 (step 0 就挂): 查 `NEX_WORKSPACE_ID` / `NEX_API_KEY` / 配额,
+   以及 per-session 日志里 create sandbox 的报错。
+
+______________________________________________________________________
+
+## 10. 不要设置 http_proxy / https_proxy
+
+**症状**: `Setup step 1 failed: _download_setup - Upload failed with status 503`,
+沙箱建出来了但任务 setup 挂掉。
+
+**根因**: DesktopEnv 往 guest 传文件用的是 requests, 它会自动走环境里的
+`http_proxy`/`https_proxy`。guest 是 nex 内网地址, 走公司代理必然 503。
+
+**做法**: 只设 `download_proxy` (evaluator 拉 ground-truth 用, DesktopEnv 内部单独读),
+不要 export `http_proxy`/`https_proxy`。如果因为装包临时开过代理, 跑之前先
+`unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`。

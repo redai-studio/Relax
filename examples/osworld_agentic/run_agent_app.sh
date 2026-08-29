@@ -44,13 +44,9 @@ if [ -n "${AGENT_DEBUG_LOG_DIR:-}" ]; then
 fi
 
 # Vendored trees live under vendor/; put them on PYTHONPATH so that the
-# `desktop_env` / `mm_agents` / `agents` / `mcp_tools` names resolve without
+# `mm_agents` / `agents` names resolve without
 # monkey-patching site-packages.
-export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/vendor:${SCRIPT_DIR}/vendor/desktop_env:${SCRIPT_DIR}/vendor/mm_agents:${SCRIPT_DIR}/vendor/mcp_tools:${SCRIPT_DIR}/vendor/agents:${PYTHONPATH:-}"
-
-# OSWorld's DesktopEnv boots a Docker container per session. The docker
-# provider itself talks to /var/run/docker.sock; the training launcher must
-# have granted this container access (or run rootful with a mounted socket).
+export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/vendor:${SCRIPT_DIR}/vendor/agents:${PYTHONPATH:-}"
 
 exec python -m app.agent \
     --input-json "${RELAX_INPUT_JSON}" \

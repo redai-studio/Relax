@@ -1,5 +1,10 @@
 # Vendor snapshot — hybrid-routing-agent
 
+> **本仓库不再 vendor `desktop_env`。** 它从 `$OSWORLD_REPO` 指向的 nex 版 OSWorld
+> checkout 导入 (providers/nex + MCP 版 DesktopEnv + guest 修复), 这样评测和 RL
+> 共用同一份环境代码。vendor/ 下只保留 `mm_agents` 与 `agents`。
+> 同时删除的还有 `vendor/mcp_tools` (guest 侧 MCP 载荷, 由 OSWorld 侧 MCP_SRC_ROOT 注入)。
+
 This directory vendors code from
 [`redai-infra/hybrid-routing-agent`](https://github.com/redai-infra/hybrid-routing-agent)
 so the OSWorld GUI+MCP recipe can be built on top of Relax's agentic stack
@@ -16,14 +21,14 @@ without git-submodule friction.
 
 ## What is vendored
 
-| Local path | Upstream path | Purpose |
-|---|---|---|
-| `vendor/desktop_env/` | `OSWorld-main/desktop_env/` | OSWorld VM controller + MCP-injection layer |
-| `vendor/mm_agents/` | `OSWorld-main/mm_agents/` | `hybrid_agent_local.py` (message array, tool_call parse, image history) |
-| `vendor/mcp_tools/` | `mcp_tools/` | MCP server + curated tool set, injected into the guest VM |
-| `vendor/agents/` | `agents/` | BM25 `ToolRetriever` (top-K MCP tool retrieval) |
-| `tools/tools_registry.json` | `tools/tools_registry.json` | Retriever corpus (tool name → doc string) |
-| `vendor/UPSTREAM_PATCHES.md` | `OSWorld-main/PATCHES.md` | Upstream's own diff record vs. `xlang-ai/OSWorld` |
+| Local path                   | Upstream path               | Purpose                                                                 |
+| ---------------------------- | --------------------------- | ----------------------------------------------------------------------- |
+| `vendor/desktop_env/`        | `OSWorld-main/desktop_env/` | OSWorld VM controller + MCP-injection layer                             |
+| `vendor/mm_agents/`          | `OSWorld-main/mm_agents/`   | `hybrid_agent_local.py` (message array, tool_call parse, image history) |
+| `vendor/mcp_tools/`          | `mcp_tools/`                | MCP server + curated tool set, injected into the guest VM               |
+| `vendor/agents/`             | `agents/`                   | BM25 `ToolRetriever` (top-K MCP tool retrieval)                         |
+| `tools/tools_registry.json`  | `tools/tools_registry.json` | Retriever corpus (tool name → doc string)                               |
+| `vendor/UPSTREAM_PATCHES.md` | `OSWorld-main/PATCHES.md`   | Upstream's own diff record vs. `xlang-ai/OSWorld`                       |
 
 ## What is NOT vendored
 
