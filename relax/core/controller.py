@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 import concurrent.futures
+import copy
 import os
 import threading
 import time
@@ -44,6 +45,7 @@ from relax.utils.s3_model_loader import (
     cleanup_s3_model_weights_from_shm,
     is_s3_uri,
     prepare_local_model,
+    read_s3_model_config,
     remove_stale_s3_model_caches,
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
@@ -88,6 +90,20 @@ class ServiceStartupPhase(str, Enum):
 def _uses_s3_model_prefetch(config: Namespace) -> bool:
     source = getattr(config, "model_source", None)
     return source is not None and is_s3_uri(source.uri)
+
+
+def _build_train_start_config(config: Namespace) -> Namespace:
+    start_config = copy.copy(config)
+    if not _uses_s3_model_prefetch(config):
+        return start_config
+    try:
+        start_config._model_source_config = read_s3_model_config(config)
+    except Exception as exc:
+        logger.warning(
+            "Unable to read remote model config for train START telemetry "
+            f"({type(exc).__name__}); continuing without it."
+        )
+    return start_config
 
 
 def _require_positive_timeout(value: float, env_name: str) -> float:
@@ -723,7 +739,7 @@ class Controller:
             roles_to_create.append((role, cls, num_gpus, data_source))
 
         self._maybe_resolve_num_rollout(roles_to_create)
-        relax_utils.report_train_start(self.config)
+        relax_utils.report_train_start(_build_train_start_config(self.config))
 
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)

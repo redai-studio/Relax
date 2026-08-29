@@ -52,6 +52,9 @@ _MANIFEST_VERSION = 1
 _CACHE_DIR_PATTERN = re.compile(rf"{_MARKER_PREFIX}_[0-9a-f]{{16}}")
 _CLEANUP_LOCK_TIMEOUT_SECONDS = 300.0
 _CLEANUP_LOCK_POLL_INTERVAL_SECONDS = 0.1
+_TELEMETRY_S3_CONNECT_TIMEOUT_SECONDS = 2.0
+_TELEMETRY_S3_READ_TIMEOUT_SECONDS = 3.0
+_TELEMETRY_S3_TOTAL_MAX_ATTEMPTS = 1
 
 
 def is_s3_uri(uri) -> bool:
@@ -138,7 +141,15 @@ def _safe_join(root: str, rel: str) -> str:
     return dest
 
 
-def _make_s3_client(*, endpoint, use_placeholder_credentials=False, use_path_style=False):
+def _make_s3_client(
+    *,
+    endpoint,
+    use_placeholder_credentials=False,
+    use_path_style=False,
+    connect_timeout=None,
+    read_timeout=None,
+    total_max_attempts=None,
+):
     import boto3
     from botocore.config import Config
 
@@ -147,6 +158,12 @@ def _make_s3_client(*, endpoint, use_placeholder_credentials=False, use_path_sty
         max_pool_connections=64,
         proxies={},  # Disable proxies for this client without mutating os.environ.
     )
+    if connect_timeout is not None:
+        config_kwargs["connect_timeout"] = connect_timeout
+    if read_timeout is not None:
+        config_kwargs["read_timeout"] = read_timeout
+    if total_max_attempts is not None:
+        config_kwargs["retries"] = {"total_max_attempts": total_max_attempts, "mode": "standard"}
     if use_path_style:
         config_kwargs["s3"] = {"addressing_style": "path"}
     client_kwargs = dict(endpoint_url=endpoint, config=Config(**config_kwargs))
@@ -591,6 +608,32 @@ def _resolve_endpoint(args) -> str | None:
     if endpoint is not None:
         return endpoint
     return os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+
+
+def read_s3_model_config(args) -> dict:
+    """Read only ``config.json`` using the resolved model source policy."""
+    source = getattr(args, "model_source", None)
+    if source is None or not is_s3_uri(source.uri):
+        raise ValueError("an S3 model source is required to read config.json")
+
+    bucket, prefix = _parse_s3_uri(source.uri)
+    cli = _make_s3_client(
+        endpoint=_resolve_endpoint(args),
+        use_placeholder_credentials=source.credential_mode == "placeholder",
+        use_path_style=source.addressing_style == "path",
+        connect_timeout=_TELEMETRY_S3_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=_TELEMETRY_S3_READ_TIMEOUT_SECONDS,
+        total_max_attempts=_TELEMETRY_S3_TOTAL_MAX_ATTEMPTS,
+    )
+    response = cli.get_object(Bucket=bucket, Key=_normalize_prefix(prefix) + "config.json")
+    body = response["Body"]
+    try:
+        model_config = json.loads(body.read())
+    finally:
+        body.close()
+    if not isinstance(model_config, Mapping):
+        raise ValueError(f"S3 model config.json must contain a JSON object, got {type(model_config).__name__}")
+    return dict(model_config)
 
 
 def _resolve_shm_root(args) -> str:

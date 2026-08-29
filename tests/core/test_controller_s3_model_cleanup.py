@@ -20,6 +20,52 @@ controller = load_controller_with_stubbed_dependencies("_test_controller_s3_mode
 ROLES = controller.ROLES
 
 
+def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"))
+    model_config = {"model_type": "qwen3", "hidden_size": 4096}
+    monkeypatch.setattr(controller, "read_s3_model_config", lambda args: model_config)
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert start_config._model_source_config is model_config
+    assert not hasattr(config, "_model_source_config")
+
+
+def test_train_start_config_fails_open_when_remote_config_is_unavailable(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"))
+    warnings = []
+    monkeypatch.setattr(
+        controller,
+        "read_s3_model_config",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("not found")),
+    )
+    monkeypatch.setattr(controller.logger, "warning", warnings.append)
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert not hasattr(start_config, "_model_source_config")
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0]
+    assert "not found" not in warnings[0]
+    assert "s3://" not in warnings[0]
+
+
+def test_train_start_config_does_not_read_local_model(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="/models/qwen3"))
+    monkeypatch.setattr(
+        controller,
+        "read_s3_model_config",
+        lambda _args: pytest.fail("local model must not use the S3 client"),
+    )
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert not hasattr(start_config, "_model_source_config")
+
+
 class _FakeCleanupTask:
     def __init__(self):
         self.node_ids = []

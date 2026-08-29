@@ -205,6 +205,77 @@ def test_pre_parse_cli_model_source_disabled(monkeypatch):
     assert _pre_parse_cli_model_source() is None
 
 
+def test_read_s3_model_config_uses_model_source_access_policy(monkeypatch):
+    class Body:
+        def __init__(self):
+            self.closed = False
+
+        def read(self):
+            return b'{"model_type": "qwen3", "hidden_size": 4096}'
+
+        def close(self):
+            self.closed = True
+
+    class Client:
+        def __init__(self):
+            self.body = Body()
+            self.request = None
+
+        def get_object(self, **kwargs):
+            self.request = kwargs
+            return {"Body": self.body}
+
+    client = Client()
+    client_options = {}
+
+    def make_client(**kwargs):
+        client_options.update(kwargs)
+        return client
+
+    monkeypatch.setattr(m, "_make_s3_client", make_client)
+    args = SimpleNamespace(
+        model_source=m.ModelSource(
+            "s3://bucket/models/qwen3",
+            "http://s3.example",
+            credential_mode="placeholder",
+            addressing_style="path",
+        )
+    )
+
+    assert m.read_s3_model_config(args) == {"model_type": "qwen3", "hidden_size": 4096}
+    assert client_options == {
+        "endpoint": "http://s3.example",
+        "use_placeholder_credentials": True,
+        "use_path_style": True,
+        "connect_timeout": 2.0,
+        "read_timeout": 3.0,
+        "total_max_attempts": 1,
+    }
+    assert client.request == {"Bucket": "bucket", "Key": "models/qwen3/config.json"}
+    assert client.body.closed
+
+
+def test_read_s3_model_config_rejects_non_mapping_json(monkeypatch):
+    class Body:
+        def read(self):
+            return b"[]"
+
+        def close(self):
+            self.closed = True
+
+    body = Body()
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **_kwargs: SimpleNamespace(get_object=lambda **_kwargs: {"Body": body}),
+    )
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/model/"))
+
+    with pytest.raises(ValueError, match="config.json must contain a JSON object"):
+        m.read_s3_model_config(args)
+    assert body.closed
+
+
 def test_s3_policy_dummy_does_not_affect_genrm():
     from relax.backends.sglang.sglang_engine import _compute_genrm_server_args
 
@@ -702,6 +773,26 @@ def test_make_s3_client_preserves_default_credentials_for_generic_s3(monkeypatch
 
     assert "aws_access_key_id" not in captured
     assert "aws_secret_access_key" not in captured
+    assert captured["config"].retries == {"max_attempts": 10, "mode": "standard"}
+
+
+def test_make_s3_client_applies_bounded_request_policy(monkeypatch):
+    import boto3
+
+    captured = {}
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: captured.update(kwargs) or object())
+
+    m._make_s3_client(
+        endpoint="http://s3.example",
+        connect_timeout=2.0,
+        read_timeout=3.0,
+        total_max_attempts=1,
+    )
+
+    config = captured["config"]
+    assert config.connect_timeout == 2.0
+    assert config.read_timeout == 3.0
+    assert config.retries == {"total_max_attempts": 1, "mode": "standard"}
 
 
 def _fake_s3(objects):
