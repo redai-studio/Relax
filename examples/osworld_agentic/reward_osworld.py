@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 # ── knobs (defaults match outcome_only_rl) ─────────────────────────────────
 
-DEFAULT_LENGTH_PENALTY = 0.05          # per turn, subtracted from reward
-DEFAULT_CAP_PENALTY_THRESHOLD_FRAC = 0.5   # fraction of max_turns to earn the bonus
+DEFAULT_LENGTH_PENALTY = 0.05  # per turn, subtracted from reward
+DEFAULT_CAP_PENALTY_THRESHOLD_FRAC = 0.5  # fraction of max_turns to earn the bonus
 DEFAULT_CAP_BONUS = 0.2
 DEFAULT_MAX_TURNS = 50
 
@@ -78,10 +78,7 @@ def _has_successful_mcp_call(sample: Sample) -> bool:
     if isinstance(action_types, list) and any(t == "mcp" for t in action_types):
         exec_oks = meta.get("action_exec_oks") or []
         if isinstance(exec_oks, list) and exec_oks:
-            return any(
-                bool(ok) and (t == "mcp")
-                for ok, t in zip(exec_oks, action_types)
-            )
+            return any(bool(ok) and (t == "mcp") for ok, t in zip(exec_oks, action_types))
         # Fallback: presence-only signal
         return True
     return False
@@ -91,10 +88,8 @@ def _shape(args: Any, sample: Sample) -> dict[str, float]:
     outcome = _outcome_from_sample(sample)
     turns = _turn_count(sample)
 
-    length_penalty_coeff = float(getattr(args, "osworld_length_penalty",
-                                         DEFAULT_LENGTH_PENALTY))
-    cap_threshold_frac = float(getattr(args, "osworld_cap_threshold_frac",
-                                       DEFAULT_CAP_PENALTY_THRESHOLD_FRAC))
+    length_penalty_coeff = float(getattr(args, "osworld_length_penalty", DEFAULT_LENGTH_PENALTY))
+    cap_threshold_frac = float(getattr(args, "osworld_cap_threshold_frac", DEFAULT_CAP_PENALTY_THRESHOLD_FRAC))
     cap_bonus = float(getattr(args, "osworld_cap_bonus", DEFAULT_CAP_BONUS))
     max_turns = int(getattr(args, "osworld_max_turns", DEFAULT_MAX_TURNS))
 

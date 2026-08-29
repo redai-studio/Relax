@@ -59,7 +59,8 @@ except Exception:
 
 
 def _discover_tasks(root: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
-    """Return {task_id: (path, task_config)} for every ``*.json`` under ``root``."""
+    """Return {task_id: (path, task_config)} for every ``*.json`` under
+    ``root``."""
     tasks: dict[str, tuple[Path, dict[str, Any]]] = {}
     for jf in root.rglob("*.json"):
         try:
@@ -82,7 +83,8 @@ def _discover_tasks(root: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
 
 
 def _read_manifest(path: Path) -> list[str]:
-    """A manifest is a plain text file, one task_id per line (# comments allowed)."""
+    """A manifest is a plain text file, one task_id per line (# comments
+    allowed)."""
     ids: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -128,21 +130,28 @@ def _select(
         rows.append(_build_row(tid, entry[1]))
     if missing:
         # Loud but non-fatal: recipes evolve and the manifest may lag.
-        logger.warning("manifest %s references %d unknown task_id(s): %s",
-                       manifest, len(missing), missing[:5])
+        logger.warning("manifest %s references %d unknown task_id(s): %s", manifest, len(missing), missing[:5])
     return rows
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--input-dir", type=Path, required=True,
-                   help="Path to OSWorld evaluation_examples directory (recursive scan).")
-    p.add_argument("--output-dir", type=Path, required=True,
-                   help="Where to write train.parquet / eval.parquet.")
-    p.add_argument("--train-manifest", type=Path, default=None,
-                   help="Optional text file listing training task_ids (one per line).")
-    p.add_argument("--eval-manifest", type=Path, default=None,
-                   help="Optional text file listing evaluation task_ids (one per line).")
+    p.add_argument(
+        "--input-dir", type=Path, required=True, help="Path to OSWorld evaluation_examples directory (recursive scan)."
+    )
+    p.add_argument("--output-dir", type=Path, required=True, help="Where to write train.parquet / eval.parquet.")
+    p.add_argument(
+        "--train-manifest",
+        type=Path,
+        default=None,
+        help="Optional text file listing training task_ids (one per line).",
+    )
+    p.add_argument(
+        "--eval-manifest",
+        type=Path,
+        default=None,
+        help="Optional text file listing evaluation task_ids (one per line).",
+    )
     return p.parse_args()
 
 

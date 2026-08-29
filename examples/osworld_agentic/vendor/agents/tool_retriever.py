@@ -1,5 +1,4 @@
-"""
-tool_retriever.py
+"""tool_retriever.py.
 
 RAG-based retrieval of the most relevant MCP tools for a given task.
 
@@ -25,6 +24,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+
 logger = logging.getLogger(__name__)
 
 REGISTRY_PATH = Path(__file__).parent.parent / "tools" / "tools_registry.json"
@@ -35,9 +35,9 @@ DEFAULT_TOP_K = 18
 # Public API
 # ─────────────────────────────────────────────
 
+
 class ToolRetriever:
-    """
-    Retrieve the most relevant MCP tools for a task description.
+    """Retrieve the most relevant MCP tools for a task description.
 
     Parameters
     ----------
@@ -77,8 +77,7 @@ class ToolRetriever:
         app_hint: Optional[str] = None,
         exclude_apps: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Return up to top_k tool schemas most relevant to *task_description*.
+        """Return up to top_k tool schemas most relevant to *task_description*.
 
         Parameters
         ----------
@@ -133,14 +132,15 @@ class ToolRetriever:
 
         logger.debug(
             "ToolRetriever: returned %d/%d tools for task=%r",
-            len(selected), len(candidates), task_description[:60],
+            len(selected),
+            len(candidates),
+            task_description[:60],
         )
         return selected
 
     def format_for_prompt(self, tools: List[Dict[str, Any]]) -> str:
-        """
-        Render a tool list as the compact text block injected into the policy prompt.
-        """
+        """Render a tool list as the compact text block injected into the
+        policy prompt."""
         lines: List[str] = ["Available MCP tools (use ACTION_TYPE: mcp to call):"]
         for i, t in enumerate(tools, 1):
             name = t.get("name", "")
@@ -148,8 +148,7 @@ class ToolRetriever:
             desc = t.get("description", "No description")
             params = t.get("params", {})
             param_str = ", ".join(
-                f"{k}: {v.get('type', 'any')}" if isinstance(v, dict) else f"{k}: any"
-                for k, v in params.items()
+                f"{k}: {v.get('type', 'any')}" if isinstance(v, dict) else f"{k}: any" for k, v in params.items()
             )
             lines.append(f"  {i:>3}. [{app}] {name}({param_str})")
             lines.append(f"       {desc}")
@@ -182,9 +181,7 @@ class ToolRetriever:
     # BM25 scorer
     # ------------------------------------------------------------------
 
-    def _score_bm25(
-        self, query: str, tools: List[Dict[str, Any]]
-    ) -> List[Tuple[float, Dict[str, Any]]]:
+    def _score_bm25(self, query: str, tools: List[Dict[str, Any]]) -> List[Tuple[float, Dict[str, Any]]]:
         """Simple BM25-ish TF-IDF scoring (no external library required)."""
         query_tokens = _tokenize(query)
         if not query_tokens:
@@ -227,23 +224,21 @@ class ToolRetriever:
     def _init_dense_encoder(self, model_name: str) -> None:
         try:
             from sentence_transformers import SentenceTransformer
+
             self._encoder = SentenceTransformer(model_name)
             # Pre-embed all tools
             texts = [_tool_text(t) for t in self._tools]
             self._tool_embeddings = self._encoder.encode(texts, convert_to_numpy=True)
             logger.info("Dense encoder initialised (%s)", model_name)
         except ImportError:
-            logger.warning(
-                "sentence-transformers not installed; falling back to BM25"
-            )
+            logger.warning("sentence-transformers not installed; falling back to BM25")
             self.backend = "bm25"
 
-    def _score_dense(
-        self, query: str, tools: List[Dict[str, Any]]
-    ) -> List[Tuple[float, Dict[str, Any]]]:
+    def _score_dense(self, query: str, tools: List[Dict[str, Any]]) -> List[Tuple[float, Dict[str, Any]]]:
         if self._encoder is None:
             return self._score_bm25(query, tools)
         import numpy as np
+
         q_emb = self._encoder.encode([query], convert_to_numpy=True)[0]
         scored = []
         for i, t in enumerate(tools):
@@ -251,9 +246,7 @@ class ToolRetriever:
             idx = self._tools.index(t) if t in self._tools else -1
             if idx >= 0:
                 emb = self._tool_embeddings[idx]
-                cos = float(
-                    np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-9)
-                )
+                cos = float(np.dot(q_emb, emb) / (np.linalg.norm(q_emb) * np.linalg.norm(emb) + 1e-9))
             else:
                 cos = 0.0
             scored.append((cos, t))
@@ -263,6 +256,7 @@ class ToolRetriever:
 # ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
+
 
 def _tool_text(tool: Dict[str, Any]) -> str:
     parts = [
