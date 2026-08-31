@@ -38,8 +38,23 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 FROM base as train
 
 RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.1 && \
+    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+
+# DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
+#   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
+#   - FlashMLA: fused DSA sparse attention; without it the CSA backward is quadratic in seq len
+#     (mcore only allows the fusion on SM90 when dsa_indexer_loss_coeff == 0)
+ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
+        git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
+    git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA && \
+    cd /opt/FlashMLA && git checkout ${FLASH_MLA_COMMIT} && \
+    git submodule update --init --recursive && \
+    MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd'), \
+        'flash_mla built but flash_mla_sparse_fwd missing'" && \
+    rm -rf /opt/FlashMLA
 
 # FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
 # window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
@@ -70,6 +85,7 @@ RUN MAX_JOBS=64 \
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
+    pip install megatron-energon fsspec==2024.3.1 --no-cache-dir&& \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
@@ -93,7 +109,7 @@ WORKDIR /root
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
 
-ARG MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
+ARG MEGATRON_BRIDGE_COMMIT=af17edf52c514c58c79cd291b04a9b42bc5c57f3
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
