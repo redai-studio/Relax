@@ -246,7 +246,6 @@ def _resolve_external_model_arch(package_name):
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
 
     # Each SGLang patch is controlled by its own env flag and applied
     # independently (see ``_launch_server_with_patches`` and
@@ -589,6 +588,7 @@ class SGLangEngine(RayActor):
 
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
+        server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         bootstrap_port = (
