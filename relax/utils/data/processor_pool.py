@@ -35,6 +35,7 @@ from relax.utils.data.processing_utils import (
     remap_mm_train_inputs,
 )
 from relax.utils.logging_utils import get_logger
+from relax.utils.multimodal.image_utils import resize_qwen_vl_extreme_aspect_ratio
 
 
 logger = get_logger(__name__)
@@ -49,6 +50,20 @@ def _init_worker(model_path: str, trust_remote_code: bool) -> None:
     global _worker_processor
     _worker_processor = load_processor(model_path, trust_remote_code=trust_remote_code)
     logger.info(f"ProcessorPool worker initialized (pid={os.getpid()})")
+
+
+def _is_qwen_vl_processor(processor: object) -> bool:
+    """Return whether ``processor`` uses a Transformers Qwen-VL image
+    processor."""
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        return False
+    for cls in type(image_processor).__mro__:
+        if cls.__module__.startswith(
+            ("transformers.models.qwen2_vl.", "transformers.models.qwen3_vl.")
+        ) and cls.__name__.startswith(("Qwen2VLImageProcessor", "Qwen3VLImageProcessor")):
+            return True
+    return False
 
 
 def prepare_mm_inputs_for_ipc(multimodal_inputs: dict) -> dict:
@@ -104,6 +119,16 @@ def process_sample_in_worker(
         restored = dict(multimodal_inputs)
         if images := restored.get("images"):
             restored["images"] = [Image.fromarray(arr) for arr in images]
+            if _is_qwen_vl_processor(_worker_processor):
+                resized_images = []
+                for image in restored["images"]:
+                    resized = resize_qwen_vl_extreme_aspect_ratio(image)
+                    if resized is not image:
+                        logger.warning(
+                            f"Qwen-VL image aspect ratio exceeded 200; resized from {image.size} to {resized.size}."
+                        )
+                    resized_images.append(resized)
+                restored["images"] = resized_images
         # Videos arrive as shared-memory torch.Tensors — usable directly by the processor.
         # Audio arrives as numpy arrays — usable directly by the processor.
 
