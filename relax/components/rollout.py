@@ -591,16 +591,30 @@ class Rollout(Base):
         can_update = await self._async_check_production_for_update_weight(step)
         if can_update:
             self._weight_update_ready.clear()
+            self.status = "paused"
             try:
-                self.status = "paused"
+                prepared = await self.rollout_manager.set_weight_updating.remote(True)
+                if prepared is False:
+                    raise HTTPException(status_code=503, detail="Elastic scale-in is draining")
                 await self.rollout_manager.health_monitoring_pause.remote()
-                await self.rollout_manager.set_weight_updating.remote(True)
+            except Exception:
+                rollback_succeeded = False
+                try:
+                    await self.rollout_manager.set_weight_updating.remote(False)
+                    rollback_succeeded = True
+                except Exception as rollback_error:
+                    self._logger.warning(
+                        "Failed to roll back a partial weight-update handshake: %s",
+                        rollback_error,
+                    )
+                if rollback_succeeded:
+                    self.status = "running"
+                raise
             finally:
-                # Always release the handshake gate: even if the remote calls
-                # above raise (e.g. RayActorError from a dead engine),
-                # end_update_weight must not block forever. The 500 still
-                # propagates to the actor, which already has graceful
-                # degradation (actor_fwd_only). _weight_update_ready only orders
+                # Always release the handshake gate if a remote call above
+                # raises, so a later end_update_weight cannot block forever.
+                # The error still propagates to the actor, which fails closed.
+                # _weight_update_ready only orders
                 # the can_do <-> end_update_weight handshake; it does not gate
                 # the real weight transfer, so setting it on the failure path
                 # cannot make an engine use wrong weights.

@@ -4,6 +4,7 @@
 
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -227,7 +228,17 @@ def create_test_manager(args=None, servers=None):
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}
-    manager._is_weight_updating = False
+    manager._engine_lifecycle_lock = threading.RLock()
+    manager._training_weight_updating = False
+    manager._scale_out_weight_updating = False
+    manager._next_engine_rank = max(
+        (
+            group.rank_offset + len(group.all_engines)
+            for srv in manager.servers.values()
+            for group in srv.engine_groups
+        ),
+        default=0,
+    )
 
     # Mock the distributed lock
     lock = MagicMock()

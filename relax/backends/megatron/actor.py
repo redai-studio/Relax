@@ -1835,22 +1835,39 @@ class MegatronTrainRayActor(TrainRayActor):
         # Default: both services healthy → update both
         rollout_only = False
         actor_fwd_only = False
+        process_group = get_gloo_group()
 
         # When true_on_policy_mode is enabled, actor_fwd is intentionally absent
         # (its log_probs are recomputed inline by the train forward). Force
         # rollout-only weight update and skip the actor_fwd HTTP probe.
         actor_fwd_absent = getattr(self.args, "true_on_policy_mode", False)
 
-        if dist.get_rank() == 0:
+        if dist.get_rank(process_group) == 0:
             # Check rollout service
             try:
                 rollout_serve_url = get_serve_url("rollout")
+                retry_deadline = None
                 while True:
+                    request_timeout = self.args.rollout_http_timeout
+                    if retry_deadline is not None:
+                        request_timeout = retry_deadline - time.monotonic()
+                        if request_timeout <= 0:
+                            raise requests.exceptions.Timeout("elastic scale-in fence did not clear")
                     response = requests.get(
                         f"{rollout_serve_url}/can_do_update_weight_for_async",
-                        timeout=self.args.rollout_http_timeout,
+                        timeout=request_timeout,
                     )
+                    if getattr(response, "status_code", 200) == 503:
+                        if retry_deadline is None:
+                            retry_deadline = time.monotonic() + max(float(self.args.rollout_http_timeout), 1.0)
+                        logger.warning("Elastic scale-in is draining; retrying before weight update.")
+                        time.sleep(min(1.0, max(0.0, retry_deadline - time.monotonic())))
+                        continue
                     response.raise_for_status()
+                    # A successful non-503 response means the scale-in fence
+                    # has cleared. Do not let an earlier draining deadline
+                    # bound the normal readiness polling below.
+                    retry_deadline = None
                     res = response.json()
                     if res:
                         response = requests.get(f"{rollout_serve_url}/recover_rollout_engines")
@@ -1890,7 +1907,7 @@ class MegatronTrainRayActor(TrainRayActor):
             dtype=torch.int32,
             device="cpu",
         )
-        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=process_group)
         rollout_only = bool(flags[0].item())
         actor_fwd_only = bool(flags[1].item())
 

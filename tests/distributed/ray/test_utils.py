@@ -16,6 +16,7 @@ from relax.utils.model_source import ModelSource
 
 try:
     from relax.distributed.ray.rollout import (
+        EngineGroupLifecycle,
         RolloutManager,
         ScaleOutRequest,
         ScaleOutStatus,
@@ -350,3 +351,28 @@ class TestRolloutServerProperties:
         srv.num_new_engines = 0
         assert g1.num_new_engines == 0
         assert g2.num_new_engines == 0
+
+    @pytest.mark.parametrize(
+        ("lifecycle_status", "expected_calls"),
+        [
+            (EngineGroupLifecycle.ACTIVE, 1),
+            (EngineGroupLifecycle.DRAINING, 0),
+            (EngineGroupLifecycle.REMOVING, 0),
+        ],
+    )
+    def test_recover_scaled_group_only_when_active(self, monkeypatch, lifecycle_status, expected_calls):
+        group = make_engine_group(is_scaled_out=True)
+        group.pg = (object(), [], [])
+        group.lifecycle_status = lifecycle_status
+        calls = []
+
+        def start_engines(port_cursors):
+            calls.append(port_cursors)
+            return [], port_cursors
+
+        monkeypatch.setattr(group, "start_engines", start_engines)
+        server = make_rollout_server(engine_groups=[group])
+
+        server.recover()
+
+        assert len(calls) == expected_calls
