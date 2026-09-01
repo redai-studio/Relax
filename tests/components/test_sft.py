@@ -212,6 +212,132 @@ def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
     assert _sft_train_partitions_in_flight(seen_partitions) == 1
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("task_type", "seq_cls"),
+        ("eval_size", 0.25),
+    ],
+)
+def test_sft_remote_batch_producer_falls_back_for_target_only_modes(monkeypatch, attribute, value):
+    from relax.components.sft import SFT
+
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: True)
+
+    args = _make_args(global_batch_size=4)
+    args.sft_async_prepack = True
+    setattr(args, attribute, value)
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft._logger_instance = MagicMock()
+
+    assert sft._should_use_remote_batch_producer() is False
+
+
+def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
+    from relax.components import sft as sft_module
+
+    call_order = []
+    fake_client = MagicMock()
+    fake_tokenizer = MagicMock()
+
+    def _prepare_model(config, *, completeness):
+        call_order.append("prepare")
+        assert completeness == "metadata"
+        config.hf_checkpoint = "/dev/shm/resolved-sft-model"
+
+    def _load_tokenizer(path, **kwargs):
+        call_order.append("tokenizer")
+        assert path == "/dev/shm/resolved-sft-model"
+        assert kwargs == {"trust_remote_code": True}
+        return fake_tokenizer
+
+    class _FakeIndexManager:
+        total_size = 4
+
+        def __init__(self):
+            self.current_epoch = -1
+            self.position = 0
+            self.indices = list(range(self.total_size))
+
+        def shuffle(self, epoch):
+            self.current_epoch = epoch
+            self.position = 0
+            self.indices = list(range(self.total_size))
+
+    fake_dataset = MagicMock()
+    fake_dataset.__len__ = MagicMock(return_value=4)
+    fake_dataset.index_manager = _FakeIndexManager()
+    fake_dataset._prefetch = None
+
+    monkeypatch.setattr(sft_module.tq, "init", MagicMock())
+    monkeypatch.setattr(sft_module.tq, "get_client", MagicMock(return_value=fake_client))
+    monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", _prepare_model)
+    monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", _load_tokenizer)
+    monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
+    monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
+    create_dataset = MagicMock(return_value=fake_dataset)
+    monkeypatch.setattr(sft_module, "_create_sft_train_dataset", create_dataset)
+
+    args = _make_args(global_batch_size=2)
+    producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
+    producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
+
+    state = producer.initialize(start_step=0)
+
+    assert call_order == ["prepare", "tokenizer"]
+    assert args.hf_checkpoint == "/dev/shm/resolved-sft-model"
+    assert state["train_size"] == 4
+    assert create_dataset.call_args.kwargs["task_type"] == "causal_lm"
+
+
+def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch):
+    from relax.components import sft as sft_module
+
+    class _FakeIndexManager:
+        total_size = 16
+
+        def __init__(self):
+            self.current_epoch = 0
+            self.position = 0
+            self.indices = list(range(self.total_size))
+
+        def shuffle(self, epoch):
+            if epoch != self.current_epoch:
+                self.current_epoch = epoch
+                self.position = 0
+                self.indices = list(range(self.total_size))
+
+    class _FakeDataset:
+        def __init__(self):
+            self.index_manager = _FakeIndexManager()
+            self._prefetch = MagicMock()
+
+        async def get_batch_async(self, batch_size):
+            start = self.index_manager.position
+            self.index_manager.position += batch_size
+            return [_make_processed(idx) for idx in range(start, start + batch_size)], False
+
+    monkeypatch.setattr(sft_module, "print_first_sample", MagicMock())
+    args = _make_args(global_batch_size=4)
+    producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
+    producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
+    producer._dataset = _FakeDataset()
+    producer._tokenizer = MagicMock()
+    producer.data_system_client = MagicMock()
+    producer.data_system_client.async_put = AsyncMock()
+    producer._train_size = 16
+
+    asyncio.run(producer.produce_partition(0, "sft_0_shard_0_of_2", 4, False))
+    producer._dataset._prefetch.set_index_order.assert_not_called()
+
+    asyncio.run(producer.produce_partition(1, "sft_1_shard_0_of_2", 4, False))
+    producer._dataset._prefetch.set_index_order.assert_called_once_with([4, 5])
+    assert producer.data_system_client.async_put.await_count == 2
+
+
 @pytest.mark.parametrize("returned_count", [0, 3])
 def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_count):
     from relax.components.sft import SFT

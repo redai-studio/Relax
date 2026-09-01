@@ -419,6 +419,11 @@ def post_process_env(args, env):
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
 
+    # Producer and consumer derive the same TransferQueue partition names from
+    # this value, so it must be identical in every Serve and Megatron actor.
+    if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
+        env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
+
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each
     # name is copied from the driver's os.environ; missing names are

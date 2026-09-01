@@ -7,9 +7,10 @@ These are the bits previously duplicated as ``_sft_*`` private functions in
 here keeps the dispatchers in those files to one-line calls.
 """
 
-import os
 import random
 from argparse import Namespace
+
+from relax.utils.env import Envs
 
 
 def resolve_sft_eval_split(total_size: int, eval_size: float | int | None) -> tuple[int, int]:
@@ -94,11 +95,7 @@ def sft_tq_num_shards(args: Namespace) -> int:
     """
     if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
         return 1
-    raw_value = os.environ.get("RELAX_SFT_TQ_SHARDS", "1")
-    try:
-        return max(1, int(raw_value))
-    except ValueError:
-        return 1
+    return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
 
 def sft_partition_ids(args: Namespace, step: int) -> list[str]:

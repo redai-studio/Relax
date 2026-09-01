@@ -653,6 +653,9 @@ class SFTStreamingDataset:
             while not found:
                 self._raise_if_failed()
                 if not self._prefetch.is_alive:
+                    found, sample = self._prefetch.get_cached(idx, record_miss=False)
+                    if found:
+                        break
                     raise RuntimeError(
                         f"SFTStreamingDataset: prefetch worker exited before sample idx={idx} was cached "
                         f"(cache_size={self._prefetch.cache_size})"
