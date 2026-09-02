@@ -429,7 +429,7 @@ SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetc
 这个变量本身不会开启 prepack。它仅在使用 `--loss-type sft --sft-async-prepack` 时生效，否则 Relax 只使用一个分区。Async prepack 还要求开启 `--per-rank-fetch`、至少允许两个 in-flight step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP=1，并使用 THD QKV 格式。
 :::
 
-当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；单 shard 仍使用原有的 `sft_K` 名称。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
+当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；原有的 `sft_K` 名称只会在 `N == 1` 时使用。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
 
 满足条件时，Relax 会为 train batch 启动 `N` 个远端 `_SFTBatchProducerActor`。配置的 `--sft-prefetch-num-workers` 会按每个 shard `ceil(workers / N)` 分配，且每个 shard 至少有一个 worker。Eval 仍由 coordinator 本地协调：`--eval-size` 会在每个远端 producer 内使用同一份确定性的 train/eval split，coordinator 负责渲染 holdout 样本（或 `--eval-prompt-data`）并在 eval interval 推送 `sft_eval_<step>_n<N>_<i>` 分区。
 
@@ -437,7 +437,7 @@ SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetc
 
 - Ray 未初始化。
 - 使用 `--task-type seq_cls`。
-- 设置了 `--custom-dataset-class-path`。
+- 设置了 `--custom-dataset-class` / `--custom-dataset-class-path`。
 - `--sft-oversize-strategy` 为 `skip` 或 `custom`，或者 `--sft-invalid-multimodal-strategy` 为 `skip`。
 
 本地 fallback 仍会把 batch 拆成 `N` 个 TransferQueue 分区，但不会创建 `N` 个远端 producer actor。日志出现 `SFT remote shard producer enabled: ... shards=N ...` 才表示 remote producer 并行已生效；fallback 路径会记录 `SFT remote shard producer disabled: ...` 及具体原因。

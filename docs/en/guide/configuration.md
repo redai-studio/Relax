@@ -429,7 +429,7 @@ The SFT producer uses its own `PrefetchBuffer` independent from the rollout data
 This variable does not enable prepacking. It is effective only with `--loss-type sft --sft-async-prepack`; otherwise Relax uses one partition. Async prepacking also requires `--per-rank-fetch`, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, VPP=1, and THD QKV format.
 :::
 
-With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; one shard keeps the existing `sft_K` name. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.
+With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; the existing `sft_K` name is used only when `N == 1`. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.
 
 When eligible, Relax starts `N` remote `_SFTBatchProducerActor` instances for train batches. The configured `--sft-prefetch-num-workers` is distributed as `ceil(workers / N)` per shard, with at least one worker per shard. Eval is still coordinated locally: `--eval-size` uses the same deterministic train/eval split inside every remote producer, while the coordinator renders the held-out samples (or `--eval-prompt-data`) and pushes `sft_eval_<step>_n<N>_<i>` partitions at eval intervals.
 
@@ -437,7 +437,7 @@ Remote train producers fall back to the local coordinator path in any of these c
 
 - Ray is not initialized.
 - `--task-type seq_cls` is used.
-- `--custom-dataset-class-path` is set.
+- `--custom-dataset-class` / `--custom-dataset-class-path` is set.
 - `--sft-oversize-strategy` is `skip` or `custom`, or `--sft-invalid-multimodal-strategy` is `skip`.
 
 The local fallback still splits the batch into `N` TransferQueue partitions, but it does not create `N` remote producer actors. Look for `SFT remote shard producer enabled: ... shards=N ...` to confirm that remote producer parallelism is active; fallback paths log `SFT remote shard producer disabled: ...` with the reason.

@@ -441,7 +441,7 @@ env_vars:
 
 使用 `N` 个 shard 时，`--global-batch-size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。例如 global batch size 为 32、DP size 为 8 时，本地 batch 为 4，因此可以设置 2 或 4 个 shard，不能设置 3 个。
 
-满足 remote 路径条件时，`N` 个 shard 会为 train batch 启动 `N` 个 Ray producer actor。Eval 可以同时开启：train shard 由远端 producer 生产，coordinator 负责渲染 eval split 或 eval prompt data，并在 eval interval 推送原有的 `sft_eval_<step>_n<N>_<i>` 分区。部分配置（包括序列分类、自定义数据集和允许跳过样本的过滤策略）会使用单个本地 producer，但仍然写入 `N` 个分区。因此，`RELAX_SFT_TQ_SHARDS=2` 并不一定表示有两个 producer actor。可以通过下面的日志确认 remote 路径是否真正启用：
+满足 remote 路径条件时，`N` 个 shard 会为 train batch 启动 `N` 个 Ray producer actor。Eval 可以同时开启：train shard 由远端 producer 生产，coordinator 负责渲染 eval split 或 eval prompt data，并在 eval interval 推送原有的 `sft_eval_<step>_n<N>_<i>` 分区。部分配置（包括序列分类、自定义数据集（`--custom-dataset-class` / `--custom-dataset-class-path`）和允许跳过样本的过滤策略）会使用单个本地 producer，但仍然写入 `N` 个分区。因此，`RELAX_SFT_TQ_SHARDS=2` 并不一定表示有两个 producer actor。可以通过下面的日志确认 remote 路径是否真正启用：
 
 ```text
 SFT remote shard producer enabled: ... shards=2 ...

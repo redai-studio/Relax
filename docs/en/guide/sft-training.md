@@ -441,7 +441,7 @@ Enable async prepacking in the training arguments as well:
 
 For `N` shards, both `--global-batch-size` and the per-DP-rank local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`. For example, with global batch size 32 and DP size 8, the local batch is 4, so 2 or 4 shards are valid but 3 is not.
 
-When the remote path is eligible, `N` shards launch `N` Ray producer actors for train batches. Eval can be enabled at the same time: train shards are produced remotely, while the coordinator renders the eval split or eval prompt data and pushes the usual `sft_eval_<step>_n<N>_<i>` partitions at eval intervals. Some configurations, including sequence classification, custom datasets, and skip-capable sample filtering, use one local producer that still writes `N` partitions. Therefore, `RELAX_SFT_TQ_SHARDS=2` does not always mean two producer actors. Confirm the remote path from this log:
+When the remote path is eligible, `N` shards launch `N` Ray producer actors for train batches. Eval can be enabled at the same time: train shards are produced remotely, while the coordinator renders the eval split or eval prompt data and pushes the usual `sft_eval_<step>_n<N>_<i>` partitions at eval intervals. Some configurations, including sequence classification, custom datasets (`--custom-dataset-class` / `--custom-dataset-class-path`), and skip-capable sample filtering, use one local producer that still writes `N` partitions. Therefore, `RELAX_SFT_TQ_SHARDS=2` does not always mean two producer actors. Confirm the remote path from this log:
 
 ```text
 SFT remote shard producer enabled: ... shards=2 ...
