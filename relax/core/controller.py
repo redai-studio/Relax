@@ -292,7 +292,12 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
-        if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
+        use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
+        if (
+            getattr(self.config, "fully_async", False)
+            and getattr(self.config, "use_dynamic_batch_size", False)
+            and not use_sft_prepack
+        ):
             sampler = IdentityWindowSampler(
                 dp_size=dp_size,
                 placement="streaming",

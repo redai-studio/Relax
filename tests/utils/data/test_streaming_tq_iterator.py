@@ -91,6 +91,57 @@ def test_streaming_tq_iterator_sampling_config_carries_window_quota(monkeypatch)
     assert "consumed_samples" not in config
 
 
+def test_get_data_from_transfer_queue_can_skip_per_rank_agreement(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    class _Meta:
+        size = 0
+
+    class _Client:
+        def get_meta(self, **kwargs):
+            return _Meta()
+
+    def fail_agreement(*args, **kwargs):
+        raise AssertionError("_agree_on_fetch should not run")
+
+    monkeypatch.setattr(stream_module, "_agree_on_fetch", fail_agreement)
+
+    data, meta = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=_Client(),
+        data_fields=["tokens"],
+        batch_size=1,
+        partition_id="partition",
+        task_name="task",
+        sampling_config={},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        synchronize_per_rank_fetch=False,
+    )
+
+    assert data is None
+    assert meta.size == 0
+
+
+def test_get_data_from_transfer_queue_rejects_disabled_agreement_without_per_rank_fetch(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="requires per_rank_fetch=True"):
+        stream_module.get_data_from_transfer_queue(
+            args=Namespace(),
+            tq_client=object(),
+            data_fields=["tokens"],
+            batch_size=1,
+            partition_id="partition",
+            task_name="task",
+            sampling_config={},
+            batch_index=0,
+            per_rank_fetch=False,
+            synchronize_per_rank_fetch=False,
+        )
+
+
 def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeypatch):
     """Regression for the fully-async DP-imbalance deadlock.
 

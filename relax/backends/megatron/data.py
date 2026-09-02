@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
-from collections.abc import Sequence
-from copy import deepcopy
+from collections.abc import Callable, Sequence
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +41,18 @@ logger = get_logger(__name__)
 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY = "rollout_mini_local_sample_counts"
 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY = "rollout_mini_global_sample_counts"
 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY = "rollout_mini_prompt_group_counts"
+
+
+class PrepackedBatch(dict):
+    """Marker dict for SFT micro-batches that have already gone through
+    ``get_batch`` on the prefetch worker.
+
+    ``get_batch`` short-circuits on ``isinstance(batch, PrepackedBatch)`` so
+    the second pass on the training thread only moves data to device without
+    re-doing CP splitting / packed-seq bookkeeping.
+    """
+
+    __slots__ = ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +284,7 @@ def get_batch(
     qkv_format: str = "thd",
     allgather_cp: bool = False,
     is_vl_model: bool = False,
+    pack_device: torch.device | None = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -311,7 +324,18 @@ def get_batch(
     else:
         batch, _ = next(data_iterator)
 
+    if isinstance(batch, PrepackedBatch):
+        return batch
+
+    if pack_device is not None:
+        for key, dtype in (("tokens", torch.long), ("loss_masks", torch.int)):
+            values = batch.get(key)
+            if values is not None:
+                batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
+
     use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
+    if use_dynamic_context_parallel and pack_device is not None and pack_device.type == "cpu":
+        raise ValueError("CPU prepacking does not support dynamic context parallelism.")
     if use_dynamic_context_parallel:
         # Pick this mb's CP size with the SAME per-GPU token budget the iterator was packed
         # with: forward-only iterators carry log_probs_max_tokens_per_gpu, the training
@@ -332,6 +356,7 @@ def get_batch(
         cp_rank = mpu.get_context_parallel_rank()
 
     tokens = batch["tokens"]
+    batch_device = pack_device or tokens[0].device
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
@@ -371,7 +396,7 @@ def get_batch(
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
-            device = device_utils.make_current_torch_device()
+            device = batch_device
 
             seqlens = torch.tensor([t.size(0) for t in tokens], dtype=torch.int32, device=device)
             seqlens_padded = (seqlens + align_size - 1) // align_size * align_size
@@ -420,9 +445,7 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(
-                cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
-            )
+            cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=batch_device)
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [
@@ -443,9 +466,7 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
-            cu_seqlens = (
-                torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
-            )
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=batch_device) * cp_size
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         packed_seq_params = PackedSeqParams(
@@ -602,7 +623,25 @@ def get_batch(
                 ]
 
     batch = move_tensors_to_device(batch, batch["tokens"].device)
+    if pack_device is not None:
+        batch = PrepackedBatch(batch)
     return batch
+
+
+def prepack_sft_micro_batch_cpu(args: Namespace, batch: RolloutBatch) -> PrepackedBatch:
+    """Build one complete SFT micro-batch on CPU for background prefetch."""
+    iterator = iter([(batch, None)])
+    packed = get_batch(
+        iterator,
+        ["tokens"],
+        args.data_pad_size_multiplier,
+        args.qkv_format,
+        args.allgather_cp,
+        getattr(args, "is_vl_model", False),
+        pack_device=torch.device("cpu"),
+    )
+    pinned = pin_tensors(packed)
+    return pinned if isinstance(pinned, PrepackedBatch) else PrepackedBatch(pinned)
 
 
 def gather_log_data(
@@ -887,10 +926,11 @@ def get_data_iterator(
             end = step_offsets[i + 1]
             num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
 
-        num_microbatches = torch.tensor(
+        required_num_microbatches = torch.tensor(
             num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
         )
-        dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        dist.all_reduce(required_num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        num_microbatches = required_num_microbatches
 
         if vpp_size > 1:
             # vpp requires the number of microbatches to be divisible by vpp_size
@@ -1071,7 +1111,7 @@ def log_rollout_data(
             stats = torch.tensor(
                 [max(total_lengths), -min(total_lengths)],
                 dtype=torch.int64,
-                device=loss_masks[0].device,
+                device=device_utils.make_current_torch_device(),
             )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=dp_group)
             log_dict["total_lengths/max"] = int(stats[0].item())
@@ -1222,17 +1262,65 @@ def sync_actor_critic_data(
     )
 
 
-def move_tensors_to_device(data, device):
+def _map_packed_seq_params(data: PackedSeqParams, map_value: Callable[[Any], Any]) -> PackedSeqParams:
+    mapped = copy(data)
+    for name, value in vars(data).items():
+        setattr(mapped, name, map_value(value))
+    return mapped
+
+
+def move_tensors_to_device(data: Any, device: torch.device, *, non_blocking: bool = False) -> Any:
     """Recursively move tensors in a (nested) dict/list to the specified
     device.
 
     Non-tensor values are left unchanged.
     """
     if isinstance(data, dict):
-        return {k: move_tensors_to_device(v, device) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [move_tensors_to_device(v, device) for v in data]
+        return {k: move_tensors_to_device(v, device, non_blocking=non_blocking) for k, v in data.items()}
+    if isinstance(data, list):
+        return [move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data]
+    if isinstance(data, tuple):
+        return tuple(move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data)
+    if isinstance(data, PackedSeqParams):
+        return _map_packed_seq_params(
+            data,
+            lambda value: move_tensors_to_device(value, device, non_blocking=non_blocking),
+        )
+    if isinstance(data, torch.Tensor):
+        return data.to(device, non_blocking=non_blocking)
+    return data  # e.g., int, str, None, etc.
+
+
+def pin_tensors(data: Any) -> Any:
+    """Recursively pin CPU tensors in a pre-packed micro-batch."""
+    if isinstance(data, dict):
+        return {k: pin_tensors(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [pin_tensors(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(pin_tensors(v) for v in data)
+    if isinstance(data, PackedSeqParams):
+        return _map_packed_seq_params(data, pin_tensors)
+    if isinstance(data, torch.Tensor) and data.device.type == "cpu":
+        try:
+            return data.contiguous().pin_memory()
+        except RuntimeError as exc:
+            from relax.utils.data.micro_batch_ring import _raise_pin_memory_failure
+
+            _raise_pin_memory_failure("pin_tensors", exc)
+    return data
+
+
+def record_tensors_on_stream(data: Any, stream: Any) -> None:
+    """Keep asynchronously copied tensors alive on the consuming stream."""
+    if isinstance(data, dict):
+        for value in data.values():
+            record_tensors_on_stream(value, stream)
+    elif isinstance(data, (list, tuple)):
+        for value in data:
+            record_tensors_on_stream(value, stream)
+    elif isinstance(data, PackedSeqParams):
+        for value in vars(data).values():
+            record_tensors_on_stream(value, stream)
     elif isinstance(data, torch.Tensor):
-        return data.to(device)
-    else:
-        return data  # e.g., int, str, None, etc.
+        data.record_stream(stream)

@@ -370,6 +370,7 @@ class SFT(Base):
         await self.data_system_client.async_put(
             data=dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
             partition_id=f"sft_{self.step}",
+            custom_meta=[{"total_lengths": int(length)} for length in backend_batch["total_lengths"]],
         )
         if crossed_epoch:
             self._logger.info(
@@ -498,6 +499,7 @@ class SFT(Base):
             await self.data_system_client.async_put(
                 data=dict_to_tensordict(chunk, batch_size=len(chunk["tokens"])),
                 partition_id=partition_id,
+                custom_meta=[{"total_lengths": int(length)} for length in chunk["total_lengths"]],
             )
             drained = await self._wait_for_partition_drained(partition_id, timeout_sec=chunk_drain_timeout)
             if not drained:

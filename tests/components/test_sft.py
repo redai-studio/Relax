@@ -164,6 +164,7 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     assert "total_lengths" in pushed_data
     assert "response_lengths" in pushed_data
     assert kwargs_call.get("partition_id") == "sft_0"
+    assert kwargs_call.get("custom_meta") == [{"total_lengths": 8}] * 4
 
 
 @pytest.mark.asyncio
