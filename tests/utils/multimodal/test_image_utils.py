@@ -164,6 +164,16 @@ def test_load_image_supports_local_path_and_file_uri(tmp_path):
     assert from_uri.getpixel((1, 1)) == (9, 8, 7)
 
 
+def test_load_image_supports_truncated_jpeg():
+    source = Image.new("RGB", (8, 8), (1, 2, 3))
+    buffer = BytesIO()
+    source.save(buffer, format="JPEG")
+
+    loaded = load_image(buffer.getvalue()[:-4])
+
+    assert loaded.size == (8, 8)
+
+
 def test_load_image_rejects_unsupported_type():
     with pytest.raises(NotImplementedError, match="Unsupported image input type"):
         load_image(123)

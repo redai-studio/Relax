@@ -10,7 +10,7 @@ from typing import Any, ByteString, Dict, Optional, Tuple, Union
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageFile
 
 from relax.utils.env import Envs
 
@@ -20,6 +20,9 @@ from .config import MultimodalConfig, get_image_max_token_num, get_image_min_tok
 SPATIAL_MERGE_SIZE = 2
 QWEN_VL_MAX_ASPECT_RATIO = 200
 QWEN_VL_SAFE_ASPECT_RATIO = 199
+
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 ImageInput = Union[
