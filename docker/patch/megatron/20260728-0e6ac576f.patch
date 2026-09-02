@@ -1284,6 +1284,72 @@ index 2796bc6..71e036e 100644
      def _maintain_float32_expert_bias(self):
          """
          Maintain the expert bias in float32.
+diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -1031,7 +1031,7 @@
+         )
+         derived_labels_from_input_ids = True
+ 
+-    if config.mtp_detach_heads:
++    if getattr(config, "mtp_detach_lm_head", True):
+         if output_weight is not None:
+             output_weight = output_weight.detach()
+         else:
+@@ -1084,6 +1084,7 @@
+                 mtp_logits = scale_logits_fn(mtp_logits)
+             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+         mtp_loss = loss_mask * mtp_loss
++        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+ 
+         if is_training:
+             if mtp_logits is not None:
+@@ -1097,7 +1098,7 @@
+                 total = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+ 
+             MTPLossLoggingHelper.save_loss_to_tracker(
+-                torch.sum(mtp_loss),
++                mtp_loss_scale * torch.sum(mtp_loss),
+                 num_tokens,
+                 mtp_layer_number,
+                 config.mtp_num_layers,
+@@ -1106,7 +1107,6 @@
+                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                 calculate_per_token_loss=config.calculate_per_token_loss,
+             )
+-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+         if config.calculate_per_token_loss:
+             # When calculate_per_token_loss is enabled, finalize_model_grads will
+             # divide all gradients by total_num_tokens (from main loss).
+@@ -1383,12 +1383,12 @@
+         # embedding
+         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+ 
+-        if self.config.mtp_detach_heads:
++        if getattr(self.config, "mtp_detach_embedding", True):
+             decoder_input = decoder_input.detach()
+ 
+         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+         # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
+-        # which happens after detach() with mtp_detach_heads. Activation
++        # which happens after detach() with mtp_detach_embedding. Activation
+         # checkpointing (CheckpointFunction.apply) requires at least one input tensor
+         # with requires_grad=True to produce a differentiable output, so we ensure it
+         # here to maintain gradient flow to MTP layer parameters.
+@@ -2167,8 +2167,11 @@
+         else:
+             hidden_states = hidden_states_list[offset]
+ 
+-        if self.config.mtp_detach_heads:
+-            hidden_states = hidden_states.detach()
++        if offset == 0 and getattr(self.config, "mtp_detach_backbone", True):
++            # offset > 0 means hidden_states came from a previous MTP stage under VPP,
++            # not from the main backbone -- detaching there would sever gradient flow
++            # between MTP layers.
++            hidden_states = hidden_states.detach().requires_grad_(True)
+ 
+         for iteration in range(self.config.mtp_num_layers):
+             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index 43e45b7..8166f94 100644
 --- a/megatron/core/transformer/transformer_config.py
