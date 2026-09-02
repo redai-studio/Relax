@@ -264,6 +264,7 @@ def get_model_provider_func(
             "recompute_granularity",
             "recompute_method",
             "recompute_num_layers",
+            "recompute_modules",
             "distribute_saved_activations",
             "moe_router_load_balancing_type",
             "moe_router_dtype",

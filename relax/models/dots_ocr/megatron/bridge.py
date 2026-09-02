@@ -5,7 +5,7 @@ from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRe
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, QKVMapping, ReplicatedMapping
 from megatron.bridge.models.conversion.transformers_compat import rope_theta_from_hf
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 
 from relax.models.dots_ocr.configuration import DotsVisionConfig
 from relax.models.dots_ocr.megatron.model import DotsOCRModel
@@ -17,7 +17,7 @@ from relax.models.dots_ocr.megatron.provider import DotsOCRModelProvider
     target=DotsOCRModel,
 )
 class DotsOCRBridge(MegatronModelBridge):
-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> DotsOCRModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> DotsOCRModelProvider:
         hf_config = hf_pretrained.config
         model_dtype = self.dtype_from_hf(hf_config, default=torch.float32)
         vision_config = hf_config.vision_config

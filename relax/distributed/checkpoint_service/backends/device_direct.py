@@ -1151,7 +1151,12 @@ class DeviceDirectBackend(CommBackend):
         slot = self._lora_adapter_full.get(_base_param_prefix(name)) if self._lora_adapter_full else None
         if not slot or "in" not in slot or "out" not in slot:
             return param
-        from megatron.bridge.peft.lora import LoRAMerge
+
+        try:
+            # Megatron-Bridge >= 0.6.0 moved LoRAMerge into its own module.
+            from megatron.bridge.peft.lora_merge import LoRAMerge
+        except ImportError:  # bridge <= 0.5.x
+            from megatron.bridge.peft.lora import LoRAMerge
 
         linear_in = slot["in"].float()
         linear_out = slot["out"].float()
