@@ -217,7 +217,6 @@ async def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
     ("attribute", "value"),
     [
         ("task_type", "seq_cls"),
-        ("eval_size", 0.25),
     ],
 )
 def test_sft_remote_batch_producer_falls_back_for_target_only_modes(monkeypatch, attribute, value):
@@ -235,6 +234,23 @@ def test_sft_remote_batch_producer_falls_back_for_target_only_modes(monkeypatch,
     sft._logger_instance = MagicMock()
 
     assert sft._should_use_remote_batch_producer() is False
+
+
+def test_sft_remote_batch_producer_allows_eval_size(monkeypatch):
+    from relax.components.sft import SFT
+
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: True)
+
+    args = _make_args(global_batch_size=4)
+    args.sft_async_prepack = True
+    args.eval_size = 0.25
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft._logger_instance = MagicMock()
+
+    assert sft._should_use_remote_batch_producer() is True
 
 
 def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
@@ -294,6 +310,47 @@ def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
     assert create_dataset.call_args.kwargs["task_type"] == "causal_lm"
 
 
+def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatch):
+    from relax.components import sft as sft_module
+
+    class _FakeIndexManager:
+        total_size = 10
+
+        def __init__(self):
+            self.current_epoch = -1
+            self.position = 0
+            self.indices = list(range(self.total_size))
+
+        def shuffle(self, epoch):
+            self.current_epoch = epoch
+            self.position = 0
+            self.indices = list(range(self.total_size))
+
+    fake_dataset = MagicMock()
+    fake_dataset.__len__ = MagicMock(return_value=10)
+    fake_dataset.index_manager = _FakeIndexManager()
+    fake_dataset._prefetch = None
+
+    monkeypatch.setattr(sft_module.tq, "init", MagicMock())
+    monkeypatch.setattr(sft_module.tq, "get_client", MagicMock())
+    monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", MagicMock())
+    monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
+    monkeypatch.setattr(sft_module, "_resolve_pad_token_ids_from_config", MagicMock(return_value=frozenset()))
+    monkeypatch.setattr(sft_module, "_create_sft_train_dataset", MagicMock(return_value=fake_dataset))
+
+    args = _make_args(global_batch_size=2)
+    args.eval_size = 0.2
+    producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
+    producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
+
+    state = producer.initialize(start_step=0)
+
+    train_indices, _eval_indices = resolve_sft_split_indices(10, 0.2, seed=args.seed)
+    assert state["train_size"] == 8
+    fake_dataset.restrict_training_indices.assert_called_once_with(train_indices)
+
+
 @pytest.mark.asyncio
 async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch):
     from relax.components import sft as sft_module
@@ -338,6 +395,102 @@ async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch
     await producer.produce_partition(1, "sft_1_shard_0_of_2", 4, False)
     producer._dataset._prefetch.set_index_order.assert_called_once_with([4, 5])
     assert producer.data_system_client.async_put.await_count == 2
+
+
+def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(monkeypatch):
+    from relax.components.sft import SFT
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch, n_samples=10)
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: True)
+    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
+    monkeypatch.setattr("relax.components.sft.tq.get_client", MagicMock())
+
+    args = _make_args(global_batch_size=2)
+    args.sft_async_prepack = True
+    args.eval_size = 0.2
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft.role = "sft"
+    sft.step = 0
+    sft._dataset = None
+    sft._eval_dataset = None
+    sft._eval_indices = None
+    sft._batch_producers = []
+    sft._train_size = 0
+    sft._tokenizer = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+    sft._runtime_env = None
+    sft._init_remote_batch_producers = MagicMock(side_effect=lambda: setattr(sft, "_train_size", 8))
+
+    sft._init_data_pipeline()
+
+    train_indices, eval_indices = resolve_sft_split_indices(10, 0.2, seed=args.seed)
+    assert sft._train_size == len(train_indices)
+    assert sft._eval_indices == eval_indices
+    fake_ds.restrict_training_indices.assert_not_called()
+    assert [sample.source_idx for sample in sft._build_eval_batches()] == list(eval_indices)
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_step_produces_eval_before_advancing_step(monkeypatch):
+    from relax.components import sft as sft_module
+    from relax.components.sft import SFT
+
+    class _RemoteProduce:
+        def __init__(self):
+            self.calls = []
+
+        def remote(self, step, partition_id, global_batch_size, force_multimodal_field):
+            self.calls.append((step, partition_id, global_batch_size, force_multimodal_field))
+            return object()
+
+    class _RemoteProducer:
+        def __init__(self):
+            self.produce_partition = _RemoteProduce()
+
+    monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
+    monkeypatch.setattr(
+        sft_module,
+        "_ray_get_many_async",
+        AsyncMock(
+            return_value=[
+                {"crossed_epoch": False, "epoch": 0},
+                {"crossed_epoch": False, "epoch": 0},
+            ]
+        ),
+    )
+
+    args = _make_args(global_batch_size=4)
+    args.sft_async_prepack = True
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft.role = "sft"
+    sft.step = 0
+    sft.data_system_client = MagicMock()
+    sft._dataset = None
+    sft._eval_dataset = MagicMock()
+    sft._eval_indices = None
+    sft._batch_producers = [_RemoteProducer(), _RemoteProducer()]
+    sft._train_size = 8
+    sft._tokenizer = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+    sft._stop_event = MagicMock()
+    sft._stop_event.is_set = MagicMock(return_value=False)
+
+    async def _maybe_produce_eval():
+        assert sft.step == 0
+
+    sft._maybe_produce_eval = AsyncMock(side_effect=_maybe_produce_eval)
+
+    await sft._produce_one_step()
+
+    sft._maybe_produce_eval.assert_awaited_once()
+    assert sft.step == 1
 
 
 @pytest.mark.asyncio

@@ -350,12 +350,25 @@ class _SFTBatchProducerActor:
         self._train_size = n_avail
         eval_size_arg = getattr(self.config, "eval_size", None)
         if eval_size_arg is not None:
-            if eval_size_arg < 1:
-                n_eval = max(1, int(n_avail * eval_size_arg))
-            else:
-                n_eval = int(eval_size_arg)
-            n_eval = min(n_eval, max(n_avail - 1, 0))
-            self._train_size = n_avail - n_eval if n_eval > 0 else n_avail
+            train_indices, eval_indices = resolve_sft_split_indices(
+                n_avail,
+                eval_size_arg,
+                getattr(self.config, "seed", 42),
+            )
+            self._train_size = len(train_indices)
+            if eval_indices:
+                restrict_training_indices = getattr(self._dataset, "restrict_training_indices", None)
+                if not callable(restrict_training_indices):
+                    raise TypeError(
+                        "--eval-size requires the SFT dataset to implement restrict_training_indices(indices) "
+                        "for a deterministic remote-producer split."
+                    )
+                restrict_training_indices(train_indices)
+                self._logger.info(
+                    f"--eval-size randomly held out {len(eval_indices)} samples with seed="
+                    f"{getattr(self.config, 'seed', 42)}; remote shard {self._shard_id}/{self._num_shards} "
+                    f"train pool size now {self._train_size}."
+                )
 
         shard_batch_size = self._shard_batch_size(self.config.global_batch_size)
         if self._train_size > 0:
@@ -484,9 +497,6 @@ class SFT(Base):
         if not ray.is_initialized():
             self._logger.info("SFT remote shard producer disabled: Ray is not initialized.")
             return False
-        if _has_sft_eval_work(self.config):
-            self._logger.info("SFT remote shard producer disabled: eval is configured; using local producer path.")
-            return False
         if getattr(self.config, "custom_dataset_class_path", None):
             self._logger.info(
                 "SFT remote shard producer disabled: custom dataset is configured; using local producer path."
@@ -519,11 +529,107 @@ class SFT(Base):
             for shard_id in range(num_shards)
         ]
         states = ray.get([producer.initialize.remote(self.step) for producer in self._batch_producers])
-        self._train_size = int(states[0].get("train_size") or 0)
+        train_sizes = {int(state.get("train_size") or 0) for state in states}
+        if len(train_sizes) != 1:
+            raise RuntimeError(f"SFT remote shard producer train-size mismatch: states={states}")
+        self._train_size = train_sizes.pop()
         self._logger.info(
             f"SFT remote shard producer enabled: dataset={states[0].get('dataset')} "
             f"train_size={self._train_size} shards={num_shards} "
             f"prefetch_workers_per_shard={prefetch_num_workers}"
+        )
+
+    def _init_remote_eval_pipeline(self) -> None:
+        eval_prompt_data = build_named_prompt_data_configs(getattr(self.config, "eval_prompt_data", None))
+        eval_size_arg = getattr(self.config, "eval_size", None)
+        if eval_size_arg is None and not eval_prompt_data:
+            return
+
+        prepare_model_maybe_update_args(self.config, completeness="metadata")
+        self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
+        try:
+            self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
+        except Exception as exc:
+            self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal eval samples will fail at push.")
+            self._processor_pool = None
+        pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
+        self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
+
+        cp_size = max(1, getattr(self.config, "context_parallel_size", 1) or 1)
+        capacity = self.config.max_tokens_per_gpu * cp_size
+        seed = getattr(self.config, "seed", 42)
+        task_type = getattr(self.config, "task_type", "causal_lm")
+        classification_sentinel_token_id = (
+            _resolve_classification_sentinel_token_id(self._tokenizer) if task_type == "seq_cls" else None
+        )
+        dataset_options = _resolve_sft_dataset_options(self.config, self._logger)
+
+        if eval_size_arg is not None:
+            self._dataset = _create_sft_train_dataset(
+                self.config,
+                tokenizer=self._tokenizer,
+                processor_pool=self._processor_pool,
+                capacity=capacity,
+                prefetch_buffer_size=0,
+                prefetch_chunk_size=getattr(self.config, "sft_prefetch_chunk_size", 32),
+                prefetch_num_workers=1,
+                pad_token_ids=pad_token_ids,
+                task_type=task_type,
+                classification_sentinel_token_id=classification_sentinel_token_id,
+                **dataset_options,
+            )
+            n_avail = len(self._dataset)
+            train_indices, eval_indices = resolve_sft_split_indices(n_avail, eval_size_arg, seed)
+            if self._train_size != len(train_indices):
+                raise RuntimeError(
+                    "SFT remote eval split mismatch between coordinator and shard producers: "
+                    f"coordinator train_size={len(train_indices)}, remote train_size={self._train_size}."
+                )
+            n_eval = len(eval_indices)
+            if n_eval == 0:
+                self._logger.warning(
+                    f"--eval-size {eval_size_arg} resolves to 0 samples on a dataset of size {n_avail}; "
+                    "eval will be skipped."
+                )
+            else:
+                get_batch_by_indices = getattr(self._dataset, "get_batch_by_indices", None)
+                if not callable(get_batch_by_indices):
+                    raise TypeError(
+                        "--eval-size requires the SFT dataset to implement get_batch_by_indices(indices) "
+                        "for deterministic remote-producer eval."
+                    )
+                self._eval_indices = eval_indices
+                self._logger.info(f"SFT remote eval split initialized: held out {n_eval} samples with seed={seed}.")
+            return
+
+        eval_input_key = getattr(self.config, "eval_input_key", None) or self.config.input_key
+        eval_label_key = getattr(self.config, "eval_label_key", None) or self.config.label_key
+        eval_tool_key = getattr(self.config, "eval_tool_key", None) or self.config.tool_key
+        self._eval_dataset = SFTStreamingDataset(
+            path=[d.path for d in eval_prompt_data],
+            tokenizer=self._tokenizer,
+            processor_pool=self._processor_pool,
+            capacity=capacity,
+            prompt_key=eval_input_key,
+            label_key=eval_label_key,
+            multimodal_keys=self.config.multimodal_keys,
+            conversation_key_map=getattr(self.config, "conversation_key_map", None),
+            metadata_key=self.config.metadata_key,
+            tool_key=eval_tool_key,
+            system_prompt=self.config.system_prompt,
+            source_name="+".join(d.name for d in eval_prompt_data),
+            seed=seed,
+            prefetch_max_cached=0,
+            pad_token_ids=pad_token_ids,
+            oversize_strategy=dataset_options["oversize_strategy"],
+            oversize_custom_fn=dataset_options["oversize_custom_fn"],
+            invalid_multimodal_strategy=dataset_options["invalid_multimodal_strategy"],
+            apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+            require_response=task_type != "seq_cls",
+            task_type=task_type,
+            num_labels=getattr(self.config, "num_labels", None),
+            problem_type=getattr(self.config, "problem_type", "single_label_classification"),
+            classification_sentinel_token_id=classification_sentinel_token_id,
         )
 
     def _init_data_pipeline(self) -> None:
@@ -531,6 +637,7 @@ class SFT(Base):
             return
         if self._should_use_remote_batch_producer():
             self._init_remote_batch_producers()
+            self._init_remote_eval_pipeline()
             return
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
@@ -769,6 +876,7 @@ class SFT(Base):
             current_epoch = max(payload.get("epoch") or 0 for payload in payloads)
             if crossed_epoch:
                 self._logger.info(f"SFT step {self.step}: epoch boundary crossed (epoch={current_epoch})")
+            await self._maybe_produce_eval()
             self.step += 1
             return
 

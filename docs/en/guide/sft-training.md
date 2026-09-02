@@ -419,6 +419,36 @@ Pokemon 1 GPU script:
 
 `"sft": [1, 0]` means the SFT producer is CPU-only. The Actor owns training GPUs. Rollout GPUs are needed when periodic predict is enabled.
 
+### Sharded SFT Producers
+
+`RELAX_SFT_TQ_SHARDS` is an experimental throughput knob for SFT async prepacking. It splits each global SFT batch across multiple TransferQueue partitions. Configure it in the Ray runtime environment:
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
+
+Enable async prepacking in the training arguments as well:
+
+```bash
+--per-rank-fetch
+--sft-async-prepack
+--sft-max-in-flight-steps 4
+```
+
+`--sft-max-in-flight-steps 4` is an example; async prepacking requires at least 2, or equivalently `--max-staleness >= 1`. The environment variable does not enable prepacking by itself and is ignored without `--loss-type sft --sft-async-prepack`.
+
+For `N` shards, both `--global-batch-size` and the per-DP-rank local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`. For example, with global batch size 32 and DP size 8, the local batch is 4, so 2 or 4 shards are valid but 3 is not.
+
+When the remote path is eligible, `N` shards launch `N` Ray producer actors for train batches. Eval can be enabled at the same time: train shards are produced remotely, while the coordinator renders the eval split or eval prompt data and pushes the usual `sft_eval_<step>_n<N>_<i>` partitions at eval intervals. Some configurations, including sequence classification, custom datasets, and skip-capable sample filtering, use one local producer that still writes `N` partitions. Therefore, `RELAX_SFT_TQ_SHARDS=2` does not always mean two producer actors. Confirm the remote path from this log:
+
+```text
+SFT remote shard producer enabled: ... shards=2 ...
+```
+
+When using `--eval-size`, every remote train producer applies the same seed-based held-out split so train and eval rows do not overlap. When launching Python directly, `export RELAX_SFT_TQ_SHARDS=2` is also supported. For a Ray Job, putting the value in `configs/env.yaml` ensures that producers and consumers receive the same value. See [Sharded TransferQueue Producers](./configuration.md#sharded-transferqueue-producers) for partition naming, fallback conditions, and worker allocation.
+
 ## Launch
 
 ### Single Node
@@ -503,6 +533,7 @@ If GPUs wait on SFT data:
 | `--sft-prefetch-chunk-size` | Increase | Dispatches larger prefetch chunks, with higher memory pressure. |
 | `--per-rank-fetch` | Enable for multi-GPU | Lets TP/PP ranks pull from TransferQueue directly. Pair with enough `--num-data-storage-units`. |
 | `--max-staleness` | Increase for I/O-heavy SFT | Lets the producer run ahead. The Pokemon 8 GPU script uses `--max-staleness 4`. |
+| `RELAX_SFT_TQ_SHARDS` | Start from 2 | Parallelizes eligible async-prepack producers. Increase only when data preparation is the bottleneck and batch divisibility constraints are met. |
 
 For text-only math, prefetch usually matters less than sequence length and model parallelism. For Pokemon, image loading and processor work are common bottlenecks.
 

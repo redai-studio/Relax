@@ -404,7 +404,7 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 末尾 5%）；值 ≥1 视为绝对样本数。被预留的尾部会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
+| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
 | `--sft-predict-interval` | int | None | 每 N 个 rollout step 在 eval 集上跑一次生成式 predict，把生成结果写到 `<save>/predict/predictions_step_<rollout_id>.jsonl`。设置该参数后会自动拉起 Rollout 角色（SGLang 必须在线）。它是 always-on 的 PPL eval（`--eval-interval`）的生成式补充。**必需**：`--save`（写到 `<save>/predict/` 下）以及至少一个 eval 数据源（`--eval-prompt-data` / `--eval-config` / `--eval-size`）。 |
 
 ### 流式数据集预取
@@ -416,6 +416,39 @@ SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetc
 | `--sft-prefetch-buffer-size` | int | 256 | SFT 流式数据集 PrefetchBuffer 缓存的最大预加载样本数。设为 0 禁用预取，producer 会回退到基于 ProcessorPool 的 `asyncio.gather` 路径做 batch 级并行。 |
 | `--sft-prefetch-chunk-size` | int | 32 | 每轮派发给 SFT 预取线程池的 chunk 大小。 |
 | `--sft-prefetch-num-workers` | int | 4 | SFT PrefetchBuffer 内部用于 I/O 密集型媒体解码（视频/图像）的工作线程数。 |
+
+### TransferQueue 分片 Producer
+
+`RELAX_SFT_TQ_SHARDS` 控制每个 async-prepacked SFT 训练 step 生成多少个 TransferQueue 分区。这是一个实验性环境变量，便于在不增加公开 CLI 参数的情况下对 shard 数做 A/B 测试。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `RELAX_SFT_TQ_SHARDS` | int | 1 | SFT TransferQueue shard 数。小于等于 0 的值按 1 处理。 |
+
+::: warning 生效条件
+这个变量本身不会开启 prepack。它仅在使用 `--loss-type sft --sft-async-prepack` 时生效，否则 Relax 只使用一个分区。Async prepack 还要求开启 `--per-rank-fetch`、至少允许两个 in-flight step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP=1，并使用 THD QKV 格式。
+:::
+
+当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；单 shard 仍使用原有的 `sft_K` 名称。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
+
+满足条件时，Relax 会为 train batch 启动 `N` 个远端 `_SFTBatchProducerActor`。配置的 `--sft-prefetch-num-workers` 会按每个 shard `ceil(workers / N)` 分配，且每个 shard 至少有一个 worker。Eval 仍由 coordinator 本地协调：`--eval-size` 会在每个远端 producer 内使用同一份确定性的 train/eval split，coordinator 负责渲染 holdout 样本（或 `--eval-prompt-data`）并在 eval interval 推送 `sft_eval_<step>_n<N>_<i>` 分区。
+
+遇到以下任一情况时，remote train producer 会 fallback 到本地 coordinator 路径：
+
+- Ray 未初始化。
+- 使用 `--task-type seq_cls`。
+- 设置了 `--custom-dataset-class-path`。
+- `--sft-oversize-strategy` 为 `skip` 或 `custom`，或者 `--sft-invalid-multimodal-strategy` 为 `skip`。
+
+本地 fallback 仍会把 batch 拆成 `N` 个 TransferQueue 分区，但不会创建 `N` 个远端 producer actor。日志出现 `SFT remote shard producer enabled: ... shards=N ...` 才表示 remote producer 并行已生效；fallback 路径会记录 `SFT remote shard producer disabled: ...` 及具体原因。
+
+请在 Ray 运行时环境中配置这个值，确保 producer 和 consumer 推导出相同的分区名：
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
 
 ### 超长样本处理
 

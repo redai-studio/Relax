@@ -419,6 +419,36 @@ Pokemon 1 GPU 脚本：
 
 `"sft": [1, 0]` 表示 SFT producer 是 CPU-only。Actor 使用训练 GPU。开启周期性 predict 时，Rollout 也需要 GPU 资源。
 
+### SFT 分片 Producer
+
+`RELAX_SFT_TQ_SHARDS` 是 SFT async prepack 的实验性吞吐调优开关，用于把每个全局 SFT batch 拆到多个 TransferQueue 分区。推荐在 Ray 运行时环境中配置：
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
+
+同时在训练参数中开启 async prepack：
+
+```bash
+--per-rank-fetch
+--sft-async-prepack
+--sft-max-in-flight-steps 4
+```
+
+`--sft-max-in-flight-steps 4` 只是示例；async prepack 要求该值至少为 2，或者等价地设置 `--max-staleness >= 1`。这个环境变量本身不会开启 prepack；未使用 `--loss-type sft --sft-async-prepack` 时会被忽略。
+
+使用 `N` 个 shard 时，`--global-batch-size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。例如 global batch size 为 32、DP size 为 8 时，本地 batch 为 4，因此可以设置 2 或 4 个 shard，不能设置 3 个。
+
+满足 remote 路径条件时，`N` 个 shard 会为 train batch 启动 `N` 个 Ray producer actor。Eval 可以同时开启：train shard 由远端 producer 生产，coordinator 负责渲染 eval split 或 eval prompt data，并在 eval interval 推送原有的 `sft_eval_<step>_n<N>_<i>` 分区。部分配置（包括序列分类、自定义数据集和允许跳过样本的过滤策略）会使用单个本地 producer，但仍然写入 `N` 个分区。因此，`RELAX_SFT_TQ_SHARDS=2` 并不一定表示有两个 producer actor。可以通过下面的日志确认 remote 路径是否真正启用：
+
+```text
+SFT remote shard producer enabled: ... shards=2 ...
+```
+
+使用 `--eval-size` 时，每个远端 train producer 都会应用同一份基于 `--seed` 的 holdout split，保证 train 和 eval 行不重叠。直接启动 Python 时也可以使用 `export RELAX_SFT_TQ_SHARDS=2`。通过 Ray Job 启动时，将它写入 `configs/env.yaml` 可以确保 producer 和 consumer 收到相同的值。分区命名、fallback 条件和 worker 分配方式见 [TransferQueue 分片 Producer](./configuration.md#transferqueue-分片-producer)。
+
 ## 启动
 
 ### 单机
@@ -503,6 +533,7 @@ bash scripts/entrypoint/spmd-multinode.sh \
 | `--sft-prefetch-chunk-size` | 调大 | 一次派发更多预取样本，但会增加内存压力。 |
 | `--per-rank-fetch` | 多 GPU 时开启 | 让 TP/PP rank 直接从 TransferQueue 拉数据，需配足 `--num-data-storage-units`。 |
 | `--max-staleness` | I/O 重时调大 | 允许 producer 提前生产。Pokemon 8 GPU 脚本使用 `--max-staleness 4`。 |
+| `RELAX_SFT_TQ_SHARDS` | 从 2 开始 | 并行化满足条件的 async-prepack producer。仅当数据准备是瓶颈且 batch 满足整除约束时再增加。 |
 
 纯文本 math 任务通常更受序列长度和模型并行影响；Pokemon 任务更容易被图片读取和 processor 工作拖慢。
 
