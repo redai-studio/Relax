@@ -446,6 +446,7 @@ def get_batch(
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
             cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=batch_device)
+            cu_seqlens_cpu = cu_seqlens_list
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [
@@ -466,9 +467,10 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=batch_device) * cp_size
+            cu_seqlens_cpu = [offset * cp_size for offset in cu_seqlens]
+            cu_seqlens = torch.tensor(cu_seqlens_cpu, dtype=torch.int, device=batch_device)
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        max_seqlen = max(end - start for start, end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:]))
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
@@ -476,6 +478,9 @@ def get_batch(
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
+        # Python boundaries let attention implementations iterate packed
+        # subsequences without synchronizing individual accelerator scalars.
+        packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group

@@ -11,14 +11,17 @@ Two paths (spec §7.5):
 """
 
 import hashlib
+import os
 import re
 import threading
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
 from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult, apply_chat_template_patchers
+from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
 from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
 from relax.engine.sft.dataset.sample import CanonicalSample
 from relax.utils.logging_utils import get_logger
@@ -31,7 +34,7 @@ logger = get_logger(__name__)
 # form for the purpose of marking assistant-token spans, so they should be
 # recognised as the same marker.
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
-_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template,)
+_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template, try_patch_gemma4_thinking)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
 _TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
 
@@ -110,6 +113,63 @@ _TOOL_RESPONSE_OPEN = "<tool_response>\n"
 _TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 
 
+@dataclass(frozen=True)
+class _Dialect:
+    """Turn delimiters for the fallback's text scan.
+
+    ChatML and gemma-4 frame turns differently; same scan, other delimiters.
+    """
+
+    name: str
+    role_names: dict  # canonical role -> the name the template renders
+    header_fmt: str  # "{role}" placeholder
+    end: str
+    think_open: str | None  # None: nothing to exclude — the whole reply is learned
+    think_close: str | None  # None: skip only the opener (ChatML <think>\n)
+    supports_tools: bool
+
+    def header(self, role: str) -> str:
+        return self.header_fmt.format(role=self.role_names.get(role, role))
+
+
+_CHATML = _Dialect(
+    name="chatml",
+    role_names={},
+    header_fmt="<|im_start|>{role}\n",
+    end=_IM_END,
+    think_open=_THINK_OPEN,
+    think_close=None,
+    supports_tools=True,
+)
+
+# gemma-4 renders the assistant role as "model". Reasoning is a delimited block,
+# so the mask must resume after <channel|> rather than after a fixed-length
+# opener. Matches THUDM/slime's gen_multi_turn_loss_mask_gemma4.
+_GEMMA4 = _Dialect(
+    name="gemma4",
+    role_names={"assistant": "model"},
+    header_fmt="<|turn>{role}\n",
+    end="<turn|>",
+    think_open="<|channel>thought\n",
+    think_close="<channel|>",
+    supports_tools=False,
+)
+
+# Same delimiters, but the reasoning block stays IN the loss. Only reachable via
+# GEMMA4_SFT_THINKING=1, which patches the Jinja to emit an empty thought block
+# on every assistant turn -- see gemma4_chat_template_patch.py.
+_GEMMA4_THINKING = replace(_GEMMA4, name="gemma4_thinking", think_open=None, think_close=None)
+
+
+def _detect_dialect(rendered_text: str) -> _Dialect:
+    """Pick delimiters from what the template actually emitted."""
+    if "<|turn>" in rendered_text and "<turn|>" in rendered_text:
+        if os.environ.get("GEMMA4_SFT_THINKING", "0") in ("1", "true", "True"):
+            return _GEMMA4_THINKING
+        return _GEMMA4
+    return _CHATML
+
+
 def _render_per_message_fallback(
     sample: CanonicalSample,
     *,
@@ -170,9 +230,15 @@ def _render_per_message_fallback(
         )
 
     char_mask = bytearray(len(rendered_text))  # zeros
+    dialect = _detect_dialect(rendered_text)
     cursor = 0
     for msg in sample.messages:
         if msg.role == "tool":
+            if not dialect.supports_tools:
+                raise RuntimeError(
+                    f"tool messages are not supported by the {dialect.name!r} loss-mask dialect; "
+                    f"add its tool-call delimiters to _Dialect first"
+                )
             open_pos = rendered_text.find(_TOOL_RESPONSE_OPEN, cursor)
             if open_pos < 0:
                 raise RuntimeError(
@@ -186,17 +252,20 @@ def _render_per_message_fallback(
             span_end = close_pos
             cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
         else:
-            header = f"<|im_start|>{msg.role}\n"
+            header = dialect.header(msg.role)
             header_pos = rendered_text.find(header, cursor)
             if header_pos < 0:
                 raise RuntimeError(
-                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
+                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat "
+                    f"template output (dialect={dialect.name!r}, header={header!r})"
                 )
             content_start = header_pos + len(header)
-            end_pos = rendered_text.find(_IM_END, content_start)
+            end_pos = rendered_text.find(dialect.end, content_start)
             if end_pos < 0:
-                raise RuntimeError(f"could not locate <|im_end|> for {msg.role!r} message")
-            span_end = end_pos + len(_IM_END)
+                raise RuntimeError(
+                    f"could not locate {dialect.end!r} for {msg.role!r} message (dialect={dialect.name!r})"
+                )
+            span_end = end_pos + len(dialect.end)
             if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
                 span_end += 1
             cursor = span_end
@@ -205,8 +274,21 @@ def _render_per_message_fallback(
             continue
 
         mask_start = content_start
-        if msg.role == "assistant" and rendered_text[content_start : content_start + len(_THINK_OPEN)] == _THINK_OPEN:
-            mask_start += len(_THINK_OPEN)
+        if (
+            msg.role == "assistant"
+            and dialect.think_open is not None
+            and rendered_text.startswith(dialect.think_open, content_start)
+        ):
+            if dialect.think_close is None:
+                # ChatML: only the opener is excluded; the reasoning body is learned.
+                mask_start += len(dialect.think_open)
+            else:
+                # Delimited block (gemma-4): the whole reasoning span stays out of
+                # the loss, so training targets only the visible reply.
+                close_pos = rendered_text.find(dialect.think_close, content_start)
+                if close_pos < 0:
+                    raise RuntimeError(f"found {dialect.think_open!r} without a matching {dialect.think_close!r}")
+                mask_start = close_pos + len(dialect.think_close)
         for pos in range(mask_start, span_end):
             char_mask[pos] = 1
 

@@ -319,10 +319,12 @@ class TestMergeContract:
         assert expected.shape == base.shape
 
     def test_tp1_matches_real_loramerge(self):
-        pytest.importorskip("megatron.bridge.peft.lora")
         from inspect import signature
 
-        from megatron.bridge.peft.lora import LoRAMerge
+        lora = pytest.importorskip("megatron.bridge.peft.lora")
+        if not hasattr(lora, "LoRAMerge"):
+            pytest.skip("this Megatron-Bridge build does not expose LoRAMerge")
+        LoRAMerge = lora.LoRAMerge
 
         if "tp_size" not in signature(LoRAMerge().merge).parameters:
             pytest.skip("installed megatron bridge LoRAMerge.merge lacks tp_size support")

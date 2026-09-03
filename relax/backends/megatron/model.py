@@ -1507,8 +1507,8 @@ def train(
             if mtp_values is None:
                 mtp_values = tracker.get("loss_values")
             if mtp_values is not None:
-                # here we assume only one mtp layer
-                mtp_losses = (mtp_values * mtp_loss_scale).item()
+                # Sum across MTP prediction depths.
+                mtp_losses = (mtp_values * mtp_loss_scale).sum().item()
                 MTPLossLoggingHelper.clean_loss_in_tracker()
 
                 # CI check: verify MTP loss is within expected bounds

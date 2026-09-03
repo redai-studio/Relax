@@ -120,3 +120,64 @@ def test_mtp_reference_without_mtp_model_relaxes_strict(monkeypatch, tmp_path):
     model_mod.save_hf_model(_args(tmp_path), rollout_id=4, model=[])
 
     assert recorded["strict"] is False
+
+
+def _record_reconcile(monkeypatch):
+    """Capture how save_hf_model calls the reconciler instead of running it."""
+    calls = []
+
+    def _fake(path, reference_hf_dir=None, supplement_mtp=True, **kwargs):
+        calls.append({"path": path, "reference_hf_dir": reference_hf_dir, "supplement_mtp": supplement_mtp})
+
+    monkeypatch.setattr(hf_export, "reconcile_hf_export_index", _fake)
+    return calls
+
+
+def test_reconcile_runs_for_a_vision_only_relaxation_and_leaves_mtp_alone(monkeypatch, tmp_path):
+    """Ghost entries can come from either relaxation, MTP supplementation
+    cannot.
+
+    Reconcile has to run whenever the save was non-strict, but pulling mtp.*
+    weights out of the base is only ever right when MTP was the relaxed group
+    -- otherwise a genuinely missing MTP tensor gets papered over with base
+    weights.
+    """
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    calls = _record_reconcile(monkeypatch)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
+
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=6, model=_model(vision=False))
+
+    assert recorded["strict"] is False
+    assert len(calls) == 1
+    assert calls[0]["supplement_mtp"] is False
+
+
+def test_reconcile_supplements_mtp_for_the_mtp_relaxation(monkeypatch, tmp_path):
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    calls = _record_reconcile(monkeypatch)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: True)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: False)
+
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=7, model=[])
+
+    assert recorded["strict"] is False
+    assert len(calls) == 1
+    assert calls[0]["supplement_mtp"] is True
+
+
+def test_reconcile_skipped_when_the_save_was_strict(monkeypatch, tmp_path):
+    """Nothing was relaxed, so there can be no ghost entries to reconcile."""
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    calls = _record_reconcile(monkeypatch)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: False)
+
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=8, model=[])
+
+    assert recorded["strict"] is True
+    assert calls == []
