@@ -17,11 +17,13 @@ known-first-party = ["relax"]
 known-third-party = [
     "accelerate",
     "datasets",
+    "diffusers",
     "gradio",
     "numpy",
     "peft",
     "ray",
     "sglang",
+    "soundfile",
     "torch",
     "transformers",
     "trl"

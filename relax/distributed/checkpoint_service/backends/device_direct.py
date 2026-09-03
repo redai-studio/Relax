@@ -21,6 +21,8 @@ import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from functools import lru_cache
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -28,18 +30,12 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-from megatron.core import mpu
 from tqdm import tqdm
 from urllib3.exceptions import NewConnectionError
 
-from relax.backends.megatron.weight_conversion import convert_to_hf
-from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _adapter_base_prefix, _base_param_prefix
-from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
-from relax.distributed.checkpoint_service.utils import load_weight
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -57,6 +53,40 @@ from relax.utils.megatron_peft_utils import (
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _load_megatron_dependencies() -> SimpleNamespace:
+    """Load DeviceDirect's optional Megatron implementation on first use."""
+    try:
+        from megatron.core import mpu
+
+        from relax.backends.megatron.weight_conversion import convert_to_hf
+        from relax.backends.megatron.weight_update.common import all_gather_param, named_params_and_buffers
+        from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (
+            _adapter_base_prefix,
+            _base_param_prefix,
+        )
+        from relax.backends.megatron.weight_update.lora_adapter_sync import LoraAdapterSync
+        from relax.distributed.checkpoint_service.utils import load_weight
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if missing == "megatron" or missing.startswith("megatron."):
+            raise ModuleNotFoundError(
+                "DeviceDirectBackend requires the optional Megatron dependencies; "
+                "install or use the Relax Megatron training environment."
+            ) from exc
+        raise
+    return SimpleNamespace(
+        mpu=mpu,
+        convert_to_hf=convert_to_hf,
+        all_gather_param=all_gather_param,
+        named_params_and_buffers=named_params_and_buffers,
+        adapter_base_prefix=_adapter_base_prefix,
+        base_param_prefix=_base_param_prefix,
+        LoraAdapterSync=LoraAdapterSync,
+        load_weight=load_weight,
+    )
 
 
 def bucket_tensor_counts(sizes: Sequence[int], max_bytes: int) -> list[int]:
@@ -133,6 +163,7 @@ class DeviceDirectBackend(CommBackend):
             timeout_seconds: Operation timeout (default 300)
         """
         super().__init__(backend_type, role_info)
+        self._megatron = _load_megatron_dependencies()
         self.args = args
         self.model = model
         self.model_name = model_name
@@ -181,7 +212,7 @@ class DeviceDirectBackend(CommBackend):
         # Cross-call state (the backend instance is long-lived across update_weights_for_rollout).
         # Adapter-mode incremental-sync state (base-once + adapter-delta protocol) lives in the
         # shared LoraAdapterSync helper; the merge-mode fields below stay on the backend.
-        self._lora_sync = LoraAdapterSync(args, model) if self._lora_adapter_mode else None
+        self._lora_sync = self._megatron.LoraAdapterSync(args, model) if self._lora_adapter_mode else None
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
@@ -394,10 +425,11 @@ class DeviceDirectBackend(CommBackend):
         if self.role_info is None:
             raise RuntimeError("Role info not set. Cannot initialize process group.")
         self._is_pp_src_rank = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+            self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
         )
         if self._is_pp_src_rank:
-            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
             master_address = ray._private.services.get_node_ip_address()
             self._group_name = f"slime-pp_{pp_rank}"
 
@@ -529,9 +561,10 @@ class DeviceDirectBackend(CommBackend):
 
         # Determine if this rank is the PP source rank (for weight gathering)
         self._is_pp_src_rank = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+            self._megatron.mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and self._megatron.mpu.get_tensor_model_parallel_rank() == 0
         )
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
         global_rank = topology_data.get("global_rank")
         pp_groups = topology_data.get("pp_groups")
         world_size = topology_data.get("world_size", 1)
@@ -661,7 +694,7 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
@@ -792,7 +825,7 @@ class DeviceDirectBackend(CommBackend):
 
         Returns updated buffer size on the source rank, otherwise None.
         """
-        param = all_gather_param(self.args, name, param)
+        param = self._megatron.all_gather_param(self.args, name, param)
         if not self._is_pp_src_rank:
             return
 
@@ -820,7 +853,7 @@ class DeviceDirectBackend(CommBackend):
                 if self._use_bridge:
                     converted_named_tensors += self._bridge_converter.convert(name, convert_param)
                 else:
-                    converted_named_tensors += convert_to_hf(
+                    converted_named_tensors += self._megatron.convert_to_hf(
                         self.args, self.model_name, name, convert_param, self.quantization_config
                     )
         buffer_size += param_size
@@ -837,7 +870,7 @@ class DeviceDirectBackend(CommBackend):
         """
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
@@ -870,7 +903,7 @@ class DeviceDirectBackend(CommBackend):
             #   the reference model's own expert adapters are zeroed at init (actor _init), so no
             #   double-count. Skip the raw adapter param here in both modes.
             return buffer_size
-        param = all_gather_param(self.args, name, param)
+        param = self._megatron.all_gather_param(self.args, name, param)
 
         # Fold this expert's LoRA adapter into its base weight on the owning EP rank (ETP=1, so
         # tp_size=1 and no collective) before it enters the EP-gather + convert path, exactly as
@@ -884,7 +917,7 @@ class DeviceDirectBackend(CommBackend):
         param_size = param.numel() * param.element_size()
         if (
             buffer_size + param_size
-        ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
+        ) * self._megatron.mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
             if named_tensors:
                 self._update_expert_bucket_weights_from_distributed(
                     named_tensors, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only, pbar=pbar
@@ -907,21 +940,23 @@ class DeviceDirectBackend(CommBackend):
         Clears the input buffer when complete.
         """
         names = [name for name, _ in named_tensors]
-        all_names = [None] * mpu.get_expert_model_parallel_world_size()
+        all_names = [None] * self._megatron.mpu.get_expert_model_parallel_world_size()
 
-        dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
+        dist.all_gather_object(all_names, names, group=self._megatron.mpu.get_expert_model_parallel_group())
 
         for names in all_names:
             assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"
 
-        all_gathered_params = [[] for _ in range(mpu.get_expert_model_parallel_world_size())]
+        all_gathered_params = [[] for _ in range(self._megatron.mpu.get_expert_model_parallel_world_size())]
         handles = []
         for i, (_name, param) in enumerate(named_tensors):
             params = [
                 torch.empty_like(param.data, device=self.device)
-                for _ in range(mpu.get_expert_model_parallel_world_size())
+                for _ in range(self._megatron.mpu.get_expert_model_parallel_world_size())
             ]
-            handle = dist.all_gather(params, param.data, group=mpu.get_expert_model_parallel_group(), async_op=True)
+            handle = dist.all_gather(
+                params, param.data, group=self._megatron.mpu.get_expert_model_parallel_group(), async_op=True
+            )
             handles.append(handle)
             for ep_rank, names in enumerate(all_names):
                 all_gathered_params[ep_rank].append((names[i], params[ep_rank]))
@@ -941,7 +976,7 @@ class DeviceDirectBackend(CommBackend):
                 if self._use_bridge:
                     converted_hf_tensors += self._bridge_converter.convert(name, param)
                 else:
-                    converted_hf_tensors += convert_to_hf(
+                    converted_hf_tensors += self._megatron.convert_to_hf(
                         self.args, self.model_name, name, param, self.quantization_config
                     )
             self._update_bucket_weights_from_distributed(converted_hf_tensors, pbar)
@@ -994,7 +1029,7 @@ class DeviceDirectBackend(CommBackend):
         the process group set up for actor_fwd reception.
         """
         # Prepare metadata for weight transfer
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_rank = self._megatron.mpu.get_pipeline_model_parallel_rank()
         group_name = f"update_actor_pp_{pp_rank}"
         payload = {
             "names": [name for name, _ in named_tensors],
@@ -1074,7 +1109,7 @@ class DeviceDirectBackend(CommBackend):
                 for handle in handles:
                     handle.wait()
 
-                load_weight(self.args, self.model, weights)
+                self._megatron.load_weight(self.args, self.model, weights)
 
     # ------------------------------------------------------------------
     # LoRA weight sync (fully-async)
@@ -1097,7 +1132,7 @@ class DeviceDirectBackend(CommBackend):
         """
         if self._lora_moe_etp_checked or not getattr(self.args, "num_experts", 0):
             return
-        etp = mpu.get_expert_tensor_parallel_world_size()
+        etp = self._megatron.mpu.get_expert_tensor_parallel_world_size()
         assert etp == 1, (
             f"MoE LoRA expert folding requires --expert-tensor-parallel-size 1 (got {etp}). "
             "This applies to merge mode and to adapter mode when actor_fwd/reference is present "
@@ -1121,14 +1156,14 @@ class DeviceDirectBackend(CommBackend):
         loop's gather for actor_fwd) is cheap.
         """
         adapter_full: dict[str, dict[str, torch.Tensor]] = {}
-        for name, param in named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
             if not is_lora_adapter_param(name):
                 continue
             if ".experts." in name or not getattr(param, "tensor_model_parallel", False):
                 full = param.data
             else:
-                full = all_gather_param(self.args, name, param)
-            slot = adapter_full.setdefault(_adapter_base_prefix(name), {})
+                full = self._megatron.all_gather_param(self.args, name, param)
+            slot = adapter_full.setdefault(self._megatron.adapter_base_prefix(name), {})
             slot["in" if ".linear_in." in name else "out"] = full
         return adapter_full
 
@@ -1148,7 +1183,7 @@ class DeviceDirectBackend(CommBackend):
         the colocate ``HfWeightIteratorBridge._merge_base_with_adapter`` (with tp_size=1 since
         MoE merge requires ETP=1).
         """
-        slot = self._lora_adapter_full.get(_base_param_prefix(name)) if self._lora_adapter_full else None
+        slot = self._lora_adapter_full.get(self._megatron.base_param_prefix(name)) if self._lora_adapter_full else None
         if not slot or "in" not in slot or "out" not in slot:
             return param
 
@@ -1161,8 +1196,8 @@ class DeviceDirectBackend(CommBackend):
         linear_in = slot["in"].float()
         linear_out = slot["out"].float()
         if ".experts." in name and linear_in.ndim > 2:
-            ep_size = mpu.get_expert_model_parallel_world_size()
-            ep_rank = mpu.get_expert_model_parallel_rank()
+            ep_size = self._megatron.mpu.get_expert_model_parallel_world_size()
+            ep_rank = self._megatron.mpu.get_expert_model_parallel_rank()
             global_idx = int(re.search(r"weight(\d+)$", name).group(1))
             local_idx = global_idx - ep_rank * self.args.num_experts // ep_size
             linear_in = linear_in[local_idx]
@@ -1202,7 +1237,7 @@ class DeviceDirectBackend(CommBackend):
         """
         # Delta-skip: skip the whole push when no adapter param changed beyond threshold. MUST be
         # a collective decision (each rank owns different adapter shards) or the gather would hang.
-        all_params = dict(named_params_and_buffers(self.args, self.model, convert_to_global_name=False))
+        all_params = dict(self._megatron.named_params_and_buffers(self.args, self.model, convert_to_global_name=False))
         unchanged, new_state = self._lora_sync.should_skip(all_params)
         if not first_sync and unchanged:
             logger.debug("LoRA adapter unchanged on all ranks, skipping adapter push")

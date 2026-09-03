@@ -169,6 +169,7 @@ def test_provider_source_is_attached_before_same_uri_ref_validation(monkeypatch,
     parsed = SimpleNamespace(
         hf_checkpoint=logical_uri,
         ref_load=logical_uri,
+        train_backend="megatron",
         start_rollout_id=None,
         critic_train_only=False,
         actor_num_nodes=1,

@@ -25,7 +25,12 @@ wandb
 debugpy==1.8.0
 math_verify==0.8.0
 librosa
+diffusers>=0.37.0
 imageio[ffmpeg]
+# Upper-bounded on purpose: relax/backends/fsdp/lora.py imports
+# `peft.tuners.lora.LoraLayer`, a PEFT internal with no stability guarantee.
+peft>=0.20.0,<0.21.0
+soundfile
 colorlog
 loguru
 av==17.0.0

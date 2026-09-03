@@ -277,7 +277,8 @@ export default defineConfig({
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
-                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' }
+                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
+                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' }
               ]
             },
             {
@@ -393,7 +394,8 @@ export default defineConfig({
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
-                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' }
+                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
+                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' }
               ]
             },
             {

@@ -419,6 +419,7 @@ def build_hf_peft_config_dict(
     lora_alpha: int,
     target_modules,
     lora_dropout: float,
+    task_type: str = "CAUSAL_LM",
 ) -> dict:
     """Build the HF-PEFT adapter config dict (the content of
     ``adapter_config.json``).
@@ -428,6 +429,9 @@ def build_hf_peft_config_dict(
     SGLang's ``LoRAConfig.from_dict``. JSON-safe (no enums). ``target_modules``
     must already be HF-style names (see
     ``convert_megatron_to_hf_target_modules``).
+
+    ``task_type`` defaults to the LLM value; diffusion DiTs must pass
+    ``FEATURE_EXTRACTION`` or a PEFT loader will try to attach a causal-LM head.
     """
     return {
         "r": lora_rank,
@@ -436,7 +440,7 @@ def build_hf_peft_config_dict(
         "lora_dropout": lora_dropout,
         "bias": "none",
         "peft_type": "LORA",
-        "task_type": "CAUSAL_LM",
+        "task_type": task_type,
     }
 
 
@@ -448,6 +452,7 @@ def write_hf_peft_adapter(
     lora_alpha: int,
     target_modules,
     lora_dropout: float,
+    task_type: str = "CAUSAL_LM",
 ) -> str:
     """Write a merged LoRA adapter as a standard HF-PEFT directory.
 
@@ -460,6 +465,7 @@ def write_hf_peft_adapter(
         adapter_dir: Target directory (created if missing).
         lora_rank/lora_alpha/target_modules/lora_dropout: PEFT config written to
             ``adapter_config.json`` (HF-style target module names).
+        task_type: PEFT task type; ``FEATURE_EXTRACTION`` for diffusion DiTs.
 
     Returns:
         The adapter directory path as a string.
@@ -478,6 +484,7 @@ def write_hf_peft_adapter(
         lora_alpha=lora_alpha,
         target_modules=target_modules,
         lora_dropout=lora_dropout,
+        task_type=task_type,
     )
     with open(adapter_dir / "adapter_config.json", "w") as f:
         json.dump(config_dict, f)

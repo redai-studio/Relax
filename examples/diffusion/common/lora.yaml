@@ -1,0 +1,66 @@
+# Shared invariants for native generative RL with LoRA (FlowGRPO / FSDP2 / colocate).
+# Sibling of full_ft.yaml — same pipeline, parameter-efficient instead of full-FT.
+# The canonical launch path is scripts/training/diffusion/run-qwen-image-t2i-lora-8xgpu.sh.
+#
+# What LoRA buys here is MEMORY HEADROOM, not sync bandwidth: it removes the
+# gradients and the AdamW moments for the frozen base (~25 GB/rank on a 20B DiT),
+# which is what lets you raise n_samples_per_prompt and the number of trained SDE
+# steps. The validated path is adapter sync: only the LoRA tensors move each
+# step. Set lora_merge_mode only when validating the full-weight merge path.
+
+# --- backend & algorithm ---
+train_backend: fsdp
+advantage_estimator: grpo
+loss_type: policy_loss
+generative_advantage_std_mode: group
+colocate: true
+fully_async: false
+offload_train: true
+offload_rollout: true
+
+# --- rollout / driver hooks (resolved by the FSDP + native-generation wiring) ---
+rollout_engine_class_path: relax.backends.sglang.diffusion_engine.SGLangNativeGenerationEngine
+rollout_function_path: relax.engine.rollout.native_generation.generate_rollout
+custom_convert_samples_to_train_data_path: relax.engine.rollout.native_generation.convert_samples_to_train_data
+custom_reward_post_process_path: relax.engine.rewards.generative.post_process
+
+# --- FSDP2 LoRA + adapter hyperparameters (design doc 10.1) ---
+# One convention: nested `training:` only. The merge maps these onto the flat
+# --fsdp-* / --lora-* CLI dests AFTER the deep-merge, so a flat duplicate here
+# would be silently overwritten by a task YAML's nested value.
+training:
+  trainable_mode: lora
+  trainable_attr: transformer
+  param_dtype: bf16
+  reduce_dtype: fp32
+  # fp32 optimizer masters for the adapter only. Without this the ~1e-4 relative RL
+  # updates round off a bf16 mantissa: grad norm and loss stay healthy while the
+  # policy stops moving, which reads exactly like a too-low learning rate.
+  master_dtype: fp32
+  activation_checkpointing: true
+
+  # LoRA adapter (reuses the shared --lora-* flags).
+  lora_rank: 64
+  lora_alpha: 128
+  # Must stay 0: the FlowGRPO pi_old anchor is a replay through the live model, so a
+  # stochastic forward breaks the ratio==1 invariant of the first mini-epoch and the
+  # clipped loss silently collapses. Preflight rejects anything else.
+  lora_dropout: 0.0
+  # Unset -> the model adapter's own default list (QwenImageAdapter: the eight
+  # attention projections). Override per model family if needed.
+  # lora_target_modules: [attn.to_q, attn.to_k, attn.to_v, attn.to_out.0]
+  #
+  # Rollout path: adapter streams only LoRA tensors; merge folds B@A into the
+  # base and streams full weights. Both modes require the combined SGLang patch
+  # at docker/patch/sglang/v0.5.15.post1.patch.
+  lora_merge_mode: false
+  lora_adapter_mode: true
+
+# --- weight sync transaction (design doc 10) ---
+weight_sync:
+  mode: adapter
+  wire_dtype: bf16
+  bucket_size_mb: 512
+
+# --- data ---
+input_key: prompt

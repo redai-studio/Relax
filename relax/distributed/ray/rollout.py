@@ -75,6 +75,20 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = get_logger(__name__)
 
 
+def _resolve_rollout_engine_class(args):
+    """Return the rollout engine class for the configured run.
+
+    ``rollout_engine_class_path`` (a dotpath) selects a custom engine such as
+    the native-diffusion generation engine; when unset the default text
+    ``SGLangEngine`` is returned so existing runs are unaffected (design doc
+    8.3).
+    """
+    class_path = getattr(args, "rollout_engine_class_path", None)
+    if class_path:
+        return load_function(class_path)
+    return SGLangEngine
+
+
 @dataclasses.dataclass
 class EngineGroupConfig:
     """Configuration for a single engine group.
@@ -481,7 +495,7 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -2106,7 +2120,7 @@ class RolloutManager(ReloadableMixin):
                 # Create SGLangEngine actor (connecting mode).
                 # No GPU needed: this actor is an RPC proxy to the external engine;
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
-                RolloutRayActor = ray.remote(SGLangEngine)
+                RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
                     self.args,

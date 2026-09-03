@@ -95,6 +95,14 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
 
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
+    # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
+    # via a declared hook, so the default token converter below is bypassed
+    # (design doc 8.3). When unset the standard token path runs unchanged.
+    custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    if custom_convert_path is not None:
+        custom_convert_func = load_function(custom_convert_path)
+        return custom_convert_func(args, samples)
+
     raw_rewards, rewards = post_process_rewards(args, samples)
 
     assert len(raw_rewards) == len(samples)
@@ -317,9 +325,17 @@ def dict_to_tensordict(
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
             continue
+        if key == "trajectory_refs":
+            # Serialized Ray ObjectRefs are padded to a fixed width per batch.
+            # Keep them as dense uint8 so TransferQueue and the rank-0 broadcast
+            # do not pay NestedTensor metadata/serialization overhead.
+            result[key] = torch.tensor(value, dtype=torch.uint8, device=device)
+            continue
+
         if value and isinstance(value[0], torch.Tensor):
             result[key] = _to_nested_tensor_from_tensor_list(value)
             continue
+
         depth = _nesting_depth(value)
         if depth == 0:  # empty list []
             tensor = torch.empty(0)

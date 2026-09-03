@@ -1658,11 +1658,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--lora-target-modules",
                 type=str,
                 nargs="+",
-                default=["linear_qkv", "linear_proj"],
+                default=None,
                 help=(
-                    "Target modules for LoRA (Megatron-style names, e.g. linear_qkv, "
-                    "linear_proj, linear_fc1, linear_fc2). Expanded to HF-style names "
-                    "automatically when exporting the adapter."
+                    "Target modules for LoRA. Megatron-style names on the Megatron backend "
+                    "(e.g. linear_qkv, linear_proj, linear_fc1, linear_fc2), expanded to "
+                    "HF-style names automatically when exporting the adapter; module-name "
+                    "suffixes of the trainable transformer on the FSDP generative backend "
+                    "(e.g. attn.to_q, attn.to_out.0). Unset falls back to the Megatron "
+                    "defaults, or to the generative model adapter's own list under "
+                    "--train-backend fsdp."
                 ),
             )
             parser.add_argument(
@@ -2713,6 +2717,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_ci_arguments(parser)
         parser = add_autoscaler_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        # Native generative RL (FSDP2 diffusion/flow training). Adds engine /
+        # adapter / task / reward / sampling / weight-sync flags and the FSDP2
+        # training group; default path is unaffected (all flags default off).
+        from relax.backends.fsdp.arguments import add_generative_arguments
+
+        parser = add_generative_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -2745,7 +2755,7 @@ def _pre_parse_mode():
     Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
+    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -2851,10 +2861,21 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
 
     # Serialize the driver-derived descriptor with args to every Ray actor.
     args.model_source = model_source
+    # --lora-target-modules is backend-flavoured: Megatron wants Megatron module
+    # names, the FSDP generative backend wants diffusers module-name suffixes and
+    # gets a per-model-family default from its adapter. Resolve the Megatron
+    # fallback here so every downstream Megatron consumer keeps seeing a concrete
+    # list, and leave it None for fsdp so the actor can defer to the adapter.
+    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+        args.lora_target_modules = ["linear_qkv", "linear_proj"]
 
     slime_validate_args(args)
 
-    if not args.debug_rollout_only:
+    if args.train_backend == "fsdp":
+        from relax.backends.fsdp.arguments import validate_generative_config
+
+        validate_generative_config(args)
+    elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
     if not args.debug_train_only:
