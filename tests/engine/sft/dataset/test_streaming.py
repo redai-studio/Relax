@@ -760,6 +760,25 @@ def _invalid_image_url_rows() -> list[dict]:
     ]
 
 
+def _media_fetch_rows() -> list[dict]:
+    return [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the image."},
+                        {"type": "image_url", "image_url": {"url": f"https://example.test/{idx}.png"}},
+                    ],
+                },
+                {"role": "assistant", "content": f"Answer {idx}"},
+            ],
+            "images": [],
+        }
+        for idx in range(2)
+    ]
+
+
 def test_streaming_dataset_invalid_multimodal_defaults_to_error(tmp_path: Path):
     path = tmp_path / "train.jsonl"
     _write_jsonl(path, _invalid_image_url_rows()[:1])
@@ -781,6 +800,83 @@ def test_streaming_dataset_invalid_multimodal_defaults_to_error(tmp_path: Path):
             ds.get_batch(1)
     finally:
         ds.stop()
+
+
+def test_streaming_dataset_media_fetch_error_defaults_to_error(tmp_path: Path):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, _media_fetch_rows()[:1])
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=MagicMock(),
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=0,
+        prefetch_max_cached=0,
+    )
+    ds.shuffle(0)
+
+    try:
+        with (
+            patch("relax.engine.sft.dataset.streaming.render_to_text", return_value="rendered prompt"),
+            patch(
+                "relax.engine.sft.dataset.streaming.preprocess_multimodal",
+                side_effect=RuntimeError("429 Too Many Requests"),
+            ),
+            pytest.raises(RuntimeError, match="429 Too Many Requests"),
+        ):
+            ds.get_batch(1)
+    finally:
+        ds.stop()
+
+
+@pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])
+def test_streaming_dataset_media_fetch_error_skip_refills_batch(tmp_path: Path, caplog, batch_mode: str):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(path, _media_fetch_rows())
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=MagicMock(),
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=0,
+        prefetch_max_cached=4 if batch_mode == "prefetch" else 0,
+        prefetch_chunk_size=1,
+        prefetch_num_workers=1,
+        invalid_multimodal_strategy="skip",
+    )
+
+    def _preprocess(sample, **_kwargs):
+        if sample.metadata["row_index"] == 0:
+            raise RuntimeError("429 Too Many Requests")
+        return None, None
+
+    async def _preprocess_async(sample, **_kwargs):
+        return _preprocess(sample)
+
+    with (
+        patch("relax.engine.sft.dataset.streaming.render_to_text", return_value="rendered prompt"),
+        patch("relax.engine.sft.dataset.streaming.preprocess_multimodal", side_effect=_preprocess),
+        patch("relax.engine.sft.dataset.streaming.preprocess_multimodal_async", side_effect=_preprocess_async),
+    ):
+        ds.shuffle(0)
+        try:
+            if batch_mode == "async":
+                samples, _ = asyncio.run(ds.get_batch_async(1))
+            else:
+                samples, _ = ds.get_batch(1)
+        finally:
+            ds.stop()
+
+    assert [sample.source_idx for sample in samples] == [1]
+    assert "SFTStreamingDataset[invalid-multimodal=skip]" in caplog.text
+    assert "sample idx=0" in caplog.text
+    assert "429 Too Many Requests" in caplog.text
 
 
 @pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])

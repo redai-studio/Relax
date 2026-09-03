@@ -707,12 +707,13 @@ class SFTStreamingDataset:
 
     async def _get_batch_async_gather(self, n: int) -> tuple[list[ProcessedSample], bool]:
         self._raise_if_failed()
-        rendered: list[_RenderedSample] = []
+        out: list[ProcessedSample] = []
         crossed_epoch = False
         max_attempts = max(n * 10, 32)
         attempts = 0
-        while len(rendered) < n and attempts < max_attempts:
-            need = n - len(rendered)
+        while len(out) < n and attempts < max_attempts:
+            rendered: list[_RenderedSample] = []
+            need = n - len(out)
             indices, ec = self.index_manager.get_next_indices(need)
             crossed_epoch = crossed_epoch or ec
             for idx in indices:
@@ -720,15 +721,15 @@ class SFTStreamingDataset:
                 pre = self._render_one(idx)
                 if pre is not None:
                     rendered.append(pre)
-        if len(rendered) < n:
+            if not rendered:
+                continue
+            coros = [self._finalize_async(r) for r in rendered]
+            finalized = await asyncio.gather(*coros)
+            out.extend(r for r in finalized if r is not None)
+        if len(out) < n:
             logger.warning(
-                f"SFTStreamingDataset.get_batch_async: rendered {len(rendered)}/{n} after {attempts} attempts."
+                f"SFTStreamingDataset.get_batch_async: returned {len(out)}/{n} samples after {attempts} attempts."
             )
-        if not rendered:
-            return [], crossed_epoch
-        coros = [self._finalize_async(r) for r in rendered]
-        finalized = await asyncio.gather(*coros)
-        out = [r for r in finalized if r is not None]
         return out, crossed_epoch
 
     def _process_one_safe(self, idx: int) -> ProcessedSample | None:
@@ -751,11 +752,16 @@ class SFTStreamingDataset:
         rendered = self._render_one(idx)
         if rendered is None:
             return None
-        prompt_ids, mm_inputs = preprocess_multimodal(
-            rendered.sample,
-            processor_pool=self.processor_pool,
-            rendered_text=rendered.rendered_text or "",
-        )
+        try:
+            prompt_ids, mm_inputs = preprocess_multimodal(
+                rendered.sample,
+                processor_pool=self.processor_pool,
+                rendered_text=rendered.rendered_text or "",
+            )
+        except Exception as exc:
+            if not self._skip_multimodal_processing_error(rendered, exc):
+                raise
+            return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
 
     def _render_one(self, idx: int) -> "_RenderedSample | None":
@@ -798,12 +804,27 @@ class SFTStreamingDataset:
         )
 
     async def _finalize_async(self, rendered: "_RenderedSample") -> ProcessedSample | None:
-        prompt_ids, mm_inputs = await preprocess_multimodal_async(
-            rendered.sample,
-            processor_pool=self.processor_pool,
-            rendered_text=rendered.rendered_text or "",
-        )
+        try:
+            prompt_ids, mm_inputs = await preprocess_multimodal_async(
+                rendered.sample,
+                processor_pool=self.processor_pool,
+                rendered_text=rendered.rendered_text or "",
+            )
+        except Exception as exc:
+            if not self._skip_multimodal_processing_error(rendered, exc):
+                raise
+            return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
+
+    def _skip_multimodal_processing_error(self, rendered: "_RenderedSample", exc: Exception) -> bool:
+        if self._invalid_multimodal_strategy == "error":
+            return False
+        logger.warning(
+            f"SFTStreamingDataset[invalid-multimodal=skip]: sample idx={rendered.idx} in "
+            f"{self.source_name!r} failed media loading or preprocessing: "
+            f"{type(exc).__name__}: {exc}. Skipping."
+        )
+        return True
 
     def _build_processed(
         self,
