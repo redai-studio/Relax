@@ -7,11 +7,11 @@
 # export written alongside the native torch_dist checkpoint.
 #
 # Usage:
-#   MEGATRON=<gemma-4 tree> MODEL_DIR=<dir with gemma-4-26B-A4B-it> \
+#   MODEL_DIR=<dir with gemma-4-26B-A4B-it> \
 #   PROMPT_DATA=<sft.jsonl> bash scripts/training/sft/run-gemma4-26B-sft-hf-8xgpu.sh
 #
 #   # fp8 export instead of bf16 (~half the size; needs a safetensors --hf-checkpoint):
-#   SAVE_HF_DTYPE=fp8 MEGATRON=... bash scripts/training/sft/run-gemma4-26B-sft-hf-8xgpu.sh
+#   SAVE_HF_DTYPE=fp8 bash scripts/training/sft/run-gemma4-26B-sft-hf-8xgpu.sh
 
 set -ex
 set -o pipefail
@@ -21,21 +21,6 @@ unset NCCL_NVLS_ENABLE
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-RELAX_ROOT="$(cd -- "${RELAX:-${SCRIPT_DIR}/../../..}" &>/dev/null && pwd)"
-export RELAX="${RELAX_ROOT}"
-
-export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
-
-if ! PYTHONPATH="${RELAX_ROOT}:${MEGATRON}:${PYTHONPATH:-}" python3 -c \
-    'import inspect; from megatron.bridge.models.gemma.gemma4_provider import Gemma4DenseProvider, Gemma4ModelProvider; from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge; from relax.models.gemma4.gemma4_bridge import Gemma4DenseBridge; from relax.models.gemma4.gemma4_provider import RELAX_PROVIDERS, PackedSafeGemma4DenseProvider, RelaxGemma4MoEProvider; source = inspect.getsource(Gemma4VLBridge.provider_bridge); ok = source.count("_conversion_mode()") >= 2 and RELAX_PROVIDERS.get(Gemma4DenseProvider) is PackedSafeGemma4DenseProvider and RELAX_PROVIDERS.get(Gemma4ModelProvider) is RelaxGemma4MoEProvider
-if not ok:
-    raise RuntimeError("Gemma4 packed-safe provider mapping is unavailable")' \
-    >/dev/null 2>&1; then
-    echo "ERROR: Gemma4 packed-safe integration failed its startup probe." >&2
-    echo "       ${MEGATRON} must provide the required providers and MoE text mode," >&2
-    echo "       and Relax's Gemma4 bridge/provider replacements must import cleanly." >&2
-    exit 1
-fi
 
 MODEL_CONFIG_DIR="${MODEL_CONFIG_DIR:-${SCRIPT_DIR}/../../models}"
 source "${MODEL_CONFIG_DIR}/gemma4-26B.sh"

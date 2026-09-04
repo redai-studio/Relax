@@ -5,7 +5,7 @@
 # gemma-4-31B-it full-parameter SFT, TP=8 PP=1, ray-submit launch.
 #
 # Usage:
-#   MEGATRON=<gemma-4 tree> MODEL_DIR=<dir with gemma-4-31B-it> \
+#   MODEL_DIR=<dir with gemma-4-31B-it> \
 #   PROMPT_DATA=<sft.jsonl> bash scripts/training/sft/run-gemma4-31B-sft-8xgpu.sh
 #
 #   # multi-node (QS sets MASTER_ADDR/POD_NAME/WORLD_SIZE):
@@ -20,21 +20,6 @@ unset NCCL_NVLS_ENABLE
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-RELAX_ROOT="$(cd -- "${RELAX:-${SCRIPT_DIR}/../../..}" &>/dev/null && pwd)"
-export RELAX="${RELAX_ROOT}"
-
-export MEGATRON="${MEGATRON:-/root/Megatron-LM/}"
-
-if ! PYTHONPATH="${RELAX_ROOT}:${MEGATRON}:${PYTHONPATH:-}" python3 -c \
-    'from megatron.bridge.models.gemma.gemma4_provider import Gemma4DenseProvider; from relax.models.gemma4.gemma4_bridge import Gemma4DenseBridge; from relax.models.gemma4.gemma4_provider import RELAX_PROVIDERS, PackedSafeGemma4DenseProvider; ok = RELAX_PROVIDERS.get(Gemma4DenseProvider) is PackedSafeGemma4DenseProvider
-if not ok:
-    raise RuntimeError("Gemma4 packed-safe provider mapping is unavailable")' \
-    >/dev/null 2>&1; then
-    echo "ERROR: Gemma4 packed-safe integration failed its startup probe." >&2
-    echo "       ${MEGATRON} must provide Gemma4DenseProvider, and Relax's" >&2
-    echo "       Gemma4 bridge/provider replacement must import cleanly." >&2
-    exit 1
-fi
 
 TP_SIZE="${TP_SIZE:-8}"
 ACTOR_GPUS="${ACTOR_GPUS:-8}"
