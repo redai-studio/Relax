@@ -249,7 +249,9 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
         resolved_window_id = 0 if window_id is None else window_id
         task_state = self._task_state(partition_id, task_name)
         window = self._window(task_state, resolved_window_id, window_quota)
-        if len(window.terminal_batch_by_dp) == dp_size:
+        # A lagging DP may still need a dummy for an earlier uncached round.
+        # Only indexes beyond the established terminal are guaranteed to be done.
+        if len(window.terminal_batch_by_dp) == dp_size and batch_index > max(window.terminal_batch_by_dp.values()):
             return
         bucket_key = (partition_id, task_name, resolved_window_id)
         buckets = self._window_buckets.setdefault(bucket_key, {})
@@ -358,7 +360,8 @@ class IdentityWindowSampler(StreamingTokenBudgetSampler):
 
         if window.admission_closed and all(not bucket for bucket in buckets.values()):
             for rank in range(dp_size):
-                window.terminal_batch_by_dp[rank] = batch_index
+                # Replaying an older hole must not move the terminal backwards.
+                window.terminal_batch_by_dp.setdefault(rank, batch_index)
                 if (rank, batch_index) in window.served_cache_keys:
                     window.finalized_dps.add(rank)
 
