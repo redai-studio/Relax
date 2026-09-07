@@ -3,10 +3,15 @@
 
 from __future__ import annotations
 
+import faulthandler
 import multiprocessing as mp
 import os
 import socket
+import time
+from collections.abc import Callable
 from datetime import timedelta
+from multiprocessing.queues import Queue
+from multiprocessing.synchronize import Event
 from types import SimpleNamespace
 
 import pytest
@@ -192,6 +197,90 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _failure_worker_entry(
+    rank: int,
+    port: int,
+    queue: Queue,
+    ready: Event,
+    start: Event,
+    worker: Callable[..., None],
+    worker_args: tuple[str, ...],
+    startup_timeout: float,
+    run_timeout: float,
+) -> None:
+    # Spawn reimports this module and its optional Megatron/modelopt dependencies
+    # before entering here. Do not charge those imports to the hang watchdog.
+    ready.set()
+    if not start.wait(timeout=startup_timeout):
+        raise TimeoutError(f"rank {rank} did not receive the test start signal")
+    faulthandler.dump_traceback_later(max(run_timeout - 5, run_timeout / 2))
+    try:
+        worker(rank, port, *worker_args, queue)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _run_failure_workers(
+    worker: Callable[..., None],
+    *worker_args: str,
+    startup_timeout: float = 120,
+    run_timeout: float = 20,
+) -> list[tuple[int, str]]:
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    start = ctx.Event()
+    ready = [ctx.Event() for _ in range(2)]
+    port = _free_port()
+    processes = [
+        ctx.Process(
+            target=_failure_worker_entry,
+            args=(rank, port, queue, ready[rank], start, worker, worker_args, startup_timeout, run_timeout),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        deadline = time.monotonic() + startup_timeout
+        for rank, (event, process) in enumerate(zip(ready, processes)):
+            while not event.wait(timeout=min(0.1, max(0, deadline - time.monotonic()))):
+                if process.exitcode is not None:
+                    pytest.fail(f"rank {rank} exited during spawn/import with exit code {process.exitcode}")
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"rank {rank} did not finish spawn/import within {startup_timeout}s")
+
+        # Keep the strict execution deadline, but start it only once both ranks
+        # have imported their dependencies and can enter the collective test.
+        deadline = time.monotonic() + run_timeout
+        start.set()
+        for process in processes:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        hung_ranks = [rank for rank, process in enumerate(processes) if process.is_alive()]
+        if hung_ranks:
+            pytest.fail(
+                f"{worker.__name__}{worker_args}: ranks {hung_ranks} hung during execution/exit ({run_timeout}s)"
+            )
+        assert all(process.exitcode == 0 for process in processes), [process.exitcode for process in processes]
+        results = sorted(queue.get(timeout=2) for _ in processes)
+        assert [rank for rank, _ in results] == [0, 1]
+        return results
+    finally:
+        # Clean up every sibling even if startup, an assertion, or a join fails.
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                if not process.is_alive():
+                    process.close()
+        queue.close()
+        queue.join_thread()
+
+
 def _serialization_failure_worker(rank: int, port: int, queue) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -212,20 +301,7 @@ def _serialization_failure_worker(rank: int, port: int, queue) -> None:
 
 
 def test_non_src_serialization_failure_exits_all_ranks_without_hang():
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    port = _free_port()
-    processes = [ctx.Process(target=_serialization_failure_worker, args=(rank, port, queue)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=20)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            pytest.fail("weight-sync rank hung after a non-src serialization failure")
-        assert process.exitcode == 0
-    results = sorted(queue.get(timeout=2) for _ in range(2))
+    results = _run_failure_workers(_serialization_failure_worker)
     assert all("injected serializer failure" in message for _, message in results)
 
 
@@ -267,18 +343,5 @@ def _local_phase_failure_worker(rank: int, port: int, phase: str, queue) -> None
 
 @pytest.mark.parametrize("phase, message", [("model_load", "model load failure"), ("tq_read", "TQ read failure")])
 def test_rank_local_precollective_failure_exits_all_ranks_without_hang(phase, message):
-    ctx = mp.get_context("spawn")
-    queue = ctx.Queue()
-    port = _free_port()
-    processes = [ctx.Process(target=_local_phase_failure_worker, args=(rank, port, phase, queue)) for rank in range(2)]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=20)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            pytest.fail(f"rank hung after injected {phase} failure")
-        assert process.exitcode == 0
-    results = sorted(queue.get(timeout=2) for _ in range(2))
+    results = _run_failure_workers(_local_phase_failure_worker, phase)
     assert all(message in result for _, result in results)
