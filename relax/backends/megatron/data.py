@@ -1068,6 +1068,7 @@ def log_rollout_data(
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     use_sample_mean = key in [
+                        "rewards",
                         "log_probs",
                         "ref_log_probs",
                         "rollout_log_probs",

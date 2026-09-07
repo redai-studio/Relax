@@ -1021,7 +1021,7 @@ def post_process_rollout_data(args, rollout_data):
         or getattr(args, "uses_unsplit_forward", False),
     )
 
-    for key in [
+    response_float_fields = [
         "log_probs",
         "ref_log_probs",
         "rollout_log_probs",
@@ -1029,7 +1029,16 @@ def post_process_rollout_data(args, rollout_data):
         "returns",
         "values",
         *iter_opd_cp_float_fields(),
-    ]:
+    ]
+    rewards = rollout_data.get("rewards", [])
+    if rewards and isinstance(rewards[0], list):
+        rollout_data["rewards"] = [
+            row * response_length if len(row) == 1 else row
+            for row, response_length in zip(rewards, rollout_data["response_lengths"], strict=True)
+        ]
+        response_float_fields.append("rewards")
+
+    for key in response_float_fields:
         if key not in rollout_data:
             continue
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.

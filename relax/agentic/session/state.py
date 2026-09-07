@@ -700,6 +700,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
+        response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
@@ -720,7 +721,9 @@ class SessionForest:
                 if first_response_node is None:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
+                response_node_spans.append([response_start, len(continuation_train_tokens)])
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
@@ -774,6 +777,7 @@ class SessionForest:
             response=_decode_tokens(tokenizer=tokenizer, token_ids=continuation_train_tokens),
             response_length=len(continuation_train_tokens),
             label=self.label,
+            custom_advantage=response_node_spans,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
             rollout_log_probs=rollout_log_probs,

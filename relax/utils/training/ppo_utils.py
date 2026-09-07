@@ -652,7 +652,7 @@ def _calculate_log_probs_and_entropy_chunk(
 
 
 def get_grpo_returns(
-    rewards: torch.Tensor,
+    rewards: torch.Tensor | list[float] | list[torch.Tensor],
     kl: list[torch.Tensor],
 ):
     returns = []
