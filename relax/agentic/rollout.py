@@ -53,7 +53,7 @@ _RESIDENT_ENTRY_LOCK = threading.Lock()
 _RESIDENT_ASYNC_LOCK = threading.Lock()
 _RESIDENT_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 _RESIDENT_ASYNC_THREAD: threading.Thread | None = None
-_AGENT_METADATA_INTERNAL_KEYS = {TRACE_KEY}
+_METADATA_METRIC_SKIP = {TRACE_KEY, "id", "index", "sample_index", "group_index", "start_rollout_id", "rollout_turns"}
 logger = get_logger(__name__)
 _IDLE_HEARTBEAT_INTERVAL_S = 30.0
 
@@ -795,7 +795,7 @@ def _collect_agentic_metadata_metrics(samples: list[Sample]) -> dict[str, float]
                 isinstance(key, str)
                 and key
                 and not key.startswith("_")
-                and key not in _AGENT_METADATA_INTERNAL_KEYS
+                and key not in _METADATA_METRIC_SKIP
                 and isinstance(value, (int, float))
             ):
                 metric_values.setdefault(key, []).append(float(value))

@@ -26,7 +26,7 @@ Relax provides:
 | `RELAX_INPUT_JSON` | Session input path; payload may provide messages, metadata, or both |
 | `RELAX_OUTPUT_JSON` | Optional terminal output and explicit export records |
 | `RELAX_SESSION_IO_DIR` | Per-Session temporary directory owned and removed by the agent process runtime |
-| `RELAX_BASE_URL` | OpenAI-compatible Chat Completions base URL |
+| `RELAX_BASE_URL` | Base URL for the supported model API endpoints |
 | `RELAX_SESSION_ID` | Session route token and API credential |
 | `RELAX_ROLLOUT_MODE` | `train` or `eval`, for mode-specific agent/export behavior |
 | `RELAX_GROUP_ID` | Logical Runtime Group identifier |
@@ -42,19 +42,37 @@ metadata and logical indices. Eval resolves input and metadata keys per dataset.
 
 ## Model request contract
 
-Send complete normalized `messages` on every request. Reuse stable `tools` and `chat_template_kwargs` for a continuous lineage. Preserve assistant reasoning content, tool calls, call IDs, and tool results exactly as observed by the model.
+Choose the interface used by the actual agent client and send its complete history on every request:
 
-Inspect the actual wire messages. Relax accepts `user`, `assistant`, `tool`, and `system`. If a harness emits
-`developer`, prefer its compatibility setting for `system`; otherwise ask whether the user accepts that semantic
-conversion or treat the endpoint as incompatible. User, system, and tool messages require present, non-`null`,
-non-zero-length content. Assistant may omit text content when the message carries tool calls or nonempty reasoning.
-When a tool returns `None` or `""`, choose a stable nonempty representation and keep it in every later turn and export.
+| Interface | Endpoint | Complete-history input |
+| --- | --- | --- |
+| OpenAI Chat Completions | `/v1/chat/completions` | `messages` |
+| OpenAI Responses | `/v1/responses` | typed `input` Items |
+| Anthropic Messages | `/v1/messages` | `system + messages` |
 
-Request `chat_template_kwargs` must not set `add_generation_prompt`, `tokenize`, or `tools`. Send tools through the
+Every protocol is projected to canonical `messages`, nested function `tools`, and `chat_template_kwargs` before
+SessionForest matching. Reuse stable tools and applicable template arguments for a continuous lineage. Preserve
+assistant reasoning, tool calls, call IDs, and tool results exactly as observed by the model. Responses
+`previous_response_id` is not a continuation handle; replay the complete typed `input`.
+
+Inspect the actual HTTP payload. Canonical history accepts `user`, `assistant`, `tool`, and `system`. Chat clients must
+convert `developer` to `system`; Responses projection performs that conversion. User, system, and tool messages require
+present, non-`null`, non-zero-length content. Assistant may omit text content when the message carries tool calls or
+nonempty reasoning. When a tool returns `None` or `""`, choose a stable nonempty representation and keep it in every
+later turn and export.
+
+Chat request `chat_template_kwargs` must not set `add_generation_prompt`, `tokenize`, or `tools`. Send tools through the
 top-level `tools` field. Any adapter-side canonicalization becomes the SessionForest history and must also be used by
 explicit export.
 
-The current endpoint contract and supported request fields must be verified in `relax/agentic/session/service.py`; do not infer OpenAI feature support from the client library.
+Verify the endpoint contract, supported Items/blocks, and transport behavior in
+`relax/agentic/session/service.py`; the client library's full schema does not extend the Relax contract.
+
+Omitting `stream` or setting it to `false` returns JSON. `stream=true` returns Buffered SSE: connection frames and
+heartbeats may arrive while generation is pending, then all model-content terminal events arrive after complete
+generation. A successful Chat stream has one terminal chunk containing complete usage followed by `[DONE]`, independent
+of `stream_options.include_usage`. This transport does not change normalization, SessionForest state, sampling, or
+export.
 
 ## Reasoning and tool-call parser contract
 
@@ -63,7 +81,7 @@ decoded response first; `--agentic-tool-call-parser` then parses the remaining t
 lineage contains `tools`. Verify that both parser names exist in the installed SGLang version. A parser name from a
 different model recipe is not compatibility evidence.
 
-Relax returns and commits the parsed assistant message to SessionForest:
+Relax commits this parsed canonical assistant message to SessionForest, then renders it in the request protocol:
 
 ```text
 content
@@ -74,11 +92,11 @@ finish_reason = tool_calls | stop | length
 
 A missing or incompatible parser can leave reasoning or tool syntax inside plain `content`, remove ordinary answer
 text, produce malformed arguments, or prevent the agent's tool loop from continuing. Capture one raw decoded model
-response and its Relax `choices[0].message`; test both a real tool-call turn and a non-tool final-answer turn when the
-model can produce both.
+response and its protocol-rendered Relax response; test both a real tool-call turn and a non-tool final-answer turn when
+the model can produce both.
 
 The model client created inside the agent application is the Relax-facing agent client. Configure the timeout of each
-Chat Completions request for the full lifetime of that request. Prelaunch can hold the first request before lease;
+model API request for the full lifetime of that request. Prelaunch can hold the first request before lease;
 partial rollout and fully async can retain a request across runtime boundaries. `--agent-timeout` separately limits the
 agent process's Runtime active time to contain agent-side hangs. Use
 [runtime-operations.md](runtime-operations.md) for the decision rule.
@@ -103,6 +121,9 @@ metadata needed for credit
 optional reward
 ```
 
+Explicit records always use canonical Chat-shaped `messages`, nested function `tools`, and `chat_template_kwargs`,
+including for Sessions whose agent used Responses or Messages.
+
 Every record must resolve to a committed SessionForest state. A JSON array is not the explicit export format. Keep task outcome reporting separate from per-context training credit.
 
 ## Multimodal boundary
@@ -122,11 +143,12 @@ and lineage media for image tasks.
 Before experiment preflight, verify:
 
 1. the agent runs independently on one real task;
-2. the adapter reads input and reaches the Relax endpoint;
-3. one complete model/tool loop exits normally;
+2. the adapter reads input and reaches the selected Relax protocol endpoint with Bearer Session authentication;
+3. one complete JSON or Buffered SSE model/tool loop exits normally;
 4. the Relax-facing client and outer deadlines cover prelaunch, partial-rollout, and fully-async request lifetimes;
 5. request payloads pass the context-linearity audit;
-6. configured reasoning/tool-call parsers produce the expected structured assistant messages and finish reasons;
+6. configured reasoning/tool-call parsers produce the expected structured assistant messages, call IDs, and
+   protocol-specific finish reasons;
 7. implicit or explicit export resolves to committed state;
 8. export count and training credit match `agentic-training-contract.md`;
 9. agent, tool, sandbox, and external resources clean up.

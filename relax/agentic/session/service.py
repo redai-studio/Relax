@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Group-affine SessionShard lifecycle and OpenAI chat routing."""
+"""Group-affine SessionShard lifecycle and agentic API routing."""
 
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, cast
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
+from uuid import uuid4
 
 import ray
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.requests import ClientDisconnect
 
@@ -82,6 +83,7 @@ _DEFAULT_SESSION_SHARD_COUNT = 16
 # does not participate in Session first-request barriers. Runtime residency and
 # SGLang permits remain the resource limits.
 _AGENTIC_CHAT_MAX_ONGOING_REQUESTS = 9182
+_AGENTIC_SSE_HEARTBEAT_INTERVAL_S = 15.0
 # Bound glibc arena growth and make free chunks eligible for malloc_trim().
 # These settings mitigate long-lived Shard Private Dirty; they cannot fully
 # recover fragmentation that only process exit releases.
@@ -136,7 +138,7 @@ def _resolve_fastapi_request_endpoint(func: Callable[..., Any]) -> Callable[...,
     """Let FastAPI inspect the class-bound Request endpoint correctly."""
 
     func.__annotations__["request"] = Request
-    func.__annotations__["return"] = JSONResponse
+    func.__annotations__["return"] = Response
     return func
 
 
@@ -198,7 +200,15 @@ def _openai_token_logprobs_payload(
                 "top_logprobs": [],
             }
         )
-    return {"content": content, "refusal": None}
+    return {"content": content}
+
+
+def _function_tool_call(call_id: Any, name: Any, arguments: Any) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
 
 
 def _decode_response_payload(
@@ -249,14 +259,11 @@ def _decode_response_payload(
                 sort_keys=True,
             )
             tool_calls.append(
-                {
-                    "id": f"call_{hashlib.sha256(call_payload.encode()).hexdigest()[:24]}",
-                    "type": "function",
-                    "function": {
-                        "name": str(call_item.name or ""),
-                        "arguments": call_item.parameters,
-                    },
-                }
+                _function_tool_call(
+                    f"call_{hashlib.sha256(call_payload.encode()).hexdigest()[:24]}",
+                    str(call_item.name or ""),
+                    call_item.parameters,
+                )
             )
 
     if not text and reasoning_text is None and not tool_calls:
@@ -293,7 +300,7 @@ def _decode_routed_experts(
 
 
 class AgenticChatRequestError(HTTPException):
-    """OpenAI-compatible request failure returned through the chat gateway."""
+    """Request failure returned through the agentic API gateway."""
 
     def __init__(
         self,
@@ -321,7 +328,7 @@ def _session_discarded_error(session_id: str) -> AgenticChatRequestError:
     )
 
 
-def _openai_error_result(
+def _error_result(
     message: str,
     *,
     code: str = "invalid_request_error",
@@ -340,8 +347,17 @@ def _openai_error_result(
     }
 
 
-def _openai_error_from_exception(error: AgenticChatRequestError) -> dict[str, Any]:
-    return _openai_error_result(
+def _internal_error_result(message: str) -> dict[str, Any]:
+    return _error_result(
+        message,
+        code="internal_error",
+        status_code=500,
+        error_type="internal_error",
+    )
+
+
+def _error_from_exception(error: AgenticChatRequestError) -> dict[str, Any]:
+    return _error_result(
         error.message,
         code=error.code,
         param=error.param,
@@ -350,7 +366,7 @@ def _openai_error_from_exception(error: AgenticChatRequestError) -> dict[str, An
     )
 
 
-def _openai_context_length_error_result(
+def _context_length_error_result(
     *,
     max_context_len: Optional[int],
     prompt_tokens: Optional[int],
@@ -377,17 +393,17 @@ def _openai_context_length_error_result(
             f"{requested_completion_tokens} completion tokens ({total_tokens} tokens total). "
             "Please reduce the length of the messages or max_completion_tokens."
         )
-    return _openai_error_result(
+    return _error_result(
         message,
         code="context_length_exceeded",
         param="messages",
     )
 
 
-def _openai_context_length_error(*, max_context_len: int, prompt_tokens: int) -> AgenticChatRequestError:
+def _context_length_error(*, max_context_len: int, prompt_tokens: int) -> AgenticChatRequestError:
     error = cast(
         dict[str, Any],
-        _openai_context_length_error_result(
+        _context_length_error_result(
             max_context_len=max_context_len,
             prompt_tokens=prompt_tokens,
         )["error"],
@@ -403,12 +419,406 @@ def _openai_error_response(result: dict[str, Any]) -> JSONResponse:
     status_code = int(result.get("_http_status") or 400)
     payload = {key: value for key, value in result.items() if key != "_http_status"}
     headers = {}
-    error = result.get("error")
-    if isinstance(error, dict) and (
-        error.get("type") == "internal_error" or error.get("code") in {"internal_error", "session_discarded"}
-    ):
+    error = result["error"]
+    if error.get("type") == "internal_error" or error.get("code") in {"internal_error", "session_discarded"}:
         headers["x-should-retry"] = "false"
     return JSONResponse(payload, status_code=status_code, headers=headers)
+
+
+def _positive_integer(value: Any, *, field: str, required: bool = False) -> Optional[int]:
+    if value is None:
+        if required:
+            raise AgenticChatRequestError(f"{field} is required", param=field)
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise AgenticChatRequestError(f"{field} must be a positive integer", param=field)
+    return value
+
+
+def _required_nonempty_string(value: Any, *, field: str, param: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AgenticChatRequestError(f"{field} must be a non-empty string", param=param)
+    return value
+
+
+_FUNCTION_TOOL_FIELDS: dict[str, tuple[str, frozenset[Optional[str]]]] = {
+    "responses": ("parameters", frozenset({"function"})),
+    "anthropic": ("input_schema", frozenset({None, "custom"})),
+}
+
+
+def _project_function_tools(tools: Any, *, protocol: str) -> list[dict[str, Any]]:
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        raise AgenticChatRequestError("tools must be a list", param="tools")
+    parameters_key, allowed_types = _FUNCTION_TOOL_FIELDS[protocol]
+    canonical = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") not in allowed_types:
+            continue
+        name = _required_nonempty_string(tool.get("name"), field="tools.name", param="tools")
+        parameters = tool.get(parameters_key)
+        if not isinstance(parameters, dict):
+            raise AgenticChatRequestError(
+                f"tools.{parameters_key} must be a JSON object",
+                param="tools",
+            )
+        canonical.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": parameters,
+                    "description": tool.get("description"),
+                },
+            }
+        )
+    return canonical
+
+
+def _normalized_generation_request(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    chat_template_kwargs: dict[str, Any] | None,
+    messages_param: str,
+    max_completion_tokens: Optional[int],
+    stop: Optional[list[str] | str],
+    seed: Optional[int],
+    logprobs: bool,
+) -> dict[str, Any]:
+    try:
+        messages = check_messages(messages)
+        tools = normalize_tools(tools)
+        chat_template_kwargs = normalize_template_kwargs(chat_template_kwargs)
+    except (TypeError, ValueError) as error:
+        raise AgenticChatRequestError(str(error), param=messages_param) from error
+    if not messages:
+        raise AgenticChatRequestError(
+            f"{messages_param} projected to zero supported messages",
+            param=messages_param,
+        )
+    return {
+        "messages": messages,
+        "tools": tools,
+        "chat_template_kwargs": chat_template_kwargs,
+        "logprobs": logprobs,
+        "max_completion_tokens": max_completion_tokens,
+        "stop": stop,
+        "seed": seed,
+    }
+
+
+def _text_block_content(
+    content: Any,
+    *,
+    block_type: str,
+    separator: str,
+    field: str,
+    param: str,
+    allow_empty_string: bool = False,
+) -> Optional[str]:
+    if isinstance(content, str):
+        if not content and not allow_empty_string:
+            raise AgenticChatRequestError(f"{field} must not be empty", param=param)
+        return content
+    if not isinstance(content, list):
+        raise AgenticChatRequestError(f"{field} must be a string or text block list", param=param)
+    texts = []
+    for index, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != block_type:
+            continue
+        text = block.get("text")
+        if not isinstance(text, str) or not text:
+            raise AgenticChatRequestError(f"{field}[{index}].text must be non-empty", param=param)
+        texts.append(text)
+    return separator.join(texts) if texts else None
+
+
+def _responses_input_messages(request_input: Any, instructions: Any) -> list[dict[str, Any]]:
+    def message_content(content: Any, *, role: str, field: str) -> Any:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            raise AgenticChatRequestError(f"{field} must be a string or list", param="input")
+        canonical_parts = []
+        has_image = False
+        for index, part in enumerate(content):
+            part_field = f"{field}[{index}]"
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in {"input_text", "output_text"}:
+                text = part.get("text")
+                if not isinstance(text, str) or (not text and role != "assistant"):
+                    raise AgenticChatRequestError(f"{part_field} text must be non-empty", param="input")
+                canonical_parts.append({"type": "text", "text": text})
+            elif part_type == "input_image" and role == "user":
+                image_url = part.get("image_url")
+                if not isinstance(image_url, str) or not image_url:
+                    raise AgenticChatRequestError(
+                        f"{part_field}.image_url must be a non-empty string",
+                        param="input",
+                    )
+                canonical_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                has_image = True
+        if not canonical_parts:
+            return ""
+        if not has_image:
+            return "".join(cast(str, part["text"]) for part in canonical_parts)
+        return canonical_parts
+
+    def reasoning_text(item: dict[str, Any]) -> str:
+        for key in ("summary", "content"):
+            parts = item.get(key)
+            if not isinstance(parts, list):
+                continue
+            texts = []
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"]:
+                    texts.append(part["text"])
+            if texts:
+                return "\n\n".join(texts)
+        return ""
+
+    if isinstance(request_input, str):
+        items: list[Any] = [{"role": "user", "content": request_input}]
+    elif isinstance(request_input, list):
+        items = request_input
+    else:
+        raise AgenticChatRequestError("input is required and must be a string or list", param="input")
+
+    messages: list[dict[str, Any]] = []
+    if instructions is not None:
+        if not isinstance(instructions, str) or not instructions:
+            raise AgenticChatRequestError("instructions must be a non-empty string", param="instructions")
+        messages.append({"role": "system", "content": instructions})
+
+    pending_reasoning: list[str] = []
+    pending_text: list[str] = []
+    pending_tool_calls: list[dict[str, Any]] = []
+    pending_assistant_field: Optional[str] = None
+
+    def flush_assistant() -> None:
+        nonlocal pending_assistant_field
+        if not pending_reasoning and not pending_text and not pending_tool_calls:
+            if pending_assistant_field is not None:
+                raise AgenticChatRequestError(
+                    f"{pending_assistant_field}.content projected to no supported content",
+                    param="input",
+                )
+            return
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(pending_text)}
+        if pending_reasoning:
+            message["reasoning_content"] = "\n\n".join(pending_reasoning)
+        if pending_tool_calls:
+            message["tool_calls"] = copy.deepcopy(pending_tool_calls)
+        messages.append(message)
+        pending_reasoning.clear()
+        pending_text.clear()
+        pending_tool_calls.clear()
+        pending_assistant_field = None
+
+    for index, item in enumerate(items):
+        field = f"input[{index}]"
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = item.get("role")
+        if item_type in (None, "message") and role in {"user", "assistant", "system", "developer"}:
+            canonical_role = "system" if role == "developer" else cast(str, role)
+            if canonical_role != "assistant":
+                flush_assistant()
+            content = message_content(
+                item.get("content"),
+                role=canonical_role,
+                field=f"{field}.content",
+            )
+            if canonical_role == "assistant":
+                pending_assistant_field = field
+                if content:
+                    pending_text.append(cast(str, content))
+            else:
+                messages.append({"role": canonical_role, "content": content})
+        elif item_type == "reasoning":
+            reasoning = reasoning_text(item)
+            if reasoning:
+                pending_reasoning.append(reasoning)
+        elif item_type == "function_call":
+            call_id = _required_nonempty_string(item.get("call_id"), field=f"{field}.call_id", param="input")
+            name = _required_nonempty_string(item.get("name"), field=f"{field}.name", param="input")
+            arguments = item.get("arguments")
+            if not isinstance(arguments, str):
+                raise AgenticChatRequestError(f"{field}.arguments must be a JSON string", param="input")
+            pending_tool_calls.append(_function_tool_call(call_id, name, arguments))
+        elif item_type == "function_call_output":
+            flush_assistant()
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": _required_nonempty_string(
+                        item.get("call_id"), field=f"{field}.call_id", param="input"
+                    ),
+                    "content": _text_block_content(
+                        item.get("output"),
+                        block_type="input_text",
+                        separator="",
+                        field=f"{field}.output",
+                        param="input",
+                        allow_empty_string=True,
+                    ),
+                }
+            )
+    flush_assistant()
+    return messages
+
+
+def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, Any]]:
+    def system_messages(value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        text = _text_block_content(
+            value,
+            block_type="text",
+            separator="\n\n",
+            field="system",
+            param="system",
+        )
+        return [{"role": "system", "content": text}] if text is not None else []
+
+    def image_block(block: dict[str, Any], *, field: str) -> dict[str, Any]:
+        source = block.get("source")
+        if not isinstance(source, dict):
+            raise AgenticChatRequestError(f"{field}.source must be a JSON object", param="messages")
+        source_type = source.get("type")
+        if source_type == "base64":
+            media_type = source.get("media_type")
+            data = source.get("data")
+            if not isinstance(media_type, str) or not media_type.startswith("image/"):
+                raise AgenticChatRequestError(f"{field}.source.media_type must be an image type", param="messages")
+            if not isinstance(data, str) or not data:
+                raise AgenticChatRequestError(f"{field}.source.data must be non-empty", param="messages")
+            url = f"data:{media_type};base64,{data}"
+        elif source_type == "url":
+            url = source.get("url")
+            if not isinstance(url, str) or not url:
+                raise AgenticChatRequestError(f"{field}.source.url must be non-empty", param="messages")
+        else:
+            raise AgenticChatRequestError(f"{field}.source.type is not supported", param="messages")
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    if not isinstance(raw_messages, list):
+        raise AgenticChatRequestError("messages is required and must be a list", param="messages")
+    messages = system_messages(system)
+    for message_index, raw_message in enumerate(raw_messages):
+        field = f"messages[{message_index}]"
+        if not isinstance(raw_message, dict):
+            continue
+        role = raw_message.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = raw_message.get("content")
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            raise AgenticChatRequestError(f"{field}.content must be a string or list", param="messages")
+        if role == "assistant":
+            text_parts = []
+            reasoning_parts = []
+            tool_calls = []
+            for block_index, block in enumerate(content):
+                block_field = f"{field}.content[{block_index}]"
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text = block.get("text")
+                    if not isinstance(text, str) or not text:
+                        raise AgenticChatRequestError(f"{block_field}.text must be non-empty", param="messages")
+                    text_parts.append(text)
+                elif block_type == "thinking":
+                    thinking = block.get("thinking")
+                    if not isinstance(thinking, str):
+                        raise AgenticChatRequestError(
+                            f"{block_field}.thinking must be a string",
+                            param="messages",
+                        )
+                    if thinking:
+                        reasoning_parts.append(thinking)
+                elif block_type == "tool_use":
+                    tool_id = _required_nonempty_string(block.get("id"), field=f"{block_field}.id", param="messages")
+                    name = _required_nonempty_string(block.get("name"), field=f"{block_field}.name", param="messages")
+                    arguments = block.get("input")
+                    if not isinstance(arguments, dict):
+                        raise AgenticChatRequestError(
+                            f"{block_field}.input must be a JSON object",
+                            param="messages",
+                        )
+                    tool_calls.append(_function_tool_call(tool_id, name, arguments))
+            assistant: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+            if reasoning_parts:
+                assistant["reasoning_content"] = "\n\n".join(reasoning_parts)
+            if tool_calls:
+                assistant["tool_calls"] = tool_calls
+            messages.append(assistant)
+            continue
+
+        pending_user_parts: list[dict[str, Any]] = []
+        message_start = len(messages)
+
+        def flush_user() -> None:
+            if not pending_user_parts:
+                return
+            if all(part["type"] == "text" for part in pending_user_parts):
+                user_content: Any = "".join(cast(str, part["text"]) for part in pending_user_parts)
+            else:
+                user_content = copy.deepcopy(pending_user_parts)
+            messages.append({"role": "user", "content": user_content})
+            pending_user_parts.clear()
+
+        for block_index, block in enumerate(content):
+            block_field = f"{field}.content[{block_index}]"
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text")
+                if not isinstance(text, str) or not text:
+                    raise AgenticChatRequestError(f"{block_field}.text must be non-empty", param="messages")
+                pending_user_parts.append({"type": "text", "text": text})
+            elif block_type == "image":
+                pending_user_parts.append(image_block(block, field=block_field))
+            elif block_type == "tool_result":
+                flush_user()
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": _required_nonempty_string(
+                            block.get("tool_use_id"),
+                            field=f"{block_field}.tool_use_id",
+                            param="messages",
+                        ),
+                        "content": _text_block_content(
+                            block.get("content", ""),
+                            block_type="text",
+                            separator="",
+                            field=f"{block_field}.content",
+                            param="messages",
+                            allow_empty_string=True,
+                        ),
+                    }
+                )
+        flush_user()
+        if len(messages) == message_start:
+            raise AgenticChatRequestError(
+                f"{field}.content projected to no supported content",
+                param="messages",
+            )
+    return messages
 
 
 def _session_id_from_request(request: Request) -> str:
@@ -432,80 +842,470 @@ def _session_id_from_request(request: Request) -> str:
 
 
 def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
-    def fail(message: str, *, param: Optional[str] = None) -> None:
-        raise AgenticChatRequestError(message, param=param)
+    messages = payload.get("messages")
 
-    if "messages" not in payload:
-        fail("messages is required", param="messages")
-    messages = payload["messages"]
-    if not isinstance(messages, list):
-        fail("messages must be a list", param="messages")
-
-    tools = payload.get("tools")
-    if tools is not None:
-        if not isinstance(tools, list):
-            fail("tools must be a list", param="tools")
-        if any(not isinstance(tool, dict) for tool in tools):
-            fail("tools entries must be JSON objects", param="tools")
-
-    chat_template_kwargs = payload.get("chat_template_kwargs")
-    if chat_template_kwargs is not None:
-        if not isinstance(chat_template_kwargs, dict):
-            fail("chat_template_kwargs must be a JSON object", param="chat_template_kwargs")
-        reserved = sorted({"add_generation_prompt", "tokenize", "tools"}.intersection(chat_template_kwargs))
-        if reserved:
-            fail(
-                f"chat_template_kwargs cannot set reserved keys: {', '.join(reserved)}",
-                param="chat_template_kwargs",
-            )
-
-    if "stream" in payload and payload["stream"] not in {None, False}:
-        fail("stream is not supported", param="stream")
-    if "n" in payload and payload["n"] != 1:
-        fail("n must be 1", param="n")
+    chat_template_kwargs = payload.get("chat_template_kwargs") or {}
+    reserved = sorted({"add_generation_prompt", "tokenize", "tools"}.intersection(chat_template_kwargs))
+    if reserved:
+        raise AgenticChatRequestError(
+            f"chat_template_kwargs cannot set reserved keys: {', '.join(reserved)}",
+            param="chat_template_kwargs",
+        )
     requested_logprobs = payload.get("logprobs", False)
     if requested_logprobs is None:
         logprobs = False
     elif isinstance(requested_logprobs, bool):
         logprobs = requested_logprobs
     else:
-        fail("logprobs must be a boolean", param="logprobs")
-    if "top_logprobs" in payload and payload["top_logprobs"] is not None:
-        fail("top_logprobs is not supported", param="top_logprobs")
-    if "functions" in payload and payload["functions"] not in (None, []):
-        fail("functions are not supported", param="functions")
-    if "function_call" in payload and payload["function_call"] not in (None, "none"):
-        fail("function_call is not supported", param="function_call")
+        raise AgenticChatRequestError("logprobs must be a boolean", param="logprobs")
 
     for field_name in ("max_completion_tokens", "max_tokens"):
-        value = payload.get(field_name)
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
-            fail(f"{field_name} must be a positive integer", param=field_name)
+        _positive_integer(payload.get(field_name), field=field_name)
     max_completion_tokens = payload.get("max_completion_tokens") or payload.get("max_tokens")
 
     stop = payload.get("stop")
-    if (
-        "stop" in payload
-        and stop is not None
-        and not (isinstance(stop, str) or (isinstance(stop, list) and all(isinstance(item, str) for item in stop)))
+    if stop is not None and not (
+        isinstance(stop, str) or (isinstance(stop, list) and all(isinstance(item, str) for item in stop))
     ):
-        fail("stop must be a string or list of strings", param="stop")
+        raise AgenticChatRequestError("stop must be a string or list of strings", param="stop")
 
-    try:
-        messages = check_messages(messages)
-    except (TypeError, ValueError) as error:
-        fail(str(error), param="messages")
+    return _normalized_generation_request(
+        messages=messages,
+        tools=payload.get("tools"),
+        chat_template_kwargs=chat_template_kwargs,
+        messages_param="messages",
+        max_completion_tokens=max_completion_tokens,
+        stop=stop,
+        seed=payload.get("seed"),
+        logprobs=logprobs,
+    )
 
+
+def _normalized_responses_request(payload: dict[str, Any]) -> dict[str, Any]:
+    instructions = payload.get("instructions")
+    messages = _responses_input_messages(payload.get("input"), instructions)
+    max_output_tokens = _positive_integer(payload.get("max_output_tokens"), field="max_output_tokens")
+    reasoning = payload.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    chat_template_kwargs = (
+        {"enable_thinking": effort != "none"}
+        if effort in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+        else {}
+    )
+    return _normalized_generation_request(
+        messages=messages,
+        tools=_project_function_tools(payload.get("tools"), protocol="responses"),
+        chat_template_kwargs=chat_template_kwargs,
+        messages_param="input",
+        max_completion_tokens=max_output_tokens,
+        stop=None,
+        seed=None,
+        logprobs=False,
+    )
+
+
+def _normalized_anthropic_request(payload: dict[str, Any]) -> dict[str, Any]:
+    messages = _anthropic_input_messages(payload.get("messages"), payload.get("system"))
+    max_tokens = _positive_integer(payload.get("max_tokens"), field="max_tokens", required=True)
+    thinking = payload.get("thinking")
+    thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+    chat_template_kwargs = (
+        {"enable_thinking": thinking_type != "disabled"}
+        if thinking_type in {"disabled", "enabled", "adaptive"}
+        else {}
+    )
+    stop_sequences = payload.get("stop_sequences")
+    if stop_sequences is not None and (
+        not isinstance(stop_sequences, list) or any(not isinstance(item, str) for item in stop_sequences)
+    ):
+        raise AgenticChatRequestError("stop_sequences must be a list of strings", param="stop_sequences")
+    return _normalized_generation_request(
+        messages=messages,
+        tools=_project_function_tools(payload.get("tools"), protocol="anthropic"),
+        chat_template_kwargs=chat_template_kwargs,
+        messages_param="messages",
+        max_completion_tokens=max_tokens,
+        stop=stop_sequences,
+        seed=None,
+        logprobs=False,
+    )
+
+
+def _new_api_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex}"
+
+
+def _compact_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _sse_event(event: str, payload: Any) -> str:
+    return f"event: {event}\ndata: {_compact_json(payload)}\n\n"
+
+
+def _openai_error_payload(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: copy.deepcopy(value) for key, value in result.items() if key != "_http_status"}
+
+
+def _anthropic_error_payload(result: dict[str, Any]) -> dict[str, Any]:
+    status_code = int(result.get("_http_status") or 400)
+    message = result["error"]["message"]
+    error_type = {
+        401: "authentication_error",
+        404: "not_found_error",
+    }.get(status_code, "api_error" if status_code >= 500 else "invalid_request_error")
     return {
-        "messages": messages,
-        "tools": normalize_tools(tools),
-        "chat_template_kwargs": normalize_template_kwargs(chat_template_kwargs),
-        "model": payload.get("model"),
-        "logprobs": logprobs,
-        "max_completion_tokens": max_completion_tokens,
-        "stop": stop,
-        "seed": payload.get("seed"),
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": str(message),
+        },
     }
+
+
+def _anthropic_error_response(result: dict[str, Any]) -> JSONResponse:
+    status_code = int(result.get("_http_status") or 400)
+    headers = {}
+    if status_code >= 500 or status_code == 404:
+        headers["x-should-retry"] = "false"
+    return JSONResponse(_anthropic_error_payload(result), status_code=status_code, headers=headers)
+
+
+def _chat_completion_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "id": _new_api_id("chatcmpl"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": payload.get("model"),
+        "choices": [
+            {
+                "index": 0,
+                "message": copy.deepcopy(result["message"]),
+                "logprobs": result["logprobs"],
+                "finish_reason": result["finish_reason"],
+            }
+        ],
+        "usage": copy.deepcopy(result["usage"]),
+    }
+
+
+def _chat_sse_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    if result.get("error"):
+        return f"data: {_compact_json(_openai_error_payload(result))}\n\ndata: [DONE]\n\n"
+    message = copy.deepcopy(result["message"])
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        message["tool_calls"] = [
+            {**cast(dict[str, Any], tool_call), "index": index} for index, tool_call in enumerate(tool_calls)
+        ]
+    chunk: dict[str, Any] = {
+        "id": _new_api_id("chatcmpl"),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": payload.get("model"),
+        "choices": [
+            {
+                "index": 0,
+                "delta": message,
+                "logprobs": result["logprobs"],
+                "finish_reason": result["finish_reason"],
+            }
+        ],
+        "usage": result["usage"],
+    }
+    return f"data: {_compact_json(chunk)}\n\ndata: [DONE]\n\n"
+
+
+def _responses_output_items(result: dict[str, Any]) -> list[dict[str, Any]]:
+    message = cast(dict[str, Any], result["message"])
+    output: list[dict[str, Any]] = []
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        output.append(
+            {
+                "id": _new_api_id("rs"),
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": reasoning_content}],
+            }
+        )
+    content = message.get("content")
+    if content:
+        text_part: dict[str, Any] = {
+            "type": "output_text",
+            "text": content,
+            "annotations": [],
+        }
+        output.append(
+            {
+                "id": _new_api_id("msg"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [text_part],
+            }
+        )
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        for tool_call in tool_calls:
+            function = cast(dict[str, Any], tool_call["function"])
+            output.append(
+                {
+                    "id": _new_api_id("fc"),
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": tool_call["id"],
+                    "name": function["name"],
+                    "arguments": function["arguments"],
+                }
+            )
+    return output
+
+
+def _responses_response_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    error = result.get("error")
+    failed = error is not None
+    incomplete = not failed and result["finish_reason"] == "length"
+    status = "failed" if failed else "incomplete" if incomplete else "completed"
+    response: dict[str, Any] = {
+        "id": _new_api_id("resp"),
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": status,
+        "model": payload.get("model"),
+        "output": [] if failed else _responses_output_items(result),
+    }
+    if failed:
+        response["error"] = copy.deepcopy(error)
+    elif incomplete:
+        response["incomplete_details"] = {"reason": "max_output_tokens"}
+    if not failed:
+        usage = cast(dict[str, Any], result["usage"])
+        response["usage"] = {
+            "input_tokens": usage["prompt_tokens"],
+            "output_tokens": usage["completion_tokens"],
+            "total_tokens": usage["total_tokens"],
+        }
+    return response
+
+
+def _responses_sse_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    response = _responses_response_payload(result, payload)
+    created_response = {
+        "id": response["id"],
+        "object": response["object"],
+        "created_at": response["created_at"],
+        "status": "in_progress",
+        "model": response["model"],
+        "output": [],
+    }
+    frames = [
+        _sse_event(
+            "response.created",
+            {"type": "response.created", "sequence_number": 0, "response": created_response},
+        )
+    ]
+    if response["status"] == "failed":
+        frames.append(
+            _sse_event(
+                "response.failed",
+                {"type": "response.failed", "sequence_number": 1, "response": response},
+            )
+        )
+        return "".join(frames)
+    for index, item in enumerate(response["output"]):
+        frames.append(
+            _sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": index + 1,
+                    "output_index": index,
+                    "item": item,
+                },
+            )
+        )
+    terminal_type = "response.incomplete" if response["status"] == "incomplete" else "response.completed"
+    frames.append(
+        _sse_event(
+            terminal_type,
+            {
+                "type": terminal_type,
+                "sequence_number": len(response["output"]) + 1,
+                "response": response,
+            },
+        )
+    )
+    return "".join(frames)
+
+
+_ANTHROPIC_STOP_REASONS = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+}
+
+
+def _anthropic_content_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks = []
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        blocks.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning_content,
+                "signature": f"sig_{uuid4().hex}",
+            }
+        )
+    content = message.get("content")
+    if content:
+        blocks.append({"type": "text", "text": content})
+    tool_calls = message.get("tool_calls")
+    if tool_calls:
+        for tool_call in tool_calls:
+            function = cast(dict[str, Any], tool_call["function"])
+            arguments = json.loads(function["arguments"])
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call["id"],
+                    "name": function["name"],
+                    "input": arguments,
+                }
+            )
+    return blocks
+
+
+def _anthropic_message_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    usage = cast(dict[str, Any], result["usage"])
+    return {
+        "id": _new_api_id("msg"),
+        "type": "message",
+        "role": "assistant",
+        "model": payload.get("model"),
+        "content": _anthropic_content_blocks(cast(dict[str, Any], result["message"])),
+        "stop_reason": _ANTHROPIC_STOP_REASONS[result["finish_reason"]],
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage["prompt_tokens"],
+            "output_tokens": usage["completion_tokens"],
+        },
+    }
+
+
+def _anthropic_sse_payload(
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> str:
+    if result.get("error"):
+        return _sse_event("error", _anthropic_error_payload(result))
+    message = _anthropic_message_payload(result, payload)
+    usage = cast(dict[str, Any], message["usage"])
+    start_message = {
+        **message,
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage["input_tokens"], "output_tokens": 0},
+    }
+    frames = [_sse_event("message_start", {"type": "message_start", "message": start_message})]
+    for index, block in enumerate(message["content"]):
+        block_type = block["type"]
+        if block_type == "text":
+            start_block = {"type": "text", "text": ""}
+            deltas = [{"type": "text_delta", "text": block["text"]}]
+        elif block_type == "thinking":
+            start_block = {"type": "thinking", "thinking": "", "signature": ""}
+            deltas = [
+                {"type": "thinking_delta", "thinking": block["thinking"]},
+                {"type": "signature_delta", "signature": block["signature"]},
+            ]
+        else:
+            start_block = {
+                "type": "tool_use",
+                "id": block["id"],
+                "name": block["name"],
+                "input": {},
+            }
+            deltas = [{"type": "input_json_delta", "partial_json": _compact_json(block["input"])}]
+        frames.append(
+            _sse_event(
+                "content_block_start",
+                {"type": "content_block_start", "index": index, "content_block": start_block},
+            )
+        )
+        for delta in deltas:
+            frames.append(
+                _sse_event(
+                    "content_block_delta",
+                    {"type": "content_block_delta", "index": index, "delta": delta},
+                )
+            )
+        frames.append(
+            _sse_event(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": index},
+            )
+        )
+    frames.append(
+        _sse_event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": message["stop_reason"],
+                    "stop_sequence": message["stop_sequence"],
+                },
+                "usage": {"output_tokens": usage["output_tokens"]},
+            },
+        )
+    )
+    frames.append(_sse_event("message_stop", {"type": "message_stop"}))
+    return "".join(frames)
+
+
+async def _buffered_sse_events(
+    *,
+    completion_factory: Callable[[], Awaitable[dict[str, Any]]],
+    render_terminal: Callable[[dict[str, Any]], str],
+    connected_frame: str,
+    heartbeat_frame: str,
+    heartbeat_interval_s: float = _AGENTIC_SSE_HEARTBEAT_INTERVAL_S,
+) -> AsyncIterator[str]:
+    completion_task = asyncio.create_task(completion_factory(), name="agentic-buffered-sse")
+    try:
+        yield connected_frame
+        while not completion_task.done():
+            done, _ = await asyncio.wait({completion_task}, timeout=heartbeat_interval_s)
+            if not done:
+                yield heartbeat_frame
+        result = completion_task.result()
+        try:
+            terminal = render_terminal(result)
+        except Exception as error:
+            logger.warning("Buffered SSE terminal rendering failed: %s", error, exc_info=True)
+            terminal = render_terminal(_internal_error_result("Internal error while rendering agentic response."))
+        yield terminal
+    finally:
+        if not completion_task.done():
+            completion_task.cancel()
+        await asyncio.gather(completion_task, return_exceptions=True)
 
 
 class _NonFinalizableExportError(AgentExecutionError):
@@ -638,14 +1438,19 @@ class _SessionRecord:
 
     @property
     def interrupted(self) -> bool:
-        """Report a wholly parked Session carrying a real backend prefix."""
+        """Report a Session that can be retained across an async boundary."""
 
         return (
             self.phase is SessionPhase.ACTIVE
             and not self.protected_until_finalize
-            and bool(self.live_irs)
-            and all(ir.runner_task is None and ir in self.queued_irs for ir in self.live_irs)
-            and any(ir.pending_status == "aborted" and ir.abort_count > 0 for ir in self.live_irs)
+            and (
+                # The agent may be running a tool without a live request.
+                not self.live_irs
+                or (
+                    all(ir.runner_task is None and ir in self.queued_irs for ir in self.live_irs)
+                    and any(ir.pending_status == "aborted" and ir.abort_count > 0 for ir in self.live_irs)
+                )
+            )
         )
 
 
@@ -1073,7 +1878,7 @@ class AgenticSessionShard:
                 logprobs=logprobs,
             )
         except AgenticChatRequestError as error:
-            return _openai_error_from_exception(error)
+            return _error_from_exception(error)
 
     async def mark_chat_service_response_ready(
         self,
@@ -1290,7 +2095,7 @@ class AgenticSessionShard:
                 prompt_tokens = len(prefix.train_token_prefix)
                 context_budget = int(max_context_len) - prompt_tokens
                 if context_budget <= 0:
-                    raise _openai_context_length_error(
+                    raise _context_length_error(
                         max_context_len=int(max_context_len),
                         prompt_tokens=prompt_tokens,
                     )
@@ -1327,14 +2132,9 @@ class AgenticSessionShard:
         try:
             return await asyncio.shield(ir.waiter)
         except AgenticChatRequestError as error:
-            return _openai_error_from_exception(error)
+            return _error_from_exception(error)
         except Exception:
-            return _openai_error_result(
-                "Internal error while handling agentic chat request.",
-                code="internal_error",
-                status_code=500,
-                error_type="internal_error",
-            )
+            return _internal_error_result("Internal error while handling agentic chat request.")
 
     @staticmethod
     def _match_parent_state(
@@ -1430,7 +2230,7 @@ class AgenticSessionShard:
             return
         prompt_tokens = forest.train_token_count(parent.state_hash) + len(observation_train_tokens)
         if prompt_tokens >= int(max_context_len):
-            raise _openai_context_length_error(
+            raise _context_length_error(
                 max_context_len=int(max_context_len),
                 prompt_tokens=prompt_tokens,
             )
@@ -1484,7 +2284,7 @@ class AgenticSessionShard:
                 # budget before another backend call or Forest commit.
                 session.live_irs.remove(ir)
                 ir.waiter.set_result(
-                    _openai_context_length_error_result(
+                    _context_length_error_result(
                         max_context_len=self._max_context_len(group),
                         prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
                     )
@@ -1683,7 +2483,7 @@ class AgenticSessionShard:
                     ir.backend_started = False
                     session.live_irs.remove(ir)
                     ir.waiter.set_result(
-                        _openai_context_length_error_result(
+                        _context_length_error_result(
                             max_context_len=self._max_context_len(group),
                             prompt_tokens=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
                             requested_completion_tokens=remaining_tokens,
@@ -2126,7 +2926,7 @@ class AgenticSessionShard:
             for ir in irs:
                 ir.runner_task = None
                 ir.backend_started = False
-                ir.waiter.set_result(_openai_error_from_exception(_session_discarded_error(session.session_id)))
+                ir.waiter.set_result(_error_from_exception(_session_discarded_error(session.session_id)))
             session.live_irs.clear()
             session.queued_irs.clear()
         if resources is not None:
@@ -2226,7 +3026,8 @@ def create_agentic_session_shards(
 @serve.deployment
 @serve.ingress(app)
 class AgenticChatAPIService:
-    """OpenAI chat ingress and deployment-owned SessionShard directory."""
+    """Multi-protocol agentic ingress and deployment-owned SessionShard
+    directory."""
 
     def __init__(
         self,
@@ -2241,6 +3042,127 @@ class AgenticChatAPIService:
     def _shard_handle(self, session_id: str) -> Any:
         actor_name = session_id.rsplit(".session-", maxsplit=1)[0]
         return self._session_shards[actor_name]
+
+    async def _complete_generation(
+        self,
+        *,
+        shard: Any,
+        session_id: str,
+        normalized: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            response = await shard.chat.remote(
+                session_id=session_id,
+                messages=normalized["messages"],
+                tools=normalized["tools"],
+                chat_template_kwargs=normalized["chat_template_kwargs"],
+                max_completion_tokens=normalized["max_completion_tokens"],
+                stop=normalized["stop"],
+                seed=normalized["seed"],
+                logprobs=normalized["logprobs"],
+            )
+        except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
+            if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(
+                error.as_instanceof_cause(), ray.exceptions.TaskCancelledError
+            ):
+                raise
+            return _error_result(
+                "client disconnected before agentic completion was produced",
+                code="client_disconnect",
+                status_code=499,
+                error_type="client_disconnect",
+            )
+        if response.get("error"):
+            return response
+        remote_return_at = time.time()
+        response_ready_at = time.time()
+        # Buffered SSE records terminal-response readiness here. Socket flush
+        # may happen later and is intentionally outside the Shard trace.
+        http_return_at = time.time()
+        try:
+            await shard.mark_chat_service_response_ready.remote(
+                session_id=session_id,
+                request_id=response["request_id"],
+                remote_return_at=remote_return_at,
+                response_ready_at=response_ready_at,
+                http_return_at=http_return_at,
+            )
+        except Exception as error:
+            logger.warning(
+                "Failed to record agentic service response trace for session=%s request=%s: %s",
+                session_id,
+                response["request_id"],
+                error,
+            )
+        return response
+
+    async def _handle_generation_request(
+        self,
+        request: Request,
+        *,
+        normalizer: Callable[[dict[str, Any]], dict[str, Any]],
+        render_json: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+        render_sse: Callable[[dict[str, Any], dict[str, Any]], str],
+        error_response: Callable[[dict[str, Any]], JSONResponse],
+        connected_frame: str,
+        heartbeat_frame: str,
+    ) -> Response:
+        try:
+            payload = await request.json()
+        except ClientDisconnect:
+            return error_response(
+                _error_result(
+                    "client disconnected before agentic request body was read",
+                    code="client_disconnect",
+                    status_code=499,
+                    error_type="client_disconnect",
+                )
+            )
+        except ValueError as error:
+            return error_response(_error_result(f"Invalid request body: {error}", param="body"))
+        try:
+            if not isinstance(payload, dict):
+                raise AgenticChatRequestError("request body must be a JSON object", param="body")
+            stream = payload.get("stream", False)
+            normalized = normalizer(payload)
+            session_id = _session_id_from_request(request)
+        except AgenticChatRequestError as error:
+            return error_response(_error_from_exception(error))
+        try:
+            shard = self._shard_handle(session_id)
+        except KeyError:
+            return error_response(_error_from_exception(_session_discarded_error(session_id)))
+
+        async def complete_generation() -> dict[str, Any]:
+            try:
+                return await self._complete_generation(
+                    shard=shard,
+                    session_id=session_id,
+                    normalized=normalized,
+                )
+            except Exception as error:
+                logger.warning("Agentic completion failed: %s", error, exc_info=True)
+                return _internal_error_result("Internal error while handling agentic request.")
+
+        if stream:
+            return StreamingResponse(
+                _buffered_sse_events(
+                    completion_factory=complete_generation,
+                    render_terminal=lambda result: render_sse(result, payload),
+                    connected_frame=connected_frame,
+                    heartbeat_frame=heartbeat_frame,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        result = await complete_generation()
+        if result.get("error"):
+            return error_response(result)
+        try:
+            return JSONResponse(render_json(result, payload))
+        except Exception as error:
+            logger.warning("Agentic JSON rendering failed: %s", error, exc_info=True)
+            return error_response(_internal_error_result("Internal error while rendering agentic response."))
 
     @app.get("/health")
     @app.get("/healthz")
@@ -2285,100 +3207,51 @@ class AgenticChatAPIService:
     @app.post("/chat/completions")
     @app.post("/v1/chat/completions")
     @_resolve_fastapi_request_endpoint
-    async def chat_completions(self, request: Request) -> JSONResponse:
-        """Normalize and forward one OpenAI-compatible chat request."""
+    async def chat_completions(self, request: Request) -> Response:
+        """Normalize and forward one Chat Completions request."""
 
-        try:
-            payload = await request.json()
-        except ClientDisconnect:
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "client disconnected before chat request body was read",
-                        "type": "client_disconnect",
-                        "code": "client_disconnect",
-                    }
-                },
-                status_code=499,
-            )
-        except ValueError as error:
-            return _openai_error_response(_openai_error_result(f"Invalid request body: {error}", param="body"))
-        try:
-            if not isinstance(payload, dict):
-                raise AgenticChatRequestError("request body must be a JSON object", param="body")
-            normalized = _normalized_chat_request(payload)
-            session_id = _session_id_from_request(request)
-        except AgenticChatRequestError as error:
-            return _openai_error_response(_openai_error_from_exception(error))
+        return await self._handle_generation_request(
+            request,
+            normalizer=_normalized_chat_request,
+            render_json=_chat_completion_payload,
+            render_sse=_chat_sse_payload,
+            error_response=_openai_error_response,
+            connected_frame=": connected\n\n",
+            heartbeat_frame=": heartbeat\n\n",
+        )
 
-        try:
-            shard = self._shard_handle(session_id)
-        except KeyError:
-            return _openai_error_response(_openai_error_from_exception(_session_discarded_error(session_id)))
+    @app.post("/responses")
+    @app.post("/v1/responses")
+    @_resolve_fastapi_request_endpoint
+    async def responses(self, request: Request) -> Response:
+        """Normalize and forward one OpenAI Responses request."""
 
-        try:
-            response = await shard.chat.remote(
-                session_id=session_id,
-                messages=normalized["messages"],
-                tools=normalized["tools"],
-                chat_template_kwargs=normalized["chat_template_kwargs"],
-                max_completion_tokens=normalized["max_completion_tokens"],
-                stop=normalized["stop"],
-                seed=normalized["seed"],
-                logprobs=normalized["logprobs"],
-            )
-        except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError) as error:
-            if isinstance(error, ray.exceptions.RayTaskError) and not isinstance(
-                error.as_instanceof_cause(), ray.exceptions.TaskCancelledError
-            ):
-                raise
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "client disconnected before chat completion was produced",
-                        "type": "client_disconnect",
-                        "code": "client_disconnect",
-                    }
-                },
-                status_code=499,
-            )
-        if isinstance(response.get("error"), dict):
-            return _openai_error_response(response)
-        remote_return_at = time.time()
-        response_ready_at = time.time()
-        http_return_at = time.time()
-        try:
-            await shard.mark_chat_service_response_ready.remote(
-                session_id=session_id,
-                request_id=response["request_id"],
-                remote_return_at=remote_return_at,
-                response_ready_at=response_ready_at,
-                http_return_at=http_return_at,
-            )
-        except Exception as error:
-            logger.warning(
-                "Failed to record chat service response trace for session=%s request=%s: %s",
-                session_id,
-                response["request_id"],
-                error,
-            )
-        response_payload = {
-            "id": f"chatcmpl_{session_id}_{int(time.time() * 1000)}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": response["message"],
-                    "logprobs": response["logprobs"] if normalized["logprobs"] else None,
-                    "finish_reason": response["finish_reason"],
-                }
-            ],
-            "usage": response["usage"],
-        }
-        if isinstance(normalized["model"], str):
-            response_payload["model"] = normalized["model"]
-        return JSONResponse(response_payload)
+        return await self._handle_generation_request(
+            request,
+            normalizer=_normalized_responses_request,
+            render_json=_responses_response_payload,
+            render_sse=_responses_sse_payload,
+            error_response=_openai_error_response,
+            connected_frame=": connected\n\n",
+            heartbeat_frame=": heartbeat\n\n",
+        )
+
+    @app.post("/messages")
+    @app.post("/v1/messages")
+    @_resolve_fastapi_request_endpoint
+    async def messages(self, request: Request) -> Response:
+        """Normalize and forward one Anthropic Messages request."""
+
+        ping_frame = _sse_event("ping", {"type": "ping"})
+        return await self._handle_generation_request(
+            request,
+            normalizer=_normalized_anthropic_request,
+            render_json=_anthropic_message_payload,
+            render_sse=_anthropic_sse_payload,
+            error_response=_anthropic_error_response,
+            connected_frame=ping_frame,
+            heartbeat_frame=ping_frame,
+        )
 
     async def runtime_resources(self) -> tuple[Tuple[Tuple[str, Any], ...], Optional[Any]]:
         """Lend Shards and their shared admission Coordinator to Runtime."""

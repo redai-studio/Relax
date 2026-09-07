@@ -394,8 +394,6 @@ def test_chat_request_validation_and_logprob_payload() -> None:
 
     with pytest.raises(AgenticChatRequestError, match="logprobs must be a boolean"):
         _normalized_chat_request({"messages": [{"role": "user", "content": "hello"}], "logprobs": "true"})
-    with pytest.raises(AgenticChatRequestError, match="top_logprobs is not supported"):
-        _normalized_chat_request({"messages": [{"role": "user", "content": "hello"}], "top_logprobs": 1})
 
     payload = _openai_token_logprobs_payload(
         tokenizer=_FakeTokenizer(),
