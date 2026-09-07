@@ -129,9 +129,13 @@ class RewardDomain:
         for session_result, session in zip(result, group.sessions, strict=True):
             for export in session.exports:
                 value = session_result[export.name]
-                if not isinstance(value, (int, float)) or isinstance(value, bool):
-                    raise TypeError("custom advantage output must be a number in this version.")
-                export.sample.custom_advantage = float(value)
+                if not isinstance(value, list):
+                    export.sample.custom_advantage = float(value)
+                    continue
+                expanded = [0.0] * export.sample.response_length
+                for turn_value, (start, end) in zip(value, export.sample.custom_advantage, strict=True):
+                    expanded[start:end] = [float(turn_value)] * (end - start)
+                export.sample.custom_advantage = expanded
         return True
 
     def finalize_group(self, group: GroupExport) -> GroupExport | None:

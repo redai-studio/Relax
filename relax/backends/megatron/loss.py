@@ -553,7 +553,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     """
     log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-    rewards: list[float] = rollout_data.get("rewards")
+    rewards: list[float] | list[torch.Tensor] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
@@ -586,7 +586,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         ]
 
     if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"]:
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         advantages = returns.copy()
 
