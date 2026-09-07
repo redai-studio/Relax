@@ -108,6 +108,14 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
+    if any(isinstance(reward, list) for reward in rewards):
+        if args.advantage_estimator not in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo"):
+            raise ValueError(f"dense rewards are not supported for {args.advantage_estimator!r}")
+        rewards = [
+            reward if isinstance(reward, list) else [reward] * sample.response_length
+            for reward, sample in zip(rewards, samples, strict=True)
+        ]
+
     sample_indices = [sample.index for sample in samples]
     train_data = {
         "tokens": [sample.tokens for sample in samples],
