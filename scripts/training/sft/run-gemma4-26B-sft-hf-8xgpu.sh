@@ -12,6 +12,10 @@
 #
 #   # fp8 export instead of bf16 (~half the size; needs a safetensors --hf-checkpoint):
 #   SAVE_HF_DTYPE=fp8 bash scripts/training/sft/run-gemma4-26B-sft-hf-8xgpu.sh
+#
+#   # make the export loadable by filling in the vision tower text mode omits:
+#   SAVE_HF_POST_HOOK_PATH=scripts.tools.vision_supplement_hook.supplement_vision \
+#   bash scripts/training/sft/run-gemma4-26B-sft-hf-8xgpu.sh
 
 set -ex
 set -o pipefail
@@ -110,6 +114,12 @@ if [ "${SAVE_HF_DTYPE}" = "fp8" ]; then
         --save-hf-fp8-quant-mode "${SAVE_HF_FP8_QUANT_MODE:-block}"
         --save-hf-fp8-block-size ${SAVE_HF_FP8_BLOCK_SIZE:-128 128}
     )
+fi
+
+# Text-mode gemma-4 exports no vision tower, so the checkpoint is unloadable
+# until something fills it in; see scripts/tools/vision_supplement_hook.py.
+if [ -n "${SAVE_HF_POST_HOOK_PATH:-}" ]; then
+    CKPT_ARGS+=(--save-hf-post-hook-path "${SAVE_HF_POST_HOOK_PATH}")
 fi
 
 SFT_ARGS=(
