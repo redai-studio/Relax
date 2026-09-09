@@ -26,11 +26,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from relax.utils.device import is_npu_available, make_current_torch_device
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     _lora_module_key,
     build_lora_peft,
     count_adapter_parameters,
+    exclude_frozen_lora_target_modules,
     install_gdn_gate_mask_hooks,
     is_lora_adapter_mode,
     is_lora_adapter_param,
@@ -114,6 +116,41 @@ def _dump_provider_config(provider: Any, save_path: str) -> None:
 # context parallelism actually splits the sequence dimension at the attention input.
 # Compare seq_len across CP=1 vs CP=2 runs — it must halve.  Remove after verifying.
 _CP_PROBE_INSTALLED = False
+
+
+def _patch_bridge_vision_cp_all_gather(bridge_model_module: Any, all_gather_vision_embeddings: Any) -> bool:
+    """Make Bridge's Qwen3-VL CP vision all-gather accept keyword arguments.
+
+    The Bridge Qwen3-VL forward currently calls ``autograd.Function.apply``
+    with ``cp_group=...``.  PyTorch only accepts positional arguments for
+    ``apply``, so the vision CP path fails before the first forward.  Keep the
+    autograd function unchanged and adapt only its call surface in the Bridge
+    model module.
+    """
+    if getattr(bridge_model_module, "AllGatherVisionEmbeddings", None) is not all_gather_vision_embeddings:
+        return False
+
+    class _AllGatherVisionEmbeddingsCompat:
+        @staticmethod
+        def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            return all_gather_vision_embeddings.apply(input, seqlens_on_cp_ranks, cp_group)
+
+    bridge_model_module.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsCompat
+    return True
+
+
+def _install_bridge_vision_cp_all_gather_compat() -> None:
+    """Install the Qwen3-VL Bridge compatibility patch when that model is
+    present."""
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import model as bridge_qwen3_vl_model
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import AllGatherVisionEmbeddings
+    except ImportError:
+        return
+
+    if _patch_bridge_vision_cp_all_gather(bridge_qwen3_vl_model, AllGatherVisionEmbeddings):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Patched Bridge Qwen3-VL vision CP all-gather for PyTorch autograd.apply compatibility.")
 
 
 def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -287,6 +324,11 @@ def get_model_provider_func(
             "cross_entropy_fusion_impl",
             "mtp_num_layers",
             "mtp_loss_scaling_factor",
+            # Reuse one physical MTP layer across all mtp_num_layers depths. Must
+            # be copied onto the bridge provider or it stays at the default (False)
+            # even when --mtp-use-repeated-layer is passed, so the model builds N
+            # physical layers (layers.1/2 unloaded/random).
+            "mtp_use_repeated_layer",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
@@ -329,6 +371,21 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
+        # the vision encoder input before its CP all-gather.  Relax's public
+        # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
+        # Without this compatibility mapping the parsed flag is silently
+        # ignored, so every CP rank repeats the full vision forward.
+        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+            if not provider.vision_dp_when_cp:
+                logger.info(
+                    "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
+                )
+            provider.vision_dp_when_cp = True
+
+        if getattr(provider, "vision_dp_when_cp", False):
+            _install_bridge_vision_cp_all_gather_compat()
 
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
@@ -551,6 +608,10 @@ def wrap_model_provider_with_lora(original_provider, args):
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
                 peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+                peft.target_modules = exclude_frozen_lora_target_modules(
+                    model, list(peft.target_modules), args.freeze_params_name_list
+                )
             model = peft(model, training=True)
             ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0

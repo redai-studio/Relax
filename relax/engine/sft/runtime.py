@@ -7,8 +7,9 @@ These are the bits previously duplicated as ``_sft_*`` private functions in
 here keeps the dispatchers in those files to one-line calls.
 """
 
-import random
 from argparse import Namespace
+
+import numpy as np
 
 from relax.utils.env import Envs
 
@@ -28,18 +29,32 @@ def resolve_sft_eval_split(total_size: int, eval_size: float | int | None) -> tu
 def resolve_sft_split_indices(
     total_size: int, eval_size: float | int | None, seed: int
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Return deterministic, disjoint train/eval row IDs.
+    """Return deterministic, disjoint train/eval row IDs in ms-swift order.
 
-    The full row-ID range is shuffled once with ``seed`` before splitting.
-    Returned IDs are sorted so the split membership is random while eval
-    rendering remains in stable source order. Training shuffles its subset
-    independently for every epoch.
+    ms-swift draws a seed from ``RandomState(data_seed)`` for the Hugging Face
+    ``train_test_split`` call. The test rows are the leading part of that
+    permutation and the train rows are the remainder. It then draws separate
+    seeds to shuffle the train and eval datasets. Training applies its shuffle
+    later in :class:`IndexManager`; eval has no sampler, so its dataset shuffle
+    is applied here.
     """
     train_size, n_eval = resolve_sft_eval_split(total_size, eval_size)
-    indices = list(range(total_size))
-    random.Random(seed).shuffle(indices)
-    train_indices = tuple(sorted(indices[:train_size]))
-    eval_indices = tuple(sorted(indices[train_size : train_size + n_eval]))
+    random_state = np.random.RandomState(seed)
+    seed_max = np.iinfo(np.int32).max
+    split_seed = int(random_state.randint(0, seed_max))
+    split_indices = np.random.default_rng(split_seed).permutation(total_size)
+    eval_indices_array = split_indices[:n_eval]
+    train_indices_array = split_indices[n_eval : n_eval + train_size]
+
+    # Consume the train dataset-shuffle seed here to preserve ms-swift's RNG
+    # sequence. SFTStreamingDataset applies this draw via
+    # ``dataset_seed_offset=1`` before the Megatron sampler permutation.
+    random_state.randint(0, seed_max)
+    eval_shuffle_seed = int(random_state.randint(0, seed_max))
+    eval_order = np.random.default_rng(eval_shuffle_seed).permutation(n_eval)
+
+    train_indices = tuple(int(index) for index in train_indices_array)
+    eval_indices = tuple(int(index) for index in eval_indices_array[eval_order])
     return train_indices, eval_indices
 
 

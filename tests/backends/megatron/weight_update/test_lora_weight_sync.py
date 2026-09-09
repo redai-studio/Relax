@@ -182,10 +182,15 @@ class TestCheckpointModeDetection:
                 if object_gather_list is not None:
                     object_gather_list[0] = obj
 
+            def fake_all_gather(output, obj, group=None):
+                output[0] = obj
+
             with (
                 patch("torch.distributed.get_rank", return_value=0),
                 patch("torch.distributed.get_world_size", return_value=1),
+                patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
                 patch("torch.distributed.gather_object", side_effect=fake_gather),
+                patch("torch.distributed.broadcast_object_list"),
                 patch("relax.backends.megatron.checkpoint.get_gloo_group", return_value=None),
                 patch("relax.backends.megatron.checkpoint.megatron_bridge_utils.patch_megatron_model"),
             ):
@@ -198,6 +203,41 @@ class TestCheckpointModeDetection:
             meta = json.loads((adapter_dir / "relax_lora_meta.json").read_text())
             assert meta["lora_adapter_mode"] is True
             assert meta["lora_merge_mode"] is False
+
+    def test_empty_adapter_export_is_a_hard_error(self):
+        pytest.importorskip("megatron")
+
+        from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
+
+        args = MagicMock(
+            lora_rank=32,
+            lora_alpha=32,
+            lora_target_modules=["linear_qkv"],
+            lora_dropout=0.0,
+            lora_merge_mode=False,
+            lora_adapter_mode=False,
+        )
+        bridge = MagicMock()
+        bridge.export_adapter_weights.return_value = []
+
+        def fake_all_gather(output, obj, group=None):
+            output[0] = obj
+
+        def fake_gather(obj, object_gather_list=None, dst=0, group=None):
+            object_gather_list[0] = obj
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
+            patch("torch.distributed.gather_object", side_effect=fake_gather),
+            patch("torch.distributed.broadcast_object_list"),
+            patch("relax.backends.megatron.checkpoint.get_gloo_group", return_value=None),
+            patch("relax.backends.megatron.checkpoint.megatron_bridge_utils.patch_megatron_model"),
+            pytest.raises(RuntimeError, match="no adapter parameters"),
+        ):
+            _save_lora_to_checkpoint(MagicMock(), tmpdir, args, bridge=bridge)
 
 
 # ---------------------------------------------------------------------------

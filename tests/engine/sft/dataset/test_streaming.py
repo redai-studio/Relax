@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from relax.engine.sft.dataset import streaming as streaming_module
 from relax.engine.sft.dataset.streaming import (
     ProcessedSample,
     SFTMultimodalContractError,
@@ -124,7 +125,7 @@ class _FakeTokenizer:
         messages,
         *,
         tools=None,  # noqa: ARG002
-        tokenize=True,  # noqa: ARG002
+        tokenize=True,
         return_tensors=None,  # noqa: ARG002
         return_dict=False,
         return_assistant_tokens_mask=False,
@@ -132,6 +133,7 @@ class _FakeTokenizer:
     ):
         ids: list[int] = []
         masks: list[int] = []
+        rendered_parts: list[str] = []
         next_id = 1
         for message in messages:
             content = message["content"]
@@ -139,10 +141,13 @@ class _FakeTokenizer:
                 text = "".join(part.get("text", "") for part in content if part.get("type") == "text")
             else:
                 text = content
+            rendered_parts.append(text)
             n = max(1, len(text))
             ids.extend(range(next_id, next_id + n))
             masks.extend([1 if message["role"] in ("assistant", "function_call") else 0] * n)
             next_id += n
+        if not tokenize:
+            return "".join(rendered_parts)
         input_ids = torch.tensor([ids], dtype=torch.long)
         if return_assistant_tokens_mask:
             return {"input_ids": input_ids, "assistant_masks": [masks]}
@@ -907,6 +912,65 @@ def test_streaming_dataset_invalid_multimodal_skip_refills_batch(tmp_path: Path,
         assert [sample.source_idx for sample in samples] == [1]
         assert "SFTStreamingDataset[invalid-multimodal=skip]" in caplog.text
         assert "sample idx=0, sample_id='invalid-image-url'" in caplog.text
+    finally:
+        ds.stop()
+
+
+@pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])
+def test_streaming_dataset_missing_media_skip_refills_batch(tmp_path: Path, monkeypatch, batch_mode: str):
+    path = tmp_path / "train.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "<image>\nDescribe the image."},
+                    {"role": "assistant", "content": "Bad sample"},
+                ],
+                "images": [str(tmp_path / "missing.png")],
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Text question"},
+                    {"role": "assistant", "content": "Good sample"},
+                ],
+                "images": [],
+            },
+        ],
+    )
+    ds = SFTStreamingDataset(
+        path=str(path),
+        tokenizer=_FakeTokenizer(),
+        processor_pool=object(),
+        capacity=None,
+        prompt_key="messages",
+        label_key=None,
+        multimodal_keys={"image": "images"},
+        seed=0,
+        prefetch_max_cached=4 if batch_mode == "prefetch" else 0,
+        prefetch_chunk_size=1,
+        prefetch_num_workers=1,
+        invalid_multimodal_strategy="skip",
+    )
+    ds.shuffle(0)
+    warning_messages: list[str] = []
+    original_warning = streaming_module.logger.warning
+
+    def _capture_warning(message, *args, **kwargs):
+        warning_messages.append(message % args)
+        return original_warning(message, *args, **kwargs)
+
+    monkeypatch.setattr(streaming_module.logger, "warning", _capture_warning)
+
+    try:
+        if batch_mode == "async":
+            samples, _ = asyncio.run(ds.get_batch_async(1))
+        else:
+            samples, _ = ds.get_batch(1)
+        assert [sample.source_idx for sample in samples] == [1]
+        captured_warnings = "\n".join(warning_messages)
+        assert "SFTStreamingDataset[invalid-multimodal=skip]" in captured_warnings
+        assert "image position=0" in captured_warnings
     finally:
         ds.stop()
 

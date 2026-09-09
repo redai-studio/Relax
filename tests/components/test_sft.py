@@ -116,7 +116,7 @@ def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(mon
     assert sft._train_size == 8
     assert sft._eval_indices == eval_indices
     assert eval_indices != (8, 9)
-    fake_ds.restrict_training_indices.assert_called_once_with(train_indices)
+    fake_ds.restrict_training_indices.assert_called_once_with(train_indices, dataset_seed_offset=1)
     fake_ds.shuffle.assert_called_once_with(0, position=0)
 
     assert [sample.source_idx for sample in sft._build_eval_batches()] == list(eval_indices)

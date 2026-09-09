@@ -345,6 +345,8 @@ class SFTStreamingDataset:
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",
         classification_sentinel_token_id: int | None = None,
+        loss_last_turn_only: bool = False,
+        loss_ignore_empty_think: bool = False,
     ) -> None:
         self.path = path
         self.tokenizer = tokenizer
@@ -385,6 +387,9 @@ class SFTStreamingDataset:
                 raise ValueError("SFTStreamingDataset seq_cls mode requires a sentinel token id")
             if self.capacity is not None and self.capacity < 2:
                 raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
+        self.loss_last_turn_only = loss_last_turn_only
+        self.loss_ignore_empty_think = loss_ignore_empty_think
+
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
             raise ValueError(f"oversize_strategy must be one of {sorted(valid_strategies)}, got {oversize_strategy!r}")
@@ -443,7 +448,7 @@ class SFTStreamingDataset:
             raise ValueError(f"training size must be in [1, {len(self.reader)}], got {size}")
         self.restrict_training_indices(range(size))
 
-    def restrict_training_indices(self, indices: Iterable[int]) -> None:
+    def restrict_training_indices(self, indices: Iterable[int], *, dataset_seed_offset: int = 0) -> None:
         """Restrict epoch shuffling to the provided physical row IDs."""
         if self.index_manager.current_epoch >= 0 or self.index_manager.position != 0:
             raise RuntimeError("training indices must be restricted before the dataset is shuffled or consumed")
@@ -454,7 +459,12 @@ class SFTStreamingDataset:
             raise ValueError("training indices must be unique")
         if any(not isinstance(index, int) or index < 0 or index >= len(self.reader) for index in index_pool):
             raise ValueError(f"training indices must be integers in [0, {len(self.reader)})")
-        self.index_manager = IndexManager(len(index_pool), seed=self.index_manager.seed, index_pool=index_pool)
+        self.index_manager = IndexManager(
+            len(index_pool),
+            seed=self.index_manager.seed,
+            index_pool=index_pool,
+            dataset_seed_offset=dataset_seed_offset,
+        )
 
     def shuffle(self, epoch_id: int, position: int = 0) -> None:
         self.index_manager.shuffle(epoch_id)
@@ -776,7 +786,11 @@ class SFTStreamingDataset:
             logger.warning(f"SFTStreamingDataset[invalid-multimodal=skip]: {exc} Skipping.")
             return None
         short_ids, short_mask = render_with_loss_mask(
-            sample, tokenizer=self.tokenizer, apply_chat_template_kwargs=self.apply_chat_template_kwargs
+            sample,
+            tokenizer=self.tokenizer,
+            apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            last_turn_only=self.loss_last_turn_only,
+            ignore_empty_think=self.loss_ignore_empty_think,
         )
         n = int(short_ids.shape[0])
         effective_n = n + 1 if self.task_type == "seq_cls" else n
@@ -792,6 +806,7 @@ class SFTStreamingDataset:
                 sample,
                 tokenizer=self.tokenizer,
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                last_turn_only=self.loss_last_turn_only,
             )
         return _RenderedSample(
             idx=idx,

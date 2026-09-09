@@ -4,9 +4,12 @@
 Relax."""
 
 import re
+from fnmatch import fnmatchcase
 from typing import Iterable, Tuple
 
 import torch
+
+from relax.utils.env import Envs, is_env_set
 
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout
@@ -354,6 +357,33 @@ def scope_target_modules_to_region(model, target_modules: list[str], scope: str)
     return scoped or [_LORA_NO_MATCH_SENTINEL]
 
 
+def exclude_frozen_lora_target_modules(model, target_modules: list[str], freeze_patterns: Iterable[str]) -> list[str]:
+    """Resolve LoRA targets to full module paths and drop frozen regions.
+
+    PEFT adapters still execute their dropout path after their parameters are
+    frozen.  For strict numerical comparisons this advances the RNG even when
+    the zero-initialized adapter contributes nothing to the forward output.
+    Filtering before injection avoids that side effect while preserving any
+    explicitly unfrozen subregion, such as a vision merger excluded by a
+    negative-lookahead freeze regex.
+    """
+    patterns = tuple(freeze_patterns)
+    filtered: list[str] = []
+    for full_name, _module in model.named_modules():
+        if not full_name:
+            continue
+        leaf = full_name.rsplit(".", 1)[-1]
+        if not any(
+            leaf == target or full_name == target or fnmatchcase(full_name, target) for target in target_modules
+        ):
+            continue
+        if any(re.search(pattern, full_name) for pattern in patterns):
+            continue
+        filtered.append(full_name)
+
+    return filtered or [_LORA_NO_MATCH_SENTINEL]
+
+
 def lora_module_category(name: str) -> str:
     """Bucket a LoRA-wrapped module (or adapter param) by architectural role.
 
@@ -607,6 +637,16 @@ def build_lora_peft(args):
         "dropout": args.lora_dropout,
         "bias": "none",
     }
+    # Megatron-Bridge defaults to Xavier A initialization and one adapter
+    # shared by all local experts.  Some external PEFT baselines use Kaiming
+    # initialization and one adapter per expert instead.  Keep Relax defaults
+    # unchanged, but allow launchers doing strict numerical comparisons to
+    # select those Bridge-native options without adding framework CLI flags.
+    lora_a_init_method = Envs.RELAX_LORA_A_INIT_METHOD.strip()
+    if lora_a_init_method:
+        peft_config["lora_A_init_method"] = lora_a_init_method
+    if is_env_set("RELAX_LORA_SHARE_EXPERT_ADAPTERS"):
+        peft_config["share_expert_adapters"] = Envs.RELAX_LORA_SHARE_EXPERT_ADAPTERS
     return create_peft(peft_config)
 
 
@@ -628,5 +668,6 @@ __all__ = [
     "repack_gdn_adapter_for_sglang",
     "summarize_lora_modules",
     "scope_target_modules_to_region",
+    "exclude_frozen_lora_target_modules",
     "VISION_REGION_TOKENS",
 ]

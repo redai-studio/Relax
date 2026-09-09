@@ -207,13 +207,12 @@ Both set `--expert-tensor-parallel-size 1`.
 
 ## Checkpointing and Export
 
-When LoRA is enabled, checkpoint save also writes a **portable HF-PEFT adapter** under `<checkpoint_dir>/lora_adapter/` (`relax/backends/megatron/checkpoint.py`):
+By default, `--save` writes the regular full Megatron distributed checkpoint. Add `--save-lora-only` to write a smaller, resumable actor checkpoint instead. This mode stores the LoRA tensors together with optimizer, scheduler, RNG, iteration, and common state, while restoring frozen base weights from `--hf-checkpoint` on resume.
 
-- `adapter_config.json` + `adapter_model.safetensors` — standard HF-PEFT layout, loadable with `peft.PeftModel.from_pretrained`.
-- `relax_lora_meta.json` — Relax metadata (rank, alpha, target modules, dropout, mode). Kept as a separate file so it never confuses a standard PEFT loader.
+`--save-lora-only` is mutually exclusive with full checkpoint export: it requires synchronous BF16 `torch_dist` checkpointing and cannot be combined with `--async-save`, `--rotate-ckpt`, `--no-save-optim`, `--no-save-rng`, `--fp16`, `--fp8`, or `--save-hf`. It also fails if any trainable model parameter is not a LoRA adapter, preventing an incomplete resume artifact.
 
 ::: tip
-This `lora_adapter/` directory is an **export artifact** for external / inference use — it is **not** the resume source. LoRA parameters are ordinary model parameters saved inside the main Megatron checkpoint, so `--load` resumes them like any other weight.
+The lightweight checkpoint is a sharded Megatron resume artifact, not a portable HF-PEFT adapter. Explicit `--save-hf` export can still write `lora_adapter/` with `adapter_config.json`, `adapter_model.safetensors`, and `relax_lora_meta.json`; that directory is for external or inference use and is not a resume source.
 :::
 
 ### Offline merge into a standalone HF checkpoint

@@ -55,8 +55,106 @@ def test_sft_lookahead_pauses_on_checkpoint_boundary(monkeypatch):
     monkeypatch.setattr(actor_module, "should_run_sft_predict", lambda *_args: False)
     args = Namespace(num_rollout=100, save="/checkpoint", rotate_ckpt=False, save_interval=20)
 
-    assert actor_module._should_pause_sft_prepack_lookahead(args, rollout_id=19) is True
-    assert actor_module._should_pause_sft_prepack_lookahead(args, rollout_id=18) is False
+    assert actor_module._should_pause_sft_lookahead(args, rollout_id=19) is True
+    assert actor_module._should_pause_sft_lookahead(args, rollout_id=18) is False
+
+
+def _patch_raw_prefetch_groups(monkeypatch, all_reduce):
+    monkeypatch.setattr(actor_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(actor_module.mpu, "get_tensor_and_context_parallel_group", lambda: "tp_cp")
+    monkeypatch.setattr(actor_module.mpu, "get_pipeline_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(actor_module.mpu, "get_pipeline_model_parallel_group", lambda: "pp")
+    monkeypatch.setattr(
+        actor_module.mpu, "get_data_parallel_group", lambda **_kwargs: pytest.fail("unexpected DP group")
+    )
+    monkeypatch.setattr(actor_module.dist, "all_reduce", all_reduce)
+
+
+def test_sft_train_prefetch_peer_error_forces_replica_fallback(monkeypatch):
+    groups = []
+
+    def mark_peer_error(state, *, op, group):
+        groups.append(group)
+        if group == "tp_cp":
+            state[1] = 1
+
+    _patch_raw_prefetch_groups(monkeypatch, mark_peer_error)
+    payload = (["payload"], 0.1)
+
+    assert actor_module._agree_sft_train_prefetch_result(payload, None) is None
+    assert groups == ["tp_cp", "pp"]
+
+
+def test_sft_train_prefetch_all_success_keeps_payload(monkeypatch):
+    _patch_raw_prefetch_groups(monkeypatch, lambda *_args, **_kwargs: None)
+    payload = (["payload"], 0.1)
+
+    assert actor_module._agree_sft_train_prefetch_result(payload, None) is payload
+
+
+def test_sft_train_prefetch_peer_fatal_raises_together(monkeypatch):
+    def mark_peer_fatal(state, *, op, group):
+        if group == "tp_cp":
+            state[0] = 1
+
+    _patch_raw_prefetch_groups(monkeypatch, mark_peer_fatal)
+
+    with pytest.raises(RuntimeError, match="stale on a peer rank"):
+        actor_module._agree_sft_train_prefetch_result(None, None)
+
+
+def test_sft_train_prefetch_pauses_at_step_boundary(monkeypatch):
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = Namespace(num_rollout=10)
+    actor._sft_train_prefetch_executor = MagicMock()
+    actor._sft_train_prefetch = None
+    actor._sft_train_prefetch_rollout_id = None
+    monkeypatch.setattr(actor_module, "_should_pause_sft_lookahead", lambda *_args: True)
+
+    actor._start_sft_train_prefetch(3, "sft_train", ["tokens"], 2)
+
+    actor._sft_train_prefetch_executor.submit.assert_not_called()
+
+
+def test_sft_train_prefetch_matching_failure_falls_back_and_clears_slot(monkeypatch):
+    _patch_raw_prefetch_groups(monkeypatch, lambda *_args, **_kwargs: None)
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor._sft_train_prefetch_executor = MagicMock()
+    actor._sft_train_prefetch = MagicMock()
+    actor._sft_train_prefetch.result.side_effect = RuntimeError("fetch failed")
+    actor._sft_train_prefetch_rollout_id = 4
+
+    assert actor._take_sft_train_prefetch(4) is None
+    assert actor._sft_train_prefetch is None
+    assert actor._sft_train_prefetch_rollout_id is None
+
+
+def test_sft_train_prefetch_running_stale_future_fails_fast(monkeypatch):
+    _patch_raw_prefetch_groups(monkeypatch, lambda *_args, **_kwargs: None)
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor._sft_train_prefetch_executor = MagicMock()
+    actor._sft_train_prefetch = MagicMock()
+    actor._sft_train_prefetch.done.return_value = False
+    actor._sft_train_prefetch.cancel.return_value = False
+    actor._sft_train_prefetch_rollout_id = 3
+
+    with pytest.raises(RuntimeError, match="Cannot cancel stale"):
+        actor._take_sft_train_prefetch(4)
+
+
+def test_sft_train_prefetch_shutdown_is_idempotent():
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    future = MagicMock()
+    executor = MagicMock()
+    actor._sft_train_prefetch = future
+    actor._sft_train_prefetch_rollout_id = 3
+    actor._sft_train_prefetch_executor = executor
+
+    actor._shutdown_sft_train_prefetch()
+    actor._shutdown_sft_train_prefetch()
+
+    future.cancel.assert_called_once_with()
+    executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
 
 def test_sft_prepack_fetch_concatenates_ready_tq_shards(monkeypatch):

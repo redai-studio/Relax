@@ -36,6 +36,7 @@ logger = get_logger(__name__)
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
 _CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template, try_patch_gemma4_thinking)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
+_EMPTY_THINK_UNSUPPORTED_WARNED: set[int] = set()  # tokenizer id → warned once
 _TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
 
 
@@ -57,25 +58,40 @@ def _to_chat_messages(sample: CanonicalSample) -> list[dict[str, Any]]:
     return out
 
 
+def _last_round_learn_indices(sample: CanonicalSample) -> set[int]:
+    """Learnable messages belonging to the final user round.
+
+    "Last round" is every learnable response after the final user query, not
+    just the last assistant message: an assistant tool-call, its tool response,
+    and the final answer are all one round.
+    """
+    last_user_index = max((i for i, m in enumerate(sample.messages) if m.role == "user"), default=-1)
+    return {i for i, m in enumerate(sample.messages) if i > last_user_index and m.learn}
+
+
 def _render_with_assistant_mask(
     sample: CanonicalSample,
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
     apply_chat_template_kwargs = _thread_local_chat_template_kwargs(
         tokenizer,
         apply_chat_template_kwargs,
     )
+    messages, template_kwargs = _prepare_chat_messages(
+        sample, apply_chat_template_kwargs, last_turn_only=last_turn_only
+    )
     result = tokenizer.apply_chat_template(
-        _to_chat_messages(sample),
+        messages,
         tools=sample.tools,
         tokenize=True,
         return_tensors="pt",
         return_dict=True,
         return_assistant_tokens_mask=True,
-        **(apply_chat_template_kwargs or {}),
+        **template_kwargs,
     )
     input_ids = result["input_ids"]
     masks = result["assistant_masks"]
@@ -85,7 +101,60 @@ def _render_with_assistant_mask(
         input_ids = input_ids.squeeze(0)
     if masks.dim() == 2:
         masks = masks.squeeze(0)
-    return input_ids.long(), masks.long()
+    masks = masks.long()
+    if last_turn_only:
+        # HF's assistant_masks mark every assistant span with a run of 1s
+        # (0s over tool/user turns between them). The last round can span
+        # several such runs (tool-call + answer), so keep one trailing run per
+        # learnable assistant message in it — not just the final run, which
+        # would drop an earlier tool-call span and diverge from Path 2.
+        n_runs = _last_round_assistant_run_count(sample)
+        masks = _keep_last_n_mask_runs(masks, n_runs)
+    return input_ids.long(), masks
+
+
+# Roles that apply_chat_template wraps in a {% generation %} block, so HF's
+# return_assistant_tokens_mask marks them with a run of 1s. Tool/user/system
+# turns are never marked, so they separate assistant runs with 0s.
+_ASSISTANT_MASKED_ROLES = {"assistant", "function_call"}
+
+
+def _last_round_assistant_run_count(sample: CanonicalSample) -> int:
+    """Number of learnable assistant-masked messages in the final user round.
+
+    Assumes one message renders as exactly one ``{% generation %}`` block (one
+    run of 1s), which holds for every shipped template. A custom template that
+    split a message across two blocks would keep one run too few — dropping,
+    never over-including, a supervised span (fails safe).
+    """
+    last_round = _last_round_learn_indices(sample)
+    return sum(1 for i in last_round if sample.messages[i].role in _ASSISTANT_MASKED_ROLES)
+
+
+def _keep_last_n_mask_runs(masks: torch.Tensor, n: int) -> torch.Tensor:
+    """Zero out all but the final ``n`` contiguous runs of 1s in a 1D 0/1 mask.
+
+    ``n <= 0`` clears the mask; ``n`` >= the number of runs is a no-op.
+    """
+    if masks.numel() == 0 or int(masks.sum()) == 0:
+        return masks
+    if n <= 0:
+        return torch.zeros_like(masks)
+    m = masks.tolist()
+    total = len(m)
+    out = [0] * total
+    runs_kept = 0
+    i = total - 1
+    while i >= 0 and runs_kept < n:
+        if m[i] == 0:
+            i -= 1
+            continue
+        # walk back over this contiguous run of 1s, copying it into out
+        while i >= 0 and m[i] == 1:
+            out[i] = 1
+            i -= 1
+        runs_kept += 1
+    return torch.tensor(out, dtype=masks.dtype)
 
 
 def _thread_local_chat_template_kwargs(tokenizer, apply_chat_template_kwargs: dict | None) -> dict:
@@ -105,6 +174,9 @@ def _thread_local_chat_template_kwargs(tokenizer, apply_chat_template_kwargs: di
 
 
 _THINK_OPEN = "<think>\n"
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+_NON_THINKING_PREFIX = "<think>\n\n</think>\n\n"
 _IM_END = "<|im_end|>"
 # Qwen3.5 wraps tool messages inside a user block as
 # `<tool_response>\n{content}\n</tool_response>`, so role=="tool" has no
@@ -170,11 +242,74 @@ def _detect_dialect(rendered_text: str) -> _Dialect:
     return _CHATML
 
 
+def _prepare_chat_messages(
+    sample: CanonicalSample,
+    apply_chat_template_kwargs: dict | None,
+    *,
+    last_turn_only: bool,
+) -> tuple[list[dict[str, Any]], dict]:
+    """Prepare template input, including the ms-swift non-thinking prefix.
+
+    ``add_non_thinking_prefix`` is an ms-swift preprocessing option rather than
+    a Hugging Face chat-template variable.  Consume it here so launchers can
+    request the same training input without forwarding an inert kwarg to Jinja.
+    With last-round loss, ms-swift only adds the prefix to assistant messages
+    after the final user query; otherwise it considers every assistant message.
+    """
+    template_kwargs = dict(apply_chat_template_kwargs or {})
+    add_non_thinking_prefix = bool(template_kwargs.pop("add_non_thinking_prefix", False))
+    messages = _to_chat_messages(sample)
+    if not add_non_thinking_prefix:
+        return messages, template_kwargs
+
+    start_index = (
+        max((i for i, message in enumerate(messages) if message["role"] == "user"), default=-1)
+        if last_turn_only
+        else -1
+    )
+    for index, message in enumerate(messages):
+        content = message.get("content")
+        if (
+            index >= start_index
+            and message["role"] == "assistant"
+            and isinstance(content, str)
+            and not content.startswith((_THINK_OPEN_TAG, _NON_THINKING_PREFIX))
+        ):
+            message["content"] = _NON_THINKING_PREFIX + content
+    return messages, template_kwargs
+
+
+def _empty_think_region_end(rendered_text: str, content_start: int, span_end: int) -> int:
+    """If the assistant content at ``content_start`` opens with a `<think>`
+    block whose inner text is empty/whitespace, return the char offset just
+    past the closing `</think>` and any trailing whitespace (so the whole
+    empty-think region can be kept out of the loss). Otherwise return -1.
+
+    Handles both `<think>\\n\\n</think>` (Qwen3.5 non-thinking default) and
+    `<think></think>`. Only the region up to ``span_end`` is considered.
+    """
+    if rendered_text[content_start : content_start + len(_THINK_OPEN_TAG)] != _THINK_OPEN_TAG:
+        return -1
+    inner_start = content_start + len(_THINK_OPEN_TAG)
+    close_pos = rendered_text.find(_THINK_CLOSE_TAG, inner_start, span_end)
+    if close_pos < 0:
+        return -1
+    if rendered_text[inner_start:close_pos].strip() != "":
+        return -1  # non-empty think — keep it (only default opener-skip applies)
+    end = close_pos + len(_THINK_CLOSE_TAG)
+    # swallow trailing whitespace/newlines after </think> so they don't train
+    while end < span_end and rendered_text[end] in (" ", "\n", "\t", "\r"):
+        end += 1
+    return end
+
+
 def _render_per_message_fallback(
     sample: CanonicalSample,
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
+    ignore_empty_think: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 2: single full render + char-level mask projected back through
     `offset_mapping`.
@@ -200,8 +335,7 @@ def _render_per_message_fallback(
     Qwen-style ChatML wrapping — non-ChatML templates should expose
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
-    msgs = _to_chat_messages(sample)
-    extra_kwargs = apply_chat_template_kwargs or {}
+    msgs, extra_kwargs = _prepare_chat_messages(sample, apply_chat_template_kwargs, last_turn_only=last_turn_only)
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
@@ -229,10 +363,12 @@ def _render_per_message_fallback(
             "via offset_mapping would be unreliable."
         )
 
+    last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
+
     char_mask = bytearray(len(rendered_text))  # zeros
     dialect = _detect_dialect(rendered_text)
     cursor = 0
-    for msg in sample.messages:
+    for msg_idx, msg in enumerate(sample.messages):
         if msg.role == "tool":
             if not dialect.supports_tools:
                 raise RuntimeError(
@@ -272,23 +408,31 @@ def _render_per_message_fallback(
 
         if not msg.learn:
             continue
+        if last_turn_only and msg_idx not in last_round_learn_indices:
+            continue
 
         mask_start = content_start
-        if (
-            msg.role == "assistant"
-            and dialect.think_open is not None
-            and rendered_text.startswith(dialect.think_open, content_start)
-        ):
-            if dialect.think_close is None:
-                # ChatML: only the opener is excluded; the reasoning body is learned.
-                mask_start += len(dialect.think_open)
-            else:
-                # Delimited block (gemma-4): the whole reasoning span stays out of
-                # the loss, so training targets only the visible reply.
-                close_pos = rendered_text.find(dialect.think_close, content_start)
-                if close_pos < 0:
-                    raise RuntimeError(f"found {dialect.think_open!r} without a matching {dialect.think_close!r}")
-                mask_start = close_pos + len(dialect.think_close)
+        if msg.role == "assistant":
+            think_end = (
+                _empty_think_region_end(rendered_text, content_start, span_end)
+                if ignore_empty_think and dialect is _CHATML
+                else -1
+            )
+            if think_end >= 0:
+                # empty `<think>…</think>` region (plus trailing whitespace)
+                # stays out of the loss.
+                mask_start = think_end
+            elif dialect.think_open is not None and rendered_text.startswith(dialect.think_open, content_start):
+                if dialect.think_close is None:
+                    # ChatML: only the opener is excluded; the reasoning body is learned.
+                    mask_start += len(dialect.think_open)
+                else:
+                    # Delimited block (gemma-4): the whole reasoning span stays out of
+                    # the loss, so training targets only the visible reply.
+                    close_pos = rendered_text.find(dialect.think_close, content_start, span_end)
+                    if close_pos < 0:
+                        raise RuntimeError(f"found {dialect.think_open!r} without a matching {dialect.think_close!r}")
+                    mask_start = close_pos + len(dialect.think_close)
         for pos in range(mask_start, span_end):
             char_mask[pos] = 1
 
@@ -341,6 +485,8 @@ def render_with_loss_mask(
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
+    ignore_empty_think: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render a single sample.
 
@@ -352,6 +498,15 @@ def render_with_loss_mask(
     native chat template — useful when the native template is designed
     for inference and silently drops content needed for training
     (e.g. DeepSeek-R1 distill templates strip ``<think>...</think>``).
+
+    ``last_turn_only``: when True, only the final learnable round contributes to
+    the loss; earlier assistant/function_call turns are masked. Applied to both
+    render paths.
+
+    ``ignore_empty_think``: when True, an empty ``<think></think>`` block inside
+    an assistant turn is kept entirely out of the loss (not just its opener tag).
+    Only supported on the per-message fallback path (the ``{% generation %}``
+    template path has no think info).
     """
     patch_result = _resolve_sft_template_kwargs(
         sample,
@@ -394,7 +549,16 @@ def render_with_loss_mask(
         _TEMPLATE_LOGGED.add(log_key)
 
     if HAS_GENERATION_MARKER(effective_template):
-        return _render_with_assistant_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
+        if ignore_empty_think and tok_id not in _EMPTY_THINK_UNSUPPORTED_WARNED:
+            logger.warning(
+                "--sft-ignore-empty-think has no effect on the {%% generation %%} "
+                "template path (HF assistant_masks are token-level with no think "
+                "info). It only applies to the per-message fallback path."
+            )
+            _EMPTY_THINK_UNSUPPORTED_WARNED.add(tok_id)
+        return _render_with_assistant_mask(
+            sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged, last_turn_only=last_turn_only
+        )
 
     if tok_id not in _FALLBACK_WARNED:
         logger.warning(
@@ -404,7 +568,13 @@ def render_with_loss_mask(
             "(This warning is shown once per tokenizer instance.)"
         )
         _FALLBACK_WARNED.add(tok_id)
-    return _render_per_message_fallback(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
+    return _render_per_message_fallback(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=merged,
+        last_turn_only=last_turn_only,
+        ignore_empty_think=ignore_empty_think,
+    )
 
 
 def render_to_text(
@@ -412,6 +582,7 @@ def render_to_text(
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
 ) -> str:
     """Render a sample to the chat-template text WITHOUT tokenizing.
 
@@ -425,9 +596,10 @@ def render_to_text(
         tokenizer=tokenizer,
         apply_chat_template_kwargs=apply_chat_template_kwargs,
     )
+    messages, template_kwargs = _prepare_chat_messages(sample, patch_result.kwargs, last_turn_only=last_turn_only)
     return tokenizer.apply_chat_template(
-        _to_chat_messages(sample),
+        messages,
         tools=sample.tools,
         tokenize=False,
-        **patch_result.kwargs,
+        **template_kwargs,
     )

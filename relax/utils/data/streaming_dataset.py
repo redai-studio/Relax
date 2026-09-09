@@ -27,13 +27,14 @@ Usage:
 
 import json
 import os
-import random
 import threading
 import time
 from bisect import bisect_right
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable, Iterator, Optional
+
+import numpy as np
 
 
 try:
@@ -353,11 +354,18 @@ class SampleBuffer:
 class IndexManager:
     """Manages shuffle indices and epoch transitions.
 
-    Generates reproducible shuffle permutations based on epoch ID and seed.
-    Tracks current position within the epoch.
+    Generates a two-stage sample order: a persistent dataset shuffle followed
+    by the epoch's sampler permutation. Tracks current position within the
+    epoch.
     """
 
-    def __init__(self, total_size: int, seed: int = 42, index_pool: Iterable[int] | None = None):
+    def __init__(
+        self,
+        total_size: int,
+        seed: int = 42,
+        index_pool: Iterable[int] | None = None,
+        dataset_seed_offset: int = 0,
+    ):
         """Initialize the index manager.
 
         Args:
@@ -365,9 +373,12 @@ class IndexManager:
             seed: Random seed for reproducible shuffling
             index_pool: Optional physical row IDs to shuffle instead of
                 ``range(total_size)``.
+            dataset_seed_offset: Number of dataset RNG seeds consumed before
+                the persistent dataset shuffle.
         """
         self.total_size = total_size
         self.seed = seed
+        self.dataset_seed_offset = dataset_seed_offset
         self.index_pool = tuple(range(total_size)) if index_pool is None else tuple(index_pool)
         if len(self.index_pool) != total_size:
             raise ValueError(f"index_pool length {len(self.index_pool)} does not match total_size {total_size}")
@@ -384,9 +395,22 @@ class IndexManager:
         if epoch_id == self.current_epoch:
             return
 
-        random.seed(self.seed + epoch_id)
-        self.indices = list(self.index_pool)
-        random.shuffle(self.indices)
+        # Stage 1: a dataset shuffle whose seed is drawn from RandomState(seed),
+        # stable across epochs. Stage 2: a per-epoch ``torch.randperm(epoch)``
+        # sampler permutation. Both run over positions ``[0, total_size)`` and are
+        # then mapped through ``index_pool``, so a subsetted pool (physical row
+        # IDs) is reordered by the same order rather than assuming the identity
+        # pool ``range(total_size)``.
+        random_state = np.random.RandomState(self.seed)
+        dataset_seeds = random_state.randint(0, np.iinfo(np.int32).max, size=self.dataset_seed_offset + 1)
+        dataset_seed = int(dataset_seeds[-1])
+        dataset_indices = np.random.default_rng(dataset_seed).permutation(self.total_size)
+        import torch
+
+        generator = torch.Generator().manual_seed(epoch_id)
+        sampler_indices = torch.randperm(self.total_size, generator=generator).numpy()
+        pool = np.asarray(self.index_pool)
+        self.indices = pool[dataset_indices[sampler_indices]].tolist()
         self.current_epoch = epoch_id
         self.position = 0
 

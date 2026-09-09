@@ -35,26 +35,37 @@ from relax.utils.data.processing_utils import (
     remap_mm_train_inputs,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.multimodal.image_utils import resize_qwen_vl_extreme_aspect_ratio
+from relax.utils.multimodal.config import MultimodalConfig
+from relax.utils.multimodal.image_utils import fetch_image, resize_qwen_vl_extreme_aspect_ratio
 
 
 logger = get_logger(__name__)
 
+# fp32 mm tensors that are safe to downcast to bf16 for the shared-memory IPC + TQ
+# transfer: each is a large encoder input that gets re-cast to its encoder's weight
+# dtype downstream, so the bf16 here is lossless. Do NOT add small fp32 metadata
+# tensors (e.g. video_second_per_grid) — those are consumed at full precision.
+_BF16_DOWNCAST_KEYS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+
 # Worker-local processor instance, initialized once per worker via pool initializer.
 _worker_processor = None
+_worker_multimodal_config: MultimodalConfig | None = None
 
 
-def _init_worker(model_path: str, trust_remote_code: bool) -> None:
+def _init_worker(
+    model_path: str,
+    trust_remote_code: bool,
+    multimodal_config: MultimodalConfig | None,
+) -> None:
     """Initialize the HuggingFace processor in each worker process (called
     once)."""
-    global _worker_processor
+    global _worker_multimodal_config, _worker_processor
     _worker_processor = load_processor(model_path, trust_remote_code=trust_remote_code)
+    _worker_multimodal_config = multimodal_config
     logger.info(f"ProcessorPool worker initialized (pid={os.getpid()})")
 
 
 def _is_qwen_vl_processor(processor: object) -> bool:
-    """Return whether ``processor`` uses a Transformers Qwen-VL image
-    processor."""
     image_processor = getattr(processor, "image_processor", None)
     if image_processor is None:
         return False
@@ -64,6 +75,22 @@ def _is_qwen_vl_processor(processor: object) -> bool:
         ) and cls.__name__.startswith(("Qwen2VLImageProcessor", "Qwen3VLImageProcessor")):
             return True
     return False
+
+
+def _resize_images_for_processor(
+    processor: Any,
+    images: list[Image.Image],
+    multimodal_config: MultimodalConfig | None,
+) -> list[Image.Image]:
+    """Apply Relax image-token limits with the processor's actual patch
+    size."""
+    if multimodal_config is None:
+        return images
+    image_processor = getattr(processor, "image_processor", None)
+    patch_size = getattr(image_processor, "patch_size", 14)
+    if not isinstance(patch_size, int) or patch_size <= 0:
+        patch_size = 14
+    return [fetch_image({"image": image}, image_patch_size=patch_size, config=multimodal_config) for image in images]
 
 
 def prepare_mm_inputs_for_ipc(multimodal_inputs: dict) -> dict:
@@ -118,17 +145,22 @@ def process_sample_in_worker(
         # Restore PIL Images from numpy arrays (HF processor expects PIL for some code paths)
         restored = dict(multimodal_inputs)
         if images := restored.get("images"):
-            restored["images"] = [Image.fromarray(arr) for arr in images]
+            restored_images = [Image.fromarray(arr) for arr in images]
             if _is_qwen_vl_processor(_worker_processor):
                 resized_images = []
-                for image in restored["images"]:
+                for image in restored_images:
                     resized = resize_qwen_vl_extreme_aspect_ratio(image)
                     if resized is not image:
                         logger.warning(
                             f"Qwen-VL image aspect ratio exceeded 200; resized from {image.size} to {resized.size}."
                         )
                     resized_images.append(resized)
-                restored["images"] = resized_images
+                restored_images = resized_images
+            restored["images"] = _resize_images_for_processor(
+                _worker_processor,
+                restored_images,
+                _worker_multimodal_config,
+            )
         # Videos arrive as shared-memory torch.Tensors — usable directly by the processor.
         # Audio arrives as numpy arrays — usable directly by the processor.
 
@@ -150,6 +182,16 @@ def process_sample_in_worker(
             if isinstance(v, np.ndarray):
                 v = torch.from_numpy(v)
             if isinstance(v, torch.Tensor):
+                # Downcast the large fp32 encoder-input tensors to bf16 before the
+                # shared-memory IPC + TQ transfer (halves a ~45 GiB/batch payload).
+                # Only _BF16_DOWNCAST_KEYS are cast: each is re-cast to its encoder's
+                # weight dtype downstream, so this is lossless. It must NOT be a
+                # blanket "all fp32" downcast — small fp32 metadata is consumed at
+                # full precision and would be silently corrupted (e.g. Qwen3-Omni's
+                # `video_second_per_grid` drives mrope position IDs; bf16 rounding
+                # there drifts them irrecoverably).
+                if k in _BF16_DOWNCAST_KEYS and v.dtype == torch.float32:
+                    v = v.to(torch.bfloat16)
                 # Place in shared memory for zero-copy return via fd-based IPC.
                 # contiguous() is required: share_memory_() does not support non-contiguous storage.
                 mm_train_inputs[k] = v.contiguous().share_memory_()
@@ -202,6 +244,7 @@ class ProcessorPool:
         model_path: str,
         pool_size: int | None = None,
         trust_remote_code: bool = True,
+        multimodal_config: MultimodalConfig | None = None,
     ) -> None:
         if pool_size is None:
             pool_size = min(16, os.cpu_count() or 8)
@@ -211,7 +254,7 @@ class ProcessorPool:
             max_workers=pool_size,
             mp_context=ctx,
             initializer=_init_worker,
-            initargs=(model_path, trust_remote_code),
+            initargs=(model_path, trust_remote_code, multimodal_config),
         )
         self._pool_size = pool_size
         logger.info(f"ProcessorPool created with {pool_size} workers (spawn context)")

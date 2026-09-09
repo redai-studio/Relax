@@ -21,3 +21,10 @@ def test_resolve_sft_split_indices_clamps_eval_to_leave_one_train_row():
 
     assert len(train_indices) == 1
     assert len(eval_indices) == 3
+
+
+def test_resolve_sft_split_indices_matches_ms_swift_rng_order():
+    train_indices, eval_indices = resolve_sft_split_indices(100, 0.2, seed=42)
+
+    assert train_indices[:8] == (49, 48, 46, 56, 12, 17, 0, 50)
+    assert eval_indices[:8] == (91, 52, 40, 13, 32, 26, 65, 1)

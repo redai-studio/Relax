@@ -1837,3 +1837,30 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/m
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
  
                  indexer_compressed_local, _ = indexer.compressor._forward_thd(
+diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
+--- a/megatron/bridge/models/conversion/model_bridge.py
++++ b/megatron/bridge/models/conversion/model_bridge.py
+@@ -1080,7 +1080,7 @@
+         _hf_import_cache: Dict[str, torch.Tensor] = {}
+         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
+             # None means megatron module not on current rank, skip if this task is not going to happen
+-            if task.megatron_module is None:
++            if task is None or task.megatron_module is None:
+                 continue
+             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
+             hf_param_key = str(task.mapping.hf_param)
+@@ -1209,6 +1209,6 @@
+         for task in conversion_tasks:
+             # None means megatron module not on current rank, skip if this task is not going to happen
+-            if task.megatron_module is None:
++            if task is None or task.megatron_module is None:
+                 continue
+             hf_state_dict: Mapping[str, torch.Tensor] = hf_pretrained.state
+             if isinstance(task.mapping.hf_param, str):
+@@ -1322,4 +1322,6 @@
+         for task in self._with_progress_tracking(megatron_to_hf_tasks, "Converting to HuggingFace", show_progress):
++            if task is None:
++                continue
+             if isinstance(task.param_weight, DTensor):
+                 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+                     uneven_dtensor_to_full_tensor,

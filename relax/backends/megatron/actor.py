@@ -6,6 +6,7 @@ import random
 import socket
 import time
 from argparse import Namespace
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from typing import Any, List
 
@@ -54,6 +55,7 @@ from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
     StreamingTQIterator,
     create_stream_dataloader,
+    fetch_data_from_transfer_queue,
     get_data_from_transfer_queue,
     post_process_rollout_data,
 )
@@ -226,7 +228,7 @@ def _raise_if_sft_peer_error(
     raise RuntimeError(f"SFT prepack {phase} failed on a peer rank; aborting to avoid a distributed hang.")
 
 
-def _should_pause_sft_prepack_lookahead(args: Namespace, rollout_id: int) -> bool:
+def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
     """Avoid retaining the next prefetched window across memory-heavy step
     boundaries."""
     next_rollout_id = rollout_id + 1
@@ -236,6 +238,34 @@ def _should_pause_sft_prepack_lookahead(args: Namespace, rollout_id: int) -> boo
         or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
     )
     return should_run_sft_eval(args, rollout_id) or should_run_sft_predict(args, rollout_id) or should_save_after_step
+
+
+def _agree_sft_train_prefetch_result(
+    prefetched_fetch: tuple[list, float] | None,
+    local_error: BaseException | None,
+    *,
+    fatal: bool = False,
+) -> tuple[list, float] | None:
+    """Make one model-parallel replica agree on raw-prefetch fallback."""
+    state = torch.tensor(
+        [int(fatal), int(local_error is not None), int(prefetched_fetch is None), int(prefetched_fetch is not None)],
+        dtype=torch.int32,
+        device=device_utils.make_current_torch_device(),
+    )
+    groups = [mpu.get_tensor_and_context_parallel_group()]
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        groups.append(mpu.get_pipeline_model_parallel_group())
+    for group in groups:
+        dist.all_reduce(state, op=dist.ReduceOp.MAX, group=group)
+
+    peer_fatal, peer_error, peer_missing, peer_has_payload = (bool(value) for value in state.tolist())
+    if peer_fatal:
+        if fatal and local_error is not None:
+            raise local_error
+        raise RuntimeError("SFT train-data prefetch is stale on a peer rank; aborting to avoid concurrent TQ reads.")
+    if peer_error or (peer_missing and peer_has_payload):
+        return None
+    return prefetched_fetch
 
 
 class _SFTPrepackedDeviceIterator:
@@ -340,6 +370,14 @@ class MegatronTrainRayActor(TrainRayActor):
         init(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()
+        self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
+        self._sft_train_prefetch: Future[tuple[list, float]] | None = None
+        self._sft_train_prefetch_rollout_id: int | None = None
+        if is_sft_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
+            self._sft_train_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="sft-tq-prefetch",
+            )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
 
@@ -970,12 +1008,30 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_mini_batch_metas: list = []
             rollout_mini_local_sample_counts: list[int] = []
             fetch_iter = 0
-            while batch_index < num_rollout_minis and not self.all_consumed(task_name, rollout_id):
+            while batch_index < num_rollout_minis:
+                # ``get_meta`` marks a TQ partition consumed.  A CPU-prefetched
+                # SFT batch therefore looks consumed before the main training
+                # thread has finalized and trained it.  Keep the fetch loop
+                # alive for that exact prefetched rollout; all other paths
+                # retain the normal consumed-partition exit condition.
+                has_prefetched_sft_batch = (
+                    is_sft_mode(self.args)
+                    and self._sft_train_prefetch is not None
+                    and self._sft_train_prefetch_rollout_id == rollout_id
+                )
+                if not has_prefetched_sft_batch and self.all_consumed(task_name, rollout_id):
+                    break
                 consumer = "critic" if self.role == "critic" else "actor"
                 data_fields = build_data_fields(self.args, consumer=consumer)
                 with timer("train_get_data"):
+                    prefetched_fetch = self._take_sft_train_prefetch(rollout_id)
                     rollout_data, batch_meta = self._get_data_from_transfer_queue(
-                        task_name, rollout_id, data_fields, batch_size, batch_index
+                        task_name,
+                        rollout_id,
+                        data_fields,
+                        batch_size,
+                        batch_index,
+                        prefetched_fetch=prefetched_fetch,
                     )
                 if rollout_data is None:
                     if fetch_iter % 100 == 0:
@@ -990,6 +1046,14 @@ class MegatronTrainRayActor(TrainRayActor):
                     continue
                 batch_index += 1
                 if is_sft_mode(self.args):
+                    # Start N+1 only after every rank has finalized N. A raw
+                    # prefetch can return empty on a subset of ranks while the
+                    # producer is publishing the partition; scheduling N+1
+                    # before _agree_on_fetch then makes those ranks discard it
+                    # as stale when they retry N. The current step's compute is
+                    # much longer than finalization, so this still hides the TQ
+                    # RPC without consuming partitions out of order.
+                    self._start_sft_train_prefetch(rollout_id, task_name, data_fields, batch_size)
                     if self.role == "critic":
                         return self.train_critic(rollout_id, rollout_data)
                     else:
@@ -1136,7 +1200,7 @@ class MegatronTrainRayActor(TrainRayActor):
         local_k = max_k
 
         next_rollout_id = rollout_id + 1
-        should_pause_lookahead = _should_pause_sft_prepack_lookahead(self.args, rollout_id)
+        should_pause_lookahead = _should_pause_sft_lookahead(self.args, rollout_id)
         if next_rollout_id < self.args.num_rollout and self.args.max_staleness >= 1 and not should_pause_lookahead:
             self._sft_window_prefetcher.prefetch(
                 next_rollout_id,
@@ -2329,7 +2393,13 @@ class MegatronTrainRayActor(TrainRayActor):
 
         dist.barrier(group=get_gloo_group())
 
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        save(
+            rollout_id,
+            self.model,
+            self.optimizer,
+            self.opt_param_scheduler,
+            lora_only=self.role == "actor" and getattr(self.args, "save_lora_only", False),
+        )
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
@@ -2877,8 +2947,104 @@ class MegatronTrainRayActor(TrainRayActor):
         num_microbatches = [k_global]
         return data_iterator, num_microbatches
 
+    def _start_sft_train_prefetch(
+        self, rollout_id: int, task_name: str, data_fields: list[str], batch_size: int
+    ) -> None:
+        """Start a CPU-only TQ read for the next SFT step while this one
+        trains."""
+        if self._sft_train_prefetch_executor is None:
+            return
+        if rollout_id + 1 >= self.args.num_rollout:
+            self._shutdown_sft_train_prefetch()
+            return
+        if _should_pause_sft_lookahead(self.args, rollout_id):
+            return
+        if self._sft_train_prefetch is not None:
+            raise RuntimeError("SFT train-data prefetch was not consumed before scheduling the next step.")
+
+        next_rollout_id = rollout_id + 1
+        partition_id = sft_partition_id(self.args, next_rollout_id)
+        sampling_config = {
+            "dp_rank": mpu.get_data_parallel_rank(with_context_parallel=False),
+            "task_name": task_name,
+        }
+        self._sft_train_prefetch_rollout_id = next_rollout_id
+        self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
+            fetch_data_from_transfer_queue,
+            tq_client=self.data_system_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=0,
+        )
+        if is_megatron_main_rank():
+            logger.info("Started CPU-only TQ prefetch for SFT rollout_id=%d", next_rollout_id)
+
+    def _take_sft_train_prefetch(self, rollout_id: int) -> tuple[list, float] | None:
+        """Return the matching raw payload after replica-wide status
+        agreement."""
+        if self._sft_train_prefetch_executor is None:
+            return None
+        future = self._sft_train_prefetch
+        prefetched_rollout_id = self._sft_train_prefetch_rollout_id
+        self._sft_train_prefetch = None
+        self._sft_train_prefetch_rollout_id = None
+        prefetched_fetch = None
+        local_error: BaseException | None = None
+        fatal = False
+
+        if future is not None and prefetched_rollout_id != rollout_id:
+            logger.warning(
+                "Discarding stale SFT train-data prefetch: prefetched rollout_id=%s, requested=%s.",
+                prefetched_rollout_id,
+                rollout_id,
+            )
+            if future.done():
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Discarded SFT train-data prefetch also failed: %s", exc)
+            elif not future.cancel():
+                fatal = True
+                local_error = RuntimeError(
+                    f"Cannot cancel stale SFT train-data prefetch for rollout_id={prefetched_rollout_id}; "
+                    f"requested rollout_id={rollout_id}."
+                )
+        elif future is not None:
+            with timer("sft_train_prefetch_wait"):
+                try:
+                    prefetched_fetch = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    local_error = exc
+
+        agreed_fetch = _agree_sft_train_prefetch_result(prefetched_fetch, local_error, fatal=fatal)
+        if agreed_fetch is None and local_error is not None and not fatal:
+            logger.warning("SFT train-data prefetch failed for rollout_id=%d: %s", rollout_id, local_error)
+        return agreed_fetch
+
+    def _shutdown_sft_train_prefetch(self) -> None:
+        """Release the optional raw-prefetch slot and executor once."""
+        future = self._sft_train_prefetch
+        executor = self._sft_train_prefetch_executor
+        self._sft_train_prefetch = None
+        self._sft_train_prefetch_rollout_id = None
+        self._sft_train_prefetch_executor = None
+        if future is not None:
+            future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def _get_data_from_transfer_queue(
-        self, task_name, rollout_id, data_fields, batch_size, batch_index, partition_id: str | None = None
+        self,
+        task_name,
+        rollout_id,
+        data_fields,
+        batch_size,
+        batch_index,
+        partition_id: str | None = None,
+        prefetched_fetch: tuple[list, float] | None = None,
     ):
         # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
         # Both first pp stage and the last pp stage will recieve the data.
@@ -2906,6 +3072,12 @@ class MegatronTrainRayActor(TrainRayActor):
         # remaining incompatibility is ``rollout_routed_experts`` — it relies on
         # the NestedTensor jagged bcast path that this mode bypasses.
         per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
+        prefetched_rollout_data = None
+        prefetched_fetch_time_s = None
+        if prefetched_fetch is not None:
+            if not per_rank_fetch:
+                raise RuntimeError("SFT train-data prefetch requires an active per-rank fetch path.")
+            prefetched_rollout_data, prefetched_fetch_time_s = prefetched_fetch
         rollout_data, batch_meta = get_data_from_transfer_queue(
             self.args,
             self.data_system_client,
@@ -2917,6 +3089,8 @@ class MegatronTrainRayActor(TrainRayActor):
             batch_index,
             broadcast_pp=broadcast_pp,
             per_rank_fetch=per_rank_fetch,
+            prefetched_rollout_data=prefetched_rollout_data,
+            prefetched_fetch_time_s=prefetched_fetch_time_s,
         )
 
         return rollout_data, batch_meta

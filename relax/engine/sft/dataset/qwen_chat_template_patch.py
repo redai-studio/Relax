@@ -90,7 +90,28 @@ _QWEN_COMPACT_ASSISTANT_GENERATION_RENDER_BLOCK = "\n".join(
     )
 )
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
+_QWEN_UNCONDITIONAL_REASONING_GATE = "{%- if reasoning_content %}"
+_QWEN_PRESERVE_REASONING_GATE = (
+    "{%- if reasoning_content and ((preserve_thinking is defined and preserve_thinking is true) "
+    "or (loop.index0 > ns.last_query_index)) %}"
+)
+_QWEN_UNCONDITIONAL_REASONING_TEMPLATE_SHA256 = "0ce947a61b6e34c108269eeaa5c74c975cd65269aac6c67331d663d57faa0f93"
+_QWEN_PRESERVE_REASONING_TEMPLATE_SHA256 = "277c7461016dfeb7d9b7df695db59f1eca2841f8fb9518be5a8627578dcd1941"
 _PATCH_NAME = "qwen_history_thinking"
+_QWEN_ASSISTANT_WITH_THINK = (
+    "{{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}"
+)
+_QWEN_ASSISTANT_TOOL_CALL = """{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping and content|trim and not reasoning_content|trim %}
+                {{- '<|im_start|>' + message.role + '\\n' + content }}
+            {%- else %}
+                {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}
+            {%- endif %}"""
+_QWEN_TOOL_CALL_WITH_SEPARATOR = "{{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}"
+_QWEN_TOOL_CALL_SEPARATOR_PATCH = """{%- if reasoning_content|trim %}
+                            {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}
+                        {%- else %}
+                            {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}
+                        {%- endif %}"""
 
 
 def _content_as_text(content: str | list[dict] | None) -> str:
@@ -149,22 +170,68 @@ def _patch_qwen_history_gate(template: str) -> tuple[str, bool] | None:
     old_count = template.count(_QWEN_HISTORY_GATE)
     native_count = template.count(_QWEN_PRESERVE_HISTORY_GATE)
     qwen38_count = template.count(_QWEN38_PRESERVE_HISTORY_GATE)
+    unconditional_count = template.count(_QWEN_UNCONDITIONAL_REASONING_GATE)
+    preserve_reasoning_count = template.count(_QWEN_PRESERVE_REASONING_GATE)
+    template_hash = hashlib.sha256(template.encode()).hexdigest()
     looks_like_qwen_history = "ns.last_query_index" in template and "reasoning_content" in template
-    if old_count == 0 and native_count == 0 and qwen38_count == 0 and not looks_like_qwen_history:
+    counts = (old_count, native_count, qwen38_count, unconditional_count, preserve_reasoning_count)
+    if not any(counts) and not looks_like_qwen_history:
         return None
-    if old_count == 1 and native_count == 0 and qwen38_count == 0:
+    if counts == (1, 0, 0, 0, 0):
         return template.replace(_QWEN_HISTORY_GATE, _QWEN_PRESERVE_HISTORY_GATE, 1), True
-    if old_count == 0 and native_count == 1 and qwen38_count == 0:
+    if counts == (0, 1, 0, 0, 0):
         return template, False
-    if old_count == 0 and native_count == 0 and qwen38_count == 1:
+    if counts == (0, 0, 1, 0, 0):
         # Qwen3.8 gate already preserves by default; use it as-is.
         return template, False
+    if (
+        old_count == 0
+        and native_count == 0
+        and qwen38_count == 0
+        and unconditional_count == 1
+        and preserve_reasoning_count == 0
+        and template_hash == _QWEN_UNCONDITIONAL_REASONING_TEMPLATE_SHA256
+    ):
+        return template.replace(_QWEN_UNCONDITIONAL_REASONING_GATE, _QWEN_PRESERVE_REASONING_GATE, 1), True
+    if (
+        old_count == 0
+        and native_count == 0
+        and qwen38_count == 0
+        and unconditional_count == 0
+        and preserve_reasoning_count == 1
+        and template_hash == _QWEN_PRESERVE_REASONING_TEMPLATE_SHA256
+    ):
+        return template, False
 
-    template_hash = hashlib.sha256(template.encode()).hexdigest()[:16]
     raise RuntimeError(
         "Cannot safely patch the Qwen history-thinking gate: "
-        f"expected one old gate or one native gate, found old={old_count}, native={native_count}, "
-        f"and qwen38={qwen38_count} (template sha256={template_hash})."
+        "expected one legacy/native history gate or one unconditional/native reasoning gate, "
+        f"found old={old_count}, native={native_count}, qwen38={qwen38_count}, unconditional={unconditional_count}, "
+        f"preserve_reasoning={preserve_reasoning_count} "
+        f"(template sha256={template_hash[:16]})."
+    )
+
+
+def _patch_qwen_tool_call_content(template: str) -> tuple[str, bool]:
+    """Match baseline_msswift_0625 (ms-swift 4.3.1) assistant/tool-call
+    merging."""
+    prefix_count = template.count(_QWEN_ASSISTANT_WITH_THINK)
+    separator_count = template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR)
+    patched_count = template.count(_QWEN_ASSISTANT_TOOL_CALL)
+    if patched_count == 1 and separator_count == 1:
+        return template, False
+    if prefix_count == 1 and separator_count == 1:
+        template = template.replace(_QWEN_ASSISTANT_WITH_THINK, _QWEN_ASSISTANT_TOOL_CALL, 1)
+        template = template.replace(_QWEN_TOOL_CALL_WITH_SEPARATOR, _QWEN_TOOL_CALL_SEPARATOR_PATCH, 1)
+        return template, True
+    if separator_count == 0 and patched_count == 0:
+        return template, False
+    template_hash = hashlib.sha256(template.encode()).hexdigest()[:16]
+    raise RuntimeError(
+        "Cannot safely patch Qwen assistant tool-call rendering: "
+        f"expected one prefix and separator, found prefix={prefix_count}, separator={separator_count}, "
+        f"and patched={patched_count} "
+        f"(template sha256={template_hash})."
     )
 
 
@@ -206,7 +273,9 @@ def try_patch_qwen_chat_template(
     if patched is None:
         return None
 
-    patched_template, changed = patched
+    patched_template, history_changed = patched
+    patched_template, tool_call_changed = _patch_qwen_tool_call_content(patched_template)
+    changed = history_changed or tool_call_changed
     resolved_kwargs = dict(kwargs)
     preserve_thinking = resolved_kwargs.get("preserve_thinking")
     if preserve_thinking is not None and not isinstance(preserve_thinking, bool):

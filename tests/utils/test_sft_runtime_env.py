@@ -44,3 +44,29 @@ def test_post_process_env_preserves_configured_sft_tq_shards(monkeypatch):
     runtime_env = post_process_env(_make_args(), {"env_vars": {"RELAX_SFT_TQ_SHARDS": "2"}})
 
     assert runtime_env["env_vars"]["RELAX_SFT_TQ_SHARDS"] == "2"
+
+
+def test_post_process_env_propagates_kernel_cache_session(monkeypatch):
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_DIR", "/shared/cache")
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_LOCAL_DIR", "/local/cache")
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_SESSION_ID", "session-a")
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_KEY", "profile-a")
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_BUILD_FINGERPRINT", "build-a")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+
+    runtime_env = post_process_env(_make_args(), {"env_vars": {}})
+
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_DIR"] == "/shared/cache"
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_LOCAL_DIR"] == "/local/cache"
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_SESSION_ID"] == "session-a"
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_KEY"] == "profile-a"
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_BUILD_FINGERPRINT"] == "build-a"
+
+
+def test_post_process_env_preserves_configured_kernel_cache_session(monkeypatch):
+    monkeypatch.setenv("RELAX_KERNEL_CACHE_LOCAL_DIR", "/driver/cache")
+    monkeypatch.setattr("relax.utils.utils._resolve_to_ip", lambda _addr: "127.0.0.1")
+
+    runtime_env = post_process_env(_make_args(), {"env_vars": {"RELAX_KERNEL_CACHE_LOCAL_DIR": "/configured/cache"}})
+
+    assert runtime_env["env_vars"]["RELAX_KERNEL_CACHE_LOCAL_DIR"] == "/configured/cache"

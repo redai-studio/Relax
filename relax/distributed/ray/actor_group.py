@@ -79,6 +79,12 @@ class RayTrainGroup:
             **self.runtime_env.get("env_vars", {}),
             **self.args.train_env_vars,
         }
+        # Compiler cache paths are train-actor-only.  Putting them in the Job
+        # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
+        if kernel_cache_local_dir:
+            env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
+            env_vars["TRITON_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "triton")
 
         # Only preload the torch_memory_saver hook when it is actually the offload
         # mechanism. --selective-offload uses application-level selective CPU offload

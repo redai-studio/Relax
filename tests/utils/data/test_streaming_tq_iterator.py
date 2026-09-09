@@ -142,6 +142,77 @@ def test_get_data_from_transfer_queue_rejects_disabled_agreement_without_per_ran
         )
 
 
+def test_fetch_data_from_transfer_queue_returns_raw_cpu_payload(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    class _Meta:
+        size = 1
+
+    class _Client:
+        def __init__(self):
+            self.meta_kwargs = None
+
+        def get_meta(self, **kwargs):
+            self.meta_kwargs = kwargs
+            return _Meta()
+
+        def get_data(self, meta):
+            assert isinstance(meta, _Meta)
+            return {"tokens": [torch.tensor([1])]}
+
+    client = _Client()
+    raw_data, elapsed = stream_module.fetch_data_from_transfer_queue(
+        tq_client=client,
+        data_fields=["tokens"],
+        batch_size=2,
+        partition_id="sft_3",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 1},
+        batch_index=0,
+    )
+
+    assert raw_data[0]["tokens"][0].tolist() == [1]
+    assert raw_data[1].size == 1
+    assert elapsed >= 0
+    assert client.meta_kwargs["sampling_config"] == {"dp_rank": 1, "batch_index": 0, "partition_id": "sft_3"}
+
+
+def test_prefetched_raw_payload_skips_second_tq_rpc(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    monkeypatch.setattr(stream_module.mpu, "get_tensor_and_context_parallel_group", lambda: object(), raising=False)
+
+    class _Meta:
+        size = 0
+
+    class _Client:
+        def get_meta(self, **kwargs):
+            raise AssertionError("prefetched payload must not fetch metadata again")
+
+        def get_data(self, meta):
+            raise AssertionError("prefetched payload must not fetch data again")
+
+    meta = _Meta()
+    rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=_Client(),
+        data_fields=["tokens"],
+        batch_size=2,
+        partition_id="sft_3",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 1},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        prefetched_rollout_data=[None, meta],
+        prefetched_fetch_time_s=0.1,
+    )
+
+    assert rollout_data is None
+    assert batch_meta is meta
+
+
 def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeypatch):
     """Regression for the fully-async DP-imbalance deadlock.
 

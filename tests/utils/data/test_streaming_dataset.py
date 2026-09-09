@@ -11,6 +11,7 @@ import threading
 import time
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 
@@ -379,6 +380,20 @@ class TestIndexManager:
 
         assert manager1.indices == manager2.indices
 
+    def test_shuffle_matches_huggingface_dataset(self):
+        """Match ms-swift's dataset shuffle followed by Megatron's sampler."""
+        from relax.utils.data.streaming_dataset import IndexManager
+
+        manager = IndexManager(total_size=100, seed=42)
+        manager.shuffle(0)
+
+        import torch
+
+        dataset_seed = int(np.random.RandomState(42).randint(0, np.iinfo(np.int32).max))
+        dataset_indices = np.random.default_rng(dataset_seed).permutation(100)
+        sampler_indices = torch.randperm(100, generator=torch.Generator().manual_seed(0)).numpy()
+        assert manager.indices == dataset_indices[sampler_indices].tolist()
+
     def test_shuffle_different_epochs(self):
         """Test that different epochs produce different shuffles."""
         from relax.utils.data.streaming_dataset import IndexManager
@@ -650,7 +665,7 @@ class TestStreamingDataset:
                 if os.path.exists(path):
                     os.unlink(path)
 
-    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer, monkeypatch):
+    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer):
         """Test get_batch preserves the sliced multi-file domain across epoch
         wraparound."""
         from relax.utils.data.streaming_dataset import StreamingDataset
@@ -665,8 +680,6 @@ class TestStreamingDataset:
                         f.write(json.dumps(item) + "\n")
                     files.append(f.name)
 
-            monkeypatch.setattr("random.shuffle", lambda seq: None)
-
             path = f"[{files[0]},{files[1]}]@[1:5]"
             dataset = StreamingDataset(
                 path=path,
@@ -679,7 +692,10 @@ class TestStreamingDataset:
             samples1, crossed1 = dataset.get_batch(3)
             samples2, crossed2 = dataset.get_batch(3)
 
-            assert [sample.prompt for sample in samples1] == ["A1", "A2", "B0"]
+            prompts1 = [sample.prompt for sample in samples1]
+            assert len(prompts1) == 3
+            assert len(set(prompts1)) == 3
+            assert set(prompts1).issubset({"A1", "A2", "B0", "B1"})
             prompts2 = [sample.prompt for sample in samples2]
             # The public contract is that batching stays within the sliced
             # multi-file domain and wraps across epochs when needed. The
