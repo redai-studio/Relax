@@ -31,6 +31,7 @@ logger = get_logger(__name__)
 # Global reference so signal handlers / atexit can reach the controller.
 _ctrl: Controller | None = None
 _shutdown_done = False
+_kernel_cache_heartbeat = None
 
 
 def _hard_exit(code: int):
@@ -45,7 +46,7 @@ def _hard_exit(code: int):
 
 def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     """Shut down SGLang engines and Ray on SIGTERM / SIGINT / atexit."""
-    global _shutdown_done
+    global _kernel_cache_heartbeat, _shutdown_done
 
     if sig is not None:
         exit_code = 128 + sig
@@ -60,6 +61,15 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     sig_name = signal.Signals(sig).name if sig else "atexit"
     logger.info(f"Graceful shutdown triggered ({sig_name}) — cleaning up SGLang engines...")
 
+    # Detached cache agents are outside the Ray Job's process tree. Notify them
+    # first so a short Ray Job SIGTERM grace period cannot prevent publishing;
+    # the normal path waits for a final snapshot after Serve stops train actors.
+    if sig is not None and _kernel_cache_heartbeat is not None:
+        try:
+            _kernel_cache_heartbeat.request_finalize(sig_name)
+        except Exception as e:
+            logger.warning(f"Kernel cache finalize request failed during {sig_name}: {e}")
+
     if _ctrl is not None:
         try:
             _ctrl.shutdown()
@@ -69,6 +79,12 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
     if ray.is_initialized():
         try:
             serve.shutdown()
+            if _kernel_cache_heartbeat is not None:
+                results = _kernel_cache_heartbeat.finalize(
+                    sig_name,
+                    timeout_sec=int(os.environ.get("RELAX_KERNEL_CACHE_EXIT_TIMEOUT_SEC", "600")),
+                )
+                logger.info(f"Kernel cache agents finalized: {results}")
             ray.shutdown()
             logger.info("Ray shutdown successfully")
         except Exception as e:
@@ -79,7 +95,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
 
 
 def main(args):
-    global _ctrl
+    global _ctrl, _kernel_cache_heartbeat
 
     # Load runtime_env from config so we can both pass it to ray.init and
     # explicitly to the Serve deployment. Ensure it's available even if Ray
@@ -99,6 +115,11 @@ def main(args):
             )
         except RuntimeError:
             pass
+
+    if os.environ.get("RELAX_KERNEL_CACHE_DIR"):
+        from relax.distributed.ray.kernel_cache import start_kernel_cache_heartbeat_from_env
+
+        _kernel_cache_heartbeat = start_kernel_cache_heartbeat_from_env()
 
     # init_tracking must run after serve.start() (metrics adapter probes Ray
     # Serve for the /metrics endpoint) and before Controller() (wandb primary

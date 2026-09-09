@@ -18,7 +18,13 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    ParamKey,
+    ParamWithNamePredicate,
+    get_megatron_optimizer,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -279,6 +285,83 @@ def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
     return kwargs
 
 
+_VIT_PARAMETER_REGIONS = frozenset({"image_encoder", "vision_model", "vision_tower", "visual", "vit"})
+_VISION_PROJECTION_REGIONS = frozenset({"merger", "multi_modal_projector", "projector", "projection"})
+_VISION_PROJECTION_DESCENDANTS = frozenset({"deepstack_merger_list"})
+
+
+def _is_vit_parameter_name(name: str) -> bool:
+    """Return whether ``name`` belongs to the vision encoder rather than its
+    projection head."""
+    regions = name.split(".")
+    if any(region in _VISION_PROJECTION_DESCENDANTS for region in regions):
+        return False
+    for index, region in enumerate(regions):
+        if region not in _VIT_PARAMETER_REGIONS:
+            continue
+        next_region = regions[index + 1] if index + 1 < len(regions) else None
+        return next_region not in _VISION_PROJECTION_REGIONS
+    return False
+
+
+def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) -> dict:
+    """Build Megatron optimizer overrides, including the optional MS-Swift-
+    style ViT LR group."""
+    config_overrides = get_standard_config_overrides(config)
+    vit_lr = getattr(args, "vit_lr", None)
+    if vit_lr is None:
+        return config_overrides
+
+    if not math.isfinite(vit_lr) or vit_lr <= 0.0:
+        raise ValueError(f"--vit-lr must be a finite number greater than 0, got {vit_lr!r}.")
+    if config.lr is None or not math.isfinite(config.lr) or config.lr <= 0.0:
+        raise ValueError(f"--lr must be a finite number greater than 0 when --vit-lr is set, got {config.lr!r}.")
+    if config.min_lr is None or not math.isfinite(config.min_lr) or config.min_lr < 0.0:
+        raise ValueError(f"--min-lr must be a finite non-negative number when --vit-lr is set, got {config.min_lr!r}.")
+    lr_warmup_init = getattr(args, "lr_warmup_init", 0.0)
+    if lr_warmup_init != 0.0:
+        raise ValueError(
+            "--vit-lr currently requires --lr-warmup-init 0 so the ViT and main learning rates keep the same "
+            f"ratio throughout warmup, got {lr_warmup_init!r}."
+        )
+
+    lr_mult = vit_lr / config.lr
+    vit_parameter = ParamWithNamePredicate(
+        name="relax_vit_parameter",
+        fn=lambda _param, name: _is_vit_parameter_name(name),
+    )
+    config_overrides[ParamKey(with_name_predicate=vit_parameter)] = {
+        # Megatron also uses lr_mult as part of the stable parameter-group identity when
+        # saving and restoring optimizer state; max_lr/min_lr alone are not sufficient.
+        "lr_mult": lr_mult,
+        "max_lr": vit_lr,
+        "min_lr": config.min_lr * lr_mult,
+    }
+    return config_overrides
+
+
+def _validate_vit_lr_trainable_params(args: Namespace, model: list[DDP]) -> None:
+    """Fail fast when ``--vit-lr`` does not match a trainable parameter on any
+    rank."""
+    if getattr(args, "vit_lr", None) is None:
+        return
+
+    global_match_count = sum(
+        1
+        for model_chunk in model
+        for name, param in model_chunk.named_parameters()
+        if param.requires_grad and _is_vit_parameter_name(name)
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        first_param = next(param for model_chunk in model for param in model_chunk.parameters())
+        count = torch.tensor(global_match_count, dtype=torch.long, device=first_param.device)
+        torch.distributed.all_reduce(count, group=torch.distributed.group.WORLD)
+        global_match_count = int(count.item())
+
+    if global_match_count == 0:
+        raise RuntimeError("--vit-lr did not match any trainable vision-encoder parameters in the distributed model.")
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -344,10 +427,12 @@ def setup_model_and_optimizer(
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
     config.timers = None
+    _validate_vit_lr_trainable_params(args, model)
 
     optimizer = get_megatron_optimizer(
         config=config,
         model_chunks=model,
+        config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -1137,8 +1222,13 @@ def train_one_step(
             # bypasses that main head entirely while preserving the preceding
             # MTP head calls that build the auxiliary-loss autograd graph.
             if should_bypass_main_output_layer(args):
+                # The chunked-MTP patch runs the MTP heads via the class-level
+                # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
+                # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
+                mtp_enabled = getattr(args, "enable_mtp_training", False)
+                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False)
                 mtp_output_layer_calls = (
-                    int(getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
+                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 with _bypass_output_layer(
                     model,
@@ -1478,6 +1568,8 @@ def train(
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
 
+        mtp_losses = None
+        mtp_loss_per_depth: list[float] = []
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
@@ -1500,15 +1592,15 @@ def train(
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-
             # "values" is the reduced payload on both old and new mcore;
-            # "loss_values" is the compat slot filled by save_loss_and_metrics_to_tracker.
+            # "loss_values" is the compatibility slot used by older helpers.
             mtp_values = tracker.get("values")
             if mtp_values is None:
                 mtp_values = tracker.get("loss_values")
             if mtp_values is not None:
-                # Sum across MTP prediction depths.
-                mtp_losses = (mtp_values * mtp_loss_scale).sum().item()
+                scaled = mtp_values * mtp_loss_scale
+                mtp_loss_per_depth = scaled.flatten().tolist()
+                mtp_losses = sum(mtp_loss_per_depth)
                 MTPLossLoggingHelper.clean_loss_in_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
@@ -1536,6 +1628,10 @@ def train(
             )
             if args.enable_mtp_training and mtp_losses is not None:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+                # Per-depth losses when >1 MTP depth.
+                if len(mtp_loss_per_depth) > 1:
+                    for _i, _v in enumerate(mtp_loss_per_depth, start=1):
+                        log_dict[f"train/{role_tag}mtp_{_i}_loss"] = _v
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
@@ -1594,7 +1690,12 @@ def train(
 
 
 def save(
-    iteration: int, model: Sequence[DDP], optimizer: MegatronOptimizer, opt_param_scheduler: OptimizerParamScheduler
+    iteration: int,
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer,
+    opt_param_scheduler: OptimizerParamScheduler,
+    *,
+    lora_only: bool = False,
 ) -> None:
     """Persist a training checkpoint safely with forward hooks disabled.
 
@@ -1616,10 +1717,13 @@ def save(
         checkpointing_context=None,
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
+        lora_only=lora_only,
     )
-    if is_lora_enabled(args):
-        checkpoint_dir = Path(args.save) / f"iter_{iteration:07d}"
-        _save_lora_to_checkpoint(model, str(checkpoint_dir), args)
+    # The native Megatron checkpoint above already contains the LoRA parameters
+    # and is the resume artifact. Do not additionally gather a portable HF adapter
+    # here: for large MoE LoRA runs the world-size ``gather_object`` retains every
+    # rank's adapter copy on rank 0 (>1.4 TiB host RAM on the 128-rank Qwen3.5-397B
+    # run). Portable adapters are still written by ``save_hf_model`` under --save-hf.
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -1825,6 +1929,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
     except Exception as e:
         if should_log:
             logger.error(f"Failed to save HuggingFace format: {e}")
+        raise
 
 
 def initialize_model_and_optimizer(

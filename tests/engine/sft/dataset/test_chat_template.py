@@ -9,6 +9,7 @@ import torch
 from relax.engine.sft.dataset.chat_template import (
     HAS_GENERATION_MARKER,
     _to_chat_messages,
+    render_to_text,
     render_with_loss_mask,
 )
 from relax.engine.sft.dataset.sample import (
@@ -328,3 +329,40 @@ def test_fallback_assistant_tool_calls_are_inlined_into_loss():
     assert "</tool_call>" in learned
     # Tool response stays out of the loss
     assert "ok" not in learned
+
+
+def test_non_thinking_prefix_matches_ms_swift_last_round_behavior():
+    tok = _FakeQwenStyleTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="q1", learn=False),
+            CanonicalMessage(role="assistant", content="a1", learn=True),
+            CanonicalMessage(role="user", content="q2", learn=False),
+            CanonicalMessage(role="assistant", content="a2", learn=True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+
+    input_ids, loss_mask = render_with_loss_mask(
+        sample,
+        tokenizer=tok,
+        apply_chat_template_kwargs={"add_non_thinking_prefix": True},
+        last_turn_only=True,
+        ignore_empty_think=True,
+    )
+    rendered = "".join(chr(int(token)) for token in input_ids.tolist())
+    learned = _learned_text(input_ids, loss_mask)
+
+    assert "<|im_start|>assistant\na1" in rendered
+    assert "<|im_start|>assistant\n<think>\n\n</think>\n\na2" in rendered
+    assert "<think>" not in learned
+    assert "a1" not in learned
+    assert "a2" in learned
+
+    rendered_text = render_to_text(
+        sample,
+        tokenizer=tok,
+        apply_chat_template_kwargs={"add_non_thinking_prefix": True},
+        last_turn_only=True,
+    )
+    assert rendered_text == rendered

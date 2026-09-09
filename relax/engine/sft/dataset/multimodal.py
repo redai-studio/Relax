@@ -17,6 +17,10 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+class SFTMultimodalMediaLoadError(RuntimeError):
+    """A sample media source could not be loaded or decoded."""
+
+
 def has_multimodal_content(sample: CanonicalSample) -> bool:
     return bool(sample.images or sample.videos or sample.audios)
 
@@ -34,12 +38,23 @@ def _fetch_media(sample: CanonicalSample, rendered_text: str) -> tuple[dict[str,
     from relax.utils.multimodal.video_utils import load_video
 
     mm_inputs: dict[str, list[Any]] = {}
-    if sample.images:
-        mm_inputs["images"] = [load_image(p) for p in sample.images]
-    if sample.videos:
-        mm_inputs["videos"] = [load_video(p) for p in sample.videos]
-    if sample.audios:
-        mm_inputs["audios"] = [load_audio(p) for p in sample.audios]
+    row_index = sample.metadata.get("row_index")
+    for kind, sources, loader in (
+        ("image", sample.images, load_image),
+        ("video", sample.videos, load_video),
+        ("audio", sample.audios, load_audio),
+    ):
+        if not sources:
+            continue
+        loaded: list[Any] = []
+        for position, source in enumerate(sources):
+            try:
+                loaded.append(loader(source))
+            except Exception as exc:
+                raise SFTMultimodalMediaLoadError(
+                    f"failed to load {kind} position={position} for sample row_index={row_index}: {source!r}"
+                ) from exc
+        mm_inputs[f"{kind}s"] = loaded
     return mm_inputs, rendered_text
 
 
@@ -78,9 +93,9 @@ def preprocess_multimodal(
             "processor_pool is None. Pass an instance of "
             "`relax.utils.data.processor_pool.ProcessorPool`."
         )
+    mm_inputs, text = _fetch_media(sample, rendered_text)
     from relax.utils.data.processor_pool import prepare_mm_inputs_for_ipc, process_sample_in_worker
 
-    mm_inputs, text = _fetch_media(sample, rendered_text)
     mm_inputs_ipc = prepare_mm_inputs_for_ipc(mm_inputs)
     future = processor_pool.executor.submit(process_sample_in_worker, text, mm_inputs_ipc, processor_kwargs or {})
     return future.result()
@@ -108,9 +123,9 @@ async def preprocess_multimodal_async(
             "processor_pool is None. Pass an instance of "
             "`relax.utils.data.processor_pool.ProcessorPool`."
         )
+    mm_inputs, text = _fetch_media(sample, rendered_text)
     from relax.utils.data.processor_pool import prepare_mm_inputs_for_ipc, process_sample_in_worker
 
-    mm_inputs, text = _fetch_media(sample, rendered_text)
     mm_inputs_ipc = prepare_mm_inputs_for_ipc(mm_inputs)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(

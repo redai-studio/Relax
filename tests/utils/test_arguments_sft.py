@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.arguments import _normalize_sft_max_in_flight_steps
+from relax.utils.arguments import _normalize_sft_max_in_flight_steps, _validate_sft_train_data_prefetch
 
 
 def test_sft_async_prepack_rejects_single_in_flight_step():
@@ -35,3 +35,26 @@ def test_sft_without_async_prepack_allows_one_in_flight_step():
     _normalize_sft_max_in_flight_steps(args, is_sft=True)
 
     assert args.max_staleness == 0
+
+
+def test_sft_train_data_prefetch_rejects_async_prepack():
+    args = SimpleNamespace(
+        sft_train_data_prefetch=True,
+        sft_async_prepack=True,
+        per_rank_fetch=True,
+        max_staleness=1,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_sft_train_data_prefetch(args, is_sft=True)
+
+
+def test_sft_train_data_prefetch_allows_raw_only_mode():
+    args = SimpleNamespace(
+        sft_train_data_prefetch=True,
+        sft_async_prepack=False,
+        per_rank_fetch=True,
+        max_staleness=1,
+    )
+
+    _validate_sft_train_data_prefetch(args, is_sft=True)

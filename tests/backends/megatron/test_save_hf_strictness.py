@@ -97,9 +97,8 @@ def test_vision_reference_with_vl_model_keeps_strict(monkeypatch, tmp_path):
 def test_plain_reference_keeps_strict_without_touching_the_model(monkeypatch, tmp_path):
     """A non-VL reference must short-circuit before the model config is read.
 
-    ``model=[]`` makes ``get_model_config(model[0])`` raise, and save_hf_model
-    swallows exceptions, so an eager check here silently skipped the whole
-    export.
+    ``model=[]`` makes ``get_model_config(model[0])`` raise, so the short-
+    circuit also verifies that a plain reference does not abort the export.
     """
     recorded = {}
     _install_fakes(monkeypatch, recorded)
