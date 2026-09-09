@@ -47,6 +47,7 @@ from relax.engine.sft.runtime import (
 from relax.utils.data.processor_pool import ProcessorPool
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 from relax.utils.utils import dict_to_tensordict
@@ -155,6 +156,8 @@ def _create_sft_train_dataset(
             num_labels=getattr(config, "num_labels", None),
             problem_type=getattr(config, "problem_type", "single_label_classification"),
             classification_sentinel_token_id=classification_sentinel_token_id,
+            loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
+            loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
         )
     return dataset_cls.from_args(
         config,
@@ -642,7 +645,12 @@ class SFT(Base):
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
-            self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
+            self._processor_pool = ProcessorPool(
+                self.config.hf_checkpoint,
+                pool_size=None,
+                trust_remote_code=True,
+                multimodal_config=MultimodalConfig.from_args(self.config),
+            )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
             self._processor_pool = None
@@ -699,7 +707,9 @@ class SFT(Base):
                         "--eval-size requires the SFT dataset to implement restrict_training_indices(indices) "
                         "and get_batch_by_indices(indices) for a deterministic random split."
                     )
-                restrict_training_indices(train_indices)
+                # ms-swift consumes one RandomState draw for train/test split
+                # before drawing the persistent train dataset-shuffle seed.
+                restrict_training_indices(train_indices, dataset_seed_offset=1)
                 self._logger.info(
                     f"--eval-size randomly held out {n_eval} samples with seed={seed}; "
                     f"train pool size now {self._train_size}."
@@ -735,6 +745,8 @@ class SFT(Base):
                 num_labels=getattr(self.config, "num_labels", None),
                 problem_type=getattr(self.config, "problem_type", "single_label_classification"),
                 classification_sentinel_token_id=classification_sentinel_token_id,
+                loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
+                loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
             )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees

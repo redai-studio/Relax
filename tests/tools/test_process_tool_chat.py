@@ -135,6 +135,11 @@ def test_convert_record_renames_tool_response_to_tool():
     assert roles.count("tool") == 3
 
 
+def test_convert_messages_preserves_tool_role():
+    msgs = process_tool_chat.convert_messages([{"role": "tool", "content": "result"}])
+    assert msgs == [{"role": "tool", "content": "result"}]
+
+
 def test_convert_record_preserves_other_meta_fields():
     out = process_tool_chat.convert_record(SAMPLE_RAW_RECORD)
     assert out["case_id"] == "demo_0001"

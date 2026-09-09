@@ -12,7 +12,7 @@ import torch
 from tensordict import TensorDict
 
 from relax.utils.device import get_ray_accelerator_name
-from relax.utils.env import Envs, validate_env
+from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
@@ -447,6 +447,15 @@ def post_process_env(args, env):
     # this value, so it must be identical in every Serve and Megatron actor.
     if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
         env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
+
+    # ray-job.sh prepares the node-local cache before launching the inner Ray
+    # job. Carry its resolved session into the runtime env that Controller
+    # explicitly forwards through detached Serve deployments to TrainGroup.
+    # actor_group.py then exposes the compiler-specific paths only to training
+    # actors, so Serve/TQ workers do not write into the cache.
+    for name in KERNEL_CACHE_ENV_NAMES:
+        if name not in env["env_vars"] and (value := os.environ.get(name)) is not None:
+            env["env_vars"][name] = value
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each

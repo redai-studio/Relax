@@ -192,6 +192,33 @@ def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     assert provider.vision_dp_when_cp is True
 
 
+def test_bridge_provider_maps_legacy_vision_dp_when_tp_to_cp(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(vision_dp_when_tp=True), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.vision_dp_when_cp is True
+
+
+def test_bridge_vision_cp_all_gather_compat_forwards_cp_group_positionally(monkeypatch):
+    class _OriginalAllGatherVisionEmbeddings:
+        calls = []
+
+        @staticmethod
+        def apply(*args):
+            _OriginalAllGatherVisionEmbeddings.calls.append(args)
+            return "gathered"
+
+    bridge_model_module = SimpleNamespace(AllGatherVisionEmbeddings=_OriginalAllGatherVisionEmbeddings)
+    module, _ = _load_model_provider(monkeypatch)
+
+    assert module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+    assert bridge_model_module.AllGatherVisionEmbeddings.apply("input", "seqlens", cp_group="cp") == "gathered"
+    assert _OriginalAllGatherVisionEmbeddings.calls == [("input", "seqlens", "cp")]
+    assert not module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+
+
 def test_bridge_critic_provider_registers_value_head_before_ddp(monkeypatch):
     class _FakeBridgeModel(torch.nn.Module):
         def __init__(self):

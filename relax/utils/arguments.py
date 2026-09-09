@@ -455,6 +455,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to freeze the vision projection parameters (used in bridge mode for multimodal models).",
             )
             parser.add_argument(
+                "--vit-lr",
+                type=float,
+                default=None,
+                help=(
+                    "Peak learning rate for trainable vision-encoder parameters. The ViT group follows the same "
+                    "warmup and decay schedule as --lr, with --min-lr scaled by vit_lr / lr. Vision projection "
+                    "or merger parameters remain on the main learning rate."
+                ),
+            )
+            parser.add_argument(
                 "--freeze-audio-model",
                 action="store_true",
                 default=False,
@@ -600,6 +610,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-train-data-prefetch",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. While training step N, prefetch the next step's raw "
+                    "TransferQueue payload on a CPU worker. Requires --per-rank-fetch "
+                    "and at least two SFT partitions in flight; collective agreement and "
+                    "GPU transfer remain on the main training thread."
+                ),
+            )
+            parser.add_argument(
                 "--sft-prefetch-buffer-size",
                 type=int,
                 default=256,
@@ -660,6 +681,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Required when --sft-oversize-strategy custom. Importable path to a function with "
                     "signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) | None`. "
                     "Returning None is treated as skip."
+                ),
+            )
+            parser.add_argument(
+                "--sft-loss-last-turn-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. When set, only the FINAL learnable round (the last assistant answer and "
+                    "any tool-calls after the final user query) contributes to the loss; earlier "
+                    "assistant/function_call turns are masked. Default off = train all assistant turns. "
+                    "Applies to both the generation-marker template path and the per-message fallback."
+                ),
+            )
+            parser.add_argument(
+                "--sft-ignore-empty-think",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. When set, an empty `<think></think>` block inside an assistant turn is "
+                    "kept entirely out of the loss (not just its opener tag). Default off. Only affects "
+                    "the per-message fallback path (the generation-marker template path has no think "
+                    "info; a one-time warning is logged)."
                 ),
             )
             parser.add_argument(
@@ -1713,6 +1756,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
             reset_arg(parser, "--async-save", action="store_true")
+            parser.add_argument(
+                "--save-lora-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
+                    "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
+                    "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "When unset, save the regular full distributed checkpoint."
+                ),
+            )
             reset_arg(
                 parser,
                 "--no-save-optim",
@@ -2633,6 +2687,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Defaults --mtp-num-layers to 1 when it is not specified."
                 ),
             )
+            # Auto-maps to TransformerConfig.mtp_use_repeated_layer. When set with
+            # --mtp-num-layers N, all N depths reuse the single physical MTP layer
+            # (layer_idx=0), so a checkpoint that only ships mtp.layers.0 drives N>1
+            # depths. reset_arg (not add_argument): Megatron already registers the flag.
+            reset_arg(
+                parser,
+                "--mtp-use-repeated-layer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Reuse one physical MTP layer across all --mtp-num-layers prediction depths "
+                    "(shared weights). Default off."
+                ),
+            )
 
             return parser
 
@@ -3007,6 +3075,25 @@ def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
     args.max_staleness = sft_max_in_flight_steps - 1
 
 
+def _validate_sft_train_data_prefetch(args, is_sft: bool) -> None:
+    if not getattr(args, "sft_train_data_prefetch", False):
+        return
+    if getattr(args, "sft_async_prepack", False):
+        raise ValueError(
+            "--sft-train-data-prefetch and --sft-async-prepack are mutually exclusive; "
+            "async prepack already includes raw TransferQueue lookahead."
+        )
+    if not is_sft:
+        raise ValueError("--sft-train-data-prefetch is only meaningful under --loss-type sft.")
+    if not args.per_rank_fetch:
+        raise ValueError("--sft-train-data-prefetch requires --per-rank-fetch.")
+    if args.max_staleness < 1:
+        raise ValueError(
+            "--sft-train-data-prefetch requires at least two SFT partitions in flight; "
+            "set --sft-max-in-flight-steps >= 2."
+        )
+
+
 def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
     if not is_sft:
         return
@@ -3050,6 +3137,37 @@ def validate_save_hf_post_hook_args(args) -> None:
     hook = load_function(hook_path)
     if not callable(hook):
         raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
+
+
+def validate_save_lora_only_args(args) -> None:
+    if not getattr(args, "save_lora_only", False):
+        return
+
+    incompatible = []
+    if args.train_backend != "megatron":
+        incompatible.append("--train-backend must be megatron")
+    if args.lora_rank <= 0:
+        incompatible.append("--lora-rank must be greater than 0")
+    if args.save is None:
+        incompatible.append("--save must be set")
+    if args.ckpt_format != "torch_dist":
+        incompatible.append("--ckpt-format must be torch_dist")
+    if args.async_save:
+        incompatible.append("--async-save")
+    if args.rotate_ckpt:
+        incompatible.append("--rotate-ckpt")
+    if args.no_save_optim:
+        incompatible.append("--no-save-optim")
+    if args.no_save_rng:
+        incompatible.append("--no-save-rng")
+    if args.fp8:
+        incompatible.append("--fp8")
+    if args.fp16:
+        incompatible.append("--fp16")
+    if args.save_hf is not None:
+        incompatible.append("--save-hf")
+    if incompatible:
+        raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
 
 def _validate_agentic_rollout_args(args) -> None:
@@ -3362,6 +3480,7 @@ def slime_validate_args(args):
             )
 
     _normalize_sft_max_in_flight_steps(args, is_sft)
+    _validate_sft_train_data_prefetch(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
     validate_save_hf_fp8_args(args)
@@ -3986,6 +4105,10 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    # Custom YAML is applied late and may override any checkpoint option, so
+    # validate this mutually exclusive mode only after those overrides settle.
+    validate_save_lora_only_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(

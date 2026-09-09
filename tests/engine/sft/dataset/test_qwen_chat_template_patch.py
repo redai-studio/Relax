@@ -2,6 +2,7 @@
 
 """Qwen history-thinking template patch tests."""
 
+import hashlib
 import re
 
 import pytest
@@ -10,8 +11,14 @@ import torch
 from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
 from relax.engine.sft.dataset.qwen_chat_template_patch import (
     _QWEN38_PRESERVE_HISTORY_GATE,
+    _QWEN_ASSISTANT_TOOL_CALL,
+    _QWEN_ASSISTANT_WITH_THINK,
     _QWEN_HISTORY_GATE,
     _QWEN_PRESERVE_HISTORY_GATE,
+    _QWEN_PRESERVE_REASONING_GATE,
+    _QWEN_TOOL_CALL_SEPARATOR_PATCH,
+    _QWEN_TOOL_CALL_WITH_SEPARATOR,
+    _QWEN_UNCONDITIONAL_REASONING_GATE,
     try_patch_qwen_chat_template,
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
@@ -285,6 +292,53 @@ def test_qwen38_preserve_gate_explicit_false_disables_auto_preserve():
     assert result is not None
     assert not result.changed
     assert result.kwargs["preserve_thinking"] is False
+
+
+def test_qwen35_unconditional_reasoning_gate_gets_history_policy(monkeypatch):
+    template = "\n".join(("ns.last_query_index", "reasoning_content", _QWEN_UNCONDITIONAL_REASONING_GATE))
+    monkeypatch.setattr(
+        "relax.engine.sft.dataset.qwen_chat_template_patch._QWEN_UNCONDITIONAL_REASONING_TEMPLATE_SHA256",
+        hashlib.sha256(template.encode()).hexdigest(),
+    )
+    result = try_patch_qwen_chat_template(_make_sample(), template, {"preserve_thinking": False})
+
+    assert result is not None
+    assert result.changed
+    assert _QWEN_UNCONDITIONAL_REASONING_GATE not in result.template
+    assert _QWEN_PRESERVE_REASONING_GATE in result.template
+    assert result.kwargs["preserve_thinking"] is False
+
+
+def test_qwen35_native_reasoning_gate_is_idempotent(monkeypatch):
+    template = "\n".join(("ns.last_query_index", "reasoning_content", _QWEN_PRESERVE_REASONING_GATE))
+    monkeypatch.setattr(
+        "relax.engine.sft.dataset.qwen_chat_template_patch._QWEN_PRESERVE_REASONING_TEMPLATE_SHA256",
+        hashlib.sha256(template.encode()).hexdigest(),
+    )
+    result = try_patch_qwen_chat_template(_make_sample(), template, {"preserve_thinking": False})
+
+    assert result is not None
+    assert not result.changed
+    assert result.template == template
+
+
+def test_qwen35_patch_matches_ms_swift_assistant_tool_call_merge():
+    template = "\n".join(
+        (
+            "reasoning_content",
+            _QWEN_HISTORY_GATE,
+            _QWEN_ASSISTANT_WITH_THINK,
+            _QWEN_TOOL_CALL_WITH_SEPARATOR,
+        )
+    )
+    result = try_patch_qwen_chat_template(_make_sample(), template, {"preserve_thinking": False})
+
+    assert result is not None
+    assert result.changed
+    assert _QWEN_ASSISTANT_TOOL_CALL in result.template
+    assert result.template.count(_QWEN_ASSISTANT_WITH_THINK) == 1
+    assert result.template.count(_QWEN_TOOL_CALL_WITH_SEPARATOR) == 1
+    assert _QWEN_TOOL_CALL_SEPARATOR_PATCH in result.template
 
 
 def test_qwen_patch_rejects_ambiguous_gate():

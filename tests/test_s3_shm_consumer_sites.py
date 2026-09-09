@@ -160,7 +160,12 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch):
     assert captured["resolve_args"] is config
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
     sft.AutoTokenizer.from_pretrained.assert_called_once_with(resolved, trust_remote_code=True)
-    sft.ProcessorPool.assert_called_once_with(resolved, pool_size=None, trust_remote_code=True)
+    sft.ProcessorPool.assert_called_once_with(
+        resolved,
+        pool_size=None,
+        trust_remote_code=True,
+        multimodal_config=sft.MultimodalConfig.from_args(config),
+    )
     sft._resolve_pad_token_ids_from_config.assert_called_once_with(resolved)
     assert config.hf_checkpoint == resolved
 

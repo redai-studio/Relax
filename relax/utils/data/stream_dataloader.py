@@ -17,7 +17,7 @@ from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
-from relax.utils.timer import timer
+from relax.utils.timer import Timer, timer
 
 
 logger = logging.getLogger(__name__)
@@ -631,6 +631,49 @@ def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
     return dense.tolist()
 
 
+def fetch_data_from_transfer_queue(
+    tq_client,
+    data_fields,
+    batch_size,
+    partition_id,
+    task_name,
+    sampling_config,
+    batch_index,
+    token_budget: int | None = None,
+    allow_underfill: bool = True,
+) -> tuple[list, float]:
+    """Fetch one raw TransferQueue batch without collectives or GPU work.
+
+    The result must be finalized by :func:`get_data_from_transfer_queue` on the
+    main training thread, where model-parallel ranks agree on availability.
+    """
+    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
+    if token_budget is not None:
+        config["allow_underfill"] = allow_underfill
+
+    start = time.perf_counter()
+    if token_budget is not None:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            token_budget=token_budget,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+    else:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+
+    if batch_meta.size == 0:
+        return [None, batch_meta], time.perf_counter() - start
+    return [tq_client.get_data(batch_meta), batch_meta], time.perf_counter() - start
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -646,6 +689,8 @@ def get_data_from_transfer_queue(
     allow_underfill: bool = True,
     post_process: bool = True,
     synchronize_per_rank_fetch: bool = True,
+    prefetched_rollout_data: list | None = None,
+    prefetched_fetch_time_s: float | None = None,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -690,6 +735,11 @@ def get_data_from_transfer_queue(
             empty-vs-data state across the model-parallel replica before
             returning. Set to False only when the caller has its own foreground
             synchronization point and must keep this call collective-free.
+        prefetched_rollout_data: Raw ``[data, meta]`` result from
+            :func:`fetch_data_from_transfer_queue`. It is finalized on this
+            main thread, preserving collective and GPU-work ordering.
+        prefetched_fetch_time_s: Wall-clock TQ RPC time associated with
+            ``prefetched_rollout_data`` for the fetch metric.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
@@ -697,15 +747,6 @@ def get_data_from_transfer_queue(
     """
     if not synchronize_per_rank_fetch and not per_rank_fetch:
         raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
-
-    # Compose request configuration and ask the queue for metadata.
-    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
-    if token_budget is not None:
-        # Token-budget fetch mode: the streaming sampler needs dp_size and
-        # allow_underfill in sampling_config to decide bucket assignment and
-        # end-of-stream behaviour.  dp_rank is already in sampling_config.
-        config["allow_underfill"] = allow_underfill
-
     # Determine which rank should fetch data
     #
     # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
@@ -745,37 +786,31 @@ def get_data_from_transfer_queue(
 
     def _fetch_once() -> list:
         """One get_meta (+ get_data) round-trip on this rank."""
-        if token_budget is not None:
-            batch_meta = tq_client.get_meta(
-                data_fields=data_fields,
-                token_budget=token_budget,
-                partition_id=partition_id,
-                sampling_config=config,
-                task_name=task_name,
-            )  # type: ignore
-        else:
-            batch_meta = tq_client.get_meta(
-                data_fields=data_fields,
-                batch_size=batch_size,
-                partition_id=partition_id,
-                sampling_config=config,
-                task_name=task_name,
-            )  # type: ignore
+        rollout_data, _ = fetch_data_from_transfer_queue(
+            tq_client=tq_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+            token_budget=token_budget,
+            allow_underfill=allow_underfill,
+        )
+        return rollout_data
 
-        if batch_meta.size == 0:
-            # Keep the (empty) meta so its extra_info (e.g. dummy_round) rides
-            # the broadcast to every consumer rank — the consumer decides
-            # real vs dummy vs end from what it fetched, no extra RPC.
-            return [None, batch_meta]
-        return [tq_client.get_data(batch_meta), batch_meta]
-
-    with timer(fetch_timer_name):
-        if should_fetch:
-            rollout_data = _fetch_once()
-        else:
-            # Non-fetching ranks start with an empty placeholder and
-            # will receive the real data via broadcast.
-            rollout_data = [None, None]
+    if prefetched_rollout_data is not None:
+        rollout_data = prefetched_rollout_data
+        if prefetched_fetch_time_s is not None:
+            Timer().add(fetch_timer_name, prefetched_fetch_time_s)
+    else:
+        with timer(fetch_timer_name):
+            if should_fetch:
+                rollout_data = _fetch_once()
+            else:
+                # Non-fetching ranks start with an empty placeholder and
+                # will receive the real data via broadcast.
+                rollout_data = [None, None]
 
     if per_rank_fetch and synchronize_per_rank_fetch:
         # No broadcast follows, so a producer race can split this logical DP

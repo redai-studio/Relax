@@ -550,11 +550,22 @@ def get_batch(
             pad_to = int(pad_to)
             t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
             m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            # This VL/THD path bypasses MCore's default label construction, so
+            # labels must be pre-shifted by one here (label[t] = x[t+1]); MCore's
+            # per-depth roll advances label and mask together afterwards.
+            #
+            # The mask must NOT be shifted: ``m_padded`` (from
+            # ``full_per_sample_loss_masks`` via ``align_loss_mask_for_sft``) is
+            # already in the same next-token-aligned frame as the shifted label.
+            # Shifting it again would leave it leading the label by one token, so
+            # each MTP depth would supervise the position one past what it predicts.
+            mtp_labels_padded = F.pad(t_padded[1:], (0, 1), value=pad_token_id)
+            mtp_loss_mask_padded = m_padded
             chunk = pad_to // (2 * cp_size)
             s1, e1 = chunk * cp_rank, chunk * (cp_rank + 1)
             s2, e2 = chunk * (2 * cp_size - cp_rank - 1), chunk * (2 * cp_size - cp_rank)
-            mtp_label_chunks.append(torch.cat([t_padded[s1:e1], t_padded[s2:e2]]))
-            mtp_loss_chunks.append(torch.cat([m_padded[s1:e1], m_padded[s2:e2]]))
+            mtp_label_chunks.append(torch.cat([mtp_labels_padded[s1:e1], mtp_labels_padded[s2:e2]]))
+            mtp_loss_chunks.append(torch.cat([mtp_loss_mask_padded[s1:e1], mtp_loss_mask_padded[s2:e2]]))
         batch["unsplit_mtp_labels"] = torch.cat(mtp_label_chunks).unsqueeze(0)
         batch["unsplit_mtp_loss_mask"] = torch.cat(mtp_loss_chunks).unsqueeze(0)
 
