@@ -1803,3 +1803,27 @@ diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index b553201..e123ab9 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -125,4 +125,6 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+     """Copy optimizer-relevant metadata when creating param views/copies."""
++    if hasattr(source, 'allreduce'):
++        destination.allreduce = source.allreduce
+     if hasattr(source, 'shared'):
+         destination.shared = source.shared
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index c072c52..bd18b47 100644
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -93,6 +93,8 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
+     """Returns true if the passed-in parameter is not a duplicate parameter
+     on another TP rank."""
+     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
++        return True
++    if not getattr(param, "allreduce", True):
+         return True
+     # Prefer provided tp_group when available (new explicit path).
+     if tp_group is not None:
