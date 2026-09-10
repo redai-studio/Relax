@@ -5,9 +5,10 @@
 Bridge under ``strict=True`` refuses every safetensors shard containing a key
 the training model never emits, which loses the real tensors sharing those
 shards rather than just the absent ones. So strictness is relaxed exactly when
-the reference declares a group the model structurally cannot produce -- MTP
-layers a model trained without MTP, or the vision tower of a VL base trained
-text-only -- and stays on for everything else.
+a group the reference declares really will be absent from the export: MTP
+layers a model trained without MTP, or a vision tower that could not be copied
+in from the reference (FP8, or no safetensors source to copy from). Supplying
+the tower leaves nothing missing, so those exports keep strict on.
 """
 
 from __future__ import annotations
@@ -38,6 +39,14 @@ class _NullCtx:
 
 def _install_fakes(monkeypatch, recorded):
     class _FakeBridge:
+        def __init__(self):
+            # A safetensors-backed source, as the vision supplement expects to find.
+            self.hf_pretrained = SimpleNamespace(
+                state=SimpleNamespace(
+                    source=SimpleNamespace(key_to_filename_map={}, save_generator=lambda *a, **k: None)
+                )
+            )
+
         def save_hf_pretrained(self, model, path, strict):
             recorded["strict"] = strict
             (path / "config.json").write_text("{}")
@@ -71,13 +80,46 @@ def _model(*, vision: bool):
     return [SimpleNamespace(config=config)]
 
 
-def test_vision_reference_with_text_only_model_relaxes_strict(monkeypatch, tmp_path):
+def test_vision_reference_with_text_only_model_keeps_strict(monkeypatch, tmp_path):
+    """The tower is copied in from the reference, so nothing ends up absent."""
     recorded = {}
     _install_fakes(monkeypatch, recorded)
     monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
     monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
 
     model_mod.save_hf_model(_args(tmp_path), rollout_id=1, model=_model(vision=False))
+
+    assert recorded["strict"] is True
+
+
+def test_vision_relaxation_returns_when_the_tower_cannot_be_copied(monkeypatch, tmp_path):
+    """No safetensors source to read the tower from -- fall back to
+    relaxing."""
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
+    monkeypatch.setattr(model_mod, "_install_vision_supplement", lambda bridge, reference: None)
+
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=1, model=_model(vision=False))
+
+    assert recorded["strict"] is False
+
+
+def test_fp8_still_relaxes_for_a_text_only_model(monkeypatch, tmp_path):
+    """FP8 cannot take a BF16 tower, so the group really is absent there."""
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
+    monkeypatch.setattr(model_mod, "_install_streaming_fp8_writer", lambda *a: (None, None))
+    monkeypatch.setattr(model_mod, "_apply_fp8_quantization_config", lambda *a: None)
+    args = _args(tmp_path)
+    args.save_hf_dtype = "fp8"
+    args.save_hf_fp8_quant_mode = "block"
+    args.save_hf_fp8_block_size = [128, 128]
+
+    model_mod.save_hf_model(args, rollout_id=1, model=_model(vision=False))
 
     assert recorded["strict"] is False
 
@@ -146,12 +188,28 @@ def test_reconcile_runs_for_a_vision_only_relaxation_and_leaves_mtp_alone(monkey
     calls = _record_reconcile(monkeypatch)
     monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
     monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
+    # Only an export that could not take the tower is still short of it.
+    monkeypatch.setattr(model_mod, "_install_vision_supplement", lambda bridge, reference: None)
 
     model_mod.save_hf_model(_args(tmp_path), rollout_id=6, model=_model(vision=False))
 
     assert recorded["strict"] is False
     assert len(calls) == 1
     assert calls[0]["supplement_mtp"] is False
+
+
+def test_reconcile_skipped_once_the_tower_was_supplied(monkeypatch, tmp_path):
+    """Nothing was relaxed, so there are no ghost entries to reconcile."""
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    calls = _record_reconcile(monkeypatch)
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: True)
+
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=6, model=_model(vision=False))
+
+    assert recorded["strict"] is True
+    assert calls == []
 
 
 def test_reconcile_supplements_mtp_for_the_mtp_relaxation(monkeypatch, tmp_path):
