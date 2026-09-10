@@ -2,6 +2,7 @@
 
 import dataclasses
 import gc
+import itertools
 import math
 import os
 import string
@@ -1758,6 +1759,66 @@ def _install_streaming_fp8_writer(bridge, strategy, block_size):
     return writer, restore
 
 
+def _reference_vision_tensors(reference_hf_dir, key_to_filename_map):
+    """Yield ``(key, tensor)`` for every vision weight the reference declares.
+
+    Rank-gated because only rank 0 writes; the rest just drain the generator.
+    """
+    if torch.distributed.is_initialized() and torch.distributed.get_rank(group=torch.distributed.group.WORLD) != 0:
+        return
+
+    import safetensors
+
+    by_file: dict[str, list[str]] = {}
+    for key in sorted(key_to_filename_map):
+        if "vision" in key.lower():
+            by_file.setdefault(key_to_filename_map[key], []).append(key)
+
+    count = 0
+    for filename, keys in sorted(by_file.items()):
+        with safetensors.safe_open(os.path.join(reference_hf_dir, filename), framework="pt", device="cpu") as handle:
+            for key in keys:
+                yield key, handle.get_tensor(key)
+                count += 1
+    logger.info(f"Supplemented {count} vision tensor(s) from {reference_hf_dir}")
+
+
+def _install_vision_supplement(bridge, reference_hf_dir):
+    """Chain the reference's vision weights onto the export generator.
+
+    Bridge shards from the source index, so completing the group there is what
+    makes the export come out shaped like the reference. Returns a restore
+    callable the caller MUST run in a finally block, or None if there is no
+    safetensors source to copy from.
+    """
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    state = getattr(hf_pretrained, "state", None)
+    source = getattr(state, "source", None)
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        logger.warning(
+            "Cannot supplement vision weights: --hf-checkpoint is not a safetensors-backed HF directory. "
+            "The export will be missing them."
+        )
+        return None
+
+    original_save_generator = source.save_generator
+
+    def save_generator(generator, *args, **kwargs):
+        # *args/**kwargs so Bridge can add keyword arguments without breaking us.
+        return original_save_generator(
+            itertools.chain(generator, _reference_vision_tensors(reference_hf_dir, source.key_to_filename_map)),
+            *args,
+            **kwargs,
+        )
+
+    source.save_generator = save_generator
+
+    def restore() -> None:
+        source.save_generator = original_save_generator
+
+    return restore
+
+
 def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to_not_convert):
     """Merge FP8 `quantization_config` into an already-written HF
     config.json."""
@@ -1853,10 +1914,9 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         # strict=True fails whenever the reference declares weights this model structurally
         # never emits: Bridge refuses every shard holding such a key, losing the real
         # tensors that shared it (measured on gemma-4-26B text-mode SFT: 58 of 657
-        # language tensors written). Relax for exactly those cases -- an MTP base trained
-        # without MTP, or a VL base trained text-only, where only the VL providers declare
-        # vision_config. Keep strict=True everywhere else: it is the only export-time
-        # guard against a mapping bug silently truncating the checkpoint.
+        # language tensors written). Relax only where that is still true after the vision
+        # supplement below. It is the only export-time guard against a mapping bug
+        # silently truncating the checkpoint.
         from relax.utils.hf_export import (
             reconcile_hf_export_index,
             reference_expects_mtp,
@@ -1866,24 +1926,30 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
         allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
         # Short-circuits: a reference without vision weights can never be missing them.
-        allow_missing_vision_keys = reference_expects_vision(args.hf_checkpoint) and not hasattr(
+        vision_absent_from_model = reference_expects_vision(args.hf_checkpoint) and not hasattr(
             get_model_config(model[0]), "vision_config"
         )
-
-        strict = not (allow_missing_mtp_keys or allow_missing_vision_keys)
 
         save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
         fp8_writer = None
         restore_save_generator = None
+        supplementing_vision = False
         if save_fp8:
             fp8_writer, restore_save_generator = _install_streaming_fp8_writer(
                 bridge,
                 args.save_hf_fp8_quant_mode,
                 args.save_hf_fp8_block_size,
             )
-            # StreamingFP8Writer strict-checks against the source index and cannot express
-            # an absent group. Redundant above, kept so the constraint survives edits.
-            strict = strict and not (allow_missing_mtp_keys or allow_missing_vision_keys)
+        elif vision_absent_from_model:
+            # elif: the reference tower is BF16, so under FP8 it would be neither
+            # quantized nor listed in modules_to_not_convert, and a loader would
+            # decode it as FP8.
+            restore_save_generator = _install_vision_supplement(bridge, args.hf_checkpoint)
+            supplementing_vision = restore_save_generator is not None
+
+        # Relax only for a group that really will end up absent.
+        allow_missing_vision_keys = vision_absent_from_model and not supplementing_vision
+        strict = not (allow_missing_mtp_keys or allow_missing_vision_keys)
 
         try:
             with patch_megatron_model(model):
@@ -1899,9 +1965,10 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
         # A non-strict save can leave "ghost" index entries: keys Bridge listed but wrote
         # to no shard (seen for mtp.*, not for vision -- but this is a no-op when there is
         # nothing to fix, so gate on both relaxations). Rebuilds the index from what was
-        # written and supplements MTP from the base so the checkpoint stays deployable;
-        # vision is left out, a text-only export stays text-only. Bridge writes on WORLD
-        # rank 0, so reconcile there. FP8 has its own streaming index and is skipped.
+        # written and supplements MTP from the base so the checkpoint stays deployable.
+        # Vision is not supplemented here -- it goes in through the generator above, or
+        # not at all. Bridge writes on WORLD rank 0, so reconcile there. FP8 has its own
+        # streaming index and is skipped.
         is_export_writer = (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
