@@ -54,3 +54,30 @@ tensorboard_log
 # .github
 .github/copilot-instructions.md
 env.sh
+
+# ---- OSWorld agentic RL: 运行产物 (不入库) ----
+osworld-*.log
+smokeab-*.log
+smokectrl-*.log
+guard_*.log
+memprobe_*.log
+gpuprobe_*.log
+entropy_*.log
+reward_dump_*.jsonl
+rollout_result/
+checkpoints/
+shots/
+examples/osworld_agentic/log/
+*.bak-*
+STOP
+STOP.*
+# 本机运维脚本 (含绝对路径, 不通用; 模板见 examples/osworld_agentic/launch_osworld_example.sh)
+/launch_mcpon*.sh
+/launch_smoke_*.sh
+/guard_mcpon*.sh
+/memprobe_mcpon*.sh
+/gpuprobe_*.sh
+/preflight_*.sh
+/entropy_check.py
+/smokeab_watcher.sh
+/patches/

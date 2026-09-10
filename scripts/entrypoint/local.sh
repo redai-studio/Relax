@@ -91,6 +91,7 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 echo "Starting Ray head node: MASTER_ADDR=$MASTER_ADDR, NUM_GPUS=$NUM_GPUS"
 
 ray start --head \
+    --temp-dir "${RAY_TEMP_DIR:-/data/temp/ray}" \
     --node-ip-address "${MASTER_ADDR}" \
     --num-gpus "${NUM_GPUS}" \
     --disable-usage-stats \

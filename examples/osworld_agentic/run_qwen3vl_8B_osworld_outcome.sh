@@ -46,9 +46,20 @@ CKPT_ARGS=(
     --warm-hf-checkpoint-page-cache
     --save ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome
     --megatron-to-hf-mode bridge
-    --save-interval 200
-    --max-actor-ckpt-to-keep 1
+    --save-interval ${SAVE_INTERVAL:-200}
+    --max-actor-ckpt-to-keep ${MAX_CKPT_KEEP:-1}
 )
+
+# Resume support: when RESUME_FROM_SAVE=1 and a checkpoint already exists under --save,
+# pass --load so a relaunch after a crash continues from the last saved step instead of
+# restarting from the base model. Default off, so existing runs are unaffected.
+if [ "${RESUME_FROM_SAVE:-0}" = "1" ] && [ -f "${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/latest_checkpointed_iteration.txt" ]; then
+    CKPT_ARGS+=(--load ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome)
+    echo "[resume] --load ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome (iter $(cat ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/latest_checkpointed_iteration.txt))"
+fi
+# NCCL collective timeout. Default 30 min; a hung training step wastes that long before the
+# job exits. Lower it so a crash surfaces fast and the run can be relaunched from checkpoint.
+CKPT_ARGS+=(--distributed-timeout-minutes ${DIST_TIMEOUT_MIN:-30})
 
 # Data layout produced by scripts/prepare_data.py:
 #   ${DATA_DIR}/osworld/data/train.parquet     (74 tasks; outcome_only_rl split)
@@ -62,7 +73,7 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 RUNTIME_ENV_JSON=$(cat <<EOF
 {
   "env_vars": {
-    "OSWORLD_CONFIG_PATH": "${SCRIPT_DIR}/app/osworld_config.yaml",
+    "OSWORLD_CONFIG_PATH": "${OSWORLD_CONFIG_PATH:-${SCRIPT_DIR}/app/osworld_config.yaml}",
     "OSWORLD_CACHE_DIR": "${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}",
     "OSWORLD_REPO": "${OSWORLD_REPO}",
     "OSWORLD_MCP_BONUS": "${OSWORLD_MCP_BONUS:-0}",
@@ -78,6 +89,7 @@ ROLLOUT_ARGS=(
     --label-key label
     --metadata-key extra_info
     --reward-key score
+    --custom-reward-post-process-path examples.osworld_agentic.app.reward_post_process.post_process_rewards
     --custom-rm-path examples.osworld_agentic.reward_osworld.reward_func
     --use-agentic-rollout
     --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
@@ -87,11 +99,15 @@ ROLLOUT_ARGS=(
     # drops all but the last group. (Memory: 2a732e4e.)
     --agent-env
         "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
-        "OSWORLD_CONFIG_PATH=${SCRIPT_DIR}/app/osworld_config.yaml"
+        "OSWORLD_CONFIG_PATH=${OSWORLD_CONFIG_PATH:-${SCRIPT_DIR}/app/osworld_config.yaml}"
         "OSWORLD_CACHE_DIR=${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}"
       "OSWORLD_REPO=${OSWORLD_REPO}"
         "OSWORLD_MCP_BONUS=${OSWORLD_MCP_BONUS:-0}"
         "OPENAI_MODEL=Qwen3-VL-8B-Thinking"
+        "OSWORLD_MAX_TURNS=${OSWORLD_MAX_TURNS:-50}"
+        "OSWORLD_RUN_TAG=${OSWORLD_RUN_TAG:-}"
+        "OSWORLD_SHOT_DUMP_DIR=${OSWORLD_SHOT_DUMP_DIR:-}"
+        "OSWORLD_SHOT_EVERY_N_TASKS=${OSWORLD_SHOT_EVERY_N_TASKS:-35}"
     # OSWorld sessions are long (up to 50 turns × ~5-15s each ≈ 5-15 min).
     # Give Relax enough headroom that a healthy session never SIGTERMs mid-way.
     --agent-timeout ${AGENT_TIMEOUT:-1500}
@@ -106,8 +122,8 @@ ROLLOUT_ARGS=(
     --micro-batch-size 1
     --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT:-8}
     --rollout-max-context-len 32768
-    --rollout-max-response-len 4096
-    --rollout-max-prompt-len 28672
+    --rollout-max-response-len 8192      # upstream max_gen_length: 8192
+    --rollout-max-prompt-len ${MAX_PROMPT_LEN:-16384}       # 24576 + 8192 = 32768 context budget
     --rollout-temperature 1
     --global-batch-size ${GLOBAL_BATCH_SIZE:-64}
     --rollout-shuffle
@@ -115,11 +131,11 @@ ROLLOUT_ARGS=(
 )
 
 EVAL_ARGS=(
-    --skip-eval-before-train
+    $( [ "${EVAL_BEFORE_TRAIN:-0}" = "1" ] || echo --skip-eval-before-train )   # EVAL_BEFORE_TRAIN=1 -> run held-out eval at step 0
     --eval-interval ${EVAL_INTERVAL:-500}
     --eval-prompt-data osworld_mcp "${EVAL_FILES[@]}"
     --n-samples-per-eval-prompt 1
-    --eval-max-response-len 4096
+    --eval-max-response-len 8192
     --eval-top-p 0.7
     --agentic-eval-prepare-pool-size ${EVAL_PREPARE_POOL_SIZE:-16}
 )
@@ -127,19 +143,25 @@ EVAL_ARGS=(
 # GRPO — matches the upstream 8B recipe: β=0.02 KL, ε=0.2, entropy=0.
 GRPO_ARGS=(
     --advantage-estimator grpo
+    --use-kl-loss                     # 2026-09-07 v3: without this the KL term never enters loss (loss.py:1086)
     --kl-loss-coef 0.02
-    --kl-loss-type low_var_kl
-    --entropy-coef 0.00
+    # kl_reference: "old" -- ref model tracks the actor each rollout step
+    # (default None = ref frozen at base, which blocks a narrow signal from accumulating).
+    --ref-update-interval 1
+    # update_per_step: 4 (outcome_only_rl overrides the base config's 2)
+    --num-epoch ${NUM_EPOCH:-4}
+    --kl-loss-type k3                    # use_kl_estimator_k3: true (was low_var_kl)
+    --entropy-coef ${ENTROPY_COEF:-0.00}
     --eps-clip 0.2
-    --eps-clip-high 0.28
+    --eps-clip-high 0.2                 # upstream eps: 0.20 (symmetric; was 0.28)
     --use-tis
 )
 
 OPTIMIZER_ARGS=(
     --optimizer adam
     --lr 5e-6
-    --lr-decay-style constant
-    --weight-decay 0.1
+    --lr-decay-style ${LR_DECAY:-cosine}
+    --weight-decay ${WEIGHT_DECAY:-0.0}
     --adam-beta1 0.9
     --adam-beta2 0.98
     --optimizer-cpu-offload
@@ -149,9 +171,11 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 2
+    --rollout-num-gpus-per-engine ${GPUS_PER_ENGINE:-2}
     --sglang-mem-fraction-static 0.7
 )
+# extra --sglang-* flags from the launcher (e.g. "--sglang-tokenizer-worker-num 4"); word-split on purpose
+if [ -n "${SGLANG_EXTRA_ARGS:-}" ]; then SGLANG_ARGS+=(${SGLANG_EXTRA_ARGS}); fi
 
 LOG_ARGS=(
     --use-clearml
@@ -161,14 +185,11 @@ LOG_ARGS=(
 )
 
 MEGATRON_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size ${TP_SIZE:-2}
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
-    --recompute-granularity full
-    --recompute-method uniform
-    --recompute-num-layers 1
-    --max-tokens-per-gpu 16384
+    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-32768}
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
@@ -177,8 +198,40 @@ MEGATRON_ARGS=(
     --use-dynamic-batch-size
 )
 
+# Seqlen-balanced placement of rollout rows across DP ranks (relax --balance-data).
+# Without it rows are placed sequentially: first half -> dp0, second half -> dp1.
+# Rollout rows arrive in completion order, so the long straggler trajectories all
+# land on the last DP rank (measured 731 vs 2387 samples on rollout 1); the light
+# rank finishes its step early and waits inside the DP gradient reduce-scatter
+# past the NCCL timeout. Every rollout-1 training step failed this way (9/9).
+if [ "${BALANCE_DATA:-1}" = "1" ]; then
+    MEGATRON_ARGS+=(--balance-data)
+fi
+
+# ---- recompute (激活重算) 开关 ----
+# full/uniform/1 = 每层都重算, 最省显存也最慢 (actor_train = 4x forward, step0 实测 3.95x)。
+# selective = 只重算注意力里最便宜的部分; none = 完全不重算。
+# selective 不能同时传 --recompute-method / --recompute-num-layers (Megatron 会 assert)。
+RG="${RECOMPUTE_GRANULARITY:-full}"
+if [ "$RG" = "selective" ]; then
+    MEGATRON_ARGS+=(--recompute-granularity selective)
+elif [ "$RG" = "none" ]; then
+    :
+else
+    MEGATRON_ARGS+=(--recompute-granularity "$RG")
+    MEGATRON_ARGS+=(--recompute-method "${RECOMPUTE_METHOD:-uniform}")
+    MEGATRON_ARGS+=(--recompute-num-layers "${RECOMPUTE_NUM_LAYERS:-1}")
+fi
+
+# ---- true on-policy: 跳过独立的 old_log_probs 前向 ----
+# 前提: rollout_batch_size * n_samples == global_batch_size 且 --max-staleness 0。
+# 见 relax/utils/arguments.py:328 与 backends/megatron/actor.py:1590。
+if [ "${TRUE_ON_POLICY:-0}" = "1" ]; then
+    MEGATRON_ARGS+=(--true-on-policy-mode)
+fi
+
 RAY_RESOURCE_ARGS=(
-    --resource '{"actor": [1, 8], "rollout": [1, 8]}'
+    --resource "{\"actor\": [1, ${GPUS:-8}], \"rollout\": [1, ${GPUS:-8}]}"
     --max-staleness 0
     --num-data-storage-units 1
     --colocate

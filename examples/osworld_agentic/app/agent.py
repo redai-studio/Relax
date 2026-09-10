@@ -15,6 +15,8 @@ read back by Relax; everything else is ours to shape.
 from __future__ import annotations
 
 import argparse
+
+from app import shotdump
 import asyncio
 import json
 import logging
@@ -47,8 +49,43 @@ def read_session_input(path: str | Path) -> dict[str, Any]:
 
 
 def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
+    """Emit the session result Relax reads back.
+
+    The hybrid agent rebuilds its prompt every step, so the session forest ends
+    up with one leaf per turn and Relax's implicit export (which insists on a
+    single committed leaf) drops the whole session. We therefore use the
+    explicit path: one JSONL record per turn, each carrying the exact
+    conversation state that turn committed. See PITFALLS.md section 11.
+    """
+    records = payload.pop("_turn_records", []) or []
+    metadata = payload.get("metadata", {})
+    reward = payload.get("reward")
+    # The launcher passes --reward-key score, and Relax then does
+    # sample.reward[reward_key] (relax/agentic/rollout.py:927,
+    # relax/engine/rewards/__init__.py:414). Export a dict, not a float.
+    _reward_key = os.environ.get("OSWORLD_REWARD_KEY", "score")
+    if _reward_key and not isinstance(reward, dict):
+        reward = {_reward_key: float(reward or 0.0)}
+        payload["reward"] = reward
     try:
-        Path(path).write_text(json.dumps(payload), encoding="utf-8")
+        if records:
+            lines = [
+                json.dumps(
+                    {
+                        "name": f"turn_{index:03d}",
+                        "messages": record["messages"],
+                        "tools": record.get("tools") or [],
+                        "chat_template_kwargs": record.get("chat_template_kwargs") or {},
+                        "metadata": {**metadata, "turn_index": index},
+                        "reward": reward,
+                    },
+                    ensure_ascii=False,
+                )
+                for index, record in enumerate(records)
+            ]
+            Path(path).write_text("\n".join(lines), encoding="utf-8")
+        else:
+            Path(path).write_text(json.dumps(payload), encoding="utf-8")
     except FileNotFoundError:
         # Relax already discarded the session tmpdir; nothing to do.
         pass
@@ -64,11 +101,26 @@ def _extract_task_config(session_input: dict[str, Any]) -> dict[str, Any]:
     2. ``session_input["metadata"]["task_config"]`` — same but nested (Relax
        preserves arbitrary metadata fields).
     """
-    if isinstance(session_input.get("task_config"), dict):
-        return session_input["task_config"]
+    def _coerce(value: Any) -> dict[str, Any] | None:
+        # prepare_data.py stores the config as a JSON string (Arrow cannot type
+        # the heterogeneous struct); smoke_test.sh passes a plain dict.
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    direct = _coerce(session_input.get("task_config"))
+    if direct is not None:
+        return direct
     meta = session_input.get("metadata") or {}
-    if isinstance(meta.get("task_config"), dict):
-        return meta["task_config"]
+    nested = _coerce(meta.get("task_config"))
+    if nested is not None:
+        return nested
     raise ValueError("session input contains no `task_config` — did prepare_data.py run?")
 
 
@@ -98,9 +150,10 @@ async def run_session(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     config = _load_config()
-    max_turns = int(config["max_turns"])
+    max_turns = int(os.environ.get("OSWORLD_MAX_TURNS") or config["max_turns"])  # env override (2026-09-05)
     task_config = _extract_task_config(session_input)
     instruction = task_config.get("instruction") or metadata.get("instruction") or ""
+    shotdump.init((task_config or {}).get("id", ""), instruction)
 
     env = OSWorldEnv(
         task_config=task_config,
@@ -146,6 +199,7 @@ async def run_session(
         obs = await env.reset()
 
         for step_idx in range(max_turns):
+            shotdump.shot(step_idx, getattr(obs, "screenshot_bytes", None))
             try:
                 response, pyautogui_actions, info = await _predict_one_step(
                     agent,
@@ -200,6 +254,7 @@ async def run_session(
                 step_done = step_done or step_obs.done
 
             agent.record_exec_result(action_type, step_ok, step_result)
+            shotdump.turn({"step": step_idx, "action_type": action_type, "actions": pyautogui_actions, "response": response, "ok": step_ok})
 
             if step_done:
                 stop_reason = "env_done"
@@ -207,12 +262,14 @@ async def run_session(
 
         # Final scoring lives with the env (VM-side postconfig + metrics).
         reward = await env.evaluate()
+        shotdump.finish({"reward": reward, "stop_reason": stop_reason, "turns": len(action_types), "parse_failed_steps": parse_failed_steps})
     finally:
         await env.close()
 
     elapsed = time.monotonic() - session_start
     return {
         "reward": float(reward),
+        "_turn_records": list(getattr(agent, "turn_records", [])),
         "metadata": {
             "stop_reason": stop_reason,
             "agent_turns": len(action_types),
@@ -241,7 +298,30 @@ def main() -> None:
     args = parse_args()
     session_input = read_session_input(args.input_json)
     metadata = session_input.get("metadata") or {}
-    output = asyncio.run(run_session(session_input, metadata))
+    try:
+        output = asyncio.run(run_session(session_input, metadata))
+    except Exception as exc:  # noqa: BLE001
+        # Never die silently: Relax waits for this file, and a session that
+        # never reports back blocks its whole rollout group forever.
+        logger.exception("run_session failed; reporting a zero-reward session")
+        task_config = {}
+        try:
+            task_config = _extract_task_config(session_input)
+        except Exception:  # noqa: BLE001
+            pass
+        output = {
+            "reward": 0.0,
+            "metadata": {
+                "stop_reason": "session_error",
+                "agent_turns": 0,
+                "action_types": [],
+                "parse_failed_steps": 0,
+                "task_id": task_config.get("id"),
+                "data_source": metadata.get("data_source"),
+                "session_wallclock_s": 0.0,
+                "last_error": f"{type(exc).__name__}: {exc}",
+            },
+        }
     write_session_output(args.output_json, output)
 
 

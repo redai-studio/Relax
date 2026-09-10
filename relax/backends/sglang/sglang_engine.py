@@ -204,6 +204,25 @@ def _launch_server_with_patches(server_args: ServerArgs):
     """
     from sglang.srt.entrypoints.http_server import launch_server
 
+    if getattr(server_args, "tokenizer_worker_num", 1) > 1:
+        # uvicorn multi-worker mode (tokenizer_worker_num > 1) passes
+        # sys.stdin.fileno() to every worker and re-opens it there.  Under
+        # Ray + multiprocessing.spawn this process's sys.stdin is a private
+        # /dev/null on a non-zero fd that spawned workers do not inherit, so
+        # os.fdopen() fails with EBADF.  Park a real /dev/null on fd 0 and
+        # make sys.stdin refer to it.
+        import os as _os
+        import sys as _sys
+
+        try:
+            _null = _os.open(_os.devnull, _os.O_RDONLY)
+            if _null != 0:
+                _os.dup2(_null, 0)
+                _os.close(_null)
+            _sys.stdin = open(0, "r", closefd=False)
+        except OSError:
+            _sys.stdin = None
+
     if Envs.RELAX_OPD_PREEXPANDED_PATCH:
         from relax.utils.opd.opd_sglang_patch import apply_opd_preexpanded_patch
 
