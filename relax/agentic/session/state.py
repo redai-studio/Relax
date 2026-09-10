@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import os
 import json
 import math
 from dataclasses import dataclass, field
@@ -318,6 +319,25 @@ def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str
     return compact or None
 
 
+# ---- rollout-side image pool (2026-09-08) --------------------------------------
+# An obs node used to carry pixel_values for every image in its delta. With a
+# sliding image window the SessionForest branches each time the window moves,
+# so the same screenshot was re-processed and re-stored in every branch that
+# shows it (~4x for a 4-image window). Now pixel_values is split per image, one
+# copy per unique image lives in SessionForest.mm_image_pool, and nodes keep
+# only fingerprints. build_sample() re-assembles the exact original tensor.
+_MM_POOL_ENABLED = os.environ.get("RELAX_MM_IMAGE_POOL", "0") == "1"
+_MM_POOL_KEYS = ("pixel_values", "image_grid_thw")
+
+
+def _mm_image_fingerprint(pixel_slice: torch.Tensor, grid_row: torch.Tensor) -> str:
+    t = pixel_slice.detach().contiguous().cpu()
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((tuple(int(x) for x in grid_row.tolist()), str(t.dtype), tuple(t.shape))).encode())
+    h.update(t.view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+
 @dataclass
 class MsgNode:
     kind: MsgKind
@@ -343,6 +363,7 @@ class MsgNode:
     status: str | None = None
     rollout_routed_experts: Any = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
+    mm_image_keys: list[str] | None = None
 
 
 @dataclass(eq=False)
@@ -395,6 +416,7 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
+    mm_image_pool: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def create_empty(
@@ -551,6 +573,48 @@ class SessionForest:
         )
         return _messages_tools_template_state_hash(full_messages, current_tools, current_chat_template_kwargs)
 
+    def _intern_multimodal_delta(
+        self, delta: dict[str, Any] | None
+    ) -> tuple[dict[str, Any] | None, list[str] | None]:
+        """Move per-image pixel_values into self.mm_image_pool. Returns (delta minus the
+        interned keys, fingerprints in image order). Falls back to (delta, None) whenever
+        the delta does not look like plain per-image data, so nothing else changes."""
+        if not _MM_POOL_ENABLED or not delta:
+            return delta, None
+        pv = delta.get("pixel_values")
+        grid = delta.get("image_grid_thw")
+        if not (isinstance(pv, torch.Tensor) and isinstance(grid, torch.Tensor)):
+            return delta, None
+        if grid.ndim != 2 or grid.shape[1] != 3 or pv.ndim != 2:
+            return delta, None
+        counts = [int(t) * int(h) * int(w) for t, h, w in grid.tolist()]
+        if sum(counts) != int(pv.shape[0]):
+            return delta, None
+        keys: list[str] = []
+        off = 0
+        for i, n in enumerate(counts):
+            sl = pv[off : off + n]
+            off += n
+            k = _mm_image_fingerprint(sl, grid[i])
+            if k not in self.mm_image_pool:
+                self.mm_image_pool[k] = {
+                    "pixel_values": sl.clone(),
+                    "image_grid_thw": grid[i : i + 1].clone(),
+                }
+            keys.append(k)
+        rest = {kk: vv for kk, vv in delta.items() if kk not in _MM_POOL_KEYS}
+        return (rest or None), keys
+
+    def _materialize_multimodal_delta(self, node: MsgNode) -> dict[str, Any] | None:
+        keys = getattr(node, "mm_image_keys", None)
+        if not keys:
+            return node.multimodal_train_inputs_delta
+        entries = [self.mm_image_pool[k] for k in keys]
+        out: dict[str, Any] = dict(node.multimodal_train_inputs_delta or {})
+        out["pixel_values"] = torch.cat([e["pixel_values"] for e in entries], dim=0)
+        out["image_grid_thw"] = torch.cat([e["image_grid_thw"] for e in entries], dim=0)
+        return out
+
     def append_obs(
         self,
         *,
@@ -575,6 +639,9 @@ class SessionForest:
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
+        multimodal_train_inputs_delta, mm_image_keys = self._intern_multimodal_delta(
+            multimodal_train_inputs_delta
+        )
         return self._register_node(
             MsgNode(
                 kind="obs",
@@ -586,6 +653,7 @@ class SessionForest:
                 train_token_delta=train_token_delta,
                 rollout_token_delta=rollout_token_delta,
                 multimodal_train_inputs_delta=multimodal_train_inputs_delta,
+                mm_image_keys=mm_image_keys,
                 backend_image_data_delta=backend_image_data_delta if backend_image_data_delta is not None else [],
                 backend_audio_data_delta=backend_audio_data_delta if backend_audio_data_delta is not None else [],
                 backend_video_data_delta=backend_video_data_delta if backend_video_data_delta is not None else [],
@@ -696,8 +764,9 @@ class SessionForest:
             messages.extend(node.messages_delta)
             wall_elapsed_s += float(node.wall_elapsed_s)
             generation_elapsed_s += float(node.generation_elapsed_s)
-            if node.multimodal_train_inputs_delta is not None:
-                multimodal_train_inputs_buffer.append(node.multimodal_train_inputs_delta)
+            _mm_delta = self._materialize_multimodal_delta(node)
+            if _mm_delta is not None:
+                multimodal_train_inputs_buffer.append(_mm_delta)
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node

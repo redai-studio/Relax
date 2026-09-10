@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from argparse import Namespace
@@ -16,6 +17,8 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+
+_EVAL_ON_EPOCH_BOUNDARY = os.environ.get("RELAX_EVAL_ON_EPOCH_BOUNDARY", "1") == "1"
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
@@ -366,8 +369,13 @@ class Rollout(Base):
 
         step = local_step + 1
 
+        # With rollout_batch_size == len(train set) there is exactly one rollout per
+        # epoch, so the epoch-boundary clause fires on every step and eval_interval
+        # becomes a no-op. Gate it so the interval alone can control eval cadence.
         should_eval = (step % self.config.eval_interval == 0) or (
-            self.num_rollout_per_epoch is not None and step % self.num_rollout_per_epoch == 0
+            _EVAL_ON_EPOCH_BOUNDARY
+            and self.num_rollout_per_epoch is not None
+            and step % self.num_rollout_per_epoch == 0
         )
         self._logger.info(f"Checking whether to evaluate rollout {step}, should_eval: {should_eval}")
         return should_eval

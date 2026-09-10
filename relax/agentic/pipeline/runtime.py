@@ -19,8 +19,32 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequ
 
 import httpx
 import numpy as np
+import os
 import ray
 import torch
+
+
+# ---- pixel_values storage dtype (2026-09-08) -----------------------------------
+# HF processors emit float32 pixel_values. The source is uint8 (8 bits of real
+# information per channel) and the ViT computes in bf16, so float32 storage is
+# pure overhead: 2x RAM in the rollout buffers and 2x pickle on every transfer.
+# Mirrors the reference repo's cast_pixel_fp16 (train/osworld_vlm_preprocess_shards.py).
+_MM_PIXEL_DTYPE_NAME = os.environ.get("RELAX_MM_PIXEL_DTYPE", "fp32").strip().lower()
+_MM_PIXEL_DTYPE = {
+    "fp32": None, "float32": None,
+    "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+    "fp16": torch.float16, "float16": torch.float16, "half": torch.float16,
+}[_MM_PIXEL_DTYPE_NAME]
+
+
+def _cast_pixel_values(mm: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if _MM_PIXEL_DTYPE is None or not mm:
+        return mm
+    for key in ("pixel_values", "pixel_values_videos"):
+        v = mm.get(key)
+        if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype != _MM_PIXEL_DTYPE:
+            mm[key] = v.to(_MM_PIXEL_DTYPE).contiguous()
+    return mm
 
 from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME, format_agentic_status
 from relax.agentic.pipeline import (
@@ -337,6 +361,7 @@ class SGLangMessageCompiler:
 
         if trim_length:
             train_prompt_ids = train_prompt_ids[trim_length:]
+        multimodal_train_inputs = _cast_pixel_values(multimodal_train_inputs)
         return (
             train_prompt_ids,
             multimodal_train_inputs,

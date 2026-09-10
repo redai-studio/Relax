@@ -72,6 +72,9 @@ class RelaxHybridAgent(HybridAgentLocal):
         self._max_llm_call_retries = int(max_llm_call_retries)
         self._backoff_seconds = float(backoff_seconds)
         self._stop_token_ids = list(stop_token_ids) if stop_token_ids else []
+        # One entry per committed turn; app/agent.py turns these into the
+        # explicit export records Relax needs (see PITFALLS.md section 11).
+        self.turn_records: list[dict[str, Any]] = []
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
         if not base_url:
@@ -154,6 +157,16 @@ class RelaxHybridAgent(HybridAgentLocal):
                         "call_llm finish_reason=%s (accepting content)",
                         finish_reason,
                     )
+                self.turn_records.append(
+                    {
+                        "messages": [
+                            *payload["messages"],
+                            {"role": "assistant", "content": content},
+                        ],
+                        "tools": payload.get("tools") or [],
+                        "chat_template_kwargs": payload.get("chat_template_kwargs") or {},
+                    }
+                )
                 return content
 
             last_error = f"empty content (finish_reason={finish_reason})"

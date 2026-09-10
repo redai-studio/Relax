@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -48,6 +49,9 @@ from desktop_env.desktop_env import DesktopEnv  # noqa: E402
 
 
 logger = logging.getLogger("osworld_agentic.env")
+
+_RESET_ATTEMPTS = 3
+_RESET_BACKOFF_S = 5.0
 
 
 @dataclass
@@ -93,10 +97,36 @@ class OSWorldEnv:
     async def reset(self) -> StepObs:
         """Boot the VM (first call) and reset it to the task's initial
         state."""
+        if getattr(self, "_env_slot_fd", None) is None:
+            if _ENV_GROUP_LIMIT > 0:
+                self._env_slot_fd = await _acquire_env_group_slot_async(_task_key(self.task_config))
+            else:
+                self._env_slot_fd = await _acquire_env_slot_async()
         async with self._lock:
             return await asyncio.to_thread(self._reset_sync)
 
     def _reset_sync(self) -> StepObs:
+        # OSWorld setup regularly hits transient guest failures (HTTP 500 on the
+        # file upload, sandbox-creation lock timeouts). Retry on a fresh sandbox:
+        # a session that dies in here never reports back to Relax and deadlocks
+        # the whole rollout batch. See PITFALLS.md section 12.
+        last_error: Exception | None = None
+        for attempt in range(_RESET_ATTEMPTS):
+            try:
+                return self._reset_once()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "env reset attempt %d/%d failed: %s",
+                    attempt + 1,
+                    _RESET_ATTEMPTS,
+                    exc,
+                )
+                self._close_sync()
+                time.sleep(_RESET_BACKOFF_S)
+        raise RuntimeError(f"env reset failed after {_RESET_ATTEMPTS} attempts: {last_error}")
+
+    def _reset_once(self) -> StepObs:
         if self._env is None:
             logger.info("Instantiating DesktopEnv (provider=%s)", self.provider_name)
             self._env = DesktopEnv(
@@ -118,13 +148,16 @@ class OSWorldEnv:
             await asyncio.to_thread(self._close_sync)
 
     def _close_sync(self) -> None:
-        if self._env is None:
-            return
         try:
-            self._env.close()
-        except Exception:
-            logger.exception("DesktopEnv.close raised")
-        self._env = None
+            if self._env is not None:
+                try:
+                    self._env.close()
+                except Exception:
+                    logger.exception("DesktopEnv.close raised")
+                self._env = None
+        finally:
+            _release_env_slot(getattr(self, "_env_slot_fd", None))
+            self._env_slot_fd = None
 
     # ── actions ──────────────────────────────────────────────────────────
 
@@ -226,3 +259,128 @@ def parse_mcp_action(action: str) -> Optional[tuple[str, dict[str, Any]]]:
         logger.warning("Failed to parse MCP arg JSON: %s", arg_json[:200])
         params = {}
     return tool, params
+
+
+# ---------------------------------------------------------------------------
+# [env_gate] Cross-process concurrency gate for nex sandboxes.
+# N slot files under /dev/shm; holding an flock on one file = holding a slot.
+# The kernel drops a flock automatically when its process dies, so a killed
+# run can never leak slots. Tune with OSWORLD_MAX_CONCURRENT_ENVS (0 = off).
+# Queued sessions wait on the event loop (asyncio.sleep), not in the
+# to_thread pool, so active sessions are never starved of threads.
+# ---------------------------------------------------------------------------
+import fcntl as _fcntl
+import os as _os
+import random as _random
+
+
+_ENV_SLOT_LIMIT = int(_os.environ.get("OSWORLD_MAX_CONCURRENT_ENVS", "0"))
+_ENV_SLOT_DIR = _os.environ.get("OSWORLD_ENV_SLOT_DIR", "/dev/shm/osworld_env_slots")
+
+
+async def _acquire_env_slot_async():
+    if _ENV_SLOT_LIMIT <= 0:
+        return None
+    _os.makedirs(_ENV_SLOT_DIR, exist_ok=True)
+    waited = 0.0
+    last_log = 0.0
+    while True:
+        for i in range(_ENV_SLOT_LIMIT):
+            fd = _os.open(_os.path.join(_ENV_SLOT_DIR, "slot_%04d" % i), _os.O_CREAT | _os.O_RDWR, 0o666)
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError:
+                _os.close(fd)
+                continue
+            if waited > 0:
+                logger.info("[env_gate] got slot %d after %.0fs in queue (limit=%d)", i, waited, _ENV_SLOT_LIMIT)
+            return fd
+        step = 5.0 + 5.0 * _random.random()
+        await asyncio.sleep(step)
+        waited += step
+        if waited - last_log >= 120:
+            last_log = waited
+            logger.info("[env_gate] all %d env slots busy, session queued %.0fs", _ENV_SLOT_LIMIT, waited)
+
+
+def _release_env_slot(fd):
+    if fd is None:
+        return
+    try:
+        _os.close(fd)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# [env_gate] Group-aware variant. Relax leases a group to the runtime only
+# after ALL of its sessions have issued their first LLM request
+# (SessionGroup.first_request_barrier_crossed). A per-session gate therefore
+# deadlocks: slot holders wait for siblings that are queued behind the gate.
+# Here sessions of the same task share ONE group slot (LOCK_SH on the task's
+# lock file) and at most OSWORLD_MAX_CONCURRENT_GROUPS distinct tasks may hold
+# a slot at once. A global LOCK_EX mutex makes count-and-acquire atomic across
+# the shard processes. Kernel drops every flock when a process dies.
+# ---------------------------------------------------------------------------
+import hashlib as _hashlib
+import json as _json
+
+_ENV_GROUP_LIMIT = int(_os.environ.get("OSWORLD_MAX_CONCURRENT_GROUPS", "0"))
+
+
+def _task_key(task_config):
+    tid = ""
+    try:
+        tid = str((task_config or {}).get("id") or "")
+    except Exception:
+        tid = ""
+    if not tid:
+        tid = _hashlib.md5(_json.dumps(task_config, sort_keys=True, default=str).encode()).hexdigest()
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tid)[:80]
+
+
+def _flock_is_held(path):
+    fd = _os.open(path, _os.O_CREAT | _os.O_RDWR, 0o666)
+    try:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            return True
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        return False
+    finally:
+        _os.close(fd)
+
+
+async def _acquire_env_group_slot_async(task_key):
+    _os.makedirs(_ENV_SLOT_DIR, exist_ok=True)
+    mutex_path = _os.path.join(_ENV_SLOT_DIR, "_groups.mutex")
+    my_name = "task_%s.lock" % task_key
+    my_path = _os.path.join(_ENV_SLOT_DIR, my_name)
+    waited = 0.0
+    last_log = 0.0
+    while True:
+        mfd = _os.open(mutex_path, _os.O_CREAT | _os.O_RDWR, 0o666)
+        try:
+            _fcntl.flock(mfd, _fcntl.LOCK_EX)
+            if _flock_is_held(my_path):
+                fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
+                _fcntl.flock(fd, _fcntl.LOCK_SH)
+                return fd
+            busy = 0
+            for name in _os.listdir(_ENV_SLOT_DIR):
+                if name.startswith("task_") and name != my_name and _flock_is_held(_os.path.join(_ENV_SLOT_DIR, name)):
+                    busy += 1
+            if busy < _ENV_GROUP_LIMIT:
+                fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
+                _fcntl.flock(fd, _fcntl.LOCK_SH)
+                logger.info("[env_gate] group slot %d/%d -> task %s (queued %.0fs)", busy + 1, _ENV_GROUP_LIMIT, task_key[:12], waited)
+                return fd
+        finally:
+            _os.close(mfd)
+        step = 8.0 + 7.0 * _random.random()
+        await asyncio.sleep(step)
+        waited += step
+        if waited - last_log >= 300:
+            last_log = waited
+            logger.info("[env_gate] all %d group slots busy, task %s queued %.0fs", _ENV_GROUP_LIMIT, task_key[:12], waited)

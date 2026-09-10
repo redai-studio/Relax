@@ -78,8 +78,18 @@ echo "  session id:     ${RELAX_SESSION_ID}"
 echo "== session output =="
 python3 - "${OUTPUT_JSON}" <<'PY'
 import json, sys
-data = json.loads(open(sys.argv[1], encoding="utf-8").read())
-print(json.dumps(data, indent=2, ensure_ascii=False))
+raw = open(sys.argv[1], encoding="utf-8").read().strip()
+n_records = 0
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    # Explicit export: one JSONL record per agent turn (PITFALLS.md section 11).
+    records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    n_records = len(records)
+    data = {"reward": records[0].get("reward"), "metadata": records[0].get("metadata", {})}
+summary = {k: v for k, v in data.items() if k != "messages"}
+print(json.dumps(summary, indent=2, ensure_ascii=False)[:2000])
+print(f"export_records={n_records}")
 reward = data.get("reward")
 meta = data.get("metadata", {})
 turns = meta.get("agent_turns")

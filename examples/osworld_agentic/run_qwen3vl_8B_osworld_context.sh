@@ -51,7 +51,7 @@ CKPT_ARGS=(
     --warm-hf-checkpoint-page-cache
     --save ${SAVE_DIR}/Qwen3-VL-8B-osworld-context
     --megatron-to-hf-mode bridge
-    --save-interval 200
+    --save-interval ${SAVE_INTERVAL:-200}
     --max-actor-ckpt-to-keep 1
 )
 
@@ -78,6 +78,7 @@ ROLLOUT_ARGS=(
     --label-key label
     --metadata-key extra_info
     --reward-key score
+    --custom-reward-post-process-path examples.osworld_agentic.app.reward_post_process.post_process_rewards
     --custom-rm-path examples.osworld_agentic.reward_osworld.reward_func
     --use-agentic-rollout
     --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
@@ -140,7 +141,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 2
+    --rollout-num-gpus-per-engine ${GPUS_PER_ENGINE:-2}
     --sglang-mem-fraction-static 0.7
 )
 
@@ -159,7 +160,7 @@ MEGATRON_ARGS=(
     --recompute-granularity full
     --recompute-method uniform
     --recompute-num-layers 1
-    --max-tokens-per-gpu 16384
+    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU:-32768}
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --accumulate-allreduce-grads-in-fp32
@@ -169,7 +170,7 @@ MEGATRON_ARGS=(
 )
 
 RAY_RESOURCE_ARGS=(
-    --resource '{"actor": [1, 8], "rollout": [1, 8]}'
+    --resource "{\"actor\": [1, ${GPUS:-8}], \"rollout\": [1, ${GPUS:-8}]}"
     --max-staleness 0
     --num-data-storage-units 1
     --colocate

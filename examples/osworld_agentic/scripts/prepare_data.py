@@ -104,7 +104,9 @@ def _build_row(task_id: str, task_config: dict[str, Any]) -> dict[str, Any]:
         "data_source": "osworld",
         "task_id": task_id,
         "instruction": instruction,
-        "task_config": task_config,
+        # Arrow cannot infer one struct type across heterogeneous task configs,
+        # so the config travels as a JSON string; app/agent.py parses it back.
+        "task_config": json.dumps(task_config, ensure_ascii=False),
     }
     return {
         "prompt": prompt,
