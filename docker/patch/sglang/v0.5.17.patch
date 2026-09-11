@@ -2264,19 +2264,6 @@ index db684259..17d2cb69 100644
      def compute_mrope_positions(self, input_ids, mm_items):
          image_grid_thw = None
          video_grid_thw = None
-diff --git a/python/sglang/srt/multimodal/processors/qwen_vl.py b/python/sglang/srt/multimodal/processors/qwen_vl.py
-index a53e9373..1ae2c6f4 100644
---- a/python/sglang/srt/multimodal/processors/qwen_vl.py
-+++ b/python/sglang/srt/multimodal/processors/qwen_vl.py
-@@ -723,7 +723,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
-         **kwargs,
-     ):
-         entry_time = time.perf_counter()
--        base_output = await self.load_mm_data(
-+        base_output = await self.legacy_load_mm_data(
-             prompt=input_text,
-             image_data=image_data,
-             video_data=request_obj.video_data,
 diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
 index 3bcb6b36..9b971098 100644
 --- a/python/sglang/srt/observability/req_time_stats.py

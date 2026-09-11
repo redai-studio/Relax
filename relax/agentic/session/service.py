@@ -2816,6 +2816,17 @@ class AgenticSessionShard:
                 finalize_events=finalize_events,
             )
             export_payloads.append(self._export_payload(name=None, sample=sample))
+        if session.group.rollout_mode == "train" and self.args.use_rollout_routing_replay:
+            # NOTE(wulumeng): An observation leaf has no routed experts (None). Samples should never end there, so this safeguard should never trigger.
+            for export_payload in export_payloads:
+                sample_payload = export_payload["sample_payload"]
+                expected_shape = (len(sample_payload["tokens"]) - 1, self.args.num_layers, self.args.moe_router_topk)
+                routed_experts = sample_payload["rollout_routed_experts"]
+                actual_shape = None if routed_experts is None else routed_experts.shape
+                if actual_shape != expected_shape:
+                    raise _NonFinalizableExportError(
+                        f"R3 export routed-experts shape {actual_shape} does not match expected {expected_shape}"
+                    )
         return SessionExportTransport(exports=tuple(export_payloads))
 
     def _build_sample(
