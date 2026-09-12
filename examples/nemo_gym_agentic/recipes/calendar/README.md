@@ -69,7 +69,12 @@ Agentic Chat API `:8000`。
 在能写入远程 Ray 共享数据目录的机器执行。若本机没有挂载该目录，先生成后把
 `calendar_train.jsonl` 复制到远程共享路径。
 
+Callback 白名单只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS`，默认为 `10.0.0.0/8`，可覆盖为逗号分隔的 CIDR；
+填写实际覆盖 Relax callback IP 的网段，单个 IPv4/IPv6 地址使用 `/32` 或 `/128`。
+CIDR 按 URL 中的 IP 匹配，不解析域名，且不接受 `/0`。
+
 ```bash
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 export REPO_ROOT="/path/to/Relax"
 export DATA_ROOT="/shared/data"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
@@ -104,7 +109,7 @@ docker run --rm -d \
   --shm-size 12g \
   -v "${REPO_ROOT}:/opt/relax-integration:ro" \
   -e GYM_HOST="${GYM_HOST}" \
-  -e NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${RELAX_HOST}" \
+  -e NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}" \
   -e NO_PROXY="127.0.0.1,localhost,${GYM_HOST},${RELAX_HOST}" \
   "${NEMO_GYM_IMAGE}" \
   bash /opt/relax-integration/examples/nemo_gym_agentic/recipes/calendar/start_calendar_gym.sh

@@ -8,11 +8,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 EXAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
 usage() {
+    echo "Default: 10.0.0.0/8. Override with --callback-network or NEMO_GYM_CALLBACK_ALLOWED_NETWORKS."
     cat <<'EOF'
 Usage:
   start_workplace_assistant_gym_remote.sh \
     --gym-host <routable-local-ip> \
-    --callback-host <relax-callback-host> \
+    [--callback-network <relax-callback-cidr>] \
     [--image <nemo-gym-image>] \
     [--repo-dir <docker-host-relax-checkout>] \
     [--port-base <gateway-port>] \
@@ -24,7 +25,7 @@ EOF
 }
 
 GYM_HOST=""
-RELAX_CALLBACK_HOST=""
+RELAX_CALLBACK_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}"
 NEMO_GYM_IMAGE="${NEMO_GYM_IMAGE:-relax-nemo-gym:workplace-dev}"
 NEMO_GYM_CONTAINER="${NEMO_GYM_CONTAINER:-nemo-gym-workplace}"
 RELAX_REPO_ROOT="${RELAX_REPO_ROOT:-$(cd -- "${EXAMPLE_DIR}/../.." &>/dev/null && pwd)}"
@@ -32,7 +33,7 @@ WORKPLACE_ASSISTANT_PORT_BASE="${WORKPLACE_ASSISTANT_PORT_BASE:-29000}"
 GYM_RAY_PORT="${GYM_RAY_PORT:-6382}"
 GYM_DASHBOARD_PORT="${GYM_DASHBOARD_PORT:-28365}"
 GYM_RAY_NUM_CPUS="${GYM_RAY_NUM_CPUS:-8}"
-WORKPLACE_ASSISTANT_MAX_CONCURRENCY="${WORKPLACE_ASSISTANT_MAX_CONCURRENCY:-8}"
+WORKPLACE_ASSISTANT_MAX_CONCURRENCY="${WORKPLACE_ASSISTANT_MAX_CONCURRENCY:-64}"
 NEMO_GYM_START_TIMEOUT_S="${NEMO_GYM_START_TIMEOUT_S:-600}"
 NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE:-0}"
 
@@ -42,8 +43,12 @@ while [ "$#" -gt 0 ]; do
             GYM_HOST="${2:-}"
             shift 2
             ;;
-        --callback-host)
-            RELAX_CALLBACK_HOST="${2:-}"
+        --callback-network)
+            if [ -z "${2:-}" ] || [[ "${2}" == --* ]]; then
+                echo "--callback-network requires a CIDR network" >&2
+                exit 2
+            fi
+            RELAX_CALLBACK_NETWORKS="${RELAX_CALLBACK_NETWORKS:+${RELAX_CALLBACK_NETWORKS},}${2}"
             shift 2
             ;;
         --image)
@@ -86,13 +91,16 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ -z "${GYM_HOST}" ] || [ -z "${RELAX_CALLBACK_HOST}" ]; then
+RELAX_CALLBACK_NETWORKS="${RELAX_CALLBACK_NETWORKS:-10.0.0.0/8}"
+
+if [ -z "${GYM_HOST}" ] \
+    || [ -z "${RELAX_CALLBACK_NETWORKS}" ]; then
     usage >&2
     exit 2
 fi
-for host_name in GYM_HOST RELAX_CALLBACK_HOST; do
+for host_name in GYM_HOST; do
     host_value="${!host_name}"
-    if [[ "${host_value}" == *"://"* ]] || [[ "${host_value}" == *":"* ]]; then
+    if [[ "${host_value}" == *"://"* ]] || [[ "${host_value}" == *":"* ]] || [[ "${host_value}" == */* ]]; then
         echo "${host_name} must be a bare host or IP without scheme or port" >&2
         exit 2
     fi
@@ -129,6 +137,21 @@ if [ "${NEMO_GYM_VERBOSE}" != "0" ] && [ "${NEMO_GYM_VERBOSE}" != "1" ]; then
     exit 2
 fi
 
+if [ -n "${RELAX_CALLBACK_NETWORKS}" ]; then
+    python3 - "${RELAX_CALLBACK_NETWORKS}" <<'PY'
+import ipaddress
+import sys
+
+for value in sys.argv[1].split(","):
+    try:
+        network = ipaddress.ip_network(value.strip(), strict=True)
+        if network.prefixlen == 0:
+            raise ValueError("default-route networks are not allowed")
+    except ValueError as exc:
+        raise SystemExit(f"--callback-network must contain valid CIDR networks: {value!r}: {exc}") from None
+PY
+fi
+
 command -v docker >/dev/null 2>&1 || {
     echo "docker is required" >&2
     exit 2
@@ -152,14 +175,13 @@ if docker container inspect "${NEMO_GYM_CONTAINER}" >/dev/null 2>&1; then
     docker rm -f "${NEMO_GYM_CONTAINER}" >/dev/null
 fi
 
-callback_allowlist="${RELAX_CALLBACK_HOST},${GYM_HOST},127.0.0.1"
-container_no_proxy="127.0.0.1,localhost,${GYM_HOST},${RELAX_CALLBACK_HOST}"
+container_no_proxy="127.0.0.1,localhost,${GYM_HOST}"
 
 echo "Creating remote Workplace Assistant container:"
 echo "  container=${NEMO_GYM_CONTAINER}"
 echo "  image=${NEMO_GYM_IMAGE}"
 echo "  gym_url=http://${GYM_HOST}:${WORKPLACE_ASSISTANT_PORT_BASE}"
-echo "  callback_host=${RELAX_CALLBACK_HOST}"
+echo "  callback_networks=${RELAX_CALLBACK_NETWORKS:-<none>}"
 echo "  repo_dir=${RELAX_REPO_ROOT}"
 echo "  ray_port=${GYM_RAY_PORT}"
 echo "  ray_num_cpus=${GYM_RAY_NUM_CPUS}"
@@ -176,7 +198,7 @@ docker create \
     --env GYM_RAY_PORT="${GYM_RAY_PORT}" \
     --env GYM_DASHBOARD_PORT="${GYM_DASHBOARD_PORT}" \
     --env GYM_RAY_NUM_CPUS="${GYM_RAY_NUM_CPUS}" \
-    --env NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${callback_allowlist}" \
+    --env NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${RELAX_CALLBACK_NETWORKS}" \
     --env WORKPLACE_ASSISTANT_PORT_BASE="${WORKPLACE_ASSISTANT_PORT_BASE}" \
     --env WORKPLACE_ASSISTANT_MAX_CONCURRENCY="${WORKPLACE_ASSISTANT_MAX_CONCURRENCY}" \
     --env NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE}" \

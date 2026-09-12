@@ -11,9 +11,10 @@ RELAX_INTEGRATION_ROOT="${RELAX_INTEGRATION_ROOT:-$(cd "${EXAMPLE_DIR}/../.." &&
 RAY_CLI="${RAY_CLI:-ray}"
 R2E_DATA_DIR=""
 R2E_GYM_MODE=""
+R2E_GYM_PORT_BASE="${R2E_GYM_PORT_BASE:-28100}"
 R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-}"
 R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
-R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY:-1}"
+R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY:-16}"
 NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE:-0}"
 NEMO_GYM_HTTP_PROXY="${NEMO_GYM_HTTP_PROXY:-${https_proxy:-${HTTPS_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}}}"
 NEMO_GYM_CALLBACK_PROXY="${NEMO_GYM_CALLBACK_PROXY:-}"
@@ -38,6 +39,7 @@ Usage:
     --mode <golden|train> \
     [--sif-dir <shared-sif-directory>] \
     [--sif-prefix <filename-prefix>] \
+    [--port-base <port>] \
     [--max-concurrency <positive-integer>] \
     [--proxy <http-proxy-url>] \
     [--callback-proxy <http-proxy-url>] \
@@ -47,6 +49,8 @@ Usage:
 The launcher reuses the existing local Ray cluster and must run on the Ray head
 node. RAY_ADDRESS is optional and defaults to auto. The launcher does not start
 Docker or a second Ray cluster.
+Ports: gateway=base, agent=base+1, head=base+3. Default base: 28100.
+Override via --port-base or R2E_GYM_PORT_BASE; valid range: 1-65532.
 EOF
 }
 
@@ -66,6 +70,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --sif-prefix)
             R2E_GYM_SIF_PREFIX="${2:-}"
+            shift 2
+            ;;
+        --port-base)
+            if [ -z "${2:-}" ] || [[ "${2}" == --* ]]; then
+                echo "--port-base requires an integer between 1 and 65532" >&2
+                exit 2
+            fi
+            R2E_GYM_PORT_BASE="${2}"
             shift 2
             ;;
         --max-concurrency)
@@ -135,6 +147,13 @@ case "${R2E_GYM_MODE}" in
         exit 2
         ;;
 esac
+if ! [[ "${R2E_GYM_PORT_BASE}" =~ ^[1-9][0-9]{0,4}$ ]] || ((R2E_GYM_PORT_BASE > 65532)); then
+    echo "--port-base must be an integer between 1 and 65532" >&2
+    exit 2
+fi
+R2E_GYM_GATEWAY_PORT="${R2E_GYM_PORT_BASE}"
+R2E_GYM_AGENT_PORT="$((R2E_GYM_PORT_BASE + 1))"
+R2E_GYM_HEAD_PORT="$((R2E_GYM_PORT_BASE + 3))"
 if ! [[ "${R2E_GYM_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--max-concurrency must be a positive integer" >&2
     exit 2
@@ -212,26 +231,10 @@ else
 fi
 GYM_BIND_HOST="${GYM_BIND_HOST:-0.0.0.0}"
 
-callback_hosts="${NEMO_GYM_CALLBACK_ALLOWED_HOSTS:-${GYM_HOST}}"
-callback_networks="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}"
-if [ -n "${MASTER_ADDR:-}" ] && [[ "${MASTER_ADDR}" != *"://"* ]] && [[ "${MASTER_ADDR}" != *":"* ]]; then
-    case ",${callback_hosts}," in
-        *",${MASTER_ADDR},"*) ;;
-        *) callback_hosts="${callback_hosts},${MASTER_ADDR}" ;;
-    esac
-fi
-IFS=',' read -r -a callback_host_list <<<"${callback_hosts}"
-for callback_host in "${callback_host_list[@]}"; do
-    if [ -z "${callback_host}" ] || [[ "${callback_host}" == *"://"* ]] || [[ "${callback_host}" == *":"* ]]; then
-        echo "ERROR: callback allowlist entries must be bare hosts without scheme or port: ${callback_host}" >&2
-        exit 2
-    fi
-done
-NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${callback_hosts}"
-NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${callback_networks}"
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 
 existing_no_proxy="${no_proxy:-${NO_PROXY:-}}"
-NO_PROXY="127.0.0.1,localhost,${GYM_HOST},${callback_hosts}"
+NO_PROXY="127.0.0.1,localhost,${GYM_HOST}"
 if [ -n "${existing_no_proxy}" ]; then
     NO_PROXY="${NO_PROXY},${existing_no_proxy}"
 fi
@@ -253,9 +256,9 @@ chmod 700 "${NEMO_GYM_ARTIFACT_ROOT}"
 echo "Local R2E-Gym startup configuration:"
 echo "  gym_root=${GYM_ROOT}"
 echo "  gym_host=${GYM_HOST}"
+echo "  gym_url=http://${GYM_HOST}:${R2E_GYM_GATEWAY_PORT}"
 echo "  bind_host=${GYM_BIND_HOST}"
 echo "  ray_address=${GYM_RAY_ADDRESS}"
-echo "  callback_hosts=${NEMO_GYM_CALLBACK_ALLOWED_HOSTS}"
 echo "  callback_networks=${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-<none>}"
 echo "  data=${R2E_GYM_DATA}"
 echo "  sif_dir=${R2E_GYM_SIF_DIR}"
@@ -357,17 +360,18 @@ for ray_python in "${ray_python_paths[@]}"; do
 done
 echo "Ray versions aligned with cluster Python: ${cluster_ray_version}"
 
-"${cluster_python}" - "${GYM_ROOT}" <<'PY'
+"${cluster_python}" - "${GYM_ROOT}" "${R2E_GYM_PORT_BASE}" <<'PY'
 from pathlib import Path
 import sys
 
 import psutil
 
 gym_root = Path(sys.argv[1]).resolve()
+port_base = int(sys.argv[2])
 expected_cwds = {
-    28100: gym_root / "responses_api_models" / "relax_gateway_model",
-    28101: gym_root / "responses_api_agents" / "swe_agents",
-    28103: gym_root,
+    port_base: gym_root / "responses_api_models" / "relax_gateway_model",
+    port_base + 1: gym_root / "responses_api_agents" / "swe_agents",
+    port_base + 3: gym_root,
 }
 owned_processes: dict[int, tuple[psutil.Process, set[int]]] = {}
 foreign_listeners: list[str] = []
@@ -417,7 +421,7 @@ if still_alive:
     raise SystemExit(2)
 PY
 
-for port in 28100 28101 28103; do
+for port in "${R2E_GYM_GATEWAY_PORT}" "${R2E_GYM_AGENT_PORT}" "${R2E_GYM_HEAD_PORT}"; do
     if ! port_error="$(
         "${cluster_python}" - "${port}" <<'PY'
 import socket
@@ -499,10 +503,11 @@ export NEMO_GYM_SANITIZE_PLATFORM_RELEASE=1
 export NEMO_GYM_PYTHON_STARTUP_DIR="${PYTHON_STARTUP_DIR}"
 export PYTHONPATH="${PYTHON_STARTUP_DIR}:${RELAX_INTEGRATION_ROOT}:${GYM_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
-export GYM_HOST GYM_RAY_ADDRESS NEMO_GYM_CALLBACK_ALLOWED_HOSTS NEMO_GYM_CALLBACK_ALLOWED_NETWORKS
+export GYM_HOST GYM_RAY_ADDRESS NEMO_GYM_CALLBACK_ALLOWED_NETWORKS
 export NEMO_GYM_CALLBACK_PROXY
 export NEMO_GYM_ARTIFACT_ROOT NEMO_GYM_CALLBACK_TIMEOUT_S NEMO_GYM_VERBOSE
 export R2E_GYM_DATA R2E_GYM_SIF_DIR R2E_GYM_SIF_PREFIX R2E_GYM_MAX_CONCURRENCY R2E_GYM_MAX_DEADLINE_S
+export R2E_GYM_AGENT_PORT
 export NEMO_GYM_GATEWAY_ENVIRONMENTS_JSON
 NEMO_GYM_GATEWAY_ENVIRONMENTS_JSON="$(
     "${GYM_ROOT}/.venv/bin/python" - <<'PY'
@@ -510,6 +515,7 @@ import json
 import os
 
 host = os.environ["GYM_HOST"]
+agent_port = int(os.environ["R2E_GYM_AGENT_PORT"])
 max_concurrency = int(os.environ["R2E_GYM_MAX_CONCURRENCY"])
 max_deadline = int(os.environ["R2E_GYM_MAX_DEADLINE_S"])
 print(
@@ -518,8 +524,8 @@ print(
             "r2e-gym-v1": {
                 "environment": "r2e_gym",
                 "agent_name": "swe_agents",
-                "agent_url": f"http://{host}:28101",
-                "readiness_urls": [f"http://{host}:28101"],
+                "agent_url": f"http://{host}:{agent_port}",
+                "readiness_urls": [f"http://{host}:{agent_port}"],
                 "interrupt_policy": "protected",
                 "max_concurrency": max_concurrency,
                 "queue_capacity": max_concurrency * 2,
@@ -541,11 +547,11 @@ exec "${GYM_ROOT}/.venv/bin/gym" env start \
     +ray_head_node_address="${GYM_RAY_ADDRESS}" \
     +default_host="${GYM_HOST}" \
     ++head_server.host="${GYM_BIND_HOST}" \
-    ++head_server.port=28103 \
+    ++head_server.port="${R2E_GYM_HEAD_PORT}" \
     ++policy_model.responses_api_models.relax_gateway_model.host="${GYM_BIND_HOST}" \
-    ++policy_model.responses_api_models.relax_gateway_model.port=28100 \
+    ++policy_model.responses_api_models.relax_gateway_model.port="${R2E_GYM_GATEWAY_PORT}" \
     ++swe_agents.responses_api_agents.swe_agents.host="${GYM_BIND_HOST}" \
-    ++swe_agents.responses_api_agents.swe_agents.port=28101 \
+    ++swe_agents.responses_api_agents.swe_agents.port="${R2E_GYM_AGENT_PORT}" \
     ++swe_agents.responses_api_agents.swe_agents.dataset_harness=r2e_gym \
     "++swe_agents.responses_api_agents.swe_agents.container_formatter='${R2E_GYM_SIF_DIR}/${R2E_GYM_SIF_PREFIX}{instance_id}.sif'" \
     ++swe_agents.responses_api_agents.swe_agents.dataset_path="${R2E_GYM_DATA}" \

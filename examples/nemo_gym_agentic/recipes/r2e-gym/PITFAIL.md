@@ -183,18 +183,11 @@ Gateway 无法知道属于哪个 Relax session，会返回 404/410。正确路�
 opaque prefix 必须从 Gateway `/run` payload 进入 SWE agent，再进入 OpenHands config/container。
 如果首轮能回调、后续轮断链，检查 rollout-prefix patch 是否真的在运行镜像中。
 
-## 12. callback allowlist 必须匹配 Relax 实际 host
+## 12. callback networks 必须覆盖实际 IP
 
-`--callback-host` 只填裸 host/IP，必须与 Relax `RELAX_BASE_URL` 中的 hostname 完全一致。不要填：
-
-- Gym IP；
-- Ray GCS 地址带端口；
-- dashboard URL；
-- `0.0.0.0`；
-- wildcard。
-
-Golden 模式不调用 callback，所以 wrapper 默认用 Gym host 作为合法占位；train 模式必须显式传
-Relax host。
+只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 或 `--callback-network`，使用逗号分隔的严格 CIDR。
+网段必须覆盖 Relax callback URL 中的 IP；单地址使用 `/32` 或 `/128`，禁止 `/0`。
+Golden 模式虽然不调用模型，协议仍校验 callback URL，因此也必须配置覆盖 verifier callback IP 的 CIDR。
 
 ## 13. `cleanup_unverified` 不是模型 reward=0
 

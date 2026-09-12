@@ -1,0 +1,41 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+reasoning_gym:
+  resources_servers:
+    reasoning_gym:
+      entrypoint: app.py
+      domain: knowledge
+      verified: false
+      description: Claude Code driving reasoning-gym tasks through Relax Anthropic Messages
+      value: Validate a Claude Code tool loop with the reasoning-gym scorer
+
+reasoning_gym_claude_code_agent_model_server:
+  responses_api_agents:
+    claude_code_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: reasoning_gym
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      concurrency: ${oc.env:REASONING_GYM_CC_MAX_CONCURRENCY,64}
+      model: claude-sonnet-4-5
+      anthropic_api_key: EMPTY  # pragma: allowlist secret
+      anthropic_base_url: null
+      max_turns: ${oc.env:REASONING_GYM_CC_MAX_TURNS,30}
+      timeout: ${oc.env:REASONING_GYM_CC_AGENT_TIMEOUT,300}
+      claude_code_version: "2.1.237"
+      thinking: enabled
+      bare: true
+      settings: ${oc.env:REASONING_GYM_CC_SETTINGS}
+      system_prompt: |
+        You are a precise reasoning assistant with a Bash tool for running Python.
+        Think step by step. When a calculation is needed, run Python through Bash.
+        Wrap the final answer in <answer>...</answer> tags on its own line,
+        using the exact format requested by the question.
+      datasets:
+      - name: train
+        type: train
+        jsonl_fpath: ${oc.env:REASONING_GYM_CC_DATA_JSONL}
+        license: Creative Commons Attribution 4.0 International

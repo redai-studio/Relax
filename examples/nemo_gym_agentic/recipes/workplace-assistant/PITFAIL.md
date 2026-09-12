@@ -2,6 +2,16 @@
 
 本文件记录 Workplace Assistant 接入过程中最容易踩到的坑。完整流程见 [README.md](README.md)。
 
+## 未评分的 deadline 截断不能导出为训练样本
+
+Gateway 达到 deadline 时可能返回 `status=truncated`、`reward=null`、`error.code=deadline_exceeded`。
+这表示 verifier 没有产生奖励。薄客户端必须失败退出，让 Relax 丢弃对应采样组；不能把空奖励
+正常导出，否则会触发本地 RM fallback，并因未配置 `rm_type` 导致整个 rollout 失败。
+已有奖励的截断结果（包括 `reward=0.0`）仍正常导出。
+
+持续的模型回调 500 应查看 Gateway 的 `Retrying NeMo Gym model callback` 日志，其中的 `error`
+包含上游错误详情，关闭 verbose 时也会记录。不要只增加 deadline 或用零分掩盖未评分的 trial。
+
 ## 1. 工具数量不能只抄上游描述
 
 固定 Gym commit 的上游 README 和公开 dataset card 写明 5 个数据库、26 个工具，但同一 commit
@@ -98,8 +108,8 @@ cat /proc/sys/net/ipv4/ip_local_port_range
 
 ## 10. callback allowlist 和代理
 
-allowlist 要填 Relax callback URL 中的精确裸 host/IP。Gym 和 Relax IP 必须加入
-`NO_PROXY`。否则请求可能被代理转发，表现为超时、403/404 或 callback host 不匹配。
+`NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 要覆盖 Relax callback URL 中的 IP，填写严格 CIDR。Gym 和 Relax IP 必须加入
+`NO_PROXY`。否则请求可能被代理转发，表现为超时、403/404 或 callback IP 不在允许网段内。
 
 ## 11. `max_steps=6` 是 agent 循环上限
 

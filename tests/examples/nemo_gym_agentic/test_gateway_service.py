@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -13,7 +15,8 @@ from relax_nemo_gym_example.app.protocol import (
     TrialRequest,
     TrialStatus,
 )
-from relax_nemo_gym_example.service.callback_provider import CallbackProvider
+from relax_nemo_gym_example.service import callback_provider as callback_mod
+from relax_nemo_gym_example.service.callback_provider import CallbackProvider, CallbackUpstreamError
 from relax_nemo_gym_example.service.config import EnvironmentSpec, GatewaySettings
 from relax_nemo_gym_example.service.registry import (
     AdmissionRejected,
@@ -332,8 +335,8 @@ async def test_two_callback_capabilities_forward_distinct_endpoints_and_tokens()
 
         first, second = adapter.contexts
         await asyncio.gather(
-            provider.chat_completions(first.rollout_id, {"messages": [], "model": "ignored"}),
-            provider.chat_completions(second.rollout_id, {"messages": [], "model": "ignored"}),
+            provider.request(first.rollout_id, {"messages": [], "model": "ignored"}, resource="chat/completions"),
+            provider.request(second.rollout_id, {"messages": [], "model": "ignored"}, resource="chat/completions"),
         )
 
         assert {(item["host"], item["authorization"]) for item in seen} == {
@@ -379,7 +382,7 @@ async def test_callback_supports_custom_api_key_header_and_standard_v1_base_url(
         while not adapter.contexts:
             await asyncio.sleep(0.001)
 
-        await provider.chat_completions(adapter.contexts[0].rollout_id, {"messages": []})
+        await provider.request(adapter.contexts[0].rollout_id, {"messages": []}, resource="chat/completions")
 
         assert seen[0].url.path == "/v1/chat/completions"
         assert seen[0].headers["api-key"] == "secret-one"
@@ -419,9 +422,277 @@ async def test_callback_timeout_is_capped_by_gateway_setting():
         while not adapter.contexts:
             await asyncio.sleep(0.001)
 
-        await provider.chat_completions(adapter.contexts[0].rollout_id, {"messages": []})
+        await provider.request(adapter.contexts[0].rollout_id, {"messages": []}, resource="chat/completions")
 
-        assert seen_timeout == [{"connect": 12.0, "read": 12.0, "write": 12.0, "pool": 12.0}]
+        assert len(seen_timeout) == 1
+        assert seen_timeout[0] == pytest.approx({"connect": 12.0, "read": 12.0, "write": 12.0, "pool": 12.0}, abs=0.1)
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+@pytest.fixture
+def callback_clock(monkeypatch):
+    clock = SimpleNamespace(now=0.0, waits=[])
+
+    async def sleep(delay):
+        clock.waits.append(delay)
+        clock.now += delay
+        await asyncio.sleep(0)
+
+    # Advance callback time without changing the registry or event-loop clocks.
+    monkeypatch.setattr(callback_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(
+        callback_mod,
+        "asyncio",
+        SimpleNamespace(sleep=sleep, wait_for=asyncio.wait_for, TimeoutError=asyncio.TimeoutError),
+    )
+    return clock
+
+
+async def test_callback_retries_keep_tool_history_and_trial_alive(callback_clock, caplog, monkeypatch):
+    monkeypatch.setenv("NEMO_GYM_VERBOSE", "0")
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    seen = []
+    statuses = iter([500, 502, 503, 504, 200])
+
+    def handler(request):
+        seen.append(request)
+        status = next(statuses)
+        if status == 500:
+            return httpx.Response(
+                status,
+                json={"error": {"code": "backend_failed", "message": "generation aborted", "api_key": "private-key"}},
+            )
+        # Proxy errors can be HTML or plain text; retry before decoding JSON.
+        if status != 200:
+            return httpx.Response(status, text="temporarily unavailable")
+        return httpx.Response(200, json={"id": "resp-resumed", "output": []})
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler), timeout_s=30)
+    history = [
+        {"role": "user", "content": "Create an event, then report the result."},
+        {"type": "function_call", "call_id": "call-1", "name": "create_event", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call-1", "output": '{"event_id":"event-1"}'},
+    ]
+    payload = {"input": history, "model": "ignored", "tools": [], "temperature": 0.7}
+    original = copy.deepcopy(payload)
+    try:
+        await registry.create(_request("request-retry").to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        rollout_id = adapter.contexts[0].rollout_id
+
+        response = await provider.request(rollout_id, payload, resource="responses")
+
+        assert response.status_code == 200
+        assert response.payload["id"] == "resp-resumed"
+        assert callback_clock.waits == [1, 2, 4, 8]
+        assert '"code": "backend_failed"' in caplog.text
+        assert "generation aborted" in caplog.text
+        assert "temporarily unavailable" in caplog.text
+        assert "private-key" not in caplog.text
+        assert [r.extensions["timeout"]["read"] for r in seen] == [30, 29, 27, 23, 15]
+        assert all(r.content == seen[0].content and r.headers == seen[0].headers for r in seen)
+        assert json.loads(seen[0].content) == {**original, "model": "policy-model"}
+        assert seen[0].headers["authorization"] == "Bearer secret-one"
+        assert payload == original
+        assert len(adapter.contexts) == 1
+        assert adapter.handles[0].abort_calls == 0
+        assert (await registry.get("request-retry"))["status"] == "running"
+        adapter.handles[0].complete()
+        await _wait_for_status(registry, "request-retry", "completed")
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+async def test_callback_waits_through_sixty_second_router_outage(callback_clock):
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    attempts = []
+
+    def handler(request):
+        attempts.append(callback_clock.now)
+        if callback_clock.now < 60:
+            return httpx.Response(503, json={"error": {"code": "no_available_workers"}})
+        return httpx.Response(200, json={"output": []})
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler), timeout_s=90)
+    try:
+        await registry.create(_request("request-router", deadline_s=120).to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        response = await provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        assert response.status_code == 200
+        assert attempts == [0, 1, 3, 7, 15, 23, 31, 39, 47, 55, 63]
+        assert len(adapter.contexts) == 1
+        assert (await registry.get("request-router"))["status"] == "running"
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [(status, "rejected") for status in [400, 401, 403, 404, 409, 422, 429, 499, 501]]
+    + [(500, "Internal error while rendering agentic response.")],
+)
+async def test_callback_does_not_retry_other_http_errors(status, message, callback_clock, caplog, monkeypatch):
+    monkeypatch.setenv("NEMO_GYM_VERBOSE", "0")
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    seen = []
+    error = {"error": {"message": message, "code": "invalid_request", "param": "input", "api_key": "private-key"}}
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(status, json=error)
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler))
+    try:
+        await registry.create(_request("request-rejected").to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        response = await provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        assert response.status_code == status
+        assert response.payload == error
+        assert len(seen) == 1
+        assert callback_clock.waits == []
+        assert "NeMo Gym model callback rejected" in caplog.text
+        assert f"rollout_id={adapter.contexts[0].rollout_id}" in caplog.text
+        assert f"status={status}" in caplog.text
+        assert message in caplog.text
+        assert '"code": "invalid_request"' in caplog.text
+        assert '"param": "input"' in caplog.text
+        assert "private-key" not in caplog.text
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+@pytest.mark.parametrize("callback_timeout,trial_deadline", [(5, 60), (60, 5)])
+async def test_callback_retries_share_one_deadline(callback_timeout, trial_deadline, callback_clock):
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    seen_timeouts = []
+
+    def handler(request):
+        seen_timeouts.append(request.extensions["timeout"]["read"])
+        callback_clock.now += 0.5  # Request duration also consumes the budget.
+        return httpx.Response(503, text="unavailable")
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler), timeout_s=callback_timeout)
+    try:
+        await registry.create(_request("request-deadline", deadline_s=trial_deadline).to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        with pytest.raises(CallbackUpstreamError, match="deadline exceeded"):
+            await provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        assert seen_timeouts == pytest.approx([5, 3.5, 1], abs=0.1)
+        assert callback_clock.now == pytest.approx(5, abs=0.1)
+        assert callback_clock.waits == pytest.approx([1, 2, 0.5], abs=0.1)
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ConnectError])
+async def test_callback_does_not_replay_ambiguous_transport_failures(error_type, callback_clock):
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        raise error_type("transport failed", request=request)
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler))
+    try:
+        await registry.create(_request("request-transport").to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        with pytest.raises(CallbackUpstreamError, match="transport failed"):
+            await provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        assert len(seen) == 1
+        assert callback_clock.waits == []
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+async def test_callback_total_deadline_cancels_a_blocked_response():
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    cancelled = asyncio.Event()
+
+    async def handler(request):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler), timeout_s=0.02)
+    try:
+        await registry.create(_request("request-blocked").to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        with pytest.raises(CallbackUpstreamError, match="deadline exceeded"):
+            await asyncio.wait_for(
+                provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses"), timeout=1
+            )
+        assert cancelled.is_set()
+    finally:
+        await provider.close()
+        await registry.close()
+
+
+async def test_abort_cancels_callback_backoff_without_retry_or_trial_restart(monkeypatch):
+    adapter = ControlledAdapter()
+    registry = GatewayRegistry(settings=_settings(), adapter=adapter)
+    await registry.start()
+    sleeping = asyncio.Event()
+    sleep_cancelled = asyncio.Event()
+    seen = []
+
+    async def backoff(delay):
+        sleeping.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sleep_cancelled.set()
+            raise
+
+    monkeypatch.setattr(
+        callback_mod,
+        "asyncio",
+        SimpleNamespace(sleep=backoff, wait_for=asyncio.wait_for, TimeoutError=asyncio.TimeoutError),
+    )
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(503, text="unavailable")
+
+    provider = CallbackProvider(registry, transport=httpx.MockTransport(handler))
+    try:
+        await registry.create(_request("request-backoff").to_payload())
+        await asyncio.wait_for(adapter.started.wait(), timeout=1)
+        callback_task = asyncio.create_task(
+            provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        )
+        await asyncio.wait_for(sleeping.wait(), timeout=1)
+        await registry.abort("request-backoff")
+        with pytest.raises(asyncio.CancelledError):
+            await callback_task
+        await _wait_for_status(registry, "request-backoff", "aborted")
+        assert sleep_cancelled.is_set()
+        assert len(seen) == len(adapter.contexts) == 1
+        assert adapter.handles[0].abort_calls == 1
+        with pytest.raises(CallbackUnavailable):
+            await provider.request(adapter.contexts[0].rollout_id, {"input": []}, resource="responses")
+        assert len(seen) == 1
     finally:
         await provider.close()
         await registry.close()
@@ -462,7 +733,10 @@ async def test_one_hundred_concurrent_callbacks_keep_tokens_isolated():
             await asyncio.sleep(0.001)
 
         await asyncio.gather(
-            *(provider.chat_completions(context.rollout_id, {"messages": []}) for context in adapter.contexts)
+            *(
+                provider.request(context.rollout_id, {"messages": []}, resource="chat/completions")
+                for context in adapter.contexts
+            )
         )
 
         assert set(seen_tokens) == {f"Bearer secret-{index}" for index in range(100)}
@@ -495,7 +769,7 @@ async def test_abort_cancels_an_inflight_relax_callback():
         await registry.create(_request("request-one").to_payload())
         await asyncio.wait_for(adapter.started.wait(), timeout=1.0)
         callback_task = asyncio.create_task(
-            provider.chat_completions(adapter.contexts[0].rollout_id, {"messages": []})
+            provider.request(adapter.contexts[0].rollout_id, {"messages": []}, resource="chat/completions")
         )
         await asyncio.wait_for(transport.entered.wait(), timeout=1.0)
 

@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..app.protocol import PROTOCOL_VERSION, ProtocolValidationError
-from .callback_provider import CallbackProvider, CallbackRequestError, CallbackUpstreamError
+from .callback_provider import CallbackProvider, CallbackRequestError, CallbackResponse, CallbackUpstreamError
 from .config import GatewayConfigError, GatewaySettings
 from .registry import (
     AdmissionRejected,
@@ -53,6 +56,15 @@ def create_app(
 
     app = FastAPI(title="Relax NeMo Gym Gateway", version=PROTOCOL_VERSION, lifespan=lifespan)
     app.state.registry = registry
+
+    @app.exception_handler(CallbackUnavailable)
+    @app.exception_handler(CallbackRequestError)
+    @app.exception_handler(CallbackUpstreamError)
+    async def callback_error(_: Request, exc: Exception) -> JSONResponse:
+        if isinstance(exc, CallbackUnavailable):
+            return JSONResponse(status_code=410, content={"detail": "callback capability is unavailable"})
+        status_code = 422 if isinstance(exc, CallbackRequestError) else 502
+        return JSONResponse(status_code=status_code, content={"detail": str(exc)})
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -126,7 +138,7 @@ def create_app(
         return JSONResponse(status_code=202, content=result)
 
     @app.post("/ng-rollout/{rollout_id}/v1/chat/completions")
-    async def callback_chat_completions(rollout_id: str, request: Request) -> JSONResponse:
+    async def callback_chat_completions(rollout_id: str, request: Request) -> Response:
         payload = await _json_body(request)
         log_verbose_payload(
             "request",
@@ -134,14 +146,7 @@ def create_app(
             route="/ng-rollout/{rollout_id}/v1/chat/completions",
             rollout_id=rollout_id,
         )
-        try:
-            result = await callback_provider.chat_completions(rollout_id, payload)
-        except CallbackUnavailable:
-            raise HTTPException(status_code=410, detail="callback capability is unavailable") from None
-        except CallbackRequestError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-        except CallbackUpstreamError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from None
+        result = await callback_provider.request(rollout_id, payload, resource="chat/completions")
         log_verbose_payload(
             "response",
             result.payload,
@@ -149,10 +154,10 @@ def create_app(
             rollout_id=rollout_id,
             status=result.status_code,
         )
-        return JSONResponse(status_code=result.status_code, content=result.payload)
+        return _callback_response(result)
 
     @app.post("/ng-rollout/{rollout_id}/v1/responses")
-    async def callback_responses(rollout_id: str, request: Request) -> JSONResponse:
+    async def callback_responses(rollout_id: str, request: Request) -> Response:
         payload = await _json_body(request)
         log_verbose_payload(
             "request",
@@ -160,18 +165,36 @@ def create_app(
             route="/ng-rollout/{rollout_id}/v1/responses",
             rollout_id=rollout_id,
         )
-        try:
-            result = await callback_provider.responses(rollout_id, payload)
-        except CallbackUnavailable:
-            raise HTTPException(status_code=410, detail="callback capability is unavailable") from None
-        except CallbackRequestError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
-        except CallbackUpstreamError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from None
+        result = await callback_provider.request(rollout_id, payload, resource="responses")
         log_verbose_payload(
             "response",
             result.payload,
             route="/ng-rollout/{rollout_id}/v1/responses",
+            rollout_id=rollout_id,
+            status=result.status_code,
+        )
+        return _callback_response(result)
+
+    @app.post("/ng-rollout/{rollout_id}/v1/messages")
+    async def callback_messages(rollout_id: str, request: Request) -> Response:
+        payload = await _json_body(request)
+        log_verbose_payload(
+            "request",
+            payload,
+            route="/ng-rollout/{rollout_id}/v1/messages",
+            rollout_id=rollout_id,
+        )
+        if isinstance(payload, dict) and payload.get("stream"):
+            return StreamingResponse(
+                _messages_sse(callback_provider, rollout_id, payload),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        result = await callback_provider.request(rollout_id, payload, resource="messages")
+        log_verbose_payload(
+            "response",
+            result.payload,
+            route="/ng-rollout/{rollout_id}/v1/messages",
             rollout_id=rollout_id,
             status=result.status_code,
         )
@@ -189,6 +212,59 @@ async def _json_body(request: Request) -> Any:
         return await request.json()
     except ValueError:
         raise HTTPException(status_code=400, detail="request body must be valid JSON") from None
+
+
+async def _messages_sse(
+    provider: CallbackProvider,
+    rollout_id: str,
+    payload: dict[str, Any],
+) -> AsyncIterator[str]:
+    task = asyncio.create_task(provider.request(rollout_id, payload, resource="messages"))
+    ping = _sse_event("ping", {"type": "ping"})
+    try:
+        yield ping
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=15.0)
+            if not done:
+                yield ping
+        try:
+            result = task.result()
+        except (CallbackUnavailable, CallbackRequestError, CallbackUpstreamError) as exc:
+            yield _sse_error(str(exc))
+            return
+        if result.status_code >= 400:
+            if isinstance(result.payload, dict) and result.payload.get("type") == "error":
+                yield _sse_event("error", result.payload)
+            else:
+                yield _sse_error("Upstream model callback failed")
+            return
+        if not isinstance(result.payload, str):
+            yield _sse_error("Upstream model callback returned a non-SSE response")
+            return
+        yield result.payload
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _callback_response(result: CallbackResponse) -> Response:
+    if isinstance(result.payload, str):
+        return Response(
+            content=result.payload,
+            status_code=result.status_code,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    return JSONResponse(status_code=result.status_code, content=result.payload)
+
+
+def _sse_error(message: str) -> str:
+    return _sse_event("error", {"type": "error", "error": {"type": "api_error", "message": message}})
+
+
+def _sse_event(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
 def _service_metadata(registry: GatewayRegistry, *, ready: bool | None) -> dict[str, Any]:
