@@ -20,7 +20,6 @@ _TRAINING_ARTIFACT_ARRAY_FIELDS: list[tuple[str, Any]] = [
     ("rollout_log_probs", np.float64),
     ("teacher_log_probs", np.float64),
     ("teacher_topk_token_ids", np.int32),
-    ("rollout_routed_experts", np.int32),
 ]
 
 
