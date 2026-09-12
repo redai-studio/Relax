@@ -13,6 +13,7 @@ import shutil
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -63,6 +64,11 @@ class RunAdapter(Protocol):
     async def close(self) -> None: ...
 
 
+class _RejectAllCookiesPolicy(DefaultCookiePolicy):
+    def set_ok(self, cookie: Cookie, request: Any) -> bool:
+        return False
+
+
 class HttpNemoGymRunAdapter:
     """Calls a pre-started NeMo Gym agent's ``/run`` endpoint.
 
@@ -80,7 +86,13 @@ class HttpNemoGymRunAdapter:
     ) -> None:
         self._readiness_urls = tuple(sorted({url for spec in specs for url in spec.readiness_urls}))
         self._artifact_root = artifact_root
-        self._client = httpx.AsyncClient(timeout=None, transport=transport, trust_env=False)
+        self._client = httpx.AsyncClient(
+            timeout=None,
+            transport=transport,
+            trust_env=False,
+            cookies=CookieJar(policy=_RejectAllCookiesPolicy()),
+            limits=httpx.Limits(max_connections=1024, max_keepalive_connections=256),
+        )
 
     async def start(self, context: TrialRunContext) -> RunHandle:
         payload = _build_run_payload(context.request, rollout_id=context.rollout_id)

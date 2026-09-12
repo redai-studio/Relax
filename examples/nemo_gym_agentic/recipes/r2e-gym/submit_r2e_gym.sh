@@ -56,7 +56,7 @@ fi
 RAY_ADDRESS="${RAY_ADDRESS:-${R2E_RAY_HEAD}:6379}"
 RAY_DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS:-http://${R2E_RAY_HEAD}:8265}"
 GYM_HOST="${GYM_HOST:-${R2E_RAY_HEAD}}"
-NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${NEMO_GYM_CALLBACK_ALLOWED_HOSTS:-${R2E_RAY_HEAD}}"
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 R2E_DATA_DIR="${R2E_DATA_DIR:-/data/nemo-gym/r2e-gym}"
 R2E_GYM_DATA="${R2E_GYM_DATA:-${R2E_DATA_DIR}/r2e_gym_train.jsonl}"
 R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-${R2E_DATA_DIR}/sif}"
@@ -79,14 +79,14 @@ echo "  submission_id=${R2E_GYM_SUBMISSION_ID}"
 runtime_env="$(
     jq -cn \
         --arg ray_address "${RAY_ADDRESS}" \
-        --arg callback_hosts "${NEMO_GYM_CALLBACK_ALLOWED_HOSTS}" \
+        --arg callback_networks "${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}" \
         --arg http_proxy "${http_proxy:-${HTTP_PROXY:-}}" \
         --arg https_proxy "${https_proxy:-${HTTPS_PROXY:-}}" \
         --arg no_proxy "${no_proxy:-${NO_PROXY:-}}" \
         '{
           env_vars: {
             RAY_ADDRESS: $ray_address,
-            NEMO_GYM_CALLBACK_ALLOWED_HOSTS: $callback_hosts,
+            NEMO_GYM_CALLBACK_ALLOWED_NETWORKS: $callback_networks,
             HTTP_PROXY: $http_proxy,
             HTTPS_PROXY: $https_proxy,
             NO_PROXY: $no_proxy,

@@ -398,15 +398,18 @@ def get_batch(
             align_size = tp_size * cp_size * 2
             device = batch_device
 
-            seqlens = torch.tensor([t.size(0) for t in tokens], dtype=torch.int32, device=device)
-            seqlens_padded = (seqlens + align_size - 1) // align_size * align_size
+            seqlens = [t.size(0) for t in tokens]
+            seqlens_padded = [(s + align_size - 1) // align_size * align_size for s in seqlens]
             cu_seqlens_padded = torch.zeros(len(tokens) + 1, dtype=torch.int32, device=device)
-            cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
-            max_seqlen_padded = int(seqlens_padded.max().item())
+            cu_seqlens_padded[1:] = torch.cumsum(torch.tensor(seqlens_padded, dtype=torch.int32, device=device), dim=0)
+            max_seqlen_padded = max(seqlens_padded)
 
             unsplit_tokens = pad_sequence(tokens, batch_first=True, padding_value=pad_token_id)
+            # Bridge treats a single-row input as an already packed THD stream.
+            # Its physical length must match cu_seqlens, including TP/CP padding.
+            unsplit_tokens = F.pad(unsplit_tokens, (0, max_seqlen_padded - unsplit_tokens.size(1)), value=pad_token_id)
             unsplit_attention_mask = torch.zeros_like(unsplit_tokens, dtype=torch.bool)
-            for i, s in enumerate(seqlens.tolist()):
+            for i, s in enumerate(seqlens):
                 unsplit_attention_mask[i, :s] = True
 
             batch["unsplit_tokens"] = unsplit_tokens
@@ -426,7 +429,7 @@ def get_batch(
             batch["vlm_packed_seq_params"] = vlm_packed_seq_params
             # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
-            batch["padded_total_lengths"] = seqlens_padded.tolist()
+            batch["padded_total_lengths"] = seqlens_padded
 
         if allgather_cp:
             # DSA mode: concatenate all sequences first, then slice once with CP.

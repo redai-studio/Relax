@@ -2,38 +2,63 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU Calendar agentic training.
+# Qwen3-4B 8xGPU reasoning-gym-cc agentic training.
+#
+# Rollouts drive Claude Code (via NeMo Gym's claude_code_agent harness) which
+# streams every /v1/messages call back through the Relax Gateway to this same
+# model. Reward comes from reasoning-gym's built-in scoring for the row's
+# ``metadata.source_dataset`` after ``<answer>...</answer>`` extraction.
 
 set -ex
 set -o pipefail
 
-export EXP_DIR="${EXP_DIR:-${PWD}/outputs/nemo-gym-calendar}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/nemo-gym}"
-EXP_NAME="${EXP_NAME:-calendar-qwen3-4b-8xgpu}"
+EXP_NAME="${EXP_NAME:-reasoning-gym-cc-qwen3-4b-8xgpu}"
 
-: "${NEMO_GYM_SOURCE_DATA:?Set NEMO_GYM_SOURCE_DATA to the prepared Calendar JSONL}"
+: "${MODEL_DIR:?MODEL_DIR must contain Qwen3-4B/}"
+: "${GYM_HOST:?GYM_HOST must be reachable from every Relax worker}"
+: "${DATA_DIR:?DATA_DIR must be set to the output directory for this recipe}"
+DATA_DIR="${DATA_DIR%/}"
+: "${NEMO_GYM_SOURCE_DATA:=${DATA_DIR}/reasoning_gym_cc_train.jsonl}"
+: "${SAVE_DIR:=${PWD}/outputs/${EXP_NAME}}"
+: "${NEMO_GYM_GATEWAY_PORT:=${GYM_PORT:-29200}}"
 
-now=$(date "+%Y-%m-%d-%H:%M:%S")
+now=$(date -u "+%Y%m%dT%H%M%SZ")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 EXAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 RELAX_ROOT="$(cd -- "${EXAMPLE_DIR}/../.." &>/dev/null && pwd)"
 RUN_TRAINING_SCRIPT="${EXAMPLE_DIR}/scripts/run_training.sh"
 RUN_AGENT_SCRIPT="${EXAMPLE_DIR}/scripts/run_agent_app.sh"
 
-for required_script in "${RUN_TRAINING_SCRIPT}" "${RUN_AGENT_SCRIPT}"; do
-   test -f "${required_script}"
+for absolute_path in "${MODEL_DIR}" "${DATA_DIR}" "${NEMO_GYM_SOURCE_DATA}" "${SAVE_DIR}"; do
+   case "${absolute_path}" in /*) ;; *)
+      echo "ERROR: path must be absolute: ${absolute_path}" >&2
+      exit 2
+      ;;
+   esac
 done
+for required_path in \
+   "${MODEL_DIR}/Qwen3-4B/config.json" \
+   "${NEMO_GYM_SOURCE_DATA}" \
+   "${RUN_TRAINING_SCRIPT}" \
+   "${RUN_AGENT_SCRIPT}"; do
+   if [ ! -s "${required_path}" ]; then
+      echo "ERROR: required file is missing or empty: ${required_path}" >&2
+      exit 2
+   fi
+done
+if ! [[ "${NEMO_GYM_GATEWAY_PORT}" =~ ^[0-9]+$ ]] \
+   || ((10#${NEMO_GYM_GATEWAY_PORT} < 1 || 10#${NEMO_GYM_GATEWAY_PORT} > 65535)); then
+   echo "ERROR: NEMO_GYM_GATEWAY_PORT must be an integer between 1 and 65535" >&2
+   exit 2
+fi
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-   source "${EXAMPLE_DIR}/../../scripts/entrypoint/local.sh"
+   source "${RELAX_ROOT}/scripts/entrypoint/local.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
-: "${MODEL_DIR:?MODEL_DIR must contain Qwen3-4B/}"
-: "${GYM_HOST:?GYM_HOST must be reachable from every Relax worker}"
 : "${RUNTIME_ENV_JSON:?RUNTIME_ENV_JSON must be set by a Relax entrypoint}"
-test -s "${MODEL_DIR}/Qwen3-4B/config.json"
-test -s "${NEMO_GYM_SOURCE_DATA}"
 DATA_LIMIT="$(wc -l < "${NEMO_GYM_SOURCE_DATA}")"
 
 RUNTIME_ENV_JSON="$(
@@ -44,26 +69,32 @@ RUNTIME_ENV_JSON="$(
 )"
 export RUNTIME_ENV_JSON
 
-NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-${GYM_PORT:-29100}}"
-PROMPT_SET="${EXP_DIR}/data/calendar_train.jsonl"
+PROMPT_SET="${NEMO_GYM_SOURCE_DATA%.jsonl}_relax.jsonl"
 GATEWAY_URL="http://${GYM_HOST}:${NEMO_GYM_GATEWAY_PORT}"
-SUBMISSION_ID="${RELAX_SUBMISSION_ID:-relax-nemo-gym-calendar-${now}-${BASHPID}-${RANDOM}}"
+SUBMISSION_ID="${RELAX_SUBMISSION_ID:-relax-nemo-gym-reasoning-gym-cc-${now}-${BASHPID}-${RANDOM}}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 if [ -n "${RAY_DASHBOARD_ADDRESS:-}" ]; then
    DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS}"
 elif [[ "${RAY_ADDRESS:-auto}" =~ ^([^:/]+):[0-9]+$ ]]; then
    DASHBOARD_ADDRESS="http://${BASH_REMATCH[1]}:${RAY_DASHBOARD_PORT}"
+elif [ "${RAY_ADDRESS:-auto}" = "auto" ]; then
+   ray_head_ip="$(
+      ray list nodes --address=auto --format json |
+         jq -er 'map(select(.state == "ALIVE" and .is_head_node == true)) | .[0].node_ip'
+   )"
+   DASHBOARD_ADDRESS="http://${ray_head_ip}:${RAY_DASHBOARD_PORT}"
 else
-   DASHBOARD_ADDRESS="http://127.0.0.1:${RAY_DASHBOARD_PORT}"
+   echo "ERROR: cannot derive the Ray Dashboard URL; set RAY_DASHBOARD_ADDRESS" >&2
+   exit 2
 fi
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}/Qwen3-4B/"
    --ref-load "${MODEL_DIR}/Qwen3-4B/"
+   --save ${SAVE_DIR}/nemo-gym/reasoning-gym-cc/Qwen3-4B/
+   --save-interval 100
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-   --save "${EXP_DIR}/Qwen3-4B_mcore_8xgpu/"
-   --save-interval 100
 )
 
 ROLLOUT_ARGS=(
@@ -77,36 +108,39 @@ ROLLOUT_ARGS=(
    --agent-cwd "${RELAX_ROOT}"
    --agent-env
      "NEMO_GYM_URL=${GATEWAY_URL}"
-     "NEMO_GYM_ENVIRONMENT=calendar"
-     "NEMO_GYM_CONFIG=calendar-v1"
+     "NEMO_GYM_ENVIRONMENT=reasoning_gym"
+     "NEMO_GYM_CONFIG=reasoning-gym-cc-v1"
      "NEMO_GYM_MODEL=model"
      "NEMO_GYM_INTERRUPT_POLICY=protected"
-     "NEMO_GYM_DEADLINE_S=600"
-     "NEMO_GYM_LEASE_S=60"
-   --agent-timeout 660
+     "NEMO_GYM_DEADLINE_S=900"
+     "NEMO_GYM_LEASE_S=90"
+   --agent-timeout 960
    --agentic-reasoning-parser qwen3
    --agentic-tool-call-parser qwen
-   --num-rollout 200
-   --rollout-batch-size 32
+
+   --num-rollout 100
+   --rollout-batch-size 8
    --n-samples-per-prompt 8
+   --dynamic-sampling-filter-path relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std
    --rollout-max-prompt-len 6144
-   --rollout-max-response-len 2048
-   --rollout-max-context-len 8192
+   --rollout-max-response-len 10240
+   --rollout-max-context-len 16384
    --rollout-temperature 0.7
-   --global-batch-size 256
+   --global-batch-size 64
 )
 
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --calculate-per-token-loss
+   --context-parallel-size 2
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
    --micro-batch-size 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
-   --log-probs-max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 16384
+   --log-probs-max-tokens-per-gpu 16384
    --log-probs-chunk-size 1024
 )
 
@@ -129,9 +163,16 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
-   --sglang-mem-fraction-static 0.7
-   --sglang-cuda-graph-max-bs 4
+   --rollout-num-gpus-per-engine 2
+   --sglang-mem-fraction-static 0.8
+   --sglang-router-policy consistent_hashing
+
+   # --sglang-enable-session-radix-cache
+   # --sglang-radix-eviction-policy priority
+   # --agentic-session-lifecycle
+   # --agentic-program-admission
+   # --agentic-admission-headroom 0.90
+   # --agentic-admission-pressure-threshold 0.92
 )
 
 TRACKING_ARGS=(
@@ -170,4 +211,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${TRACKING_ARGS[@]}" \
-   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4B-8xgpu-nemo-gym-calendar-${now}.log"
+   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4B-8xgpu-nemo-gym-reasoning-gym-cc-${now}.log"

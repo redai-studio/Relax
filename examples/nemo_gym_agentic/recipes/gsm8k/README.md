@@ -46,7 +46,12 @@ Relax managed session
 
 以下命令都从 Relax 仓库根目录执行：
 
+Callback 白名单只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS`，默认为 `10.0.0.0/8`，可覆盖为逗号分隔的 CIDR；
+填写实际覆盖 Relax callback IP 的网段，单个 IPv4/IPv6 地址使用 `/32` 或 `/128`。
+CIDR 按 URL 中的 IP 匹配，不解析域名，且不接受 `/0`。
+
 ```bash
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 export REPO_ROOT="$(pwd)"
 export RELAX_IMAGE="ghcr.io/redai-studio/relaxrl:latest"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
@@ -158,7 +163,7 @@ docker run --rm \
   --network host \
   --shm-size 12g \
   -e GYM_HOST="${GYM_HOST}" \
-  -e NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${RELAX_HOST},127.0.0.1" \
+  -e NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}" \
   "${NEMO_GYM_IMAGE}" \
   bash /opt/relax-integration/examples/nemo_gym_agentic/recipes/gsm8k/start_gsm8k_gym.sh
 ```

@@ -268,7 +268,9 @@ def _terminal_result_or_raise(result: TrialResult) -> TrialResult:
 def build_trial_request(session_input: dict[str, Any], environ: dict[str, str]) -> TrialRequest:
     session_id = _required_mapping_value(environ, "RELAX_SESSION_ID")
     invocation_id = _required_mapping_value(environ, "RELAX_SESSION_IO_DIR")
-    environment = _required_mapping_value(environ, "NEMO_GYM_ENVIRONMENT")
+    metadata = session_input.get("metadata") or {}
+    environment = metadata.get("environment") or _required_mapping_value(environ, "NEMO_GYM_ENVIRONMENT")
+    config = metadata.get("config") or environ.get("NEMO_GYM_CONFIG") or environment
     model = environ.get("NEMO_GYM_MODEL") or environ.get("OPENAI_MODEL") or "model"
     attempt = _positive_int_mapping_value(environ, "NEMO_GYM_ATTEMPT", 1)
     generation = {
@@ -281,7 +283,7 @@ def build_trial_request(session_input: dict[str, Any], environ: dict[str, str]) 
         group_id=environ.get("RELAX_GROUP_ID") or "unknown",
         rollout_mode=environ.get("RELAX_ROLLOUT_MODE") or "train",
         environment=environment,
-        config=environ.get("NEMO_GYM_CONFIG") or environment,
+        config=config,
         task=session_input,
         model_endpoint=ModelEndpoint(
             base_url=_required_mapping_value(environ, "RELAX_BASE_URL").rstrip("/"),

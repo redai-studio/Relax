@@ -50,13 +50,13 @@ verifier 验证、callback 网络、资源清理和失败排查。
 
 ## Recipe 索引
 
-每个 recipe 都有独立的从零运行文档和接入踩坑记录。不要从总览中拼接 recipe 命令。
-
 | Recipe              | 用途                                                  | Sandbox                            | 当前参考配置             | 文档                                                                                                |
 | ------------------- | ----------------------------------------------------- | ---------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------- |
 | Calendar            | 长对话历史、日程约束和可验证二值 reward               | 无                                 | Qwen3-4B，8K             | [README](recipes/calendar/README.md) · [PITFAIL](recipes/calendar/PITFAIL.md)                       |
 | GSM8K               | 最快验证 trial、callback 和数值 reward；无工具        | 无                                 | Qwen3-4B，8K             | [README](recipes/gsm8k/README.md) · [PITFAIL](recipes/gsm8k/PITFAIL.md)                             |
 | Workplace Assistant | 多轮工具调用、五组有状态数据库、最终状态 verifier     | 进程内会话状态，不依赖 OCI sandbox | Qwen3-4B，8K             | [README](recipes/workplace-assistant/README.md) · [PITFAIL](recipes/workplace-assistant/PITFAIL.md) |
+| Math + Workplace    | 同一训练任务按 row 混合无状态 math 与有状态 tools     | 按环境分别执行 cleanup             | Qwen3-4B，24K            | [README](recipes/multienv-math-workplace/README.md)                                                 |
+| reasoning-gym-cc    | Claude Code、Bash 工具和 reasoning-gym scorer         | Gym 容器内进程组                   | Qwen3-4B，16K            | [README](recipes/reasoning-gym-cc/README.md)                                                        |
 | R2E-Gym             | 代码仓库修改、OpenHands、Apptainer、可执行测试 reward | 每题独立 SIF，必须有 Apptainer     | Qwen3-4B 集成 smoke，32K | [README](recipes/r2e-gym/README.md) · [PITFAIL](recipes/r2e-gym/PITFAIL.md)                         |
 
 选择建议：
@@ -64,7 +64,9 @@ verifier 验证、callback 网络、资源清理和失败排查。
 1. 验证长历史和约束 verifier 用 Calendar。
 2. 首次检查协议用 GSM8K。
 3. 验证真正的 tool call/session/reward 用 Workplace Assistant。
-4. 验证长程代码 agent、sandbox 和执行式 reward 用 R2E-Gym。
+4. 验证逐行多环境路由用 Math + Workplace。
+5. 验证 Claude Code 原生 Messages 和 Bash 工具循环用 reasoning-gym-cc。
+6. 验证长程代码 agent、sandbox 和执行式 reward 用 R2E-Gym。
 
 ## 总体架构
 
@@ -74,7 +76,7 @@ verifier 验证、callback 网络、资源清理和失败排查。
 Relax 训练容器 / Relax Ray (:6379, dashboard :8265)
   ├─ Actor / Megatron
   ├─ Rollout / SGLang
-  ├─ Agentic Chat API (Ray Serve :8000)
+  ├─ Agentic model APIs (Ray Serve :8000)
   └─ 每条 session 启动一个 NeMo Gym thin client
        │
        │ POST /v1/trials + GET/renew/abort
@@ -85,12 +87,12 @@ NeMo Gym 容器 / Gym 私有 Ray (:6381)
   ├─ resource/verifier (:28102，可选)
   └─ Gym head server (:28103)
        │
-       │ /ng-rollout/<opaque-id>/v1/chat/completions
+       │ /ng-rollout/<opaque-id>/v1/chat/completions、/v1/responses 或 /v1/messages
        ▼
 Gateway callback bridge
        │
        │ request-scoped RELAX_BASE_URL + Bearer session token
-       └──────────────────────────────► Relax Agentic Chat API (:8000)
+       └──────────────────────────────► Relax Agentic model API (:8000)
 ```
 
 R2E-Gym 在 agent 后面还会为每条题目启动 OpenHands 和 evaluator Apptainer：
@@ -108,7 +110,7 @@ Relax 的 managed-agent runtime 为每条 session 提供：
 
 - `RELAX_SESSION_ID`；
 - `RELAX_GROUP_ID`；
-- `RELAX_BASE_URL`，指向该 session 的 Agentic Chat API；
+- `RELAX_BASE_URL`，指向该 session 的 Agentic model API；
 - 输入和输出 JSON 文件。
 
 thin client 用 session ID 和 attempt 生成稳定但不泄露原 ID 的 `request_id`，然后向 Gateway
@@ -119,7 +121,7 @@ rollout_id -> Relax callback URL + session bearer token + model name
 ```
 
 NeMo Gym agent 的每次模型请求都经过
-`/ng-rollout/<rollout_id>/v1/chat/completions` 或 `/v1/responses`。Gateway 因而能把每个 turn
+`/ng-rollout/<rollout_id>/v1/chat/completions`、`/v1/responses` 或 `/v1/messages`。Gateway 因而能把每个 turn
 准确转发到原 Relax session。trial 进入终态后，callback capability 会被删除。
 
 ### 为什么 Relax 调用 `/v1/trials`
@@ -149,8 +151,8 @@ NeMo Gym agent 的每次模型请求都经过
 | 28102 | resource/verifier        | GSM8K、Workplace 使用        |
 | 28103 | Gym head server          | Gym graph 管理               |
 
-`GYM_HOST` 是其他机器能够访问的 Gym host/IP，不是 Ray dashboard URL。callback allowlist 必须包含
-Relax 实际 callback URL 中的精确 host。代理配置必须把上述内网 host 加入 `NO_PROXY`，否则本地
+`GYM_HOST` 是其他机器能够访问的 Gym host/IP，不是 Ray dashboard URL。`NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 默认为 `10.0.0.0/8`，必须覆盖
+Relax 实际 callback URL 中的 IP，使用逗号分隔的严格 CIDR（单地址用 `/32` 或 `/128`，禁止 `/0`）。代理配置必须把上述内网 host 加入 `NO_PROXY`，否则本地
 callback 可能被错误发送到代理。
 
 ## 镜像关系
@@ -208,7 +210,7 @@ docker run --rm "${NEMO_GYM_IMAGE}" bash -lc '
 
 ## 模型准备
 
-当前三个训练脚本都引用 `Qwen/Qwen3-4B`，并要求：
+当前 Qwen3-4B 训练脚本要求：
 
 ```text
 ${MODEL_DIR}/Qwen3-4B/
@@ -297,7 +299,7 @@ python -m relax.utils.visualize "/绝对路径/实验目录/Qwen3-4B_mcore_8xgpu
 
 截至 2026-07-28：
 
-- Gateway 协议、session capability、converter 和 adapter 有本地自动化测试；
+- Gateway 协议、session capability 和 adapter 有本地自动化测试；
 - R2E 一条真实模型 rollout 已经经过 OpenHands、12 个模型 turn、Apptainer evaluator 并写出 Relax
   JSONL；模型没有生成有效 patch，因此 reward=0，这是能力失败，不是链路失败；
 - 该 R2E 2-GPU 任务随后进入 Actor 训练，但先后遇到长序列 log-prob 和无效 entropy 计算 OOM；
@@ -325,12 +327,18 @@ examples/nemo_gym_agentic/
 │   │   ├── prepare_gsm8k.sh / start_gsm8k_gym.sh
 │   │   ├── run-qwen3-4B-8xgpu-nemo-gym.sh
 │   │   └── verify_gsm8k.py
-│   ├── workplace_assistant/
+│   ├── workplace-assistant/
 │   │   ├── README.md / PITFAIL.md
 │   │   ├── prepare_workplace_assistant.sh / start_workplace_assistant_gym.sh
 │   │   ├── run-qwen3-4B-8xgpu-nemo-gym-workplace.sh
 │   │   └── verify_workplace_assistant*.py
-│   └── r2e_gym/
+│   ├── multienv-math-workplace/      # math + workplace 逐行混合
+│   │   ├── README.md
+│   │   └── prepare / start / run 脚本
+│   ├── reasoning-gym-cc/              # Claude Code + reasoning-gym
+│   │   ├── README.md / configs/
+│   │   └── prepare / start / verify / run 脚本
+│   └── r2e-gym/
 │       ├── README.md / PITFAIL.md
 │       ├── prepare_r2e_gym.py / prepare_r2e_gym.sh
 │       ├── start_r2e_gym_remote.sh   # Gym 与训练分离部署
@@ -340,7 +348,6 @@ examples/nemo_gym_agentic/
 │       └── verify_r2e_gym_trial.py
 ├── scripts/
 │   ├── convert_dataset.py            # 所有 recipe 共用的数据转换
-│   ├── run-qwen3-4B-8xgpu-nemo-gym.sh # 共用训练参数骨架
 │   ├── run_agent_app.sh              # Relax managed-command 入口
 │   ├── run_gateway.sh                # 独立 Gateway 入口
 │   └── run_training.sh               # Ray Job 内训练入口
@@ -361,7 +368,7 @@ examples/nemo_gym_agentic/
   运行中 trial。
 - 上游 environment 的通用 cancellation/cleanup contract 不完整；没有 cleanup probe 的环境会在
   中断时保守报告 `cleanup_unverified`。
-- 当前 training recipe 一次只选择一个 environment/config，不支持逐行混合路由。
+- 单环境 recipe 通过进程环境选择 environment/config；multienv recipe 通过每行 metadata 动态路由。
 - 数据下载脚本未固定 Hugging Face dataset revision；正式实验应记录数据文件 hash 或自行固定 revision。
 
 ## 致谢与引用

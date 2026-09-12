@@ -59,7 +59,12 @@ resource server 为每条请求创建独立数据库会话。集成 patch 维护
 
 在 Relax 仓库根目录执行：
 
+Callback 白名单只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS`，默认为 `10.0.0.0/8`，可覆盖为逗号分隔的 CIDR；
+填写实际覆盖 Relax callback IP 的网段，单个 IPv4/IPv6 地址使用 `/32` 或 `/128`。
+远程启动脚本也可重复传入 `--callback-network`。CIDR 按 URL 中的 IP 匹配，不解析域名，且不接受 `/0`。
+
 ```bash
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 export REPO_ROOT="$(pwd)"
 export RELAX_IMAGE="ghcr.io/redai-studio/relaxrl:latest"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
@@ -215,7 +220,7 @@ checkout 绝对路径；普通 Docker 通常就是当前目录，Docker-in-Docke
 ```bash
 bash examples/nemo_gym_agentic/recipes/workplace-assistant/start_workplace_assistant_gym_remote.sh \
   --gym-host "${GYM_HOST}" \
-  --callback-host "${RELAX_HOST}" \
+  --callback-network "${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}" \
   --image "${NEMO_GYM_IMAGE}" \
   --repo-dir "${REPO_ROOT}" \
   --max-concurrency 8

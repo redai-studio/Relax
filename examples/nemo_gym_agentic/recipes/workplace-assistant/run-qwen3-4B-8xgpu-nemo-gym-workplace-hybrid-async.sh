@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 8xGPU Workplace Assistant NeMo Gym agentic training.
+# Qwen3-4B 8xGPU Workplace Assistant hybrid-async training (4 actor + 4 rollout).
 
 set -ex
 set -o pipefail
@@ -28,8 +28,9 @@ test -s "${MODEL_DIR}/Qwen3-4B/config.json"
 
 NEMO_GYM_SOURCE_DATA="${NEMO_GYM_SOURCE_DATA:-/data/nemo-gym/workplace_assistant_train.jsonl}"
 NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-${GYM_PORT:-29000}}"
-SAVE_DIR="${SAVE_DIR:-${PWD}/outputs/nemo-gym-workplace}"
+SAVE_DIR="${SAVE_DIR:-${PWD}/outputs/nemo-gym-workplace-hybrid-async}"
 test -s "${NEMO_GYM_SOURCE_DATA}"
+DATA_LIMIT="$(awk 'NF { count++ } END { print count + 0 }' "${NEMO_GYM_SOURCE_DATA}")"
 
 RUNTIME_ENV_JSON="$(
    jq -c --arg relax_root "${RELAX_ROOT}" '
@@ -40,10 +41,10 @@ RUNTIME_ENV_JSON="$(
 export RUNTIME_ENV_JSON
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/nemo-gym}"
-EXP_NAME="${EXP_NAME:-workplace-assistant-qwen3-4b-8xgpu}"
+EXP_NAME="${EXP_NAME:-workplace-assistant-qwen3-4b-8xgpu-hybrid-async}"
 GATEWAY_URL="http://${GYM_HOST}:${NEMO_GYM_GATEWAY_PORT}"
-PROMPT_SET="${NEMO_GYM_PROMPT_DATA:-${SAVE_DIR}/data/workplace_assistant_smoke.jsonl}"
-SUBMISSION_ID="${RELAX_SUBMISSION_ID:-relax-nemo-gym-workplace-8xgpu-${now}-${BASHPID}-${RANDOM}}"
+PROMPT_SET="${NEMO_GYM_PROMPT_DATA:-${SAVE_DIR}/data/workplace_assistant_hybrid_train.jsonl}"
+SUBMISSION_ID="${RELAX_SUBMISSION_ID:-relax-nemo-gym-workplace-8xgpu-hybrid-async-${now}-${BASHPID}-${RANDOM}}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 if [ -n "${RAY_DASHBOARD_ADDRESS:-}" ]; then
    DASHBOARD_ADDRESS="${RAY_DASHBOARD_ADDRESS}"
@@ -58,7 +59,7 @@ CKPT_ARGS=(
    --ref-load "${MODEL_DIR}/Qwen3-4B/"
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-   --save "${SAVE_DIR}/nemo-gym/workplace/Qwen3-4B_mcore_8xgpu/"
+   --save "${SAVE_DIR}/nemo-gym/workplace/Qwen3-4B_mcore_8xgpu_hybrid_async/"
    --save-interval 100
 )
 
@@ -94,7 +95,7 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 8
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -126,10 +127,11 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
+   --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.7
    --sglang-cuda-graph-max-bs 4
    --sglang-router-policy consistent_hashing
+   --sglang-router-disable-circuit-breaker
 )
 
 TRACKING_ARGS=(
@@ -148,17 +150,23 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+RAY_SUBMIT_ARGS=()
+if [ "${RAY_NO_WAIT:-0}" = "1" ]; then
+   RAY_SUBMIT_ARGS+=(--no-wait)
+fi
+
 mkdir -p log
-ray job submit ${RAY_NO_WAIT:+--no-wait} \
+ray job submit "${RAY_SUBMIT_ARGS[@]}" \
    --submission-id="${SUBMISSION_ID}" \
    --address="${DASHBOARD_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- bash "${RUN_TRAINING_SCRIPT}" \
-   "${GATEWAY_URL}" "${NEMO_GYM_SOURCE_DATA}" "${PROMPT_SET}" 32 \
-   --resource '{"actor":[1,8],"rollout":[1,8]}' \
-   --max-staleness 0 \
+   "${GATEWAY_URL}" "${NEMO_GYM_SOURCE_DATA}" "${PROMPT_SET}" "${DATA_LIMIT}" \
+   --resource '{"actor":[1,4],"rollout":[1,4]}' \
+   --max-staleness 2 \
    --num-data-storage-units 1 \
-   --colocate \
+   --num-iters-per-train-update 1 \
+   --hybrid \
    --use-health-check \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
@@ -168,4 +176,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${TRACKING_ARGS[@]}" \
-   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4B-8xgpu-nemo-gym-workplace-${now}.log"
+   "${MISC_ARGS[@]}" 2>&1 | tee "log/qwen3-4B-8xgpu-nemo-gym-workplace-hybrid-async-${now}.log"

@@ -95,7 +95,7 @@ def test_run_agent_app_has_valid_bash_syntax():
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
 
 
-@pytest.mark.parametrize("missing_name", sorted(REQUIRED_ENV))
+@pytest.mark.parametrize("missing_name", sorted(set(REQUIRED_ENV) - {"NEMO_GYM_ENVIRONMENT"}))
 def test_run_agent_app_fails_fast_when_required_env_is_missing(missing_name):
     env = {"PATH": os.environ["PATH"], **REQUIRED_ENV}
     env.pop(missing_name)

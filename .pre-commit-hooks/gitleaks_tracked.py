@@ -90,6 +90,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
         _relay(result.stdout, sys.stdout, snapshot_root)

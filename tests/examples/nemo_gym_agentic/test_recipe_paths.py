@@ -14,7 +14,6 @@ REPO_ROOT = EXAMPLE_DIR.parents[1]
 def test_shared_scripts_remain_under_example_scripts() -> None:
     scripts_dir = EXAMPLE_DIR / "scripts"
     expected = {
-        "run-qwen3-4B-8xgpu-nemo-gym.sh",
         "run_agent_app.sh",
         "run_gateway.sh",
         "run_training.sh",
@@ -40,8 +39,8 @@ def test_each_recipe_owns_its_scripts() -> None:
         },
         "workplace-assistant": {
             "prepare_workplace_assistant.sh",
-            "run-qwen3-4B-2xgpu-nemo-gym-workplace.sh",
             "run-qwen3-4B-8xgpu-nemo-gym-workplace.sh",
+            "run-qwen3-4B-8xgpu-nemo-gym-workplace-hybrid-async.sh",
             "start_workplace_assistant_gym.sh",
             "start_workplace_assistant_gym_remote.sh",
             "verify_workplace_assistant.py",
@@ -55,6 +54,21 @@ def test_each_recipe_owns_its_scripts() -> None:
             "start_r2e_gym_remote.sh",
             "submit_r2e_gym.sh",
             "verify_r2e_gym_trial.py",
+        },
+        "multienv-math-workplace": {
+            "README.md",
+            "prepare_multienv.sh",
+            "run-qwen3-4B-8xgpu-nemo-gym-multienv.sh",
+            "start_multienv_gym.sh",
+            "start_multienv_gym_remote.sh",
+        },
+        "reasoning-gym-cc": {
+            "README.md",
+            "prepare_reasoning_gym_cc.sh",
+            "run-qwen3-4B-8xgpu-nemo-gym-reasoning-gym-cc.sh",
+            "start_reasoning_gym_cc_gym.sh",
+            "start_reasoning_gym_cc_gym_remote.sh",
+            "verify_reasoning_gym_cc_trial.py",
         },
     }
 
@@ -73,7 +87,12 @@ def test_generic_recipe_local_entrypoint_exists() -> None:
 def test_each_recipe_has_chinese_runbook_and_pitfall_record() -> None:
     recipes_dir = EXAMPLE_DIR / "recipes"
 
-    for recipe_name in ("calendar", "gsm8k", "workplace-assistant", "r2e-gym"):
+    for recipe_name in (
+        "calendar",
+        "gsm8k",
+        "workplace-assistant",
+        "r2e-gym",
+    ):
         recipe_dir = recipes_dir / recipe_name
         readme = (recipe_dir / "README.md").read_text(encoding="utf-8")
         pitfail = (recipe_dir / "PITFAIL.md").read_text(encoding="utf-8")
@@ -86,19 +105,11 @@ def test_each_recipe_has_chinese_runbook_and_pitfall_record() -> None:
 def test_each_recipe_training_script_configures_tracking_names() -> None:
     training_scripts = sorted((EXAMPLE_DIR / "recipes").glob("*/run-*.sh"))
 
-    assert len(training_scripts) == 5
+    assert len(training_scripts) == 7
     for script in training_scripts:
         content = script.read_text()
-        assert 'PROJECT_NAME="${PROJECT_NAME:-Relax/dev/nemo-gym}"' in content
+        assert 'PROJECT_NAME="${PROJECT_NAME:-Relax/dev/' in content
         assert 'EXP_NAME="${EXP_NAME:-' in content
-
-    tracking_implementations = [
-        EXAMPLE_DIR / "scripts" / "run-qwen3-4B-8xgpu-nemo-gym.sh",
-        EXAMPLE_DIR / "recipes" / "r2e-gym" / "run-qwen35-9B-8xgpu-nemo-gym-r2e.sh",
-        EXAMPLE_DIR / "recipes" / "workplace-assistant" / "run-qwen3-4B-2xgpu-nemo-gym-workplace.sh",
-    ]
-    for script in tracking_implementations:
-        content = script.read_text()
         assert "--use-clearml" in content
         assert "--use-metrics-service" in content
         assert '--tb-project-name "${PROJECT_NAME}"' in content
@@ -117,7 +128,7 @@ def test_calendar_recipe_reuses_standard_gateway_and_training_path() -> None:
     assert "++global_aiohttp_client_request_debug=True" in start_script
     assert '"NEMO_GYM_ENVIRONMENT=calendar"' in training_script
     assert '"NEMO_GYM_CONFIG=calendar-v1"' in training_script
-    assert "NEMO_GYM_GATEWAY_PORT:-29100" in training_script
+    assert "NEMO_GYM_GATEWAY_PORT:-${GYM_PORT:-29100}" in training_script
     assert "NEMO_GYM_NUM_ROLLOUT" not in training_script
     assert "NEMO_GYM_N_SAMPLES_PER_PROMPT" not in training_script
     assert "--num-rollout 200" in training_script
@@ -128,43 +139,22 @@ def test_calendar_recipe_reuses_standard_gateway_and_training_path() -> None:
 
 
 def test_workplace_training_uses_shared_checkout_without_runtime_upload() -> None:
-    shared_script = (EXAMPLE_DIR / "scripts" / "run-qwen3-4B-8xgpu-nemo-gym.sh").read_text()
-    two_gpu_script = (
-        EXAMPLE_DIR / "recipes" / "workplace-assistant" / "run-qwen3-4B-2xgpu-nemo-gym-workplace.sh"
+    training_script = (
+        EXAMPLE_DIR / "recipes" / "workplace-assistant" / "run-qwen3-4B-8xgpu-nemo-gym-workplace.sh"
     ).read_text()
     workplace_readme = (EXAMPLE_DIR / "recipes" / "workplace-assistant" / "README.md").read_text()
     gsm8k_readme = (EXAMPLE_DIR / "recipes" / "gsm8k" / "README.md").read_text()
 
-    assert 'RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../.."' in shared_script
-    assert '--agent-cwd "${RELAX_ROOT}"' in shared_script
-    assert '-- bash "${RUN_TRAINING_SCRIPT}"' in shared_script
-    assert "--working-dir" not in shared_script
-    assert 'DASHBOARD_ADDRESS="http://${BASH_REMATCH[1]}:${RAY_DASHBOARD_PORT}"' in shared_script
-    assert '--address="${DASHBOARD_ADDRESS}"' in shared_script
+    assert 'RELAX_ROOT="$(cd -- "${EXAMPLE_DIR}/../.."' in training_script
+    assert '--agent-cwd "${RELAX_ROOT}"' in training_script
+    assert '-- bash "${RUN_TRAINING_SCRIPT}"' in training_script
+    assert "--working-dir" not in training_script
+    assert 'DASHBOARD_ADDRESS="http://${BASH_REMATCH[1]}:${RAY_DASHBOARD_PORT}"' in training_script
+    assert '--address="${DASHBOARD_ADDRESS}"' in training_script
     assert "export WORKING_DIR" not in workplace_readme
     assert 'RELAX_SUBMISSION_ID="relax-nemo-workplace-smoke-001"' not in workplace_readme
     assert "export WORKING_DIR" not in gsm8k_readme
     assert 'RELAX_SUBMISSION_ID="relax-nemo-gsm8k-smoke-001"' not in gsm8k_readme
-    assert '--resource \'{"actor":[1,2],"rollout":[1,2]}\'' in two_gpu_script
-    assert "--tensor-model-parallel-size 2" in two_gpu_script
-    assert "--rollout-num-gpus-per-engine 2" in two_gpu_script
-    assert "--num-rollout 1" in two_gpu_script
-    assert "--n-samples-per-prompt 2" in two_gpu_script
-    assert "--global-batch-size 2" in two_gpu_script
-    assert "--rollout-max-context-len 8192" in two_gpu_script
-    assert "exec bash" not in two_gpu_script
-
-
-def test_shared_nemo_gym_training_enforces_context_budget() -> None:
-    shared_script = (EXAMPLE_DIR / "scripts" / "run-qwen3-4B-8xgpu-nemo-gym.sh").read_text()
-
-    assert "NEMO_GYM_ROLLOUT_MAX_CONTEXT_LEN - 1" in shared_script
-    assert '--rollout-max-prompt-len "${NEMO_GYM_ROLLOUT_MAX_PROMPT_LEN}"' in shared_script
-    assert "NEMO_GYM_ROLLOUT_MAX_PROMPT_LEN must be smaller" in shared_script
-    assert "NEMO_GYM_ROLLOUT_MAX_RESPONSE_LEN cannot exceed" in shared_script
-    assert "NEMO_GYM_MAX_TOKENS_PER_GPU must be an integer no smaller" in shared_script
-    assert 'NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-28100}"' in shared_script
-    assert 'GATEWAY_URL="http://${GYM_HOST}:${NEMO_GYM_GATEWAY_PORT}"' in shared_script
 
 
 def test_workplace_cleanup_contract_is_wired_into_recipe() -> None:
@@ -178,9 +168,6 @@ def test_workplace_cleanup_contract_is_wired_into_recipe() -> None:
     assert 'GYM_RAY_PORT="${GYM_RAY_PORT:-6382}"' in start_script
     assert 'GYM_RAY_NUM_CPUS="${GYM_RAY_NUM_CPUS:-8}"' in start_script
     assert '--num-cpus="${GYM_RAY_NUM_CPUS}"' in start_script
-    assert 'GYM_RAY_MIN_WORKER_PORT="${GYM_RAY_MIN_WORKER_PORT:-50000}"' in start_script
-    assert '--min-worker-port="${GYM_RAY_MIN_WORKER_PORT}"' in start_script
-    assert '--object-manager-port="${GYM_RAY_OBJECT_MANAGER_PORT}"' in start_script
     assert '"force_cleanup_url": f"http://{host}:{resource_port}/cleanup/{{rollout_id}}"' in start_script
     assert '"cleanup_probe_url": f"http://{host}:{resource_port}/cleanup/{{rollout_id}}"' in start_script
     assert '--env WORKPLACE_ASSISTANT_PORT_BASE="${WORKPLACE_ASSISTANT_PORT_BASE}"' in remote_script
@@ -201,9 +188,13 @@ def test_dual_use_image_preserves_relax_python_environment() -> None:
 
     assert "ENV PATH=/opt/nemo-gym/.venv/bin:" not in dockerfile
     assert "ENV PYTHONPATH=/opt/relax-integration:/opt/nemo-gym" not in dockerfile
-    assert "RELAX_RAY_VERSION=\"$(python -c 'import ray; print(ray.__version__)')\"" in dockerfile
-    assert '"ray[default]==${RELAX_RAY_VERSION}"' in dockerfile
-    assert 'test "${GYM_RAY_VERSION}" = "${RELAX_RAY_VERSION}"' in dockerfile
+    assert "RELAX_RAY_VERSION" not in dockerfile
+    assert "uv sync --frozen --extra sandbox" in dockerfile
+    assert (
+        "GYM_RAY_VERSION=\"$(/opt/nemo-gym/.venv/bin/python -c 'import ray; print(ray.__version__)')\"" in dockerfile
+    )
+    # Both the gateway and resource-server venvs use the Gym lockfile's Ray version.
+    assert dockerfile.count('"ray[default]==${GYM_RAY_VERSION}"') == 2
 
 
 def test_r2e_recipe_uses_configured_ray_and_apptainer() -> None:

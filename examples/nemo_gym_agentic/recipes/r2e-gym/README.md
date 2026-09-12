@@ -168,7 +168,12 @@ NeMo Gym 服务本身不需要 GPU。GPU 只由 Relax 模型训练使用。
 
 在 Relax 仓库根目录执行：
 
+Callback 白名单只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS`，默认为 `10.0.0.0/8`，可覆盖为逗号分隔的 CIDR；
+填写实际覆盖 Relax callback IP 的网段，单个 IPv4/IPv6 地址使用 `/32` 或 `/128`。
+远程启动脚本也可重复传入 `--callback-network`。CIDR 按 URL 中的 IP 匹配，不解析域名，且不接受 `/0`。
+
 ```bash
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 export REPO_ROOT="$(pwd)"
 export RELAX_IMAGE="ghcr.io/redai-studio/relaxrl:latest"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
@@ -371,7 +376,8 @@ curl --noproxy "*" -fsS "http://${GYM_HOST}:28100/readyz" | jq .
 
 ## 5. 验证 golden reward
 
-Golden 模式不会访问 callback，但协议仍要求一个 allowlist 内的绝对 URL：
+Golden 模式不会访问 callback，但协议仍校验 callback URL。下面使用 Gym IP 作为占位，
+因此 `${GYM_HOST}` 必须在配置网段内；不属于默认 `10.0.0.0/8` 时，追加 `${GYM_HOST}/32`：
 
 ```bash
 docker exec nemo-gym-r2e-local \
@@ -402,13 +408,23 @@ bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_remote.sh \
   --sif-dir "${R2E_GYM_SHARED_SIF_DIR}" \
   --sif-prefix "${R2E_GYM_SHARED_SIF_PREFIX}" \
   --mode train \
-  --callback-host "${RELAX_HOST}" \
+  --callback-network "${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}" \
+  --max-concurrency 64 \
   --image "${NEMO_GYM_IMAGE}" \
   --repo-dir "${REPO_ROOT}" \
   --proxy "${https_proxy}"
 ```
 
-`--callback-host` 必须等于 Relax callback URL 中的裸 host。启动完成后检查双向连通：
+当前训练配置为 `--rollout-batch-size 8`、`--n-samples-per-prompt 8`，未显式设置
+`--agentic-concurrency` 时默认驻留 8 个 Group，共 64 个 Session。因此训练模式显式设置
+`--max-concurrency 64`，为这 64 个 Session 提供执行槽位。
+
+启动脚本自身的默认并发仍为 16，排队容量为执行并发的两倍；默认最多接收 48 个未结束的 trial，
+无法承接训练的 64 个并发 Session，会返回 HTTP 429。只增加排队容量也可能使 Group 的部分
+Session 等不到执行槽位，无法全部到达首次请求屏障。修改 Gym 并发后需要重新执行启动脚本重建
+容器，`docker restart` 不会更新容器环境变量。
+
+`--callback-network` 必须覆盖 Relax callback URL 中的 IP。启动完成后检查双向连通：
 
 ```bash
 curl --noproxy "*" -fsS "http://${GYM_HOST}:28100/readyz" | jq -e '.ready == true'
@@ -471,7 +487,7 @@ bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh \
   --sif-dir "${R2E_GYM_SHARED_SIF_DIR}" \
   --sif-prefix "${R2E_GYM_SHARED_SIF_PREFIX}" \
   --mode train \
-  --max-concurrency 1 \
+  --max-concurrency 64 \
   --proxy "${https_proxy}" \
   --verbose
 ```
@@ -482,7 +498,7 @@ bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh \
 - 确认当前 shell 确实运行在该 head；
 - 使用 `0.0.0.0` bind Gym 服务，对外广告 Ray head IP；
 - 默认通过 `auto` 复用当前 Ray；显式设置 `RAY_ADDRESS` 时使用该 GCS 地址；
-- 将 head IP 和合法的 `MASTER_ADDR` 加入 callback allowlist 与 `NO_PROXY`；
+- 使用显式配置的 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 作为 callback 白名单；
 - 精确停止占用 `28100`、`28101`、`28103` 且 cwd 属于对应 NeMo Gym 服务目录的旧进程；
 - 如果端口由其他进程占用则报错，不执行宽泛进程清理；
 - 自动对齐并校验四套 Ray Python 的 Ray 版本；
@@ -490,7 +506,7 @@ bash examples/nemo_gym_agentic/recipes/r2e-gym/start_r2e_gym_local.sh \
 
 首次启动会下载 pinned R2E evaluator、OpenHands 和相关依赖；需要代理时必须传
 `--proxy "${https_proxy}"`。launcher 会同时设置大小写 HTTP/HTTPS proxy，并把 Ray head、
-callback host、localhost 加入大小写 `NO_PROXY`。
+Gym IP、localhost 加入大小写 `NO_PROXY`，并保留已有代理排除配置。
 
 该命令以前台方式运行 Gym。启动前必须确保训练集群没有残留任务；Gym ready 后不要再执行
 `ray-job.sh`，否则其中的残留进程清理会把共置 Gym 一并杀掉。请在另一个 shell 中直接执行下节的
@@ -532,8 +548,8 @@ Ray 会为本次提交生成 job ID。查询、跟踪或停止任务时，使用
 
 ### 缩小为单条 smoke
 
-8-GPU recipe 固定使用 32 个 rollout step、每个 step 读取 4 个 prompt、每个 prompt 采样 4 条
-trajectory。仅验证链路时，直接在训练脚本中临时把以下参数改为：
+8-GPU recipe 使用 32 个 rollout step、每个 step 读取 8 个 prompt、每个 prompt 采样 8 条
+trajectory，每批 64 条，`--global-batch-size 64`。仅验证链路时，直接在训练脚本中临时把以下参数改为：
 
 ```text
 --num-rollout 1
@@ -542,12 +558,9 @@ trajectory。仅验证链路时，直接在训练脚本中临时把以下参数�
 --global-batch-size 1
 ```
 
-一条 sample 只有链路意义，GRPO 没有组内相对信号。32K context、24K 单次 response 与四条
-trajectory 会显著增加 GPU、CPU、内存、磁盘和执行时间。应先保持：
-
-Remote Gym wrapper 当前默认的 environment concurrency 为 16。首次联调可通过
-`start_r2e_gym_remote.sh --max-concurrency 1` 降低并发，然后逐项扩容，不要同时增加数据量、
-sample 和 environment concurrency。
+一条 sample 只有链路意义，GRPO 没有组内相对信号。仅在训练也缩小为上述单 Session smoke 配置时，
+可用 `start_r2e_gym_remote.sh --max-concurrency 1` 降低 Gym 并发。恢复完整训练配置时，将 Gym
+并发恢复为 64；一般应保证 Gym 执行并发至少为 `agentic_concurrency × n_samples_per_prompt`。
 
 ## 9. 查看结果
 
@@ -630,7 +643,7 @@ OpenHands agent 已实际执行，但该次记录没有生成可评测 patch；`
 
 ```bash
 R2E_DATA_DIR="${R2E_DATA_DIR}" \
-  NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${RELAX_HOST}" \
+  NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}" \
   bash examples/nemo_gym_agentic/recipes/r2e-gym/submit_r2e_gym.sh \
   "<environment-ray-head-ip>" train
 ```
