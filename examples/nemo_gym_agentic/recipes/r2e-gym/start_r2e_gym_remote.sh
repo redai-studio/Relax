@@ -16,29 +16,31 @@ Usage:
     --mode <golden|train> \
     [--sif-dir <docker-host-shared-sif-directory>] \
     [--sif-prefix <filename-prefix>] \
-    [--callback-host <relax-callback-host>] \
     [--callback-network <relax-callback-cidr>] \
     [--image <nemo-gym-image>] \
     [--repo-dir <docker-host-relax-checkout>] \
     [--proxy <http-proxy-url>] \
     [--callback-proxy <http-proxy-url>] \
     [--callback-timeout-s <positive-integer>] \
+    [--port-base <port>] \
     [--max-concurrency <positive-integer>] \
     [--gym-cpus <positive-integer>] \
     [--verbose] \
     [--container-name <name>]
 
-golden mode uses the Gym host as its non-contacted callback allowlist entry.
-train mode requires an exact --callback-host or a --callback-network containing Relax's callback IP.
+Default: 10.0.0.0/8. Override with --callback-network (repeatable) or NEMO_GYM_CALLBACK_ALLOWED_NETWORKS.
+The networks must contain the callback IP, including the golden verifier URL when used.
+Ports: gateway=base, agent=base+1, head=base+3. Default base: 28100.
+Override via --port-base or R2E_GYM_PORT_BASE; valid range: 1-65532.
 EOF
 }
 
 GYM_HOST=""
 R2E_DATA_DIR=""
 R2E_GYM_MODE=""
+R2E_GYM_PORT_BASE="${R2E_GYM_PORT_BASE:-28100}"
 R2E_GYM_SIF_DIR="${R2E_GYM_SIF_DIR:-}"
 R2E_GYM_SIF_PREFIX="${R2E_GYM_SIF_PREFIX:-}"
-RELAX_CALLBACK_HOST=""
 RELAX_CALLBACK_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-}"
 NEMO_GYM_IMAGE="${NEMO_GYM_IMAGE:-relax-nemo-gym:r2e-dev}"
 NEMO_GYM_CONTAINER="${NEMO_GYM_CONTAINER:-nemo-gym-r2e-local}"
@@ -75,11 +77,11 @@ while [ "$#" -gt 0 ]; do
             R2E_GYM_SIF_PREFIX="${2:-}"
             shift 2
             ;;
-        --callback-host)
-            RELAX_CALLBACK_HOST="${2:-}"
-            shift 2
-            ;;
         --callback-network)
+            if [ -z "${2:-}" ] || [[ "${2}" == --* ]]; then
+                echo "--callback-network requires a CIDR network" >&2
+                exit 2
+            fi
             if [ -n "${RELAX_CALLBACK_NETWORKS}" ]; then
                 RELAX_CALLBACK_NETWORKS="${RELAX_CALLBACK_NETWORKS},${2:-}"
             else
@@ -105,6 +107,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --callback-timeout-s)
             NEMO_GYM_CALLBACK_TIMEOUT_S="${2:-}"
+            shift 2
+            ;;
+        --port-base)
+            if [ -z "${2:-}" ] || [[ "${2}" == --* ]]; then
+                echo "--port-base requires an integer between 1 and 65532" >&2
+                exit 2
+            fi
+            R2E_GYM_PORT_BASE="${2}"
             shift 2
             ;;
         --max-concurrency)
@@ -134,6 +144,8 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+RELAX_CALLBACK_NETWORKS="${RELAX_CALLBACK_NETWORKS:-10.0.0.0/8}"
 
 if [ -z "${GYM_HOST}" ] || [ -z "${R2E_DATA_DIR}" ] || [ -z "${R2E_GYM_MODE}" ]; then
     usage >&2
@@ -172,26 +184,16 @@ esac
 case "${R2E_GYM_MODE}" in
     golden)
         R2E_GYM_VERIFY_GOLDEN_PATCH=1
-        RELAX_CALLBACK_HOST="${RELAX_CALLBACK_HOST:-${GYM_HOST}}"
         ;;
     train)
         R2E_GYM_VERIFY_GOLDEN_PATCH=0
-        if [ -z "${RELAX_CALLBACK_HOST}" ] && [ -z "${RELAX_CALLBACK_NETWORKS}" ]; then
-            echo "train mode requires --callback-host or --callback-network" >&2
-            exit 2
-        fi
         ;;
     *)
         echo "--mode must be golden or train" >&2
         exit 2
         ;;
 esac
-if [ -n "${RELAX_CALLBACK_HOST}" ] &&
-    { [[ "${RELAX_CALLBACK_HOST}" == *"://"* ]] || [[ "${RELAX_CALLBACK_HOST}" == *":"* ]] ||
-        [[ "${RELAX_CALLBACK_HOST}" == */* ]]; }; then
-    echo "--callback-host must be the exact bare host from the Relax callback URL" >&2
-    exit 2
-fi
+: "${RELAX_CALLBACK_NETWORKS:?Set --callback-network or NEMO_GYM_CALLBACK_ALLOWED_NETWORKS}"
 if [ -n "${RELAX_CALLBACK_NETWORKS}" ]; then
     command -v python3 >/dev/null 2>&1 || {
         echo "python3 is required to validate --callback-network" >&2
@@ -203,7 +205,9 @@ import sys
 
 for value in sys.argv[1].split(","):
     try:
-        ipaddress.ip_network(value, strict=True)
+        network = ipaddress.ip_network(value.strip(), strict=True)
+        if network.prefixlen == 0:
+            raise ValueError("default-route networks are not allowed")
     except ValueError as exc:
         raise SystemExit(f"--callback-network must contain valid CIDR networks: {value!r}: {exc}") from None
 PY
@@ -214,6 +218,10 @@ if ! [[ "${NEMO_GYM_START_TIMEOUT_S}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if ! [[ "${GYM_RAY_NUM_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "GYM_RAY_NUM_CPUS must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "${R2E_GYM_PORT_BASE}" =~ ^[1-9][0-9]{0,4}$ ]] || ((R2E_GYM_PORT_BASE > 65532)); then
+    echo "--port-base must be an integer between 1 and 65532" >&2
     exit 2
 fi
 if ! [[ "${R2E_GYM_MAX_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
@@ -289,12 +297,7 @@ if docker container inspect "${NEMO_GYM_CONTAINER}" >/dev/null 2>&1; then
     docker rm -f "${NEMO_GYM_CONTAINER}" >/dev/null
 fi
 
-callback_allowlist="${GYM_HOST},127.0.0.1"
 container_no_proxy="127.0.0.1,localhost,${GYM_HOST}"
-if [ -n "${RELAX_CALLBACK_HOST}" ]; then
-    callback_allowlist="${RELAX_CALLBACK_HOST},${callback_allowlist}"
-    container_no_proxy="${container_no_proxy},${RELAX_CALLBACK_HOST}"
-fi
 if [ -n "${NEMO_GYM_NO_PROXY}" ]; then
     container_no_proxy="${container_no_proxy},${NEMO_GYM_NO_PROXY}"
 fi
@@ -309,8 +312,7 @@ echo "Creating remote R2E-Gym container:"
 echo "  container=${NEMO_GYM_CONTAINER}"
 echo "  image=${NEMO_GYM_IMAGE}"
 echo "  mode=${R2E_GYM_MODE}"
-echo "  gym_url=http://${GYM_HOST}:28100"
-echo "  callback_host=${RELAX_CALLBACK_HOST:-<none>}"
+echo "  gym_url=http://${GYM_HOST}:${R2E_GYM_PORT_BASE}"
 echo "  callback_networks=${RELAX_CALLBACK_NETWORKS:-<none>}"
 echo "  data_dir=${R2E_DATA_DIR}"
 echo "  sif_dir=${R2E_GYM_SIF_DIR}"
@@ -341,10 +343,10 @@ docker create \
     --env RAY_CLI="/opt/nemo-gym/.venv/bin/ray" \
     --env R2E_GYM_CLUSTER_PYTHON="/opt/nemo-gym/.venv/bin/python" \
     --env R2E_GYM_MODE="${R2E_GYM_MODE}" \
+    --env R2E_GYM_PORT_BASE="${R2E_GYM_PORT_BASE}" \
     --env R2E_GYM_MAX_CONCURRENCY="${R2E_GYM_MAX_CONCURRENCY}" \
     --env R2E_GYM_MAX_TURNS="${R2E_GYM_MAX_TURNS}" \
     --env NEMO_GYM_VERBOSE="${NEMO_GYM_VERBOSE}" \
-    --env NEMO_GYM_CALLBACK_ALLOWED_HOSTS="${callback_allowlist}" \
     --env NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${RELAX_CALLBACK_NETWORKS}" \
     --env NEMO_GYM_CALLBACK_PROXY="${NEMO_GYM_CALLBACK_PROXY}" \
     --env NEMO_GYM_CALLBACK_TIMEOUT_S="${NEMO_GYM_CALLBACK_TIMEOUT_S}" \
@@ -374,6 +376,7 @@ docker create \
         local_args=(
             --data-dir "$(dirname "${R2E_GYM_DATA}")"
             --mode "${R2E_GYM_MODE}"
+            --port-base "${R2E_GYM_PORT_BASE}"
             --sif-dir "${R2E_GYM_SIF_DIR}"
             --sif-prefix "${R2E_GYM_SIF_PREFIX}"
             --max-concurrency "${R2E_GYM_MAX_CONCURRENCY}"
@@ -387,7 +390,7 @@ docker create \
 
 docker start "${NEMO_GYM_CONTAINER}" >/dev/null
 
-echo "Waiting for http://${GYM_HOST}:28100/readyz ..."
+echo "Waiting for http://${GYM_HOST}:${R2E_GYM_PORT_BASE}/readyz ..."
 deadline=$((SECONDS + NEMO_GYM_START_TIMEOUT_S))
 next_progress=$SECONDS
 while [ "${SECONDS}" -lt "${deadline}" ]; do
@@ -396,10 +399,10 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
         docker logs --tail 200 "${NEMO_GYM_CONTAINER}" >&2
         exit 1
     fi
-    if ready_json="$(curl --noproxy "*" -fsS "http://${GYM_HOST}:28100/readyz" 2>/dev/null)" &&
+    if ready_json="$(curl --noproxy "*" -fsS "http://${GYM_HOST}:${R2E_GYM_PORT_BASE}/readyz" 2>/dev/null)" &&
         printf '%s' "${ready_json}" | grep -q '"ready":true'; then
         printf '%s\n' "${ready_json}"
-        echo "R2E-Gym is ready at http://${GYM_HOST}:28100"
+        echo "R2E-Gym is ready at http://${GYM_HOST}:${R2E_GYM_PORT_BASE}"
         exit 0
     fi
     if [ "${SECONDS}" -ge "${next_progress}" ]; then

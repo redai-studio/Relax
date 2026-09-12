@@ -9,7 +9,7 @@
 | ------------------------- | ----------------------------------------------------------------------------- |
 | `app.py`                  | FastAPI 路由、health/readiness 和错误映射                                     |
 | `registry.py`             | admission、幂等 create、queue、lease、deadline、终态竞争、callback capability |
-| `callback_provider.py`    | NeMo Gym Responses/Chat 请求转发到 request-scoped Relax endpoint              |
+| `callback_provider.py`    | NeMo Gym Chat、Responses、Messages 原协议转发到 request-scoped Relax endpoint |
 | `run_adapter.py`          | trial task 转成 NeMo Gym agent `/run` payload，处理完成和 cleanup             |
 | `config.py`               | environment registry、callback allowlist 和 graph 校验                        |
 | `nemo_gym_gateway_model/` | 将 Gateway 托管在 NeMo Gym graph 内的 model-server plugin                     |
@@ -26,6 +26,7 @@ POST /v1/trials/{request_id}/abort
 
 POST /ng-rollout/{rollout_id}/v1/chat/completions
 POST /ng-rollout/{rollout_id}/v1/responses
+POST /ng-rollout/{rollout_id}/v1/messages
 
 GET  /healthz
 GET  /readyz
@@ -112,14 +113,15 @@ Gateway 不接受客户端传任意 agent URL。服务端通过
 
 ## Callback 安全边界
 
-`NEMO_GYM_CALLBACK_ALLOWED_HOSTS` 是逗号分隔的精确 hostname allowlist：
+`NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 是逗号分隔的 CIDR 白名单，启动脚本默认使用 `10.0.0.0/8`，必须覆盖 callback URL 中的 IP：
 
 ```bash
-export NEMO_GYM_CALLBACK_ALLOWED_HOSTS="relax-head.example.com,relax-head"
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 ```
 
-不支持 wildcard、userinfo 或非 HTTP(S) URL。token 不写日志，record 终态后清除。Gateway 当前只支持
-非 streaming callback。
+单个 IPv4/IPv6 地址使用 `/32` 或 `/128`；网段必须是严格 CIDR，不允许 `/0`。
+CIDR 仅匹配 URL 中的 IP，不对域名做 DNS 解析。不支持 wildcard、userinfo 或非 HTTP(S) URL。token 不写日志，record 终态后清除。三种 callback
+都支持 JSON 与 Buffered SSE；Messages 在等待终态时发送 ping。
 
 ## 镜像和 Python 环境
 
@@ -148,11 +150,11 @@ docker run --rm "${NEMO_GYM_IMAGE}" bash -lc '
 02. 在 Dockerfile 构建对应 server venv；运行时不下载普通 server 依赖。
 03. 分配固定可路由端口。
 04. 注册精确 environment/config 和 readiness URL。
-05. 确认 `responses_create_params` 的未知字段能通过 converter/adapter 往返。
+05. 确认 agent 的完整 Chat、Responses 或 Messages payload 能由 Relax 对应 endpoint 接收。
 06. 提供 deterministic verifier contract：正确 reward 与错误 reward 都要测。
 07. 工具环境提供完整 trial test，证明多轮 callback 和 tool result 回灌。
 08. 有状态或 sandbox 环境提供 cleanup/abort/probe，或明确标记 protected 和限制。
-09. 新建 recipe 中文 `README.md` 与 `PITFAIL.md`。
+09. 新建 recipe 中文 `README.md`。
 10. 最后再做真实模型 rollout 和 optimizer step，分别记录证据。
 
 不要只用 health 200 或“agent `/run` 返回”作为 correctness 验收。
@@ -161,9 +163,9 @@ docker run --rm "${NEMO_GYM_IMAGE}" bash -lc '
 
 - Registry 是单进程内存状态，Uvicorn 必须 `--workers 1`。
 - 进程重启不会恢复运行中的 trial 或 durable tombstone。
-- streaming callback 未实现。
+- streaming callback 使用 Buffered SSE。
 - 通用 upstream `/run` 没有统一 cancellation handle，cleanup 能力按 environment 定制。
-- 当前每个训练 job 使用一个 environment/config，不支持 per-row 动态混合。
+- Gateway 支持按 trial 的 environment/config 路由；multienv recipe 从每行 metadata 选择该二元组。
 - 固定 commit 上的 patch 不能假设适用于 NeMo Gym `main`；升级时必须重新审计和跑全套 contract test。
 
 当前真实验证边界以[顶层文档的“当前验证边界”](../README.md#当前验证边界)为准。本文不再保留早期

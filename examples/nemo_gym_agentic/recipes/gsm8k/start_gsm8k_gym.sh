@@ -6,7 +6,7 @@ set -euo pipefail
 
 # This launcher belongs to the GSM8K recipe.
 : "${GYM_HOST:?GYM_HOST must be a routable address}"
-: "${NEMO_GYM_CALLBACK_ALLOWED_HOSTS:?Set the exact Relax callback host}"
+export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 
 GYM_ROOT="${GYM_ROOT:-/opt/nemo-gym}"
 RELAX_INTEGRATION_ROOT="${RELAX_INTEGRATION_ROOT:-/opt/relax-integration}"

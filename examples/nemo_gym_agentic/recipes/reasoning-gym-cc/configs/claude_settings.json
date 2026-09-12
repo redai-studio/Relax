@@ -1,0 +1,46 @@
+{
+  "env": {
+    "DISABLE_COMPACT": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "permissions": {
+    "deny": [
+      "Agent",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "Edit",
+      "EnterWorktree",
+      "ExitWorktree",
+      "Glob",
+      "Grep",
+      "NotebookEdit",
+      "Read",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage",
+      "Skill",
+      "Task",
+      "TaskCreate",
+      "TaskGet",
+      "TaskList",
+      "TaskOutput",
+      "TaskStop",
+      "TaskUpdate",
+      "WebFetch",
+      "WebSearch",
+      "Workflow",
+      "Write"
+    ]
+  },
+  "sandbox": {
+    "//comment": "bwrap 0.9 + kernel 5.10.134 (TencentOS an8) rejects the seccomp filter",
+    "//comment2": "(prctl(PR_SET_SECCOMP) EINVAL / errno 524). CLI cannot start bwrap on this",
+    "//comment3": "host, so we have to run Bash unsandboxed. See 2026-09-09 rollout-1 analysis.",
+    "//comment4": "Restore enabled=true and remove allowUnsandboxedCommands once bwrap/kernel are fixed.",
+    "enabled": false,
+    "failIfUnavailable": false,
+    "allowUnsandboxedCommands": true
+  }
+}
