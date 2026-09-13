@@ -12,7 +12,10 @@ record falls through to ``logging.lastResort`` (WARNING and above) and all
 INFO output silently disappears.
 """
 
+import asyncio
 import logging
+
+import pytest
 
 from relax.utils.logging_utils import LazyConfiguredLogger, get_logger
 
@@ -167,3 +170,26 @@ def test_get_logger_preserves_logger_subclasses():
     finally:
         logging.setLoggerClass(previous_class)
         _unregister(name)
+
+
+@pytest.mark.parametrize(
+    ("callback", "error", "visible"),
+    [
+        ("_chain_future.<locals>._set_state", TypeError("StopIteration interacts badly with generators"), True),
+        ("_chain_future.<locals>._set_state", RuntimeError("processor failed"), True),
+        ("_chain_future.<locals>._set_state", None, True),
+        ("other_callback", AssertionError("unexpected state"), True),
+        ("_chain_future.<locals>._set_state", AssertionError(), False),
+    ],
+)
+def test_asyncio_filter_preserves_unexpected_callback_errors(caplog, callback, error, visible):
+    """Processor failures must remain visible through asyncio's error
+    handler."""
+    loop = asyncio.new_event_loop()
+    message = f"Exception in callback {callback}(...)"
+    try:
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            loop.call_exception_handler({"message": message, "exception": error})
+        assert any(message in record.getMessage() for record in caplog.records) is visible
+    finally:
+        loop.close()

@@ -2264,6 +2264,49 @@ index db684259..17d2cb69 100644
      def compute_mrope_positions(self, input_ids, mm_items):
          image_grid_thw = None
          video_grid_thw = None
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index b4e37c7..eb14b7d 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -1066,6 +1066,20 @@ class BaseMultimodalProcessor(ABC):
+             len(audios),
+         )
+ 
++        # Decoded input_ids can contain image tokens already expanded by the
++        # client processor. Raw images are processed again below, so restore
++        # one placeholder per image, as in legacy_load_mm_data. Precomputed
++        # inputs must retain their expanded token layout.
++        if (
++            images
++            and all(not isinstance(image, dict) for image in images)
++            and isinstance(multimodal_tokens.image_token, str)
++            and multimodal_tokens.image_token_regex is not None
++        ):
++            prompt_str = multimodal_tokens.image_token_regex.sub(
++                lambda _: multimodal_tokens.image_token, prompt_str
++            )
++
+         return BaseMultiModalProcessorOutput(
+             images=images,
+             audios=audios,
+diff --git a/python/sglang/srt/multimodal/processors/executor.py b/python/sglang/srt/multimodal/processors/executor.py
+index 43da2ea..9fe011d 100644
+--- a/python/sglang/srt/multimodal/processors/executor.py
++++ b/python/sglang/srt/multimodal/processors/executor.py
+@@ -46,7 +46,12 @@ class MultimodalProcessorExecutor:
+                     else copy.deepcopy(self._processor)
+                 )
+             self._worker_state.processor = processor
+-        return function(*args, processor=processor, **kwargs)
++        try:
++            return function(*args, processor=processor, **kwargs)
++        except StopIteration as exc:
++            # asyncio cannot transfer StopIteration to its Future. Leaving it
++            # on the concurrent Future would keep the awaiting request pending.
++            raise ValueError("Multimodal processor exhausted an input iterator") from exc
+ 
+     def shutdown(self) -> None:
+         self._executor.shutdown()
 diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
 index 3bcb6b36..9b971098 100644
 --- a/python/sglang/srt/observability/req_time_stats.py
