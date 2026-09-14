@@ -48,7 +48,7 @@ def _build_multimodal_inputs(sample: CanonicalSample) -> dict | None:
 
     return {
         "images": [load_image(p) for p in (sample.images or [])],
-        "videos": [load_video(p) for p in (sample.videos or [])],
+        "videos": [load_video(p, use_audio_in_video=False)[0] for p in (sample.videos or [])],
         "audio": [load_audio(p) for p in (sample.audios or [])],
     }
 

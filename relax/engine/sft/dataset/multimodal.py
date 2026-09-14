@@ -37,7 +37,7 @@ def _fetch_media(sample: CanonicalSample, rendered_text: str) -> tuple[dict[str,
     if sample.images:
         mm_inputs["images"] = [load_image(p) for p in sample.images]
     if sample.videos:
-        mm_inputs["videos"] = [load_video(p) for p in sample.videos]
+        mm_inputs["videos"] = [load_video(p, use_audio_in_video=False)[0] for p in sample.videos]
     if sample.audios:
         mm_inputs["audios"] = [load_audio(p) for p in sample.audios]
     return mm_inputs, rendered_text
