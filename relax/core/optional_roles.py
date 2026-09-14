@@ -9,8 +9,14 @@ GENRM_ROLE = "genrm"
 
 
 def register_genrm(config: Namespace, algo: dict) -> list[str]:
-    """Conditionally register GenRM into the algo dict."""
-    if getattr(config, "genrm_model_path", None) is None:
+    """Conditionally register GenRM into the algo dict.
+
+    Triggered by the normalized ``_genrm_instances_resolved`` (populated at
+    arg-parse time from either --genrm-instances or the legacy
+    --genrm-model-path), not directly by --genrm-model-path, so both single-
+    and multi-instance configs go through the same gate.
+    """
+    if not getattr(config, "_genrm_instances_resolved", None):
         return []
 
     from relax.components.genrm import GenRM
