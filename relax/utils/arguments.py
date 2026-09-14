@@ -742,6 +742,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="the temperature for the inference engine during rollout.",
             )
             parser.add_argument(
+                "--sglang-native-group-sampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use one SGLang /generate request with sampling_params.n equal to the prompt group size "
+                    "for standard first-turn group-RM rollouts."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-top-p", type=float, default=1.0, help="the top-p for the inference engine during rollout."
             )
             parser.add_argument(
@@ -3928,6 +3937,35 @@ def slime_validate_args(args):
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
+
+    if getattr(args, "sglang_native_group_sampling", False):
+        # Keep in sync with _native_group_sampling_eligible() in
+        # relax/engine/rollout/sglang_rollout.py: any of these makes every group
+        # ineligible, so the flag would silently do nothing.
+        native_group_blockers = []
+        if not getattr(args, "group_rm", False):
+            native_group_blockers.append("--group-rm is not set")
+        if getattr(args, "partial_rollout", False):
+            native_group_blockers.append("--partial-rollout is set")
+        if getattr(args, "use_slime_router", False):
+            native_group_blockers.append("--use-slime-router is set")
+        if getattr(args, "use_opd", False):
+            native_group_blockers.append("OPD is enabled")
+        if getattr(args, "use_rollout_routing_replay", False):
+            native_group_blockers.append("--use-rollout-routing-replay is set")
+        if getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False):
+            native_group_blockers.append("LoRA adapter mode is enabled")
+        if getattr(args, "sglang_enable_deterministic_inference", False):
+            native_group_blockers.append("--sglang-enable-deterministic-inference is set")
+        if getattr(args, "sglang_speculative_algorithm", None):
+            native_group_blockers.append("--sglang-speculative-algorithm is set")
+        if getattr(args, "custom_generate_function_path", None) is not None:
+            native_group_blockers.append("--custom-generate-function-path is set")
+        if native_group_blockers:
+            logger.warning(
+                "--sglang-native-group-sampling is enabled but every rollout group will fall back "
+                f"to per-sample requests because: {'; '.join(native_group_blockers)}."
+            )
 
     if args.custom_config_path:
         with open(args.custom_config_path) as f:
