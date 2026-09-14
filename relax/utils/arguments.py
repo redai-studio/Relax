@@ -19,6 +19,7 @@ from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
+    maybe_enable_sglang_weights_cpu_backup,
     teacher_sglang_parse_args,
     validate_managed_opd_teacher_colocate_args,
     validate_opd_args,
@@ -3753,6 +3754,7 @@ def slime_validate_args(args):
         args.offload_train = False
     if args.offload_rollout is None:
         args.offload_rollout = False
+    maybe_enable_sglang_weights_cpu_backup(args)
 
     if args.use_critic:
         args.offload_train = True

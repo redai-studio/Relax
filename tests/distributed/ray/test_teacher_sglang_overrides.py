@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 from relax.utils.opd.opd_utils import (
     build_teacher_engine_args,
     build_teacher_overrides,
+    maybe_enable_sglang_weights_cpu_backup,
     teacher_sglang_parse_args,
 )
 
@@ -52,3 +53,35 @@ def test_teacher_sglang_parse_args_only_keeps_explicit_overrides(monkeypatch):
 
     assert args.teacher_sglang_mem_fraction_static == 0.73
     assert not hasattr(args, "teacher_sglang_model_path")
+
+
+def test_opd_with_offloaded_rollout_enables_weights_cpu_backup():
+    args = SimpleNamespace(use_opd=True, offload_rollout=True)
+
+    maybe_enable_sglang_weights_cpu_backup(args)
+
+    assert args.sglang_enable_weights_cpu_backup is True
+
+
+def test_opd_without_offload_keeps_weights_cpu_backup_untouched():
+    args = SimpleNamespace(use_opd=True, offload_rollout=False)
+
+    maybe_enable_sglang_weights_cpu_backup(args)
+
+    assert not hasattr(args, "sglang_enable_weights_cpu_backup")
+
+
+def test_non_opd_keeps_weights_cpu_backup_untouched():
+    args = SimpleNamespace(offload_rollout=True)
+
+    maybe_enable_sglang_weights_cpu_backup(args)
+
+    assert not hasattr(args, "sglang_enable_weights_cpu_backup")
+
+
+def test_explicit_weights_cpu_backup_is_preserved():
+    args = SimpleNamespace(use_opd=True, offload_rollout=True, sglang_enable_weights_cpu_backup=True)
+
+    maybe_enable_sglang_weights_cpu_backup(args)
+
+    assert args.sglang_enable_weights_cpu_backup is True

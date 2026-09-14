@@ -189,7 +189,6 @@ SGLANG_ARGS=(
    --sglang-chunked-prefill-size 16384
    --sglang-max-running-requests 128
    --sglang-load-format dummy
-   --sglang-enable-weights-cpu-backup
 )
 
 PARTIAL_ROLLOUT_ARGS=(

@@ -199,7 +199,6 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static ${STUDENT_MEM_FRACTION:-0.7}
    --sglang-load-format dummy
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
-   --sglang-enable-weights-cpu-backup
 )
 
 WANDB_ARGS=(

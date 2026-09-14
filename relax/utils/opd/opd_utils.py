@@ -144,6 +144,9 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
     overrides["model_path"] = args.teacher_hf_checkpoint
     overrides.setdefault("load_format", "auto")
     overrides.setdefault("enable_memory_saver", colocate_sync)
+    if overrides.get("enable_memory_saver"):
+        # Release/resume without a CPU backup leaves weight pages uninitialized (uniform output).
+        overrides.setdefault("enable_weights_cpu_backup", True)
     return overrides
 
 
@@ -461,6 +464,18 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
             "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs. "
             f"Got rollout={args.rollout_num_gpus}, teacher={teacher_gpus}, actor total={actor_total_gpus}."
         )
+
+
+def maybe_enable_sglang_weights_cpu_backup(args: Any) -> None:
+    # Rollout sleep/wake without a CPU backup leaves weight pages uninitialized.
+    if not getattr(args, "use_opd", False):
+        return
+    if not getattr(args, "offload_rollout", False):
+        return
+    if getattr(args, "sglang_enable_weights_cpu_backup", False):
+        return
+    logger.info("OPD with offloaded rollout: auto-enabling --sglang-enable-weights-cpu-backup.")
+    args.sglang_enable_weights_cpu_backup = True
 
 
 def add_opd_arguments(parser: Any) -> Any:

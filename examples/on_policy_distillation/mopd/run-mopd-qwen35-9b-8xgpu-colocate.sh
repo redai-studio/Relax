@@ -197,7 +197,6 @@ SGLANG_ARGS=(
    # single request's 45K mm tokens).
    --sglang-chunked-prefill-size 16384
    --sglang-load-format dummy
-   --sglang-enable-weights-cpu-backup
 )
 
 RESOURCE_JSON="{\"actor\": [1, ${ACTOR_GPUS}], \"rollout\": [1, ${ROLLOUT_GPUS}], \"teacher\": [1, ${TEACHER_GPUS}]}"

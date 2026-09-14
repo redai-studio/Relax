@@ -129,7 +129,6 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
    --sglang-mem-fraction-static "${STUDENT_MEM_FRACTION:-0.8}"
    --sglang-load-format dummy
-   --sglang-enable-weights-cpu-backup
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 

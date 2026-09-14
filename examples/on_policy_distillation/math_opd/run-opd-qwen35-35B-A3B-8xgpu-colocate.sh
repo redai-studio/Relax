@@ -133,7 +133,6 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.6
    --sglang-load-format dummy
-   --sglang-enable-weights-cpu-backup
    --sglang-max-running-requests 64
 )
 
