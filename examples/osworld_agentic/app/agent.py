@@ -15,8 +15,6 @@ read back by Relax; everything else is ours to shape.
 from __future__ import annotations
 
 import argparse
-
-from app import shotdump
 import asyncio
 import json
 import logging
@@ -26,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from app import shotdump
 from app.env_osworld import OSWorldEnv, StepObs, parse_mcp_action
 from app.hybrid_agent import (
     ContextLengthExceededError,
@@ -101,6 +100,7 @@ def _extract_task_config(session_input: dict[str, Any]) -> dict[str, Any]:
     2. ``session_input["metadata"]["task_config"]`` — same but nested (Relax
        preserves arbitrary metadata fields).
     """
+
     def _coerce(value: Any) -> dict[str, Any] | None:
         # prepare_data.py stores the config as a JSON string (Arrow cannot type
         # the heterogeneous struct); smoke_test.sh passes a plain dict.
@@ -254,7 +254,15 @@ async def run_session(
                 step_done = step_done or step_obs.done
 
             agent.record_exec_result(action_type, step_ok, step_result)
-            shotdump.turn({"step": step_idx, "action_type": action_type, "actions": pyautogui_actions, "response": response, "ok": step_ok})
+            shotdump.turn(
+                {
+                    "step": step_idx,
+                    "action_type": action_type,
+                    "actions": pyautogui_actions,
+                    "response": response,
+                    "ok": step_ok,
+                }
+            )
 
             if step_done:
                 stop_reason = "env_done"
@@ -262,7 +270,14 @@ async def run_session(
 
         # Final scoring lives with the env (VM-side postconfig + metrics).
         reward = await env.evaluate()
-        shotdump.finish({"reward": reward, "stop_reason": stop_reason, "turns": len(action_types), "parse_failed_steps": parse_failed_steps})
+        shotdump.finish(
+            {
+                "reward": reward,
+                "stop_reason": stop_reason,
+                "turns": len(action_types),
+                "parse_failed_steps": parse_failed_steps,
+            }
+        )
     finally:
         await env.close()
 

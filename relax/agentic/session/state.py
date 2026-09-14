@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import os
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -573,12 +573,13 @@ class SessionForest:
         )
         return _messages_tools_template_state_hash(full_messages, current_tools, current_chat_template_kwargs)
 
-    def _intern_multimodal_delta(
-        self, delta: dict[str, Any] | None
-    ) -> tuple[dict[str, Any] | None, list[str] | None]:
-        """Move per-image pixel_values into self.mm_image_pool. Returns (delta minus the
-        interned keys, fingerprints in image order). Falls back to (delta, None) whenever
-        the delta does not look like plain per-image data, so nothing else changes."""
+    def _intern_multimodal_delta(self, delta: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[str] | None]:
+        """Move per-image pixel_values into self.mm_image_pool.
+
+        Returns (delta minus the interned keys, fingerprints in image order).
+        Falls back to (delta, None) whenever the delta does not look like plain
+        per-image data, so nothing else changes.
+        """
         if not _MM_POOL_ENABLED or not delta:
             return delta, None
         pv = delta.get("pixel_values")
@@ -639,9 +640,7 @@ class SessionForest:
             tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
-        multimodal_train_inputs_delta, mm_image_keys = self._intern_multimodal_delta(
-            multimodal_train_inputs_delta
-        )
+        multimodal_train_inputs_delta, mm_image_keys = self._intern_multimodal_delta(multimodal_train_inputs_delta)
         return self._register_node(
             MsgNode(
                 kind="obs",

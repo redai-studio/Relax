@@ -17,11 +17,11 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, cast
 
+import torch
+
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
 from relax.utils.types import Sample
-
-import torch
 
 
 # ---- release pixel tensors once a batch crossed the TQ boundary (2026-09-08) ----
@@ -56,7 +56,6 @@ def _mm_rss_bytes() -> int:
         return 0
 
 
-
 def _release_transferred_pixels(samples: List[Sample]) -> int:
     if not _MM_RELEASE_AFTER_TRANSFER:
         return 0
@@ -82,7 +81,10 @@ def _release_transferred_pixels(samples: List[Sample]) -> int:
             _rss1 = _mm_rss_bytes()
             _MM_LOG.info(
                 "mm_release samples=%d freed=%.1fGiB rss=%.1f->%.1fGiB returned=%.1fGiB",
-                len(samples), freed / 2**30, _rss0 / 2**30, _rss1 / 2**30,
+                len(samples),
+                freed / 2**30,
+                _rss0 / 2**30,
+                _rss1 / 2**30,
                 (_rss0 - _rss1) / 2**30,
             )
     return freed

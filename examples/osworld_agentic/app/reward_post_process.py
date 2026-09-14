@@ -57,7 +57,8 @@ def _f(name: str, default: float) -> float:
 
 
 def _session_key(sample, position: int):
-    """Identify the attempt a record belongs to; fall back to standing alone."""
+    """Identify the attempt a record belongs to; fall back to standing
+    alone."""
     session_id = getattr(sample, "session_id", None)
     if session_id:
         return session_id
@@ -69,8 +70,11 @@ def _session_key(sample, position: int):
 
 
 def _turns(sample, n_records: int) -> int:
-    """Policy steps for this trajectory. One export record per agent turn, so
-    the record count is the natural fallback when metadata is unavailable."""
+    """Policy steps for this trajectory.
+
+    One export record per agent turn, so the record count is the natural
+    fallback when metadata is unavailable.
+    """
     metadata = getattr(sample, "metadata", None) or {}
     for key in ("agent_turns", "rollout_turns", "num_turns"):
         value = metadata.get(key)
@@ -99,9 +103,7 @@ def post_process_rewards(args, samples):
     for position, sample in enumerate(samples):
         if sample.group_index is None:
             raise ValueError("Sample.group_index is required for group reward normalization.")
-        groups.setdefault(sample.group_index, {}).setdefault(
-            _session_key(sample, position), []
-        ).append(position)
+        groups.setdefault(sample.group_index, {}).setdefault(_session_key(sample, position), []).append(position)
 
     shaped = [0.0] * len(samples)
     traj_turns: dict = {}
@@ -128,7 +130,7 @@ def post_process_rewards(args, samples):
         returns = [shaped[sessions[k][0]] for k in keys]
         mu = sum(returns) / len(returns)
         var = sum((r - mu) ** 2 for r in returns) / len(returns)
-        std = var ** 0.5
+        std = var**0.5
 
         # drop groups that are all-pass or all-fail (upstream Table 6)
         _succ = [1.0 if float(outcomes[sessions[k][0]] or 0.0) >= 0.5 else 0.0 for k in keys]
@@ -179,7 +181,13 @@ def post_process_rewards(args, samples):
             stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             with open(dump_path, "a", encoding="utf-8") as handle:
                 for row in dump_rows:
-                    handle.write(json.dumps({"ts": stamp, "run_tag": os.environ.get("OSWORLD_RUN_TAG", ""), "step": _DUMP_STEP, **row}, ensure_ascii=False) + "\n")
+                    handle.write(
+                        json.dumps(
+                            {"ts": stamp, "run_tag": os.environ.get("OSWORLD_RUN_TAG", ""), "step": _DUMP_STEP, **row},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
         except OSError:
             pass  # diagnostics must never break a training step
 

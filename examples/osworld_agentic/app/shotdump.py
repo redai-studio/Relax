@@ -1,4 +1,5 @@
 """Per-turn screenshot + trajectory dump (opt-in, sampled by task_id)."""
+
 from __future__ import annotations
 
 import hashlib
@@ -7,6 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
+
 
 _S = {"dir": None, "on": False}
 
@@ -33,9 +35,12 @@ def init(task_id: str, instruction: str = "") -> None:
     d = Path(base) / task_id / (time.strftime("%m%d-%H%M%S") + "_" + _sess_tag())
     try:
         d.mkdir(parents=True, exist_ok=True)
-        meta = {"task_id": task_id, "instruction": instruction,
-                "run_tag": os.environ.get("OSWORLD_RUN_TAG", ""),
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        meta = {
+            "task_id": task_id,
+            "instruction": instruction,
+            "run_tag": os.environ.get("OSWORLD_RUN_TAG", ""),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
         (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2))
     except Exception:
         return

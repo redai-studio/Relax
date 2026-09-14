@@ -17,12 +17,13 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
-
-_EVAL_ON_EPOCH_BOUNDARY = os.environ.get("RELAX_EVAL_ON_EPOCH_BOUNDARY", "1") == "1"
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
+
+
+_EVAL_ON_EPOCH_BOUNDARY = os.environ.get("RELAX_EVAL_ON_EPOCH_BOUNDARY", "1") == "1"
 
 
 app = FastAPI()
