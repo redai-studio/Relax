@@ -972,6 +972,21 @@ class Controller:
 
         self._shutdown_agentic_rollout_services()
 
+        # Router processes must be terminated explicitly.  They are daemonic,
+        # but ``daemon=True`` only reaps through multiprocessing's atexit hook,
+        # and every exit path in ``entrypoints/train.py`` ends in ``os._exit()``
+        # — which skips atexit entirely.  Without this the router is reparented
+        # to init and outlives the job: measured at ~1.4 GB RSS and a 378 MiB
+        # CUDA context on GPU 0 per submission, accumulating across runs.
+        try:
+            from relax.distributed.ray.rollout import stop_launched_routers
+
+            killed = stop_launched_routers()
+            if killed > 0:
+                logger.info(f"Terminated {killed} router process(es) during shutdown")
+        except Exception as e:
+            logger.warning(f"Failed to terminate router processes during shutdown: {e}")
+
         try:
             self._cleanup_s3_model_weights_after_init(force=True)
         except Exception as e:
