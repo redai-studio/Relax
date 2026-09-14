@@ -24,7 +24,10 @@ def validate_ppo_config(config: Namespace) -> None:
 
     resource = getattr(config, "resource", None) or {}
     if "critic" not in resource:
-        raise ValueError("--advantage-estimator ppo requires a 'critic' entry in --resource.")
+        raise ValueError(
+            "--advantage-estimator ppo requires a 'critic' entry in --resource. "
+            "Fix: add a critic entry such as 'critic': [1, 1]."
+        )
 
     if getattr(config, "fully_async", False) or getattr(config, "hybrid", False):
         raise ValueError("PPO does not currently support --fully-async or --hybrid.")

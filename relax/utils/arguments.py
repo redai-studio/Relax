@@ -5,13 +5,12 @@ import json
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 import yaml
 from sglang_router.launch_router import RouterArgs
 
-from relax.backends.sglang.arguments import sglang_parse_args
-from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -40,6 +39,60 @@ _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
+_DEFAULT_ROLLOUT_DATA_SOURCE = "relax.engine.rollout.data_source.RolloutDataSourceWithBuffer"
+_BUILTIN_ROLLOUT_DATA_SOURCES = {
+    "relax.engine.rollout.data_source.RolloutDataSource",
+    _DEFAULT_ROLLOUT_DATA_SOURCE,
+}
+
+
+def _parse_sglang_namespaces():
+    """Load SGLang only for modes that actually start rollout servers."""
+    from relax.backends.sglang.arguments import sglang_parse_args
+
+    return sglang_parse_args(), teacher_sglang_parse_args()
+
+
+def _validate_sglang_args(args) -> None:
+    from relax.backends.sglang.arguments import validate_args
+
+    validate_args(args)
+
+
+@contextmanager
+def _registered_options():
+    """Collect options registered by the real Relax/backend parsers."""
+    registered = set()
+    original = argparse._ActionsContainer.add_argument
+
+    def add_argument(container, *name_or_flags, **kwargs):
+        registered.update(flag for flag in name_or_flags if isinstance(flag, str) and flag.startswith("-"))
+        return original(container, *name_or_flags, **kwargs)
+
+    argparse._ActionsContainer.add_argument = add_argument
+    try:
+        yield registered
+    finally:
+        argparse._ActionsContainer.add_argument = original
+
+
+def _unknown_options(argv: list[str], registered: set[str]) -> list[str]:
+    unknown = []
+    for token in argv:
+        if token == "--" or not token.startswith("-"):
+            continue
+        try:
+            float(token)
+            continue
+        except ValueError:
+            pass
+        option = token.split("=", 1)[0]
+        if option in registered:
+            continue
+        if option not in unknown:
+            unknown.append(option)
+    return unknown
+
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
@@ -1142,7 +1195,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--data-source-path",
                 type=str,
-                default="relax.engine.rollout.data_source.RolloutDataSourceWithBuffer",
+                default=_DEFAULT_ROLLOUT_DATA_SOURCE,
                 help="The data source class for rollout data.",
             )
             parser.add_argument(
@@ -2756,13 +2809,40 @@ def _pre_parse_cli_model_source():
     return ModelSource(uri=pre.hf_checkpoint)
 
 
-def parse_args(add_custom_arguments=None):
-    """Parse Relax arguments with an optional registered model source."""
+def _prevalidate_resource_cli() -> None:
+    """Validate resource shape before loading heavyweight backend parsers."""
+    if any(option in sys.argv[1:] for option in ("-h", "--help")):
+        return
+    if not any(token.split("=", 1)[0] == "--resource" for token in sys.argv[1:]):
+        return
+    resource_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    resource_parser.add_argument("--resource", type=json.loads)
+    resource_args, _ = resource_parser.parse_known_args()
+    _validate_resource_config(resource_args)
+
+
+def parse_args(add_custom_arguments=None, *, strict=False):
+    """Parse Relax arguments with an optional registered model source.
+
+    ``strict`` is used by static preflight callers to reject options that the
+    split Megatron/SGLang parsers would otherwise silently ignore.
+    """
     from relax.utils.model_source import resolve_model_source
 
     cli_source = _pre_parse_cli_model_source()
     provider_source = None if _s3_model_download_disabled() else resolve_model_source(sys.argv)
-    return _parse_args_impl(add_custom_arguments, model_source=provider_source or cli_source)
+    model_source = provider_source or cli_source
+    if not strict:
+        return _parse_args_impl(add_custom_arguments, model_source=model_source)
+    with _registered_options() as registered:
+        args = _parse_args_impl(add_custom_arguments, model_source=model_source)
+    unknown = _unknown_options(sys.argv[1:], registered)
+    if unknown:
+        options = ", ".join(unknown)
+        raise ValueError(
+            f"Unknown training option(s): {options}. Fix: correct the spelling or remove unsupported options."
+        )
+    return args
 
 
 def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
@@ -2788,6 +2868,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
+    _prevalidate_resource_cli()
     skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
@@ -2795,8 +2876,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     sglang_ns = None
     teacher_sglang_ns = None
     if not skip_sglang:
-        sglang_ns = sglang_parse_args()
-        teacher_sglang_ns = teacher_sglang_parse_args()
+        sglang_ns, teacher_sglang_ns = _parse_sglang_namespaces()
 
     # Phase 2: Parse megatron + slime args.
     # Uses ignore_unknown_args=True so that --sglang-* and pre-parsed CLI flags
@@ -2842,13 +2922,17 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         args = megatron_validate_args(args)
 
     if not args.debug_train_only:
-        sglang_validate_args(args)
+        _validate_sglang_args(args)
+
+    # Keep parser test doubles and third-party wrappers compatible while real
+    # Relax namespaces always carry the resource field.
+    if hasattr(args, "resource"):
+        validate_preflight_args(args)
 
     # Only fully-async mode relies on the newer TransferQueue (e.g.
     # StreamingTokenBudgetSampler), so gate the version requirement on it.
     if getattr(args, "fully_async", False):
         check_transfer_queue_version()
-
     return args
 
 
@@ -3018,13 +3102,16 @@ def _validate_agentic_rollout_args(args) -> None:
     args.eval_function_path = "relax.agentic.rollout.generate_rollout"
     args.apply_chat_template = False
     if not isinstance(args.agent_command, str) or not args.agent_command.strip():
-        raise ValueError("--agent-command is required when --use-agentic-rollout is set.")
+        raise ValueError(
+            "--agent-command is required when --use-agentic-rollout is set. "
+            "Fix: provide the command used to start the agent process."
+        )
     if not isinstance(args.agent_cwd, str) or not args.agent_cwd.strip():
         raise ValueError("--agent-cwd is required when --use-agentic-rollout is set.")
     if not os.path.isdir(os.path.expanduser(args.agent_cwd)):
         raise ValueError(f"--agent-cwd must point to an existing directory, got {args.agent_cwd!r}.")
     if args.agent_timeout <= 0:
-        raise ValueError("--agent-timeout must be > 0.")
+        raise ValueError("--agent-timeout must be > 0. Fix: set --agent-timeout to a positive number of seconds.")
     if not isinstance(args.agent_env, list) or not all(isinstance(item, str) for item in args.agent_env):
         raise TypeError("--agent-env must be provided as a list of KEY=VALUE strings.")
     for item in args.agent_env:
@@ -3208,6 +3295,145 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
     return True
 
 
+def _validate_resource_config(args) -> None:
+    resource = getattr(args, "resource", None)
+    if not isinstance(resource, dict) or not resource:
+        raise ValueError(
+            "--resource must be a non-empty JSON object. Fix: pass entries such as "
+            '--resource \'{"actor": [1, 8], "rollout": [1, 8]}\'.'
+        )
+    for role, spec in resource.items():
+        if not isinstance(role, str) or not isinstance(spec, (list, tuple)) or len(spec) != 2:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: expected [num_services, num_gpus], got {spec!r}. "
+                "Fix: use a two-integer list for every role."
+            )
+        num_services, num_gpus = spec
+        if type(num_services) is not int or type(num_gpus) is not int:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: both values must be integers, got {spec!r}. "
+                "Fix: replace booleans, strings, or floats with JSON integers."
+            )
+        if num_services != 1:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: num_services must currently be 1, got {num_services}. "
+                "Fix: set the first list value to 1."
+            )
+        if num_gpus < 0:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: num_gpus must be >= 0, got {num_gpus}. "
+                "Fix: set the second list value to a non-negative integer."
+            )
+        if role in {"advantages", "sft"} and num_gpus != 0:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: this CPU-only role requires num_gpus == 0. "
+                "Fix: set the second list value to 0."
+            )
+        if role in {"actor", "rollout", "critic", "genrm"} and num_gpus == 0:
+            raise ValueError(
+                f"Invalid --resource entry for {role!r}: this model role requires num_gpus > 0. "
+                "Fix: allocate at least one GPU or remove the inactive role."
+            )
+
+
+def _validate_dataset_paths(args) -> None:
+    from relax.utils.data.data_utils import SUPPORTED_DATA_EXTENSIONS, resolve_path_plan
+
+    prompt_data = getattr(args, "prompt_data", None)
+    is_sft = getattr(args, "loss_type", None) == "sft"
+    if is_sft:
+        uses_builtin_prompt_data = not getattr(args, "custom_dataset_class_path", None)
+    else:
+        uses_builtin_prompt_data = (
+            bool(getattr(args, "rollout_global_dataset", True))
+            and getattr(
+                args,
+                "data_source_path",
+                _DEFAULT_ROLLOUT_DATA_SOURCE,
+            )
+            in _BUILTIN_ROLLOUT_DATA_SOURCES
+        )
+    path_specs = []
+    if uses_builtin_prompt_data:
+        path_specs = [prompt_data] if isinstance(prompt_data, str) else list(prompt_data or [])
+    eval_prompt_data = list(getattr(args, "eval_prompt_data", None) or [])
+    if is_sft:
+        path_specs.extend(eval_prompt_data[1::2])
+    else:
+        path_specs.extend(dataset.path for dataset in getattr(args, "eval_datasets", []) or [])
+    for spec in path_specs:
+        paths, _ = resolve_path_plan(spec)
+        if not paths:
+            raise FileNotFoundError(
+                f"Dataset path {spec!r} resolved to no supported files. "
+                "Fix: add a .jsonl or .parquet file, or correct the dataset path."
+            )
+        missing = [path for path in paths if not os.path.exists(path)]
+        if missing:
+            raise FileNotFoundError(
+                f"Dataset path(s) do not exist: {missing}. Fix: correct the path or mount/download the dataset first."
+            )
+        unsupported = [path for path in paths if not path.endswith(SUPPORTED_DATA_EXTENSIONS)]
+        if unsupported:
+            formats = ", ".join(SUPPORTED_DATA_EXTENSIONS)
+            raise ValueError(
+                f"Unsupported dataset file format: {unsupported}. "
+                f"Fix: convert each file to one of the built-in loader formats: {formats}."
+            )
+
+
+def resolve_configured_roles(args) -> list[str]:
+    """Return roles the existing registry would create when configured."""
+    from relax.core.optional_roles import register_extra_roles
+    from relax.core.registry import ALGOS, process_role
+
+    algorithm = "sft" if getattr(args, "loss_type", None) == "sft" else args.advantage_estimator
+    implementations = ALGOS[algorithm].copy()
+    extras = register_extra_roles(args, implementations)
+    candidates = [*process_role(args), *extras]
+    resource = getattr(args, "resource", {})
+    roles = list(dict.fromkeys(str(role) for role in candidates if role in implementations and str(role) in resource))
+    if is_managed_opd_teacher_enabled(args) and not getattr(args, "debug_train_only", False):
+        roles.append("teacher")
+    return roles
+
+
+def validate_preflight_args(args) -> None:
+    """Run read-only checks that are useful before launching runtime
+    services."""
+    from relax.engine.sft.bootstrap import validate_sft_resource
+    from relax.utils.training.ppo_utils import validate_ppo_config
+
+    _validate_resource_config(args)
+    validate_ppo_config(args)
+    validate_sft_resource(args)
+    if getattr(args, "loss_type", None) != "sft":
+        if getattr(args, "debug_rollout_only", False):
+            required_roles = {"rollout"}
+        elif getattr(args, "debug_train_only", False):
+            required_roles = {"actor"}
+        else:
+            required_roles = {"actor", "rollout"}
+            if getattr(args, "fully_async", False) and not getattr(args, "hybrid", False):
+                required_roles.add("advantages")
+        missing = sorted(required_roles - set(args.resource))
+        if missing:
+            raise ValueError(
+                f"Missing required --resource role(s): {missing}. "
+                "Fix: add each missing role as [1, num_gpus], or select the matching debug-only mode."
+            )
+    active_roles = resolve_configured_roles(args)
+    zero_gpu_roles = sorted(
+        role for role in active_roles if role not in {"advantages", "sft"} and args.resource[role][1] == 0
+    )
+    if zero_gpu_roles:
+        raise ValueError(
+            f"Active model role(s) require num_gpus > 0: {zero_gpu_roles}. "
+            "Fix: allocate at least one GPU to each active model role or remove the inactive role."
+        )
+    _validate_dataset_paths(args)
+
+
 def _validate_ref_load(args: argparse.Namespace) -> None:
     """Validate a local reference checkpoint or defer a source alias."""
     if is_model_source_alias(args, args.ref_load):
@@ -3263,7 +3489,7 @@ def slime_validate_args(args):
         args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.max_staleness < 0:
-        raise ValueError("--max-staleness must be >= 0.")
+        raise ValueError("--max-staleness must be >= 0. Fix: set --max-staleness to zero or a positive integer.")
 
     if getattr(args, "lora_rank", 0) > 0:
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
@@ -3330,7 +3556,8 @@ def slime_validate_args(args):
         raise ValueError(
             "The options 'partial_rollout' and 'use_rollout_routing_replay' cannot be enabled simultaneously. "
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
-            "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
+            "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive. "
+            "Fix: remove one of --partial-rollout or --use-rollout-routing-replay."
         )
 
     if not is_sft and args.advantage_estimator == "rloo" and args.kl_coef != 0:
@@ -3394,7 +3621,10 @@ def slime_validate_args(args):
         assert args.eval_size > 0, "--eval-size must be positive."
 
     if args.save_interval is not None:
-        assert args.save is not None, "'--save' is required when save_interval is set."
+        assert args.save is not None, (
+            "'--save' is required when save_interval is set. "
+            "Fix: provide --save <checkpoint-directory> or remove --save-interval."
+        )
 
     if getattr(args, "sft_predict_interval", None) is not None:
         assert args.loss_type == "sft", "--sft-predict-interval is only meaningful under --loss-type sft."
@@ -3438,7 +3668,7 @@ def slime_validate_args(args):
         if args.fully_async:
             assert not args.normalize_advantages, (
                 "Advantage normalization is not supported in fully-async mode (--fully-async). "
-                "Please remove --normalize-advantages from your command."
+                "Fix: remove --normalize-advantages from your command."
             )
             assert not args.opd_type == "megatron", (
                 "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
@@ -3481,11 +3711,15 @@ def slime_validate_args(args):
                 )
 
         if args.use_rollout_logprobs:
-            assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+            assert not args.use_tis, (
+                "use_rollout_logprobs and use_tis cannot be set at the same time. "
+                "Fix: remove either --use-rollout-logprobs or --use-tis."
+            )
 
         if args.get_mismatch_metrics:
             assert args.custom_tis_function_path is not None, (
-                "custom_tis_function_path must be set when get_mismatch_metrics is set"
+                "custom_tis_function_path must be set when get_mismatch_metrics is set. "
+                "Fix: provide --custom-tis-function-path or remove --get-mismatch-metrics."
             )
 
             if args.use_rollout_logprobs:
@@ -3494,7 +3728,10 @@ def slime_validate_args(args):
                 )
 
     if args.use_dynamic_batch_size:
-        assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
+        assert args.max_tokens_per_gpu is not None, (
+            "max_tokens_per_gpu must be set when use_dynamic_batch_size is set. "
+            "Fix: provide --max-tokens-per-gpu or remove --use-dynamic-batch-size."
+        )
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
@@ -3561,9 +3798,14 @@ def slime_validate_args(args):
 
     if args.loss_type == "sft":
         if not args.custom_dataset_class_path and not args.prompt_data:
-            raise ValueError("--loss-type sft requires --prompt-data.")
+            raise ValueError(
+                "--loss-type sft requires --prompt-data. Fix: provide --prompt-data or a --custom-dataset-class-path."
+            )
         if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
-            raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
+            raise ValueError(
+                "--sft-oversize-strategy custom requires --sft-oversize-custom-function-path. "
+                "Fix: provide the handler path or choose a built-in oversize strategy."
+            )
         # SFT does not use advantages / reference; force-disable to avoid wasted compute.
         args.compute_advantages_and_returns = False
         # SFT samples have highly variable length; only the dynamic-batch-size
@@ -3789,6 +4031,11 @@ def slime_validate_args(args):
         )
 
     if args.num_steps_per_rollout is not None:
+        if args.num_steps_per_rollout <= 0:
+            raise ValueError(
+                "--num-steps-per-rollout must be > 0. "
+                "Fix: set it to a positive integer or omit it to derive the batch size normally."
+            )
         global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
         if args.global_batch_size is not None:
             assert args.global_batch_size == global_batch_size, (

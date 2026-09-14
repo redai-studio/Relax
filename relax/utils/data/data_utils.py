@@ -637,17 +637,21 @@ def filter_long_prompts(
     return filtered_samples
 
 
+JSONL_EXTENSION = ".jsonl"
+PARQUET_EXTENSION = ".parquet"
+SUPPORTED_DATA_EXTENSIONS = (JSONL_EXTENSION, PARQUET_EXTENSION)
+
+
 def _expand_directory(dir_path: str) -> list[str]:
     """Recursively find all supported data files (.jsonl, .parquet) under a
     directory.
 
     Files are sorted by full path to ensure deterministic ordering across runs.
     """
-    supported_extensions = (".jsonl", ".parquet")
     files = []
     for root, _, filenames in os.walk(dir_path):
         for fname in filenames:
-            if fname.endswith(supported_extensions):
+            if fname.endswith(SUPPORTED_DATA_EXTENSIONS):
                 files.append(os.path.join(root, fname))
     files.sort()
     if not files:
@@ -709,7 +713,7 @@ def _build_reader_for_path(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
 
-    if path.endswith(".jsonl"):
+    if path.endswith(JSONL_EXTENSION):
 
         def jsonl_reader(p):
             with open(p, encoding="utf-8") as f:
@@ -728,7 +732,7 @@ def _build_reader_for_path(path: str):
             reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)
         return reader
 
-    if path.endswith(".parquet"):
+    if path.endswith(PARQUET_EXTENSION):
         if pq is None:
             raise ImportError("pyarrow is required for parquet support")
 

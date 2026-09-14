@@ -1,0 +1,26 @@
+{"name":"unknown_option","args":["--does-not-exist","1"],"contains":"Unknown training option","fix":"correct the spelling"}
+{"name":"unknown_short_option","args":["-evil"],"contains":"Unknown training option","fix":"correct the spelling"}
+{"name":"missing_dataset","args":["--prompt-data","/missing/task35.jsonl"],"contains":"Dataset path(s) do not exist","fix":"correct the path"}
+{"name":"empty_resource","args":["--resource","{}"],"contains":"--resource must be a non-empty JSON object","fix":"pass entries"}
+{"name":"resource_shape","args":["--resource","{\"actor\": [1]}"],"contains":"expected [num_services, num_gpus]","fix":"two-integer list"}
+{"name":"resource_boolean","args":["--resource","{\"actor\": [true, 1]}"],"contains":"both values must be integers","fix":"JSON integers"}
+{"name":"resource_service_count","args":["--resource","{\"actor\": [2, 1]}"],"contains":"num_services must currently be 1","fix":"first list value to 1"}
+{"name":"resource_negative_gpu","args":["--resource","{\"actor\": [1, -1]}"],"contains":"num_gpus must be >= 0","fix":"non-negative integer"}
+{"name":"resource_zero_gpu","args":["--resource","{\"actor\": [1, 0], \"rollout\": [1, 1]}"],"contains":"requires num_gpus > 0","fix":"at least one GPU"}
+{"name":"cpu_role_positive_gpu","args":["--resource","{\"actor\": [1, 1], \"rollout\": [1, 1], \"advantages\": [1, 1]}"],"contains":"CPU-only role requires num_gpus == 0","fix":"second list value to 0"}
+{"name":"missing_rollout_resource","args":["--resource","{\"actor\": [1, 1]}"],"contains":"Missing required --resource role","fix":"add each missing role"}
+{"name":"ppo_missing_critic","args":["--advantage-estimator","ppo"],"contains":"requires a 'critic' entry","fix":"add a critic entry"}
+{"name":"negative_staleness","args":["--max-staleness","-1"],"contains":"--max-staleness must be >= 0","fix":"zero or a positive integer"}
+{"name":"zero_steps_per_rollout","args":["--num-steps-per-rollout","0"],"contains":"--num-steps-per-rollout must be > 0","fix":"positive integer"}
+{"name":"partial_routing_conflict","args":["--partial-rollout","--use-rollout-routing-replay"],"contains":"cannot be enabled simultaneously","fix":"remove one"}
+{"name":"save_interval_without_save","args":["--save-interval","10"],"contains":"'--save' is required","fix":"provide --save"}
+{"name":"fully_async_normalization","args":["--fully-async","--normalize-advantages"],"contains":"Advantage normalization is not supported","fix":"remove --normalize-advantages"}
+{"name":"rollout_logprobs_tis","args":["--use-rollout-logprobs","--use-tis"],"contains":"cannot be set at the same time","fix":"remove either"}
+{"name":"mismatch_without_function","args":["--get-mismatch-metrics"],"contains":"custom_tis_function_path must be set","fix":"provide --custom-tis-function-path"}
+{"name":"dynamic_batch_without_budget","args":["--use-dynamic-batch-size"],"contains":"max_tokens_per_gpu must be set","fix":"provide --max-tokens-per-gpu"}
+{"name":"agentic_without_command","args":["--use-agentic-rollout"],"contains":"--agent-command is required","fix":"provide the command"}
+{"name":"agentic_bad_timeout","args":["--use-agentic-rollout","--agent-command","echo ok","--agent-cwd",".","--agent-timeout","0"],"contains":"--agent-timeout must be > 0","fix":"positive number of seconds"}
+{"name":"sft_without_prompt","args":["--loss-type","sft","--use-dynamic-batch-size","--max-tokens-per-gpu","1024"],"remove_prompt":true,"contains":"--loss-type sft requires --prompt-data","fix":"provide --prompt-data"}
+{"name":"sft_custom_without_handler","args":["--loss-type","sft","--use-dynamic-batch-size","--max-tokens-per-gpu","1024","--sft-oversize-strategy","custom"],"contains":"requires --sft-oversize-custom-function-path","fix":"provide the handler path"}
+{"name":"fully_async_true_on_policy_missing_advantages","args":["--fully-async","--resource","{\"actor\": [1, 1], \"rollout\": [1, 1]}"],"remove_flags":["--colocate"],"contains":"Missing required --resource role","fix":"add each missing role"}
+{"name":"fully_async_missing_advantages","args":["--fully-async","--global-batch-size","8","--resource","{\"actor\": [1, 1], \"rollout\": [1, 1], \"actor_fwd\": [1, 1]}"],"remove_flags":["--colocate"],"contains":"Missing required --resource role","fix":"add each missing role"}
