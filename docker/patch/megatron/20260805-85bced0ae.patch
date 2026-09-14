@@ -1,0 +1,2851 @@
+diff --git a/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py b/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
+index 7c73cc1..fe47876 100644
+--- a/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
++++ b/megatron/bridge/models/kimi_vl/kimi_k25_vl_bridge.py
+@@ -187,8 +187,15 @@ class KimiK25VLBridge(MegatronModelBridge):
+         for fqn, tensor in converted_weights_dict.items():
+             if self._is_quantized_expert_key(fqn):
+                 base = fqn[:-7] if fqn.endswith(".weight") else fqn
+-                # Preserve the original scale dtype from the HF checkpoint
+                 orig_scale_key = f"{base}.weight_scale"
++                # When the source HF checkpoint has been pre-cast to BF16 (no
++                # `weight_scale` triplet present), passthrough instead of re-
++                # quantizing — downstream sglang loads BF16 and would reject
++                # the INT4 export names with "not found in params_dict".
++                if orig_scale_key not in hf_state_dict:
++                    result[fqn] = tensor
++                    continue
++                # Preserve the original scale dtype from the HF checkpoint
+                 scale_dtype = (
+                     hf_state_dict[orig_scale_key].dtype if orig_scale_key in hf_state_dict else torch.bfloat16
+                 )
+diff --git a/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py b/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py
+index 11b883e..8c6e346 100644
+--- a/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py
++++ b/megatron/bridge/models/kimi_vl/kimi_k25_vl_provider.py
+@@ -57,6 +57,11 @@ class KimiK25VLModelProvider(MLAModelProvider):
+     pad_token_id: int = 163839
+     ignore_index: int = -100
+ 
++    # Split vision encoder workload across TP ranks (data-parallel over TP).
++    # Each TP rank processes a chunk of images, then all-reduce gathers the
++    # full embedding.  Reduces per-GPU peak memory for the vision encoder.
++    vision_dp_when_tp: bool = False
++
+     # Freeze options for fine-tuning scenarios
+     freeze_language_model: bool = False
+     freeze_vision_model: bool = False
+diff --git a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
+index 0e4b120..3c606ac 100644
+--- a/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
++++ b/megatron/bridge/models/kimi_vl/modeling_kimi_k25_vl.py
+@@ -16,6 +16,8 @@ import logging
+ from typing import List, Optional
+ 
+ import torch
++import torch.distributed
++from megatron.core import parallel_state as mpu
+ from megatron.core.packed_seq_params import PackedSeqParams
+ from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
+ from megatron.core.transformer.module import MegatronModule
+@@ -23,6 +25,7 @@ from torch import Tensor
+ from transformers.dynamic_module_utils import get_class_from_dynamic_module
+ 
+ from megatron.bridge.models.gpt_provider import GPTModelProvider
++from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import preprocess_packed_seqs
+ from megatron.bridge.utils.common_utils import hook_hf_module_setattr_for_tp_grad_sync
+ 
+ 
+@@ -136,11 +139,15 @@ class KimiK25VLModel(MegatronModule):
+             if not hasattr(MoonViT3dEncoder, "use_deterministic_attn"):
+                 MoonViT3dEncoder.use_deterministic_attn = False
+ 
+-            # transformers >=5.5 strictly validates `attn_implementation` at
+-            # __init__ and selects `flash_attention_2` by default when flash-attn
+-            # is installed. MoonViT3dPretrainedModel doesn't declare flash-attn-2
+-            # support, so force eager attention before construction.
+-            self.vision_tower_config._attn_implementation = "eager"
++            # MoonViT3dPretrainedModel declares `_supports_flash_attn_2 = True` (old
++            # transformers API).  transformers >= 5.0 unified flash-attn support under
++            # `_supports_flash_attn` (default False); bridge the old flag so the strict
++            # init-time check in _flash_attn_can_dispatch() does not raise ValueError.
++            if not getattr(MoonViT3dPretrainedModel, "_supports_flash_attn", False):
++                MoonViT3dPretrainedModel._supports_flash_attn = getattr(
++                    MoonViT3dPretrainedModel, "_supports_flash_attn_2", False
++                )
++            self.vision_tower_config._attn_implementation = "flash_attention_2"
+             self.vision_tower = MoonViT3dPretrainedModel(self.vision_tower_config)
+             self.mm_projector = PatchMergerMLP(self.projector_config)  # TODO: support different types of mm projector
+             # Ensure HF visual tower params are marked for TP grad sync and future assignments are hooked.
+@@ -317,8 +324,79 @@ class KimiK25VLModel(MegatronModule):
+ 
+         return final_embedding, final_attention_mask, final_labels, position_ids
+ 
++    def _vision_forward_tp_split(
++        self,
++        pixel_values: torch.Tensor,
++        grid_thws: torch.Tensor,
++    ) -> List[torch.Tensor]:
++        """Run vision encoder + projector with workload split across TP ranks.
++
++        Each TP rank processes a subset of images determined by splitting
++        ``grid_thws``, then the partial feature tensors are all-reduced so
++        every rank holds the complete result.
++        """
++        tp_rank = mpu.get_tensor_model_parallel_rank()
++        tp_size = mpu.get_tensor_model_parallel_world_size()
++
++        num_images = grid_thws.shape[0]
++        merge_h, merge_w = self.vision_tower.merge_kernel_size
++        param_dtype = next(self.vision_tower.parameters()).dtype
++        text_hidden = self.projector_config.hidden_size
++
++        pixel_counts = grid_thws.prod(dim=-1)
++        out_token_counts = (grid_thws[:, 1] // merge_h) * (grid_thws[:, 2] // merge_w)
++        total_out_tokens = out_token_counts.sum().item()
++
++        chunk_indices = list(range(num_images))
++        chunks = [chunk_indices[i::tp_size] for i in range(tp_size)]
++        my_indices = chunks[tp_rank] if tp_rank < len(chunks) else []
++
++        out_buffer = torch.zeros(
++            (total_out_tokens, text_hidden),
++            device=pixel_values.device,
++            dtype=param_dtype,
++        )
++
++        if my_indices:
++            pixel_cumsum = pixel_counts.cumsum(dim=0)
++            pv_parts = []
++            grid_parts = []
++            for idx in my_indices:
++                px_start = 0 if idx == 0 else pixel_cumsum[idx - 1].item()
++                px_end = pixel_cumsum[idx].item()
++                pv_parts.append(pixel_values[px_start:px_end])
++                grid_parts.append(grid_thws[idx : idx + 1])
++
++            local_pv = torch.cat(pv_parts, dim=0)
++            local_grid = torch.cat(grid_parts, dim=0)
++
++            local_vit_out = self.vision_tower(local_pv, local_grid)
++            local_features = self.mm_projector(local_vit_out)
++
++            out_cumsum = out_token_counts.cumsum(dim=0)
++            for feat_i, img_idx in enumerate(my_indices):
++                out_start = 0 if img_idx == 0 else out_cumsum[img_idx - 1].item()
++                out_end = out_cumsum[img_idx].item()
++                out_buffer[out_start:out_end] = local_features[feat_i].to(param_dtype)
++
++        tp_group = mpu.get_tensor_model_parallel_group()
++        torch.distributed.all_reduce(out_buffer, group=tp_group)
++
++        result = []
++        out_cumsum = out_token_counts.cumsum(dim=0)
++        for i in range(num_images):
++            start = 0 if i == 0 else out_cumsum[i - 1].item()
++            end = out_cumsum[i].item()
++            result.append(out_buffer[start:end])
++
++        return result
++
+     def _extract_image_features(self, pixel_values, grid_thws):
+         """Extract and project image features."""
++        tp_size = mpu.get_tensor_model_parallel_world_size()
++        if getattr(self.config, "vision_dp_when_tp", False) and tp_size > 1:
++            return self._vision_forward_tp_split(pixel_values, grid_thws)
++
+         image_features = self.vision_tower(pixel_values, grid_thws)
+         return self.mm_projector(image_features)
+ 
+@@ -357,6 +435,12 @@ class KimiK25VLModel(MegatronModule):
+             2. Dynamic expansion: input_ids has 1 placeholder per image, expands to N tokens.
+         """
+         if self.pre_process:
++            # Save the caller-supplied per-sample attention mask before any rewrite —
++            # _merge_input_ids_with_image_features sets `attention_mask = None` on the
++            # vision path, but the THD repack below needs the original [B, T] mask to
++            # know each sample's valid length.
++            saved_attention_mask = attention_mask
++
+             if inputs_embeds is None:
+                 inputs_embeds = self.language_model.embedding(
+                     input_ids=input_ids, position_ids=None
+@@ -392,8 +476,30 @@ class KimiK25VLModel(MegatronModule):
+                 # Don't need attention mask for causal attention.
+                 attention_mask = None
+ 
+-            # Transpose back to (T, B, D) for Megatron language model
+-            inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
++            # When THD packed_seq_params is provided (VL+CP/SP), repack the raw
++            # padded [B, T_max, D] embedding into compact THD
++            # [sum(padded_seqlens)/cp, 1, D] using the saved per-sample attention
++            # mask. Mirrors the Qwen3VL bridge: without this, downstream MLA
++            # attention sees a tensor whose first dim does not match
++            # cu_seqlens_q_padded (sum=sum(padded_seqlens)), and SP scatter can
++            # hit `T_max % tp_size != 0` since T_max is raw batch-max.
++            # preprocess_packed_seqs also recomputes cu_seqlens with align64.
++            needs_thd_repack = (
++                packed_seq_params is not None
++                and packed_seq_params.qkv_format == "thd"
++                and saved_attention_mask is not None
++            )
++            if needs_thd_repack:
++                inputs_embeds, packed_seq_params = preprocess_packed_seqs(
++                    inputs_embeds,  # [B, T_max, D]
++                    saved_attention_mask,
++                    pre_process=True,
++                )
++                # preprocess_packed_seqs returns [1, T_thd, D]; switch to (T_thd, 1, D)
++                inputs_embeds = inputs_embeds.transpose(0, 1).contiguous()
++            else:
++                # Transpose back to (T, B, D) for Megatron language model
++                inputs_embeds = inputs_embeds.transpose(1, 0).contiguous()  # (B, T, D) -> (T, B, D)
+ 
+             if self.config.sequence_parallel:
+                 inputs_embeds = scatter_to_sequence_parallel_region(inputs_embeds)
+diff --git a/megatron/bridge/models/qwen/qwen3_moe_bridge.py b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
+index 04afd67..a83cebf 100755
+--- a/megatron/bridge/models/qwen/qwen3_moe_bridge.py
++++ b/megatron/bridge/models/qwen/qwen3_moe_bridge.py
+@@ -69,6 +69,40 @@ class Qwen3MoEBridge(MegatronModelBridge):
+ 
+         return provider
+ 
++    def build_conversion_tasks(self, hf_pretrained, megatron_model):
++        """Inject virtual .weight keys so INT4 checkpoints (weight_packed/weight_scale/
++        weight_zero_point) pass the hf_keys validation in the base class.
++
++        When hf_checkpoint points to an INT4 compressed-tensors checkpoint, expert
++        weights are stored as weight_packed/weight_scale/weight_zero_point triplets
++        with no plain .weight key. The base build_conversion_tasks checks that each
++        mapped HF name exists in hf_keys and skips the param if not found, causing
++        all expert weights to be silently dropped. We patch get_all_keys() to return
++        synthetic .weight keys alongside the real packed keys so the check passes.
++        Downstream quantize_params in HfWeightIteratorBridge then converts the BF16
++        output back to INT4 before sending to the rollout engine.
++        """
++        if not (hasattr(hf_pretrained, "state") and hasattr(hf_pretrained.state, "source")):
++            return super().build_conversion_tasks(hf_pretrained, megatron_model)
++
++        original_get_all_keys = hf_pretrained.state.source.get_all_keys
++
++        def _get_all_keys_with_virtual():
++            keys = original_get_all_keys()
++            all_keys_set = set(keys)
++            virtual_keys = [
++                key[:-7]  # "...weight_packed" -> "...weight"
++                for key in keys
++                if key.endswith("_packed") and f"{key[:-7]}_scale" in all_keys_set
++            ]
++            return keys + virtual_keys
++
++        hf_pretrained.state.source.get_all_keys = _get_all_keys_with_virtual
++        try:
++            return super().build_conversion_tasks(hf_pretrained, megatron_model)
++        finally:
++            hf_pretrained.state.source.get_all_keys = original_get_all_keys
++
+     def mapping_registry(self) -> MegatronMappingRegistry:
+         # Return MegatronMappingRegistry containing parameter mappings from Megatron to HF format
+         # First create simple 1:1 parameter mappings using a dictionary for readability
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+index d067655..3a4e744 100644
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -120,6 +120,7 @@ class Qwen3VLGPTModel(GPTModel):
+         *,
+         inference_params: Optional[BaseInferenceContext] = None,
+         loss_mask: Optional[Tensor] = None,
++        mtp_kwargs: Optional[dict] = None,
+         # args for deepstack
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
+@@ -210,6 +211,7 @@ class Qwen3VLGPTModel(GPTModel):
+             runtime_gather_output=runtime_gather_output,
+             extra_block_kwargs=extra_block_kwargs,
+             inference_context=inference_context,
++            mtp_kwargs=mtp_kwargs or {},
+         )
+ 
+         if _shadow_embedding:
+diff --git a/megatron/bridge/models/qwen_vl/qwen35_vl_bridge.py b/megatron/bridge/models/qwen_vl/qwen35_vl_bridge.py
+index 7fcf295..7ac1134 100644
+--- a/megatron/bridge/models/qwen_vl/qwen35_vl_bridge.py
++++ b/megatron/bridge/models/qwen_vl/qwen35_vl_bridge.py
+@@ -404,15 +404,6 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
+                     k="mtp.layers.*.self_attn.k_proj.weight",
+                     v="mtp.layers.*.self_attn.v_proj.weight",
+                 ),
+-                GatedMLPMapping(
+-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc1.weight*",
+-                    gate="mtp.layers.*.mlp.experts.*.gate_proj.weight",
+-                    up="mtp.layers.*.mlp.experts.*.up_proj.weight",
+-                ),
+-                AutoMapping(
+-                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc2.weight*",
+-                    hf_param="mtp.layers.*.mlp.experts.*.down_proj.weight",
+-                ),
+                 GatedMLPMapping(
+                     megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.shared_experts.linear_fc1.weight",
+                     gate="mtp.layers.*.mlp.shared_expert.gate_proj.weight",
+@@ -429,6 +420,43 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
+             ]
+         )
+ 
++        # Detect MTP MoE expert weight format: Qwen3.5 stores per-expert
++        # (mtp.layers.0.mlp.experts.{i}.gate_proj.weight), Qwen3.6 stores packed
++        # (mtp.layers.0.mlp.experts.gate_up_proj). Same architecture string,
++        # different storage — must inspect HF keys.
++        mtp_experts_packed = False
++        if hasattr(self.hf_pretrained, "state") and hasattr(self.hf_pretrained.state, "source"):
++            hf_keys = set(self.hf_pretrained.state.source.get_all_keys())
++            if "mtp.layers.0.mlp.experts.gate_up_proj" in hf_keys:
++                mtp_experts_packed = True
++
++        if mtp_experts_packed:
++            # Qwen3.6: packed format (same as main decoder)
++            mapping_list.extend([
++                FusedGatedExpertMapping(
++                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc1.weight*",
++                    hf_param="mtp.layers.*.mlp.experts.gate_up_proj",
++                ),
++                FusedExpertMapping(
++                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc2.weight*",
++                    hf_param="mtp.layers.*.mlp.experts.down_proj",
++                    transpose_on_export=True,
++                ),
++            ])
++        else:
++            # Qwen3.5: per-expert format (current behavior)
++            mapping_list.extend([
++                GatedMLPMapping(
++                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc1.weight*",
++                    gate="mtp.layers.*.mlp.experts.*.gate_proj.weight",
++                    up="mtp.layers.*.mlp.experts.*.up_proj.weight",
++                ),
++                AutoMapping(
++                    megatron_param="language_model.mtp.layers.*.mtp_model_layer.mlp.experts.linear_fc2.weight*",
++                    hf_param="mtp.layers.*.mlp.experts.*.down_proj.weight",
++                ),
++            ])
++
+         return MegatronMappingRegistry(*mapping_list)
+ 
+ 
+diff --git a/megatron/bridge/peft/utils.py b/megatron/bridge/peft/utils.py
+index c297a23..587e1de 100644
+--- a/megatron/bridge/peft/utils.py
++++ b/megatron/bridge/peft/utils.py
+@@ -15,28 +15,36 @@
+ import logging
+ import math
+ import re
+-from dataclasses import dataclass
++from dataclasses import dataclass, fields
++from importlib import import_module
+ from importlib.metadata import version
+-from typing import Callable, Dict, List, Optional, Tuple
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+ 
+ import packaging
+ import torch
+ import torch.nn as nn
+ from megatron.core import ModelParallelConfig, parallel_state
+ from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor, ShardedTensorFactory
++from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+ from megatron.core.tensor_parallel.mappings import (
+     gather_from_sequence_parallel_region,
+     scatter_to_sequence_parallel_region,
+ )
+ from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
++from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe.router import TopKRouter
+ 
++from megatron.bridge.utils.activation_map import str_to_dtype
+ from megatron.bridge.utils.import_utils import safe_import_from
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
++ModelList = list[MegatronModule]
++CheckpointPath = str | Path
++
+ 
+ TEColumnParallelLinear, HAVE_TE_COL_LINEAR = safe_import_from(
+     "megatron.core.extensions.transformer_engine", "TEColumnParallelLinear"
+@@ -1479,3 +1487,148 @@ class GroupedExpertLinearAdapter(nn.Module):
+         sharded_state_dict.update(linear_in_sd)
+         sharded_state_dict.update(linear_out_sd)
+         return sharded_state_dict
++
++
++def create_peft(config: Mapping[str, Any], dtype: torch.dtype | str | int | None = None) -> object | None:
++    """Create a Bridge PEFT object from a small config mapping."""
++    kwargs = dict(config)
++    peft_type = kwargs.pop("type", "lora")
++    if "rank" in kwargs:
++        kwargs["dim"] = kwargs.pop("rank")
++    if kwargs.get("dim", 0) <= 0:
++        return None
++
++    peft_cls = _import_peft_class(peft_type)
++
++    peft_fields = {field.name for field in fields(peft_cls) if field.init}
++    config_dtype = kwargs.pop("dtype", None)
++    if "lora_dtype" not in kwargs:
++        kwargs["lora_dtype"] = config_dtype if config_dtype is not None else dtype
++
++    if kwargs.get("lora_dtype") is None or "lora_dtype" not in peft_fields:
++        kwargs.pop("lora_dtype", None)
++    else:
++        kwargs["lora_dtype"] = str_to_dtype(str(kwargs["lora_dtype"]).lower())
++
++    kwargs = {key: value for key, value in kwargs.items() if key in peft_fields}
++
++    return peft_cls(**kwargs)
++
++
++def _import_peft_class(peft_type: str) -> type[Any]:
++    peft_classes = {
++        "lora": ("megatron.bridge.peft.lora", "LoRA"),
++        "vlm_lora": ("megatron.bridge.peft.lora", "VLMLoRA"),
++        "canonical_lora": ("megatron.bridge.peft.canonical_lora", "CanonicalLoRA"),
++        "dora": ("megatron.bridge.peft.dora", "DoRA"),
++    }
++    if peft_type not in peft_classes:
++        supported_types = ", ".join(sorted(peft_classes))
++        raise ValueError(f"Unsupported PEFT type {peft_type!r}. Supported types: {supported_types}.")
++
++    module_name, class_name = peft_classes[peft_type]
++    try:
++        module = import_module(module_name)
++    except ImportError as err:
++        message = f"Failed to import PEFT type {peft_type!r} ({module_name}:{class_name})."
++        if peft_type in {"lora", "vlm_lora", "canonical_lora"}:
++            message += " Install Megatron Bridge with the [te] extra for Transformer Engine support."
++        raise ImportError(message) from err
++
++    return getattr(module, class_name)
++
++
++def load_peft_adapter_checkpoint(
++    model: ModelList | MegatronModule,
++    adapter_checkpoint_path: CheckpointPath,
++    peft: object,
++    strict: bool = False,
++    model_sd_kwargs: Mapping[str, object] | None = None,
++    ckpt_format: str = "torch_dist",
++    pg_collection: ProcessGroupCollection | None = None,
++    fully_parallel_load: bool = True,
++    load_strategy: object | None = None,
++) -> None:
++    """Load a PEFT adapter checkpoint into an already transformed model."""
++    from megatron.core import dist_checkpointing
++    from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
++    from megatron.core.dist_checkpointing.strategies.fully_parallel import FullyParallelLoadStrategyWrapper
++
++    from megatron.bridge.training.checkpointing import apply_peft_adapter_filter_to_state_dict
++
++    model_chunks = _ensure_model_list(model)
++    sharded_state_dict = _model_state_dict(
++        model_chunks,
++        model_sd_kwargs,
++        ckpt_format,
++        pg_collection=pg_collection,
++    )
++    sharded_state_dict = apply_peft_adapter_filter_to_state_dict(sharded_state_dict, peft)
++
++    checkpoint_path = str(adapter_checkpoint_path)
++    if load_strategy is None:
++        load_strategy = get_default_load_sharded_strategy(checkpoint_path)
++        if pg_collection is None and fully_parallel_load:
++            try:
++                pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["dp_cp"])
++            except AssertionError:
++                pg_collection = None
++        dp_cp_group = _get_process_group(pg_collection, "dp_cp")
++        if fully_parallel_load and dp_cp_group is not None:
++            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy, dp_cp_group)
++
++    loaded_state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_path, load_strategy)
++    for vpp_rank, model_chunk in enumerate(model_chunks):
++        model_key = "model" if len(model_chunks) == 1 else f"model{vpp_rank}"
++        if model_key not in loaded_state_dict:
++            if len(model_chunks) == 1:
++                fallback_model_key = next((key for key in loaded_state_dict if key.startswith("model")), None)
++                if fallback_model_key is not None:
++                    model_key = fallback_model_key
++                else:
++                    raise KeyError(
++                        "Expected adapter checkpoint to contain a top-level 'model' or 'model*' key, "
++                        f"but found keys: {list(loaded_state_dict.keys())}"
++                    )
++            else:
++                expected_model_keys = [f"model{rank}" for rank in range(len(model_chunks))]
++                raise KeyError(
++                    f"Expected adapter checkpoint to contain top-level key {model_key!r} "
++                    f"for virtual pipeline model chunk {vpp_rank} "
++                    f"(expected keys: {expected_model_keys}), "
++                    f"but found keys: {list(loaded_state_dict.keys())}"
++                )
++        model_chunk.load_state_dict(loaded_state_dict[model_key], strict=strict)
++
++
++def _model_state_dict(
++    model: ModelList,
++    model_sd_kwargs: Mapping[str, object] | None = None,
++    ckpt_format: str = "torch_dist",
++    pg_collection: ProcessGroupCollection | None = None,
++) -> dict[str, Any]:
++    """Generate Bridge model checkpoint sections for an external trainer."""
++    from megatron.bridge.training.checkpointing import _generate_model_state_dict
++
++    return _generate_model_state_dict(
++        model,
++        dict(model_sd_kwargs or {}),
++        ckpt_format,
++        pg_collection=pg_collection,
++    )
++
++
++def _ensure_model_list(model: ModelList | MegatronModule) -> ModelList:
++    return model if isinstance(model, list) else [model]
++
++
++def _get_process_group(pg_collection: ProcessGroupCollection | None, *names: str) -> object | None:
++    """Return the first named process group available on a collection."""
++
++    if pg_collection is None:
++        return None
++    for name in names:
++        group = getattr(pg_collection, name, None)
++        if group is not None:
++            return group
++    return None
+diff --git a/megatron/core/context_parallel_layout.py b/megatron/core/context_parallel_layout.py
+new file mode 100644
+index 0000000..c287ffb
+--- /dev/null
++++ b/megatron/core/context_parallel_layout.py
+@@ -0,0 +1,699 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++"""Context parallel tensor layout helpers."""
++
++from contextlib import contextmanager
++from typing import Any, List, NamedTuple, Optional, Tuple
++
++import torch
++
++from megatron.core.tensor_parallel import all_to_all
++
++_THD_CP_ROUTE_ATTRS = {
++    ("zigzag", "contiguous"): "cp_partition_route_zigzag_to_contiguous",
++    ("contiguous", "zigzag"): "cp_partition_route_contiguous_to_zigzag",
++}
++
++
++@contextmanager
++def _cp_layout_nvtx_range(message: str):
++    active = torch.cuda.is_available()
++    if active:
++        torch.cuda.nvtx.range_push(message)
++    try:
++        yield
++    finally:
++        if active:
++            torch.cuda.nvtx.range_pop()
++
++
++def get_thd_context_parallel_rank_indices(
++    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
++) -> torch.Tensor:
++    """Return global THD token indices owned by one CP rank in a layout.
++
++    Args:
++        cu_seqlens: Global packed-sequence cumulative lengths before CP partitioning.
++        cp_size: Context-parallel group size.
++        cp_rank: Context-parallel rank.
++        layout: Either ``"zigzag"`` or ``"contiguous"``.
++
++    The returned indices are ordered exactly as the rank-local THD tensor is stored.
++    ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
++    partitions the flattened packed THD buffer into rank-contiguous spans.
++    """
++    if layout not in ("zigzag", "contiguous"):
++        raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
++    if cp_size < 1:
++        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
++    if not 0 <= cp_rank < cp_size:
++        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
++    if cu_seqlens.dim() != 1:
++        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
++
++    cu = cu_seqlens.to(dtype=torch.long)
++    if cu.numel() == 0 or cu[0].item() != 0:
++        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
++
++    if torch.any(torch.diff(cu) < 0):
++        raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
++
++    nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
++    nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
++    cu = cu[nonduplicate_boundaries]
++
++    total_tokens = int(cu[-1].item())
++    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
++    if total_tokens == 0:
++        return positions
++
++    seq_lens = torch.diff(cu)
++    chunk_divisor = 2 * cp_size
++    if torch.any(seq_lens % chunk_divisor != 0):
++        raise ValueError(
++            "All packed sequence lengths must be divisible by "
++            f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
++            f"got {seq_lens}."
++        )
++
++    if layout == "contiguous":
++        part_len = total_tokens // cp_size
++        rank_start = cp_rank * part_len
++        return positions[rank_start : rank_start + part_len]
++
++    seq_idx = torch.bucketize(positions, cu[1:], right=True)
++    global_starts = cu[:-1]
++    pos_in_seq = positions - global_starts[seq_idx]
++    chunk_lens = (seq_lens // chunk_divisor)[seq_idx]
++    chunk = pos_in_seq // chunk_lens
++    offset = pos_in_seq - chunk * chunk_lens
++
++    owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
++    local_slot = torch.where(chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk))
++
++    local_starts = (global_starts // cp_size)[seq_idx]
++    local_pos = local_starts + local_slot * chunk_lens + offset
++
++    rank_mask = owner == cp_rank
++    rank_positions = positions[rank_mask]
++    rank_local_pos = local_pos[rank_mask]
++    return rank_positions[torch.argsort(rank_local_pos)]
++
++
++class ThdCpPartitionRoute(NamedTuple):
++    """Everything one THD zigzag<->contiguous all-to-all needs, precomputed.
++
++    ``send_rows`` / ``recv_rows`` are ``None`` when the permutation on that side is
++    the identity, which lets the swap skip the gather/scatter entirely.
++    The first six fields are exactly what #5664's ``decode_thd_cp_partition_route()``
++    returns; see :func:`build_thd_cp_partition_route` for why the encoded tensor form is
++    not used here. ``cu_seqlens``, the layout pair and ``cp_size`` / ``cp_rank`` are
++    Relax-only additions carrying no computation -- they exist so a route cached on a
++    ``PackedSeqParams`` can prove it still describes the conversion being asked for.
++    """
++
++    local_source_length: int
++    local_target_length: int
++    send_rows: Optional[torch.Tensor]
++    recv_rows: Optional[torch.Tensor]
++    input_split_sizes: List[int]
++    output_split_sizes: List[int]
++    cu_seqlens: torch.Tensor
++    cu_seqlens_version: int
++    cp_size: int
++    cp_rank: int
++    source_layout: str
++    target_layout: str
++
++
++_ThdLayoutSegment = Tuple[int, int, int]
++
++
++def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
++    if cu_seqlens.dim() != 1:
++        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
++
++    cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
++    if not cu or cu[0] != 0:
++        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
++
++    compact_cu: List[int] = [cu[0]]
++    prev = cu[0]
++    for value in cu[1:]:
++        if value < prev:
++            raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
++        if value != prev:
++            compact_cu.append(value)
++        prev = value
++    return compact_cu
++
++
++def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
++    total_tokens = cu[-1]
++    if total_tokens % cp_size != 0:
++        raise ValueError(
++            f"Contiguous CP partitioning requires total_tokens={total_tokens} "
++            f"to be divisible by cp_size={cp_size}."
++        )
++
++    chunk_divisor = 2 * cp_size
++    bad_seq_lens = [
++        seq_end - seq_start
++        for seq_start, seq_end in zip(cu[:-1], cu[1:])
++        if (seq_end - seq_start) % chunk_divisor != 0
++    ]
++    if bad_seq_lens:
++        raise ValueError(
++            "All packed sequence lengths must be divisible by "
++            f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
++            f"got {bad_seq_lens}."
++        )
++
++
++def _build_thd_layout_segments(
++    cu: List[int], cp_size: int, cp_rank: int, layout: str
++) -> Tuple[List[_ThdLayoutSegment], int]:
++    """Describe a rank's THD partition as (global_start, length, local_start) runs.
++
++    Both layouts are unions of contiguous global spans, so the whole route can be
++    derived by intersecting spans instead of materialising per-token index tensors.
++    """
++    total_tokens = cu[-1]
++    if layout == "contiguous":
++        part_len = total_tokens // cp_size
++        if part_len == 0:
++            return [], 0
++        return [(cp_rank * part_len, part_len, 0)], part_len
++
++    if layout != "zigzag":
++        raise ValueError(
++            f"Unsupported context-parallel layout {layout!r} for THD layout segments "
++            f"with cp_size={cp_size}, rank={cp_rank}."
++        )
++
++    segments: List[_ThdLayoutSegment] = []
++    local_start = 0
++    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
++        seq_len = seq_end - seq_start
++        chunk_len = seq_len // (2 * cp_size)
++        first_chunk = cp_rank
++        second_chunk = 2 * cp_size - cp_rank - 1
++        segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
++        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
++        local_start += 2 * chunk_len
++
++    return segments, local_start
++
++
++def _intersect_thd_layout_segments(
++    source_segments: List[_ThdLayoutSegment], target_segments: List[_ThdLayoutSegment]
++) -> List[Tuple[int, int, int]]:
++    """Overlap two sorted segment lists into (source_row, target_row, length) runs."""
++    intersections: List[Tuple[int, int, int]] = []
++    source_index = 0
++    target_index = 0
++    while source_index < len(source_segments) and target_index < len(target_segments):
++        source_global_start, source_len, source_local_start = source_segments[source_index]
++        target_global_start, target_len, target_local_start = target_segments[target_index]
++        source_global_end = source_global_start + source_len
++        target_global_end = target_global_start + target_len
++
++        overlap_start = max(source_global_start, target_global_start)
++        overlap_end = min(source_global_end, target_global_end)
++        if overlap_start < overlap_end:
++            intersections.append(
++                (
++                    source_local_start + overlap_start - source_global_start,
++                    target_local_start + overlap_start - target_global_start,
++                    overlap_end - overlap_start,
++                )
++            )
++
++        if source_global_end <= target_global_end:
++            source_index += 1
++        else:
++            target_index += 1
++
++    return intersections
++
++
++def _append_range(rows: List[int], start: int, length: int) -> None:
++    rows.extend(range(start, start + length))
++
++
++def _row_list_is_identity(rows: List[int]) -> bool:
++    return all(row == index for index, row in enumerate(rows))
++
++
++def _thd_cp_partition_route_attr_name(source_layout: str, target_layout: str) -> str:
++    try:
++        return _THD_CP_ROUTE_ATTRS[(source_layout, target_layout)]
++    except KeyError as exc:
++        raise ValueError(
++            f"Unsupported CP layout conversion {source_layout!r} -> {target_layout!r} "
++            "for THD route."
++        ) from exc
++
++
++def build_thd_cp_partition_route(
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    *,
++    device: Optional[torch.device] = None,
++) -> ThdCpPartitionRoute:
++    """Precompute one THD CP layout conversion route.
++
++    The route depends only on packed sequence metadata, CP rank/size and the
++    source/target layouts, so it can be reused by every tensor with the same THD
++    sequence axis in the same microbatch. The whole derivation runs on CPU ints
++    after a single ``cu_seqlens`` transfer, which is what keeps the conversion
++    itself free of device-host synchronisation.
++
++    Deviation from #5664: upstream serialises the result into a single flat
++    ``torch.Tensor`` and decodes it again inside every conversion, so that the route
++    can be a CUDA-graph capture input. Decoding costs three device-to-host copies,
++    which on this path (~200 conversions per microbatch under full recompute) puts
++    back the synchronisation this route exists to remove, and Megatron's full-iteration
++    CUDA graph is rejected for THD layout conversion anyway. We therefore return the
++    decoded form directly -- the fields below are exactly upstream's
++    ``decode_thd_cp_partition_route()`` tuple. Revisit if GDN ever needs to run under
++    graph capture: the route tensors would then have to be stable capture inputs again.
++    """
++    _thd_cp_partition_route_attr_name(source_layout, target_layout)
++    if device is None:
++        device = cu_seqlens.device
++
++    with _cp_layout_nvtx_range(f"cp_layout/thd/route/{source_layout}_to_{target_layout}"):
++        cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
++        _validate_thd_route_partitioning(cu, cp_size)
++
++        source_segments_by_rank: List[List[_ThdLayoutSegment]] = []
++        source_lengths: List[int] = []
++        target_segments_by_rank: List[List[_ThdLayoutSegment]] = []
++        target_lengths: List[int] = []
++        for rank in range(cp_size):
++            source_segments, source_length = _build_thd_layout_segments(
++                cu, cp_size, rank, source_layout
++            )
++            target_segments, target_length = _build_thd_layout_segments(
++                cu, cp_size, rank, target_layout
++            )
++            source_segments_by_rank.append(source_segments)
++            source_lengths.append(source_length)
++            target_segments_by_rank.append(target_segments)
++            target_lengths.append(target_length)
++
++        local_source_segments = source_segments_by_rank[cp_rank]
++        local_target_segments = target_segments_by_rank[cp_rank]
++
++        send_rows_list: List[int] = []
++        input_split_sizes: List[int] = []
++        for dst_rank in range(cp_size):
++            intersections = _intersect_thd_layout_segments(
++                local_source_segments, target_segments_by_rank[dst_rank]
++            )
++            intersections.sort(key=lambda item: item[1])
++            input_split_size = 0
++            for source_row, _, length in intersections:
++                _append_range(send_rows_list, source_row, length)
++                input_split_size += length
++            input_split_sizes.append(input_split_size)
++
++        recv_rows_list: List[int] = []
++        output_split_sizes: List[int] = []
++        for src_rank in range(cp_size):
++            intersections = _intersect_thd_layout_segments(
++                source_segments_by_rank[src_rank], local_target_segments
++            )
++            intersections.sort(key=lambda item: item[1])
++            output_split_size = 0
++            for _, target_row, length in intersections:
++                _append_range(recv_rows_list, target_row, length)
++                output_split_size += length
++            output_split_sizes.append(output_split_size)
++
++        assert len(send_rows_list) == source_lengths[cp_rank]
++        assert len(recv_rows_list) == target_lengths[cp_rank]
++
++        send_rows = (
++            None
++            if _row_list_is_identity(send_rows_list)
++            else torch.tensor(send_rows_list, device=device, dtype=torch.long)
++        )
++        recv_rows = (
++            None
++            if _row_list_is_identity(recv_rows_list)
++            else torch.tensor(recv_rows_list, device=device, dtype=torch.long)
++        )
++        return ThdCpPartitionRoute(
++            local_source_length=source_lengths[cp_rank],
++            local_target_length=target_lengths[cp_rank],
++            send_rows=send_rows,
++            recv_rows=recv_rows,
++            input_split_sizes=input_split_sizes,
++            output_split_sizes=output_split_sizes,
++            cu_seqlens=cu_seqlens,
++            cu_seqlens_version=cu_seqlens._version,
++            cp_size=cp_size,
++            cp_rank=cp_rank,
++            source_layout=source_layout,
++            target_layout=target_layout,
++        )
++
++
++def _thd_cp_partition_route_is_reusable(
++    route: Optional[ThdCpPartitionRoute],
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    device: torch.device,
++) -> bool:
++    """A cached route is only valid for the exact packed boundaries it was built from.
++
++    ``cu_seqlens`` is matched on object identity *plus* autograd's version counter,
++    never on value: a value comparison would itself be a device-host synchronisation,
++    which is precisely what the route exists to avoid. Identity alone would not survive
++    a caller that refills a preallocated boundary buffer in place -- a pattern that
++    already exists elsewhere in Megatron -- so the version counter, which every in-place
++    op bumps (views share the counter with their base) and which costs a plain Python
++    attribute read, closes that hole. The one case neither check sees is a write that
++    bypasses the dispatcher entirely, e.g. through ``data_ptr()``.
++    """
++    if route is None:
++        return False
++    if route.cu_seqlens is not cu_seqlens:
++        return False
++    if route.cu_seqlens_version != cu_seqlens._version:
++        return False
++    if route.cp_size != cp_size or route.cp_rank != cp_rank:
++        return False
++    if route.source_layout != source_layout or route.target_layout != target_layout:
++        return False
++    rows = route.send_rows if route.send_rows is not None else route.recv_rows
++    return rows is None or rows.device == device
++
++
++def get_thd_cp_partition_route(
++    packed_seq_params: Optional[Any],
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    *,
++    device: Optional[torch.device] = None,
++) -> ThdCpPartitionRoute:
++    """Return this microbatch's route, building and caching it on first use.
++
++    Packed boundaries change every microbatch, so the cache is attached to the
++    ``PackedSeqParams`` instance the forward was handed and is only reused while it
++    still describes the very same ``cu_seqlens`` tensor. Every GDN layer in a
++    microbatch, plus its recompute replay, shares one build.
++
++    Deviation from #5664: upstream expects the routes to have been prebuilt by the data
++    pipeline, so its lookup is a bare ``getattr`` and the build-on-miss path emits a
++    ``FutureWarning``. Here build-on-miss is the intended path -- the object a GDN
++    forward receives is not necessarily the one the data pipeline created, because the
++    Bridge/VLM path can repack ``PackedSeqParams`` after embedding -- so there is
++    nothing to warn about, and the cache instead has to defend itself against reuse
++    across microbatches and against dynamic CP changing ``cp_size``/``cp_rank`` between
++    microbatches on the same module. Callers that do own the final object can still
++    prebuild eagerly via :func:`prebuild_thd_cp_partition_routes`.
++    """
++    if device is None:
++        device = cu_seqlens.device
++    attr_name = _thd_cp_partition_route_attr_name(source_layout, target_layout)
++    cached = getattr(packed_seq_params, attr_name, None) if packed_seq_params is not None else None
++    if _thd_cp_partition_route_is_reusable(
++        cached, cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device
++    ):
++        return cached
++
++    route = build_thd_cp_partition_route(
++        cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device=device
++    )
++    if packed_seq_params is not None:
++        setattr(packed_seq_params, attr_name, route)
++    return route
++
++
++def prebuild_thd_cp_partition_routes(
++    packed_seq_params: Optional[Any],
++    cp_group: Optional[torch.distributed.ProcessGroup] = None,
++    cu_seqlens: Optional[torch.Tensor] = None,
++    *,
++    device: Optional[torch.device] = None,
++) -> None:
++    """Eagerly populate both THD CP layout routes for a packed microbatch."""
++    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
++        return
++    if cp_group is None:
++        cp_group = getattr(packed_seq_params, "cp_group", None)
++    if cp_group is None or cp_group.size() <= 1:
++        return
++    if cu_seqlens is None:
++        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
++        if cu_seqlens is None:
++            cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
++    if cu_seqlens is None:
++        return
++
++    for source_layout, target_layout in _THD_CP_ROUTE_ATTRS:
++        get_thd_cp_partition_route(
++            packed_seq_params,
++            cu_seqlens,
++            cp_group.size(),
++            cp_group.rank(),
++            source_layout,
++            target_layout,
++            device=device,
++        )
++
++
++def zigzag_to_contiguous_chunks(
++    x: torch.Tensor,
++    cp_group: torch.distributed.ProcessGroup,
++    seq_dim: int = 0,
++    cu_seqlens: Optional[torch.Tensor] = None,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
++) -> torch.Tensor:
++    """Permute CP chunks from Megatron zigzag layout to contiguous-time layout.
++
++    SBHD tensors have two equal chunks per rank along ``seq_dim`` and use a
++    chunk-level all-to-all. THD tensors pass global ``cu_seqlens`` and use one
++    packed-token all-to-all over the whole local THD tensor.
++    """
++    if cu_seqlens is not None:
++        return _zigzag_contiguous_thd_swap(
++            x,
++            cp_group,
++            seq_dim,
++            cu_seqlens,
++            source_layout="zigzag",
++            target_layout="contiguous",
++            thd_cp_partition_route=thd_cp_partition_route,
++        )
++    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
++
++
++def contiguous_to_zigzag_chunks(
++    x: torch.Tensor,
++    cp_group: torch.distributed.ProcessGroup,
++    seq_dim: int = 0,
++    cu_seqlens: Optional[torch.Tensor] = None,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
++) -> torch.Tensor:
++    """Inverse of :func:`zigzag_to_contiguous_chunks`."""
++    if cu_seqlens is not None:
++        return _zigzag_contiguous_thd_swap(
++            x,
++            cp_group,
++            seq_dim,
++            cu_seqlens,
++            source_layout="contiguous",
++            target_layout="zigzag",
++            thd_cp_partition_route=thd_cp_partition_route,
++        )
++    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
++
++
++def _pack_thd_cp_route_send_buffer(
++    x: torch.Tensor, local_source_length: int, send_rows: Optional[torch.Tensor]
++) -> torch.Tensor:
++    if local_source_length == 0:
++        return x.narrow(0, 0, 0)
++    if send_rows is None:
++        return x
++    return x.index_select(0, send_rows)
++
++
++def _scatter_thd_cp_route_recv_buffer(
++    recv_buf: torch.Tensor, recv_rows: Optional[torch.Tensor], out_shape: Tuple[int, ...]
++) -> torch.Tensor:
++    if recv_rows is None:
++        return recv_buf
++    out = recv_buf.new_empty(out_shape)
++    if recv_rows.numel() > 0:
++        out.index_copy_(0, recv_rows, recv_buf)
++    return out
++
++
++def _zigzag_contiguous_thd_swap(
++    x: torch.Tensor,
++    cp_group: Optional[torch.distributed.ProcessGroup],
++    seq_dim: int,
++    cu_seqlens: torch.Tensor,
++    source_layout: str,
++    target_layout: str,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
++) -> torch.Tensor:
++    """Single-all-to-all THD permutation between zigzag and contiguous layouts.
++
++    The packed THD tensor stays packed: we first group local tokens by their
++    target CP rank, exchange those groups once, then scatter received tokens
++    back into the target rank-local order. Which rows go where is described by a
++    :class:`ThdCpPartitionRoute` the caller should have precomputed once for the
++    microbatch; without one this rebuilds it, which is correct but pays the build
++    on every conversion.
++    """
++    cp_size = cp_group.size() if cp_group is not None else 1
++    if cp_size == 1:
++        return x
++    cp_rank = cp_group.rank()
++
++    conversion_name = f"{source_layout}_to_{target_layout}"
++    with _cp_layout_nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
++        if seq_dim != 0:
++            x = x.movedim(seq_dim, 0)
++        x = x.contiguous()
++
++        route = thd_cp_partition_route
++        if not _thd_cp_partition_route_is_reusable(
++            route, cu_seqlens, cp_size, cp_rank, source_layout, target_layout, x.device
++        ):
++            route = build_thd_cp_partition_route(
++                cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device=x.device
++            )
++
++        if x.size(0) != route.local_source_length:
++            raise ValueError(
++                f"Local THD tensor length ({x.size(0)}) does not match {source_layout} "
++                f"rank-{cp_rank} partition length ({route.local_source_length})."
++            )
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
++            send_buf = _pack_thd_cp_route_send_buffer(x, route.local_source_length, route.send_rows)
++            if not send_buf.is_contiguous():
++                send_buf = send_buf.contiguous()
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
++            recv_buf = all_to_all(
++                cp_group, send_buf, route.output_split_sizes, route.input_split_sizes
++            )
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
++            out_shape = (route.local_target_length,) + tuple(x.shape[1:])
++            out = _scatter_thd_cp_route_recv_buffer(recv_buf, route.recv_rows, out_shape)
++
++        if seq_dim != 0:
++            out = out.movedim(0, seq_dim)
++        return out.contiguous()
++
++
++def _zigzag_contiguous_chunk_swap(
++    x: torch.Tensor,
++    cp_group: Optional[torch.distributed.ProcessGroup],
++    seq_dim: int,
++    to_contiguous: bool,
++) -> torch.Tensor:
++    """Single-all-to-all chunk permutation between zigzag and contiguous layouts.
++
++    Each rank holds exactly two chunks along ``seq_dim``. The mapping from
++    local (rank, slot) to (rank, slot) in the target layout is deterministic
++    and depends only on ``cp_size`` and ``cp_rank``, so we pack send data in
++    destination-rank order and use one ``all_to_all_single`` with unequal
++    splits to route each chunk to its target rank.
++    """
++    cp_size = cp_group.size() if cp_group is not None else 1
++    if cp_size == 1:
++        return x
++    cp_rank = cp_group.rank()
++
++    # Work with seq_dim at position 0.
++    if seq_dim != 0:
++        x = x.movedim(seq_dim, 0)
++    x = x.contiguous()
++
++    seq_len_local = x.size(0)
++    assert seq_len_local % 2 == 0, (
++        f"zigzag/contiguous chunk swap requires an even local sequence length, "
++        f"got {seq_len_local}."
++    )
++    chunk_len = seq_len_local // 2
++
++    def _rank_to_chunks(rank: int, in_zigzag: bool) -> Tuple[int, int]:
++        """Global chunk indices at (slot 0, slot 1) for this rank."""
++        if in_zigzag:
++            return (rank, 2 * cp_size - rank - 1)
++        return (2 * rank, 2 * rank + 1)
++
++    def _chunk_to_dest(chunk_idx: int, target_zigzag: bool) -> Tuple[int, int]:
++        """Destination (rank, slot) for a given global chunk index in the target layout."""
++        if target_zigzag:
++            if chunk_idx < cp_size:
++                return chunk_idx, 0
++            return 2 * cp_size - chunk_idx - 1, 1
++        return chunk_idx // 2, chunk_idx % 2
++
++    source_in_zigzag = to_contiguous
++    target_in_zigzag = not to_contiguous
++
++    local_chunk_indices = _rank_to_chunks(cp_rank, source_in_zigzag)
++    local_dests = [_chunk_to_dest(c, target_in_zigzag) for c in local_chunk_indices]
++
++    # Pack the send buffer so chunks are ordered by (dst_rank, dst_slot).
++    local_slot_order = sorted(range(2), key=lambda s: local_dests[s])
++    local_chunks = [x[:chunk_len], x[chunk_len:]]
++    send_buf = torch.cat([local_chunks[s] for s in local_slot_order], dim=0).contiguous()
++
++    input_split_chunks = [0] * cp_size
++    for dst_rank, _ in local_dests:
++        input_split_chunks[dst_rank] += 1
++
++    # Mirror every source rank's packing logic so we know which received chunk
++    # belongs in which local target slot.
++    output_split_chunks = [0] * cp_size
++    recv_dst_slots_per_source: List[List[int]] = [[] for _ in range(cp_size)]
++    for src in range(cp_size):
++        src_chunks = _rank_to_chunks(src, source_in_zigzag)
++        src_dests = [_chunk_to_dest(c, target_in_zigzag) for c in src_chunks]
++        src_slot_order = sorted(range(2), key=lambda s: src_dests[s])
++        for s in src_slot_order:
++            dst_rank, dst_slot = src_dests[s]
++            if dst_rank == cp_rank:
++                output_split_chunks[src] += 1
++                recv_dst_slots_per_source[src].append(dst_slot)
++
++    input_split_sizes = [n * chunk_len for n in input_split_chunks]
++    output_split_sizes = [n * chunk_len for n in output_split_chunks]
++
++    recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
++
++    # Reassemble local chunks in target-layout slot order.
++    target_slots: List[Optional[torch.Tensor]] = [None, None]
++    offset = 0
++    for src in range(cp_size):
++        for dst_slot in recv_dst_slots_per_source[src]:
++            target_slots[dst_slot] = recv_buf[offset : offset + chunk_len]
++            offset += chunk_len
++    assert all(t is not None for t in target_slots), "Incomplete chunk reassembly in CP swap"
++
++    out = torch.cat(target_slots, dim=0)
++    if seq_dim != 0:
++        out = out.movedim(0, seq_dim)
++    return out.contiguous()
+diff --git a/megatron/core/dist_checkpointing/strategies/torch.py b/megatron/core/dist_checkpointing/strategies/torch.py
+index 58e1e56..abe561d 100644
+--- a/megatron/core/dist_checkpointing/strategies/torch.py
++++ b/megatron/core/dist_checkpointing/strategies/torch.py
+@@ -501,10 +501,12 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
+     def _validate_global_shapes(self, metadata, sharded_tensors):
+         for sh_ten in sharded_tensors:
+             if sh_ten.key not in metadata.state_dict_metadata:
+-                raise KeyError(
+-                    f"{sh_ten.key} from model not in state dict:"
+-                    f" {sorted(metadata.state_dict_metadata.keys())}"
+-                )
++                # raise KeyError(
++                #     f"{sh_ten.key} from model not in state dict:"
++                #     f" {sorted(metadata.state_dict_metadata.keys())}"
++                # )
++                print(f"{sh_ten.key} from model not in state dict, will skip")
++                continue
+             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
+             expected_shape = sh_ten.global_shape
+             if loaded_shape != expected_shape:
+@@ -528,7 +530,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
+         tensor_metadata = self.metadata.state_dict_metadata
+         metadata_with_sizes = [
+             (tensor_metadata[key], tensor_metadata[key].size, sharded_tensor)
+-            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items()
++            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items() if key in tensor_metadata
+         ]
+         try:
+             # Temporarily set sizes to expected shapes
+@@ -865,6 +867,7 @@ class TorchDistLoadShardedStrategy:
+             planner=MCoreLoadPlanner(
+                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
++                allow_partial_load=True,
+                 flatten_state_dict=False,
+                 flatten_sharded_tensors=False,
+             ),
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+index 2a82a1e..5441f93 100644
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -836,6 +836,7 @@ class TELinear(te.pytorch.Linear):
+         self.te_quant_params: Optional[TEQuantizationParams] = None
+ 
+         for param in self.parameters():
++            setattr(param, "parallel_mode", parallel_mode)
+             if is_expert:
+                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
+                 setattr(param, "allreduce", not self.expert_parallel)
+@@ -1671,6 +1672,61 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
+ 
+ 
+ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
++    def ceil_div(x: int, y: int) -> int:
++        return (x + y - 1) // y
++
++    class _FakeInt4QuantizationSTE(torch.autograd.Function):
++        @staticmethod
++        def forward(ctx, x, group_size):
++            m, n = x.shape
++            block_size_m, block_size_n = 1, group_size
++
++
++            m_padded = ceil_div(m, block_size_m) * block_size_m
++            n_padded = ceil_div(n, block_size_n) * block_size_n
++
++            x_padded = torch.zeros(
++                (m_padded, n_padded),
++                dtype=x.dtype, device=x.device
++            )
++            x_padded[:m, :n] = x
++
++            x_view = x_padded.view(
++                m_padded // block_size_m,
++                block_size_m,
++                n_padded // block_size_n,
++                block_size_n
++            )
++
++            x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
++            q_max = 7
++            x_scale = x_max / q_max
++
++            x_scale = x_scale.clamp(min=1e-5)
++
++            x_div = x_view / x_scale
++            x_round = torch.round(x_div)
++
++            x_q_clamped = x_round.clamp(-q_max, q_max)
++
++            x_dequant_view = x_q_clamped * x_scale
++
++            x_dequant_full = x_dequant_view.view_as(x_padded)
++            x_out = x_dequant_full[:m, :n].contiguous().to(x.dtype)
++
++            return x_out
++
++        @staticmethod
++        def backward(ctx, grad_output):
++            return grad_output, None
++
++    def fake_int4_quantization_ste(x, group_size):
++        x_out = _FakeInt4QuantizationSTE.apply(x, group_size)
++        
++        if hasattr(x, 'main_grad'):
++            x_out.main_grad = x.main_grad
++            
++        return x_out
+ 
+     class TEGroupedLinear(te.pytorch.GroupedLinear):
+         """
+@@ -1913,6 +1969,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+                             "amax_history_bwd": torch.cat(
+                                 [state["amax_history_bwd"].view(-1, 1) for state in state_list],
+                                 dim=1,
++
+                             ).view(self.fp8_meta["recipe"].amax_history_len, -1),
+                         }
+                     )
+@@ -1990,6 +2047,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+                 return out
+             return out, None
+ 
++        def _get_weight_tensors(self):
++            """Get the weight tensors of the module."""
++            weight_tensors = super()._get_weight_tensors()
++
++            if os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
++                group_size = int(os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
++
++                weight_tensors = [
++                    fake_int4_quantization_ste(w, group_size) 
++                    for w in weight_tensors
++                ]
++                
++            return weight_tensors
++
+         def _encode_extra_state(self, state):
+             # TE 2.0 changed the format of extra_state to be a byte tensor
+             if is_te_min_version("2.0.0"):
+diff --git a/megatron/core/fusions/fused_mla_yarn_rope_apply.py b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
+index 1fd5dcf..c9aeef1 100644
+--- a/megatron/core/fusions/fused_mla_yarn_rope_apply.py
++++ b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
+@@ -385,6 +385,7 @@ def rotary_fwd_kv_kernel(
+     SIN,
+     emb_dim: tl.constexpr,
+     k_dim: tl.constexpr,
++    k_dim_ceil: tl.constexpr,
+     v_dim: tl.constexpr,
+     head_num: tl.constexpr,
+     batch_size,
+@@ -434,21 +435,27 @@ def rotary_fwd_kv_kernel(
+     cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+     sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
+ 
+-    KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
+-    kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
+-    mask = kv_off < head_num * stride_kv_nheads
+-    k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
+-    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
+-    k = tl.load(KV_ptr + k_in_off, mask=mask)
+-    v = tl.load(KV_ptr + v_in_off, mask=mask)
++    KV_ptr = KV + pid_m * stride_kv_seq # + pid_head * BLOCK_H * stride_kv_nheads
++    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
++    kj_range = tl.arange(0, k_dim_ceil)[None, :]
++    mask_k = (ki_range < head_num) & (kj_range < k_dim)
++    mask_v = ki_range < head_num
++    k_off = ki_range * stride_kv_nheads + kj_range
++    if v_dim > 0:
++        v_off = ki_range * stride_kv_nheads + k_dim + tl.arange(0, v_dim)[None, :]
++        v = tl.load(KV_ptr + v_off, mask=mask_v)
++    else:
++        v = tl.zeros((BLOCK_H, 1), dtype=KV.dtype.element_ty)
++    k = tl.load(KV_ptr + k_off, mask=mask_k)
+ 
+-    K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
+-    V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
++    K_ptr = O_KEY + pid_m * stride_k_seq # + pid_head * BLOCK_H * stride_k_nheads
++    V_ptr = O_VALUE + pid_m * stride_v_seq # + pid_head * BLOCK_H * stride_v_nheads
+ 
+-    k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
+-    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
+-    tl.store(K_ptr + k_out_off, k, mask=mask)
+-    tl.store(V_ptr + v_out_off, v, mask=mask)
++    k_out_off = ki_range * stride_k_nheads + kj_range
++    tl.store(K_ptr + k_out_off, k, mask=mask_k)
++    if v_dim > 0:
++        v_out_off = ki_range * stride_v_nheads + tl.arange(0, v_dim)[None, :]
++        tl.store(V_ptr + v_out_off, v, mask=mask_v)
+ 
+     EMB = K_POS_EMB + pid_m * stride_emb_seq
+     # x1 = t[..., 0::2], x2 = t[..., 1::2]
+@@ -460,14 +467,16 @@ def rotary_fwd_kv_kernel(
+     x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+     x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
+ 
++    x_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
++    mask_x = x_range < head_num
+     x_left_off = (
+-        tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
++        x_range * stride_k_nheads
+         + k_dim
+         + tl.arange(0, emb_dim // 2)[None, :]
+     )
+     x_right_off = x_left_off + emb_dim // 2
+-    tl.store(K_ptr + x_left_off, x_left, mask=mask)
+-    tl.store(K_ptr + x_right_off, x_right, mask=mask)
++    tl.store(K_ptr + x_left_off, x_left, mask=mask_x)
++    tl.store(K_ptr + x_right_off, x_right, mask=mask_x)
+ 
+ 
+ @triton.autotune(
+@@ -493,6 +502,7 @@ def rotary_bwd_kv_kernel(
+     SIN,
+     emb_dim: tl.constexpr,
+     k_dim: tl.constexpr,
++    k_dim_ceil: tl.constexpr,
+     v_dim: tl.constexpr,
+     head_num: tl.constexpr,
+     batch_size,
+@@ -533,27 +543,32 @@ def rotary_bwd_kv_kernel(
+     else:
+         token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
+ 
+-    dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
+-    dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
+-    mask = dkv_off < head_num * stride_dkv_nheads
+-    dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
+-    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+-
+-    dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
+-    dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
+-    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
+-    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
+-    dk = tl.load(dK_ptr + dk_in_off, mask=mask)
+-    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
+-    tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
+-    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
++    dKV_ptr = dKV + pid_m * stride_dkv_seq # + pid_head * BLOCK_H * stride_dkv_nheads
++    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H 
++    kj_range = tl.arange(0, k_dim_ceil)[None, :]
++    mask_k = (ki_range < head_num) & (kj_range < k_dim)
++    mask_v = ki_range < head_num
++    dk_out_off = ki_range * stride_dkv_nheads + kj_range
++
++    dK_ptr = dK + pid_m * stride_dk_seq # + pid_head * BLOCK_H * stride_dk_nheads
++    dV_ptr = dV + pid_m * stride_dv_seq # + pid_head * BLOCK_H * stride_dv_nheads
++    dk_in_off = ki_range * stride_dk_nheads + kj_range
++
++    dk = tl.load(dK_ptr + dk_in_off, mask=mask_k)
++    tl.store(dKV_ptr + dk_out_off, dk, mask=mask_k)
++    
++    if v_dim > 0:
++        dv_out_off = ki_range * stride_dkv_nheads + k_dim + tl.arange(0, v_dim)[None, :]
++        dv_in_off = ki_range * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
++        dv = tl.load(dV_ptr + dv_in_off, mask=mask_v)
++        tl.store(dKV_ptr + dv_out_off, dv, mask=mask_v)
+ 
+     if pid_head == 0:
+         x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
+         x_right_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
+         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
+-            dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
+-            x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
++            dK_ptr = dK + pid_m * stride_dk_seq # + i * BLOCK_H * stride_dk_nheads
++            x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim + i * BLOCK_H * stride_dk_nheads
+             mask = x_off < head_num * stride_dk_nheads
+             x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
+             x_right_off = x_left_off + emb_dim // 2
+@@ -632,6 +647,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
+ 
+         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
+         o_value = kv.new_empty(total_seqlen, nheads, v_dim)
++        k_dim_ceil = triton.next_power_of_2(k_dim)
+ 
+         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+         rotary_fwd_kv_kernel[grid](
+@@ -643,6 +659,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
+             sin,
+             emb_dim,
+             k_dim,
++            k_dim_ceil,
+             v_dim,
+             nheads,
+             batch_size,
+@@ -700,6 +717,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
+ 
+         d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
+         d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
++        k_dim_ceil = triton.next_power_of_2(ctx.k_dim)
+ 
+         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
+         rotary_bwd_kv_kernel[grid](
+@@ -711,6 +729,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
+             sin,
+             ctx.emb_dim,
+             ctx.k_dim,
++            k_dim_ceil,
+             ctx.v_dim,
+             nheads,
+             batch_size,
+diff --git a/megatron/core/inference/contexts/dynamic_context.py b/megatron/core/inference/contexts/dynamic_context.py
+index 3ff370f..21858ea 100644
+--- a/megatron/core/inference/contexts/dynamic_context.py
++++ b/megatron/core/inference/contexts/dynamic_context.py
+@@ -57,7 +57,8 @@ except ImportError:
+ try:
+     from torch_memory_saver import torch_memory_saver
+ 
+-    torch_memory_saver.hook_mode = "torch"
++    # Commented out: breaks SGLang CUDA graph (requires hook_mode="preload")
++    # torch_memory_saver.hook_mode = "torch"
+     HAVE_TORCH_MEMORY_SAVER = True
+ except ImportError:
+     HAVE_TORCH_MEMORY_SAVER = False
+diff --git a/megatron/core/models/gpt/gpt_layer_specs.py b/megatron/core/models/gpt/gpt_layer_specs.py
+index 92d561c..d4f62cb 100755
+--- a/megatron/core/models/gpt/gpt_layer_specs.py
++++ b/megatron/core/models/gpt/gpt_layer_specs.py
+@@ -189,6 +189,8 @@ def get_gpt_layer_with_transformer_engine_submodules(
+     enable_hyper_connection: bool = False,
+     mla_down_proj_fusion: bool = False,
+     dense_grouped_gemm: bool = False,
++    post_self_attn_layernorm: bool = False,
++    post_mlp_layernorm: bool = False,
+ ) -> TransformerLayerSubmodules:
+     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
+     training).
+@@ -282,9 +284,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
+                     ),
+                 ),
+                 self_attn_bda=get_bias_dropout_add,
++                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
+                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                 mlp=mlp,
+                 mlp_bda=get_bias_dropout_add,
++                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
+                 sharded_state_dict_keys_map=(
+                     {
+                         "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+@@ -314,10 +318,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
+             ),
+             self_attn_bda=get_bias_dropout_add,
+             self_attention_hyper_connection=hc_module,
++            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
+             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
+             mlp=mlp,
+             mlp_bda=get_bias_dropout_add,
+             mlp_hyper_connection=hc_module,
++            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
+         )
+     else:
+         qk_norm = backend.layer_norm(for_qk=True)
+@@ -339,10 +345,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
+             ),
+             self_attn_bda=get_bias_dropout_add,
+             self_attention_hyper_connection=hc_module,
++            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
+             pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
+             mlp=mlp,
+             mlp_bda=get_bias_dropout_add,
+             mlp_hyper_connection=hc_module,
++            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
+             sharded_state_dict_keys_map={
+                 "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                 "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index 19de0ed..52156a2 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -31,6 +31,7 @@ from megatron.core.transformer.multi_token_prediction import (
+     MultiTokenPredictionBlock,
+     mtp_on_this_rank,
+     process_mtp_loss,
++    roll_tensor,
+ )
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.transformer.transformer_block import TransformerBlock
+@@ -506,6 +507,7 @@ class GPTModel(LanguageModule):
+         loss_mask: Optional[Tensor] = None,
+         padding_mask: Optional[Tensor] = None,
+         is_spec_decode: Optional[bool] = None,
++        mtp_kwargs: Optional[dict] = {},
+     ) -> Tensor:
+         """Forward function of the GPT Model This function passes the input tensors
+         through the embedding layer, and then the decoder and finally into the post
+@@ -585,6 +587,7 @@ class GPTModel(LanguageModule):
+             extra_block_kwargs=extra_block_kwargs,
+             inference_context=inference_context,
+             is_spec_decode=is_spec_decode,
++            mtp_kwargs=mtp_kwargs,
+         )
+ 
+     def _postprocess(
+@@ -607,6 +610,7 @@ class GPTModel(LanguageModule):
+         extra_block_kwargs=None,
+         inference_context=None,
+         is_spec_decode=None,
++        mtp_kwargs={},
+     ):
+         """Postprocesses decoder hidden states to generate logits or compute loss.
+ 
+@@ -631,7 +635,27 @@ class GPTModel(LanguageModule):
+         output_weight = None
+         if self.share_embeddings_and_output_weights:
+             output_weight = self.shared_embedding_or_output_weight()
+-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
++            if output_weight is not None:
++                output_weight = output_weight.detach()
++        mtp_labels = labels
++        if mtp_kwargs is not None and mtp_kwargs.get("mtp_labels", None) is not None:
++            mtp_labels = mtp_kwargs["mtp_labels"]
++            mtp_labels, _ = roll_tensor(
++                mtp_labels,
++                shifts=-1,
++                dims=-1,
++                cp_group=self.pg_collection.cp,
++                packed_seq_params=packed_seq_params,
++            )
++            if loss_mask is not None:
++                loss_mask, _ = roll_tensor(
++                    loss_mask,
++                    shifts=-1,
++                    dims=-1,
++                    cp_group=self.pg_collection.cp,
++                    packed_seq_params=packed_seq_params,
++                )
++        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode) and mtp_labels is not None:
+             hidden_states = self.mtp(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+@@ -660,7 +684,7 @@ class GPTModel(LanguageModule):
+                 # In training/eval, use the utility function for processing MTP loss/scaling.
+                 hidden_states = process_mtp_loss(
+                     hidden_states=hidden_states,
+-                    labels=labels,
++                    labels=mtp_labels,
+                     loss_mask=loss_mask,
+                     output_layer=self.output_layer,
+                     output_weight=output_weight,
+diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+index c87ccd5..8572db4 100644
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -249,6 +249,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
+         return cpu_optimizers
+ 
+     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
++        import warnings
++        warnings.warn(
++            "CPU offload optimizer init can be very slow (potentially minutes) for "
++            "large MoE models due to per-parameter pinned-memory allocation and H2D copies."
++        )
+         params = []
+         for group in self.param_groups:
+             params.extend(group["params"])
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index 4430a8c..084389b 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -706,6 +706,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
+                 # align the step across param groups.
+                 param_group["step"] = int(step)
++            if "step" in param_group and param_group["step"] is None:
++                del param_group["step"]
+ 
+         # Grad scaler state.
+         if self.grad_scaler:
+@@ -1771,6 +1773,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                                 # separately via param_groups, not as part of the gradient buffer.
+                                 tensors[key] = LocalNonpersistentObject(tensors[key])
+                                 continue
++                            if key == 'step':
++                                continue
+                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
+                                 tensors[key].shape,
+                                 gbuf_local_start,
+diff --git a/megatron/core/packed_seq_params.py b/megatron/core/packed_seq_params.py
+index 322f12a..21f43ca 100644
+--- a/megatron/core/packed_seq_params.py
++++ b/megatron/core/packed_seq_params.py
+@@ -64,3 +64,17 @@ class PackedSeqParams:
+                 .to(torch.int32)
+                 .unsqueeze(0)  # Add a batch dimension
+             )
++
++
++def resolve_cp_group(
++    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
++) -> dist.ProcessGroup:
++    """Return the dynamic CP group from packed_seq_params when available, else the static one.
++
++    Dynamic CP assigns a per-microbatch CP group that may differ from the
++    process-group stored at model construction time. This helper centralises
++    the resolution logic used by GPTModel, GatedDeltaNet, and MTP layers.
++    """
++    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
++        return packed_seq_params.cp_group
++    return static_cp_group
+diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
+index 863b5d5..6c81e6e 100644
+--- a/megatron/core/parallel_state.py
++++ b/megatron/core/parallel_state.py
+@@ -11,6 +11,7 @@ from typing import Callable, List, Optional
+ 
+ import numpy as np
+ import torch
++import torch.distributed as dist
+ 
+ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+ 
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index 465e83f..232caef 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -232,34 +232,26 @@ class P2PCommunicator:
+                 group=self.pp_group,
+             )
+         else:
+-            ops = []
+-            if send_prev_shape_tensor is not None:
+-                send_prev_op = torch.distributed.P2POp(
+-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
+-                )
+-                ops.append(send_prev_op)
+-            if recv_prev_shape_tensor is not None:
+-                recv_prev_op = torch.distributed.P2POp(
+-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
+-                )
+-                ops.append(recv_prev_op)
+-            if send_next_shape_tensor is not None:
+-                send_next_op = torch.distributed.P2POp(
+-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
+-                )
+-                ops.append(send_next_op)
+-            if recv_next_shape_tensor is not None:
+-                recv_next_op = torch.distributed.P2POp(
+-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
+-                )
+-                ops.append(recv_next_op)
+-            if len(ops) > 0:
+-                reqs = torch.distributed.batch_isend_irecv(ops)
+-                for req in reqs:
+-                    req.wait()
++            # PR #5271 (Megatron-LM): shape exchange MUST use _p2p_ops rather than
++            # batch_isend_irecv. batch_isend_irecv is one tagless NCCL group; when
++            # pp_group.size()==2, prev_rank == next_rank (single physical peer) and
++            # same-peer ops pair FIFO by enqueue order. Both ranks build ops in the
++            # same fixed order but hold opposite prev/next roles → recv_prev_shape
++            # and recv_next_shape get silently crossed. _p2p_ops handles size==2
++            # via the group.WORLD split + even/odd ordering, correct for size>=4 too.
++            reqs = _p2p_ops(
++                tensor_send_prev=send_prev_shape_tensor,
++                tensor_recv_prev=recv_prev_shape_tensor,
++                tensor_send_next=send_next_shape_tensor,
++                tensor_recv_next=recv_next_shape_tensor,
++                group=self.pp_group,
++                prev_pipeline_rank=self.prev_rank,
++                next_pipeline_rank=self.next_rank,
++            )
++            for req in reqs.values():
++                req.wait()
+ 
+-            # To protect against race condition when using batch_isend_irecv().
+-            # should take this out once the bug with batch_isend_irecv is resolved.
++            # keep the CUDA sync as a defensive measure — cheap for 3-int64 tensors.
+             torch.cuda.synchronize()
+ 
+         recv_prev_shape = [0, 0, 0]
+@@ -371,6 +363,11 @@ class P2PCommunicator:
+                 return []
+ 
+             p2p_func = _ring_exchange_wrapper
++        elif self.pp_group.size() == 2:
++            # PR #5271 (Megatron-LM): size==2 has same-peer (prev_rank == next_rank);
++            # batch_isend_irecv cannot pair same-peer bidirectional ops correctly (see
++            # #1450). Force _p2p_ops which handles this via WORLD split + even/odd order.
++            p2p_func = _p2p_ops
+         elif config.batch_p2p_comm:
+             assert wait_on_reqs
+             p2p_func = _batched_p2p_ops
+@@ -381,10 +378,12 @@ class P2PCommunicator:
+         next_rank = self.next_rank
+         prev_rank = self.prev_rank
+ 
+-        if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+-            reqs = []
+-        else:
++        # reqs init must match p2p_func return type: _p2p_ops returns dict,
++        # _batched_p2p_ops + _ring_exchange_wrapper return list.
++        if p2p_func is _p2p_ops:
+             reqs = {}
++        else:
++            reqs = []
+ 
+         tensor_recv_prev = None
+         tensor_recv_next = None
+diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
+index 8df4df1..e41d55f 100644
+--- a/megatron/core/ssm/gated_delta_net.py
++++ b/megatron/core/ssm/gated_delta_net.py
+@@ -14,12 +14,17 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from torch import Tensor
+ 
++from megatron.core.context_parallel_layout import (
++    contiguous_to_zigzag_chunks,
++    get_thd_cp_partition_route,
++    zigzag_to_contiguous_chunks,
++)
+ from megatron.core.dist_checkpointing import ShardedTensor
+ from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+ from megatron.core.fp8_utils import get_fp8_align_size
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.jit import jit_fuser
+-from megatron.core.packed_seq_params import PackedSeqParams
++from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.ssm.mamba_context_parallel import (
+     _all_to_all_cp2hp,
+@@ -42,6 +47,7 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
+ try:
+     from fla.modules.convolution import causal_conv1d
+     from fla.modules.l2norm import l2norm
++    from fla.ops.cp import build_cp_context
+     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+ 
+     HAVE_FLA = True
+@@ -233,6 +239,15 @@ class GatedDeltaNet(MegatronModule):
+             tp_group=self.pg_collection.tp,
+         )
+ 
++        # Cache for chunkwise-CP contexts consumed by FLA kernels. Rebuilding these
++        # per-forward is unsafe under CUDA graph capture because build_cp_context
++        # allocates fresh tensors whose pointers get baked into the captured graph.
++        # For non-packed (SBHD) input the cu_seqlens is fully determined by the
++        # (static) global sequence length and batch size, so the context is cached on
++        # both values. Packed (THD) input rebuilds per micro-batch because the packed
++        # boundaries change every step.
++        self._chunkwise_cp_context_cache = {}
++
+         self.reset_parameters()
+ 
+     def reset_parameters(self):
+@@ -265,6 +280,7 @@ class GatedDeltaNet(MegatronModule):
+         packed_seq_params: Optional[PackedSeqParams] = None,
+         sequence_len_offset: Optional[int] = None,
+         *,
++        pg_collection: Optional[ProcessGroupCollection] = None,
+         inference_params: Optional[BaseInferenceContext] = None,
+         **kwargs,
+     ):
+@@ -288,8 +304,63 @@ class GatedDeltaNet(MegatronModule):
+ 
+         inference_context = deprecate_inference_params(inference_context, inference_params)
+ 
++        # Bridge repacking may replace PackedSeqParams. Validate the object received
++        # by every GDN forward; group.size() is local metadata and needs no collective.
++        if packed_seq_params is not None:
++            dynamic_cp_group = getattr(packed_seq_params, "cp_group", None)
++            local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
++            if (dynamic_cp_group is None) != (local_cp_size is None):
++                raise ValueError(
++                    "PackedSeqParams.cp_group and local_cp_size must either both be set "
++                    "or both be None."
++                )
++            if dynamic_cp_group is not None and local_cp_size != dynamic_cp_group.size():
++                raise ValueError(
++                    f"PackedSeqParams.local_cp_size ({local_cp_size}) does not match "
++                    f"cp_group.size() ({dynamic_cp_group.size()})."
++                )
++        base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
++        cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
++        cp_size = cp_group.size() if cp_group is not None else 1
++
++        # Route the resolved group to exactly one CP algorithm. The unused path gets
++        # None/size 1, which makes its existing divisions and collectives no-ops.
++        if cp_size == 1:
++            cp_group_headwise = cp_group
++            cp_size_headwise = 1
++            cp_group_chunkwise = None
++            cp_size_chunkwise = 1
++        elif self.config.linear_cp_mode == "headwise":
++            cp_group_headwise = cp_group
++            cp_size_headwise = cp_size
++            cp_group_chunkwise = None
++            cp_size_chunkwise = 1
++        elif self.config.linear_cp_mode == "chunkwise":
++            cp_group_headwise = None
++            cp_size_headwise = 1
++            cp_group_chunkwise = cp_group
++            cp_size_chunkwise = cp_size
++        elif self.config.linear_cp_mode == "all_gather":
++            raise RuntimeError(
++                "linear_cp_mode='all_gather' is implemented by the Relax GatedDeltaNet "
++                "wrapper, not by Megatron. Reaching this forward with cp_size="
++                f"{cp_size} means the wrapper was not installed."
++            )
++        else:
++            raise ValueError(
++                f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; expected "
++                "'headwise', 'chunkwise' or 'all_gather'. 'auto' must be resolved to a "
++                "concrete mode before the model is constructed."
++            )
++
+         seq_len, batch, _ = hidden_states.shape
+-        seq_len = seq_len * self.sp_size * self.cp_size
++        # Sequence length seen by the conv / scan kernels: headwise CP turns the
++        # sequence split into a head split and so restores the full sequence;
++        # chunkwise CP keeps this rank's time slice.
++        seq_len_post_headwise = seq_len * self.sp_size * cp_size_headwise
++        # Sequence length described by the global (pre-CP-split) cu_seqlens.
++        seq_len_global = seq_len_post_headwise * cp_size_chunkwise
++        seq_len = seq_len_post_headwise
+ 
+         if inference_context is not None:
+             assert (
+@@ -299,53 +370,103 @@ class GatedDeltaNet(MegatronModule):
+             # TODO: support inference
+             raise NotImplementedError("GDN does not support inference for now.")
+ 
+-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
++        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
++        if is_thd:
+             assert batch == 1, "Packed sequence expects batch dimension to be 1"
+             assert (
+                 not self.config.deterministic_mode
+             ), "Packed sequence does not support deterministic mode."
+ 
+-            # Resolve cu_seqlens with alignment padding handling.
+-            cu_seqlens_q = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_q_padded,
+-                packed_seq_params.cu_seqlens_q,
+-                seq_len,
+-                "cu_seqlens_q",
+-            )
+-            cu_seqlens_kv = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_kv_padded,
+-                packed_seq_params.cu_seqlens_kv,
+-                seq_len,
+-                "cu_seqlens_kv",
+-            )
+-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+-            )
+-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
+-            assert num_packed_seqs > 0, (
+-                "Number of packed sequences must be greater than 0, "
+-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            # Resolve cu_seqlens with alignment padding handling. These are the *global*
++            # (pre-CP-split) boundaries in both CP modes, taken from the PackedSeqParams
++            # this forward was handed -- for the Bridge/VLM unsplit path that is the
++            # post-embedding, post-repack object, so no stale boundary can leak in.
++            cu_seqlens_q, cu_seqlens_kv = self._resolve_thd_cu_seqlens(
++                packed_seq_params, seq_len_global, cp_size
+             )
+         else:
+             cu_seqlens_q = None
+             cu_seqlens_kv = None
+ 
++        if cp_size_chunkwise > 1:
++            # Chunkwise CP runs through the FLA CP kernels only; the torch-native
++            # reference scan used by deterministic mode has no cp_context path.
++            if self.config.deterministic_mode:
++                raise ValueError(
++                    "GDN chunkwise CP does not support deterministic_mode: the torch-native "
++                    "reference scan has no CP context. Use linear_cp_mode='headwise'."
++                )
++            if not is_thd and batch > 1:
++                raise ValueError(
++                    "GDN chunkwise CP with SBHD inputs requires micro_batch_size == 1 because "
++                    "the FLA gated delta rule backend needs a single batch dimension when "
++                    "cp_context is used. Use packed THD input or micro_batch_size=1."
++                )
++
++        # Build the chunkwise CP context once per forward. It carries this rank's *local*
++        # cu_seqlens plus the neighbour bookkeeping the FLA kernels need in order to
++        # exchange conv boundary tokens and chunk-boundary states.
++        cu_seqlens_q, chunkwise_cp_context = self._build_chunkwise_cp_context(
++            cp_group_chunkwise, cp_size_chunkwise, cu_seqlens_q, seq_len_global, batch
++        )
++
++        # Both zigzag <-> contiguous conversions below are pure functions of the packed
++        # boundaries and the CP group, so resolve them once here and let every GDN layer
++        # of this micro-batch (and its recompute replay) reuse the same routes.
++        route_to_contiguous = None
++        route_to_zigzag = None
++        if cp_size_chunkwise > 1 and is_thd:
++            route_to_contiguous = get_thd_cp_partition_route(
++                packed_seq_params,
++                cu_seqlens_q,
++                cp_size_chunkwise,
++                cp_group_chunkwise.rank(),
++                "zigzag",
++                "contiguous",
++                device=hidden_states.device,
++            )
++            route_to_zigzag = get_thd_cp_partition_route(
++                packed_seq_params,
++                cu_seqlens_q,
++                cp_size_chunkwise,
++                cp_group_chunkwise.rank(),
++                "contiguous",
++                "zigzag",
++                device=hidden_states.device,
++            )
++
+         # Input projection
+         nvtx_range_push(suffix="in_proj")
+         qkvzba, _ = self.in_proj(hidden_states)
+         nvtx_range_pop(suffix="in_proj")
+ 
++        # Chunkwise CP expects the contiguous-time layout (rank r owns global chunks
++        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule, because that is the
++        # partition fla.ops.cp.build_cp_context assumes. Megatron hands us the
++        # zigzag attention-load-balanced layout (rank r owns [r, 2*cp-r-1]), so reshuffle
++        # over the CP group with a single all-to-all. No full-sequence gather, and the
++        # tensor stays sharded 1/cp throughout.
++        if cp_size_chunkwise > 1:
++            nvtx_range_push(suffix="zigzag_to_contiguous")
++            qkvzba = zigzag_to_contiguous_chunks(
++                qkvzba,
++                cp_group_chunkwise,
++                seq_dim=0,
++                cu_seqlens=cu_seqlens_q if is_thd else None,
++                thd_cp_partition_route=route_to_contiguous,
++            )
++            nvtx_range_pop(suffix="zigzag_to_contiguous")
++
+         # CP All to All: CP to HP
+-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
++        if cp_size_headwise > 1 and is_thd:
++            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size_headwise, dim=0)
+             outputs = []
+             for qkvzba_i in unpacked_qkvzba:
+                 qkvzba_i = tensor_a2a_cp2hp(
+                     qkvzba_i,
+                     seq_dim=0,
+                     head_dim=-1,
+-                    cp_group=self.pg_collection.cp,
++                    cp_group=cp_group_headwise,
+                     split_sections=[
+                         self.qk_dim_local_tp,
+                         self.qk_dim_local_tp,
+@@ -357,12 +478,12 @@ class GatedDeltaNet(MegatronModule):
+                 )
+                 outputs.append(qkvzba_i)
+             qkvzba = torch.cat(outputs, dim=0)
+-        else:
++        elif cp_size_headwise > 1:
+             qkvzba = tensor_a2a_cp2hp(
+                 qkvzba,
+                 seq_dim=0,
+                 head_dim=-1,
+-                cp_group=self.pg_collection.cp,
++                cp_group=cp_group_headwise,
+                 split_sections=[
+                     self.qk_dim_local_tp,
+                     self.qk_dim_local_tp,
+@@ -381,10 +502,10 @@ class GatedDeltaNet(MegatronModule):
+         qkv, gate, beta, alpha = torch.split(
+             qkvzba,
+             [
+-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
+-                self.v_dim_local_tp // self.cp_size,
+-                self.num_value_heads // self.tp_size // self.cp_size,
+-                self.num_value_heads // self.tp_size // self.cp_size,
++                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
++                self.v_dim_local_tp // cp_size_headwise,
++                self.num_value_heads // self.tp_size // cp_size_headwise,
++                self.num_value_heads // self.tp_size // cp_size_headwise,
+             ],
+             dim=-1,
+         )
+@@ -403,14 +524,14 @@ class GatedDeltaNet(MegatronModule):
+         conv1d_weight = get_parameter_local_cp(
+             self.conv1d.weight,
+             dim=0,
+-            cp_group=self.pg_collection.cp,
++            cp_group=cp_group_headwise,
+             split_sections=qkv_channels_split_sections,
+         )
+         conv1d_bias = (
+             get_parameter_local_cp(
+                 self.conv1d.bias,
+                 dim=0,
+-                cp_group=self.pg_collection.cp,
++                cp_group=cp_group_headwise,
+                 split_sections=qkv_channels_split_sections,
+             )
+             if self.conv_bias
+@@ -425,7 +546,7 @@ class GatedDeltaNet(MegatronModule):
+                 stride=self.conv1d.stride,
+                 padding=self.conv1d.padding,
+                 dilation=self.conv1d.dilation,
+-                groups=self.conv_dim_local_tp // self.cp_size,
++                groups=self.conv_dim_local_tp // cp_size_headwise,
+             )
+             qkv = self.act_fn(conv_out[..., :seq_len])
+             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+@@ -439,22 +560,22 @@ class GatedDeltaNet(MegatronModule):
+                 initial_state=None,
+                 output_final_state=False,
+                 cu_seqlens=cu_seqlens_q,
++                cp_context=chunkwise_cp_context,
+             )
+         nvtx_range_pop(suffix="conv1d")
+ 
+         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
+         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
+-        query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+-            qkv, gate, beta, alpha, batch, seq_len
+-        )
++        with torch._dynamo.config.patch(disable=True):
++            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
++                qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=cp_size_headwise
++            )
+         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+ 
+         # Calculate g and beta
+         nvtx_range_push(suffix="g_and_beta")
+-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+-        dt_bias_local_cp = get_parameter_local_cp(
+-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
+-        )
++        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
++        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
+         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
+         nvtx_range_pop(suffix="g_and_beta")
+ 
+@@ -469,6 +590,7 @@ class GatedDeltaNet(MegatronModule):
+             output_final_state=False,
+             use_qk_l2norm_in_kernel=False,
+             cu_seqlens=cu_seqlens_q,
++            cp_context=chunkwise_cp_context,
+         )
+         nvtx_range_pop(suffix="gated_delta_rule")
+ 
+@@ -482,19 +604,32 @@ class GatedDeltaNet(MegatronModule):
+         norm_out = norm_out.reshape(batch, seq_len, -1)
+         norm_out = norm_out.transpose(0, 1).contiguous()
+ 
++        # Inverse of the zigzag -> contiguous reshuffle done before conv1d, so the layers
++        # after GDN and the loss see the layout they expect.
++        if cp_size_chunkwise > 1:
++            nvtx_range_push(suffix="contiguous_to_zigzag")
++            norm_out = contiguous_to_zigzag_chunks(
++                norm_out,
++                cp_group=cp_group_chunkwise,
++                seq_dim=0,
++                cu_seqlens=cu_seqlens_q if is_thd else None,
++                thd_cp_partition_route=route_to_zigzag,
++            )
++            nvtx_range_pop(suffix="contiguous_to_zigzag")
++
+         # CP all to all: HP to CP
+-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
++        if cp_size_headwise > 1 and is_thd:
+             unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+             outputs = []
+             for norm_out_i in unpacked_norm_out:
+                 norm_out_i = tensor_a2a_hp2cp(
+-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
++                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise
+                 )
+                 outputs.append(norm_out_i)
+             norm_out = torch.cat(outputs, dim=0)
+-        else:
++        elif cp_size_headwise > 1:
+             norm_out = tensor_a2a_hp2cp(
+-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
++                norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_headwise
+             )
+ 
+         # Output projection
+@@ -504,6 +639,48 @@ class GatedDeltaNet(MegatronModule):
+ 
+         return out, out_bias
+ 
++    def _build_chunkwise_cp_context(
++        self, cp_group_chunkwise, cp_size_chunkwise, cu_seqlens_q, seq_len_global, batch
++    ):
++        """Build (or fetch from cache) the FLA chunkwise-CP context for this forward.
++
++        ``build_cp_context`` takes the *global* cu_seqlens plus the CP group and derives,
++        for this rank: its local cu_seqlens, whether it holds the first / last chunk of
++        each sequence, how many ranks it must receive state from, and how many conv
++        boundary tokens to pull from the previous rank. That is the entire cross-rank
++        contract of chunkwise CP.
++        """
++        if cp_size_chunkwise <= 1:
++            return cu_seqlens_q, None
++
++        if cu_seqlens_q is not None:
++            return cu_seqlens_q, build_cp_context(
++                cu_seqlens=cu_seqlens_q,
++                group=cp_group_chunkwise,
++                conv1d_kernel_size=self.conv_kernel_dim,
++            )
++
++        # Non-packed (SBHD) input: cu_seqlens is fully determined by the static global
++        # sequence length and batch size, so cache both the generated boundaries and
++        # context. Rebuilding either every forward breaks CUDA graph replay.
++        cache_key = (seq_len_global, batch)
++        cached = self._chunkwise_cp_context_cache.get(cache_key)
++        if cached is None:
++            cached_cu_seqlens = (
++                torch.arange(batch + 1, device=torch.cuda.current_device(), dtype=torch.long)
++                * seq_len_global
++            )
++            cached = (
++                cached_cu_seqlens,
++                build_cp_context(
++                    cu_seqlens=cached_cu_seqlens,
++                    group=cp_group_chunkwise,
++                    conv1d_kernel_size=self.conv_kernel_dim,
++                ),
++            )
++            self._chunkwise_cp_context_cache[cache_key] = cached
++        return cached
++
+     @jit_fuser
+     def _apply_gated_norm(self, x, gate):
+         # Output Norm
+@@ -517,15 +694,23 @@ class GatedDeltaNet(MegatronModule):
+         return y
+ 
+     @jit_fuser
+-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
++    def _prepare_qkv_for_gated_delta_rule(
++        self, qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise: Optional[int] = None
++    ):
+         """
+         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
+         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
++
++        ``cp_size_headwise`` is how many CP ranks the heads were split across; it is 1 for
++        chunkwise CP, where all TP-local heads stay on the rank. Defaults to
++        ``self.cp_size`` so pre-existing callers keep working unchanged.
+         """
++        if cp_size_headwise is None:
++            cp_size_headwise = self.cp_size
+         # Split qkv into query_key and value
+         query_key, value = torch.split(
+             qkv,
+-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
++            [2 * self.qk_dim_local_tp // cp_size_headwise, self.v_dim_local_tp // cp_size_headwise],
+             dim=-1,
+         )
+ 
+@@ -538,7 +723,7 @@ class GatedDeltaNet(MegatronModule):
+             query_key = l2norm(query_key.contiguous())
+ 
+         # Split query and key
+-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
++        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
+         query, key = torch.split(query_key, [split_size, split_size], dim=2)
+ 
+         # Expand query and key if needed (grouped query attention)
+@@ -567,7 +752,67 @@ class GatedDeltaNet(MegatronModule):
+         beta = beta.sigmoid()
+         return g, beta
+ 
+-    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
++    def _resolve_thd_cu_seqlens(self, packed_seq_params, seq_len_global, cp_size):
++        """Resolve and validate this micro-batch's global THD boundaries, once.
++
++        Every GDN layer is handed the same ``PackedSeqParams``, so the checks below --
++        each of which reads a device tensor from Python and therefore stalls on the
++        GPU -- only need to run for the first layer that asks. The result is cached on
++        the ``PackedSeqParams`` instance and reused while it still describes the very
++        same boundary tensors, mirroring how the CP layout routes are cached.
++
++        A cached result is reused only when all four source tensors are still the same
++        objects *and* none of them has been written in place. Identity alone would not
++        notice a caller refilling a preallocated boundary buffer, so autograd's version
++        counter -- which every in-place op bumps, and which costs a plain Python
++        attribute read -- is checked as well. Comparing values instead would reintroduce
++        the device-host sync this cache exists to remove.
++        """
++        sources = (
++            packed_seq_params.cu_seqlens_q_padded,
++            packed_seq_params.cu_seqlens_q,
++            packed_seq_params.cu_seqlens_kv_padded,
++            packed_seq_params.cu_seqlens_kv,
++        )
++        versions = tuple(None if t is None else t._version for t in sources)
++        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
++        if cached is not None:
++            cached_meta, cached_sources, cached_versions, cached_value = cached
++            if (
++                cached_meta == (seq_len_global, cp_size)
++                and all(a is b for a, b in zip(cached_sources, sources))
++                and cached_versions == versions
++            ):
++                return cached_value
++
++        cu_seqlens_q = self._resolve_cu_seqlens(
++            sources[0], sources[1], seq_len_global, "cu_seqlens_q", cp_size=cp_size
++        )
++        cu_seqlens_kv = self._resolve_cu_seqlens(
++            sources[2], sources[3], seq_len_global, "cu_seqlens_kv", cp_size=cp_size
++        )
++        assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++            "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++        num_packed_seqs = cu_seqlens_q.shape[0] - 1
++        assert num_packed_seqs > 0, (
++            "Number of packed sequences must be greater than 0, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++
++        resolved = (cu_seqlens_q, cu_seqlens_kv)
++        packed_seq_params._gdn_resolved_cu_seqlens = (
++            (seq_len_global, cp_size),
++            sources,
++            versions,
++            resolved,
++        )
++        return resolved
++
++    def _resolve_cu_seqlens(
++        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
++    ):
+         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+         if cu_seqlens_padded is not None:
+             cu_seqlens = cu_seqlens_padded
+@@ -582,6 +827,13 @@ class GatedDeltaNet(MegatronModule):
+                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+             )
+ 
++        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
++        if (seq_lengths % cp_size != 0).any():
++            raise ValueError(
++                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
++                f"but got lengths: {seq_lengths.tolist()}"
++            )
++
+         return cu_seqlens
+ 
+     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
+@@ -780,8 +1032,10 @@ def get_parameter_local_cp(
+         torch.Tensor: The local parameter for the current context parallel rank.
+     """
+ 
+-    cp_size = cp_group.size()
+-    cp_rank = cp_group.rank()
++    # A ``None`` group means "this CP algorithm is not active on this forward"
++    # (chunkwise CP keeps every TP-local head), i.e. behave as size 1.
++    cp_size = cp_group.size() if cp_group is not None else 1
++    cp_rank = cp_group.rank() if cp_group is not None else 0
+ 
+     # No need to split if CP size is 1.
+     if cp_size == 1:
+@@ -800,7 +1054,7 @@ def get_parameter_local_cp(
+     slices = [slice(None)] * param.dim()
+     dim_size = param.size(dim=dim)
+     slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
+-    param = param[slices]
++    param = param[tuple(slices)]
+     return param
+ 
+ 
+@@ -945,6 +1199,7 @@ def torch_chunk_gated_delta_rule(
+     output_final_state=False,
+     use_qk_l2norm_in_kernel=False,
+     cu_seqlens=None,
++    cp_context=None,
+ ):
+     # pylint: disable=line-too-long
+     '''
+@@ -957,6 +1212,9 @@ def torch_chunk_gated_delta_rule(
+     assert (
+         cu_seqlens is None
+     ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
++    assert (
++        cp_context is None
++    ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
+ 
+     initial_dtype = query.dtype
+     if use_qk_l2norm_in_kernel:
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index 610700f..1ef4fee 100644
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -358,7 +358,14 @@ class LinearWithFrozenWeight(torch.autograd.Function):
+     def backward(ctx, grad_output):
+         """Backward with frozen weight."""
+         (weight,) = ctx.saved_tensors
+-        grad_input = grad_output.matmul(weight)
++        if grad_output.dim() > 2:
++            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
++            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
++            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
++            grad_input = grad_output_2d.matmul(weight)
++            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
++        else:
++            grad_input = grad_output.matmul(weight)
+ 
+         if ctx.allreduce_dgrad:
+             # All-reduce. Note: here async and sync are effectively the same.
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index d316d23..9bb6d2b 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -787,6 +787,9 @@ def topk_routing_with_score_function(
+                 scores, topk, num_groups, group_topk, _compute_topk
+             )
+ 
++    from relax.utils.training.routing_replay import get_routing_replay_compute_topk
++    compute_topk = get_routing_replay_compute_topk(compute_topk)
++
+     # Precision notes:
+     # - Logits are converted to fp32 for score functions.
+     # - All the intermediate calculations are in fp32.
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index b675d33..0cf3e00 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -216,6 +216,9 @@ class TopKRouter(Router):
+         if self.config.moe_enable_routing_replay:
+             self.router_replay = RouterReplay()
+ 
++        from relax.utils.training.routing_replay import register_routing_replay
++        register_routing_replay(self)
++
+     def _maintain_float32_expert_bias(self):
+         """
+         Maintain the expert bias in float32.
+diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
+index ba5018a..a900a7d 100755
+--- a/megatron/core/transformer/multi_token_prediction.py
++++ b/megatron/core/transformer/multi_token_prediction.py
+@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
+ 
+ import torch
+ from torch import Tensor
++import warnings
+ 
+ from megatron.core import InferenceParams, parallel_state, tensor_parallel
+ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+@@ -609,6 +610,31 @@ class MTPLossAutoScaler(torch.autograd.Function):
+         MTPLossAutoScaler.main_loss_backward_scale = scale
+ 
+ 
++def _call_output_layer_for_mtp_loss(
++    output_layer: Callable,
++    hidden_states: Tensor,
++    output_weight: Optional[Tensor],
++    runtime_gather_output: Optional[bool],
++    **kwargs,
++):
++    """Call the output layer without letting MTP loss update lm_head parameters."""
++    output_layer_params = {
++        name: param.detach() for name, param in output_layer.named_parameters()
++    }
++    output_layer_buffers = dict(output_layer.named_buffers())
++    detached_output_weight = output_weight.detach() if output_weight is not None else None
++    return torch.func.functional_call(
++        output_layer,
++        {**output_layer_params, **output_layer_buffers},
++        (hidden_states,),
++        {
++            "weight": detached_output_weight,
++            "runtime_gather_output": runtime_gather_output,
++            **kwargs,
++        },
++    )
++
++
+ def process_mtp_loss(
+     hidden_states: Tensor,
+     labels: Tensor,
+@@ -646,12 +672,12 @@ def process_mtp_loss(
+     Returns:
+         Tensor: Updated hidden states after MTP loss processing (first chunk only).
+     """
+-    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+-    hidden_states = hidden_states_list[0]
+-
+     if labels is None:
+         return hidden_states
+ 
++    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
++    hidden_states = hidden_states_list[0]
++
+     mtp_labels = labels.clone()
+     if loss_mask is None:
+         loss_mask = torch.ones_like(mtp_labels)
+@@ -672,27 +698,30 @@ def process_mtp_loss(
+             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+         )
+         if fuse_linear_cross_entropy:
+-            mtp_loss = output_layer(
++            mtp_loss = _call_output_layer_for_mtp_loss(
++                output_layer,
+                 hidden_states_list[mtp_layer_number + 1],
+-                weight=output_weight,
++                output_weight=output_weight,
+                 runtime_gather_output=runtime_gather_output,
+                 output_cross_entropy_loss=True,
+                 labels=mtp_labels,
+             )
+         else:
+-            mtp_logits, _ = output_layer(
++            mtp_logits, _ = _call_output_layer_for_mtp_loss(
++                output_layer,
+                 hidden_states_list[mtp_layer_number + 1],
+-                weight=output_weight,
++                output_weight=output_weight,
+                 runtime_gather_output=runtime_gather_output,
+             )
+             if scale_logits_fn is not None:
+                 mtp_logits = scale_logits_fn(mtp_logits)
+             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+         mtp_loss = loss_mask * mtp_loss
++        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+         if is_training:
+             # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
+             mtp_loss_for_log = (
+-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
++                mtp_loss_scale * torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+             ) / num_tokens.clamp(min=1)
+             MTPLossLoggingHelper.save_loss_to_tracker(
+                 mtp_loss_for_log,
+@@ -700,7 +729,6 @@ def process_mtp_loss(
+                 config.mtp_num_layers,
+                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+             )
+-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+         if config.calculate_per_token_loss:
+             # When calculate_per_token_loss is enabled, finalize_model_grads will
+             # divide all gradients by total_num_tokens (from main loss).
+@@ -891,17 +919,19 @@ class MultiTokenPredictionLayer(MegatronModule):
+             cp_group=self.cp_group,
+             packed_seq_params=packed_seq_params,
+         )
+-        position_ids, _ = roll_tensor(
+-            position_ids,
+-            shifts=-1,
+-            dims=-1,
+-            cp_group=self.cp_group,
+-            packed_seq_params=packed_seq_params,
+-        )
++        if position_ids is not None:
++            position_ids, _ = roll_tensor(
++                position_ids,
++                shifts=-1,
++                dims=-1,
++                cp_group=self.cp_group,
++                packed_seq_params=packed_seq_params,
++            )
+         # embedding
+         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
++        decoder_input = decoder_input.detach()
+ 
+-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
++        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=False)
+ 
+         return input_ids, position_ids, decoder_input, hidden_states
+ 
+@@ -1059,6 +1089,51 @@ class MultiTokenPredictionLayer(MegatronModule):
+         return hidden_states
+ 
+     def _checkpointed_forward(self, forward_func, *args, **kwargs):
++        """Wrap `forward_func` with activation checkpointing while only passing tensors.
++
++        Non-tensor arguments (e.g., configuration objects, None) are captured via closure so
++        that checkpoint implementations never receive them directly, avoiding save_for_backward
++        issues with non-tensor inputs.
++        """
++
++        # TODO(jiajun): Is there any better implementation here?
++        positional_specs = []
++        kw_specs = []
++        tensor_args: List[torch.Tensor] = []
++
++        for arg in args:
++            if torch.is_tensor(arg):
++                positional_specs.append(('tensor', len(tensor_args)))
++                tensor_args.append(arg)
++            else:
++                positional_specs.append(('const', arg))
++
++        for key, value in kwargs.items():
++            if torch.is_tensor(value):
++                kw_specs.append((key, ('tensor', len(tensor_args))))
++                tensor_args.append(value)
++            else:
++                kw_specs.append((key, ('const', value)))
++
++        def run(*flat_tensor_args):
++            rebuilt_args = []
++            for spec_type, payload in positional_specs:
++                if spec_type == 'tensor':
++                    rebuilt_args.append(flat_tensor_args[payload])
++                else:
++                    rebuilt_args.append(payload)
++
++            rebuilt_kwargs = {}
++            for key, (spec_type, payload) in kw_specs:
++                if spec_type == 'tensor':
++                    rebuilt_kwargs[key] = flat_tensor_args[payload]
++                else:
++                    rebuilt_kwargs[key] = payload
++
++            return forward_func(*rebuilt_args, **rebuilt_kwargs)
++
++        tensor_args_tuple = tuple(tensor_args)
++
+         def checkpoint_handler():
+             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+             if self.config.fp8:
+@@ -1069,12 +1144,11 @@ class MultiTokenPredictionLayer(MegatronModule):
+                     self.config.distribute_saved_activations,
+                     tensor_parallel.random.get_cuda_rng_tracker,
+                     parallel_state.get_tensor_model_parallel_group(),
+-                    *args,
+-                    **kwargs,
++                    *tensor_args_tuple,
+                 )
+             else:
+                 return tensor_parallel.checkpoint(
+-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
++                    run, self.config.distribute_saved_activations, *tensor_args_tuple
+                 )
+ 
+         if self.config.recompute_method == 'uniform':
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index cac634f..bcca610 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -244,6 +244,9 @@ class TransformerConfig(ModelParallelConfig):
+     attention_output_gate: bool = False
+     """Whether to apply output gate to the attention layers."""
+ 
++    post_self_attn_layernorm: bool = False
++    post_mlp_layernorm: bool = False
++
+     test_mode: bool = False
+     """Whether to run real-time tests."""
+ 
+@@ -314,6 +317,32 @@ class TransformerConfig(ModelParallelConfig):
+     linear_num_value_heads: Optional[int] = 32
+     """Number of value and gate heads for the gated delta net."""
+ 
++    linear_cp_mode: Optional[str] = "headwise"
++    """Context-parallel execution mode for linear-attention layers (e.g. Gated Delta Net).
++    Independent of `cp_comm_type`, which only controls standard attention.
++
++    This is a *static* setting: it is fixed before the model is constructed and is read by
++    both the construction-time head-divisibility check below and by `GatedDeltaNet.forward`.
++    It must not be rewritten during training -- dynamic context parallelism varies only the
++    CP group and its size, never the CP algorithm.
++
++    "headwise": Ulysses-style. An all-to-all turns the sequence split into a head split, so
++    each rank scans the *full* sequence for `num_heads / (tp * cp)` heads. Requires
++    `linear_num_{key,value}_heads % (tp * cp) == 0`.
++    "chunkwise": Each rank keeps a contiguous *time* slice and all TP-local heads, and the
++    CP-aware FLA kernels (`causal_conv1d` / `chunk_gated_delta_rule` with an `fla.ops.cp`
++    context) exchange only conv boundary tokens and chunk-boundary state summaries. Requires
++    `linear_num_{key,value}_heads % tp == 0` only.
++    "all_gather": Relax-only. Declares that a Relax wrapper implements CP by gathering the
++    full sequence and running a duplicated scan on every CP rank. Megatron's own
++    `GatedDeltaNet.forward` does not implement it and raises if it is ever reached with
++    cp_size > 1, so a missing wrapper fails fast instead of running the wrong algorithm.
++    Uses the same TP-only head rule as "chunkwise", which is what makes non-divisible
++    geometries constructible.
++
++    Upstream Megatron-LM defaults this to "chunkwise"; Relax keeps "headwise" so that
++    upgrading the image never silently reroutes an existing recipe."""
++
+     ####################
+     # initialization
+     ####################
+@@ -1242,15 +1271,24 @@ class TransformerConfig(ModelParallelConfig):
+                     f"linear_num_key_heads ({self.linear_num_key_heads})."
+                 )
+ 
+-            # Check tensor parallelism compatibility
+-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+-            assert self.linear_num_key_heads % tp_cp_size == 0, (
++            # Check tensor parallelism compatibility. Headwise CP splits linear-attention
++            # heads across CP ranks; chunkwise CP and the Relax all-gather fallback keep all
++            # TP-local heads on every CP rank, so they only need TP divisibility.
++            assert self.linear_cp_mode in ("headwise", "chunkwise", "all_gather"), (
++                f"linear_cp_mode must be one of 'headwise', 'chunkwise' or 'all_gather', got "
++                f"{self.linear_cp_mode!r}. It is a static setting resolved before model "
++                f"construction; 'auto' must already have been resolved by the caller."
++            )
++            linear_head_parallel_size = self.tensor_model_parallel_size
++            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
++                linear_head_parallel_size *= self.context_parallel_size
++            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
+                 f"{self.linear_num_key_heads=} must be a multiple of "
+-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
++                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+             )
+-            assert self.linear_num_value_heads % tp_cp_size == 0, (
++            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
+                 f"{self.linear_num_value_heads=} must be a multiple of "
+-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
++                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+             )
+         elif self.experimental_attention_variant == "dsa":
+             pass
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index ee20545..2ba4d06 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -245,6 +245,7 @@ class TransformerLayerSubmodules:
+     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+     self_attention: Union[ModuleSpec, type] = IdentityOp
+     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
++    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+ 
+     pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
+     cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+@@ -255,6 +256,7 @@ class TransformerLayerSubmodules:
+     mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
+     mlp: Union[ModuleSpec, type] = IdentityOp
+     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
++    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+ 
+     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
+     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+@@ -352,6 +354,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+         # [Module 3: BiasDropoutFusion]
+         self.self_attn_bda = build_module(submodules.self_attn_bda)
+ 
++        self.post_self_attn_layernorm = build_module(
++            submodules.post_self_attn_layernorm,
++            config=self.config,
++            hidden_size=self.config.hidden_size,
++            eps=self.config.layernorm_epsilon,
++        )
++
+         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
+         self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
+             config=self.config,
+@@ -418,6 +427,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+ 
+         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+ 
++        self.post_mlp_layernorm = build_module(
++            submodules.post_mlp_layernorm,
++            config=self.config,
++            hidden_size=self.config.hidden_size,
++            eps=self.config.layernorm_epsilon
++        )
++
+         self.recompute_input_layernorm = False
+         self.recompute_pre_mlp_layernorm = False
+         self.recompute_mlp = False
+@@ -638,6 +654,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+                 attention_output_with_bias[0]
+             )
+ 
++        attention_output, attention_output_bias = attention_output_with_bias
++        attention_output = self.post_self_attn_layernorm(attention_output)
++        attention_output_with_bias = (attention_output, attention_output_bias)
++
+         # TODO: could we move `bias_dropout_add_exec_handler` itself
+         # inside the module provided in the `bias_dropout_add_spec` module?
+         nvtx_range_push(suffix="self_attn_bda")
+@@ -823,6 +843,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+                 self._set_fc2_residual(residual)
+             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+ 
++        mlp_output, mlp_output_bias = mlp_output_with_bias
++        mlp_output = self.post_mlp_layernorm(mlp_output)
++        mlp_output_with_bias = (mlp_output, mlp_output_bias)
++
+         nvtx_range_pop(suffix="mlp")
+ 
+         if (
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 62f6e44..c25969b 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1992,6 +1992,9 @@ def core_transformer_config_from_args(args, config_class=None):
+ 
+     kw_args['inference_sampling_seed'] = args.seed
+ 
++    kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
++    kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
++
+     # handle quantization config
+     # NOTE: Kitchen arguments are only added to the namespace when
+     # Kitchen library is available.
+@@ -2475,7 +2478,7 @@ def _add_network_size_args(parser):
+         '--position-embedding-type',
+         type=str,
+         default='learned_absolute',
+-        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
++        choices=['learned_absolute', 'rope', 'yarn', 'mrope', 'relative', 'none'],
+         help='Position embedding type.',
+     )
+     group.add_argument(
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index a0817e8..7cd094d 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -222,7 +222,9 @@ from megatron.training.utils import (
+ try:
+     from torch_memory_saver import torch_memory_saver
+ 
+-    torch_memory_saver.hook_mode = "torch"
++    # NOTE(wuhuan): keep the default hook mode; forcing "torch" triggers
++    # 'torch.AcceleratorError: CUDA error: invalid argument' on weight updates.
++    # torch_memory_saver.hook_mode = "torch"
+     HAVE_TORCH_MEMORY_SAVER = True
+ except ImportError:
+     HAVE_TORCH_MEMORY_SAVER = False

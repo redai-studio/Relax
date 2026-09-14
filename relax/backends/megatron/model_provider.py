@@ -252,6 +252,7 @@ def get_model_provider_func(
             "pipeline_model_parallel_size",
             "virtual_pipeline_model_parallel_size",
             "context_parallel_size",
+            "linear_cp_mode",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",

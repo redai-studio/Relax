@@ -303,14 +303,6 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    # Relax the Megatron GDN head-vs-(tp*cp) config gate down to (tp) BEFORE the model
-    # provider finalizes the TransformerConfig (get_model_provider_func below triggers
-    # __post_init__), so high-CP GDN configs (e.g. TP2/CP16) validate. The matching
-    # forward all-gather path is installed by _patch_gdn_for_dynamic_cp after the model
-    # is built; see both functions for why % tp suffices (GDN weights are TP-only).
-    if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
-        _relax_gdn_cp_config_assert()
-
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
         ModelType.encoder_or_decoder,
@@ -337,6 +329,15 @@ def setup_model_and_optimizer(
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
         # roles that still run forward.
         _patch_gdn_for_dynamic_cp()
+        model_config = get_model_config(model[0])
+        if getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net" and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            logger.info(
+                f"[GDN CP] role={role} linear_cp_mode={model_config.linear_cp_mode} "
+                f"TP={model_config.tensor_model_parallel_size} max_CP={model_config.context_parallel_size} "
+                f"key_heads={model_config.linear_num_key_heads} value_heads={model_config.linear_num_value_heads}"
+            )
 
     if args.only_load_weight:
         return model, None, None
@@ -409,84 +410,13 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
 
-def _relax_gdn_cp_config_assert() -> None:
-    """Relax Megatron's GDN config gate ``linear_num_{key,value}_heads %
-    (tp*cp) == 0`` down to ``% tp`` so high-CP GDN configs (e.g. TP2/CP16)
-    finalize.
-
-    Megatron's ``TransformerConfig.__post_init__`` enforces the *native* cp2hp
-    (split-sequence -> split-head) divisibility ``heads % (tp * cp)``.
-    ``_patch_gdn_for_dynamic_cp`` replaces that forward with an all-gather + duplicated
-    scan whose weights stay **TP-only** (``qk_dim_local_tp = qk_dim // tp``, etc.), so
-    only ``heads % tp`` is actually required. Without relaxing this config gate, TP2/CP16
-    (16 % 32 != 0) aborts at config finalize (``get_model_provider_func`` -> ``finalize``
-    -> ``__post_init__``) *before* the forward patch is installed.
-
-    Only intervenes when the native check would reject but the relaxed ``% tp`` check
-    passes: it temporarily scales the two GDN head counts by ``cp`` (which preserves
-    ``value % key`` and makes ``heads % (tp*cp)`` hold), runs the original
-    ``__post_init__``, then restores them. Those head counts are validation-only in
-    ``__post_init__`` (no stored value is derived from them -- verified against Megatron
-    core), and ``GatedDeltaNet.__init__`` reads the restored config later, so nothing
-    downstream sees the temporary values. Idempotent; monkey-patch only (no upstream
-    edit), matching ``_patch_gdn_for_dynamic_cp``.
-    """
-    try:
-        from megatron.core.transformer.transformer_config import TransformerConfig
-    except ImportError:
-        return
-
-    if getattr(TransformerConfig, "_gdn_cp_relaxed", False):
-        return
-
-    _orig_post_init = TransformerConfig.__post_init__
-
-    def _relaxed_post_init(self, *post_init_args, **post_init_kwargs):
-        if getattr(self, "experimental_attention_variant", None) == "gated_delta_net":
-            tp = self.tensor_model_parallel_size
-            cp = self.context_parallel_size
-            key = self.linear_num_key_heads or 0
-            val = self.linear_num_value_heads or 0
-            native_bad = cp > 1 and ((key % (tp * cp)) != 0 or (val % (tp * cp)) != 0)
-            relaxed_ok = tp > 0 and (key % tp) == 0 and (val % tp) == 0
-            if native_bad and relaxed_ok:
-                # key%tp==0 => (key*cp)%(tp*cp)==0, and (val*cp)%(key*cp)==(val%key) so the
-                # value%key assert is preserved. Restored in `finally` before anything else
-                # (incl. GatedDeltaNet.__init__) reads the config.
-                self.linear_num_key_heads = key * cp
-                self.linear_num_value_heads = val * cp
-                try:
-                    _orig_post_init(self, *post_init_args, **post_init_kwargs)
-                finally:
-                    self.linear_num_key_heads = key
-                    self.linear_num_value_heads = val
-                return
-        _orig_post_init(self, *post_init_args, **post_init_kwargs)
-
-    TransformerConfig.__post_init__ = _relaxed_post_init
-    TransformerConfig._gdn_cp_relaxed = True
-
-
 def _patch_gdn_for_dynamic_cp() -> None:
-    """Monkey-patch GatedDeltaNet.forward for CP via all-gather + duplicated
-    scan.
+    """Patch GDN forward for dynamic CP and Relax's all-gather mode.
 
-    Megatron's native GDN forward implements CP by converting "split sequence"
-    into "split head" (``cp2hp`` all-to-all, ``num_value_heads // tp // cp``),
-    which forces ``num_heads % (tp * cp) == 0`` and breaks at high CP for
-    head-light models (e.g. Qwen3.5). This patch keeps that efficient native path
-    whenever the heads still divide ``tp * cp`` (``native_ok``), and only when
-    native would break does it fall back to all-gathering the full sequence across
-    CP, running the recurrent scan duplicated on each rank while keeping relax's
-    **TP** head-split intact, then re-slicing this rank's shard. The effective
-    constraint drops to ``num_heads % tp == 0`` (CP16 works), and weight
-    conversion / DCS sync / checkpoint (all TP-only) are untouched.
-
-    Dynamic CP: size/group are read per micro-batch from ``packed_seq_params``
-    (set in get_batch), falling back to the static CP group. The ``cp == 1``,
-    non-thd, and ``native_ok`` cases keep upstream behavior (swap the dynamic CP
-    group, call the original forward). Idempotent; avoids editing upstream
-    Megatron source.
+    CP=1 and MCore-native headwise/chunkwise modes call the patched MCore
+    forward directly. Only static ``linear_cp_mode='all_gather'`` with CP>1
+    executes Relax's existing fallback. No shared module/config state is
+    modified.
     """
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -498,23 +428,6 @@ def _patch_gdn_for_dynamic_cp() -> None:
 
     _orig_forward = GatedDeltaNet.forward
 
-    def _call_orig_with_dynamic_cp(
-        self, cp_size, cp_group, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
-    ):
-        # cp == 1 or non-thd: preserve upstream behavior; just point the module at
-        # the (possibly dynamic) CP group for the original forward.
-        _orig_cp_size = self.cp_size
-        _orig_cp_group = self.pg_collection.cp
-        self.cp_size = cp_size
-        self.pg_collection.cp = cp_group
-        try:
-            return _orig_forward(
-                self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
-            )
-        finally:
-            self.cp_size = _orig_cp_size
-            self.pg_collection.cp = _orig_cp_group
-
     def _dcp_gdn_forward(
         self, hidden_states, attention_mask, inference_context=None, packed_seq_params=None, *args, **kwargs
     ):
@@ -524,26 +437,16 @@ def _patch_gdn_for_dynamic_cp() -> None:
         from .cp_utils import gdn_cp_slice
 
         cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params)
-        is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
-        # Native cp2hp (head-split) is exact and cheaper (no duplicated scan, GDN
-        # activation sharded by CP) whenever the heads divide tp*cp. Only fall back
-        # to the all-gather path when native would break the head split — i.e. when
-        # num_key_heads is not divisible by tp*cp (covers tp*cp > num_key_heads).
-        # num_value_heads is a multiple of num_key_heads, so this one check suffices.
-        native_ok = self.num_key_heads % (self.tp_size * cp_size) == 0
-        if cp_size == 1 or not is_thd or native_ok:
-            return _call_orig_with_dynamic_cp(
-                self,
-                cp_size,
-                cp_group,
-                hidden_states,
-                attention_mask,
-                inference_context,
-                packed_seq_params,
-                *args,
-                **kwargs,
+        if cp_size == 1 or self.config.linear_cp_mode != "all_gather":
+            return _orig_forward(
+                self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
             )
 
+        is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        assert is_thd, (
+            "GDN linear_cp_mode='all_gather' with cp_size>1 only supports packed (thd) sequences; "
+            "use linear_cp_mode='headwise' or 'chunkwise' for SBHD/static-batch inputs."
+        )
         assert inference_context is None, "GDN all-gather CP path does not support inference."
         # Packed (thd) + deterministic is unsupported: a single conv/scan over the
         # concatenated samples would bleed state across cu_seqlens boundaries, and
@@ -603,19 +506,14 @@ def _patch_gdn_for_dynamic_cp() -> None:
         )
 
         # Reuse the module's own prep (split/l2norm/GQA-expand) with CP disabled so
-        # its internal `// self.cp_size` becomes a no-op. Wrap in the dynamo-disable
+        # its internal `// cp_size_headwise` becomes a no-op. Wrap in the dynamo-disable
         # guard added by docker/patch/megatron/20260506-85bced0ae.patch (Qwen3.6 GDN
         # torch.compile failure); calling _prepare_qkv_for_gated_delta_rule directly
         # would re-trigger that compile failure.
-        _saved_cp = self.cp_size
-        self.cp_size = 1
-        try:
-            with torch._dynamo.config.patch(disable=True):
-                query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len
-                )
-        finally:
-            self.cp_size = _saved_cp
+        with torch._dynamo.config.patch(disable=True):
+            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+                qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=1
+            )
 
         # g/beta from the full (un-CP-sliced) A_log / dt_bias.
         g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)

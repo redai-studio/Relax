@@ -128,6 +128,41 @@ def _validate_dynamic_context_parallel(args):
     args.max_seqlen_per_dp_cp_rank = args.max_tokens_per_gpu
 
 
+def _validate_linear_cp_mode(args) -> None:
+    """Fail fast on `--linear-cp-mode` / flag combinations that are invalid for
+    every model, without needing the HF config.
+
+    Geometry-dependent rejections (e.g. explicit `headwise` on heads not
+    divisible by `tp*max_cp`) can only be checked once the real GDN head counts
+    are known, which happens in MCore's `TransformerConfig.__post_init__` gate
+    -- not here.
+    """
+    mode = getattr(args, "linear_cp_mode", "headwise")
+    allowed_modes = {"headwise", "chunkwise", "all_gather"}
+    if mode not in allowed_modes:
+        raise ValueError(
+            f"--linear-cp-mode must be one of {sorted(allowed_modes)!r}; got {mode!r}. v1 does not support 'auto'."
+        )
+
+    if mode == "chunkwise" and getattr(args, "allgather_cp", False):
+        raise ValueError(
+            "--linear-cp-mode=chunkwise is incompatible with --allgather-cp: chunkwise CP requires "
+            "Megatron's zig-zag THD packing, while --allgather-cp switches the data path to a single "
+            "contiguous per-rank chunk. Note --allgather-cp is a data/attention packing flag, unrelated "
+            "to the GDN `all_gather` CP mode."
+        )
+
+    cp_may_exceed_one = (
+        getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1
+    )
+    if mode == "chunkwise" and cp_may_exceed_one and getattr(args, "deterministic_mode", False):
+        raise ValueError(
+            "--linear-cp-mode=chunkwise does not support --deterministic-mode while CP>1 may occur: "
+            "the deterministic torch reference path only accepts cp_context=None. Use "
+            "--linear-cp-mode=headwise or =all_gather for deterministic CP>1 runs."
+        )
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron
     validations."""
@@ -174,6 +209,8 @@ def validate_args(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
+
+    _validate_linear_cp_mode(args)
     return args
 
 
