@@ -29,6 +29,8 @@ OPENHANDS_SETUP_PATCH="${EXAMPLE_DIR}/service/patches/openhands_setup_portabilit
 OPENHANDS_PLATFORM_PATCH="${EXAMPLE_DIR}/service/patches/openhands_platform_release.patch"
 OPENHANDS_R2E_RUNTIME_PATCH="${EXAMPLE_DIR}/service/patches/openhands_r2e_runtime.patch"
 OPENHANDS_R2E_RUNTIME_SETUP_PATCH="${EXAMPLE_DIR}/service/patches/openhands_r2e_runtime_setup.patch"
+R2EGYM_TEST_LAYOUT_PATCH="${EXAMPLE_DIR}/service/patches/r2egym_test_layout.patch"
+R2EGYM_TEST_LAYOUT_SETUP_PATCH="${EXAMPLE_DIR}/service/patches/r2egym_test_layout_setup.patch"
 PYTHON_STARTUP_DIR="${EXAMPLE_DIR}/service/python_startup"
 
 usage() {
@@ -465,11 +467,15 @@ apptainer exec "${first_sif}" true
 cp \
     "${OPENHANDS_R2E_RUNTIME_PATCH}" \
     "${GYM_ROOT}/responses_api_agents/swe_agents/setup_scripts/openhands_r2e_runtime.patch"
+cp \
+    "${R2EGYM_TEST_LAYOUT_PATCH}" \
+    "${GYM_ROOT}/responses_api_agents/swe_agents/setup_scripts/r2egym_test_layout.patch"
 
 for patch_path in \
     "${OPENHANDS_SETUP_PATCH}" \
     "${OPENHANDS_PLATFORM_PATCH}" \
-    "${OPENHANDS_R2E_RUNTIME_SETUP_PATCH}"; do
+    "${OPENHANDS_R2E_RUNTIME_SETUP_PATCH}" \
+    "${R2EGYM_TEST_LAYOUT_SETUP_PATCH}"; do
     if [ ! -f "${patch_path}" ]; then
         echo "ERROR: OpenHands setup patch is missing: ${patch_path}" >&2
         exit 2
@@ -495,6 +501,19 @@ if [ -d "${openhands_checkout}/.git" ]; then
         git -C "${openhands_checkout}" apply "${OPENHANDS_R2E_RUNTIME_PATCH}"
     else
         echo "ERROR: OpenHands R2E runtime patch does not apply cleanly: ${OPENHANDS_R2E_RUNTIME_PATCH}" >&2
+        exit 2
+    fi
+fi
+
+r2egym_checkout="${GYM_ROOT}/responses_api_agents/swe_agents/swe_r2e_gym_setup/R2E-Gym"
+if [ -d "${r2egym_checkout}/.git" ]; then
+    if git -C "${r2egym_checkout}" apply --reverse --check "${R2EGYM_TEST_LAYOUT_PATCH}" >/dev/null 2>&1; then
+        echo "R2E-Gym test layout patch is already applied: ${R2EGYM_TEST_LAYOUT_PATCH}"
+    elif git -C "${r2egym_checkout}" apply --check "${R2EGYM_TEST_LAYOUT_PATCH}"; then
+        echo "Applying R2E-Gym test layout patch: ${R2EGYM_TEST_LAYOUT_PATCH}"
+        git -C "${r2egym_checkout}" apply "${R2EGYM_TEST_LAYOUT_PATCH}"
+    else
+        echo "ERROR: R2E-Gym test layout patch does not apply cleanly: ${R2EGYM_TEST_LAYOUT_PATCH}" >&2
         exit 2
     fi
 fi

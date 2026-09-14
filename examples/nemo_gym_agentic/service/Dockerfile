@@ -58,6 +58,10 @@ COPY examples/nemo_gym_agentic/service/patches/claude_code_agent_cleanup.patch \
     /tmp/claude_code_agent_cleanup.patch
 COPY examples/nemo_gym_agentic/service/patches/claude_code_agent_pinned_install.patch \
     /tmp/claude_code_agent_pinned_install.patch
+COPY examples/nemo_gym_agentic/service/patches/r2egym_test_layout.patch \
+    /opt/nemo-gym/responses_api_agents/swe_agents/setup_scripts/r2egym_test_layout.patch
+COPY examples/nemo_gym_agentic/service/patches/r2egym_test_layout_setup.patch \
+    /tmp/r2egym_test_layout_setup.patch
 COPY examples/nemo_gym_agentic/service/nemo_gym_gateway_model \
     /opt/nemo-gym/responses_api_models/relax_gateway_model
 
@@ -65,6 +69,7 @@ RUN git -C /opt/nemo-gym apply /tmp/nemo_gym_http_error_traceback.patch \
     && git -C /opt/nemo-gym apply /tmp/workplace_assistant_cleanup.patch \
     && git -C /opt/nemo-gym apply /tmp/swe_agents_r2e.patch \
     && git -C /opt/nemo-gym apply /tmp/openhands_r2e_runtime_setup.patch \
+    && git -C /opt/nemo-gym apply /tmp/r2egym_test_layout_setup.patch \
     && git -C /opt/nemo-gym apply /tmp/openhands_setup_portability.patch \
     && git -C /opt/nemo-gym apply /tmp/openhands_platform_release.patch \
     && git -C /opt/nemo-gym apply /tmp/claude_code_agent_cleanup.patch \

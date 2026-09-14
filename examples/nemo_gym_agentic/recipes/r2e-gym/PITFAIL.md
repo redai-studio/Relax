@@ -426,3 +426,18 @@ Event already has an ID:1
 
 当前修复在每次 attempt 前分别对 replay event 列表和 initial action 执行 `deepcopy`。不要通过清空
 单个 `_id` 或吞掉 retry 异常绕过；ReplayManager 还可能原地修改其他 Event 字段。
+
+## 24. 重复初始化测试目录会让 pytest 沿循环软链重复收集
+
+部分 SIF 已有 `/testbed/r2e_tests -> /root/r2e_tests`。旧 R2E-Gym 把 `r2e_tests` 当成
+普通 skip file 移动，然后再次 `ln -s`，会创建 `/root/r2e_tests/r2e_tests` 指回自身。
+实测 Pyramid 的 825 个测试因此重复 40 次，变成 33000 个，评测耗时超过外层 trial deadline。
+GPU 在等待奖励和整组补采期间空闲；这与 OpenHands 历史丢失导致的多叶导出错误是两个问题。
+
+`r2egym_test_layout.patch` 将测试目录从通用移动循环中排除，保留已有测试目录，仅移除经
+目标核对的自身软链，并用 `ln -sfnT` 重建入口。启动脚本对已有 setup volume 应用补丁，
+新 checkout 由 setup hook 应用；修改后重启 Gym 即可，不需要重建 SIF。
+
+真实 SIF 隔离验证：重复初始化三次、修复旧循环后，均收集 825 个测试；完整测试结果与原始
+SIF 一致（786 passed / 39 failed），修复后耗时 3.71 秒。该验证没有应用模型 patch，
+因此不能把基线的 39 个失败当成修复回归，也不能宣称任务 reward 验证通过。
