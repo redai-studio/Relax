@@ -102,6 +102,8 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
+   # INT4 fake-QAT replaces weight tensors; TE fused wgrad requires the original tensors.
+   --no-gradient-accumulation-fusion
    --tensor-model-parallel-size 8
    --sequence-parallel
    --pipeline-model-parallel-size 8
