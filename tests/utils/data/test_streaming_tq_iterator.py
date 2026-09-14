@@ -245,7 +245,8 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
     assert iterator._sample_count == 2  # dummies don't count as samples
 
 
-def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch):
+@pytest.mark.parametrize("nested_ids", [False, True], ids=["dense_ids", "nested_ids"])
+def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch, nested_ids):
     stream_module = _load_stream_module(monkeypatch)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
@@ -262,7 +263,13 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
             return _Meta()
 
         def get_data(self, batch_meta):
+            sample_indices = (
+                torch.nested.nested_tensor([torch.tensor([901]), torch.tensor([901])], layout=torch.jagged)
+                if nested_ids
+                else torch.tensor([901, 901])
+            )
             return {
+                "sample_indices": sample_indices,
                 "response_lengths": torch.nested.nested_tensor(
                     [
                         torch.tensor([512]),
@@ -289,7 +296,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
         args=Namespace(),
         tq_client=_TQClient(),
-        data_fields=["response_lengths", "total_lengths", "raw_reward"],
+        data_fields=["response_lengths", "total_lengths", "raw_reward", "sample_indices"],
         batch_size=2,
         partition_id="train_0",
         task_name="ref_log_probs",
@@ -302,6 +309,8 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
     assert rollout_data["raw_reward"] == [1.5, 2.5]
+    assert rollout_data["sample_indices"] == [901, 901]
+    assert all(isinstance(identity, int) for identity in rollout_data["sample_indices"])
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):

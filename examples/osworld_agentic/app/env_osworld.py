@@ -17,9 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl as _fcntl
+import hashlib as _hashlib
 import json
+import json as _json
 import logging
 import os
+import os as _os
+import random as _random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -82,7 +87,9 @@ class OSWorldEnv:
         require_a11y_tree: bool = False,
         cache_dir: Optional[str] = None,
     ) -> None:
-        self.task_config = task_config
+        from .task_setup_compat import normalize_task_setup
+
+        self.task_config = normalize_task_setup(task_config)
         self.provider_name = provider_name
         self.snapshot_name = snapshot_name
         self.screen_size = (screen_width, screen_height)
@@ -122,8 +129,10 @@ class OSWorldEnv:
                     _RESET_ATTEMPTS,
                     exc,
                 )
-                self._close_sync()
-                time.sleep(_RESET_BACKOFF_S)
+                self._close_sync(release_slot=False)
+                if attempt + 1 < _RESET_ATTEMPTS:
+                    time.sleep(_RESET_BACKOFF_S)
+        self._close_sync()
         raise RuntimeError(f"env reset failed after {_RESET_ATTEMPTS} attempts: {last_error}")
 
     def _reset_once(self) -> StepObs:
@@ -147,7 +156,7 @@ class OSWorldEnv:
         async with self._lock:
             await asyncio.to_thread(self._close_sync)
 
-    def _close_sync(self) -> None:
+    def _close_sync(self, *, release_slot: bool = True) -> None:
         try:
             if self._env is not None:
                 try:
@@ -156,8 +165,9 @@ class OSWorldEnv:
                     logger.exception("DesktopEnv.close raised")
                 self._env = None
         finally:
-            _release_env_slot(getattr(self, "_env_slot_fd", None))
-            self._env_slot_fd = None
+            if release_slot:
+                _release_env_slot(getattr(self, "_env_slot_fd", None))
+                self._env_slot_fd = None
 
     # ── actions ──────────────────────────────────────────────────────────
 
@@ -269,9 +279,6 @@ def parse_mcp_action(action: str) -> Optional[tuple[str, dict[str, Any]]]:
 # Queued sessions wait on the event loop (asyncio.sleep), not in the
 # to_thread pool, so active sessions are never starved of threads.
 # ---------------------------------------------------------------------------
-import fcntl as _fcntl
-import os as _os
-import random as _random
 
 
 _ENV_SLOT_LIMIT = int(_os.environ.get("OSWORLD_MAX_CONCURRENT_ENVS", "0"))
@@ -322,8 +329,7 @@ def _release_env_slot(fd):
 # a slot at once. A global LOCK_EX mutex makes count-and-acquire atomic across
 # the shard processes. Kernel drops every flock when a process dies.
 # ---------------------------------------------------------------------------
-import hashlib as _hashlib
-import json as _json
+
 
 _ENV_GROUP_LIMIT = int(_os.environ.get("OSWORLD_MAX_CONCURRENT_GROUPS", "0"))
 
@@ -374,7 +380,13 @@ async def _acquire_env_group_slot_async(task_key):
             if busy < _ENV_GROUP_LIMIT:
                 fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
                 _fcntl.flock(fd, _fcntl.LOCK_SH)
-                logger.info("[env_gate] group slot %d/%d -> task %s (queued %.0fs)", busy + 1, _ENV_GROUP_LIMIT, task_key[:12], waited)
+                logger.info(
+                    "[env_gate] group slot %d/%d -> task %s (queued %.0fs)",
+                    busy + 1,
+                    _ENV_GROUP_LIMIT,
+                    task_key[:12],
+                    waited,
+                )
                 return fd
         finally:
             _os.close(mfd)
@@ -383,4 +395,6 @@ async def _acquire_env_group_slot_async(task_key):
         waited += step
         if waited - last_log >= 300:
             last_log = waited
-            logger.info("[env_gate] all %d group slots busy, task %s queued %.0fs", _ENV_GROUP_LIMIT, task_key[:12], waited)
+            logger.info(
+                "[env_gate] all %d group slots busy, task %s queued %.0fs", _ENV_GROUP_LIMIT, task_key[:12], waited
+            )

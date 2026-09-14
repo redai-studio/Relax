@@ -48,6 +48,31 @@ fi
 # monkey-patching site-packages.
 export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/vendor:${SCRIPT_DIR}/vendor/agents:${PYTHONPATH:-}"
 
+# PyTorch probes CUDA libraries along sys.path. Avoid probing the shared
+# repository during import; restore the exact agent paths before executing it.
+if [ "${OSWORLD_LOCAL_TORCH_BOOTSTRAP:-0}" = "1" ]; then
+    export OSWORLD_AGENT_IMPORT_PATH="${PYTHONPATH}"
+    export OSWORLD_AGENT_WORK_DIR="${SCRIPT_DIR}"
+    export PYTHONPATH=""
+    cd "${TMPDIR:-/tmp}"
+    exec python -u -c '
+import os
+import runpy
+import sys
+import time
+
+started = time.monotonic()
+import torch
+print("[osworld_agent_bootstrap] torch=" + torch.__version__ + " import_seconds=" + str(time.monotonic() - started), flush=True)
+work_dir = os.environ.pop("OSWORLD_AGENT_WORK_DIR")
+original_path = os.environ.pop("OSWORLD_AGENT_IMPORT_PATH")
+os.environ["PYTHONPATH"] = original_path
+os.chdir(work_dir)
+sys.path[:] = [work_dir, *[p or work_dir for p in original_path.split(os.pathsep)], *sys.path[1:]]
+runpy.run_module("app.agent", run_name="__main__", alter_sys=True)
+' --input-json "${RELAX_INPUT_JSON}" --output-json "${RELAX_OUTPUT_JSON}"
+fi
+
 exec python -m app.agent \
     --input-json "${RELAX_INPUT_JSON}" \
     --output-json "${RELAX_OUTPUT_JSON}"

@@ -15,13 +15,15 @@
 #   3. Set env vars:   MODEL_DIR=/path/to/models DATA_DIR=/path/to/data \
 #                      SAVE_DIR=/path/to/save bash $0
 
-set -ex
+set -e
 set -o pipefail
 
 TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-[ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+if [ "${OSWORLD_ENV_LOADED:-0}" != "1" ] && [ -f "${SCRIPT_DIR}/env.sh" ]; then
+    source "${SCRIPT_DIR}/env.sh"
+fi
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
@@ -38,13 +40,30 @@ fi
 mkdir -p "${SAVE_DIR}"
 
 # Housekeeping: prune stale per-run agent logs (>3 days).
-find "${SCRIPT_DIR}/log/agent" -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
+if [ "${OSWORLD_PRUNE_OLD_AGENT_LOGS:-1}" = "1" ]; then
+    find "${SCRIPT_DIR}/log/agent" -maxdepth 1 -type d -mtime +3 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# Model and resume checkpoint arguments. Explicit source is separate from new output.
+CKPT_REF_LOAD="${MODEL_DIR}/Qwen3-VL-8B-Thinking"
+if [ -n "${OSWORLD_RESUME_DIR:-}" ]; then
+  if [ "${RESUME_FROM_SAVE:-0}" = "1" ]; then
+    echo "Choose OSWORLD_RESUME_DIR or RESUME_FROM_SAVE, not both" >&2
+    exit 1
+  fi
+  if [ ! -f "${OSWORLD_RESUME_DIR}/latest_checkpointed_iteration.txt" ]; then
+    echo "Missing resume checkpoint tracker: ${OSWORLD_RESUME_DIR}" >&2
+    exit 1
+  fi
+  # This recipe updates ref from actor after every completed training step.
+  CKPT_REF_LOAD="${OSWORLD_RESUME_DIR}"
+fi
 
 CKPT_ARGS=(
-    --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-8B-Thinking
-    --ref-load ${MODEL_DIR}/Qwen3-VL-8B-Thinking
+    --hf-checkpoint "${MODEL_DIR}/Qwen3-VL-8B-Thinking"
+    --ref-load "${CKPT_REF_LOAD}"
     --warm-hf-checkpoint-page-cache
-    --save ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome
+    --save "${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome"
     --megatron-to-hf-mode bridge
     --save-interval ${SAVE_INTERVAL:-200}
     --max-actor-ckpt-to-keep ${MAX_CKPT_KEEP:-1}
@@ -53,8 +72,11 @@ CKPT_ARGS=(
 # Resume support: when RESUME_FROM_SAVE=1 and a checkpoint already exists under --save,
 # pass --load so a relaunch after a crash continues from the last saved step instead of
 # restarting from the base model. Default off, so existing runs are unaffected.
-if [ "${RESUME_FROM_SAVE:-0}" = "1" ] && [ -f "${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/latest_checkpointed_iteration.txt" ]; then
-    CKPT_ARGS+=(--load ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome)
+if [ -n "${OSWORLD_RESUME_DIR:-}" ]; then
+  CKPT_ARGS+=(--load "${OSWORLD_RESUME_DIR}")
+  echo "[resume] actor and ref from ${OSWORLD_RESUME_DIR}; save to ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome"
+elif [ "${RESUME_FROM_SAVE:-0}" = "1" ] && [ -f "${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/latest_checkpointed_iteration.txt" ]; then
+    CKPT_ARGS+=(--load "${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome")
     echo "[resume] --load ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome (iter $(cat ${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/latest_checkpointed_iteration.txt))"
 fi
 # NCCL collective timeout. Default 30 min; a hung training step wastes that long before the
@@ -64,7 +86,7 @@ CKPT_ARGS+=(--distributed-timeout-minutes ${DIST_TIMEOUT_MIN:-30})
 # Data layout produced by scripts/prepare_data.py:
 #   ${DATA_DIR}/osworld/data/train.parquet     (74 tasks; outcome_only_rl split)
 #   ${DATA_DIR}/osworld/data/eval.parquet      (309 tasks; OSWorld-MCP full)
-TRAIN_FILES=("'${DATA_DIR}/osworld/data/train.parquet'")
+TRAIN_FILES=("'${OSWORLD_TRAIN_DATA:-${DATA_DIR}/osworld/data/train.parquet}'")
 EVAL_FILES=("${DATA_DIR}/osworld/data/eval.parquet")
 PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
@@ -77,11 +99,33 @@ RUNTIME_ENV_JSON=$(cat <<EOF
     "OSWORLD_CACHE_DIR": "${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}",
     "OSWORLD_REPO": "${OSWORLD_REPO}",
     "OSWORLD_MCP_BONUS": "${OSWORLD_MCP_BONUS:-0}",
+    "RAY_OVERRIDE_JOB_RUNTIME_ENV": "${RAY_OVERRIDE_JOB_RUNTIME_ENV:-0}",
+    "RELAX_PROPAGATE_ENV_VARS": "${RELAX_PROPAGATE_ENV_VARS:-}",
+    "OSWORLD_PER_TRAJ_NORM": "${OSWORLD_PER_TRAJ_NORM:-1}",
+    "OSWORLD_MAX_STEPS_REF": "${OSWORLD_MAX_STEPS_REF:-50}",
+    "OSWORLD_LENGTH_PENALTY_COEF": "${OSWORLD_LENGTH_PENALTY_COEF:-0.05}",
+    "OSWORLD_CAP_PENALTY": "${OSWORLD_CAP_PENALTY:-0.2}",
+    "OSWORLD_ACC_LO": "${OSWORLD_ACC_LO:-0.05}",
+    "OSWORLD_ACC_HI": "${OSWORLD_ACC_HI:-0.95}",
+    "OSWORLD_ADV_CLIP": "${OSWORLD_ADV_CLIP:-0}",
+    "OSWORLD_REWARD_DUMP": "${OSWORLD_REWARD_DUMP:-}",
+    "OSWORLD_RUN_TAG": "${OSWORLD_RUN_TAG:-}",
     "OPENAI_MODEL": "Qwen3-VL-8B-Thinking"
   }
 }
 EOF
 )
+
+# Explicitly forward recipe variables to the job driver, then to nested actors.
+RUNTIME_ENV_JSON=$(RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON}" python3 -c '
+import json, os
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+for name in os.environ.get("RELAX_PROPAGATE_ENV_VARS", "").split(","):
+    name = name.strip()
+    if name and name in os.environ:
+        runtime_env["env_vars"][name] = os.environ[name]
+print(json.dumps(runtime_env))
+')
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -98,6 +142,7 @@ ROLLOUT_ARGS=(
     # `nargs="+"`, not `action="append"`, so repeating the flag silently
     # drops all but the last group. (Memory: 2a732e4e.)
     --agent-env
+        "OSWORLD_LOCAL_TORCH_BOOTSTRAP=${OSWORLD_LOCAL_TORCH_BOOTSTRAP:-0}"
         "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
         "OSWORLD_CONFIG_PATH=${OSWORLD_CONFIG_PATH:-${SCRIPT_DIR}/app/osworld_config.yaml}"
         "OSWORLD_CACHE_DIR=${OSWORLD_CACHE_DIR:-/tmp/osworld_cache}"
@@ -126,9 +171,20 @@ ROLLOUT_ARGS=(
     --rollout-max-prompt-len ${MAX_PROMPT_LEN:-16384}       # 24576 + 8192 = 32768 context budget
     --rollout-temperature 1
     --global-batch-size ${GLOBAL_BATCH_SIZE:-64}
-    --rollout-shuffle
-    --use-streaming-dataset
 )
+
+# Opt in to one complete, ordered task set per synchronous rollout.
+# The example entry point selects custom hooks after framework argument parsing.
+TRAIN_ENTRYPOINT=(relax/entrypoints/train.py)
+if [ "${OSWORLD_FIXED_TASK_BATCH:-0}" = "1" ]; then
+    TRAIN_ENTRYPOINT=(-m examples.osworld_agentic.train_fixed_tasks)
+  if [ "${OSWORLD_NATIVE_MINIBATCH3:-0}" = "1" ]; then
+    TRAIN_ENTRYPOINT=(-m examples.osworld_agentic.train_fixed12_minibatch3)
+    ROLLOUT_ARGS+=(--num-steps-per-rollout 3)
+  fi
+else
+    ROLLOUT_ARGS+=(--rollout-shuffle --use-streaming-dataset)
+fi
 
 EVAL_ARGS=(
     $( [ "${EVAL_BEFORE_TRAIN:-0}" = "1" ] || echo --skip-eval-before-train )   # EVAL_BEFORE_TRAIN=1 -> run held-out eval at step 0
@@ -139,6 +195,10 @@ EVAL_ARGS=(
     --eval-top-p 0.7
     --agentic-eval-prepare-pool-size ${EVAL_PREPARE_POOL_SIZE:-16}
 )
+
+if [ "${OSWORLD_DISABLE_EVAL:-0}" = "1" ]; then
+  EVAL_ARGS=(--skip-eval-before-train)
+fi
 
 # GRPO — matches the upstream 8B recipe: β=0.02 KL, ε=0.2, entropy=0.
 GRPO_ARGS=(
@@ -159,7 +219,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
     --optimizer adam
-    --lr 5e-6
+    --lr ${OSWORLD_LEARNING_RATE:-5e-6}
     --lr-decay-style ${LR_DECAY:-cosine}
     --weight-decay ${WEIGHT_DECAY:-0.0}
     --adam-beta1 0.9
@@ -169,6 +229,13 @@ OPTIMIZER_ARGS=(
     --use-precision-aware-optimizer
     --no-rope-fusion
 )
+
+if [ -n "${OSWORLD_LR_DECAY_ITERS:-}" ]; then
+    OPTIMIZER_ARGS+=(--lr-decay-iters "${OSWORLD_LR_DECAY_ITERS}")
+fi
+if [ "${OSWORLD_OVERRIDE_OPT_PARAM_SCHEDULER:-0}" = "1" ]; then
+   OPTIMIZER_ARGS+=(--override-opt_param-scheduler)
+fi
 
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine ${GPUS_PER_ENGINE:-2}
@@ -239,9 +306,9 @@ RAY_RESOURCE_ARGS=(
 
 mkdir -p logs
 
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
-    -- python3 relax/entrypoints/train.py \
+    -- python3 "${TRAIN_ENTRYPOINT[@]}" \
     "${RAY_RESOURCE_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \
