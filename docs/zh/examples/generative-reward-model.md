@@ -287,6 +287,140 @@ python3 relax/entrypoints/train.py \
     --rm-type dapo-genrm
 ```
 
+## 多实例 GenRM（一个服务托管多个评判模型）
+
+以上内容都假设只部署一个评判模型。`--genrm-instances` 让**一个 GenRM Serve 部署同时托管多个独立的评判模型**——不同大小、不同 checkpoint、不同评分标准——每个由调用方在请求中传入的 `route_key` 字符串来选择。Serve 部署本身、HTTP 路由（`/genrm`）以及健康检查 / metrics 接口都不变，只是请求体多了一个字段。
+
+这种能力天然适配：
+
+- **多目标奖励** —— 例如一个实例判答案正确性，另一个判安全性/无害性，你的 reward 函数把两者合并成一个训练信号。
+- **Agentic 流水线** —— agent 轨迹中不同模块（planner、tool-caller、最终答案判断等）可以各自由适合该模块的评判模型打分，而不需要为每个模块单独起一套 GenRM 部署（以及单独切一份 GPU）。
+
+### `--genrm-instances` 命令行参数
+
+| 参数                 | 类型   | 默认值 | 描述                                                                                     |
+| :-------------------- | :----- | :----- | :----------------------------------------------------------------------------------------- |
+| `--genrm-instances`  | `JSON` | `None` | `{route_key: instance_spec}` 的 JSON 字典。设置后**优先于** `--genrm-model-path`（若两者都设置，旧的单实例参数会被忽略并打 warning）。 |
+
+每个 `instance_spec` 是一个字典，支持以下键：
+
+| 键                     | 类型    | 是否必填 | 描述                                                                             |
+| :---------------------- | :------ | :------- | :----------------------------------------------------------------------------------- |
+| `model_path`             | `str`   | ✅ 必填  | 该实例评判模型的路径                                                              |
+| `num_gpus`               | `int`   | ✅ 必填  | 该实例的 GPU 预算。**不会在多个实例间自动均分**——每个实例都必须显式声明自己的预算。 |
+| `num_gpus_per_engine`    | `int`   | 否       | 该实例每个 SGLang 引擎占用的 GPU 数，默认取全局 `--genrm-num-gpus-per-engine`。       |
+| `engine_config`          | `dict`  | 否       | 该实例专属的引擎配置（如 `max_context_len`、`mem_fraction_static`），默认取全局 `--genrm-engine-config`。 |
+| `sampling_config`        | `dict`  | 否       | 该实例专属的采样参数，默认取全局 `--genrm-sampling-config`。                       |
+
+旧的 `--genrm-model-path` 配置方式完全不受影响——内部会自动归一化为一个使用保留 key `"__default__"` 的单实例 `--genrm-instances` 配置，因此没有携带 `route_key` 的请求（或从未切换到 `--genrm-instances` 的脚本）行为和以前完全一致。
+
+### 示例：两个评判模型，拆分 bundle
+
+以下配置对应 [`run-qwen3-4B-8xgpu-dual-genrm-split.sh`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/run-qwen3-4B-8xgpu-dual-genrm-split.sh)：一个 8 卡 Split 布局，rollout 占 4 卡，两个 GenRM 实例共用剩下 4 卡（各占 2 卡）：
+
+```bash
+python3 relax/entrypoints/train.py \
+    --genrm-instances '{
+        "quality": {"model_path": "/path/to/quality-judge", "num_gpus": 2, "num_gpus_per_engine": 2,
+                     "sampling_config": {"temperature": 0.1, "max_response_len": 64}},
+        "safety":  {"model_path": "/path/to/safety-judge",  "num_gpus": 2, "num_gpus_per_engine": 2,
+                     "sampling_config": {"temperature": 0.1, "max_response_len": 32,
+                                          "chat_template_kwargs": {"enable_thinking": false}}}
+    }' \
+    --rollout-num-gpus 4 \
+    --resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}' \
+    --colocate \
+    --custom-rm-path examples.generate_reward_model.reward_dual_genrm_quality_safety.reward_func \
+    --reward-key score
+```
+
+`--resource` 中的 `"genrm"` 需要等于**所有实例 `num_gpus` 之和**（此处 `2 + 2 = 4`）；除此之外，[配置](#配置) 一节里 Split / Shared 的 bundle 判定公式对这个总量同样适用，无需另外理解。
+
+::: tip 需要简洁作答的评判模型，记得关闭「思考」模式
+如果评判模型默认会先输出一段较长的思考过程再给出结论（推理增强模型的常见习惯），reward 函数里宽松的解析逻辑可能找不到干净的 `1`/`0`，导致悄悄地把所有样本打成 0 分。可以在该实例的 `sampling_config` 里加上 `"chat_template_kwargs": {"enable_thinking": false}` 强制它直接给结论，如上面 `safety` 实例的写法。
+:::
+
+### 调用指定实例：`route_key`
+
+在 reward 函数（或任何持有 `GenRMClient` 的代码）里，传入 `route_key` 即可选择由哪个实例来响应这次调用：
+
+```python
+from relax.utils.genrm_client import get_genrm_client
+
+genrm_client = get_genrm_client()
+
+quality_response = await genrm_client.generate(
+    messages=[{"role": "user", "content": "Judge correctness..."}],
+    route_key="quality",
+)
+safety_response = await genrm_client.generate(
+    messages=[{"role": "user", "content": "Judge safety..."}],
+    route_key="safety",
+)
+```
+
+在 HTTP 层，`route_key` 只是 `/generate` 请求体里多出的一个字段：
+
+```bash
+curl -X POST http://localhost:8000/genrm/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Judge safety..."}],
+    "route_key": "safety"
+  }'
+```
+
+不传 `route_key` 会路由到唯一的 `"__default__"` 实例——这正是服务用旧的 `--genrm-model-path` 启动时的行为。如果传的 `route_key` 从未在 `--genrm-instances` 中声明过，请求会直接失败，报出清晰的「未注册的 GenRM 实例」错误，而不是静默路由错。
+
+启用 `--genrm-instances` 之后，`/health` 与 `/metrics` 接口会返回**每个实例各自**的明细：
+
+```bash
+curl http://localhost:8000/genrm/health
+```
+
+```json
+{
+  "status": "healthy",
+  "service": "genrm",
+  "instances": {
+    "quality": {"status": "healthy"},
+    "safety": {"status": "healthy"}
+  }
+}
+```
+
+### Agentic 场景示例：按模块路由
+
+在 agentic rollout 中，轨迹的不同步骤通常已经在 `metadata` 里携带了「这一步是哪个模块产生的」这类信息。自定义 reward 函数可以直接读取这个字段并映射成 `route_key`，而不必像 `reward_dual_genrm_quality_safety.py` 那样硬编码两个固定的调用：
+
+```python
+# --genrm-instances '{"planner_judge": {...}, "tool_call_judge": {...}, "final_answer_judge": {...}}'
+
+MODULE_TO_ROUTE_KEY = {
+    "plan": "planner_judge",
+    "tool_call": "tool_call_judge",
+    "final_answer": "final_answer_judge",
+}
+
+async def agentic_reward_func(args, sample, **kwargs) -> dict:
+    genrm_client = get_genrm_client()
+    per_step_scores = []
+    for step in sample.metadata["trajectory_steps"]:
+        route_key = MODULE_TO_ROUTE_KEY[step["module"]]
+        judge_response = await genrm_client.generate(
+            messages=_format_step_messages(step),
+            route_key=route_key,
+        )
+        per_step_scores.append(_parse_judgement(judge_response))
+
+    # 如何聚合完全由你决定：加权平均、取 min() 做「木桶效应」惩罚，
+    # 或者只给最后一步打分、把前面的步骤当作过程奖励——
+    # Relax 本身不预设任何聚合策略。
+    return {"score": sum(per_step_scores) / len(per_step_scores)}
+```
+
+按流水线中各模块的角色来分配 GPU 预算（高频的 tool-call 检查用小而快的模型，每条轨迹只跑一次的最终答案判断用更大的模型），并确保所有实例 `num_gpus` 之和仍满足 [配置](#配置) 一节中的 Split/Shared bundle 等式。
+
 ## 脚本详解
 
 两个脚本共享相同的结构，以下是关键配置组的详细说明：
@@ -424,12 +558,14 @@ print(response)  # "1" 或 "0"
 5. **使用低采样温度**：温度 0.1 可产生确定性的评估结果；仅在需要评估多样性时提高。
 6. **监控健康状态**：定期检查 `/health` 端点，确保 GenRM 引擎正常运行。
 7. **按模型大小分配 GPU**：大型 GenRM 模型（如 30B）建议 shared 模式 + `--genrm-num-gpus-per-engine` 设为整个集群规模。
+8. **`--genrm-instances` 中每个实例都要显式写 `num_gpus`**：不存在跨实例的自动均分，实例大小配错了是配置问题，不是框架默认行为——按各自要跑的评判模型来定量。
+9. **需要简洁作答的评判模型记得关闭「思考」模式**：推理增强模型默认往往会先输出一段较长的思考过程再给结论；如果你的解析逻辑期望拿到干净的 `1`/`0`，在该实例的 `sampling_config` 里设置 `"chat_template_kwargs": {"enable_thinking": false}`。
 
 ## 故障排除
 
 ### GenRM 未启用
 
-确保设置了 `--genrm-model-path` 参数。只有当该参数不为 `None` 时，GenRM 才会被激活。
+确保设置了 `--genrm-model-path`（或 `--genrm-instances`）参数。只有配置了至少一个实例时，GenRM 才会被激活。
 
 ### Colocated 模式下资源分配错误
 
@@ -454,7 +590,15 @@ print(response)  # "1" 或 "0"
 
 ### GenRM 始终返回 0
 
-DAPO-GenRM 奖励函数使用严格相等来解析响应 — 只有精确的 `"1"` 字符串才会产生正分。如果 GenRM 模型输出了其他内容（如 `"1."`、`"Yes"` 或多行文本），分数将为 0。请验证 GenRM 模型和 prompt 模板能产生干净的 `"1"` / `"0"` 输出。
+DAPO-GenRM 奖励函数使用严格相等来解析响应 — 只有精确的 `"1"` 字符串才会产生正分。如果 GenRM 模型输出了其他内容（如 `"1."`、`"Yes"` 或多行文本），分数将为 0。请验证 GenRM 模型和 prompt 模板能产生干净的 `"1"` / `"0"` 输出。如果评判模型是推理增强模型，检查它是否在给结论前先输出了 `<think>` 思考轨迹——见 [多实例 GenRM](#多实例-genrm一个服务托管多个评判模型) 一节里的「思考模式」提示。
+
+### `--genrm-instances`：报错 "missing required key 'num_gpus'"
+
+`--genrm-instances` 中的每个实例都必须显式声明自己的 `num_gpus`——不存在跨实例的隐式均分（与 Relax 里其他一些多教师调度逻辑不同）。给对应实例的配置补上 `"num_gpus": <n>` 即可。
+
+### 报错 "No GenRM instance registered for route_key=..."
+
+reward 函数（或直接发 HTTP 请求的调用方）传入的 `route_key` 没有匹配到 `--genrm-instances` 里的任何一个 key。检查是否写错了字符串，或者确认服务确实是用 `--genrm-instances` 启动的，而不是旧的 `--genrm-model-path`（后者只暴露 `"__default__"` 这一个 key——对单实例部署传任何其他 `route_key` 都会以同样的方式报错）。
 
 ## 文件结构
 
@@ -465,7 +609,9 @@ examples/generate_reward_model/
 ├── run-qwen3-4B-8xgpu-colocated.sh                        # 4B colocate 模式
 ├── run-qwen3-4B-8xgpu-async.sh                            # 4B fully async 模式
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B，split-bundle inline reward
-└── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B，shared-bundle 两阶段 swap
+├── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B，shared-bundle 两阶段 swap
+├── run-qwen3-4B-8xgpu-dual-genrm-split.sh                 # 4B policy + 两个 GenRM 实例（--genrm-instances），split-bundle
+└── reward_dual_genrm_quality_safety.py                    # 通过 route_key 路由到两个 GenRM 实例的自定义 reward
 ```
 
 ## 延伸阅读

@@ -2557,6 +2557,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     'Example: \'{ "temperature": 0.2, "max_response_len": 2048 }\''
                 ),
             )
+            parser.add_argument(
+                "--genrm-instances",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON dict deploying multiple named genRM instances, routed by a "
+                    "reward/scoring task name the caller passes to GenRMClient.generate(route_key=...). "
+                    "Each key is a route name; each value is a dict with keys: "
+                    "model_path (str, required), num_gpus (int, required), "
+                    "num_gpus_per_engine (int, optional, defaults to --genrm-num-gpus-per-engine), "
+                    "engine_config (dict, optional, defaults to --genrm-engine-config), "
+                    "sampling_config (dict, optional, defaults to --genrm-sampling-config). "
+                    'Example: \'{"quality": {"model_path": "/a", "num_gpus": 4}, '
+                    '"safety": {"model_path": "/b", "num_gpus": 4}}\'. '
+                    "When set, this takes priority over --genrm-model-path (and the latter is ignored "
+                    "with a warning if also set)."
+                ),
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -3001,6 +3019,84 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 _MTP_ONLY_PARAM_PATTERN = r"(^|\.)mtp(\.|$)"
+
+
+_GENRM_DEFAULT_INSTANCE_KEY = "__default__"
+
+
+def _resolve_genrm_instances(args) -> dict:
+    """Normalize --genrm-instances vs the legacy single-instance flags into one
+    ``{route_key: spec}`` shape.
+
+    Returns an empty dict if genRM is not enabled at all. Each spec has keys
+    ``model_path``, ``num_gpus``, ``num_gpus_per_engine``, ``engine_config``,
+    ``sampling_config``.
+    """
+    instances = getattr(args, "genrm_instances", None)
+    if instances is not None:
+        if not isinstance(instances, dict) or not instances:
+            raise ValueError("--genrm-instances must be a non-empty JSON object.")
+        if getattr(args, "genrm_model_path", None) is not None:
+            logger.warning(
+                "Both --genrm-instances and --genrm-model-path are set; --genrm-instances "
+                "takes priority and --genrm-model-path is ignored."
+            )
+        resolved = {}
+        for key, spec in instances.items():
+            if key == _GENRM_DEFAULT_INSTANCE_KEY:
+                raise ValueError(
+                    f"--genrm-instances route key '{_GENRM_DEFAULT_INSTANCE_KEY}' is reserved for "
+                    "the legacy --genrm-model-path configuration."
+                )
+            if not isinstance(key, str) or not key:
+                raise ValueError("--genrm-instances route keys must be non-empty strings.")
+            if not isinstance(spec, dict):
+                raise ValueError(f"--genrm-instances['{key}'] must be a JSON object.")
+            if "model_path" not in spec:
+                raise ValueError(f"--genrm-instances['{key}'] is missing required key 'model_path'.")
+            if "num_gpus" not in spec:
+                raise ValueError(
+                    f"--genrm-instances['{key}'] is missing required key 'num_gpus'. "
+                    "Each genRM instance must explicitly state its GPU budget "
+                    "(no implicit even split across instances)."
+                )
+            resolved[key] = {
+                "model_path": spec["model_path"],
+                "num_gpus": spec["num_gpus"],
+                "num_gpus_per_engine": spec.get("num_gpus_per_engine") or args.genrm_num_gpus_per_engine,
+                "engine_config": spec.get("engine_config", args.genrm_engine_config) or {},
+                "sampling_config": spec.get("sampling_config", args.genrm_sampling_config) or {},
+            }
+        return resolved
+
+    if getattr(args, "genrm_model_path", None) is None:
+        return {}
+
+    return {
+        _GENRM_DEFAULT_INSTANCE_KEY: {
+            "model_path": args.genrm_model_path,
+            "num_gpus": args.genrm_num_gpus,
+            "num_gpus_per_engine": args.genrm_num_gpus_per_engine,
+            "engine_config": args.genrm_engine_config or {},
+            "sampling_config": args.genrm_sampling_config or {},
+        }
+    }
+
+
+def _validate_genrm_resource_config(args, instance_specs: dict) -> None:
+    """Require the GenRM placement-group budget to match all instances."""
+    if not instance_specs:
+        return
+    resource = getattr(args, "resource", None) or {}
+    if "genrm" not in resource:
+        raise ValueError("GenRM is enabled, but --resource has no 'genrm' entry.")
+    resource_gpus = resource["genrm"][1]
+    instance_gpus = sum(spec["num_gpus"] for spec in instance_specs.values())
+    if resource_gpus != instance_gpus:
+        raise ValueError(
+            "--resource['genrm'] GPU count must equal the sum of all GenRM instance GPU budgets; "
+            f"got resource={resource_gpus}, instances={instance_gpus}."
+        )
 
 
 def _normalize_mtp_detach_paths(args) -> None:
@@ -3849,8 +3945,11 @@ def slime_validate_args(args):
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."
     )
 
-    # Check if genRM is enabled
-    genrm_enabled = args.genrm_model_path is not None
+    # Check if genRM is enabled, and normalize --genrm-instances vs the legacy
+    # single-instance flags into one shape downstream code can rely on.
+    args._genrm_instances_resolved = _resolve_genrm_instances(args)
+    _validate_genrm_resource_config(args, args._genrm_instances_resolved)
+    genrm_enabled = bool(args._genrm_instances_resolved)
     managed_opd_teacher_enabled = is_managed_opd_teacher_enabled(args)
     args._genrm_colocate_with_rollout = False
 
@@ -3896,7 +3995,7 @@ def slime_validate_args(args):
             actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
         rollout_g = args.rollout_num_gpus
-        genrm_g = args.genrm_num_gpus
+        genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
         if rollout_g + genrm_g == actor_total_gpus:
             args._genrm_colocate_with_rollout = False
             logger.info(

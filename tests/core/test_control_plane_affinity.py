@@ -147,6 +147,46 @@ def test_genrm_manager_requests_stable_cpu(monkeypatch, tmp_path):
     }
 
 
+def test_multi_genrm_managers_have_route_specific_names(monkeypatch, tmp_path):
+    captured_options = []
+    captured_ctor_kwargs = []
+    genrm_module = ModuleType("relax.distributed.ray.genrm")
+
+    class FakeGenRMManager(_FakeActorClass):
+        @classmethod
+        def options(cls, **options):
+            captured_options.append(options)
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):
+            captured_ctor_kwargs.append(kwargs)
+            return MagicMock()
+
+    genrm_module.GenRMManager = FakeGenRMManager
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.genrm", genrm_module)
+    spec = {
+        "model_path": "/model",
+        "num_gpus": 1,
+        "num_gpus_per_engine": 1,
+        "engine_config": {},
+        "sampling_config": {},
+    }
+    args = _elastic_args(
+        tmp_path,
+        offload_rollout=False,
+        _genrm_instances_resolved={"quality": dict(spec), "safety": dict(spec)},
+    )
+
+    placement_group_module.create_genrm_managers(args, "pg")
+
+    assert [options["name"] for options in captured_options] == [
+        "relax_genrm_manager_quality",
+        "relax_genrm_manager_safety",
+    ]
+    assert [kwargs["port_window_index"] for kwargs in captured_ctor_kwargs] == [0, 1]
+
+
 def test_dcs_proxy_requests_stable_cpu(monkeypatch, tmp_path):
     try:
         from relax.distributed.checkpoint_service.backends import device_direct

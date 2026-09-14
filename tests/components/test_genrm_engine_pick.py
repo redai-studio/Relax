@@ -51,25 +51,40 @@ class _Replica:
 
     ``ray.get`` and ``time`` are stubbed in the namespace the methods actually
     resolve names from, so the clock is deterministic and no Ray runtime is
-    touched. That namespace is *not* ``relax.components.genrm.__dict__``:
-    ``@serve.ingress`` rebuilds the class against its own globals, so patching
-    the module would silently miss and let the real ``ray.get`` auto-init a
-    cluster.
+    touched. Two distinct namespaces are involved, and both must be patched:
+
+    - ``GenRM._pick_engine``/``_resolve_instance_key`` resolve names from a
+      globals dict FastAPI's class-based-view rewriting builds for route
+      handlers -- a *copy* of ``relax.components.genrm.__dict__``, not the
+      module dict itself (``@serve.ingress`` rebuilds the class against this
+      copy, so patching only the module would silently miss and let the real
+      ``ray.get`` auto-init a cluster).
+    - ``_EngineCacheState.needs_refresh``/``refresh``/``invalidate`` are a
+      plain module-level class, never touched by that rewriting, so their
+      ``time`` still resolves from the *original* module dict. Patching only
+      the FastAPI copy leaves this class reading the real wall clock, and
+      every cooldown/refresh assertion silently uses live time instead of the
+      test's fake clock.
     """
 
     def __init__(self, monkeypatch, responses, start_time=100.0):
         cls = genrm_module.GenRM.func_or_class
         method_globals = cls._pick_engine.__globals__
         assert method_globals.get("ray") is not None, "engine picking no longer resolves 'ray' from its globals"
+        module_globals = genrm_module.__dict__
+        assert method_globals is not module_globals, (
+            "FastAPI route rewriting no longer copies GenRM's globals -- "
+            "the module_globals patch below may now be redundant, not wrong"
+        )
 
         self._replica = object.__new__(cls)
-        self._replica._engine_hosts_ports = None
-        self._replica._engine_cycle = None
-        self._replica._engine_cache_refreshed_at = 0.0
+        self._replica._engine_caches = {"__default__": genrm_module._EngineCacheState()}
         # Only ``get_engine_hosts_ports.remote()`` is ever reached; the token it
         # returns is resolved by the patched ``ray.get`` below, mirroring how a
         # real ObjectRef is consumed.
-        self._replica.genrm_manager = SimpleNamespace(get_engine_hosts_ports=SimpleNamespace(remote=lambda: _TOKEN))
+        self._replica.genrm_managers = {
+            "__default__": SimpleNamespace(get_engine_hosts_ports=SimpleNamespace(remote=lambda: _TOKEN))
+        }
 
         self.now = start_time
         self.fetches = 0
@@ -82,15 +97,18 @@ class _Replica:
             self.fetches += 1
             return reply
 
+        fake_time = SimpleNamespace(monotonic=lambda: self.now)
         monkeypatch.setitem(method_globals, "ray", SimpleNamespace(get=fake_ray_get))
-        monkeypatch.setitem(method_globals, "time", SimpleNamespace(monotonic=lambda: self.now))
+        monkeypatch.setitem(method_globals, "time", fake_time)
+        monkeypatch.setitem(module_globals, "time", fake_time)
         monkeypatch.setenv("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", str(COOLDOWN_S))
 
     def pick(self):
-        return self._replica._pick_engine()
+        _key, idx, host, port = self._replica._pick_engine(None)
+        return idx, host, port
 
     def invalidate(self):
-        self._replica._invalidate_engine_cache()
+        self._replica._engine_caches["__default__"].invalidate()
 
     def advance(self, seconds):
         self.now += seconds
@@ -200,3 +218,27 @@ class TestEmptyEngineList:
         with pytest.raises(RuntimeError):
             r.pick()
         assert r.fetches == 2, "but it must keep retrying so recovery is noticed"
+
+
+class TestManagerLookup:
+    def test_selects_manager_by_route_key(self):
+        cls = genrm_module.GenRM.func_or_class
+        replica = object.__new__(cls)
+        quality_manager = object()
+        safety_manager = object()
+        replica.genrm_managers = {"quality": quality_manager, "safety": safety_manager}
+
+        assert replica.get_genrm_manager("quality") is quality_manager
+        assert replica.get_genrm_manager("safety") is safety_manager
+
+    def test_omitted_route_key_requires_exactly_one_instance(self):
+        cls = genrm_module.GenRM.func_or_class
+        replica = object.__new__(cls)
+        manager = object()
+        replica.genrm_managers = {"quality": manager}
+
+        assert replica.get_genrm_manager() is manager
+
+        replica.genrm_managers["safety"] = object()
+        with pytest.raises(RuntimeError, match="route_key"):
+            replica.get_genrm_manager()
