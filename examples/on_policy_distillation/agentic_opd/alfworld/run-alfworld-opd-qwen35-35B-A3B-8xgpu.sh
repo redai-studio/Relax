@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
 # ALFWorld agentic OPD (On-Policy Distillation), Qwen3.5-35B-A3B (MoE), 8xGPU colocate.
+# Rollout: 1P1D TP2/EP1 on 4 GPUs; teacher: TP4 on the other 4 GPUs.
 
 set -ex
 set -o pipefail
@@ -24,15 +25,22 @@ DATA_DIR="${DATA_DIR:-/root/alfworld-relax}"
 
 CONDA_HOME="${CONDA_HOME:-/root/miniconda3}"
 ALFWORLD_CONDA_ENV="${ALFWORLD_CONDA_ENV:-relax-opd-alfworld}"
+ALFWORLD_VENV="${ALFWORLD_VENV:-}"
 ALFWORLD_DATA="${ALFWORLD_DATA:-/root/alfworld}"
+ALFWORLD_MAX_TURNS="${ALFWORLD_MAX_TURNS:-40}"
+ALFWORLD_HISTORY_LENGTH="${ALFWORLD_HISTORY_LENGTH:-2}"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=150}"
 
-ROLLOUT_BATCH_SIZE=128
-ROLLOUT_N_GROUPS=1
-ROLLOUT_RESP_LENGTH=512
-ROLLOUT_PROMPT_LENGTH=2048
-EVAL_ROLLOUT_RESP_LENGTH=512
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-256}"
+ROLLOUT_N_GROUPS="${ROLLOUT_N_GROUPS:-1}"
+# Match GRPO: this is a per-turn cap, independent of the trajectory budget.
+ROLLOUT_RESP_LENGTH="${ROLLOUT_RESP_LENGTH:-2048}"
+ROLLOUT_PROMPT_LENGTH="${ROLLOUT_PROMPT_LENGTH:-2048}"
+# Bound the whole multi-turn training trajectory independently of the turn cap.
+ROLLOUT_MAX_CONTEXT_LENGTH="${ROLLOUT_MAX_CONTEXT_LENGTH:-32768}"
+AGENTIC_CONCURRENCY="${AGENTIC_CONCURRENCY:-${ROLLOUT_BATCH_SIZE}}"
+EVAL_ROLLOUT_RESP_LENGTH="${EVAL_ROLLOUT_RESP_LENGTH:-${ROLLOUT_RESP_LENGTH}}"
 
 STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-35B-A3B}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${EXP_DIR}/Qwen3.5-35B-A3B-GRPO-alfworld-50step}"
@@ -46,7 +54,43 @@ ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
 TEACHER_GPUS="${TEACHER_GPUS:-4}"
 ACTOR_GPUS="${ACTOR_GPUS:-8}"
 
-EXP_NAME=agentic-opd-alfworld-sampledkl-${STUDENT_MODEL_NAME}-${now}
+# Student and teacher are online together during rollout; actor reuses all 8 GPUs.
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+SGLANG_CONFIG="${SGLANG_CONFIG:-${SCRIPT_DIR}/sglang-1p1d-tp2-qwen35-35B-A3B.yaml}"
+if [ "${ROLLOUT_GPUS}" -ne 4 ] || [ "${TEACHER_GPUS}" -ne 4 ] || \
+   [ "${ACTOR_GPUS}" -ne 8 ] || [ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" -ne 2 ]; then
+    echo "This PD recipe requires rollout=4, teacher=4, actor=8 GPUs and TP2 rollout engines." >&2
+    exit 1
+fi
+if [ ! -f "${SGLANG_CONFIG}" ]; then
+    echo "SGLang PD config not found: ${SGLANG_CONFIG}" >&2
+    exit 1
+fi
+# One D engine serves all resident sessions; allow 25% scheduling margin.
+SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-$(((AGENTIC_CONCURRENCY * ROLLOUT_N_GROUPS * 5 + 3) / 4))}"
+
+# Forward these to Ray actors and SGLang HTTP processes. The pool value
+# selects hybrid-model metadata handling; Mooncake transport remains RDMA.
+export SGLANG_TIMEOUT_KEEP_ALIVE="${SGLANG_TIMEOUT_KEEP_ALIVE:-600}"
+export SGLANG_MOONCAKE_CUSTOM_MEM_POOL="${SGLANG_MOONCAKE_CUSTOM_MEM_POOL:-INTRA_NODE_NVLINK}"
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}SGLANG_TIMEOUT_KEEP_ALIVE,SGLANG_MOONCAKE_CUSTOM_MEM_POOL"
+RUNTIME_ENV_JSON=$(python3 - <<'PYENV'
+import json
+import os
+
+runtime = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env_vars = runtime.setdefault("env_vars", {})
+# Keep both caller-provided lists when the driver rebuilds actor environments.
+propagate = env_vars.get("RELAX_PROPAGATE_ENV_VARS", "") + "," + os.environ["RELAX_PROPAGATE_ENV_VARS"]
+env_vars["RELAX_PROPAGATE_ENV_VARS"] = ",".join(dict.fromkeys(x.strip() for x in propagate.split(",") if x.strip()))
+for name in ("SGLANG_TIMEOUT_KEEP_ALIVE", "SGLANG_MOONCAKE_CUSTOM_MEM_POOL"):
+    env_vars[name] = os.environ[name]
+print(json.dumps(runtime))
+PYENV
+)
+export RUNTIME_ENV_JSON
+
+EXP_NAME=agentic-opd-alfworld-sampledkl-1p1d-tp${ROLLOUT_NUM_GPUS_PER_ENGINE}-${STUDENT_MODEL_NAME}-${now}
 SAVE_DIR=${EXP_DIR}/save/${EXP_NAME}
 mkdir -p "${SAVE_DIR}"
 
@@ -74,13 +118,23 @@ ROLLOUT_ARGS=(
    --agent-env
       "CONDA_HOME=${CONDA_HOME}"
       "ALFWORLD_CONDA_ENV=${ALFWORLD_CONDA_ENV}"
+      "ALFWORLD_VENV=${ALFWORLD_VENV}"
       "ALFWORLD_DATA=${ALFWORLD_DATA}"
+      "ALFWORLD_MAX_TURNS=${ALFWORLD_MAX_TURNS}"
+      "ALFWORLD_HISTORY_LENGTH=${ALFWORLD_HISTORY_LENGTH}"
+      # Match the turn cap used below for finish_length/context_exhausted handling.
+      "ALFWORLD_MAX_RESPONSE_LEN=${ROLLOUT_RESP_LENGTH}"
+      "OMP_NUM_THREADS=1"
+      "MKL_NUM_THREADS=1"
+      "OPENBLAS_NUM_THREADS=1"
 
    --num-rollout              ${NUM_ROLLOUT}
    --rollout-batch-size       ${ROLLOUT_BATCH_SIZE}
    --n-samples-per-prompt     ${ROLLOUT_N_GROUPS}
    --rollout-max-prompt-len   ${ROLLOUT_PROMPT_LENGTH}
    --rollout-max-response-len ${ROLLOUT_RESP_LENGTH}
+   --rollout-max-context-len  ${ROLLOUT_MAX_CONTEXT_LENGTH}
+   --agentic-concurrency     ${AGENTIC_CONCURRENCY}
    --rollout-temperature      1.0
    --rollout-top-p            1.0
    --global-batch-size $((ROLLOUT_BATCH_SIZE * ROLLOUT_N_GROUPS))
@@ -105,7 +159,13 @@ OPD_ARGS=(
    --warm-hf-checkpoint-page-cache
 
    --teacher-sglang-mem-fraction-static 0.7
+   # Teacher scores the complete trajectory as input and needs the same headroom.
+   --teacher-sglang-context-length $((ROLLOUT_MAX_CONTEXT_LENGTH + 64))
+   --teacher-sglang-chunked-prefill-size ${TEACHER_PREFILL_CHUNK:-8192}
+   --teacher-sglang-max-prefill-tokens ${TEACHER_MAX_PREFILL_TOKENS:-16384}
    --teacher-num-gpus-per-engine 4
+   # Pin teacher admission independently of the student PD batch capacity.
+   --teacher-sglang-max-running-requests ${TEACHER_MAX_RUNNING_REQUESTS:-64}
    --teacher-sglang-disable-cuda-graph
 
    --opd-kl-coef ${OPD_KL_COEF}
@@ -150,15 +210,23 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
    --use-dynamic-batch-size
-   --max-tokens-per-gpu ${ACTOR_MAX_TOKENS_PER_GPU:-8192}
+   # A complete multi-turn trajectory must fit the per-GPU token budget at CP1.
+   --max-tokens-per-gpu ${ACTOR_MAX_TOKENS_PER_GPU:-${ROLLOUT_MAX_CONTEXT_LENGTH}}
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
-   --sglang-mem-fraction-static ${STUDENT_MEM_FRACTION:-0.7}
+   --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
+   --sglang-config "${SGLANG_CONFIG}"
+   # SGLang reserves input/output slots internally. Keep the RL/training budget
+   # at 32768 and add service headroom for legal requests near that limit.
+   --sglang-context-length $((ROLLOUT_MAX_CONTEXT_LENGTH + 64))
+   --sglang-router-policy consistent_hashing
+   --sglang-router-prefill-policy consistent_hashing
+   --sglang-router-decode-policy consistent_hashing
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
-   --sglang-max-running-requests 64
+   --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
+   --sglang-cuda-graph-max-bs-decode ${SGLANG_MAX_RUNNING_REQUESTS}
 )
 
 WANDB_ARGS=(

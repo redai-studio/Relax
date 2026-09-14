@@ -25,6 +25,13 @@ TASK_TYPES = (
     "pick_two_obj_and_place",
 )
 
+# Episode exit paths emitted by app/agent.py. Tracking their mix is what tells
+# you which budget is actually binding: "finish_length" blames the per-turn
+# --rollout-max-response-len, "context_exhausted" blames
+# --rollout-max-context-len, and "max_turns" blames ALFWORLD_MAX_TURNS. Without
+# this split a high truncated_ratio is unattributable.
+STOP_REASONS = ("env_done", "max_turns", "finish_length", "context_exhausted")
+
 
 def compute_score(metadata: dict) -> dict:
     success = float(metadata.get("success", 1.0 if metadata.get("won") else 0.0))
@@ -34,10 +41,16 @@ def compute_score(metadata: dict) -> dict:
         "score": success,
         "acc": success,
         "won": success,
+        "num_turns": float(metadata.get("num_turns") or 0),
     }
     # Per-category success so eval can report the paper's six ALFWorld tasks.
     if task_type in TASK_TYPES:
         result[f"success/{task_type}"] = success
+    # One-hot the exit path so its mean reads as the fraction of episodes that
+    # ended that way.
+    stop_reason = metadata.get("stop_reason")
+    for reason in STOP_REASONS:
+        result[f"stop_reason/{reason}"] = 1.0 if stop_reason == reason else 0.0
     return result
 
 
