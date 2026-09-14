@@ -131,15 +131,16 @@ class Actor(Base):
         self._peer_barrier = peers
 
     def set_genrm_manager(self, genrm_manager: Any) -> None:
-        """Set the genRM manager for coordinated offload/onload.
+        """Set the genRM manager(s) for coordinated offload/onload.
 
-        In colocated mode, the genRM manager is used to offload genRM engines
-        before training and onload them before rollout, since they share GPU
-        resources.
+        ``genrm_manager`` is a list of manager handles -- one per genRM
+        instance (a single-instance config still passes a one-element list). In
+        colocated mode, they are used to offload genRM engines before training
+        and onload them before rollout, since they share GPU resources.
         """
         self.genrm_manager = genrm_manager
         self.actor_model.set_genrm_manager(self.genrm_manager)
-        self._logger.info("GenRM manager set on Actor for coordinated offload/onload")
+        self._logger.info("GenRM manager(s) set on Actor for coordinated offload/onload")
 
     def set_teacher_manager(self, teacher_manager: Any) -> None:
         """Set the managed OPD teacher manager for coordinated

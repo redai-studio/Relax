@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
+import asyncio
 import concurrent.futures
 import copy
 import os
@@ -8,7 +9,7 @@ import traceback
 from argparse import Namespace
 from enum import Enum, IntEnum
 from functools import partial
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import transfer_queue as tq
@@ -23,7 +24,7 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
-from relax.core.optional_roles import register_extra_roles
+from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
 from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
@@ -69,7 +70,7 @@ def _is_colocate(config: Namespace) -> bool:
 
 logger = get_logger(__name__)
 
-ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", "genrm"]
+ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", GENRM_ROLE]
 # ``auto`` may resolve to a node-local full checkpoint on a single-node engine,
 # while ``runai_streamer`` keeps the model source on raw S3.  Be conservative:
 # cleanup is enabled only when the configured plan cannot retain SHM weights.
@@ -170,9 +171,23 @@ class Controller:
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
         self._health_manager = HealthManager(check_interval=1.0, config=config)
-        self._restarting = False  # Flag to indicate a restart is in progress
-        self._restart_done_event = threading.Event()  # Signals main thread that global restart Phase 1+2 is done
-        self._restart_error = None  # Stores any error from the global restart thread
+        if not hasattr(self, "_restarting"):
+            self._restarting = False  # Flag to indicate a restart is in progress
+        # Keep the synchronization object stable across the self.__init__ call
+        # performed by a global restart. Both the restart worker and the main
+        # training thread must always refer to the same event generation.
+        if not hasattr(self, "_restart_done_event"):
+            self._restart_done_event = threading.Event()
+        if not hasattr(self, "_restart_consumed_event"):
+            # A HealthChecker snapshot may contain multiple unhealthy roles.
+            # Do not let the next callback overwrite this cycle's mode/error
+            # until the training thread has consumed its completion signal.
+            self._restart_consumed_event = threading.Event()
+            self._restart_consumed_event.set()
+        if not hasattr(self, "_restart_error"):
+            self._restart_error = None
+        if not hasattr(self, "_restart_mode"):
+            self._restart_mode = None
         # Preserve across __init__ calls during global restart (same pattern as _global_restart_count)
         if not hasattr(self, "_pending_task_refs"):
             self._pending_task_refs: list = []
@@ -405,6 +420,21 @@ class Controller:
             except Exception as e:
                 logger.debug(f"[Global Restart] Failed to cancel task ref (may already be done): {e}")
         logger.info("[Global Restart] All pending task refs cancelled")
+
+    def _consume_restart_cycle(self) -> tuple[str, Optional[BaseException]]:
+        """Snapshot one completed restart before acknowledging its
+        generation."""
+        self._restart_done_event.clear()
+        restart_mode = self._restart_mode or "unknown"
+        restart_error = self._restart_error
+
+        # Commit all state changes for this cycle before publishing the
+        # acknowledgement. After set(), the health checker may immediately
+        # start the next generation and own these fields.
+        self._restarting = False
+        self._restart_mode = None
+        self._restart_consumed_event.set()
+        return restart_mode, restart_error
 
     def _on_service_unhealthy(self, role: str) -> None:
         """Callback when a service becomes unhealthy. Initiates service
@@ -822,12 +852,16 @@ class Controller:
     def training_loop(self):
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
-        async def run_all_services():
-            if not (self.config.debug_train_only or self.config.debug_rollout_only):
-                # Pass genRM manager to actor for coordinated offload/onload
-                if "genrm" in self.serve_dict and not self.config.fully_async:
-                    genrm_manager = await self.serve_dict["genrm"].get_genrm_manager()
-                    await self.serve_dict[ROLES.actor].set_genrm_manager(genrm_manager)
+        async def run_all_services(*, resume_existing: bool = False):
+            if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
+                # Pass genRM manager(s) to actor for coordinated offload/onload
+                if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
+                    genrm_service = self.serve_dict[GENRM_ROLE]
+                    genrm_managers = [
+                        await genrm_service.get_genrm_manager(route_key)
+                        for route_key in self.config._genrm_instances_resolved
+                    ]
+                    await self.serve_dict[ROLES.actor].set_genrm_manager(genrm_managers)
 
                 await set_managed_opd_teacher_on_actor_service(
                     self.serve_dict.get(ROLES.actor),
@@ -888,12 +922,13 @@ class Controller:
             # All startup consumers have now initialized and the first policy
             # weights have been synchronized. Remove source weight shards
             # before any service starts its training/rollout loop.
-            self._cleanup_s3_model_weights_after_init()
+            if not resume_existing:
+                self._cleanup_s3_model_weights_after_init()
 
             task_refs = []
             service_names = []
             for role, service in self.serve_dict.items():
-                task_ref = service.run()
+                task_ref = service._task_ref if resume_existing else service.run()
                 if task_ref is not None:
                     task_refs.append(task_ref)
                     service_names.append(service.role)
@@ -905,7 +940,7 @@ class Controller:
                 logger.info(f"Started {len(task_refs)} services in parallel: {service_names}")
 
                 try:
-                    [await task_ref for task_ref in task_refs]
+                    await asyncio.gather(*task_refs)
                     logger.info("Service task completed successfully")
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}")
@@ -913,9 +948,10 @@ class Controller:
                     with self._pending_task_refs_lock:
                         self._pending_task_refs.clear()
 
+        resume_existing = False
         while True:
             try:
-                run(run_all_services())
+                run(run_all_services(resume_existing=resume_existing))
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
@@ -928,20 +964,17 @@ class Controller:
                     logger.warning(
                         f"Training loop interrupted by ongoing restart, waiting for restart to complete: {e}"
                     )
-                    self._restart_done_event.wait()  # Block until _global_restart signals done
-                    self._restart_done_event.clear()  # Reset for next restart cycle
+                    restart_done_event = self._restart_done_event
+                    restart_done_event.wait()  # Block until _global_restart signals done
+                    restart_mode, restart_error = self._consume_restart_cycle()
+                    resume_existing = restart_mode == "local"
 
-                    if self._restart_error is not None:
-                        # Global restart itself failed — nothing more we can do
-                        logger.exception(f"Global restart failed, cannot recover: {self._restart_error}")
-                        self._report_error_to_metrics_service(self._restart_error)
-                        raise RuntimeError(f"Global restart failed: {self._restart_error}") from self._restart_error
+                    if restart_error is not None:
+                        logger.exception(f"{restart_mode} restart failed, cannot recover: {restart_error}")
+                        self._report_error_to_metrics_service(restart_error)
+                        raise RuntimeError(f"{restart_mode} restart failed: {restart_error}") from restart_error
 
-                    # Global restart succeeded — self.__init__() has been called,
-                    # all services are re-registered. Loop back to re-run
-                    # run_all_services() with fresh state.
-                    self._restarting = False
-                    logger.info("Global restart completed, re-running training loop")
+                    logger.info(f"{restart_mode} restart completed, re-running training loop")
                     continue
                 logger.exception(f"Training loop failed: {e}")
                 # Report error to metrics service for Apprise notification
@@ -1023,7 +1056,6 @@ class Controller:
             role: Service role name to restart.
         """
         logger.info(f"Restarting service '{role}'...")
-        serve.delete(role)
         # Must mirror register_all_serve's algo-key resolution. SFT mode is
         # identified by ``loss_type == "sft"``, not by ``advantage_estimator``
         # (Megatron's parser doesn't accept "sft" as an --advantage-estimator
@@ -1042,29 +1074,75 @@ class Controller:
             logger.warning(f"No class registered for role '{role}', skipping")
             return
 
+        # Serialize restart generations. HealthChecker can invoke this callback
+        # repeatedly for several unhealthy roles from one status snapshot; the
+        # training thread must consume the previous generation first.
+        self._restart_consumed_event.wait()
+        self._restart_consumed_event.clear()
         self._restarting = True
+        self._restart_done_event.clear()
+        self._restart_error = None
         restart_count = self._health_manager.increment_restart_count(role)
         logger.info(f"Restarting {role}, restart count: {restart_count}")
 
         # TODO(yuzhe) remove rollout and actor_fwd from global_restart.
-        if role in [ROLES.actor, ROLES.rollout, ROLES.actor_fwd] or restart_count >= 3:
+        # These services have startup-only cross-service wiring. Recreating one
+        # replica in place would lose barriers, manager handles, or the initial
+        # fully-async weight synchronization, so use the full-rewire path.
+        full_rewire_roles = {
+            ROLES.actor,
+            ROLES.rollout,
+            ROLES.actor_fwd,
+            ROLES.critic,
+            ROLES.reference,
+            GENRM_ROLE,
+        }
+        global_restart = role in full_rewire_roles or restart_count >= 3
+        self._restart_mode = "global" if global_restart else "local"
+        if global_restart:
             # Perform full Controller re-initialization from zero when:
             # 1. Actor fails (core training service, all other services depend on it)
             # 2. Any service has been restarted >= 3 times (system is unstable)
-            reason = "actor failure" if role == ROLES.actor else f"restart_count({restart_count}) >= 3 for '{role}'"
+            reason = (
+                f"{role} requires cross-service rewiring"
+                if role in full_rewire_roles
+                else f"restart_count({restart_count}) >= 3 for '{role}'"
+            )
             logger.warning(f"Triggering global restart due to: {reason}")
             self._global_restart()
             # _restarting is reset by the main thread after it processes the restart_done_event
         else:
             # Delegate in-place restart to Service (reuses PG, restores step, syncs weights, re-runs task)
             service = self.serve_dict[role]
-            service.restart()
-
-            self._restarting = False
-            self._health_manager.mark_healthy(role)
-            logger.info(f"Service '{role}' restarted successfully")
+            try:
+                service.restart()
+                self._health_manager.mark_healthy(role)
+                logger.info(f"Service '{role}' restarted successfully")
+            except BaseException as e:
+                self._restart_error = e
+                logger.exception(f"Service '{role}' restart failed: {e}")
+            finally:
+                self._restart_done_event.set()
 
     def _global_restart(self) -> None:
+        """Run a global restart and always release the waiting main thread."""
+        restart_done_event = self._restart_done_event
+        try:
+            self._run_global_restart()
+        except BaseException as e:
+            self._restart_error = e
+            logger.exception(f"[Global Restart] Unhandled restart failure: {e}")
+            # A failure before _run_global_restart reaches its normal cancel
+            # phase must still interrupt the training thread so it can consume
+            # this cycle's error and release the restart-generation handshake.
+            try:
+                self._cancel_pending_tasks()
+            except BaseException as cancel_error:
+                logger.warning(f"[Global Restart] Failed to cancel pending tasks after error: {cancel_error}")
+        finally:
+            restart_done_event.set()
+
+    def _run_global_restart(self) -> None:
         """Perform a full global restart by re-initializing the Controller from
         zero.
 
@@ -1265,11 +1343,8 @@ class Controller:
         # =====================================================================
         # Phase 2: Re-initialize from zero by calling __init__
         # =====================================================================
-        # IMPORTANT: Save a reference to the event BEFORE calling __init__(),
-        # because __init__() will overwrite self._restart_done_event with a new
-        # Event object. The main thread is waiting on the OLD event.
-        restart_done_event = self._restart_done_event
-        # Also save _restarting and _global_restart_count since __init__ resets them
+        # Save _restarting and _global_restart_count since __init__ resets them.
+        # _restart_done_event itself is deliberately preserved by __init__.
         saved_restarting = True  # Must remain True so main thread knows to wait
         saved_global_restart_count = self._global_restart_count
 
@@ -1282,12 +1357,10 @@ class Controller:
         except Exception as e:
             logger.exception(f"[Global Restart] Failed to re-initialize Controller: {e}")
             self._restart_error = e
-            restart_done_event.set()  # Unblock main thread so it can handle the error
             return
 
         # Signal the main thread that global restart is done.
         # The main thread (blocked in training_loop's while-loop) will wake up
         # and re-run run_all_services() with the freshly initialized state.
         self._restart_error = None
-        restart_done_event.set()
-        logger.info("=== Global restart (full re-initialization) completed, main thread signaled ===")
+        logger.info("=== Global restart (full re-initialization) completed ===")

@@ -923,7 +923,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
-                pre_train_offload_handles.append(self.genrm_manager.offload.remote())
+                # A list of one or more GenRM manager handles (one per instance).
+                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
             append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
             if pre_train_offload_handles:
                 ray.get(pre_train_offload_handles)
@@ -2504,7 +2505,8 @@ class MegatronTrainRayActor(TrainRayActor):
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
             if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
-                post_sync_handles.append(self.genrm_manager.onload.remote())
+                # A list of one or more GenRM manager handles (one per instance).
+                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
 

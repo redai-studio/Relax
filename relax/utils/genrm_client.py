@@ -66,6 +66,7 @@ class GenRMClient:
         self,
         messages: List[dict],
         sampling_params: Optional[Dict] = None,
+        route_key: Optional[str] = None,
     ) -> str:
         """Async generate response for given chat messages.
 
@@ -79,6 +80,10 @@ class GenRMClient:
             sampling_params: Optional sampling parameters to override defaults.
                 Supported keys: temperature, top_p, top_k, max_new_tokens.
                 Example: {"temperature": 0.3, "top_p": 0.9}
+            route_key: Selects which genRM instance to use, when the service
+                hosts more than one (see --genrm-instances). Typically the
+                name of the reward/scoring task making the call. Omit to use
+                the service's sole instance.
 
         Returns:
             Raw response string from the GenRM model
@@ -89,6 +94,8 @@ class GenRMClient:
         }
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params
+        if route_key is not None:
+            payload["route_key"] = route_key
 
         backoff = _GENRM_INITIAL_BACKOFF_SEC
         for attempt in range(1, _GENRM_MAX_ATTEMPTS + 1):

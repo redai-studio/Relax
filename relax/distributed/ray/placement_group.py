@@ -153,7 +153,8 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
 
 
 def create_genrm_manager(args, pg, runtime_env=None):
-    """Create and initialize GenRM manager.
+    """Create and initialize a single GenRM manager (legacy single-instance
+    path).
 
     Args:
         args: Argument namespace containing genRM configuration
@@ -168,7 +169,8 @@ def create_genrm_manager(args, pg, runtime_env=None):
     # `name` (with no explicit namespace) lets user code inside other actors of
     # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
     # Used by custom_reward_post_process_path when GenRM lifecycle is managed
-    # from userland.
+    # from userland. Only safe as a fixed, well-known name because this path
+    # is exclusively for the single-instance case (see create_genrm_managers).
     genrm_manager = GenRMManager.options(
         **with_control_plane_affinity(
             args,
@@ -189,3 +191,66 @@ def create_genrm_manager(args, pg, runtime_env=None):
         ray.get(genrm_manager.offload.remote())
 
     return genrm_manager
+
+
+def create_genrm_managers(args, pg, runtime_env=None):
+    """Create and initialize the GenRM manager(s) declared by
+    ``args._genrm_instances_resolved``.
+
+    Single-instance configs (the legacy --genrm-model-path path, normalized to
+    the sentinel key "__default__") go through ``create_genrm_manager`` so the
+    well-known Ray actor name "relax_genrm_manager" keeps working for userland
+    lookups. Multi-instance configs (--genrm-instances) launch one manager per
+    route key, sharing ``pg`` at non-overlapping GPU offsets, named
+    "relax_genrm_manager_{key}" -- there is no single well-known name to
+    preserve once more than one instance exists.
+
+    Returns:
+        ``{route_key: manager_handle}``.
+    """
+    import copy
+
+    from .genrm import GenRMManager
+    from .multi_instance_orchestrator import start_multi_instance_managers
+
+    instance_specs = args._genrm_instances_resolved
+    if list(instance_specs.keys()) == ["__default__"]:
+        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env)}
+    port_window_indices = {key: index for index, key in enumerate(instance_specs)}
+
+    def _build_genrm_manager_args(base_args, key, spec):
+        instance_args = copy.copy(base_args)
+        instance_args.genrm_model_path = spec["model_path"]
+        instance_args.genrm_num_gpus = spec["num_gpus"]
+        instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
+        instance_args.genrm_engine_config = spec["engine_config"]
+        instance_args.genrm_sampling_config = spec["sampling_config"]
+        return instance_args
+
+    def _spawn_genrm_manager(key, instance_args, bundle_offset, spec):
+        return GenRMManager.options(
+            **with_control_plane_affinity(
+                instance_args,
+                {
+                    "name": f"relax_genrm_manager_{key}",
+                    "num_cpus": 1,
+                    "num_gpus": 0,
+                    "runtime_env": runtime_env,
+                },
+            )
+        ).remote(
+            instance_args,
+            pg,
+            bundle_offset=bundle_offset,
+            port_window_index=port_window_indices[key],
+        )
+
+    managers = start_multi_instance_managers(
+        args=args,
+        instance_specs=instance_specs,
+        build_manager_args=_build_genrm_manager_args,
+        spawn_manager=_spawn_genrm_manager,
+        region_offset=0,
+    )
+    logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
+    return managers

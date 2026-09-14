@@ -4,6 +4,11 @@
 
 This module provides a Ray Serve deployment for Generative Reward Model
 (genRM), which evaluates responses using LLM-based preference prediction.
+
+A single Serve deployment can host multiple genRM instances (distinct
+models/configs), routed by a caller-supplied ``route_key`` -- typically the
+name of the reward/scoring task invoking it. Requests that omit ``route_key``
+fall back to the sole "__default__" instance (the legacy single-model config).
 """
 
 import asyncio
@@ -20,7 +25,7 @@ from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
-from relax.distributed.ray.placement_group import create_genrm_manager
+from relax.distributed.ray.placement_group import create_genrm_managers
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -36,6 +41,10 @@ GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
 # NOTE: GENRM_SERVE_MAX_ONGOING_REQUESTS above must stay module-level — it feeds
 # the @serve.deployment decorator, which runs at import. The retry count has no
 # such constraint, so it is read at the call site to stay lazy.
+
+# Sentinel instance key for the legacy single-model config (--genrm-model-path)
+# and for requests that don't pass a route_key.
+_DEFAULT_INSTANCE_KEY = "__default__"
 
 
 class Message(BaseModel):
@@ -53,6 +62,7 @@ class GenerateRequest(BaseModel):
 
     messages: Union[List[Message], List[dict]]
     sampling_params: Optional[dict] = None
+    route_key: Optional[str] = None
 
 
 class GenerateResponse(BaseModel):
@@ -62,6 +72,40 @@ class GenerateResponse(BaseModel):
     """
 
     response: str
+
+
+class _EngineCacheState:
+    """Per-instance round-robin cache over a GenRMManager's live engine list.
+
+    Isolated per route_key so a dead/rebuilt engine on one instance never
+    perturbs another instance's cycle.
+    """
+
+    def __init__(self) -> None:
+        self.hosts_ports: Optional[list] = None
+        self.cycle: Optional[Any] = None
+        self.refreshed_at: float = 0.0
+
+    def invalidate(self) -> None:
+        now = time.monotonic()
+        if now - self.refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
+            return
+        self.hosts_ports = None
+
+    def needs_refresh(self) -> bool:
+        if self.hosts_ports is None:
+            return True
+        if self.hosts_ports:
+            return False
+        return time.monotonic() - self.refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
+
+    def refresh(self, hosts_ports: list) -> None:
+        self.refreshed_at = time.monotonic()
+        # Swap the list and its cycle together: the manager compacts the list
+        # over dead engines, so a cycle built for the old length would hand
+        # back an out-of-range index.
+        self.cycle = cycle(range(len(hosts_ports)))
+        self.hosts_ports = hosts_ports
 
 
 @serve.deployment(
@@ -76,7 +120,8 @@ class GenRM(Base):
     """GenRM Service for generative reward model evaluation.
 
     This service uses SGLang engines to perform preference evaluation by
-    comparing model responses against ground truth or standards.
+    comparing model responses against ground truth or standards. It may host
+    one or more genRM instances (models/configs), routed by ``route_key``.
     """
 
     def __init__(
@@ -103,14 +148,13 @@ class GenRM(Base):
         self.healthy = healthy
         self.role = role
 
-        # Initialize GenRM Manager
-        self.genrm_manager = create_genrm_manager(config, pg, runtime_env=runtime_env)
+        # {route_key: GenRMManager handle}. Single-instance configs (the legacy
+        # --genrm-model-path path) resolve to exactly {"__default__": manager}.
+        self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
+        self.instance_specs = config._genrm_instances_resolved
 
-        # Store engine addresses for HTTP-based generation
-        self._engine_hosts_ports = None
-        self._engine_index = 0
-        self._engine_cache_refreshed_at = 0.0
-        self._logger.info("GenRM service initialized successfully")
+        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
+        self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
         # many concurrent engine requests; keepalive_expiry >> the default 5s so
@@ -120,8 +164,12 @@ class GenRM(Base):
             limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
         )
 
-        # Load tokenizer for prompt encoding
-        self.tokenizer = load_tokenizer(config.genrm_model_path, trust_remote_code=True)
+        # Load one tokenizer per instance -- distinct instances may be distinct
+        # models with distinct tokenizers/chat templates.
+        self.tokenizers = {
+            key: load_tokenizer(spec["model_path"], trust_remote_code=True)
+            for key, spec in self.instance_specs.items()
+        }
 
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
@@ -141,108 +189,83 @@ class GenRM(Base):
         for formatting the prompt and parsing the response.
 
         Args:
-            request: GenerateRequest containing messages list and optional sampling_params
+            request: GenerateRequest containing messages list, optional
+                sampling_params, and an optional route_key selecting which
+                genRM instance to use (defaults to the sole instance).
 
         Returns:
             GenerateResponse containing raw model response text
         """
         try:
-            # Call SGLang engine via GenRMManager
-            output = await self._call_engine(request.messages, request.sampling_params)
-
-            # Return raw response text
+            output = await self._call_engine(request.route_key, request.messages, request.sampling_params)
             response = output.get("text", "").strip()
             return GenerateResponse(response=response)
 
         except Exception as e:
-            self._logger.error(f"GenRM generation failed: {e}")
+            self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
             raise
 
-    def _invalidate_engine_cache(self) -> None:
-        """Force the next _pick_engine to re-read the live engine list.
+    def _resolve_instance_key(self, route_key: Optional[str]) -> str:
+        if route_key is None and len(self.genrm_managers) == 1:
+            return next(iter(self.genrm_managers))
+        key = route_key or _DEFAULT_INSTANCE_KEY
+        if key not in self.genrm_managers:
+            raise RuntimeError(
+                f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
+            )
+        return key
 
-        GenRMManager rebuilds a dead engine on a *fresh port*, so a cache held
-        from before the rebuild points at nothing.
+    def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
+        """Round-robin one live engine of the instance selected by
+        ``route_key``, refreshing that instance's cache if it was dropped."""
+        key = self._resolve_instance_key(route_key)
+        cache = self._engine_caches[key]
+        if cache.needs_refresh():
+            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
+            cache.refresh(hosts_ports)
 
-        Throttled: a dead engine fails many in-flight requests at once, and the
-        refresh is a blocking ray.get on this replica's event loop. Without the
-        cooldown a burst of N failures costs N serialized round-trips.
-        """
-        now = time.monotonic()
-        if now - self._engine_cache_refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
-            return
-        self._engine_hosts_ports = None
-
-    def _needs_engine_refresh(self) -> bool:
-        """Whether _pick_engine must re-read the engine list before serving.
-
-        An empty list is never a valid cache. The manager reports ``[]`` for the
-        whole window between offload() retiring every dead engine and the next
-        onload() rebuilding them, so caching it would strand this replica on
-        "No genRM engines available" forever — long after recovery finished,
-        because nothing would ever re-read the list. The retry loop in
-        _call_engine cannot rescue it either: _pick_engine raises before any
-        HTTP request is made, so _invalidate_engine_cache is never reached.
-
-        Re-reading is throttled by the same cooldown as an invalidation: while
-        the list is empty *every* in-flight request lands here, and the read is
-        a blocking ray.get on this replica's event loop.
-        """
-        if self._engine_hosts_ports is None:
-            return True
-        if self._engine_hosts_ports:
-            return False
-        return time.monotonic() - self._engine_cache_refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
-
-    def _pick_engine(self) -> tuple[int, str, int]:
-        """Round-robin one live engine, refreshing the list if it was
-        dropped."""
-        if self._needs_engine_refresh():
-            hosts_ports = ray.get(self.genrm_manager.get_engine_hosts_ports.remote())
-            self._engine_cache_refreshed_at = time.monotonic()
-            # Swap the list and its cycle together: the manager compacts the
-            # list over dead engines, so a cycle built for the old length would
-            # hand back an out-of-range index.
-            self._engine_cycle = cycle(range(len(hosts_ports)))
-            self._engine_hosts_ports = hosts_ports
-
-        hosts_ports = self._engine_hosts_ports
+        hosts_ports = cache.hosts_ports
         if not hosts_ports:
-            raise RuntimeError("No genRM engines available")
+            raise RuntimeError(f"No genRM engines available for instance '{key}'")
 
         # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython).
-        # Re-read the local alias, not self._*, so a concurrent invalidation
+        # Re-read the local alias, not cache.*, so a concurrent invalidation
         # can't make the index and the list disagree.
-        idx = next(self._engine_cycle) % len(hosts_ports)
+        idx = next(cache.cycle) % len(hosts_ports)
         host, port = hosts_ports[idx]
-        return idx, host, port
+        return key, idx, host, port
 
-    async def _call_engine(self, messages: list, sampling_params: Optional[dict] = None) -> dict:
+    async def _call_engine(
+        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+    ) -> dict:
         """Call an SGLang engine for text generation.
 
-        Uses the engine addresses obtained from GenRMManager to send HTTP
-        requests to the underlying SGLang server.
+        Uses the engine addresses obtained from the selected instance's
+        GenRMManager to send HTTP requests to the underlying SGLang server.
 
         Args:
+            route_key: Selects which genRM instance to use.
             messages: List of chat messages in OpenAI format.
             sampling_params: Optional per-request sampling params that override defaults.
 
         Returns:
             Dict containing at least {"text": str} from the SGLang server.
         """
-        idx, host, port = self._pick_engine()
+        key, idx, host, port = self._pick_engine(route_key)
+        spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
         # worker thread so it does not block this replica's event loop. Fast (Rust) tokenizers
         # release the GIL during encode, so concurrent requests tokenize in parallel instead of
         # serializing — without this a single replica throttles dispatch and starves the engines.
-        # Forward chat_template_kwargs from --genrm-sampling-config through to
+        # Forward chat_template_kwargs from the instance's sampling_config through to
         # the jinja template — e.g. `{"enable_thinking": false}` for Qwen3+ to
         # suppress the default <think> block. Keys unused by the template are
         # silently dropped by transformers, so this is safe across model families.
-        chat_template_kwargs = self.config.genrm_sampling_config.get("chat_template_kwargs", {}) or {}
+        sampling_config = spec["sampling_config"]
+        chat_template_kwargs = sampling_config.get("chat_template_kwargs", {}) or {}
         input_ids = await asyncio.to_thread(
-            self.tokenizer.apply_chat_template,
+            self.tokenizers[key].apply_chat_template,
             messages,
             tokenize=True,
             add_generation_prompt=True,
@@ -258,10 +281,10 @@ class GenRM(Base):
 
         # Merge per-request sampling params with default config
         default_sampling = {
-            "temperature": self.config.genrm_sampling_config.get("temperature", 0.2),
-            "top_p": self.config.genrm_sampling_config.get("top_p", 1.0),
-            "top_k": self.config.genrm_sampling_config.get("top_k", -1),
-            "max_new_tokens": self.config.genrm_sampling_config.get("max_response_len", 1024),
+            "temperature": sampling_config.get("temperature", 0.2),
+            "top_p": sampling_config.get("top_p", 1.0),
+            "top_k": sampling_config.get("top_k", -1),
+            "max_new_tokens": sampling_config.get("max_response_len", 1024),
         }
         # Override defaults with per-request params
         if sampling_params:
@@ -293,8 +316,8 @@ class GenRM(Base):
                     # replacement will come back on a different port, so drop the
                     # cache and re-pick — retrying the same dead host is useless.
                     if status == 0:
-                        self._invalidate_engine_cache()
-                    idx, host, port = self._pick_engine()
+                        self._engine_caches[key].invalidate()
+                    key, idx, host, port = self._pick_engine(route_key)
                     await asyncio.sleep(0.3 * _attempt)
                     continue
                 raise
@@ -302,45 +325,55 @@ class GenRM(Base):
 
     @app.get("/health")
     async def health(self) -> dict:
-        """Health check endpoint."""
-        try:
-            # Check if genRM engines are healthy
-            is_healthy = ray.get(self.genrm_manager.health_check.remote())
-            return {
-                "status": "healthy" if is_healthy else "unhealthy",
-                "service": "genrm",
-            }
-        except Exception as e:
-            self._logger.error(f"GenRM health check failed: {e}")
-            return {
-                "status": "unhealthy",
-                "service": "genrm",
-                "error": str(e),
-            }
+        """Health check endpoint; reports per-instance status."""
+        instances = {}
+        for key, manager in self.genrm_managers.items():
+            try:
+                is_healthy = ray.get(manager.health_check.remote())
+                instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
+            except Exception as e:
+                self._logger.error(f"GenRM health check failed for instance '{key}': {e}")
+                instances[key] = {"status": "unhealthy", "error": str(e)}
+        overall = "healthy" if all(v["status"] == "healthy" for v in instances.values()) else "unhealthy"
+        if list(instances) == [_DEFAULT_INSTANCE_KEY]:
+            result = {"status": overall, "service": "genrm"}
+            if "error" in instances[_DEFAULT_INSTANCE_KEY]:
+                result["error"] = instances[_DEFAULT_INSTANCE_KEY]["error"]
+            return result
+        return {"status": overall, "service": "genrm", "instances": instances}
 
     @app.get("/metrics")
     async def metrics(self) -> dict:
-        """Metrics endpoint."""
-        return {
-            "service": "genrm",
-            "model_path": self.config.genrm_model_path,
-            "num_gpus": self.config.genrm_num_gpus,
-            "num_engines": self.config.genrm_num_gpus // self.config.genrm_num_gpus_per_engine,
+        """Metrics endpoint; reports per-instance stats."""
+        instances = {
+            key: {
+                "model_path": spec["model_path"],
+                "num_gpus": spec["num_gpus"],
+                "num_engines": spec["num_gpus"] // spec["num_gpus_per_engine"],
+            }
+            for key, spec in self.instance_specs.items()
         }
+        if list(instances) == [_DEFAULT_INSTANCE_KEY]:
+            return {"service": "genrm", **instances[_DEFAULT_INSTANCE_KEY]}
+        return {"service": "genrm", "instances": instances}
 
-    def get_genrm_manager(self) -> Any:
-        """Get the underlying GenRM manager."""
-        return self.genrm_manager
+    def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
+        """Get one GenRM manager by route key.
+
+        Omitting ``route_key`` remains supported when exactly one instance is
+        configured.
+        """
+        return self.genrm_managers[self._resolve_instance_key(route_key)]
 
     def onload(self) -> None:
-        """Load genRM model weights to GPU."""
+        """Load genRM model weights to GPU, for every instance."""
         self._logger.info("GenRM onload requested")
-        ray.get(self.genrm_manager.onload.remote())
+        ray.get([m.onload.remote() for m in self.genrm_managers.values()])
 
     def offload(self) -> None:
-        """Offload genRM model weights from GPU."""
+        """Offload genRM model weights from GPU, for every instance."""
         self._logger.info("GenRM offload requested")
-        ray.get(self.genrm_manager.offload.remote())
+        ray.get([m.offload.remote() for m in self.genrm_managers.values()])
 
 
 # ── Compatibility wrapper for old imports ─────────────────────────────────

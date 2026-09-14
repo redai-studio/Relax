@@ -39,6 +39,10 @@ Two colocate sub-modes are auto-detected from the GPU allocation:
 
 See [GenRM example](/en/examples/generative-reward-model) for full configuration.
 
+### Multiple Instances (`route_key`)
+
+A single GenRM deployment can host several independent judge models at once (configured via `--genrm-instances`), selected per request via the `route_key` field in the request body. Omitting `route_key` (or running the legacy single-instance `--genrm-model-path` config) routes to the sole `"__default__"` instance. For the config format, per-instance `/health` / `/metrics` detail, and an agentic module-routing example, see [GenRM Example · Multi-Instance GenRM](/en/examples/generative-reward-model#multi-instance-genrm-multiple-judge-models-behind-one-service).
+
 ## HTTP Endpoints
 
 <SwaggerUI specUrl="/Relax/openapi/genrm.json" />
