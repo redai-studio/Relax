@@ -37,8 +37,13 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 
 FROM base as train
 
+# flash-linear-attention 0.4.2 (pulls fla-core 0.4.2) is the first release carrying
+# `fla.ops.cp`, which GDN chunkwise context parallel needs. NOTE: `fla-core` depends
+# on an unpinned `torch`, so pip re-resolves torch's own looser `nvidia-cudnn-cu12` pin here;
+# the explicit `nvidia-cudnn-cu12==9.16.0.29` install further down runs after this layer
+# and is what the final image keeps.
 RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.1 && \
+    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
 # FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
