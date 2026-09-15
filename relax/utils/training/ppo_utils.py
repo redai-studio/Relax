@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from relax.algorithms import algorithm_needs_critic
 from relax.utils.logging_utils import get_logger
 
 
@@ -19,12 +20,13 @@ logger = get_logger(__name__)
 
 
 def validate_ppo_config(config: Namespace) -> None:
-    if getattr(config, "advantage_estimator", None) != "ppo":
+    if not algorithm_needs_critic(config):
         return
 
     resource = getattr(config, "resource", None) or {}
     if "critic" not in resource:
-        raise ValueError("--advantage-estimator ppo requires a 'critic' entry in --resource.")
+        estimator = getattr(config, "advantage_estimator", None)
+        raise ValueError(f"--advantage-estimator {estimator} requires a 'critic' entry in --resource.")
 
     if getattr(config, "fully_async", False) or getattr(config, "hybrid", False):
         raise ValueError("PPO does not currently support --fully-async or --hybrid.")
