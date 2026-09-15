@@ -52,6 +52,20 @@ _MANIFEST_VERSION = 1
 _CACHE_DIR_PATTERN = re.compile(rf"{_MARKER_PREFIX}_[0-9a-f]{{16}}")
 _CLEANUP_LOCK_TIMEOUT_SECONDS = 300.0
 _CLEANUP_LOCK_POLL_INTERVAL_SECONDS = 0.1
+# A full weight download holds the per-model lock far longer than a cleanup, so a
+# reader waiting on an in-flight download needs a much larger bound than the
+# cleanup timeout before it gives up and raises a diagnosable error.
+_DOWNLOAD_LOCK_TIMEOUT_SECONDS = 3600.0
+# Files that must appear in a remote listing before a download is published. A
+# transient truncated listing (e.g. an S3-gateway / Alluxio hiccup) would
+# otherwise yield a subset that both the manifest and the completeness check
+# validate as "complete". Only ``config.json`` is required: it is present in
+# every Transformers checkpoint, while tokenizer file names vary widely across
+# model families, so allow-listing tokenizer formats would false-reject valid
+# checkpoints (XLM-R, DeBERTa, Marian, ...).
+_ESSENTIAL_MODEL_FILES = ("config.json",)
+_LISTING_RETRY_ATTEMPTS = 3
+_LISTING_RETRY_BACKOFF_SECONDS = 0.5
 _TELEMETRY_S3_CONNECT_TIMEOUT_SECONDS = 2.0
 _TELEMETRY_S3_READ_TIMEOUT_SECONDS = 3.0
 _TELEMETRY_S3_TOTAL_MAX_ATTEMPTS = 1
@@ -185,6 +199,41 @@ def _list_objects_with_size(cli, bucket, prefix):
 
 def _list_objects(cli, bucket, prefix):
     return [k for k, _ in _list_objects_with_size(cli, bucket, prefix)]
+
+
+def _assert_listing_has_essential_files(objs, prefix: str) -> None:
+    """Raise if a non-empty listing is missing the files every model needs.
+
+    Guards against a transient truncated remote listing that would otherwise be
+    published as a "complete" subset. The check is intentionally cheap and only
+    inspects relative paths already returned by the listing.
+    """
+    rels = {key[len(prefix) :] for key, _size in objs}
+    missing = [name for name in _ESSENTIAL_MODEL_FILES if name not in rels]
+    if missing:
+        raise RuntimeError(f"model listing is missing essential files {missing}; possible truncated remote listing")
+
+
+def _relist_until_essential(cli, bucket, prefix, objs):
+    """Return a listing that contains the essential model files.
+
+    Re-list a bounded number of times when the current listing looks truncated
+    so a transient gateway hiccup is retried, while a genuinely incomplete
+    prefix still fails fast with a clear error.
+    """
+    for attempt in range(_LISTING_RETRY_ATTEMPTS):
+        try:
+            _assert_listing_has_essential_files(objs, prefix)
+            return objs
+        except RuntimeError as exc:
+            if attempt + 1 >= _LISTING_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                f"{exc}; re-listing s3://{bucket}/{prefix} (attempt {attempt + 1}/{_LISTING_RETRY_ATTEMPTS})"
+            )
+            time.sleep(_LISTING_RETRY_BACKOFF_SECONDS * (attempt + 1))
+            objs = _list_objects_with_size(cli, bucket, prefix)
+    return objs
 
 
 def _missing_bytes(objs, prefix: str, dest: str) -> int:
@@ -323,8 +372,13 @@ def _manifest_files_complete(dest: str, manifest: dict, *, kind: str | None = No
     return matched
 
 
-def _acquire_cleanup_lock(lock_file) -> None:
-    deadline = time.monotonic() + _CLEANUP_LOCK_TIMEOUT_SECONDS
+def _acquire_flock_bounded(lock_file, timeout: float) -> None:
+    """Acquire an exclusive flock, polling until ``timeout`` then raising.
+
+    Serializes writers/readers of the per-model cache while turning a stuck
+    peer into a diagnosable ``TimeoutError`` instead of a silent forever-hang.
+    """
+    deadline = time.monotonic() + timeout
     while True:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -334,6 +388,108 @@ def _acquire_cleanup_lock(lock_file) -> None:
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for the S3 model SHM cache lock") from exc
             time.sleep(min(_CLEANUP_LOCK_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _acquire_cleanup_lock(lock_file) -> None:
+    _acquire_flock_bounded(lock_file, _CLEANUP_LOCK_TIMEOUT_SECONDS)
+
+
+def _has_valid_metadata_payload(dest: str, identity: str) -> bool:
+    """Return True if ``dest`` holds a complete, live metadata payload.
+
+    A full payload is a superset of the metadata payload, so a matching
+    ``.done`` marker also qualifies. Callers use this to avoid destroying a
+    payload that dummy-load / tokenizer readers may currently depend on.
+    """
+    for marker in (dest + ".done", dest + ".metadata.done"):
+        try:
+            with open(marker) as marker_file:
+                if marker_file.read().strip() != identity:
+                    continue
+        except OSError:
+            continue
+        manifest = _read_model_manifest(dest, identity)
+        if manifest is not None and _manifest_files_complete(dest, manifest, kind="metadata"):
+            return True
+    return False
+
+
+def _atomic_swap_dir(staging: str, dest: str) -> None:
+    """Swap ``dest`` for ``staging`` with only a brief absence window.
+
+    NOTE: this is not a truly atomic replace. ``os.replace`` cannot overlay a
+    non-empty directory, so the old payload is renamed aside first and removed
+    only after the new one is in place; between the two renames ``dest`` does
+    not exist. A concurrent lock-free reader can still observe that sub-second
+    gap -- this only shortens the window (from a multi-minute re-download to two
+    renames), it does not eliminate it. If the replace fails the old payload is
+    renamed back so ``dest`` stays readable. Callers must hold the per-model
+    lock; a ``.old`` sidecar left by a hard crash between the two renames is
+    reaped by ``remove_stale_s3_model_caches``.
+    """
+    old = dest + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    moved_aside = False
+    if os.path.isdir(dest):
+        os.rename(dest, old)
+        moved_aside = True
+    try:
+        os.replace(staging, dest)
+    except BaseException:
+        # Roll back so a failed swap keeps the live payload readable at dest
+        # instead of stranding it in the .old sidecar. Never let the rollback
+        # rename mask the original error.
+        if moved_aside and not os.path.exists(dest):
+            try:
+                os.rename(old, dest)
+            except OSError:
+                pass
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def _discard_staging_payload(dest: str) -> None:
+    """Remove only the in-progress staging artifacts, keeping a published
+    payload.
+
+    Used when a full download fails while a live metadata payload was
+    intentionally preserved in ``dest`` for concurrent readers.
+    """
+    shutil.rmtree(dest + ".tmp", ignore_errors=True)
+    for suffix in (".tmp.manifest.json", ".tmp.manifest.json.tmp"):
+        try:
+            os.remove(dest + suffix)
+        except OSError:
+            # Best-effort cleanup: never let a cleanup error mask the primary
+            # download/swap exception being propagated.
+            pass
+
+
+def _reclaim_residual_weights(dest: str) -> None:
+    """Physically remove weight shards left under a preserved payload.
+
+    A prior full download, an interrupted
+    ``cleanup_s3_model_weights_from_shm``, or a crash between the directory
+    swap and the manifest publish can leave weight shards under ``dest`` while
+    the on-disk manifest still lists only metadata. Scan the directory directly
+    rather than trusting the (possibly stale) manifest, and drop weight files
+    so they do not count against capacity before a re-download. Safe here: the
+    caller holds the lock and no complete ``.done`` payload exists, so no
+    consumer reads these weights.
+    """
+    if not os.path.isdir(dest):
+        return
+    indexed_weights = _indexed_weight_paths(dest)
+    for current_root, _dirs, files in os.walk(dest):
+        for name in files:
+            full = os.path.join(current_root, name)
+            rel = os.path.relpath(full, dest)
+            if not _is_model_weight_path(rel, indexed_weights):
+                continue
+            try:
+                os.remove(full)
+            except OSError:
+                pass
 
 
 def _discard_cache_payload(dest: str) -> None:
@@ -447,7 +603,7 @@ def _download_model_metadata_to_shm_once(
     lock = dest + ".lock"
     os.makedirs(os.path.dirname(dest) or "/", exist_ok=True)
     with open(lock, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _acquire_flock_bounded(lock_file, _DOWNLOAD_LOCK_TIMEOUT_SECONDS)
         identity = _cache_identity(uri, endpoint)
         if os.path.isdir(dest) and os.path.isfile(full_marker):
             with open(full_marker) as marker_file:
@@ -478,6 +634,11 @@ def _download_model_metadata_to_shm_once(
             objects = _list_objects_with_size(cli, bucket, prefix)
             if not objects:
                 raise RuntimeError(f"no objects under s3://{bucket}/{prefix}")
+            # Sanity-check the listing (and, if config.json is missing, re-list)
+            # BEFORE deriving the download set and the capacity check. This is a
+            # cheap guard against gross truncation, not a proof of completeness:
+            # it only confirms config.json is present.
+            objects = _relist_until_essential(cli, bucket, prefix, objects)
             index_objects = [(key, size) for key, size in objects if key.lower().endswith(".index.json")]
             _download_selected_objects(
                 cli,
@@ -517,8 +678,7 @@ def _download_model_metadata_to_shm_once(
             manifest = _read_model_manifest(staging, identity)
             if manifest is None or not _manifest_files_complete(staging, manifest, kind="metadata"):
                 raise RuntimeError(f"downloaded model metadata is incomplete: s3://{bucket}/{prefix}")
-            shutil.rmtree(dest, ignore_errors=True)
-            os.replace(staging, dest)
+            _atomic_swap_dir(staging, dest)
             os.replace(staging + ".manifest.json", dest + ".manifest.json")
             _write_ready_marker(marker, identity)
         except BaseException:
@@ -543,7 +703,7 @@ def _download_model_to_shm_once(
     identity = _cache_identity(uri, endpoint)
     os.makedirs(os.path.dirname(dest) or "/", exist_ok=True)
     with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        _acquire_flock_bounded(lf, _DOWNLOAD_LOCK_TIMEOUT_SECONDS)
         if os.path.exists(marker) and os.path.isdir(dest):
             with open(marker) as mf:
                 marker_matches = mf.read().strip() == identity
@@ -552,7 +712,21 @@ def _download_model_to_shm_once(
                 if manifest is not None and _manifest_files_complete(dest, manifest):
                     logger.info(f"shm cache hit: {dest}")
                     return
-        _discard_cache_payload(dest)
+        # A colocated metadata consumer (e.g. a dummy-load SGLang engine or a
+        # tokenizer reader) may be reading this same dest lock-free. Never wipe a
+        # live, complete metadata payload up front — stage the full download
+        # alongside it and swap atomically so readers stay valid throughout.
+        preserved_live_payload = _has_valid_metadata_payload(dest, identity)
+        if preserved_live_payload:
+            # Keep the live metadata payload readable, but drop stale staging /
+            # swap leftovers and reclaim residual weight shards from an
+            # interrupted prior attempt so a retry self-heals (no FileExistsError
+            # on staging) and the leftovers do not count against capacity.
+            _discard_staging_payload(dest)
+            shutil.rmtree(dest + ".old", ignore_errors=True)
+            _reclaim_residual_weights(dest)
+        else:
+            _discard_cache_payload(dest)
         bucket, prefix = _parse_s3_uri(uri)
         prefix = _normalize_prefix(prefix)
         cli = _make_s3_client(
@@ -563,6 +737,12 @@ def _download_model_to_shm_once(
         objs = _list_objects_with_size(cli, bucket, prefix)
         if not objs:
             raise RuntimeError(f"no objects under s3://{bucket}/{prefix}")
+        # Sanity-check the listing (and, if config.json is missing, re-list)
+        # BEFORE the capacity check and manifest. This is a cheap guard against
+        # gross truncation (it only confirms config.json is present), not a
+        # proof of completeness -- so capacity/manifest at least never run
+        # against a config-less listing.
+        objs = _relist_until_essential(cli, bucket, prefix, objs)
         need = sum(size for _key, size in objs)
         free = _free_bytes(os.path.dirname(dest) or "/")
         if need > free * capacity_margin:
@@ -572,6 +752,7 @@ def _download_model_to_shm_once(
                 "contact the Relax team for model-specific support for oversized checkpoints"
             )
         staging = dest + ".tmp"
+        swapped = False
         try:
             os.makedirs(staging)
             _download_prefix(
@@ -588,12 +769,19 @@ def _download_model_to_shm_once(
             manifest = _read_model_manifest(staging, identity)
             if manifest is None or not _manifest_files_complete(staging, manifest):
                 raise RuntimeError(f"downloaded model cache is incomplete: s3://{bucket}/{prefix}")
-            shutil.rmtree(dest, ignore_errors=True)
-            os.replace(staging, dest)
+            _atomic_swap_dir(staging, dest)
+            swapped = True
             os.replace(staging + ".manifest.json", dest + ".manifest.json")
             _write_ready_marker(marker, identity)
         except BaseException:
-            _discard_cache_payload(dest)
+            # After the swap dest is the new (not-yet-published) full payload and
+            # the preserved metadata payload is already gone, so a post-swap
+            # failure must wipe dest fully — otherwise the full weights linger
+            # with a stale metadata manifest and leak (cleanup skips them).
+            if preserved_live_payload and not swapped:
+                _discard_staging_payload(dest)
+            else:
+                _discard_cache_payload(dest)
             raise
 
 
@@ -671,6 +859,7 @@ def remove_stale_s3_model_caches(args) -> tuple[int, int]:
         ".manifest.json",
         ".done",
         ".tmp",
+        ".old",
     )
 
     def cache_base_name(name: str) -> str | None:
