@@ -2,36 +2,38 @@
 
 Thank you for your interest in contributing to Relax! This guide will help you get started.
 
-## Getting Started
+## Developing
 
-### 1. Set Up Development Environment
+### 1. Get the Code
 
-Create a virtual environment and install dependencies:
+**Fork** [redai-studio/Relax](https://github.com/redai-studio/Relax) on GitHub, then clone your fork locally. Replace `<your_user_name>` with your GitHub username:
 
 ```bash
-# Clone the repository
-git clone https://github.com/redai-studio/Relax.git
+git clone https://github.com/<your_user_name>/Relax.git
 cd Relax
+git remote add upstream https://github.com/redai-studio/Relax.git
 
-# Create virtual environment
+# Sync with the main branch of the upstream repository
+git checkout main
+git pull upstream main
+```
+
+`origin` points to your fork, and `upstream` points to the Relax repository. For subsequent contributions, switch to your local `main` and pull upstream updates before creating a working branch. Develop on working branches and keep your local `main` for syncing with upstream.
+
+### 2. Set Up the Development Environment
+
+See the [installation guide](./installation.md) for environment requirements.
+
+```bash
+# Create a virtual environment
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Install in development mode
 pip install -e .
-```
-
-### 2. Start Ray and Deploy Services
-
-```bash
-# Start Ray cluster
-ray start --head
-
-# Deploy all services
-python -m relax.core.controller deploy --config configs/env.yaml
 ```
 
 ### 3. Run Example Experiment
@@ -45,64 +47,50 @@ cd examples/deepeyes
 bash run_deepeyes.sh
 ```
 
-## Development Workflow
-
-### 1. Create a Branch
+### 4. Start Developing
 
 ```bash
-# Create a feature branch
-git checkout -b feature/your-feature-name
-
-# Or a bugfix branch
-git checkout -b fix/your-bug-fix
+git checkout -b feature/your-change
 ```
 
-### 2. Make Changes
+Install pre-commit and Git hooks:
 
-- Write clean, readable code
-- Follow the existing code style
-- Add tests for new features
-- Update documentation as needed
+```bash
+pip install pre-commit
+pre-commit install
+```
 
-### 3. Run Tests
+Once installed, checks run automatically on each `git commit`.
+
+### 5. Run Unit Tests
+
+After changing the code, add tests for new or fixed behavior and choose the test scope appropriate for your changes:
 
 ```bash
 # Run all tests
 pytest tests/
 
-# Run specific test file
+# Run a specific test file
 pytest tests/utils/test_metrics_service.py
 
 # Run with coverage
 pytest --cov=relax tests/
 ```
 
-### 4. Format Code
+### 6. Commit Changes
+
+After completing the relevant validation, review your changes and stage the files you intend to commit. Replace `<changed-files>` with actual paths, separated by spaces:
 
 ```bash
-# Format with black
-black relax/
-
-# Sort imports
-isort relax/
-
-# Run linter
-flake8 relax/
+git status
+git diff
+git add <changed-files>
+git commit -m "feat: describe your change"
 ```
 
-### 5. Commit Changes
+If a hook modifies files or reports errors, review and fix the changes, then run `git add` and `git commit` again until the checks pass and the commit succeeds.
 
-```bash
-# Stage changes
-git add .
-
-# Commit with descriptive message
-git commit -m "feat: add new feature"
-# or
-git commit -m "fix: resolve bug in metrics service"
-```
-
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
+Follow [Conventional Commits](https://www.conventionalcommits.org/) for commit messages:
 
 - `feat:` - New feature
 - `fix:` - Bug fix
@@ -112,14 +100,15 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 - `test:` - Adding or updating tests
 - `chore:` - Maintenance tasks
 
-### 6. Push and Create Pull Request
+### 7. Open a PR
 
 ```bash
-# Push to your fork
-git push origin feature/your-feature-name
-
-# Create pull request on GitHub
+git push origin feature/your-change
 ```
+
+On GitHub, open a PR from your working branch in your fork to **`main` in `redai-studio/Relax`**, and fill out the [PR template](https://github.com/redai-studio/Relax/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Replace the branch name in the command if you chose a different one.
+
+Address CI results and review feedback on the same branch, then check, commit, and push your changes. The PR updates automatically.
 
 ## Code Style Guidelines
 
@@ -167,7 +156,6 @@ def compute_reward(
 ### Writing Tests
 
 ```python
-import pytest
 from relax.utils.metrics.client import MetricsClient
 
 def test_metrics_client_log_metric():
@@ -191,12 +179,14 @@ def test_metrics_client_log_metric():
 
 ### Adding Documentation
 
-1. Add markdown files to `docs/guide/` or `docs/zh/guide/`
-2. Update `.vitepress/config.mts` to add to sidebar
+1. Add markdown files to `docs/en/guide/` or `docs/zh/guide/`
+2. Update `docs/.vitepress/config.mts` to add to sidebar
 3. Include code examples and diagrams
 4. Provide both English and Chinese versions
 
 ### Building Documentation
+
+Install Node.js, then run the following commands from the repository root:
 
 ```bash
 # Start documentation dev server
