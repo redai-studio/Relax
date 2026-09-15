@@ -53,7 +53,7 @@ CIDR 按 URL 中的 IP 匹配，不解析域名，且不接受 `/0`。
 ```bash
 export NEMO_GYM_CALLBACK_ALLOWED_NETWORKS="${NEMO_GYM_CALLBACK_ALLOWED_NETWORKS:-10.0.0.0/8}"
 export REPO_ROOT="$(pwd)"
-export RELAX_IMAGE="ghcr.io/redai-infra/relaxrl:latest"
+export RELAX_IMAGE="ghcr.io/redai-studio/relaxrl:latest"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
 export DATA_ROOT="/绝对路径/relax-nemo-data"
 export MODEL_DIR="/绝对路径/models"
@@ -84,7 +84,7 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-Dockerfile 默认基于 `ghcr.io/redai-infra/relaxrl:latest`。使用其他已有 Relax tag 时，给上述命令
+Dockerfile 默认基于 `ghcr.io/redai-studio/relaxrl:latest`。使用其他已有 Relax tag 时，给上述命令
 增加 `--build-arg RELAX_IMAGE="<image>"`；不需要构建 Relax 镜像。
 
 检查镜像：

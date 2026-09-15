@@ -41,7 +41,7 @@ if [ "$1" == "github" ]; then
     fi
     
     # Push to GitHub Pages
-    git push -f git@github.com:redai-infra/Relax.git gh-pages
+    git push -f git@github.com:redai-studio/Relax.git gh-pages
     
     echo "✅ Deployed to GitHub Pages!"
     

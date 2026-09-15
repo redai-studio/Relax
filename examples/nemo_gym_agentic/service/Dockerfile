@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG RELAX_IMAGE=ghcr.io/redai-infra/relaxrl:latest
+ARG RELAX_IMAGE=ghcr.io/redai-studio/relaxrl:latest
 FROM ${RELAX_IMAGE}
 
 ARG NEMO_GYM_COMMIT=a85670eb167ba9b48cc53a36a070eed815e6c40d

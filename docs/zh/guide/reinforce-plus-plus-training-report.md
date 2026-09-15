@@ -4,7 +4,7 @@
 
 ## 范围与证据边界
 
-- Proposal：[Task 29 issue #192](https://github.com/redai-infra/Relax/issues/192)
+- Proposal：[Task 29 issue #192](https://github.com/redai-studio/Relax/issues/192)
 - 脱敏的可复现证据：[日志、展开命令、指标和 manifest](https://github.com/zheself/Relax/releases/tag/task29-reinforcepp-evidence-c72caf1)
 - 实验源码 commit：`5f7cd574372288391bb1c41ca0677422cd31e725`
 - 实验 upstream base：`b095ba68ce95c7d98762cf128eab630878f394e6`

@@ -10,7 +10,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 cd Relax
 
 # 创建虚拟环境

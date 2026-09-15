@@ -49,5 +49,5 @@ A single GenRM deployment can host several independent judge models at once (con
 
 ## Source
 
-- Implementation: [`relax/components/genrm.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/genrm.py)
-- Base class: [`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- Implementation: [`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

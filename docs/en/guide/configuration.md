@@ -552,7 +552,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 |-----------|------|---------|-------------|
 | `--autoscaler-config` | str | None | Path to autoscaler YAML configuration file. Enables autoscaling when set, disabled when not set. Example: `--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
+For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-studio/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
 
 ### Scale-Out Operation Parameters
 

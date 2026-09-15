@@ -365,9 +365,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.genrm_manager = None
 
-        init(args)
         if repatch is not None:
             repatch(args)
+        init(args)
         tq.init(args.tq_config)
         self.data_system_client = tq.get_client()
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None

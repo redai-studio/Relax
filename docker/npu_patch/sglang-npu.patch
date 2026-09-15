@@ -1,56 +1,1449 @@
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index bd9d7eafa1..1740283de2 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -598,7 +598,7 @@ async def health_generate(request: Request) -> Response:
+     ):
+         return Response(status_code=200)
+ 
+-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
++    sampling_params = {"max_new_tokens": 1, "temperature": 1.0,"top_k":-1,"top_p":1.0}
+     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+     # collide and crash the shared DetokenizerManager decode_status).
+     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+index 7f506e7f1a..204b9382e8 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+@@ -5,11 +5,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
+     fused_gdn_gating_kernel_without_sigmoid,
+     fused_gdn_gating_npu,
+ )
+-from sgl_kernel_npu.mamba.causal_conv1d import (
+-    causal_conv1d_fn_npu,
+-    causal_conv1d_update_npu,
+-    causal_conv1d_update_v2,
+-)
+ 
+ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+     AscendMambaAttnBackendBase,
+@@ -26,8 +21,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ 
+ fused_gdn_gating = fused_gdn_gating_npu
+-causal_conv1d_fn = causal_conv1d_fn_npu
+-causal_conv1d_update = causal_conv1d_update_npu
+ 
+ 
+ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -109,6 +102,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         self._prepare_mamba_track_metadata(forward_batch)
+         self.graph_mode = False
+ 
++    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
++        w = getattr(layer, "_conv_weights_t", None)
++        if w is None:
++            w = layer.conv_weights.transpose(0, 1).contiguous()
++            layer._conv_weights_t = w
++        return w
++
+     def forward_decode(
+         self,
+         layer: RadixLinearAttention,
+@@ -125,16 +125,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         cache_indices = self.forward_metadata.mamba_cache_indices
+ 
+         assert isinstance(mixed_qkv, torch.Tensor)
+-        conv_states_tmp = conv_states.transpose(1, 2).clone()
+-        mixed_qkv = causal_conv1d_update(
++        mixed_qkv = torch.ops.npu.causal_conv1d(
+             mixed_qkv,
+-            conv_states_tmp,
+-            layer.conv_weights,
+-            layer.bias,
+-            layer.activation,
+-            conv_state_indices=cache_indices,
++            self._get_conv_weights_t(layer),
++            conv_states=conv_states,
++            bias=layer.bias,
++            query_start_loc=query_start_loc,
++            cache_indices=cache_indices,
++            activation_mode=1,
++            pad_slot_id=-1,
++            run_mode=1,
+         )
+-        conv_states[:] = conv_states_tmp.transpose(1, 2)
+ 
+         query, key, value = torch.split(
+             mixed_qkv,
+@@ -219,44 +220,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+                 dtype=torch.int32,
+                 device=mixed_qkv.device,
+             )
+-            mixed_qkv = causal_conv1d_update_v2(
+-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
+-                conv_state=conv_states.contiguous(),
+-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
++            mixed_qkv = torch.ops.npu.causal_conv1d(
++                mixed_qkv,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states,
+                 bias=layer.bias,
+-                activation=layer.activation,
+-                conv_state_indices=cache_indices,
++                query_start_loc=query_start_loc,
++                cache_indices=cache_indices,
+                 num_accepted_tokens=num_accepted_tokens,
++                activation_mode=1,
+                 pad_slot_id=-1,
+-                validate_data=False,
+-            ).view(seq_len, -1)
++                run_mode=1,
++            )
+         else:
+-            mixed_qkv = mixed_qkv.transpose(0, 1)
+             if forward_metadata.has_mamba_track_mask:
+-                mixed_qkv_to_track = mixed_qkv[
+-                    :, forward_metadata.track_conv_indices
+-                ].transpose(0, 1)
+-                conv_states.transpose(1, 2)[
+-                    forward_metadata.conv_states_mask_indices
+-                ] = mixed_qkv_to_track
++                mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
++                conv_states[forward_metadata.conv_states_mask_indices] = (
++                    mixed_qkv_to_track
++                )
+             kernel_size = layer.conv_weights.shape[-1]
+-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
+-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+-
+-            mixed_qkv = causal_conv1d_fn(
++            conv_states_for_prefill = conv_states[
++                :, -(kernel_size - 1) :, :
++            ].contiguous()
++            mixed_qkv = torch.ops.npu.causal_conv1d(
+                 mixed_qkv,
+-                layer.conv_weights,
+-                layer.bias,
+-                activation=layer.activation,
+-                conv_states=conv_states_tmp,
+-                has_initial_state=has_initial_states,
+-                cache_indices=cache_indices,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states_for_prefill,
++                bias=layer.bias,
+                 query_start_loc=query_start_loc,
+-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+-            ).transpose(0, 1)[:seq_len]
+-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
+-                1, 2
+-            ).contiguous()
++                cache_indices=cache_indices,
++                has_initial_state=has_initial_states,
++                activation_mode=1,
++                pad_slot_id=-1,
++                run_mode=0,
++            )
++            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
+         if is_target_verify:
+             g, beta = fused_gdn_gating_kernel_without_sigmoid(
+                 layer.A_log, a, b, layer.dt_bias
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+index 919f46619a..c8a185388a 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+@@ -37,6 +37,21 @@ if TYPE_CHECKING:
+         BaseCudaGraphRunner,
+     )
+ 
++@contextmanager
++def _disable_tms_during_graph_capture():
++    try:
++        from torch_memory_saver import torch_memory_saver
++        _impl = torch_memory_saver._impl
++    except Exception:
++        _impl = None
++
++    if _impl is not None:
++        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
++    try:
++        yield
++    finally:
++        if _impl is not None:
++            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+     """One torch.npu.NPUGraph per shape; attention metadata captured
+@@ -117,7 +132,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+             stream=self._capture_stream,
+             auto_dispatch_capture=True,
+         ):
+-            out = forward_fn()
++            with _disable_tms_during_graph_capture():
++                out = forward_fn()
+ 
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = out
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 1ade4ed9e4..0161bd398a 100644
+index 82a3d77f05..25d4c21406 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
-@@ -314,12 +314,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+@@ -402,10 +402,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+             layer.w2_weight.data = layer.w2_weight.data.reshape(
                  layer.num_local_experts, *new_shape_w2
              )
- 
 -        if _is_npu:
 -            for weight_name in ["w13_weight", "w2_weight"]:
 -                weight = getattr(layer, weight_name)
--                weight.data = weight.data.transpose(1, 2)
--                weight.data = npu_format_cast(weight.data)
--
+-                weight.data = npu_format_cast(weight)
++        # if _is_npu:
++        #     for weight_name in ["w13_weight", "w2_weight"]:
++        #         weight = getattr(layer, weight_name)
++        #         weight.data = npu_format_cast(weight)
+ 
          return
  
-     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
-@@ -646,7 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
-         # gmm1: gate_up_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w13_weight],
-+            weight=[layer.w13_weight.transpose(1, 2)],
-             bias=w13_bias,
-             split_item=2,
-             group_list_type=1,
-@@ -670,7 +664,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
-         # gmm2: down_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w2_weight],
-+            weight=[layer.w2_weight.transpose(1, 2)],
-             bias=w2_bias,
-             split_item=2,
-             group_list_type=1,
+diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
+index 6696945..7854f7a 100644
+--- a/python/sglang/srt/layers/radix_linear_attention.py
++++ b/python/sglang/srt/layers/radix_linear_attention.py
+@@ -35,6 +35,27 @@ if TYPE_CHECKING:
+     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
++def wrap_conv1d_weight_loader(attn: RadixLinearAttention, base_loader):
++    """Wrap conv1d.weight's loader so every (re)load also refreshes the
++    transposed copy cached on the RadixLinearAttention wrapper.
++
++    mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++    ``Tensor.data`` carries a version counter independent of the Parameter's,
++    so ``_version``-based invalidation cannot observe online weight updates
++    (e.g. RL Actor->SGLang sync via ``update_weights_from_tensor``). The
++    refresh is explicit and in place so captured graphs keep referencing the
++    same storage.
++    """
++
++    def loader(param, loaded_weight):
++        base_loader(param, loaded_weight)
++        cached = getattr(attn, "_conv_weights_t", None)
++        if cached is not None:
++            cached.copy_(attn.conv_weights.transpose(0, 1))
++
++    return loader
++
++
+ class RadixLinearAttention(nn.Module):
+     """
+     The Linear Attention Layer Implementation.
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index e83e4157fa..19ed3f244b 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -81,6 +81,170 @@ class Sampler(nn.Module):
+         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
+         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
+         self.use_ascend_backend = get_flags().sampling_backend == "ascend"
++        # Generate uniform noise on a side stream while the model is running, and
++        # apply the exponential-race transform at consumption time on the main
++        # stream, exactly matching stock aten::exponential_ semantics (NPU
++        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
++        # uniform_() decomposes to DSARandomUniform plus an async
++        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
++        # the side stream cannot contend with the model's vector-core kernels
++        # even when it overlaps the next forward (v1 ran the full exponential_()
++        # chain here and its AIV tail contended with forward).
++        # This is opt-in because it changes the random-number sequence, although it
++        # preserves the categorical sampling distribution.
++        self.enable_async_exponential = is_npu() and get_bool_env_var(
++            "SGLANG_NPU_ASYNC_EXPONENTIAL"
++        )
++        self._async_exponential_stream = None
++        self._async_exponential_event = None
++        self._async_exponential_u = None
++        self._async_exponential_pending = False
++        self._async_exp_min_bound = None
++
++    def can_prepare_async_exponential(
++        self, sampling_info: SamplingBatchInfo
++    ) -> bool:
++        """Return whether this batch can use precomputed uniform noise."""
++        return (
++            self.enable_async_exponential
++            and not sampling_info.is_all_greedy
++            and sampling_info.sampling_seed is None
++            and not sampling_info.need_top_p_sampling
++            and not sampling_info.need_top_k_sampling
++            and not sampling_info.need_min_p_sampling
++        )
++
++    @torch.no_grad()
++    def prepare_async_exponential(
++        self,
++        batch_size: int,
++        vocab_size: int,
++        sampling_info: SamplingBatchInfo,
++        device: torch.device,
++    ) -> bool:
++        """Enqueue U(0,1) noise before model forward on a dedicated NPU stream.
++
++        Reusing the buffer is safe because the side stream first waits for all
++        previously enqueued work on the current stream. The sampling path later
++        inserts a device-side event wait; it never synchronizes the CPU.
++        """
++        if not self.can_prepare_async_exponential(sampling_info):
++            return False
++
++        # A delayed sampler may still own the previous buffer. Do not overwrite it.
++        if self._async_exponential_pending:
++            logger.warning(
++                "Skip async exponential preparation because the previous batch "
++                "has not consumed its random buffer"
++            )
++            return False
++
++        if self._async_exponential_stream is None:
++            self._async_exponential_stream = torch.npu.Stream()
++            self._async_exponential_event = torch.npu.Event()
++            logger.info(
++                "Enabled asynchronous NPU exponential-race sampling "
++                "(uniform noise on side stream, stock-exponential argmax consumption)"
++            )
++
++        current_stream = torch.npu.current_stream()
++        self._async_exponential_stream.wait_stream(current_stream)
++
++        expected_shape = (batch_size, vocab_size)
++        with torch.npu.stream(self._async_exponential_stream):
++            u = self._async_exponential_u
++            if (
++                u is None
++                or tuple(u.shape) != expected_shape
++                or u.dtype != torch.float32
++                or u.device.type != torch.device(device).type
++            ):
++                # SGLang converts next-token logits to FP32 before sampling; the
++                # noise grid must match CANN's fp32 uniform to preserve the
++                # incumbent sampling distribution.
++                u = torch.empty(
++                    expected_shape,
++                    dtype=torch.float32,
++                    device=device,
++                )
++                self._async_exponential_u = u
++            u.uniform_()
++            self._async_exponential_event.record()
++
++        self._async_exponential_pending = True
++        return True
++
++    def _sample_with_async_exponential(
++        self, probs: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        """Consume precomputed U(0,1) noise using the exponential-race identity.
++
++        The full stock exponential_ transform (complement + clamp + -log) runs
++        here on the main stream (serial work that the sampling path owns
++        anyway), keeping the side stream free of AIV kernels so it cannot
++        slow down the model forward.
++        """
++        if not self._async_exponential_pending:
++            return None
++
++        u = self._async_exponential_u
++        self._async_exponential_pending = False
++        if (
++            u is None
++            or u.shape != probs.shape
++            or u.dtype != probs.dtype
++            or u.device != probs.device
++        ):
++            logger.warning(
++                "Async uniform buffer does not match probs; falling back to "
++                "torch.multinomial (u=%s/%s/%s, probs=%s/%s/%s)",
++                None if u is None else tuple(u.shape),
++                None if u is None else u.dtype,
++                None if u is None else u.device,
++                tuple(probs.shape),
++                probs.dtype,
++                probs.device,
++            )
++            return None
++
++        current_stream = torch.npu.current_stream()
++        current_stream.wait_event(self._async_exponential_event)
++        u.record_stream(current_stream)
++
++        # Do not modify probs in place: the standard backend reuses it for logprobs.
++        # argmax over probs / q with q ~ Exp(1): v1's production consumption
++        # form, kept because the stock argmax kernel is healthy while argmin at
++        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
++        # q is produced by transforming u in place with the exact stock
++        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
++        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
++        # The guard is a single torch.minimum against a cached 0-dim bound
++        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
++        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
++        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
++        # the legacy-family ClipByValueV2 op with two scalar->device uploads
++        # per call, which costs more than the unary-template kernels used by
++        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
++        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
++        # mapped it to +inf/+0.0 instead). For fp32 q stays within
++        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
++        # inf/NaN edge.
++        # All transform ops run here on the main stream; the side stream stays
++        # pure DSA uniform with zero AIV kernels.
++        bound = self._async_exp_min_bound
++        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(u.dtype).eps / 2.0,
++                dtype=u.dtype,
++                device=u.device,
++            )
++            self._async_exp_min_bound = bound
++        u.neg_().add_(1.0)
++        torch.minimum(u, bound, out=u)
++        u.log_().neg_()
++        sampled_index = torch.div(probs, u).argmax(dim=-1)
++        return sampled_index.view(-1).to(torch.int32)
+ 
+     def _preprocess_logits(
+         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+@@ -115,6 +279,9 @@ class Sampler(nn.Module):
+                 to get the unique seed for each position.
+         """
+         logits = logits_output.next_token_logits
++        # In the plain probability path, keep the softmax output and apply log
++        # only to the values requested by the caller.
++        logprobs_are_probs = False
+ 
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
+@@ -180,9 +347,13 @@ class Sampler(nn.Module):
+                 # Standard path: do softmax and sample from probs.
+                 logits.div_(sampling_info.temperatures)
+ 
+-                # In-place op to save memory
+-                logits[:] = torch.softmax(logits, dim=-1)
+-                probs = logits
++                # Do not write the softmax output back into logits: the
++                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
++                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
++                # read again on this path and is overwritten by the next
++                # forward anyway. Trade-off: one extra live [batch, vocab]
++                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
++                probs = torch.softmax(logits, dim=-1)
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+@@ -191,8 +362,9 @@ class Sampler(nn.Module):
+                     logprobs = (
+                         logprobs_via_logsoftmax_kernel
+                         if logprobs_via_logsoftmax_kernel is not None
+-                        else torch.log(probs)
++                        else probs
+                     )
++                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
+                 del probs
+ 
+         # Attach logprobs to logits_output (in-place modification)
+@@ -206,6 +378,7 @@ class Sampler(nn.Module):
+                 token_ids_logprobs,
+                 sampling_info,
+                 batch_next_token_ids,
++                logprobs_are_probs,
+             )
+ 
+         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+@@ -225,11 +398,13 @@ class Sampler(nn.Module):
+         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
+         """
+         if simple_sampling_case:
+-            batch_next_token_ids = sampling_from_probs_torch(
+-                probs,
+-                sampling_seed=sampling_info.sampling_seed,
+-                positions=positions,
+-            )
++            batch_next_token_ids = self._sample_with_async_exponential(probs)
++            if batch_next_token_ids is None:
++                batch_next_token_ids = sampling_from_probs_torch(
++                    probs,
++                    sampling_seed=sampling_info.sampling_seed,
++                    positions=positions,
++                )
+         else:
+             backend = get_flags().sampling_backend
+             if backend == "flashinfer":
+@@ -302,7 +477,11 @@ class Sampler(nn.Module):
+                     probabilities, sampling_info.sampling_seed, positions
+                 ).view(-1)
+             else:
+-                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
++                batch_next_token_ids = self._sample_with_async_exponential(probs)
++                if batch_next_token_ids is None:
++                    batch_next_token_ids = torch.multinomial(
++                        probs, num_samples=1
++                    ).view(-1)
+             return batch_next_token_ids.to(torch.int32)
+         else:
+             assert (
+@@ -353,9 +532,14 @@ class Sampler(nn.Module):
+         token_ids_logprobs: List[List[int]],
+         sampling_info: SamplingBatchInfo,
+         batch_next_token_ids: torch.Tensor,
++        logprobs_are_probs: bool,
+     ):
+-        # clamp to avoid -inf values
+-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++        # Clamp the extracted values instead of the full [batch, vocab]
++        # matrix. clamp(min=const) is elementwise and monotone
++        # non-decreasing, so it commutes with topk/gather: clamping the
++        # small outputs gives identical results (-inf -> finfo.min) while
++        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
++        clamp_min = torch.finfo(logprobs.dtype).min
+ 
+         # Attach logprobs to logits_output (in-place modification)
+         if any(x > 0 for x in top_logprobs_nums):
+@@ -362,7 +546,17 @@ class Sampler(nn.Module):
+-            (
+-                logits_output.next_token_top_logprobs_val,
+-                logits_output.next_token_top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
++            # Same extraction as get_top_logprobs, but clamp the
++            # [batch, max_k] topk result in a single kernel before
++            # slicing per request. Runs topk exactly once.
++            max_k = max(top_logprobs_nums)
++            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
++            if logprobs_are_probs:
++                top_vals.log_()
++            top_vals.clamp_(min=clamp_min)
++            logits_output.next_token_top_logprobs_val = [
++                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
++            logits_output.next_token_top_logprobs_idx = [
++                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
+ 
+         if any(x is not None for x in token_ids_logprobs):
+             (
+@@ -372,10 +567,19 @@ class Sampler(nn.Module):
+                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
+             )
+ 
+-        logits_output.next_token_logprobs = logprobs[
+-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+-            batch_next_token_ids,
+-        ]
++            for row in logits_output.next_token_token_ids_logprobs_val:
++                if torch.is_tensor(row):
++                    if logprobs_are_probs:
++                        row.log_()
++                    row.clamp_(min=clamp_min)
++
++        # Gather one value per row directly; this removes the temporary arange
++        # and the 2-D advanced-index operation from the hot path.
++        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
++        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
++        if logprobs_are_probs:
++            next_token_logprobs.log_()
++        logits_output.next_token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
+ 
+     def _sync_token_ids_across_tp(
+         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 3db49daf82..fdc5f40d81 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -486,6 +486,35 @@ class TpModelWorker(BaseTpWorker):
+             can_run_cuda_graph=can_run_cuda_graph,
+         )
+ 
++    def _prepare_async_exponential(
++        self,
++        forward_batch: ForwardBatch,
++        is_verify: bool,
++    ) -> None:
++        """Start simple-sampling RNG before forward so it can overlap on NPU."""
++        if (
++            is_verify
++            or self.enable_spec
++            or forward_batch.is_prefill_only
++            or not forward_batch.forward_mode.is_decode()
++            or forward_batch.sampling_info is None
++            or forward_batch.sampling_info.grammars is not None
++        ):
++            return
++
++        sampler = self.model_runner.sampler
++        prepare = getattr(sampler, "prepare_async_exponential", None)
++        if prepare is None:
++            return
++
++        prepare(
++            batch_size=forward_batch.batch_size,
++            vocab_size=self.model_runner.model_config.vocab_size,
++            sampling_info=forward_batch.sampling_info,
++            device=forward_batch.input_ids.device,
++        )
++
++
+     def forward_batch_generation(
+         self,
+         batch: Optional[ScheduleBatch],
+@@ -511,6 +540,7 @@ class TpModelWorker(BaseTpWorker):
+             return self._forward_batch_generation_dllm(forward_batch)
+ 
+         if self.pp_group.is_last_rank:
++            self._prepare_async_exponential(forward_batch, is_verify)
+             out = self.model_runner.forward(
+                 forward_batch,
+                 pp_proxy_tensors=pp_proxy_tensors,
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 368781d8d5..0856caae48 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -1089,6 +1089,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         if self.disable or len(key) == 0:
+             return None
+ 
++        key = key.page_aligned(self.page_size)
++        if len(key) == 0:
++            return None
++
+         return key
+ 
+     def _match_post_processor(
+@@ -1158,6 +1162,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         )
+ 
+     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
++        assert (
++            0 < split_len < len(child.key)
++        ), f"split_len must create non-empty nodes, {split_len=}, {len(child.key)=}"
+         # new_node -> child
+         new_node = TreeNode()
+         new_node.children = {key[split_len:].child_key(self.page_size): child}
+@@ -1166,6 +1173,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         new_node.full_lock_ref = child.full_lock_ref
+         new_node.mamba_lock_ref = 0
+         new_node.key = child.key[:split_len]
++        assert len(new_node.key) > 0, f"new_node.key should not be empty"
+         new_node.value = child.value[:split_len].clone()
+ 
+         # child time should be later than parent's time for mamba tombstone
+@@ -1176,6 +1184,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+             self.mamba_lru_list.remove_node(child)
+         child.parent = new_node
+         child.key = child.key[split_len:]
++        assert len(child.key) > 0, f"child.key should not be empty"
+         child.value = child.value[split_len:].clone()
+         new_node.parent.children[key.child_key(self.page_size)] = new_node
+         new_node.hash_value, child.hash_value = split_node_hash_value(
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 031ab4fe87..93e14ff483 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+     ForwardBatchDeepSeekMHAMixin,
+ )
+ from sglang.srt.model_executor.triton_ops.position import compute_position_triton
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_parallel, get_server_args
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     is_cuda,
+@@ -1053,11 +1053,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         return mrope_positions
+ 
+     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
++        mm_inputs = batch.multimodal_inputs
++        rl_on_policy_target = get_server_args().rl_on_policy_target
++
++        if (
++            self.spec_info is None
++            and batch.dllm_config is None
++            and (
++                rl_on_policy_target is not None
++                or all(mm_input is None for mm_input in mm_inputs)
++            )
++        ):
++            # Regular text generation does not need to rebuild mRoPE on the
++            # host. init_new has already produced the same flattened token
++            # positions on model_runner.device: clamp_position() for decode,
++            # or compute_position() for extend/mixed. Text mRoPE has identical
++            # temporal/height/width coordinates, so materialize the three rows
++            # directly and avoid the per-request host factories, cat, and H2D.
++            self.mrope_positions = (
++                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
++            )
++            return
+         # batch_size * [3 * seq_len]
+         batch_size = self.seq_lens_cpu.shape[0]
+         mrope_positions_list = [[]] * batch_size
+         for batch_idx in range(batch_size):
+-            mm_input = batch.multimodal_inputs[batch_idx]
++            mm_input = mm_inputs[batch_idx]
+             if self.forward_mode.is_decode():
+                 # 3 * N
+                 if (
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index d5aac381dc..e710d83b05 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
+     moe_tensor_model_parallel_all_reduce,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+@@ -93,7 +94,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_flags, get_parallel
++from sglang.srt.runtime_context import (
++    get_flags,
++    get_parallel,
++)
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+@@ -106,14 +110,6 @@ from sglang.srt.utils import (
+     make_layers,
+     use_intel_amx_backend,
+ )
+-
+-if is_npu():
+-    from sglang.srt.hardware_backend.npu.cmo import (
+-        shared_expert_on_independent_stream,
+-        wait_share_stream,
+-    )
+-
+-from sglang.srt.environ import envs
+ from sglang.srt.utils.hf_transformers_utils import get_rope_config
+ 
+ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+@@ -446,9 +442,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             # router_logits: (num_tokens, n_experts)
+             router_logits, _ = self.gate(hidden_states)
+             if enable_dual_stream:
+-                shared_output = shared_expert_on_independent_stream(
+-                    hidden_states.clone(), self._forward_shared_experts
+-                )
++                current_stream = torch.npu.current_stream()
++                self.alt_stream.wait_stream(current_stream)
++                with torch.npu.stream(self.alt_stream):
++                    shared_output = self._forward_shared_experts(hidden_states)
++                    shared_output.record_stream(self.alt_stream)
++                    shared_event = self.alt_stream.record_event()
+             else:
+                 shared_output = self._forward_shared_experts(hidden_states)
+             topk_output = self.topk(
+@@ -469,8 +468,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             hidden_states=hidden_states,
+             topk_output=topk_output,
+         )
+-        if enable_dual_stream:
+-            wait_share_stream()
++        if hidden_states.shape[0] > 0 and enable_dual_stream:
++            torch.npu.current_stream().wait_event(shared_event)
+ 
+         if shared_output is not None:
+             final_hidden_states.add_(shared_output)
+@@ -991,7 +990,14 @@ class Qwen2MoeForCausalLM(nn.Module):
+         self.pp_group = get_pp_group()
+         self.config = config
+         self.quant_config = quant_config
+-        alt_stream = torch.cuda.Stream() if _is_cuda else None
++        # Mirror qwen3_5.py: on NPU, SGLANG_NPU_USE_MULTI_STREAM also needs a
++        # real stream — _forward_deepep's dual-stream branch dereferences
++        # self.alt_stream unconditionally once enabled.
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or (is_npu() and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
++            else None
++        )
+         self.model = Qwen2MoeModel(
+             config,
+             quant_config,
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index fed78cf..11cbadd 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -35,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
+ 
+ # Distributed
+ from sglang.srt.distributed import get_pp_group
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ 
+@@ -64,7 +65,10 @@ from sglang.srt.layers.parameter import (
+ )
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
++from sglang.srt.layers.radix_linear_attention import (
++    RadixLinearAttention,
++    wrap_conv1d_weight_loader,
++)
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+@@ -229,23 +233,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         self._bind_packed_weight_loaders(self.in_proj_qkvz)
+         self._bind_packed_weight_loaders(self.in_proj_ba)
+ 
+-        # Conv1d weight loader setup
+-        query_key_settings = (self.key_dim, 0, False)
+-        value_settings = (self.value_dim, 0, False)
+-
+-        self._override_weight_loader(
+-            self.conv1d.weight,
+-            mamba_v2_sharded_weight_loader(
+-                [
+-                    query_key_settings,
+-                    query_key_settings,
+-                    value_settings,
+-                ],
+-                self.attn_tp_size,
+-                self.attn_tp_rank,
+-            ),
+-        )
+-
+         # State parameters
+         self.dt_bias = nn.Parameter(
+             torch.ones(self.num_v_heads // self.attn_tp_size),
+@@ -275,6 +262,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             dt_bias=self.dt_bias,
+         )
+ 
++        # Conv1d weight loader setup. The wrapper refreshes the transposed
++        # copy cached on self.attn by the attention backend after every
++        # (re)load, so it must be bound after self.attn exists.
++        query_key_settings = (self.key_dim, 0, False)
++        value_settings = (self.value_dim, 0, False)
++
++        self._override_weight_loader(
++            self.conv1d.weight,
++            wrap_conv1d_weight_loader(
++                self.attn,
++                mamba_v2_sharded_weight_loader(
++                    [
++                        query_key_settings,
++                        query_key_settings,
++                        value_settings,
++                    ],
++                    self.attn_tp_size,
++                    self.attn_tp_rank,
++                ),
++            ),
++        )
++
+         self.norm = RMSNormGated(
+             self.head_v_dim,
+             eps=self.layer_norm_epsilon,
+@@ -608,7 +617,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+@@ -824,7 +837,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+@@ -1207,6 +1224,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
+ 
+         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or _hip_use_alt_stream or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++            else None
++        )
+ 
+         # Embedding layer
+         if self.pp_group.is_first_rank:
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index daf9fa82e2..f00f718fd2 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -617,7 +617,7 @@ def eagle_sample(
+ 
+     # Sample tokens
+     target_predict = None
+-    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
++    if sampling_info.is_all_greedy or _is_hip or _is_xpu:
+         target_predict = torch.argmax(next_token_logits, dim=-1)
+         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+@@ -632,43 +632,80 @@ def eagle_sample(
+             topk=verify_input.tree_topk,
+         )
+     else:
+-        from sgl_kernel import (
+-            top_k_renorm_prob,
+-            top_p_renorm_prob,
+-            tree_speculative_sampling_target_only,
+-        )
+-
+-        from sglang.srt.speculative.reject_sampling import (
+-            chain_speculative_sampling_triton,
+-        )
+-
+         use_rejection_sampling = (
+             get_global_server_args().speculative_use_rejection_sampling
+         )
+ 
++        if _is_npu:
++            from sgl_kernel_npu.sample import (
++                chain_speculative_sampling_rejection,
++                top_k_top_p_renorm_probs,
++                tree_speculative_sampling_target_only,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_rejection
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++        else:
++            from sgl_kernel import (
++                top_k_renorm_prob,
++                top_p_renorm_prob,
++                tree_speculative_sampling_target_only,
++            )
++
++            from sglang.srt.speculative.reject_sampling import (
++                chain_speculative_sampling_triton,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_triton
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++
+         # Apply temperature and get target probs
+         expanded_temperature = torch.repeat_interleave(
+             sampling_info.temperatures, verify_input.draft_token_num, dim=0
+         )  # (bs * num_draft_tokens, 1)
+ 
++        sampling_logits = next_token_logits.float() if _is_npu else next_token_logits
+         target_probs = F.softmax(
+-            next_token_logits / expanded_temperature, dim=-1
++            sampling_logits / expanded_temperature, dim=-1
+         )  # (bs * num_draft_tokens, vocab_size)
+         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+-        target_probs = top_k_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
+-            ),
+-        )  # (bs * num_draft_tokens, vocab_size)
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+-        target_probs = top_p_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+-            ),
+-        )
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
++
++        if _is_npu:
++            target_probs = top_k_top_p_renorm_probs(
++                target_probs,
++                torch.repeat_interleave(
++                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                ),
++                torch.repeat_interleave(
++                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                ),
++                sampling_info.need_top_k_sampling,
++                sampling_info.need_top_p_sampling,
++            )
++            maybe_detect_nan(target_probs, "v2 verify: target_probs after renorm")
++        else:
++            if sampling_info.need_top_k_sampling:
++                target_probs = top_k_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                    ),
++                )  # (bs * num_draft_tokens, vocab_size)
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
++            if sampling_info.need_top_p_sampling:
++                target_probs = top_p_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                    ),
++                )
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+         draft_probs = (
+             verify_input.draft_probs
+@@ -687,16 +724,15 @@ def eagle_sample(
+                 "does not produce one (draft_probs missing or vocab-mismatched)."
+             )
+ 
++        if _is_npu:
++            target_probs = target_probs.contiguous()
++            draft_probs = draft_probs.float().contiguous()
++
+         # coins for rejection sampling
+         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+         # coins for final sampling
+         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+ 
+-        sampling_fn = (
+-            chain_speculative_sampling_triton
+-            if use_rejection_sampling
+-            else tree_speculative_sampling_target_only
+-        )
+         sampling_fn(
+             predicts=predict,  # mutable
+             accept_index=accept_index,  # mutable
+diff --git a/python/sglang/srt/speculative/triton_ops/cache_locs.py b/python/sglang/srt/speculative/triton_ops/cache_locs.py
+index 663c238722..522fd5ee44 100644
+--- a/python/sglang/srt/speculative/triton_ops/cache_locs.py
++++ b/python/sglang/srt/speculative/triton_ops/cache_locs.py
+@@ -363,6 +363,14 @@ def assign_extend_cache_locs_func(
+         return out_cache_loc
+ 
+     elif _is_npu:
++        '''
++        sgl-kernel-npu's cache_loc_assign / cache_loc_update operate under an explicit contract:
++        each row processes max_step tokens, and the tiling dimension of out_cache_loc is
++        cacheLocSize = batchSize * max_step, which is validated on the host side.
++        The host enforces 1 <= max_step <= MAX_STEP (16) and checks the size of out_cache_loc.
++        Therefore, here we allocate exactly batch_size * draft_token_num and pass draft_token_num
++        as max_step; no padding to 16 is needed.
++        '''
+         out_cache_loc = torch.empty(
+             (batch_size * draft_token_num,),
+             dtype=torch.int32,
+@@ -374,6 +382,7 @@ def assign_extend_cache_locs_func(
+             start_offset,
+             end_offset,
+             out_cache_loc,
++            draft_token_num,
+         )
+ 
+         return out_cache_loc
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index f68721f3d0..3e85ee7c10 100644
+index 82db90da3b..aabd222d7e 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
-@@ -46,6 +46,7 @@ import types
- import uuid
- import warnings
- from collections import OrderedDict, defaultdict
+@@ -73,6 +73,7 @@ from typing import (
+     TypeVar,
+     Union,
+ )
 +from relax.utils.device import is_npu_available
- from contextlib import contextmanager
- from dataclasses import dataclass
- from decimal import Decimal
-@@ -150,7 +151,7 @@ def is_npu() -> bool:
+ from unittest import SkipTest
+ from unittest.case import _ShouldStop
+ from urllib.parse import unquote, urlparse
+@@ -176,7 +177,8 @@ def is_npu() -> bool:
      if not hasattr(torch, "npu"):
          return False
  
 -    if not torch.npu.is_available():
++    # if not torch.npu.is_available():
 +    if not is_npu_available:
          raise RuntimeError(
              "torch_npu detected, but NPU device is not available or visible."
          )
+diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+index ad98e59283..a5b2cdfd32 100644
+--- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
++++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+@@ -41,7 +41,7 @@ class TorchMemorySaverAdapter(ABC):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         raise NotImplementedError
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         raise NotImplementedError
+ 
+     def disable(self):
+@@ -67,7 +67,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
++        if cuda_graph is not None:
++            kwargs["cuda_graph"] = cuda_graph
++        # kwargs.pop("auto_dispatch_capture", None)  # torch_memory_saver 0.0.8 does not support this arg
+         return _memory_saver.cuda_graph(**kwargs)
+ 
+     def disable(self):
+@@ -94,7 +97,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+         yield
+ 
+     @contextmanager
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         yield
+ 
+     @contextmanager
+diff --git a/test/registered/unit/layers/test_conv_weight_cache_refresh.py b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+new file mode 100644
+index 0000000000..ed2574df66 100644
+--- /dev/null
++++ b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+@@ -0,0 +1,109 @@
++"""Regression tests for the GDN conv1d weight cache refresh.
++
++The Ascend GDN backend caches a transposed copy of conv1d.weight on the
++RadixLinearAttention wrapper (AscendGDNAttnBackend._get_conv_weights_t).
++mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++because ``Tensor.data`` carries a version counter independent of the
++Parameter's, online weight updates (e.g. RL Actor->SGLang sync via
++``update_weights_from_tensor``) are invisible to ``_version``-based
++invalidation. conv1d.weight's loader is therefore wrapped with
++``wrap_conv1d_weight_loader`` to refresh the cached copy explicitly, in
++place, so captured graphs keep referencing the same storage.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
++from sglang.srt.layers.radix_linear_attention import wrap_conv1d_weight_loader
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_CHANNELS = 16  # q(4) + k(4) + v(8) on a single TP rank
++_KERNEL = 4
++
++
++def _make_conv_param() -> torch.nn.Parameter:
++    # conv1d.weight layout: [channels, 1, kernel]
++    return torch.nn.Parameter(
++        torch.randn(_CHANNELS, 1, _KERNEL), requires_grad=False
++    )
++
++
++def _make_base_loader():
++    # Same shard layout as Qwen3_5: q/k shards then the v shard, TP size 1.
++    return mamba_v2_sharded_weight_loader(
++        [(4, 0, False), (4, 0, False), (8, 0, False)], 1, 0
++    )
++
++
++class _FakeAttn:
++    """Stands in for RadixLinearAttention: holds conv_weights and the cache."""
++
++    def __init__(self, conv_param: torch.nn.Parameter):
++        self.conv_weights = conv_param.view(_CHANNELS, _KERNEL)
++        self._conv_weights_t = self.conv_weights.transpose(0, 1).contiguous()
++
++
++class TestConvWeightCacheRefresh(CustomTestCase):
++
++    def test_mamba_loader_write_bypasses_param_version(self):
++        """Root-cause guard: the real loader must not bump ``_version``.
++
++        If a future PyTorch/SGLang change makes param.data writes bump the
++        shared version counter, this test fails and the explicit wrapper may
++        be revisited.
++        """
++        param = _make_conv_param()
++        view = param.view(_CHANNELS, _KERNEL)
++        param_version = param._version
++        view_version = view._version
++
++        _make_base_loader()(param, torch.randn_like(param))
++
++        self.assertEqual(param._version, param_version)
++        self.assertEqual(view._version, view_version)
++
++    def test_wrapped_loader_refreshes_cache_in_place(self):
++        """An online reload must refresh the cached transpose in place."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        cached = attn._conv_weights_t
++        cached_ptr = cached.data_ptr()
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        # The loader actually wrote the new weights.
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++        # The cache is refreshed in place: same tensor object, same storage
++        # (captured graphs keep referencing it), content matches the
++        # transpose of the new weights.
++        self.assertIs(attn._conv_weights_t, cached)
++        self.assertEqual(attn._conv_weights_t.data_ptr(), cached_ptr)
++        reference = param.view(_CHANNELS, _KERNEL).transpose(0, 1)
++        torch.testing.assert_close(attn._conv_weights_t, reference, rtol=0, atol=0)
++
++    def test_wrapped_loader_without_cache_is_noop(self):
++        """Initial load (before the first forward) must not create a cache."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        del attn._conv_weights_t
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        self.assertFalse(hasattr(attn, "_conv_weights_t"))
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/mem_cache/test_mamba_unittest.py b/test/registered/unit/mem_cache/test_mamba_unittest.py
+index 9ad577b42e..390a3721c5 100755
+--- a/test/registered/unit/mem_cache/test_mamba_unittest.py
++++ b/test/registered/unit/mem_cache/test_mamba_unittest.py
+@@ -419,6 +419,58 @@ class TestMamba(unittest.TestCase):
+         self.assertEqual(list(second_insert_events[0].token_ids), [5])
+         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+ 
++    def test_mamba_radix_cache_limited_partial_page_match_does_not_split(self):
++        page_size = 64
++        tree = self._setup_minimal_mamba_radix_cache(page_size)
++        token_ids = array("q", range(page_size))
++
++        tree.insert(
++            InsertParams(
++                key=RadixKey(token_ids, None),
++                value=torch.arange(page_size),
++                mamba_value=torch.tensor([0]),
++            )
++        )
++
++        match = tree.match_prefix(
++            MatchPrefixParams(key=RadixKey(token_ids, None, limit=page_size - 1))
++        )
++
++        self.assertEqual(len(match.device_indices), 0)
++        self.assertEqual(self._non_root_key_lengths(tree), [page_size])
++
++    def _setup_minimal_mamba_radix_cache(self, page_size: int) -> MambaRadixCache:
++        tree = MambaRadixCache.__new__(MambaRadixCache)
++        tree.page_size = page_size
++        tree.mamba_cache_chunk_size = page_size
++        tree.disable = False
++        tree.device = torch.device("cpu")
++        tree.enable_kv_cache_events = False
++        tree.kv_event_queue = []
++        tree.full_evictable_size_ = 0
++        tree.mamba_evictable_size_ = 0
++        tree.full_protected_size_ = 0
++        tree.mamba_protected_size_ = 0
++
++        tree.root_node = TreeNode()
++        tree.root_node.key = RadixKey(array("q"), None)
++        tree.root_node.value = []
++        tree.root_node.hash_value = []
++        tree.root_node.full_lock_ref = 1
++        tree.root_node.mamba_lock_ref = 1
++        tree.full_lru_list = LRUList(mamba=False)
++        tree.mamba_lru_list = LRUList(mamba=True)
++        return tree
++
++    def _non_root_key_lengths(self, tree: MambaRadixCache) -> list[int]:
++        lengths = []
++        stack = list(tree.root_node.children.values())
++        while stack:
++            node = stack.pop()
++            lengths.append(len(node.key))
++            stack.extend(node.children.values())
++        return lengths
++
+     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
+         """Helper to create a MambaRadixCache with allocator for testing."""
+         server_args = ServerArgs(model_path="dummy", page_size=1)
+diff --git a/test/registered/unit/layers/test_sampler_attach_logprobs.py b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+new file mode 100644
+index 0000000000..9dfc930392 100644
+--- /dev/null
++++ b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+@@ -0,0 +1,156 @@
++"""Unit tests for Sampler._attach_logprobs_to_output.
++
++Regression coverage for two bugs in the decode logprob attach path:
++  - iterating ``logits_output.token_ids_logprobs_val`` (a nonexistent field on
++    LogitsProcessorOutput) instead of ``next_token_token_ids_logprobs_val``
++    raised AttributeError for any request with specific token-ID logprobs;
++  - the top-logprob branch ran a full-vocab topk twice (get_top_logprobs plus
++    an immediate re-topk that overwrote the first result).
++
++The method under test does not touch ``self``, so the Sampler is allocated
++with ``__new__`` to skip the distributed-group init in ``__init__``.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.sampler import Sampler
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_VOCAB = 1000
++
++
++def _make_sampler() -> Sampler:
++    # _attach_logprobs_to_output never reads instance state; bypass __init__
++    # (which requires an initialized torch distributed group).
++    return Sampler.__new__(Sampler)
++
++
++def _attach(
++    logprobs: torch.Tensor,
++    top_logprobs_nums,
++    token_ids_logprobs,
++    batch_next_token_ids: torch.Tensor,
++    logprobs_are_probs: bool = False,
++) -> LogitsProcessorOutput:
++    logits_output = LogitsProcessorOutput(next_token_logits=None)
++    _make_sampler()._attach_logprobs_to_output(
++        logits_output=logits_output,
++        logprobs=logprobs,
++        top_logprobs_nums=top_logprobs_nums,
++        token_ids_logprobs=token_ids_logprobs,
++        sampling_info=None,
++        batch_next_token_ids=batch_next_token_ids,
++        logprobs_are_probs=logprobs_are_probs,
++    )
++    return logits_output
++
++
++class TestAttachTokenIdsLogprobs(CustomTestCase):
++
++    def test_token_ids_logprobs_no_attribute_error(self):
++        """Specific token-ID logprob requests must not raise AttributeError."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[5, 7], [42]],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_val)
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_idx)
++
++    def test_token_ids_logprobs_values(self):
++        logprobs = torch.log_softmax(torch.randn(3, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        requested = [[5, 7], None, [42]]
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0, 0],
++            token_ids_logprobs=requested,
++            batch_next_token_ids=torch.tensor([3, 4, 9], dtype=torch.int32),
++        )
++        vals = out.next_token_token_ids_logprobs_val
++        idxs = out.next_token_token_ids_logprobs_idx
++        self.assertEqual(len(vals), 3)
++        torch.testing.assert_close(
++            vals[0], reference[0, torch.tensor([5, 7])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[0], [5, 7])
++        # None request yields empty placeholders.
++        self.assertEqual(vals[1], [])
++        self.assertEqual(idxs[1], [])
++        torch.testing.assert_close(
++            vals[2], reference[2, torch.tensor([42])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[2], [42])
++
++    def test_token_ids_logprobs_probs_input(self):
++        """logprobs_are_probs=True applies log() before clamping, per row."""
++        probs = torch.softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = probs.clone()
++        out = _attach(
++            logprobs=probs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[1, 2], [3]],
++            batch_next_token_ids=torch.tensor([0, 1], dtype=torch.int32),
++            logprobs_are_probs=True,
++        )
++        torch.testing.assert_close(
++            out.next_token_token_ids_logprobs_val[0],
++            reference[0, torch.tensor([1, 2])].log(),
++            rtol=1e-6,
++            atol=1e-6,
++        )
++
++
++class TestAttachTopLogprobs(CustomTestCase):
++
++    def test_top_logprobs_values(self):
++        """Per-request k slicing stays correct with the single-topk path."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[3, 1],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        ref_vals, ref_idx = reference.topk(3, dim=-1)
++        self.assertEqual(len(out.next_token_top_logprobs_val), 2)
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[0], ref_vals[0], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[0], ref_idx[0]))
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[1], ref_vals[1][:1], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[1], ref_idx[1][:1]))
++
++    def test_next_token_logprobs_gather(self):
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        torch.testing.assert_close(
++            out.next_token_logprobs,
++            torch.stack([reference[0, 3], reference[1, 4]]),
++            rtol=0,
++            atol=0,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
