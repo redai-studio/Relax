@@ -96,7 +96,7 @@ bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
 每条样本训练一次。`NUM_ROLLOUT` 可调整步数，`OSWORLD_LEARNING_RATE` 默认 `1e-6`。
 
 `train_fixed_tasks.py` 接入固定任务数据源和整组补采；`train_fixed12_minibatch3.py`
-校验 96/32 的分批设置，并关闭不适用于此次多 batch 更新的零 advantage 剔除。
+校验 96/32 的分批设置。
 公用的 `run_qwen3vl_8B_osworld_outcome.sh` 负责模型、训练参数和 Ray 提交。
 
 ### 每轮一次更新，训练 100 步
@@ -194,6 +194,4 @@ ______________________________________________________________________
 ## 7. 性能设计
 
 - Agentic rollout 在 session 内复用截图张量，按完整任务组分批传入 TensorQueue，传输后释放源端像素，降低 CPU 内存峰值。
-- 当 reference 与 rollout 前 actor 权重一致且计算条件兼容时，复用 old log-prob 前向结果；不满足条件则执行独立 reference 前向。
-- 零 advantage 剔除只在无有效 KL/熵梯度且满足 batch 限制时开启。它跳过物理 session 记录，保留逻辑 batch、loss 分母和 optimizer/scheduler 更新次数；12 任务三 batch recipe 显式关闭该优化。
 - `RECOMPUTE_GRANULARITY` 默认 `selective`。可按显存需求改为 `full`，结合 `RECOMPUTE_METHOD` 和 `RECOMPUTE_NUM_LAYERS` 配置重算。

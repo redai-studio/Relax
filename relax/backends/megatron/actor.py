@@ -103,12 +103,10 @@ from .data import (
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
-from .ref_logprob_reuse import WeightSnapshotVersions, can_reuse_ref_log_probs
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
 from .weight_update.update_weight_from_tensor import UpdateWeightFromTensor
-from .zero_advantage import filter_zero_advantage_rows
 
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
@@ -317,10 +315,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
             self._active_model_tag: str | None = "actor"
-            self._weight_snapshot_versions = WeightSnapshotVersions()
-            self._weight_snapshot_versions.mark_modified()
             self.weights_backuper.backup("actor")
-            self._weight_snapshot_versions.backup("actor")
 
             if with_ref:
                 self.load_other_checkpoint("ref", args.ref_load)
@@ -335,7 +330,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 # Create rollout_actor as a copy of current actor
                 if args.update_weights_interval == 1:
                     self.weights_backuper.backup("rollout_actor")
-                    self._weight_snapshot_versions.backup("rollout_actor")
 
             update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
             # Push-side repack is decided by the HF config: an FP8 release auto-routes
@@ -535,7 +529,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
-        self._weight_snapshot_versions.restore(target_tag)
         self._active_model_tag = target_tag
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
@@ -909,23 +902,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     t.to(cur_device) if isinstance(t, torch.Tensor) and t.device.type != "cuda" else t for t in tensors
                 ]
 
-        original_rows = len(rollout_data["total_lengths"])
-        snapshot_versions = getattr(self, "_weight_snapshot_versions", None)
-        rollout_data, dropped = filter_zero_advantage_rows(
-            self.args,
-            rollout_data,
-            reference_matches_actor=(
-                snapshot_versions is not None and snapshot_versions.same_snapshot("actor", "ref")
-            ),
-        )
-        if dropped:
-            logger.info(
-                "Pruned %s/%s zero-advantage rows before model forwards (rank=%s)",
-                dropped,
-                original_rows,
-                self._rank,
-            )
-
         # Create data iterator for actor forward + routing replay + train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
@@ -953,8 +929,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
             if should_compute_old_log_probs:
-                reuse_ref_log_probs = can_reuse_ref_log_probs(self.args, self._weight_snapshot_versions)
-                if "ref" in self.weights_backuper.backup_tags and not reuse_ref_log_probs:
+                if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
@@ -997,13 +972,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
-
-                if reuse_ref_log_probs:
-                    # Preserve the reference KL target while avoiding an identical
-                    # forward. Keep independent lists; the no-grad tensors are read-only.
-                    rollout_data["ref_log_probs"] = list(rollout_data["log_probs"])
-                    if is_megatron_main_rank():
-                        logger.info(f"Reusing old-policy log probabilities for reference at rollout_id {rollout_id}")
 
                 # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
@@ -1050,9 +1018,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         # update the cpu actor weight to the latest model
         if hasattr(self, "weights_backuper"):
-            self._weight_snapshot_versions.mark_modified()
             self.weights_backuper.backup("actor")
-            self._weight_snapshot_versions.backup("actor")
 
         # Update ref model if needed
         if (
@@ -1065,7 +1031,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 if is_megatron_main_rank():
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
-                self._weight_snapshot_versions.backup("ref")
 
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -1527,9 +1492,7 @@ class MegatronTrainRayActor(TrainRayActor):
             RoutingReplay.clear_all()
 
         # Update CPU actor weight backup
-        self._weight_snapshot_versions.mark_modified()
         self.weights_backuper.backup("actor")
-        self._weight_snapshot_versions.backup("actor")
 
         # Update ref model if needed
         if (
@@ -1541,7 +1504,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 if is_megatron_main_rank():
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
-                self._weight_snapshot_versions.backup("ref")
 
         total_lengths = rollout_data["total_lengths"]
         all_total_lengths = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -1833,13 +1795,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
                     # First copy rollout_actor to old_actor
                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    self._weight_snapshot_versions.copy(src_tag="rollout_actor", dst_tag="old_actor")
                     # Then copy current actor to rollout_actor
                     self.weights_backuper.backup("rollout_actor")
-                    self._weight_snapshot_versions.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
-                    self._weight_snapshot_versions.backup("old_actor")
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
@@ -2035,9 +1994,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if old_ckpt_step is not None:
             self.args.ckpt_step = old_ckpt_step
 
-        self._weight_snapshot_versions.mark_modified()
         self.weights_backuper.backup(model_tag)
-        self._weight_snapshot_versions.backup(model_tag)
         self._active_model_tag = model_tag
 
     def all_consumed(self, task_name, rollout_id, partition_id: str | None = None, streaming: bool = False):
