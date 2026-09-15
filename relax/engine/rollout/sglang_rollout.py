@@ -296,6 +296,31 @@ async def _encode_multimodal_inputs(multimodal_inputs: dict) -> tuple[dict[str, 
     return encoded, monotonic() - t_start
 
 
+def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np.ndarray:
+    """Decode SGLang's shape-less DSV4 indexer payload.
+
+    SGLang returns one int32 row for every input token except the final one.
+    The remaining width is ``num_c4_layers * index_topk`` and is intentionally
+    kept flat here. Megatron's concrete model config validates and selects the
+    C4 columns that are built on this PP rank.
+    """
+    encoded = meta_info.get("indexer_topk")
+    if encoded is None:
+        raise RuntimeError(
+            "SGLang did not return meta_info['indexer_topk'] while --use-rollout-indexer-replay is enabled."
+        )
+    if num_rows <= 0:
+        raise ValueError(f"indexer replay requires at least one captured row, got {num_rows}")
+
+    values = np.frombuffer(pybase64.b64decode(encoded.encode("ascii")), dtype=np.int32)
+    if values.size == 0 or values.size % num_rows != 0:
+        raise ValueError(
+            "Invalid SGLang indexer_topk payload: "
+            f"num_values={values.size} is not a positive multiple of num_rows={num_rows}."
+        )
+    return values.reshape(num_rows, values.size // num_rows)
+
+
 async def generate(
     args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
 ) -> Sample:
@@ -346,6 +371,8 @@ async def generate(
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
+    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+        payload["return_indexer_topk"] = True
 
     if state.opd_manager and not evaluation:
         state.opd_manager.before_rollout(payload)
@@ -478,6 +505,16 @@ async def generate(
             len(sample.tokens) - 1,
             args.num_layers,
             args.moe_router_topk,
+        )
+
+    if getattr(args, "use_rollout_indexer_replay", False) and not evaluation:
+        setattr(
+            sample,
+            "rollout_indexer_topk",
+            _decode_rollout_indexer_topk(
+                output["meta_info"],
+                len(sample.tokens) - 1,
+            ),
         )
 
     sample.update_from_meta_info(args, output["meta_info"])

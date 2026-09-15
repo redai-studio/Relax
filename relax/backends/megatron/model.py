@@ -916,6 +916,8 @@ def forward_only(
             "loss_mask": forward_loss_mask,
             **mm_kwargs,
         }
+        if batch.get("padding_mask") is not None:
+            forward_kwargs["padding_mask"] = batch["padding_mask"]
         output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
@@ -1083,6 +1085,9 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
+    if use_indexer_replay:
+        from relax.utils.training.indexer_replay import IndexerReplay
 
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).
@@ -1158,7 +1163,6 @@ def train_one_step(
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-
         # set in the SFT branch below; left as None for return_schedule_plan or
         # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
@@ -1169,14 +1173,27 @@ def train_one_step(
             # chunked-logits incompatibility is enforced as a hard assert in
             # arguments.py.slime_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
-            output_tensor = model.build_schedule_plan(
-                input_ids=batch["tokens"],
-                position_ids=None,
-                attention_mask=None,
-                labels=None,
-                packed_seq_params=batch["packed_seq_params"],
-                loss_mask=batch["full_loss_masks"],
-            )
+            if use_indexer_replay:
+                with IndexerReplay.forward_stage():
+                    output_tensor = model.build_schedule_plan(
+                        input_ids=batch["tokens"],
+                        position_ids=None,
+                        attention_mask=None,
+                        labels=None,
+                        packed_seq_params=batch["packed_seq_params"],
+                        loss_mask=batch["full_loss_masks"],
+                        padding_mask=batch.get("padding_mask"),
+                    )
+            else:
+                output_tensor = model.build_schedule_plan(
+                    input_ids=batch["tokens"],
+                    position_ids=None,
+                    attention_mask=None,
+                    labels=None,
+                    packed_seq_params=batch["packed_seq_params"],
+                    loss_mask=batch["full_loss_masks"],
+                    padding_mask=batch.get("padding_mask"),
+                )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
             needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
@@ -1190,6 +1207,8 @@ def train_one_step(
                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
             }
+            if batch.get("padding_mask") is not None:
+                forward_kwargs["padding_mask"] = batch["padding_mask"]
 
             # thd VL+CP: bridge needs per-sample attention_mask + matching thd
             # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
@@ -1236,9 +1255,17 @@ def train_one_step(
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
                 ) as lm_head_forward:
-                    output_tensor = model(**forward_kwargs)
+                    if use_indexer_replay:
+                        with IndexerReplay.forward_stage():
+                            output_tensor = model(**forward_kwargs)
+                    else:
+                        output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                if use_indexer_replay:
+                    with IndexerReplay.forward_stage():
+                        output_tensor = model(**forward_kwargs)
+                else:
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage

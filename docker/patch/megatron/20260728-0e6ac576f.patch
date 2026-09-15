@@ -963,7 +963,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
 +            fp32_param = self.param_to_fp32_param.get(param)
 +            if fp32_param is not None:
 +                fp32_param.data.copy_(v["master_param"])
-
+ 
      def update_fp32_param_by_new_param(self):
          """
 @@ -379,6 +387,16 @@
@@ -988,7 +988,7 @@ index 9baed75..8f68e3d 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
 @@ -471,7 +471,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
-
+ 
                  # fp32 params.
                  elif model_param.type() == 'torch.cuda.FloatTensor':
 -                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -1489,10 +1489,10 @@ diff --git a/megatron/core/fp8_utils.py b/megatron/core/fp8_utils.py
 +
      return custom_recipe
 diff --git a/megatron/core/safe_globals.py b/megatron/core/safe_globals.py
+index d046c3e1e3..59ac05e1c1 100644
 --- a/megatron/core/safe_globals.py
 +++ b/megatron/core/safe_globals.py
-@@ -102,13 +102,15 @@ class SafeUnpickler(pickle.Unpickler):
-             ("torch.storage", "_load_from_bytes"),
+@@ -103,12 +103,14 @@
              ("transformer_engine.common.recipe", "DelayedScaling"),
              ("transformer_engine.common.recipe", "Float8CurrentScaling"),
              ("transformer_engine.common.recipe", "Float8BlockScaling"),
@@ -1837,6 +1837,40 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/m
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
  
                  indexer_compressed_local, _ = indexer.compressor._forward_thd(
+diff --git a/megatron/bridge/data/builders/energon.py b/megatron/bridge/data/builders/energon.py
+--- a/megatron/bridge/data/builders/energon.py
++++ b/megatron/bridge/data/builders/energon.py
+@@ -22,7 +22,6 @@ from typing import Any, Literal
+ from transformers import AutoProcessor, AutoTokenizer, Qwen3VLProcessor
+ 
+ from megatron.bridge.data.base import DataloaderConfig, DatasetBuildContext, validate_declarative_mapping
+-from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
+ from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
+ 
+ 
+@@ -289,6 +288,8 @@ class EnergonDatasetBuilder:
+ 
+     def build(self, context: DatasetBuildContext) -> tuple[Any | None, Any | None, None]:
+         """Build requested Energon train and validation iterators."""
++        from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
++
+         assert self.config.path is not None
+         build_train = context.train_samples > 0
+         build_validation = self.config.do_validation and context.valid_samples > 0
+diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/megatron/core/transformer/experimental_attention_variant/csa.py
+--- a/megatron/core/transformer/experimental_attention_variant/csa.py
++++ b/megatron/core/transformer/experimental_attention_variant/csa.py
+@@ -2576,3 +2576,9 @@
+                 )
+-
++                if getattr(self.config, "relax_use_indexer_replay", False):
++                    from relax.utils.training.indexer_replay import maybe_replay_indexer_topk
++                    compressed_topk = maybe_replay_indexer_topk(
++                        layer_number=self.layer_number,
++                        computed_topk=compressed_topk,
++                    )
++
+             # ---- Step 5: attention compressed KV path -------------------------
 diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
 --- a/megatron/bridge/models/conversion/model_bridge.py
 +++ b/megatron/bridge/models/conversion/model_bridge.py

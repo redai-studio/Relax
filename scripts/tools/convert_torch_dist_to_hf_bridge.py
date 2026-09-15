@@ -21,6 +21,7 @@ os.environ["PYTHONPATH"] = os.pathsep.join([_RELAX_ROOT, *_pythonpath_entries])
 
 _model_load_save_module = None
 _original_load_model_config = None
+_original_transformer_config_from_args = None
 _original_save_file = None
 _provider_override = {}
 _lora_checkpoint_spec = None
@@ -246,7 +247,9 @@ def _patched_load_model_config(checkpoint_path):
 
 def _initialize_bridge_patches():
     global _model_load_save_module, _original_load_model_config, _original_save_file
+    global _original_transformer_config_from_args
 
+    import megatron.bridge.training.mlm_compat.arguments as mlm_compat_args_module
     import megatron.bridge.training.model_load_save as model_load_save_module
     import safetensors.torch as safetensors_torch
 
@@ -255,6 +258,51 @@ def _initialize_bridge_patches():
     _original_save_file = safetensors_torch.save_file
     model_load_save_module.load_model_config = _patched_load_model_config
     safetensors_torch.save_file = _save_file_ensure_contiguous
+    _original_transformer_config_from_args = mlm_compat_args_module._transformer_config_from_args
+    mlm_compat_args_module._transformer_config_from_args = _patched_transformer_config_from_args
+    # Some Bridge revisions import this helper by name.
+    if (
+        getattr(model_load_save_module, "_transformer_config_from_args", None)
+        is _original_transformer_config_from_args
+    ):
+        model_load_save_module._transformer_config_from_args = _patched_transformer_config_from_args
+
+
+# export_ckpt -> load_model_config rebuilds a *generic* TransformerConfig from the
+# checkpoint's saved CLI args via _transformer_config_from_args. Those args carry
+# cp_partition_mode='contiguous' (a real CLI flag), but NOT
+# experimental_attention_variant='dsv4_hybrid' (the bridge derives that from the HF
+# config; it is not a saved CLI arg). mcore's __post_init__ then raises
+# "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+# This throwaway config is discarded and replaced by the bridge provider in
+# _patched_load_model_config, and export is single-process (no CP), so neutralize the
+# CP-only args before the generic rebuild.
+def _patched_transformer_config_from_args(mlm_args, *args_, **kwargs_):
+    if getattr(mlm_args, "cp_partition_mode", None) == "contiguous":
+        mlm_args.cp_partition_mode = "zigzag"
+    cp_size = getattr(mlm_args, "context_parallel_size", 1)
+    if isinstance(cp_size, int) and cp_size > 1:
+        mlm_args.context_parallel_size = 1
+    # Same class of problem one arg over: a run using --pipeline-model-parallel-layout
+    # does NOT get that layout into the saved CLI args (mlm_args.pipeline_model_parallel_layout
+    # is None); only decoder_first_pipeline_num_layers survives as a leftover. mcore then
+    # falls back to uniform splitting and raises e.g. for 43 layers / PP=8 / first=6:
+    # "number of layers at middle stage: 37 must be divisible by the middle pipeline
+    # model parallel size 7". load_megatron_model() flattens TP/PP/CP/EP to 1 immediately
+    # after this config is built (model_load_save.py:462-476), so neutralize the pipeline
+    # args here too. Safe: downstream, mlm_args is only read for padded_vocab_size /
+    # make_vocab_size_divisible_by in build_and_load_model().
+    pp_size = getattr(mlm_args, "pipeline_model_parallel_size", 1)
+    if isinstance(pp_size, int) and pp_size > 1:
+        mlm_args.pipeline_model_parallel_size = 1
+        mlm_args.transformer_pipeline_model_parallel_size = 1
+        mlm_args.decoder_first_pipeline_num_layers = None
+        mlm_args.decoder_last_pipeline_num_layers = None
+        mlm_args.pipeline_model_parallel_layout = None
+        mlm_args.virtual_pipeline_model_parallel_size = None
+        mlm_args.num_layers_per_virtual_pipeline_stage = None
+        mlm_args.num_virtual_stages_per_pipeline_rank = None
+    return _original_transformer_config_from_args(mlm_args, *args_, **kwargs_)
 
 
 def _checkpoint_has_mtp(input_dir):
@@ -269,19 +317,17 @@ def _checkpoint_has_mtp(input_dir):
     return any("mtp" in k.lower() for k in metadata.state_dict_metadata)
 
 
-def _export_checkpoint(bridge, input_dir, output_dir, strict):
+def _export_checkpoint(bridge, input_dir, output_dir, strict, *, weight_dtype=None):
     """Load torch-dist weights and explicitly merge any reconstructed LoRA on
     HF export."""
     from megatron.bridge.training.model_load_save import temporary_distributed_context
 
+    save_kwargs = {"strict": strict, "merge_adapter_weights": True}
+    if weight_dtype is not None:
+        save_kwargs["weight_dtype"] = weight_dtype
     with temporary_distributed_context(backend="gloo"):
         megatron_model = bridge.load_megatron_model(input_dir, wrap_with_ddp=False)
-        bridge.save_hf_pretrained(
-            megatron_model,
-            output_dir,
-            strict=strict,
-            merge_adapter_weights=True,
-        )
+        bridge.save_hf_pretrained(megatron_model, output_dir, **save_kwargs)
 
 
 if __name__ == "__main__":
@@ -305,6 +351,25 @@ if __name__ == "__main__":
         "--fp8",
         action="store_true",
         help="Quantize each exported HF tensor to FP8 before it is buffered for safetensors output.",
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Export plain bf16 weights (no quantization). When the origin is a quantized model "
+        "(fp8/MXFP4), the default export RE-quantizes the trained weights back to that scheme; "
+        "pass --bf16 to instead write dequantized bf16 (no .scale companions, ~570GB for DSv4-Flash) "
+        "and preserve full SFT precision. Routes through save_hf_pretrained(weight_dtype=torch.bfloat16), "
+        "which export_ckpt does not expose. Mutually exclusive with --fp8.",
+    )
+    parser.add_argument(
+        "--copy-config",
+        action="store_true",
+        help="Copy the origin --origin-hf-dir/config.json to the output verbatim instead of using the "
+        "bridge-regenerated config. Use this for architecture-preserving exports (plain SFT): the bridge "
+        "rewrites config in its own dialect (e.g. DSv4 `compress_rates`/`layer_types` instead of the native "
+        "`compress_ratios`) and the model's native deploy stack expects the original field names. With "
+        "--bf16 the copied config's quantization_config is dropped (weights are dequantized). Do NOT use "
+        "when the architecture changed (e.g. layer-reduced) or with --fp8 (custom quant recipe).",
     )
     parser.add_argument(
         "--fp8-strategy",
@@ -333,6 +398,14 @@ if __name__ == "__main__":
         help="Target FP8 safetensors shard size in MiB; one converted tensor group may exceed it (default: 4096).",
     )
     args = parser.parse_args()
+
+    if args.fp8 and args.bf16:
+        raise ValueError("--fp8 and --bf16 are mutually exclusive: pick one export precision.")
+    if args.copy_config and args.fp8:
+        raise ValueError(
+            "--copy-config and --fp8 are mutually exclusive: --fp8 quantizes with its own recipe, "
+            "so the origin config would misdescribe the exported weights."
+        )
 
     _initialize_bridge_patches()
     from megatron.bridge import AutoBridge
@@ -418,6 +491,7 @@ if __name__ == "__main__":
             args.input_dir,
             args.output_dir,
             strict=not allow_missing_mtp_keys,
+            weight_dtype=torch.bfloat16 if args.bf16 else None,
         )
     finally:
         if source is not None and original_save_generator is not None:
@@ -449,26 +523,93 @@ if __name__ == "__main__":
     import json
     import shutil
 
+    # Produce config.json.
+    #
+    # The bridge regenerates config from the (unquantized) Megatron provider in ITS OWN
+    # dialect: for DSv4 it emits `compress_rates` (dict) + `layer_types` instead of the
+    # native per-layer `compress_ratios` list, drops `num_hash_layers`, and omits
+    # `quantization_config`. The model's native deploy stack (e.g. DeepSeek's sglang
+    # script) indexes `compress_ratios[layer_id]`, so a bridge-dialect config fails with
+    # "compress_ratios not found".
+    #
+    # --copy-config: for an architecture-preserving export (plain SFT) the ORIGIN config
+    # already describes these weights exactly, so copy it verbatim — a clean, byte-for-byte
+    # native config whose quantization_config matches the re-quantized weights. With --bf16
+    # the weights are dequantized, so the copied config's quantization_config is removed.
+    #
+    # Default (no --copy-config): keep the bridge-regenerated config, make it
+    # transformers-4.x consumable, carry the quantization_config over when the weights are
+    # quantized, and restore native fields the bridge dropped (guarded by matching
+    # model_type + num_hidden_layers). Safe for arch-changed / custom exports.
     cfg_path = os.path.join(args.output_dir, "config.json")
+    origin_cfg_path = os.path.join(args.origin_hf_dir, "config.json")
     if os.path.isfile(cfg_path):
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        rope_params = cfg.get("rope_parameters")
-        if isinstance(rope_params, dict):
-            cfg.setdefault("rope_theta", rope_params.get("rope_theta"))
-            cfg.setdefault("rope_scaling", None)
-        if "dtype" in cfg and "torch_dtype" not in cfg:
-            cfg["torch_dtype"] = cfg["dtype"]
-        cfg["transformers_version"] = "4.51.0"
-        if fp8_writer is not None:
-            cfg["quantization_config"] = build_quantization_config(
-                args.fp8_strategy,
-                fp8_block_size,
-                fp8_writer.result.modules_to_not_convert,
+        if args.copy_config:
+            if not os.path.isfile(origin_cfg_path):
+                raise ValueError("--copy-config requires --origin-hf-dir to contain a config.json")
+            shutil.copyfile(origin_cfg_path, cfg_path)
+            note = f"[convert] --copy-config: copied origin config.json verbatim -> {cfg_path}"
+            if args.bf16:
+                with open(cfg_path) as f:
+                    c = json.load(f)
+                if c.pop("quantization_config", None) is not None:
+                    with open(cfg_path, "w") as f:
+                        json.dump(c, f, indent=2, ensure_ascii=False)
+                    note += " (removed quantization_config; --bf16 weights are dequantized)"
+            print(note)
+        else:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            origin_cfg = None
+            if os.path.isfile(origin_cfg_path):
+                with open(origin_cfg_path) as f:
+                    origin_cfg = json.load(f)
+            same_arch = origin_cfg is not None and (
+                origin_cfg.get("model_type") == cfg.get("model_type")
+                and origin_cfg.get("num_hidden_layers") == cfg.get("num_hidden_layers")
             )
-        with open(cfg_path, "w") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        print(f"[convert] post-processed {cfg_path} for transformers 4.x compatibility")
+            rope_params = cfg.get("rope_parameters")
+            if isinstance(rope_params, dict):
+                cfg.setdefault("rope_theta", rope_params.get("rope_theta"))
+                cfg.setdefault("rope_scaling", None)
+            if "dtype" in cfg and "torch_dtype" not in cfg:
+                cfg["torch_dtype"] = cfg["dtype"]
+            cfg["transformers_version"] = "4.51.0"
+            if fp8_writer is not None:
+                cfg["quantization_config"] = build_quantization_config(
+                    args.fp8_strategy,
+                    fp8_block_size,
+                    fp8_writer.result.modules_to_not_convert,
+                )
+            elif "quantization_config" not in cfg:
+                index_path = os.path.join(args.output_dir, "model.safetensors.index.json")
+                output_is_quantized = False
+                if os.path.isfile(index_path):
+                    with open(index_path) as f:
+                        weight_map = json.load(f).get("weight_map", {})
+                    output_is_quantized = any(
+                        k.endswith(".scale") or k.endswith("weight_scale_inv") for k in weight_map
+                    )
+                if output_is_quantized and origin_cfg is not None and origin_cfg.get("quantization_config"):
+                    cfg["quantization_config"] = origin_cfg["quantization_config"]
+                    print("[convert] carried quantization_config over from origin (quantized weights).")
+            if same_arch and origin_cfg is not None:
+                restored = [k for k in origin_cfg if k not in cfg]
+                for k in restored:
+                    cfg[k] = origin_cfg[k]
+                if restored:
+                    print(
+                        f"[convert] restored {len(restored)} native config field(s) dropped by the "
+                        f"bridge: {sorted(restored)}"
+                    )
+            if args.bf16:
+                cfg.pop("quantization_config", None)
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+            print(
+                f"[convert] post-processed {cfg_path} (bridge-config path; pass --copy-config for a "
+                "byte-identical native config)"
+            )
 
     for fname in ("tokenizer_config.json", "vocab.json", "merges.txt"):
         src = os.path.join(args.origin_hf_dir, fname)

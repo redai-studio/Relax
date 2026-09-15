@@ -100,7 +100,13 @@ from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
-from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
+from .cp_utils import (
+    all_gather_with_cp,
+    maybe_padded_total_lengths,
+    slice_with_cp,
+    warmup_pipeline_process_group,
+    warmup_static_cp_forward_neighbor_p2p,
+)
 from .data import (
     ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
@@ -471,6 +477,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.model,
                     convert_to_global_name=args.megatron_to_hf_mode == "raw",
                     translate_gpu_to_cpu=not self.args.enable_weights_backuper,
+                    include_persistent_buffers=args.megatron_to_hf_mode == "bridge",
                 ),
                 single_tag=None if args.enable_weights_backuper else "actor",
             )
@@ -718,6 +725,29 @@ class MegatronTrainRayActor(TrainRayActor):
 
         clear_memory()
         reload_process_groups(timeout_minutes=self.args.distributed_timeout_minutes)
+        if Envs.RELAX_DEBUG_DSV4_PP_GROUP_WARMUP:
+            if getattr(self.hf_config, "model_type", None) != "deepseek_v4":
+                raise RuntimeError("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP is only supported for DeepSeek-V4")
+
+            from megatron.core.utils import get_model_config
+
+            config = get_model_config(self.model[0])
+            if mpu.get_pipeline_model_parallel_world_size() <= 2:
+                raise RuntimeError("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP requires pipeline parallel size > 2")
+            if not config.variable_seq_lengths or not config.batch_p2p_comm:
+                raise RuntimeError(
+                    "RELAX_DEBUG_DSV4_PP_GROUP_WARMUP requires variable sequence lengths and batched P2P"
+                )
+            # The first NCCL batch_isend_irecv on a process group requires
+            # every group rank to participate. Variable-shape PP exchanges
+            # otherwise let only the first adjacent stages enter that call.
+            warmup_pipeline_process_group()
+        if Envs.RELAX_DEBUG_DSV4_CP_P2P_WARMUP:
+            if getattr(self.hf_config, "model_type", None) != "deepseek_v4":
+                raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP is only supported for DeepSeek-V4")
+            if getattr(self.args, "dynamic_context_parallel", False):
+                raise RuntimeError("RELAX_DEBUG_DSV4_CP_P2P_WARMUP only supports static context parallelism")
+            warmup_static_cp_forward_neighbor_p2p()
         print_memory("after wake_up model")
 
     def _switch_model(self, target_tag: str) -> None:
@@ -786,8 +816,10 @@ class MegatronTrainRayActor(TrainRayActor):
             # matches the bridge; the per-CP-rank stream is then tp-divisible, so no global pad (the
             # bridge adds none either).
             #
-            # Otherwise (non-VL) the forward uses get_batch's per-sample slice_with_cp (2*cp align)
-            # + global tp*data_pad_size_multiplier pad, so mirror that here.
+            # For non-VL allgather CP, get_batch concatenates the global stream first, pads it to
+            # cp*tp*data_pad_size_multiplier, then takes one contiguous chunk per CP rank.  Otherwise
+            # the forward uses get_batch's per-sample slice_with_cp (2*cp align) + global
+            # tp*data_pad_size_multiplier pad, so mirror the corresponding layout here.
             padded_total_lengths = maybe_padded_total_lengths(
                 [t.shape[0] for t in tokens], self.args.qkv_format, getattr(self.args, "is_vl_model", False)
             )
@@ -795,16 +827,27 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_routed_experts = [
                     pad_func(r, padded_total_lengths[i] - r.shape[0]) for i, r in enumerate(rollout_routed_experts)
                 ]
+                rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
             else:
                 # Pad each sample by 1 (the last, non-loss token) so it matches the token length.
                 rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
-            rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            if padded_total_lengths is None:
                 pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-                pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-                if pad != 0:
-                    rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+                cp_size = mpu.get_context_parallel_world_size()
+                if self.args.allgather_cp and cp_size > 1:
+                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                    global_pad_size = cp_size * pad_size
+                    pad = (global_pad_size - rollout_routed_experts.size(0) % global_pad_size) % global_pad_size
+                    if pad != 0:
+                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+                    cp_rank = mpu.get_context_parallel_rank()
+                    rollout_routed_experts = rollout_routed_experts.chunk(cp_size, dim=0)[cp_rank]
+                else:
+                    rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                    rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                    pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+                    if pad != 0:
+                        rollout_routed_experts = pad_func(rollout_routed_experts, pad)
 
             if self.args.sequence_parallel:
                 seqlen = rollout_routed_experts.size(0)
@@ -837,6 +880,190 @@ class MegatronTrainRayActor(TrainRayActor):
 
         for iterator in data_iterator:
             iterator.reset()
+
+    def fill_indexer_replay(self, data_iterator, num_microbatches, rollout_data):
+        """Pack SGLang's logical C4 IDs into Megatron's local CP/PP layout."""
+        from relax.utils.training.indexer_replay import IndexerReplay
+
+        if "rollout_indexer_topk" not in rollout_data:
+            raise ValueError(
+                "rollout_indexer_topk is required in rollout_data when use_rollout_indexer_replay is set."
+            )
+
+        from megatron.core.transformer.transformer_block import get_num_layers_to_build
+        from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+        for iterator in data_iterator:
+            iterator.reset()
+
+        layer_to_ordinal: dict[int, int] = {}
+        local_layer_numbers: list[int] = []
+        indexer_topk = None
+        for vp_stage, model in enumerate(self.model):
+            config = model.module.config
+            ratios_value = getattr(config, "csa_compress_ratios", None)
+            if ratios_value is None or not hasattr(config, "dsa_indexer_topk"):
+                raise RuntimeError("Rollout indexer replay requires a DeepSeek-V4 hybrid Megatron model")
+            indexer_loss_coeff = getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
+            if indexer_loss_coeff != 0.0:
+                raise RuntimeError(
+                    "Rollout indexer replay requires dsa_indexer_loss_coeff=0, "
+                    f"got {indexer_loss_coeff} from the Megatron model config"
+                )
+            ratios = list(ratios_value)
+            if len(ratios) < config.num_layers:
+                raise RuntimeError(
+                    f"DSV4 csa_compress_ratios has {len(ratios)} entries for {config.num_layers} layers"
+                )
+            c4_ordinal = 0
+            for layer_id, ratio in enumerate(ratios[: config.num_layers]):
+                if ratio == 4:
+                    layer_to_ordinal[layer_id] = c4_ordinal
+                    c4_ordinal += 1
+
+            model_topk = int(config.dsa_indexer_topk)
+            if indexer_topk is not None and indexer_topk != model_topk:
+                raise RuntimeError(f"Inconsistent DSV4 indexer top-k widths: {indexer_topk} vs {model_topk}")
+            indexer_topk = model_topk
+
+            num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
+            offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+            local_layer_numbers.extend(
+                layer_id + 1
+                for layer_id in range(offset, offset + num_layers_to_build)
+                if layer_id in layer_to_ordinal
+            )
+
+        if indexer_topk is None:
+            raise RuntimeError("No Megatron model config was available for DSV4 indexer replay")
+        if not layer_to_ordinal:
+            raise RuntimeError("The Megatron model has no DeepSeek-V4 C4 indexer layers to replay")
+        if len(local_layer_numbers) != len(set(local_layer_numbers)):
+            raise RuntimeError(f"Duplicate local DSV4 indexer replay layers: {local_layer_numbers}")
+        local_ordinals = [layer_to_ordinal[layer_number - 1] for layer_number in local_layer_numbers]
+        IndexerReplay.begin_step(local_layer_numbers)
+        for model in self.model:
+            model.module.config.relax_use_indexer_replay = True
+
+        def pad_rows(tensor: torch.Tensor, count: int, value: int | bool) -> torch.Tensor:
+            if count == 0:
+                return tensor
+            padding = torch.full(
+                (count, *tensor.shape[1:]),
+                value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            return torch.cat((tensor, padding), dim=0)
+
+        try:
+            for _ in range(sum(num_microbatches)):
+                batch = data_iterator[0].get_next(["rollout_indexer_topk", "tokens"])
+                flat_indexer_topk = batch["rollout_indexer_topk"]
+                tokens = batch["tokens"]
+                if flat_indexer_topk is None or tokens is None:
+                    raise RuntimeError("Missing indexer replay or tokens in a replay microbatch")
+                if len(flat_indexer_topk) != len(tokens):
+                    raise RuntimeError(
+                        f"Indexer replay sample count {len(flat_indexer_topk)} != token sample count {len(tokens)}"
+                    )
+
+                per_sample_topk = []
+                per_sample_valid = []
+                for flat, sample_tokens in zip(flat_indexer_topk, tokens, strict=False):
+                    if flat.dtype != torch.int32:
+                        raise RuntimeError(f"SGLang indexer replay must use int32, got {flat.dtype}")
+                    if flat.ndim != 2 or flat.shape[0] != sample_tokens.shape[0] - 1:
+                        raise RuntimeError(
+                            "SGLang indexer replay rows must equal token rows minus one, "
+                            f"got replay={tuple(flat.shape)}, tokens={tuple(sample_tokens.shape)}"
+                        )
+                    if flat.shape[1] % indexer_topk != 0:
+                        raise RuntimeError(
+                            f"SGLang indexer replay width {flat.shape[1]} is not divisible by top-k {indexer_topk}"
+                        )
+                    num_slots = flat.shape[1] // indexer_topk
+                    if num_slots != len(layer_to_ordinal):
+                        raise RuntimeError(
+                            f"SGLang returned {num_slots} C4 slots but Megatron expects {len(layer_to_ordinal)}"
+                        )
+                    reshaped = flat.reshape(flat.shape[0], num_slots, indexer_topk)
+                    per_sample_topk.append(reshaped[:, local_ordinals, :])
+                    per_sample_valid.append(torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device))
+
+                padded_total_lengths = maybe_padded_total_lengths(
+                    [t.shape[0] for t in tokens],
+                    self.args.qkv_format,
+                    getattr(self.args, "is_vl_model", False),
+                )
+                if padded_total_lengths is not None:
+                    per_sample_topk = [
+                        pad_rows(replay, padded_total_lengths[i] - replay.shape[0], -1)
+                        for i, replay in enumerate(per_sample_topk)
+                    ]
+                    per_sample_valid = [
+                        pad_rows(valid, padded_total_lengths[i] - valid.shape[0], False)
+                        for i, valid in enumerate(per_sample_valid)
+                    ]
+                    packed_topk = torch.cat(
+                        [
+                            slice_with_cp(replay, lambda value, count: pad_rows(value, count, -1))
+                            for replay in per_sample_topk
+                        ],
+                        dim=0,
+                    )
+                    packed_valid = torch.cat(
+                        [
+                            slice_with_cp(valid, lambda value, count: pad_rows(value, count, False))
+                            for valid in per_sample_valid
+                        ],
+                        dim=0,
+                    )
+                else:
+                    per_sample_topk = [pad_rows(replay, 1, -1) for replay in per_sample_topk]
+                    per_sample_valid = [pad_rows(valid, 1, False) for valid in per_sample_valid]
+                    pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+                    cp_size = mpu.get_context_parallel_world_size()
+                    if self.args.allgather_cp and cp_size > 1:
+                        packed_topk = torch.cat(per_sample_topk, dim=0)
+                        packed_valid = torch.cat(per_sample_valid, dim=0)
+                        global_pad_size = cp_size * pad_size
+                        pad = (global_pad_size - packed_topk.shape[0] % global_pad_size) % global_pad_size
+                        packed_topk = pad_rows(packed_topk, pad, -1)
+                        packed_valid = pad_rows(packed_valid, pad, False)
+                        cp_rank = mpu.get_context_parallel_rank()
+                        packed_topk = packed_topk.chunk(cp_size, dim=0)[cp_rank]
+                        packed_valid = packed_valid.chunk(cp_size, dim=0)[cp_rank]
+                    else:
+                        packed_topk = torch.cat(
+                            [
+                                slice_with_cp(replay, lambda value, count: pad_rows(value, count, -1))
+                                for replay in per_sample_topk
+                            ],
+                            dim=0,
+                        )
+                        packed_valid = torch.cat(
+                            [
+                                slice_with_cp(valid, lambda value, count: pad_rows(value, count, False))
+                                for valid in per_sample_valid
+                            ],
+                            dim=0,
+                        )
+                        pad = (pad_size - packed_topk.shape[0] % pad_size) % pad_size
+                        packed_topk = pad_rows(packed_topk, pad, -1)
+                        packed_valid = pad_rows(packed_valid, pad, False)
+
+                local_topk = packed_topk.contiguous()
+                for column, layer_number in enumerate(local_layer_numbers):
+                    IndexerReplay.record(layer_number, local_topk[:, column, :], packed_valid)
+        except Exception:
+            IndexerReplay.clear()
+            raise
+        finally:
+            for iterator in data_iterator:
+                iterator.reset()
+
+        del rollout_data["rollout_indexer_topk"]
 
     def compute_log_prob(
         self,
@@ -1071,6 +1298,9 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"got {len(rollout_mini_batches)}."
                     )
                 rollout_data = concat_rollout_batches(rollout_mini_batches)
+                if getattr(self.args, "use_rollout_indexer_replay", False):
+                    for mini_batch in rollout_mini_batches:
+                        mini_batch.pop("rollout_indexer_topk", None)
                 rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = rollout_mini_local_sample_counts
                 rollout_data[ROLLOUT_MINI_BATCH_METAS_KEY] = rollout_mini_batch_metas
                 if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
@@ -1558,6 +1788,10 @@ class MegatronTrainRayActor(TrainRayActor):
         prepared_data_iterator: list[_SFTPrepackedDeviceIterator] | None = None,
         prepared_num_microbatches: list[int] | None = None,
     ) -> None:
+        use_indexer_replay = getattr(self.args, "use_rollout_indexer_replay", False)
+        if use_indexer_replay:
+            from relax.utils.training.indexer_replay import IndexerReplay
+
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
@@ -1595,6 +1829,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
+        if use_indexer_replay:
+            self.fill_indexer_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
             # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
@@ -1610,6 +1846,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("fallthrough")
                     self._switch_model("ref")
                     rollout_data.update(
                         self.compute_log_prob(
@@ -1623,6 +1861,8 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "teacher" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("fallthrough")
                     self._switch_model("teacher")
                     rollout_data.update(
                         self.compute_log_prob(
@@ -1640,6 +1880,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
+                    if use_indexer_replay:
+                        IndexerReplay.set_stage("replay_forward")
                     rollout_data.update(
                         self.compute_log_prob(
                             data_iterator,
@@ -1650,6 +1892,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
+                    if use_indexer_replay:
+                        IndexerReplay.reset_forward()
 
                 # Restore model tag before train (keep_old_actor may have switched to old_actor).
                 if self._active_model_tag != "actor":
@@ -1675,6 +1919,8 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            if use_indexer_replay:
+                IndexerReplay.set_stage("replay_backward")
             with timer("actor_train"):
                 try:
                     train(
@@ -1699,6 +1945,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.use_routing_replay:
             RoutingReplay.clear_all()
+        if use_indexer_replay:
+            IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
         # update the cpu actor weight to the latest model
         if hasattr(self, "weights_backuper"):
@@ -3071,10 +3319,12 @@ class MegatronTrainRayActor(TrainRayActor):
         # rank-0 pickle + one TP/PP broadcast.  Cross-rank consistency relies
         # on every model-parallel rank presenting the same logical
         # ``dp_rank``/``batch_index`` to the TQ sampler, so sampler replay
-        # returns byte-identical sample ids regardless of PP/TP world size. The only
-        # remaining incompatibility is ``rollout_routed_experts`` — it relies on
-        # the NestedTensor jagged bcast path that this mode bypasses.
+        # returns byte-identical sample ids regardless of PP/TP world size.
+        # replay tensors rely on the NestedTensor jagged broadcast path
+        # that per-rank fetch bypasses.
         per_rank_fetch = self.args.per_rank_fetch and "rollout_routed_experts" not in data_fields
+        if getattr(self.args, "use_rollout_indexer_replay", False):
+            per_rank_fetch = per_rank_fetch and "rollout_indexer_topk" not in data_fields
         prefetched_rollout_data = None
         prefetched_fetch_time_s = None
         if prefetched_fetch is not None:

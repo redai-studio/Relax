@@ -2050,6 +2050,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
             parser.add_argument(
+                "--use-rollout-indexer-replay",
+                action="store_true",
+                default=False,
+                help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -3870,6 +3876,57 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
+    if getattr(args, "use_rollout_indexer_replay", False):
+        unsupported = []
+        if is_sft:
+            unsupported.append("SFT")
+        if args.train_backend != "megatron":
+            unsupported.append(f"train_backend={args.train_backend}")
+        if getattr(args, "multimodal_keys", None) is not None:
+            unsupported.append("multimodal model")
+        if not args.colocate:
+            unsupported.append("non-colocated deployment")
+        if args.partial_rollout:
+            unsupported.append("partial rollout")
+        if args.fully_async or args.hybrid:
+            unsupported.append("fully-async/hybrid")
+        if args.use_slime_router:
+            unsupported.append("slime router")
+        if args.use_agentic_rollout:
+            unsupported.append("agentic rollout")
+        if args.rollout_function_path != "relax.engine.rollout.sglang_rollout.generate_rollout":
+            unsupported.append(f"custom rollout_function_path={args.rollout_function_path}")
+        if args.custom_generate_function_path is not None:
+            unsupported.append(f"custom generate_function_path={args.custom_generate_function_path}")
+        if args.qkv_format != "thd":
+            unsupported.append(f"qkv_format={args.qkv_format}")
+        if args.context_parallel_size <= 1:
+            unsupported.append(f"context_parallel_size={args.context_parallel_size}")
+        if not args.allgather_cp or args.cp_partition_mode != "contiguous":
+            unsupported.append("non-contiguous/non-allgather CP")
+        if args.tensor_model_parallel_size != 1 or args.sequence_parallel:
+            unsupported.append("TP>1/sequence parallel")
+        if args.dynamic_context_parallel:
+            unsupported.append("dynamic CP")
+        if args.enable_mtp_training or args.sglang_speculative_algorithm:
+            unsupported.append("MTP/speculative decoding")
+        if not args.sglang_enable_dp_attention:
+            unsupported.append("SGLang attention TP>1")
+        if getattr(args, "sglang_enable_hierarchical_cache", False):
+            unsupported.append("SGLang hierarchical cache")
+        if args.dsa_indexer_loss_coeff not in (None, 0, 0.0):
+            unsupported.append(f"dsa_indexer_loss_coeff={args.dsa_indexer_loss_coeff}")
+        if args.recompute_granularity == "full" and args.recompute_method != "uniform":
+            unsupported.append(f"full recompute_method={args.recompute_method}")
+        if getattr(args, "overlap_moe_expert_parallel_comm", False):
+            unsupported.append("combined-1f1b")
+        if unsupported:
+            raise ValueError(
+                "--use-rollout-indexer-replay currently supports only colocated Megatron DeepSeek-V4 "
+                "THD with static contiguous allgather CP, TP1, SGLang DP attention, no MTP, and zero "
+                f"indexer teacher-loss coefficient; unsupported settings: {', '.join(unsupported)}."
+            )
+
     validate_reward_side_kl(args, is_sft)
 
     if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
@@ -4029,6 +4086,19 @@ def slime_validate_args(args):
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+        data_pad_size_multiplier = getattr(args, "data_pad_size_multiplier", 128)
+        assert data_pad_size_multiplier > 0, "--data-pad-size-multiplier must be positive."
+        tp_size = getattr(args, "tensor_model_parallel_size", 1)
+        local_pad_size = tp_size * data_pad_size_multiplier
+        for name in ("max_tokens_per_gpu", "log_probs_max_tokens_per_gpu"):
+            token_budget = getattr(args, name)
+            assert token_budget > 0, f"--{name.replace('_', '-')} must be positive."
+            assert token_budget % local_pad_size == 0, (
+                f"--{name.replace('_', '-')} ({token_budget}) must be divisible by tensor_model_parallel_size * "
+                f"--data-pad-size-multiplier ({tp_size} * {data_pad_size_multiplier} = {local_pad_size}) so data "
+                "padding does not exceed the configured per-GPU token budget."
+            )
 
         # The token-budget sampler always emits at least one sample per micro-batch,
         # even if that single sample exceeds the budget (otherwise the stream stalls).

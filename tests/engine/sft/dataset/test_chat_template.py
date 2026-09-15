@@ -4,6 +4,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 from relax.engine.sft.dataset.chat_template import (
@@ -11,6 +12,11 @@ from relax.engine.sft.dataset.chat_template import (
     _to_chat_messages,
     render_to_text,
     render_with_loss_mask,
+)
+from relax.engine.sft.dataset.deepseek_chat_template_patch import (
+    _DS_ASSISTANT_NON_TRANSITION_SCAFFOLD,
+    _DS_ASSISTANT_SCAFFOLD,
+    _DS_HISTORY_GATE,
 )
 from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
@@ -331,6 +337,201 @@ def test_fallback_assistant_tool_calls_are_inlined_into_loss():
     assert "ok" not in learned
 
 
+# --- DeepSeek-V4 dialect ---------------------------------------------------
+
+# Minimal executable DeepSeek template retaining the exact two scaffold anchors
+# and history gate consumed by the production patcher.
+_DS_TEMPLATE = "\n".join(
+    (
+        "{%- set thinking = thinking | default(false) -%}",
+        "{%- set thinking_start_token = '<think>' -%}",
+        "{%- set thinking_end_token = '</think>' -%}",
+        "{%- set last_user_idx = namespace(value=-1) -%}",
+        "{%- for message in messages -%}",
+        "  {%- if message['role'] in ['user', 'developer', 'tool'] -%}",
+        "    {%- set last_user_idx.value = loop.index0 -%}",
+        "  {%- endif -%}",
+        "{%- endfor -%}",
+        "{{- '<｜begin▁of▁sentence｜>' -}}",
+        "{%- for message in messages -%}",
+        "  {%- if message['role'] == 'assistant' -%}",
+        "    {%- set tp = namespace(has=false) -%}",
+        _DS_HISTORY_GATE,
+        "    {%- if loop.first or messages[loop.index0 - 1]['role'] != 'assistant' -%}",
+        "      {{- '<｜Assistant｜>' -}}",
+        _DS_ASSISTANT_SCAFFOLD,
+        "    {%- else -%}",
+        _DS_ASSISTANT_NON_TRANSITION_SCAFFOLD,
+        "    {%- endif -%}",
+        "    {{- message['content'] -}}",
+        "    {%- for tool_call in message.get('tool_calls', []) -%}",
+        "      {{- '<｜DSML｜tool_calls>[' + tool_call['function']['name'] + ']</｜DSML｜tool_calls>' -}}",
+        "    {%- endfor -%}",
+        "    {{- '<｜end▁of▁sentence｜>' -}}",
+        "  {%- elif message['role'] == 'tool' -%}",
+        "    {{- '<tool_result>' + message['content'] + '</tool_result>' -}}",
+        "  {%- elif message['role'] == 'system' -%}",
+        "    {{- '[sys]' + message['content'] -}}",
+        "  {%- else -%}",
+        "    {{- '<｜User｜>' + message['content'] -}}",
+        "  {%- endif -%}",
+        "{%- endfor -%}",
+    )
+)
+
+
+class _FakeDeepSeekTokenizer(_FakeFastTokenizerNoGenerationMarker):
+    """Execute the patched Jinja; tokenize characters with exact offsets."""
+
+    chat_template = _DS_TEMPLATE
+
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, chat_template=None, **kwargs):  # noqa: ARG002
+        from jinja2 import Environment
+
+        text = Environment().from_string(chat_template or self.chat_template).render(messages=messages, **kwargs)
+        return self._tokenize(text)[0] if tokenize else text
+
+
+def _ds_sample(solution: str, learn: bool = True) -> CanonicalSample:
+    return CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="Q", learn=False),
+            CanonicalMessage(role="assistant", content=solution, learn=learn),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+
+
+def test_deepseek_dialect_masks_assistant_including_think_and_eos():
+    tok = _FakeDeepSeekTokenizer()
+    input_ids, loss_mask = render_with_loss_mask(_ds_sample("<think>\nR\n</think>\n\nA"), tokenizer=tok)
+    full = _learned_text(input_ids, torch.ones_like(loss_mask))
+    learned = _learned_text(input_ids, loss_mask)
+    # Per-message patch renders one reasoning block without an extra plain scaffold.
+    assert full.count("</think>") == 1
+    # The opening scaffold is context; reasoning, closing tag, answer and EOS are learned.
+    assert learned == "R\n</think>\n\nA<｜end▁of▁sentence｜>"
+    # Prefix / user are excluded.
+    assert "Q" not in learned and "<｜User｜>" not in learned
+    assert "<｜Assistant｜>" not in learned
+
+
+def test_deepseek_dialect_eos_is_inclusive():
+    tok = _FakeDeepSeekTokenizer()
+    input_ids, loss_mask = render_with_loss_mask(_ds_sample("<think>\nR\n</think>\nA"), tokenizer=tok)
+    learned = _learned_text(input_ids, loss_mask)
+    assert learned.endswith("<｜end▁of▁sentence｜>")
+
+
+def test_deepseek_plain_answer_keeps_native_scaffold():
+    tok = _FakeDeepSeekTokenizer()
+    # Content without an embedded think block: auto policy keeps the scaffold
+    # `</think>` as context, outside the loss.
+    input_ids, loss_mask = render_with_loss_mask(_ds_sample("4"), tokenizer=tok)
+    full = _learned_text(input_ids, torch.ones_like(loss_mask))
+    learned = _learned_text(input_ids, loss_mask)
+    assert "<｜Assistant｜></think>" in full
+    assert learned == "4<｜end▁of▁sentence｜>"
+
+
+class _FakeDeepSeekAgentTokenizer:
+    """Fake DeepSeek-V4 tokenizer for multi-turn + system + tool_calls + tool-
+    return agent sessions.
+
+    Mirrors the jinja structure: system is folded (no turn marker), a tool
+    result merges into the user block via `<tool_result>` (no own `<｜User｜>`
+    when already in a user run), and an assistant turn is
+    `<｜Assistant｜>{content + tool_calls}<｜end▁of▁sentence｜>`. Char-by-char
+    tokenize.
+    """
+
+    chat_template = "<｜User｜> <｜Assistant｜> <｜end▁of▁sentence｜>"  # DS markers, no {% generation %}
+
+    @staticmethod
+    def _render(messages, **kwargs):  # noqa: ARG004
+        out = ""
+        in_user = False
+        for m in messages:
+            role = m["role"]
+            content = m.get("content") or ""
+            if role == "system":
+                out += "[sys]" + content  # folded prefix, no turn marker
+            elif role == "user":
+                out += "\n\n" if in_user else "<｜User｜>"
+                in_user = True
+                out += content
+            elif role == "tool":
+                out += "\n\n" if in_user else "<｜User｜>"
+                in_user = True
+                out += "<tool_result>" + content + "</tool_result>"
+            elif role == "assistant":
+                in_user = False
+                out += "<｜Assistant｜>" + content
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", tc)
+                    out += "\n\n<｜DSML｜tool_calls>[" + fn["name"] + "]</｜DSML｜tool_calls>"
+                out += "<｜end▁of▁sentence｜>"
+        return out
+
+    @staticmethod
+    def _tokenize(text):
+        return [ord(c) for c in text], [(i, i + 1) for i in range(len(text))]
+
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, chat_template=None, **kwargs):  # noqa: ARG002
+        text = self._render(messages)
+        if not tokenize:
+            return text
+        return self._tokenize(text)[0]
+
+    def __call__(self, text, *, add_special_tokens=False, return_offsets_mapping=False, **kwargs):  # noqa: ARG002
+        ids, offsets = self._tokenize(text)
+        result = {"input_ids": ids}
+        if return_offsets_mapping:
+            result["offset_mapping"] = offsets
+        return result
+
+
+def test_deepseek_dialect_multiturn_system_tool_session():
+    """Multi-turn agent session: every assistant turn (think + content +
+    tool_calls + EOS) is learned; system / user / tool-return are excluded.
+
+    Regression for the old dialect that mis-advanced the cursor on tool turns
+    and crashed.
+    """
+    tok = _FakeDeepSeekAgentTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="system", content="SYS", learn=False),
+            CanonicalMessage(role="user", content="U1", learn=False),
+            CanonicalMessage(
+                role="assistant",
+                content="<think>R1</think>A1",
+                learn=True,
+                tool_calls=[{"type": "function", "function": {"name": "FN1"}}],
+            ),
+            CanonicalMessage(role="tool", content="TOOLRET", learn=False),
+            CanonicalMessage(role="assistant", content="<think>R2</think>A2", learn=True),
+        ],
+        metadata={"source_dataset": "x", "row_index": 0},
+    )
+    # Disable scaffold suppression: this fake renders no scaffold, and the assistant
+    # content already carries its own think block.
+    input_ids, loss_mask = render_with_loss_mask(
+        sample, tokenizer=tok, apply_chat_template_kwargs={"deepseek_suppress_scaffold_think": False}
+    )
+    learned = _learned_text(input_ids, loss_mask)
+    # Both assistant turns learn reasoning + content + tool_calls + EOS, excluding opening scaffolds.
+    assert "R1</think>A1" in learned
+    assert "<think>" not in learned
+    assert "FN1" in learned and "<｜DSML｜tool_calls>" in learned
+    assert "R2</think>A2" in learned
+    assert learned.count("<｜end▁of▁sentence｜>") == 2
+    # Non-assistant turns excluded, and prompt markers not learned.
+    assert "SYS" not in learned and "U1" not in learned
+    assert "TOOLRET" not in learned and "<tool_result>" not in learned
+    assert "<｜User｜>" not in learned and "<｜Assistant｜>" not in learned
+
+
 def test_non_thinking_prefix_matches_ms_swift_last_round_behavior():
     tok = _FakeQwenStyleTokenizer()
     sample = CanonicalSample(
@@ -366,3 +567,124 @@ def test_non_thinking_prefix_matches_ms_swift_last_round_behavior():
         last_turn_only=True,
     )
     assert rendered_text == rendered
+
+
+def test_deepseek_last_round_keeps_tool_call_and_answer_with_consistent_text():
+    tok = _FakeDeepSeekTokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="system", content="SYS", learn=False),
+            CanonicalMessage(role="user", content="OLD_QUERY", learn=False),
+            CanonicalMessage(role="assistant", content="<think>OLD_REASON</think>OLD_ANSWER", learn=True),
+            CanonicalMessage(role="user", content="NEW_QUERY", learn=False),
+            CanonicalMessage(
+                role="assistant",
+                content="<think>TOOL_REASON</think>CALL",
+                learn=True,
+                tool_calls=[{"type": "function", "function": {"name": "LOOKUP"}}],
+            ),
+            CanonicalMessage(role="tool", content="TOOL_RESULT", learn=False),
+            CanonicalMessage(role="assistant", content="<think>FINAL_REASON</think>FINAL_ANSWER", learn=True),
+        ],
+        metadata={"source_dataset": "unit-test", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok, last_turn_only=True)
+    rendered = "".join(chr(token) for token in input_ids.tolist())
+    learned = _learned_text(input_ids, loss_mask)
+
+    assert render_to_text(sample, tokenizer=tok, last_turn_only=True) == rendered
+    assert rendered.count("<think>") == 3
+    assert rendered.count("</think>") == 3
+    assert "TOOL_REASON</think>CALL" in learned
+    assert "<｜DSML｜tool_calls>[LOOKUP]</｜DSML｜tool_calls>" in learned
+    assert "FINAL_REASON</think>FINAL_ANSWER" in learned
+    assert learned.count("<｜end▁of▁sentence｜>") == 2
+    for excluded in ("SYS", "OLD_QUERY", "OLD_REASON", "OLD_ANSWER", "NEW_QUERY", "TOOL_RESULT", "<think>"):
+        assert excluded not in learned
+    assert sample.messages[4].content == "<think>TOOL_REASON</think>CALL"
+    assert sample.messages[4].reasoning_content is None
+
+
+_GEMMA4_TEMPLATE = "\n".join(
+    (
+        "{%- macro strip_thinking(content) -%}{{- content -}}{%- endmacro -%}",
+        "{%- for message in messages -%}",
+        "  {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}",
+        "  {{- '<|turn>' + role + '\\n' -}}",
+        "  {%- if message['role'] == 'assistant' -%}",
+        "    {%- set thinking_text = message.get('reasoning_content', '') -%}",
+        "    {%- if thinking_text -%}",
+        "      {{- '<|channel>thought\\n' + thinking_text + '<channel|>' -}}",
+        "    {%- endif -%}",
+        "    {{- strip_thinking(message['content']) -}}",
+        "  {%- else -%}",
+        "    {{- message['content'] -}}",
+        "  {%- endif -%}",
+        "  {{- '<turn|>\\n' -}}",
+        "{%- endfor -%}",
+    )
+)
+
+
+class _FakeGemma4Tokenizer(_FakeDeepSeekTokenizer):
+    chat_template = _GEMMA4_TEMPLATE
+
+
+@pytest.mark.parametrize("thinking_mode", [False, True])
+@pytest.mark.parametrize("reasoning", [None, "REASON"])
+def test_gemma4_fallback_preserves_each_thinking_mode(monkeypatch, thinking_mode, reasoning):
+    monkeypatch.setenv("GEMMA4_SFT_THINKING", "1" if thinking_mode else "0")
+    tok = _FakeGemma4Tokenizer()
+    sample = CanonicalSample(
+        messages=[
+            CanonicalMessage(role="user", content="QUERY", learn=False),
+            CanonicalMessage(role="assistant", content="ANSWER", reasoning_content=reasoning, learn=True),
+        ],
+        metadata={"source_dataset": "unit-test", "row_index": 0},
+    )
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok)
+    rendered = "".join(chr(token) for token in input_ids.tolist())
+    learned = _learned_text(input_ids, loss_mask)
+    thought = "<|channel>thought\n" + (reasoning or "") + "<channel|>"
+    expected = "ANSWER<turn|>\n"
+    if thinking_mode:
+        expected = thought + expected
+    assert learned == expected
+    assert (thought in rendered) == (thinking_mode or reasoning is not None)
+    assert render_to_text(sample, tokenizer=tok) == rendered
+    assert "QUERY" not in learned
+
+
+def test_deepseek_generation_path_normalizes_embedded_reasoning():
+    tokenizer = _mock_tokenizer_with_generation_marker(_DS_TEMPLATE + "{% generation %}assistant{% endgeneration %}")
+    sample = _ds_sample("<think>REASON</think>ANSWER")
+    render_with_loss_mask(sample, tokenizer=tokenizer, last_turn_only=True)
+    messages = tokenizer.apply_chat_template.call_args.args[0]
+    assert messages[1] == {"role": "assistant", "content": "ANSWER", "reasoning_content": "REASON"}
+    assert sample.messages[1].content == "<think>REASON</think>ANSWER"
+    assert sample.messages[1].reasoning_content is None
+
+
+def test_deepseek_non_thinking_prefix_does_not_duplicate_normalized_reasoning():
+    tokenizer = _FakeDeepSeekTokenizer()
+    sample = _ds_sample("<think>REASON</think>ANSWER")
+    template_kwargs = {"add_non_thinking_prefix": True}
+    input_ids, loss_mask = render_with_loss_mask(
+        sample, tokenizer=tokenizer, apply_chat_template_kwargs=template_kwargs
+    )
+    rendered = "".join(chr(token) for token in input_ids.tolist())
+    assert rendered.count("<think>") == 1
+    assert rendered.count("</think>") == 1
+    assert _learned_text(input_ids, loss_mask) == "REASON</think>ANSWER<｜end▁of▁sentence｜>"
+    assert render_to_text(sample, tokenizer=tokenizer, apply_chat_template_kwargs=template_kwargs) == rendered
+
+
+def test_deepseek_embedded_reasoning_does_not_gain_non_thinking_prefix():
+    tok = _FakeDeepSeekTokenizer()
+    sample = _ds_sample("<think>REASON</think>ANSWER")
+    kwargs = {"add_non_thinking_prefix": True}
+    input_ids, loss_mask = render_with_loss_mask(sample, tokenizer=tok, apply_chat_template_kwargs=kwargs)
+    rendered = "".join(chr(token) for token in input_ids.tolist())
+    assert rendered.count("<think>") == rendered.count("</think>") == 1
+    assert _learned_text(input_ids, loss_mask) == "REASON</think>ANSWER<｜end▁of▁sentence｜>"
+    assert render_to_text(sample, tokenizer=tok, apply_chat_template_kwargs=kwargs) == rendered
