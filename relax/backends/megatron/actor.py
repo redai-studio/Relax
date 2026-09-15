@@ -2742,6 +2742,10 @@ class MegatronTrainRayActor(TrainRayActor):
         elif self.args.offload_train:
             destroy_process_groups()
 
+        if self.args.offload_rollout:
+            # Wait for every trainer to release update buffers before restoring KV/GenRM.
+            dist.barrier(group=get_gloo_group())
+
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
