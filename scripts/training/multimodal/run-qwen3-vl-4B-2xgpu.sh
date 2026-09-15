@@ -96,9 +96,6 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --clip-grad 1.0
-   --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
-   --use-precision-aware-optimizer
    --no-rope-fusion
 )
 
