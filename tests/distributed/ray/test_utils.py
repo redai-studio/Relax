@@ -355,15 +355,15 @@ class TestRolloutServerProperties:
     @pytest.mark.parametrize(
         ("lifecycle_status", "expected_calls"),
         [
-            (EngineGroupLifecycle.ACTIVE, 1),
-            (EngineGroupLifecycle.DRAINING, 0),
-            (EngineGroupLifecycle.REMOVING, 0),
+            ("ACTIVE", 1),
+            ("DRAINING", 0),
+            ("REMOVING", 0),
         ],
     )
     def test_recover_scaled_group_only_when_active(self, monkeypatch, lifecycle_status, expected_calls):
         group = make_engine_group(is_scaled_out=True)
         group.pg = (object(), [], [])
-        group.lifecycle_status = lifecycle_status
+        group.lifecycle_status = EngineGroupLifecycle[lifecycle_status]
         calls = []
 
         def start_engines(port_cursors):

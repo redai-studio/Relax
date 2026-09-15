@@ -4,7 +4,9 @@
 
 import asyncio
 import json
+import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -918,6 +920,12 @@ def test_streaming_dataset_invalid_multimodal_skip_refills_batch(tmp_path: Path,
 
 @pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])
 def test_streaming_dataset_missing_media_skip_refills_batch(tmp_path: Path, monkeypatch, batch_mode: str):
+    for kind in ("video", "audio"):
+        module_name = f"relax.utils.multimodal.{kind}_utils"
+        loader_module = ModuleType(module_name)
+        setattr(loader_module, f"load_{kind}", MagicMock(side_effect=AssertionError(f"unexpected {kind} load")))
+        monkeypatch.setitem(sys.modules, module_name, loader_module)
+
     path = tmp_path / "train.jsonl"
     _write_jsonl(
         path,
