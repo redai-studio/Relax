@@ -37,7 +37,7 @@ logger = get_logger(__name__)
 # Minimum required TransferQueue version and the command to upgrade to it.
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
-    'pip install "transferqueue @ git+https://github.com/redai-infra/'
+    'pip install "transferqueue @ git+https://github.com/redai-studio/'
     'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
 )
 

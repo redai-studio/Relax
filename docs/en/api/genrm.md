@@ -45,5 +45,5 @@ See [GenRM example](/en/examples/generative-reward-model) for full configuration
 
 ## Source
 
-- Implementation: [`relax/components/genrm.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/genrm.py)
-- Base class: [`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- Implementation: [`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

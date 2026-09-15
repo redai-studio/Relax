@@ -98,23 +98,3 @@ export RELAX_ENTRYPOINT_MODE="local"
 
 # Runtime env (RUNTIME_ENV_JSON) is intentionally omitted on P800: the NVIDIA
 # NCCL/NVSHMEM-specific tuning vars used on CUDA do not apply here.
-
-# infer cpu threads num
-NUM_GPUS_TOTAL="${NUM_GPUS_TOTAL:-8}"
-if [ -z "${CPU_THREADS_PER_ACTOR:-}" ]; then
-    _cores_per_socket=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {gsub(/ /,"",$2); print $2; exit}')
-    _sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ {gsub(/ /,"",$2); print $2; exit}')
-    if [ -n "${_cores_per_socket}" ] && [ -n "${_sockets}" ] && [ "${_sockets}" -gt 0 ]; then
-        _total_phys=$((_cores_per_socket * _sockets))
-        CPU_THREADS_PER_ACTOR=$((_total_phys / NUM_GPUS_TOTAL))
-        # clamp to [4, 64], avoid bad values
-        [ "${CPU_THREADS_PER_ACTOR}" -lt 4 ] && CPU_THREADS_PER_ACTOR=4
-        [ "${CPU_THREADS_PER_ACTOR}" -gt 64 ] && CPU_THREADS_PER_ACTOR=64
-    else
-        CPU_THREADS_PER_ACTOR=24
-    fi
-fi
-echo "[cpu-threads] NUM_GPUS_TOTAL=${NUM_GPUS_TOTAL} CPU_THREADS_PER_ACTOR=${CPU_THREADS_PER_ACTOR}"
-export CPU_THREADS_PER_ACTOR
-
-echo "=== Local P800 environment ready ==="

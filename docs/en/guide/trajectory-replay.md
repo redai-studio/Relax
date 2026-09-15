@@ -190,4 +190,4 @@ writer.finalize(ranks=[0])
 - Production capture is split into two bundle types: rollout-level (reward/advantage, identity `rollout_id`, instrumented in `train_actor`) and step-level (loss, identity `(rollout_id, step_id)`, instrumented in `train_one_step`); cross-bundle propagation of the "first divergent stage" is not yet unified. Enable with `RELAX_REPLAY_CAPTURE=1` and `RELAX_REPLAY_CAPTURE_DIR`.
 - Remote RM/GenRM results are treated as `recorded-only` and are not recomputed offline.
 
-See [Task 34 RFC #171](https://github.com/redai-infra/Relax/issues/171) for the design discussion.
+See [Task 34 RFC #171](https://github.com/redai-studio/Relax/issues/171) for the design discussion.

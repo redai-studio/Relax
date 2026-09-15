@@ -1,3 +1,4 @@
+import taskLists from 'markdown-it-task-lists'
 import { defineConfig } from 'vitepress'
 
 // https://vitepress.dev/reference/site-config
@@ -209,9 +210,12 @@ export default defineConfig({
   // Ignore dead links for source code references and placeholder pages
   ignoreDeadLinks: true,
 
-  // Enable LaTeX math rendering
+  // Enable LaTeX math rendering and GitHub-style task lists
   markdown: {
-    math: true
+    math: true,
+    config(md) {
+      md.use(taskLists)
+    }
   },
   
   // 多语言配置
@@ -229,7 +233,7 @@ export default defineConfig({
           {
             text: 'Resources',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: 'Paper', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -347,7 +351,7 @@ export default defineConfig({
           {
             text: '资源',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: '论文', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -478,7 +482,7 @@ export default defineConfig({
   themeConfig: {
     logo: '/rednote-logo.png',
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/redai-infra/Relax' }
+      { icon: 'github', link: 'https://github.com/redai-studio/Relax' }
     ],
     search: {
       provider: 'local'

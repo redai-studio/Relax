@@ -552,7 +552,7 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 |------|------|--------|------|
 | `--autoscaler-config` | str | None | Autoscaler YAML 配置文件路径。设置后启用自动扩缩容，未设置则禁用。示例：`--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml)。
+Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-studio/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml)。
 
 ### Scale-Out 操作参数
 

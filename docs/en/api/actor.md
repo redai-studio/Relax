@@ -34,5 +34,5 @@ The Actor runs a background training loop that:
 
 ## Source
 
-- Implementation: [`relax/components/actor.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/actor.py)
-- Base class: [`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- Implementation: [`relax/components/actor.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/actor.py)
+- Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

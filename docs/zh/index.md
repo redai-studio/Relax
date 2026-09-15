@@ -9,7 +9,7 @@ hero:
       link: /zh/guide/introduction
     - theme: alt
       text: 在 GitHub 上查看
-      link: https://github.com/redai-infra/Relax
+      link: https://github.com/redai-studio/Relax
 
 features:
   - icon: '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="icon-teal"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2" fill="currentColor" fill-opacity="0.2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>'

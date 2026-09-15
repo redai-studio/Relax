@@ -1,0 +1,1847 @@
+diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+index b14c561..7b0508d 100644
+--- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
++++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
+@@ -36,6 +36,7 @@ class TorchMemorySaver:
+         capture_error_mode="global",
+         tag: str = _TAG_DEFAULT,
+         enable_cpu_backup: bool = False,
++        **kwargs,
+     ):
+         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+         self._ensure_initialized()
+@@ -46,6 +47,7 @@ class TorchMemorySaver:
+             capture_error_mode=capture_error_mode,
+             tag=tag,
+             enable_cpu_backup=enable_cpu_backup,
++            **kwargs
+         ):
+             yield
+ 
+@@ -115,12 +117,13 @@ class _TorchMemorySaverImpl:
+         capture_error_mode,
+         tag: str,
+         enable_cpu_backup: bool,
++        **kwargs,
+     ):
+         assert (
+             self._hook_mode == "preload"
+         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
+         with torch.npu.graph(
+-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
++            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode, **kwargs
+         ):
+             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+                 yield
+@@ -159,6 +162,7 @@ class _TorchMemorySaverImpl:
+             # only be released after the memory region is resumed and empty_cache() is invoked.
+             torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
+             del pool
++            torch.npu.empty_cache()
+         finally:
+             self._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+@@ -175,4 +179,4 @@ def _sanity_checks():
+     if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+         raise RuntimeError(
+             "TorchMemorySaver is disabled for the current process because expandable_segments is not supported yet."
+-        )
++        )
+\ No newline at end of file
+diff --git a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp b/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
+index 5fbecbe..b42f5bc 100644
+--- a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
++++ b/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
+@@ -19,8 +19,8 @@
+ namespace sglang {
+ namespace npu_kernel {
+ 
+-at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_t poolSize, uint32_t &blockDim,
+-                     bool isUpddate)
++at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_t poolSize, uint64_t maxStep,
++                     uint32_t &blockDim, bool isUpddate)
+ {
+     auto batchSize = reqPoolIndices.sizes()[0];
+     auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
+@@ -39,6 +39,7 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+     tillingData->rowNumNoTail = batchSize / (tillingData->vcoreNum);
+     tillingData->tailNum = batchSize % (tillingData->vcoreNum);
+     tillingData->rowSize = rowSize;
++    tillingData->maxStep = maxStep;
+ 
+     if (reqPoolIndices.options().dtype() == at::kInt) {
+         tillingData->key = 1;
+@@ -50,13 +51,13 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+         tillingData->reqInxBufferSize = tillingData->reqInxBufferCount * sizeof(int64_t);
+     }
+ 
+-    tillingData->tokenCountAlignInt32 = host_utils::alinInt32Count(MAX_STEP);
++    tillingData->tokenCountAlignInt32 = host_utils::alinInt32Count(maxStep);
+     tillingData->tokenColAlignInt32 = tillingData->tokenCountAlignInt32 * sizeof(int32_t);
+ 
+     tillingData->offsetCountAlignInt64 = host_utils::alinInt64Count(batchSize);
+     tillingData->offsetColAlignInt64 = tillingData->offsetCountAlignInt64 * sizeof(int64_t);
+ 
+-    tillingData->cacheLocSize = batchSize * MAX_STEP;
++    tillingData->cacheLocSize = batchSize * maxStep;
+     tillingData->cacheLocCountAlignInt32 = host_utils::alinInt32Count(tillingData->cacheLocSize);
+     tillingData->cacheLocAlignInt32 = tillingData->cacheLocCountAlignInt32 * sizeof(int32_t);
+ 
+@@ -73,7 +74,7 @@ at::Tensor getTiling(const at::Tensor &reqPoolIndices, uint64_t rowSize, uint64_
+ }
+ 
+ HOST_API void checkParams(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool, const at::Tensor &startOffset,
+-                          const at::Tensor &endOffset, const at::Tensor &outCacheLoc)
++                          const at::Tensor &endOffset, const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+     auto reqIdxType = reqPoolIndices.options().dtype();
+     if ((reqIdxType != at::kInt && reqIdxType != at::kLong) || tokenPool.options().dtype() != at::kInt ||
+@@ -83,16 +84,28 @@ HOST_API void checkParams(const at::Tensor &reqPoolIndices, const at::Tensor &to
+             "Only support inputTensor combo1: int64, int32, int64, int64, int32; combo2: "
+             "int32, int32, int64, int64, int32");
+     }
++    if (maxStep < 1 || maxStep > MAX_STEP) {
++        throw std::invalid_argument("max_step must be in [1, " + std::to_string(MAX_STEP) + "], got " +
++                                    std::to_string(maxStep) +
++                                    " (the cache_loc_assign kernel handles at most MAX_STEP tokens per row)");
++    }
++    auto batchSize = reqPoolIndices.sizes()[0];
++    if (outCacheLoc.numel() < batchSize * static_cast<int64_t>(maxStep)) {
++        throw std::invalid_argument("out_cache_loc too small: needs at least batchSize * max_step = " +
++                                    std::to_string(batchSize * maxStep) + " elements, got " +
++                                    std::to_string(outCacheLoc.numel()));
++    }
+ }
+ 
+ HOST_API at::Tensor cache_loc_assign(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool,
+                                      const at::Tensor &startOffset, const at::Tensor &endOffset,
+-                                     const at::Tensor &outCacheLoc)
++                                     const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+-    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc);
++    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc, maxStep);
+     uint32_t blockDim;
+     uint32_t cacheAssignMode = 0;
+-    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], blockDim, false);
++    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], maxStep, blockDim,
++                                        false);
+ 
+     EXEC_KERNEL_CMD(cache_loc_assign, blockDim, reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc,
+                     tilingTensor, cacheAssignMode);
+@@ -101,12 +114,13 @@ HOST_API at::Tensor cache_loc_assign(const at::Tensor &reqPoolIndices, const at:
+ 
+ HOST_API at::Tensor cache_loc_update(const at::Tensor &reqPoolIndices, const at::Tensor &tokenPool,
+                                      const at::Tensor &startOffset, const at::Tensor &endOffset,
+-                                     const at::Tensor &outCacheLoc)
++                                     const at::Tensor &outCacheLoc, int64_t maxStep)
+ {
+-    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc);
++    checkParams(reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc, maxStep);
+     uint32_t blockDim;
+     uint32_t cacheAssignMode = 1;
+-    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], blockDim, true);
++    at::Tensor tilingTensor = getTiling(reqPoolIndices, tokenPool.sizes()[1], tokenPool.sizes()[0], maxStep, blockDim,
++                                        true);
+ 
+     EXEC_KERNEL_CMD(cache_loc_assign, blockDim, reqPoolIndices, tokenPool, startOffset, endOffset, outCacheLoc,
+                     tilingTensor, cacheAssignMode);
+diff --git a/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h b/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
+index 2f8e9bd..2d473ee 100644
+--- a/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
++++ b/csrc/cache_location_assign/op_host/tiling/cache_loc_assign.h
+@@ -26,6 +26,7 @@ struct AssignCacheTillingData {
+     uint64_t reqInxBufferCount{0};
+     uint64_t reqInxBufferSize{0};
+ 
++    uint64_t maxStep{0};
+     uint64_t tokenCountAlignInt32{0};
+     uint64_t tokenColAlignInt32{0};
+ 
+@@ -37,6 +38,10 @@ struct AssignCacheTillingData {
+     uint64_t cacheLocAlignInt32{0};
+ };
+ 
++// Upper bound of the per-row token count this kernel handles in one call.
++// The host validates `1 <= max_step <= MAX_STEP` and derives every buffer
++// size (token transfer count, out_cache_loc tiling) from the caller-supplied
++// max_step — never from this constant.
+ constexpr uint32_t MAX_STEP = 16;
+ 
+ #endif  // CACHE_LOC_ASSIGN_TILING_H
+diff --git a/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp b/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
+index 109f604..c78f303 100644
+--- a/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
++++ b/csrc/cache_location_assign/op_kernel/cache_loc_assign_kernel.cpp
+@@ -21,6 +21,12 @@ constexpr int32_t BUFFER_NUM = 2;
+ constexpr uint32_t ASSIGN_TO_POOL = 0;
+ constexpr uint32_t RETRIEVE_FROM_POOL = 1;
+ 
++// Per-row contract: the caller passes max_step (tokens moved per row) through
++// the tiling data. The host validates `1 <= max_step <= MAX_STEP` and sizes
++// out_cache_loc as `batchSize * max_step`; every transfer below (token pool
++// copy in CopyIn, token pool write-back, cacheLoc GM read/write) is derived
++// from max_step, so no fixed-size over/under-transfer can occur.
++
+ template <typename T>
+ class CacheLocAssignKernel
+ {
+@@ -44,6 +50,7 @@ public:
+         }
+         this->rowSize = tempTilingGM->rowSize;
+         this->reqInxBufferCount = tempTilingGM->reqInxBufferCount;
++        this->maxStep = tempTilingGM->maxStep;
+         this->tokenCountAlignInt32 = tempTilingGM->tokenCountAlignInt32;
+         this->offsetCountAlignInt64 = tempTilingGM->offsetCountAlignInt64;
+         this->cacheLocCountAlignInt32 = tempTilingGM->cacheLocCountAlignInt32;
+@@ -151,7 +158,7 @@ private:
+             tokenPoolLocal.SetValue(j, cache);
+         }
+ 
+-        uint32_t tokenBytes = static_cast<uint32_t>(MAX_STEP * sizeof(int32_t));
++        uint32_t tokenBytes = static_cast<uint32_t>(this->maxStep * sizeof(int32_t));
+         AscendC::DataCopyExtParams copyParams{1, tokenBytes, 0, 0, 0};
+         AscendC::DataCopyPad(tokenPoolGM[reqIdx * this->rowSize + start], tokenPoolLocal, copyParams);
+ 
+@@ -208,6 +215,7 @@ private:
+     uint64_t tailOffset;
+     uint64_t rowOffset;
+     uint64_t rowSize;
++    uint64_t maxStep;
+     uint64_t cacheLocSize;
+ 
+     int64_t cacheIdxStart{0};
+diff --git a/csrc/pytorch_extensions.cpp b/csrc/pytorch_extensions.cpp
+index 1cfccb0..8e4ad91 100644
+--- a/csrc/pytorch_extensions.cpp
++++ b/csrc/pytorch_extensions.cpp
+@@ -32,11 +32,11 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
+ 
+     m.def(
+         "cache_loc_assign(Tensor req_indices, Tensor token_pool, Tensor start_offset, Tensor end_offset, Tensor "
+-        "out_cache_loc) -> Tensor");
++        "out_cache_loc, int max_step) -> Tensor");
+ 
+     m.def(
+         "cache_loc_update(Tensor req_indices, Tensor token_pool, Tensor start_offset, Tensor end_offset, Tensor "
+-        "out_cache_loc) -> Tensor");
++        "out_cache_loc, int max_step) -> Tensor");
+ 
+     m.def(
+         "assign_cache_op(Tensor! out, Tensor src, Tensor dst_start_idx, Tensor dst_end_idx, Tensor src_start_idx, "
+diff --git a/include/sgl_kenel_npu_ops.h b/include/sgl_kenel_npu_ops.h
+index c6a4fba..ad51c12 100644
+--- a/include/sgl_kenel_npu_ops.h
++++ b/include/sgl_kenel_npu_ops.h
+@@ -19,13 +19,15 @@ at::Tensor cache_loc_assign(const at::Tensor &req_indices,
+                             const at::Tensor &token_pool,
+                             const at::Tensor &start_offset,
+                             const at::Tensor &end_offset,
+-                            const at::Tensor &out_cache_loc);
++                            const at::Tensor &out_cache_loc,
++                            int64_t max_step);
+ 
+ at::Tensor cache_loc_update(const at::Tensor &req_indices,
+                             const at::Tensor &token_pool,
+                             const at::Tensor &start_offset,
+                             const at::Tensor &end_offset,
+-                            const at::Tensor &out_cache_loc);
++                            const at::Tensor &out_cache_loc,
++                            int64_t max_step);
+ 
+ bool assign_cache_op(at::Tensor &dst_tensor, const at::Tensor &src_tensor,
+                      const at::Tensor &dst_start_idx,
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
+index e69de29..6e7bbd6 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
+@@ -0,0 +1,13 @@
++from sgl_kernel_npu.sample.chain_speculative_sampling import (
++    chain_speculative_sampling_rejection,
++)
++from sgl_kernel_npu.sample.probability import top_k_top_p_renorm_probs
++from sgl_kernel_npu.sample.tree_speculative_sampling_target_only import (
++    tree_speculative_sampling_target_only,
++)
++
++__all__ = [
++    "chain_speculative_sampling_rejection",
++    "top_k_top_p_renorm_probs",
++    "tree_speculative_sampling_target_only",
++]
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py
+new file mode 100644
+index 0000000..e8340da
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py
+@@ -0,0 +1,354 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _chain_rejection_accept_kernel(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    uniform_samples,
++    target_probs,
++    draft_probs,
++    metadata,
++    num_draft_tokens: tl.constexpr,
++    num_speculative_tokens: tl.constexpr,
++    num_draft_prob_rows: tl.constexpr,
++    vocab_size: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    row_offset = req_idx * num_draft_tokens
++
++    cur_prob_row = tl.full((), 0, tl.int64)
++    last_accepted_idx = tl.load(retrive_index + row_offset).to(tl.int64)
++    num_accepted = 0
++    active = tl.full((), 1, tl.int32)
++
++    tl.store(accept_index + req_idx * num_speculative_tokens, last_accepted_idx)
++
++    # Linear Leviathan/Chen verification. Candidate 0 is the root; candidate
++    # step uses probability row step - 1 until a rejection terminates the chain.
++    for step in range(1, num_draft_tokens):
++        if active == 1:
++            draft_token = tl.load(candidates + row_offset + step).to(tl.int64)
++            target_offset = (
++                (row_offset + cur_prob_row) * vocab_size + draft_token
++            )
++            draft_offset = (
++                (req_idx * num_draft_prob_rows + cur_prob_row) * vocab_size
++                + draft_token
++            )
++            target_prob = tl.load(target_probs + target_offset).to(tl.float32)
++            draft_prob = tl.load(draft_probs + draft_offset).to(tl.float32)
++            coin = tl.load(uniform_samples + row_offset + step - 1).to(
++                tl.float32
++            )
++
++            if coin * draft_prob < target_prob:
++                tl.store(predicts + last_accepted_idx, draft_token)
++                num_accepted += 1
++                draft_idx = tl.load(retrive_index + row_offset + step).to(
++                    tl.int64
++                )
++                tl.store(
++                    accept_index
++                    + req_idx * num_speculative_tokens
++                    + num_accepted,
++                    draft_idx,
++                )
++                last_accepted_idx = draft_idx
++                # Keep this loop-carried value int64 across both branches.
++                # Triton infers the constexpr loop variable `step` as int32.
++                cur_prob_row = tl.full((), step, tl.int64)
++            else:
++                active = 0
++
++    tl.store(accept_token_num + req_idx, num_accepted)
++
++    # metadata = [target row, output slot, all drafts accepted].
++    metadata_offset = req_idx * 3
++    tl.store(metadata + metadata_offset, cur_prob_row)
++    tl.store(metadata + metadata_offset + 1, last_accepted_idx)
++    tl.store(metadata + metadata_offset + 2, active)
++
++
++@triton.jit
++def _chain_rejection_block_sum_kernel(
++    target_probs,
++    draft_probs,
++    metadata,
++    block_sums,
++    num_draft_tokens: tl.constexpr,
++    num_draft_prob_rows: tl.constexpr,
++    vocab_size: tl.constexpr,
++    vocab_block_size: tl.constexpr,
++    num_vocab_blocks: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    block_idx = tl.program_id(1)
++    vocab_offsets = block_idx * vocab_block_size + tl.arange(0, vocab_block_size)
++    vocab_mask = vocab_offsets < vocab_size
++
++    metadata_offset = req_idx * 3
++    target_row = tl.load(metadata + metadata_offset).to(tl.int64)
++    all_accepted = tl.load(metadata + metadata_offset + 2).to(tl.int32)
++    target_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
++    target = tl.load(
++        target_probs + target_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++
++    if all_accepted == 1:
++        residual = target
++    else:
++        draft_offset = (
++            req_idx * num_draft_prob_rows + target_row
++        ) * vocab_size
++        draft = tl.load(
++            draft_probs + draft_offset + vocab_offsets,
++            mask=vocab_mask,
++            other=0.0,
++        ).to(tl.float32)
++        residual = tl.maximum(target - draft, 0.0)
++
++    tl.store(
++        block_sums + req_idx * num_vocab_blocks + block_idx,
++        tl.sum(residual, axis=0),
++    )
++
++
++@triton.jit
++def _chain_rejection_sample_kernel(
++    predicts,
++    target_probs,
++    draft_probs,
++    metadata,
++    block_sums,
++    uniform_samples_for_final_sampling,
++    num_draft_tokens: tl.constexpr,
++    num_draft_prob_rows: tl.constexpr,
++    vocab_size: tl.constexpr,
++    vocab_block_size: tl.constexpr,
++    num_vocab_blocks: tl.constexpr,
++    pad_num_vocab_blocks: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    metadata_offset = req_idx * 3
++    target_row = tl.load(metadata + metadata_offset).to(tl.int64)
++    output_idx = tl.load(metadata + metadata_offset + 1).to(tl.int64)
++    all_accepted = tl.load(metadata + metadata_offset + 2).to(tl.int32)
++
++    block_offsets = tl.arange(0, pad_num_vocab_blocks)
++    block_mask = block_offsets < num_vocab_blocks
++    sums = tl.load(
++        block_sums + req_idx * num_vocab_blocks + block_offsets,
++        mask=block_mask,
++        other=0.0,
++    ).to(tl.float32)
++    block_cdf = tl.cumsum(sums, axis=0)
++    total = tl.sum(sums, axis=0)
++    coin = tl.load(uniform_samples_for_final_sampling + req_idx).to(tl.float32)
++    target_value = coin * total
++
++    selected_block = tl.sum(
++        ((block_cdf <= target_value) & block_mask).to(tl.int32), axis=0
++    )
++    selected_block = tl.minimum(selected_block, num_vocab_blocks - 1)
++    prefix_sum = tl.sum(
++        tl.where(block_offsets < selected_block, sums, 0.0), axis=0
++    )
++    local_target = tl.maximum(target_value - prefix_sum, 0.0)
++
++    local_offsets = tl.arange(0, vocab_block_size)
++    vocab_offsets = selected_block * vocab_block_size + local_offsets
++    vocab_mask = vocab_offsets < vocab_size
++    target_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
++    target = tl.load(
++        target_probs + target_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++    if all_accepted == 1:
++        residual = target
++    else:
++        draft_offset = (
++            req_idx * num_draft_prob_rows + target_row
++        ) * vocab_size
++        draft = tl.load(
++            draft_probs + draft_offset + vocab_offsets,
++            mask=vocab_mask,
++            other=0.0,
++        ).to(tl.float32)
++        residual = tl.maximum(target - draft, 0.0)
++
++    local_cdf = tl.cumsum(residual, axis=0)
++    local_index = tl.sum(
++        ((local_cdf <= local_target) & vocab_mask).to(tl.int32), axis=0
++    )
++    last_valid_local = tl.max(
++        tl.where((residual > 0.0) & vocab_mask, local_offsets, -1), axis=0
++    )
++    valid_local_count = tl.minimum(
++        vocab_block_size,
++        vocab_size - selected_block * vocab_block_size,
++    )
++    sampled_local = tl.where(
++        local_index < valid_local_count,
++        local_index,
++        last_valid_local,
++    )
++    sampled_token = tl.where(
++        sampled_local >= 0,
++        selected_block * vocab_block_size + sampled_local,
++        vocab_size - 1,
++    )
++    tl.store(predicts + output_idx, tl.minimum(sampled_token, vocab_size - 1))
++
++
++def chain_speculative_sampling_rejection(
++    predicts: torch.Tensor,
++    accept_index: torch.Tensor,
++    accept_token_num: torch.Tensor,
++    candidates: torch.Tensor,
++    retrive_index: torch.Tensor,
++    retrive_next_token: torch.Tensor,
++    retrive_next_sibling: torch.Tensor,
++    uniform_samples: torch.Tensor,
++    uniform_samples_for_final_sampling: torch.Tensor,
++    target_probs: torch.Tensor,
++    draft_probs: torch.Tensor,
++    threshold_single: float = 1.0,
++    threshold_acc: float = 1.0,
++    deterministic: bool = True,
++) -> None:
++    """NPU kernel implementation of classic chain rejection sampling."""
++    del retrive_next_token, retrive_next_sibling
++    del threshold_single, threshold_acc, deterministic
++
++    if candidates.ndim != 2 or target_probs.ndim != 3:
++        raise ValueError("candidates must be 2-D and target_probs must be 3-D")
++    batch_size, num_draft_tokens = candidates.shape
++    if batch_size == 0:
++        return
++    if num_draft_tokens == 0:
++        raise ValueError("num_draft_tokens must be positive")
++    if target_probs.shape[:2] != (batch_size, num_draft_tokens):
++        raise ValueError(
++            "target_probs shape must be [batch, num_draft_tokens, vocab_size]"
++        )
++    if retrive_index.shape != candidates.shape:
++        raise ValueError("retrive_index shape must match candidates")
++    if accept_index.shape != candidates.shape:
++        raise ValueError(
++            "classic rejection sampling requires a topk=1 linear chain"
++        )
++    if accept_token_num.shape != (batch_size,):
++        raise ValueError("accept_token_num must have shape [batch]")
++    if predicts.ndim != 1:
++        raise ValueError("predicts must be 1-D")
++    if uniform_samples.shape != candidates.shape:
++        raise ValueError("uniform_samples shape must match candidates")
++    if uniform_samples_for_final_sampling.shape != (batch_size,):
++        raise ValueError(
++            "uniform_samples_for_final_sampling must have shape [batch]"
++        )
++    if draft_probs is None or draft_probs.ndim != 3:
++        raise ValueError("draft_probs must be a 3-D tensor")
++    if draft_probs.shape[0] != batch_size:
++        raise ValueError("draft_probs batch size must match candidates")
++    if draft_probs.shape[1] < max(num_draft_tokens - 1, 1):
++        raise ValueError("draft_probs does not contain every proposal row")
++    if draft_probs.shape[-1] != target_probs.shape[-1]:
++        raise ValueError("draft_probs and target_probs vocab sizes must match")
++    if target_probs.dtype != torch.float32 or draft_probs.dtype != torch.float32:
++        raise TypeError("target_probs and draft_probs must be torch.float32")
++    if uniform_samples.dtype != torch.float32:
++        raise TypeError("uniform_samples must be torch.float32")
++    if uniform_samples_for_final_sampling.dtype != torch.float32:
++        raise TypeError("uniform_samples_for_final_sampling must be torch.float32")
++    integer_dtypes = (
++        (predicts, torch.int32, "predicts"),
++        (accept_index, torch.int32, "accept_index"),
++        (accept_token_num, torch.int32, "accept_token_num"),
++        (candidates, torch.int64, "candidates"),
++        (retrive_index, torch.int64, "retrive_index"),
++    )
++    for tensor, expected_dtype, name in integer_dtypes:
++        if tensor.dtype != expected_dtype:
++            raise TypeError(f"{name} must be {expected_dtype}")
++    tensors = (
++        predicts,
++        accept_index,
++        accept_token_num,
++        candidates,
++        retrive_index,
++        uniform_samples,
++        uniform_samples_for_final_sampling,
++        target_probs,
++        draft_probs,
++    )
++    if any(tensor.device != target_probs.device for tensor in tensors):
++        raise ValueError("all tensors must be on the same NPU device")
++    if any(not tensor.is_contiguous() for tensor in tensors):
++        raise ValueError("all tensors must be contiguous")
++
++    num_speculative_tokens = accept_index.shape[1]
++    num_draft_prob_rows = draft_probs.shape[1]
++    vocab_size = target_probs.shape[-1]
++    vocab_block_size = 2048
++    num_vocab_blocks = triton.cdiv(vocab_size, vocab_block_size)
++    pad_num_vocab_blocks = triton.next_power_of_2(num_vocab_blocks)
++
++    metadata = torch.empty(
++        (batch_size, 3), dtype=torch.int64, device=target_probs.device
++    )
++    block_sums = torch.empty(
++        (batch_size, num_vocab_blocks),
++        dtype=torch.float32,
++        device=target_probs.device,
++    )
++
++    _chain_rejection_accept_kernel[(batch_size,)](
++        predicts,
++        accept_index,
++        accept_token_num,
++        candidates,
++        retrive_index,
++        uniform_samples,
++        target_probs,
++        draft_probs,
++        metadata,
++        num_draft_tokens=num_draft_tokens,
++        num_speculative_tokens=num_speculative_tokens,
++        num_draft_prob_rows=num_draft_prob_rows,
++        vocab_size=vocab_size,
++    )
++    _chain_rejection_block_sum_kernel[(batch_size, num_vocab_blocks)](
++        target_probs,
++        draft_probs,
++        metadata,
++        block_sums,
++        num_draft_tokens=num_draft_tokens,
++        num_draft_prob_rows=num_draft_prob_rows,
++        vocab_size=vocab_size,
++        vocab_block_size=vocab_block_size,
++        num_vocab_blocks=num_vocab_blocks,
++    )
++    _chain_rejection_sample_kernel[(batch_size,)](
++        predicts,
++        target_probs,
++        draft_probs,
++        metadata,
++        block_sums,
++        uniform_samples_for_final_sampling,
++        num_draft_tokens=num_draft_tokens,
++        num_draft_prob_rows=num_draft_prob_rows,
++        vocab_size=vocab_size,
++        vocab_block_size=vocab_block_size,
++        num_vocab_blocks=num_vocab_blocks,
++        pad_num_vocab_blocks=pad_num_vocab_blocks,
++    )
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py
+new file mode 100644
+index 0000000..cadddd0
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py
+@@ -0,0 +1,40 @@
++import torch
++
++
++def top_k_top_p_renorm_probs(
++    probs: torch.Tensor,
++    top_ks: torch.Tensor,
++    top_ps: torch.Tensor,
++    need_top_k_sampling: bool,
++    need_top_p_sampling: bool,
++) -> torch.Tensor:
++    """Apply the same sequential top-k then top-p policy used by SGLang GPU."""
++    if not need_top_k_sampling and not need_top_p_sampling:
++        return probs
++
++    vocab_size = probs.shape[-1]
++    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
++
++    if need_top_k_sampling:
++        top_ks = top_ks.to(device=probs.device, dtype=torch.long).clamp(
++            min=1, max=vocab_size
++        )
++        positions = torch.arange(vocab_size, device=probs.device).view(1, -1)
++        sorted_probs.masked_fill_(positions >= top_ks.view(-1, 1), 0.0)
++        sorted_probs.div_(
++            sorted_probs.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
++        )
++
++    if need_top_p_sampling:
++        top_ps = top_ps.to(device=probs.device, dtype=probs.dtype)
++        cumulative_probs = sorted_probs.cumsum(dim=-1)
++        sorted_probs.masked_fill_(
++            cumulative_probs - sorted_probs > top_ps.view(-1, 1), 0.0
++        )
++        sorted_probs.div_(
++            sorted_probs.sum(dim=-1, keepdim=True).clamp_min_(1e-20)
++        )
++
++    return torch.zeros_like(probs).scatter_(
++        dim=-1, index=sorted_indices, src=sorted_probs
++    )
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py
+new file mode 100644
+index 0000000..e34baab
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py
+@@ -0,0 +1,383 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _tree_target_only_accept_kernel(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    retrive_next_token,
++    retrive_next_sibling,
++    uniform_samples,
++    target_probs,
++    rejected_probs,
++    metadata,
++    threshold_single,
++    threshold_acc,
++    num_draft_tokens: tl.constexpr,
++    num_speculative_tokens: tl.constexpr,
++    vocab_size: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    row_offset = req_idx * num_draft_tokens
++
++    cur_prob_row = tl.full((), 0, tl.int64)
++    cur_node = tl.full((), 0, tl.int64)
++    last_accepted_idx = tl.load(retrive_index + row_offset).to(tl.int64)
++    coin = tl.load(uniform_samples + row_offset).to(tl.float32)
++    num_accepted = 0
++    path_active = tl.full((), 1, tl.int32)
++
++    tl.store(accept_index + req_idx * num_speculative_tokens, last_accepted_idx)
++
++    # This is the same breadth-at-each-depth traversal used by the CUDA kernel:
++    # descend to the first child, then walk siblings until one is accepted.
++    for _depth in range(1, num_speculative_tokens):
++        accepted_at_depth = tl.full((), 0, tl.int32)
++        prob_acc = tl.full((), 0.0, tl.float32)
++
++        if path_active == 1:
++            cur_node = tl.load(
++                retrive_next_token + row_offset + cur_node
++            ).to(tl.int64)
++            if cur_node == -1:
++                path_active = 0
++
++        # The loop is bounded by the number of tree nodes. It terminates
++        # logically when a child is accepted or the sibling list reaches -1.
++        for _sibling in range(0, num_draft_tokens):
++            if (
++                (path_active == 1)
++                & (accepted_at_depth == 0)
++                & (cur_node != -1)
++            ):
++                draft_token = tl.load(
++                    candidates + row_offset + cur_node
++                ).to(tl.int64)
++                draft_idx = tl.load(
++                    retrive_index + row_offset + cur_node
++                ).to(tl.int64)
++                prob_offset = (
++                    (row_offset + cur_prob_row) * vocab_size + draft_token
++                )
++                target_prob_single = tl.load(
++                    target_probs + prob_offset
++                ).to(tl.float32)
++                prob_acc += target_prob_single
++
++                accepted = (coin <= prob_acc / threshold_acc) | (
++                    target_prob_single >= threshold_single
++                )
++                if accepted:
++                    tl.store(predicts + last_accepted_idx, draft_token)
++                    num_accepted += 1
++                    tl.store(
++                        accept_index
++                        + req_idx * num_speculative_tokens
++                        + num_accepted,
++                        draft_idx,
++                    )
++                    last_accepted_idx = draft_idx
++                    cur_prob_row = cur_node
++                    coin = tl.load(
++                        uniform_samples + row_offset + cur_node
++                    ).to(tl.float32)
++                    accepted_at_depth = 1
++                else:
++                    # The CUDA target-only kernel stores the rejected sibling's
++                    # target probability in draft_probs and later samples from
++                    # relu(target_probs - draft_probs).
++                    tl.store(rejected_probs + prob_offset, target_prob_single)
++                    cur_node = tl.load(
++                        retrive_next_sibling + row_offset + cur_node
++                    ).to(tl.int64)
++
++        if accepted_at_depth == 0:
++            path_active = 0
++
++    tl.store(accept_token_num + req_idx, num_accepted)
++
++    # metadata = [final target-probability row, final output slot].
++    metadata_offset = req_idx * 2
++    tl.store(metadata + metadata_offset, cur_prob_row)
++    tl.store(metadata + metadata_offset + 1, last_accepted_idx)
++
++
++@triton.jit
++def _tree_target_only_block_sum_kernel(
++    target_probs,
++    rejected_probs,
++    metadata,
++    block_sums,
++    num_draft_tokens: tl.constexpr,
++    vocab_size: tl.constexpr,
++    vocab_block_size: tl.constexpr,
++    num_vocab_blocks: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    block_idx = tl.program_id(1)
++    vocab_offsets = block_idx * vocab_block_size + tl.arange(0, vocab_block_size)
++    vocab_mask = vocab_offsets < vocab_size
++
++    target_row = tl.load(metadata + req_idx * 2).to(tl.int64)
++    probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
++    target = tl.load(
++        target_probs + probs_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++    rejected = tl.load(
++        rejected_probs + probs_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++    residual = tl.maximum(target - rejected, 0.0)
++    block_sum = tl.sum(residual, axis=0)
++    tl.store(block_sums + req_idx * num_vocab_blocks + block_idx, block_sum)
++
++
++@triton.jit
++def _tree_target_only_sample_kernel(
++    predicts,
++    target_probs,
++    rejected_probs,
++    metadata,
++    block_sums,
++    uniform_samples_for_final_sampling,
++    num_draft_tokens: tl.constexpr,
++    vocab_size: tl.constexpr,
++    vocab_block_size: tl.constexpr,
++    num_vocab_blocks: tl.constexpr,
++    pad_num_vocab_blocks: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    metadata_offset = req_idx * 2
++    target_row = tl.load(metadata + metadata_offset).to(tl.int64)
++    output_idx = tl.load(metadata + metadata_offset + 1).to(tl.int64)
++
++    block_offsets = tl.arange(0, pad_num_vocab_blocks)
++    block_mask = block_offsets < num_vocab_blocks
++    sums = tl.load(
++        block_sums + req_idx * num_vocab_blocks + block_offsets,
++        mask=block_mask,
++        other=0.0,
++    ).to(tl.float32)
++    block_cdf = tl.cumsum(sums, axis=0)
++    total = tl.sum(sums, axis=0)
++    coin = tl.load(uniform_samples_for_final_sampling + req_idx).to(tl.float32)
++    target = coin * total
++
++    selected_block = tl.sum(
++        ((block_cdf <= target) & block_mask).to(tl.int32), axis=0
++    )
++    selected_block = tl.minimum(selected_block, num_vocab_blocks - 1)
++    prefix_sum = tl.sum(
++        tl.where(block_offsets < selected_block, sums, 0.0), axis=0
++    )
++    local_target = tl.maximum(target - prefix_sum, 0.0)
++
++    local_offsets = tl.arange(0, vocab_block_size)
++    vocab_offsets = selected_block * vocab_block_size + local_offsets
++    vocab_mask = vocab_offsets < vocab_size
++    probs_offset = (req_idx * num_draft_tokens + target_row) * vocab_size
++    target_probs_block = tl.load(
++        target_probs + probs_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++    rejected_probs_block = tl.load(
++        rejected_probs + probs_offset + vocab_offsets,
++        mask=vocab_mask,
++        other=0.0,
++    ).to(tl.float32)
++    residual = tl.maximum(target_probs_block - rejected_probs_block, 0.0)
++
++    local_cdf = tl.cumsum(residual, axis=0)
++    local_index = tl.sum(
++        ((local_cdf <= local_target) & vocab_mask).to(tl.int32), axis=0
++    )
++    last_valid_local = tl.max(
++        tl.where((residual > 0.0) & vocab_mask, local_offsets, -1), axis=0
++    )
++    valid_local_count = tl.minimum(
++        vocab_block_size,
++        vocab_size - selected_block * vocab_block_size,
++    )
++    sampled_local = tl.where(
++        local_index < valid_local_count,
++        local_index,
++        last_valid_local,
++    )
++    sampled_token = tl.where(
++        sampled_local >= 0,
++        selected_block * vocab_block_size + sampled_local,
++        vocab_size - 1,
++    )
++    sampled_token = tl.minimum(sampled_token, vocab_size - 1)
++    tl.store(predicts + output_idx, sampled_token)
++
++
++def tree_speculative_sampling_target_only(
++    predicts: torch.Tensor,
++    accept_index: torch.Tensor,
++    accept_token_num: torch.Tensor,
++    candidates: torch.Tensor,
++    retrive_index: torch.Tensor,
++    retrive_next_token: torch.Tensor,
++    retrive_next_sibling: torch.Tensor,
++    uniform_samples: torch.Tensor,
++    uniform_samples_for_final_sampling: torch.Tensor,
++    target_probs: torch.Tensor,
++    draft_probs: torch.Tensor,
++    threshold_single: float = 1.0,
++    threshold_acc: float = 1.0,
++    deterministic: bool = True,
++) -> None:
++    """NPU port of GPU target-only tree speculative sampling.
++
++    ``draft_probs`` is scratch storage, matching the GPU API. The function
++    clears it and records rejected sibling probabilities before sampling from
++    ``relu(target_probs - draft_probs)`` on the final selected tree row.
++    """
++    del deterministic
++
++    if candidates.ndim != 2 or target_probs.ndim != 3:
++        raise ValueError("candidates must be 2-D and target_probs must be 3-D")
++
++    batch_size, num_draft_tokens = candidates.shape
++    if batch_size == 0:
++        return
++    if num_draft_tokens == 0:
++        raise ValueError("num_draft_tokens must be positive")
++    if target_probs.shape[:2] != (batch_size, num_draft_tokens):
++        raise ValueError(
++            "target_probs shape must be [batch, num_draft_tokens, vocab_size]"
++        )
++    tree_shapes = (
++        retrive_index.shape,
++        retrive_next_token.shape,
++        retrive_next_sibling.shape,
++        uniform_samples.shape,
++    )
++    if any(shape != candidates.shape for shape in tree_shapes):
++        raise ValueError("all tree-index and uniform tensors must match candidates")
++    if accept_index.ndim != 2 or accept_index.shape[0] != batch_size:
++        raise ValueError("accept_index must be [batch, max_tree_depth]")
++    num_speculative_tokens = accept_index.shape[1]
++    if not 1 <= num_speculative_tokens <= num_draft_tokens:
++        raise ValueError("max_tree_depth must be in [1, num_draft_tokens]")
++    if accept_token_num.shape != (batch_size,):
++        raise ValueError("accept_token_num must have shape [batch]")
++    if predicts.ndim != 1:
++        raise ValueError("predicts must be 1-D")
++    if uniform_samples_for_final_sampling.shape != (batch_size,):
++        raise ValueError(
++            "uniform_samples_for_final_sampling must have shape [batch]"
++        )
++    if draft_probs.shape != target_probs.shape:
++        raise ValueError("draft_probs scratch must match target_probs")
++    if draft_probs.data_ptr() == target_probs.data_ptr():
++        raise ValueError("draft_probs must not alias target_probs")
++    if target_probs.dtype != torch.float32 or draft_probs.dtype != torch.float32:
++        raise TypeError("target_probs and draft_probs must be torch.float32")
++    if uniform_samples.dtype != torch.float32:
++        raise TypeError("uniform_samples must be torch.float32")
++    if uniform_samples_for_final_sampling.dtype != torch.float32:
++        raise TypeError("uniform_samples_for_final_sampling must be torch.float32")
++    integer_dtypes = (
++        (predicts, torch.int32, "predicts"),
++        (accept_index, torch.int32, "accept_index"),
++        (accept_token_num, torch.int32, "accept_token_num"),
++        (candidates, torch.int64, "candidates"),
++        (retrive_index, torch.int64, "retrive_index"),
++        (retrive_next_token, torch.int64, "retrive_next_token"),
++        (retrive_next_sibling, torch.int64, "retrive_next_sibling"),
++    )
++    for tensor, expected_dtype, name in integer_dtypes:
++        if tensor.dtype != expected_dtype:
++            raise TypeError(f"{name} must be {expected_dtype}")
++    tensors = (
++        predicts,
++        accept_index,
++        accept_token_num,
++        candidates,
++        retrive_index,
++        retrive_next_token,
++        retrive_next_sibling,
++        uniform_samples,
++        uniform_samples_for_final_sampling,
++        target_probs,
++        draft_probs,
++    )
++    if any(tensor.device != target_probs.device for tensor in tensors):
++        raise ValueError("all tensors must be on the same NPU device")
++    if any(not tensor.is_contiguous() for tensor in tensors):
++        raise ValueError("all tensors must be contiguous")
++    if not 0.0 <= threshold_single <= 1.0:
++        raise ValueError("threshold_single must be in [0, 1]")
++    if not 0.0 <= threshold_acc <= 1.0:
++        raise ValueError("threshold_acc must be in [0, 1]")
++
++    threshold_acc = max(float(threshold_acc), 1e-9)
++    vocab_size = target_probs.shape[-1]
++    vocab_block_size = 2048
++    num_vocab_blocks = triton.cdiv(vocab_size, vocab_block_size)
++    pad_num_vocab_blocks = triton.next_power_of_2(num_vocab_blocks)
++
++    # The CUDA call site passes zeros_like(target_probs). Clearing in the NPU
++    # wrapper makes the scratch contract explicit and permits empty_like callers.
++    draft_probs.zero_()
++    metadata = torch.empty(
++        (batch_size, 2), dtype=torch.int64, device=target_probs.device
++    )
++    block_sums = torch.empty(
++        (batch_size, num_vocab_blocks),
++        dtype=torch.float32,
++        device=target_probs.device,
++    )
++
++    _tree_target_only_accept_kernel[(batch_size,)](
++        predicts,
++        accept_index,
++        accept_token_num,
++        candidates,
++        retrive_index,
++        retrive_next_token,
++        retrive_next_sibling,
++        uniform_samples,
++        target_probs,
++        draft_probs,
++        metadata,
++        float(threshold_single),
++        threshold_acc,
++        num_draft_tokens=num_draft_tokens,
++        num_speculative_tokens=num_speculative_tokens,
++        vocab_size=vocab_size,
++    )
++    _tree_target_only_block_sum_kernel[(batch_size, num_vocab_blocks)](
++        target_probs,
++        draft_probs,
++        metadata,
++        block_sums,
++        num_draft_tokens=num_draft_tokens,
++        vocab_size=vocab_size,
++        vocab_block_size=vocab_block_size,
++        num_vocab_blocks=num_vocab_blocks,
++    )
++    _tree_target_only_sample_kernel[(batch_size,)](
++        predicts,
++        target_probs,
++        draft_probs,
++        metadata,
++        block_sums,
++        uniform_samples_for_final_sampling,
++        num_draft_tokens=num_draft_tokens,
++        vocab_size=vocab_size,
++        vocab_block_size=vocab_block_size,
++        num_vocab_blocks=num_vocab_blocks,
++        pad_num_vocab_blocks=pad_num_vocab_blocks,
++    )
+diff --git a/tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py b/tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py
+new file mode 100644
+index 0000000..40b04be
+--- /dev/null
++++ b/tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py
+@@ -0,0 +1,138 @@
++import torch
++import torch_npu  # noqa: F401
++
++from sgl_kernel_npu.sample import chain_speculative_sampling_rejection
++
++
++def chain_rejection_reference(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    uniform_samples,
++    uniform_samples_for_final_sampling,
++    target_probs,
++    draft_probs,
++):
++    batch_size, num_draft_tokens = candidates.shape
++    for req_idx in range(batch_size):
++        cur_prob_row = 0
++        last_accepted_idx = int(retrive_index[req_idx, 0])
++        accept_index[req_idx, 0] = last_accepted_idx
++        num_accepted = 0
++        all_accepted = True
++
++        for step in range(1, num_draft_tokens):
++            draft_token = int(candidates[req_idx, step])
++            p = float(target_probs[req_idx, cur_prob_row, draft_token])
++            q = float(draft_probs[req_idx, cur_prob_row, draft_token])
++            coin = float(uniform_samples[req_idx, step - 1])
++            if coin * q < p:
++                predicts[last_accepted_idx] = draft_token
++                num_accepted += 1
++                last_accepted_idx = int(retrive_index[req_idx, step])
++                accept_index[req_idx, num_accepted] = last_accepted_idx
++                cur_prob_row = step
++            else:
++                all_accepted = False
++                break
++
++        accept_token_num[req_idx] = num_accepted
++        residual = target_probs[req_idx, cur_prob_row].clone()
++        if not all_accepted:
++            residual.sub_(draft_probs[req_idx, cur_prob_row]).clamp_min_(0.0)
++        target = float(uniform_samples_for_final_sampling[req_idx]) * float(
++            residual.sum()
++        )
++        sampled_token = int((residual.cumsum(0) <= target).sum())
++        if sampled_token == residual.numel():
++            positive = torch.nonzero(residual > 0.0).flatten()
++            sampled_token = (
++                int(positive[-1]) if positive.numel() else residual.numel() - 1
++            )
++        predicts[last_accepted_idx] = sampled_token
++
++
++def test_chain_rejection_matches_gpu_algorithm():
++    batch_size, num_draft_tokens, vocab_size = 2, 4, 11
++    candidates = torch.tensor([[0, 2, 3, 4], [0, 5, 6, 7]])
++    retrive_index = torch.arange(batch_size * num_draft_tokens).view(
++        batch_size, num_draft_tokens
++    )
++    target_probs = torch.softmax(
++        torch.tensor(
++            [
++                [
++                    [0.1, 0.2, 2.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
++                    [0.1, 0.2, 0.1, 2.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
++                    [0.1, 0.2, 0.1, 0.1, 2.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
++                    [0.1, 0.2, 0.1, 0.1, 2.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
++                ],
++                [
++                    [0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 2.0, 0.1, 0.1, 0.1],
++                    [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 2.0, 0.2, 0.1, 0.1, 0.1],
++                    [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 2.0, 0.1, 0.1, 0.1],
++                    [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 2.0, 0.1, 0.1, 0.1],
++                ],
++            ],
++            dtype=torch.float32,
++        ),
++        dim=-1,
++    )
++    draft_probs = torch.softmax(
++        torch.tensor(
++            [
++                [[0.1] * vocab_size, [0.1] * vocab_size, [0.1] * vocab_size],
++                [[0.1] * vocab_size, [0.1] * vocab_size, [0.1] * vocab_size],
++            ],
++            dtype=torch.float32,
++        ),
++        dim=-1,
++    )
++    draft_probs[1, 0, 5] = 0.9
++    draft_probs[1, 0] /= draft_probs[1, 0].sum()
++    uniforms = torch.tensor([[0.1, 0.1, 0.1, 0.0], [0.99, 0.0, 0.0, 0.0]])
++    final_uniforms = torch.tensor([0.37, 0.61])
++
++    expected_predicts = torch.full(
++        (batch_size * num_draft_tokens,), -1, dtype=torch.int32
++    )
++    expected_accept_index = torch.full(
++        (batch_size, num_draft_tokens), -1, dtype=torch.int32
++    )
++    expected_accept_num = torch.zeros(batch_size, dtype=torch.int32)
++    chain_rejection_reference(
++        expected_predicts,
++        expected_accept_index,
++        expected_accept_num,
++        candidates,
++        retrive_index,
++        uniforms,
++        final_uniforms,
++        target_probs,
++        draft_probs,
++    )
++
++    predicts = torch.full_like(expected_predicts, -1, device="npu")
++    accept_index = torch.full_like(expected_accept_index, -1, device="npu")
++    accept_num = torch.zeros_like(expected_accept_num, device="npu")
++    next_token = torch.full_like(candidates, -1, device="npu")
++    next_sibling = torch.full_like(candidates, -1, device="npu")
++    chain_speculative_sampling_rejection(
++        predicts,
++        accept_index,
++        accept_num,
++        candidates.npu(),
++        retrive_index.npu(),
++        next_token,
++        next_sibling,
++        uniforms.npu(),
++        final_uniforms.npu(),
++        target_probs.npu(),
++        draft_probs.npu(),
++    )
++
++    torch.testing.assert_close(predicts.cpu(), expected_predicts)
++    torch.testing.assert_close(accept_index.cpu(), expected_accept_index)
++    torch.testing.assert_close(accept_num.cpu(), expected_accept_num)
+diff --git a/tests/python/sgl_kernel_npu/test_speculative_probability.py b/tests/python/sgl_kernel_npu/test_speculative_probability.py
+new file mode 100644
+index 0000000..563f174
+--- /dev/null
++++ b/tests/python/sgl_kernel_npu/test_speculative_probability.py
+@@ -0,0 +1,31 @@
++import torch
++
++from sgl_kernel_npu.sample.probability import top_k_top_p_renorm_probs
++
++
++def test_top_k_top_p_renorm_matches_sequential_reference():
++    torch.manual_seed(7)
++    probs = torch.softmax(torch.randn(4, 97), dim=-1)
++    top_ks = torch.tensor([1, 7, 31, 97])
++    top_ps = torch.tensor([0.3, 0.75, 0.95, 1.0])
++
++    actual = top_k_top_p_renorm_probs(
++        probs, top_ks, top_ps, True, True
++    )
++
++    sorted_probs, sorted_indices = probs.sort(dim=-1, descending=True)
++    positions = torch.arange(probs.shape[-1]).view(1, -1)
++    sorted_probs[positions >= top_ks.view(-1, 1)] = 0.0
++    sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
++    top_k_probs = torch.zeros_like(probs).scatter(
++        -1, sorted_indices, sorted_probs
++    )
++    sorted_probs, sorted_indices = top_k_probs.sort(dim=-1, descending=True)
++    cumulative = sorted_probs.cumsum(dim=-1)
++    sorted_probs[cumulative - sorted_probs > top_ps.view(-1, 1)] = 0.0
++    sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
++    expected = torch.zeros_like(probs).scatter(
++        -1, sorted_indices, sorted_probs
++    )
++
++    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+diff --git a/tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py b/tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py
+new file mode 100644
+index 0000000..3c12d53
+--- /dev/null
++++ b/tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py
+@@ -0,0 +1,595 @@
++import argparse
++import time
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from sgl_kernel_npu.sample import tree_speculative_sampling_target_only
++
++
++def target_only_tree_reference(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    retrive_next_token,
++    retrive_next_sibling,
++    uniform_samples,
++    uniform_samples_for_final_sampling,
++    target_probs,
++    rejected_probs,
++    threshold_single,
++    threshold_acc,
++):
++    """CPU reference translated directly from the GPU CUDA kernel."""
++    batch_size, num_draft_tokens = candidates.shape
++    num_speculative_tokens = accept_index.shape[1]
++    threshold_acc = max(float(threshold_acc), 1e-9)
++    rejected_probs.zero_()
++
++    for req_idx in range(batch_size):
++        cur_prob_row = 0
++        cur_node = 0
++        coin = float(uniform_samples[req_idx, 0])
++        last_accepted_idx = int(retrive_index[req_idx, 0])
++        accept_index[req_idx, 0] = last_accepted_idx
++        num_accepted = 0
++
++        for _ in range(1, num_speculative_tokens):
++            cur_node = int(retrive_next_token[req_idx, cur_node])
++            prob_acc = 0.0
++            while cur_node != -1:
++                draft_idx = int(retrive_index[req_idx, cur_node])
++                draft_token = int(candidates[req_idx, cur_node])
++                target_prob = float(
++                    target_probs[req_idx, cur_prob_row, draft_token]
++                )
++                prob_acc += target_prob
++                if (
++                    coin <= prob_acc / threshold_acc
++                    or target_prob >= threshold_single
++                ):
++                    predicts[last_accepted_idx] = draft_token
++                    num_accepted += 1
++                    accept_index[req_idx, num_accepted] = draft_idx
++                    last_accepted_idx = draft_idx
++                    cur_prob_row = cur_node
++                    coin = float(uniform_samples[req_idx, cur_node])
++                    break
++
++                rejected_probs[req_idx, cur_prob_row, draft_token] = target_prob
++                cur_node = int(retrive_next_sibling[req_idx, cur_node])
++
++            if cur_node == -1:
++                break
++
++        accept_token_num[req_idx] = num_accepted
++        residual = (
++            target_probs[req_idx, cur_prob_row]
++            - rejected_probs[req_idx, cur_prob_row]
++        ).clamp_min(0.0)
++        target = float(uniform_samples_for_final_sampling[req_idx]) * float(
++            residual.sum()
++        )
++        sampled_token = int((residual.cumsum(0) <= target).sum())
++        if sampled_token == residual.numel():
++            positive = torch.nonzero(residual > 0.0).flatten()
++            sampled_token = (
++                int(positive[-1]) if positive.numel() else residual.numel() - 1
++            )
++        predicts[last_accepted_idx] = sampled_token
++
++    return predicts, accept_index, accept_token_num, rejected_probs
++
++
++def target_only_chain_reference(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    uniform_samples,
++    uniform_samples_for_final_sampling,
++    target_probs,
++    threshold_single,
++    threshold_acc,
++):
++    batch_size, num_draft_tokens = candidates.shape
++    threshold_acc = max(float(threshold_acc), 1e-9)
++
++    for req_idx in range(batch_size):
++        last_accepted_idx = int(retrive_index[req_idx, 0])
++        accept_index[req_idx, 0] = last_accepted_idx
++        num_accepted = 0
++        rejected_token = -1
++
++        for step in range(1, num_draft_tokens):
++            draft_token = int(candidates[req_idx, step])
++            target_prob = float(target_probs[req_idx, step - 1, draft_token])
++            coin = float(uniform_samples[req_idx, step - 1])
++            if (
++                coin <= target_prob / threshold_acc
++                or target_prob >= threshold_single
++            ):
++                predicts[last_accepted_idx] = draft_token
++                num_accepted += 1
++                last_accepted_idx = int(retrive_index[req_idx, step])
++                accept_index[req_idx, num_accepted] = last_accepted_idx
++            else:
++                rejected_token = draft_token
++                break
++
++        accept_token_num[req_idx] = num_accepted
++        final_probs = target_probs[req_idx, num_accepted].clone().float()
++        if rejected_token >= 0:
++            final_probs[rejected_token] = 0.0
++        final_probs.clamp_min_(0.0)
++        target = float(uniform_samples_for_final_sampling[req_idx]) * float(
++            final_probs.sum()
++        )
++        sampled_token = int((final_probs.cumsum(0) <= target).sum())
++        sampled_token = min(sampled_token, final_probs.numel() - 1)
++        predicts[last_accepted_idx] = sampled_token
++
++    return predicts, accept_index, accept_token_num
++
++
++@pytest.mark.parametrize(
++    "threshold_single,threshold_acc", [(1.0, 1.0), (0.0, 0.0), (0.5, 0.8)]
++)
++def test_general_tree_matches_gpu_algorithm_reference(
++    threshold_single, threshold_acc
++):
++    candidates = torch.tensor(
++        [[0, 1, 2, 3, 4, 5], [7, 8, 9, 10, 11, 12]], dtype=torch.int64
++    )
++    retrive_index = torch.tensor(
++        [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]], dtype=torch.int64
++    )
++    retrive_next_token = torch.tensor(
++        [[1, 2, -1, 4, 5, -1], [4, 2, 3, -1, 5, -1]],
++        dtype=torch.int64,
++    )
++    retrive_next_sibling = torch.tensor(
++        [[-1, 3, -1, -1, -1, -1], [-1, -1, -1, -1, 1, -1]],
++        dtype=torch.int64,
++    )
++    batch_size, num_draft_tokens = candidates.shape
++    vocab_size = 20
++    target_probs = torch.full(
++        (batch_size, num_draft_tokens, vocab_size), 0.01, dtype=torch.float32
++    )
++    target_probs[0, 0, 1] = 0.12
++    target_probs[0, 0, 3] = 0.72
++    target_probs[0, 3, 4] = 0.82
++    target_probs[0, 4, 5] = 0.75
++    target_probs[1, 0, 11] = 0.68
++    target_probs[1, 0, 8] = 0.14
++    target_probs[1, 4, 12] = 0.77
++    target_probs /= target_probs.sum(dim=-1, keepdim=True)
++    uniforms = torch.tensor(
++        [[0.55, 0.2, 0.8, 0.4, 0.3, 0.9], [0.6, 0.2, 0.8, 0.7, 0.3, 0.4]],
++        dtype=torch.float32,
++    )
++    final_uniforms = torch.tensor([0.25, 0.75], dtype=torch.float32)
++
++    ref_predicts = torch.full((12,), -1, dtype=torch.int32)
++    ref_accept_index = torch.full((2, 4), -1, dtype=torch.int32)
++    ref_accept_num = torch.zeros(2, dtype=torch.int32)
++    ref_rejected = torch.empty_like(target_probs)
++    target_only_tree_reference(
++        ref_predicts,
++        ref_accept_index,
++        ref_accept_num,
++        candidates,
++        retrive_index,
++        retrive_next_token,
++        retrive_next_sibling,
++        uniforms,
++        final_uniforms,
++        target_probs,
++        ref_rejected,
++        threshold_single,
++        threshold_acc,
++    )
++
++    npu_predicts = torch.full_like(ref_predicts, -1, device="npu")
++    npu_accept_index = torch.full_like(ref_accept_index, -1, device="npu")
++    npu_accept_num = torch.zeros_like(ref_accept_num, device="npu")
++    npu_rejected = torch.empty_like(target_probs, device="npu")
++    tree_speculative_sampling_target_only(
++        npu_predicts,
++        npu_accept_index,
++        npu_accept_num,
++        candidates.npu(),
++        retrive_index.npu(),
++        retrive_next_token.npu(),
++        retrive_next_sibling.npu(),
++        uniforms.npu(),
++        final_uniforms.npu(),
++        target_probs.npu(),
++        npu_rejected,
++        threshold_single,
++        threshold_acc,
++        True,
++    )
++
++    torch.testing.assert_close(npu_predicts.cpu(), ref_predicts, rtol=0, atol=0)
++    torch.testing.assert_close(
++        npu_accept_index.cpu(), ref_accept_index, rtol=0, atol=0
++    )
++    torch.testing.assert_close(npu_accept_num.cpu(), ref_accept_num, rtol=0, atol=0)
++    torch.testing.assert_close(npu_rejected.cpu(), ref_rejected, rtol=0, atol=0)
++
++
++def target_only_chain_torch(
++    predicts,
++    accept_index,
++    accept_token_num,
++    candidates,
++    retrive_index,
++    uniform_samples,
++    uniform_samples_for_final_sampling,
++    target_probs,
++):
++    batch_size, num_draft_tokens = candidates.shape
++    device = candidates.device
++    draft_tokens = candidates[:, 1:].long()
++    step_probs = torch.gather(
++        target_probs[:, :-1, :], 2, draft_tokens.unsqueeze(-1)
++    ).squeeze(-1)
++    accept_steps = uniform_samples[:, : num_draft_tokens - 1] <= step_probs
++    reject_count = (~accept_steps).to(torch.int32).cumsum(dim=1)
++    num_correct = (reject_count == 0).to(torch.int32).sum(dim=1)
++
++    accept_token_num.copy_(num_correct)
++    accept_index.fill_(-1)
++    positions = torch.arange(num_draft_tokens, device=device).view(1, -1)
++    valid_accept = positions <= num_correct.view(-1, 1)
++    accept_index.copy_(
++        torch.where(
++            valid_accept,
++            retrive_index.to(torch.int32),
++            torch.full_like(accept_index, -1),
++        )
++    )
++
++    predicts.zero_()
++    parent_positions = torch.arange(num_draft_tokens - 1, device=device).view(1, -1)
++    valid_parent = parent_positions < num_correct.view(-1, 1)
++    parent_indices = retrive_index[:, :-1].reshape(-1).long()
++    parent_values = candidates[:, 1:].to(torch.int32).reshape(-1)
++    predicts[parent_indices] = torch.where(
++        valid_parent.reshape(-1), parent_values, predicts[parent_indices]
++    )
++
++    rows = torch.arange(batch_size, device=device)
++    final_rows = num_correct.long()
++    final_probs = target_probs[rows, final_rows].clone()
++    rejected = num_correct < num_draft_tokens - 1
++    rejected_positions = (num_correct.long() + 1).clamp_max(num_draft_tokens - 1)
++    rejected_tokens = candidates[rows, rejected_positions].long()
++    final_probs[rejected, rejected_tokens[rejected]] = 0.0
++
++    probability_sums = final_probs.sum(dim=-1, keepdim=True)
++    targets = uniform_samples_for_final_sampling.view(-1, 1) * probability_sums
++    final_tokens = (
++        (final_probs.cumsum(dim=-1) <= targets)
++        .to(torch.int32)
++        .sum(dim=-1)
++        .clamp_max(target_probs.shape[-1] - 1)
++    )
++    final_indices = retrive_index[rows, final_rows].long()
++    predicts[final_indices] = final_tokens.to(torch.int32)
++
++
++def make_chain_indices(batch_size, num_draft_tokens, device):
++    retrive_index = torch.arange(
++        batch_size * num_draft_tokens, dtype=torch.int64, device=device
++    ).view(batch_size, num_draft_tokens)
++    retrive_next_token = torch.arange(
++        1, num_draft_tokens + 1, dtype=torch.int64, device=device
++    ).repeat(batch_size, 1)
++    retrive_next_token[:, -1] = -1
++    retrive_next_sibling = torch.full_like(retrive_next_token, -1)
++    return retrive_index, retrive_next_token, retrive_next_sibling
++
++
++def make_stable_chain_final_uniforms(
++    candidates,
++    uniform_samples,
++    target_probs,
++):
++    """Choose final-sampling coins away from inverse-CDF boundaries."""
++    batch_size, num_draft_tokens = candidates.shape
++    final_uniforms = torch.empty(batch_size, dtype=torch.float32)
++
++    for req_idx in range(batch_size):
++        num_accepted = 0
++        rejected_token = -1
++        for step in range(1, num_draft_tokens):
++            draft_token = int(candidates[req_idx, step])
++            target_prob = float(target_probs[req_idx, step - 1, draft_token])
++            if float(uniform_samples[req_idx, step - 1]) <= target_prob:
++                num_accepted += 1
++            else:
++                rejected_token = draft_token
++                break
++
++        final_probs = target_probs[req_idx, num_accepted].double().clone()
++        if rejected_token >= 0:
++            final_probs[rejected_token] = 0.0
++
++        sampled_token = int(final_probs.argmax())
++        probability_sum = final_probs.sum()
++        cdf_before = final_probs[:sampled_token].sum()
++        cdf_midpoint = cdf_before + final_probs[sampled_token] * 0.5
++        final_uniforms[req_idx] = (cdf_midpoint / probability_sum).float()
++
++    return final_uniforms
++
++
++@pytest.mark.parametrize("batch_size", [1, 4, 17])
++@pytest.mark.parametrize("num_draft_tokens", [2, 5])
++@pytest.mark.parametrize("vocab_size", [20, 32000, 151552])
++def test_target_only_chain_matches_reference(
++    batch_size, num_draft_tokens, vocab_size
++):
++    torch.manual_seed(20260717 + batch_size + num_draft_tokens + vocab_size)
++    candidates = torch.randint(
++        0, vocab_size, (batch_size, num_draft_tokens), dtype=torch.int64
++    )
++    logits = torch.randn(batch_size, num_draft_tokens, vocab_size)
++    target_probs = torch.softmax(logits, dim=-1).float()
++
++    # Give some draft tokens meaningful acceptance probability.
++    for req_idx in range(batch_size):
++        for step in range(1, num_draft_tokens):
++            token = int(candidates[req_idx, step])
++            target_probs[req_idx, step - 1] *= 0.35
++            target_probs[req_idx, step - 1, token] += 0.65
++            target_probs[req_idx, step - 1] /= target_probs[
++                req_idx, step - 1
++            ].sum()
++
++    uniform_samples = torch.rand(batch_size, num_draft_tokens)
++    # A random coin can land within FP32 reduction error of a CDF boundary for
++    # large vocabularies. Use the midpoint of a high-mass token's interval so
++    # exact token equality tests the algorithm instead of reduction order.
++    final_uniform_samples = make_stable_chain_final_uniforms(
++        candidates,
++        uniform_samples,
++        target_probs,
++    )
++    retrive_index, retrive_next_token, retrive_next_sibling = make_chain_indices(
++        batch_size, num_draft_tokens, "cpu"
++    )
++
++    ref_predicts = torch.full(
++        (batch_size * num_draft_tokens,), -1, dtype=torch.int32
++    )
++    ref_accept_index = torch.full(
++        (batch_size, num_draft_tokens), -1, dtype=torch.int32
++    )
++    ref_accept_num = torch.zeros(batch_size, dtype=torch.int32)
++    target_only_chain_reference(
++        ref_predicts,
++        ref_accept_index,
++        ref_accept_num,
++        candidates,
++        retrive_index,
++        uniform_samples,
++        final_uniform_samples,
++        target_probs,
++        1.0,
++        1.0,
++    )
++
++    npu_predicts = torch.full_like(ref_predicts, -1, device="npu")
++    npu_accept_index = torch.full_like(ref_accept_index, -1, device="npu")
++    npu_accept_num = torch.zeros_like(ref_accept_num, device="npu")
++    candidates_npu = candidates.npu()
++    retrive_index_npu = retrive_index.npu()
++    next_token_npu = retrive_next_token.npu()
++    next_sibling_npu = retrive_next_sibling.npu()
++    target_probs_npu = target_probs.npu()
++
++    tree_speculative_sampling_target_only(
++        predicts=npu_predicts,
++        accept_index=npu_accept_index,
++        accept_token_num=npu_accept_num,
++        candidates=candidates_npu,
++        retrive_index=retrive_index_npu,
++        retrive_next_token=next_token_npu,
++        retrive_next_sibling=next_sibling_npu,
++        uniform_samples=uniform_samples.npu(),
++        uniform_samples_for_final_sampling=final_uniform_samples.npu(),
++        target_probs=target_probs_npu,
++        draft_probs=torch.empty_like(target_probs_npu),
++        threshold_single=1.0,
++        threshold_acc=1.0,
++        deterministic=True,
++    )
++
++    torch.testing.assert_close(npu_predicts.cpu(), ref_predicts, rtol=0, atol=0)
++    torch.testing.assert_close(
++        npu_accept_index.cpu(), ref_accept_index, rtol=0, atol=0
++    )
++    torch.testing.assert_close(npu_accept_num.cpu(), ref_accept_num, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize(
++    "threshold_single,threshold_acc",
++    [(1.0, 1.0), (0.0, 0.0), (0.5, 0.8)],
++)
++def test_target_only_thresholds(threshold_single, threshold_acc):
++    batch_size, num_draft_tokens, vocab_size = 2, 4, 32
++    candidates = torch.tensor([[0, 3, 4, 5], [0, 7, 8, 9]], dtype=torch.int64)
++    target_probs = torch.full(
++        (batch_size, num_draft_tokens, vocab_size), 1.0 / vocab_size
++    )
++    for req_idx in range(batch_size):
++        for step in range(1, num_draft_tokens):
++            token = int(candidates[req_idx, step])
++            target_probs[req_idx, step - 1] *= 0.2
++            target_probs[req_idx, step - 1, token] += 0.8
++            target_probs[req_idx, step - 1] /= target_probs[
++                req_idx, step - 1
++            ].sum()
++
++    uniforms = torch.tensor([[0.1, 0.9, 0.2, 0.0], [0.7, 0.2, 0.95, 0.0]])
++    final_uniforms = torch.tensor([0.25, 0.75])
++    retrive_index, next_token, next_sibling = make_chain_indices(
++        batch_size, num_draft_tokens, "cpu"
++    )
++
++    ref_predicts = torch.full((batch_size * num_draft_tokens,), -1, dtype=torch.int32)
++    ref_accept_index = torch.full(
++        (batch_size, num_draft_tokens), -1, dtype=torch.int32
++    )
++    ref_accept_num = torch.zeros(batch_size, dtype=torch.int32)
++    target_only_chain_reference(
++        ref_predicts,
++        ref_accept_index,
++        ref_accept_num,
++        candidates,
++        retrive_index,
++        uniforms,
++        final_uniforms,
++        target_probs,
++        threshold_single,
++        threshold_acc,
++    )
++
++    npu_predicts = torch.full_like(ref_predicts, -1, device="npu")
++    npu_accept_index = torch.full_like(ref_accept_index, -1, device="npu")
++    npu_accept_num = torch.zeros_like(ref_accept_num, device="npu")
++    target_probs_npu = target_probs.npu()
++    tree_speculative_sampling_target_only(
++        npu_predicts,
++        npu_accept_index,
++        npu_accept_num,
++        candidates.npu(),
++        retrive_index.npu(),
++        next_token.npu(),
++        next_sibling.npu(),
++        uniforms.npu(),
++        final_uniforms.npu(),
++        target_probs_npu,
++        torch.empty_like(target_probs_npu),
++        threshold_single,
++        threshold_acc,
++        True,
++    )
++
++    torch.testing.assert_close(npu_predicts.cpu(), ref_predicts, rtol=0, atol=0)
++    torch.testing.assert_close(
++        npu_accept_index.cpu(), ref_accept_index, rtol=0, atol=0
++    )
++    torch.testing.assert_close(npu_accept_num.cpu(), ref_accept_num, rtol=0, atol=0)
++
++
++def run_benchmark(batch_size, num_draft_tokens, vocab_size, warmup, iterations):
++    candidates = torch.randint(
++        0,
++        vocab_size,
++        (batch_size, num_draft_tokens),
++        dtype=torch.int64,
++        device="npu",
++    )
++    target_probs = torch.softmax(
++        torch.randn(
++            batch_size,
++            num_draft_tokens,
++            vocab_size,
++            dtype=torch.float32,
++            device="npu",
++        ),
++        dim=-1,
++    )
++    retrive_index, next_token, next_sibling = make_chain_indices(
++        batch_size, num_draft_tokens, "npu"
++    )
++    uniforms = torch.rand(
++        batch_size, num_draft_tokens, dtype=torch.float32, device="npu"
++    )
++    final_uniforms = torch.rand(batch_size, dtype=torch.float32, device="npu")
++    draft_probs = torch.empty_like(target_probs)
++    predicts = torch.zeros(
++        batch_size * num_draft_tokens, dtype=torch.int32, device="npu"
++    )
++    accept_index = torch.full(
++        (batch_size, num_draft_tokens), -1, dtype=torch.int32, device="npu"
++    )
++    accept_num = torch.zeros(batch_size, dtype=torch.int32, device="npu")
++
++    def run_kernel():
++        tree_speculative_sampling_target_only(
++            predicts,
++            accept_index,
++            accept_num,
++            candidates,
++            retrive_index,
++            next_token,
++            next_sibling,
++            uniforms,
++            final_uniforms,
++            target_probs,
++            draft_probs,
++            1.0,
++            1.0,
++            True,
++        )
++
++    def run_torch():
++        target_only_chain_torch(
++            predicts,
++            accept_index,
++            accept_num,
++            candidates,
++            retrive_index,
++            uniforms,
++            final_uniforms,
++            target_probs,
++        )
++
++    def benchmark(fn):
++        for _ in range(warmup):
++            fn()
++        torch.npu.synchronize()
++        started = time.perf_counter()
++        for _ in range(iterations):
++            fn()
++        torch.npu.synchronize()
++        return (time.perf_counter() - started) * 1000 / iterations
++
++    kernel_latency_ms = benchmark(run_kernel)
++    torch_latency_ms = benchmark(run_torch)
++    print(
++        f"batch={batch_size} drafts={num_draft_tokens} vocab={vocab_size} "
++        f"kernel_ms={kernel_latency_ms:.4f} torch_ms={torch_latency_ms:.4f} "
++        f"speedup={torch_latency_ms / kernel_latency_ms:.2f}x"
++    )
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--perf", action="store_true")
++    parser.add_argument("--batch-size", type=int, default=16)
++    parser.add_argument("--num-draft-tokens", type=int, default=5)
++    parser.add_argument("--vocab-size", type=int, default=151552)
++    parser.add_argument("--warmup", type=int, default=10)
++    parser.add_argument("--iterations", type=int, default=100)
++    args = parser.parse_args()
++    if args.perf:
++        run_benchmark(
++            args.batch_size,
++            args.num_draft_tokens,
++            args.vocab_size,
++            args.warmup,
++            args.iterations,
++        )
++    else:
++        raise SystemExit(pytest.main([__file__]))

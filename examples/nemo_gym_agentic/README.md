@@ -159,7 +159,7 @@ callback 可能被错误发送到代理。
 
 需要两个运行角色：
 
-1. `RELAX_IMAGE`：公开的标准 Relax 训练镜像 `ghcr.io/redai-infra/relaxrl:latest`，运行 GPU Ray
+1. `RELAX_IMAGE`：公开的标准 Relax 训练镜像 `ghcr.io/redai-studio/relaxrl:latest`，运行 GPU Ray
    cluster 和训练任务；
 2. `NEMO_GYM_IMAGE`：由本目录 Dockerfile 基于 `RELAX_IMAGE` 构建，运行 NeMo Gym 服务。
 
@@ -171,7 +171,7 @@ venv。
 ### 构建 NeMo Gym 镜像
 
 ```bash
-export RELAX_IMAGE="ghcr.io/redai-infra/relaxrl:latest"
+export RELAX_IMAGE="ghcr.io/redai-studio/relaxrl:latest"
 export NEMO_GYM_IMAGE="relax-nemo-gym:a85670e"
 export http_proxy="http://proxy.example.com:3128"   # 无代理时留空
 export https_proxy="${http_proxy}"

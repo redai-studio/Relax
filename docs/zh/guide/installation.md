@@ -21,13 +21,13 @@
 
 ```bash
 # 克隆代码仓库
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 
 # 拉取 Docker 镜像
-docker pull ghcr.io/redai-infra/relaxrl:latest
+docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # 运行容器，将本地代码仓库挂载到容器内的 /root/Relax
-docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-infra/relaxrl:latest /bin/bash
+docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-studio/relaxrl:latest /bin/bash
 ```
 
 或者基于 Dockerfile 构建镜像：
@@ -57,13 +57,13 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-更多 Docker 发布信息请参见 [Docker README](https://github.com/redai-infra/Relax/blob/main/docker/README.md)。
+更多 Docker 发布信息请参见 [Docker README](https://github.com/redai-studio/Relax/blob/main/docker/README.md)。
 
 ### 方法 2：从源码安装
 
 ```bash
 # 克隆仓库
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 cd Relax
 
 # 安装依赖
@@ -87,7 +87,7 @@ export MEGATRON="your megatron path"
 export PYTHONPATH=your_megatron_path:$PYTHONPATH
 ```
 
-此外 Relax 依赖 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 进行权重转换。安装方式参考 [`docker/Dockerfile`](https://github.com/redai-infra/Relax/blob/main/docker/Dockerfile)，将 Bridge 源码与 Megatron-LM submodule 合并到同一目录后加入 `PYTHONPATH`：
+此外 Relax 依赖 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 进行权重转换。安装方式参考 [`docker/Dockerfile`](https://github.com/redai-studio/Relax/blob/main/docker/Dockerfile)，将 Bridge 源码与 Megatron-LM submodule 合并到同一目录后加入 `PYTHONPATH`：
 
 ```bash
 export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54

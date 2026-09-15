@@ -8,7 +8,7 @@ a claim that one algorithm is statistically superior.
 
 ## Scope and evidence boundary
 
-- Proposal: [Task 29 issue #192](https://github.com/redai-infra/Relax/issues/192)
+- Proposal: [Task 29 issue #192](https://github.com/redai-studio/Relax/issues/192)
 - Sanitized reproducibility evidence:
   [logs, expanded commands, metrics and manifest](https://github.com/zheself/Relax/releases/tag/task29-reinforcepp-evidence-c72caf1)
 - Experiment source commit: `5f7cd574372288391bb1c41ca0677422cd31e725`

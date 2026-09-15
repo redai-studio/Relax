@@ -98,7 +98,7 @@ Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three f
  └─────────────────────────────────────────────────┘
 ```
 
-All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
+All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
 
 ## Scripts
 
@@ -106,7 +106,7 @@ All three colocate sub-modes reclaim every GPU for the Actor during training. Ro
 | :---------------------------------------------- | :------------------------- | :----------------------------------------------------------------------------- |
 | `run-qwen3-4B-8xgpu-colocated.sh`               | Split (small GenRM)        | Qwen3-4B policy + small GenRM on 8 GPU; disjoint bundles, inline reward        |
 | `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split (large GenRM)        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; 8+8 disjoint shards, inline reward  |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; shared bundles, two-phase sleep-wake swap, batched reward via [`post_process_genrm_swap.py`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; shared bundles, two-phase sleep-wake swap, batched reward via [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
 | `run-qwen3-4B-8xgpu-async.sh`                   | (Fully Async)              | Independent GPU pools per role; rollout & training fully overlapped             |
 
 ### Resource Layout
@@ -268,7 +268,7 @@ On `--colocate` with GenRM, the GPU layout picks Split vs Shared automatically:
 | `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (same bundles) |
 | Anything else                                        | Rejected at startup with a clear error |
 
-Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
+Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
 :::
 
 ::: warning Set `mem_fraction_static` in Shared / Co-resident

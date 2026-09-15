@@ -10,6 +10,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.19.37",
+    "markdown-it-task-lists": "^2.1.1",
     "medium-zoom": "^1.1.0",
     "mermaid": "^10.0.0",
     "swagger-ui-dist": "^5.32.1",

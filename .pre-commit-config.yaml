@@ -26,10 +26,8 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.9
     hooks:
-      - id: ruff
-        # exclude: 'relax/xxx'
-        args: [ --fix ]
-
+      - id: ruff-check
+        args: [--fix]
       - id: ruff-format
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.9
@@ -59,7 +57,8 @@ repos:
       - id: check-conflict-markers
         name: check-conflict-markers
         entry: python .pre-commit-hooks/check_conflict_markers.py
-        language: system
+        language: python
+        language_version: python3
         types: [text]
         exclude: |
             (?x)^(
@@ -68,14 +67,14 @@ repos:
       - id: format-ascii-boxes
         name: format-ascii-boxes
         entry: python .pre-commit-hooks/format_ascii_boxes.py
-        language: system
+        language: python
+        language_version: python3
         files: \.md$
-
-  # Gitleaks - Secret detection
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.24.2
-    hooks:
       - id: gitleaks
+        name: gitleaks
         entry: python .pre-commit-hooks/gitleaks_tracked.py
+        language: python
+        language_version: python3
+        additional_dependencies: ["nogoo9-gitleaks==8.30.1"]
         always_run: true
         pass_filenames: false

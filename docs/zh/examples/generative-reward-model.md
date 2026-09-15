@@ -98,7 +98,7 @@ Relax 中 GenRM 有两种顶层部署模式：
  └─────────────────────────────────────────────────┘
 ```
 
-三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md)。
+三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 
 ## 脚本
 
@@ -106,7 +106,7 @@ Relax 中 GenRM 有两种顶层部署模式：
 | :---------------------------------------------- | :---------------------- | :-------------------------------------------------------------------------------- |
 | `run-qwen3-4B-8xgpu-colocated.sh`               | Split（小 GenRM）       | Qwen3-4B policy + 小 GenRM 共 8 GPU；不相交 bundle，inline reward                 |
 | `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split（大 GenRM）       | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；8+8 不相交分片，inline reward          |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap     | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；共享 bundle，两阶段 sleep-wake 切换，批量 reward，实现见 [`post_process_genrm_swap.py`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap     | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；共享 bundle，两阶段 sleep-wake 切换，批量 reward，实现见 [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
 | `run-qwen3-4B-8xgpu-async.sh`                   | （Fully Async）         | 每个角色独占 GPU 池；rollout 与训练完全并行                                       |
 
 ### 资源分配
@@ -267,7 +267,7 @@ python3 relax/entrypoints/train.py \
 | `rollout_num_gpus == genrm_num_gpus == actor_total`   | **Shared**（同一批 bundle）             |
 | 其他                                                  | 启动时报错拒绝                          |
 
-Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。何时优先 defer-swap 见 [示例 README](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md)。
+Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 :::
 
 ::: warning Shared / Co-resident 必须设置 `mem_fraction_static`

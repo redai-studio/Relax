@@ -45,5 +45,5 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 ## 源码
 
-- 实现：[`relax/components/genrm.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/genrm.py)
-- 基类：[`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- 实现：[`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- 基类：[`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

@@ -39,5 +39,5 @@ In fully-async mode, the Rollout service coordinates with the Actor for weight u
 
 ## Source
 
-- Implementation: [`relax/components/rollout.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/rollout.py)
-- Base class: [`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- Implementation: [`relax/components/rollout.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/rollout.py)
+- Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)
