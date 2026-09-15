@@ -168,7 +168,7 @@ def generate_rollout(
             _ACTIVE_STEP = state
         try:
             _log_reward_environment(rollout_id, "rollout_start")
-            from examples.osworld_agentic.fixed_task_retry import install_prepare_retry
+            from examples.osworld_agentic.training.sandbox import install_prepare_retry
             from relax.agentic.rollout import get_agentic_resident_pipeline
 
             install_prepare_retry(get_agentic_resident_pipeline().runtime_domain)

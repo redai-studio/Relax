@@ -6,7 +6,7 @@ rollout session 独占一台虚拟桌面，agent 靠截图 + pyautogui / MCP 操
 
 |              |                                                                                           |
 | ------------ | ----------------------------------------------------------------------------------------- |
-| 训练入口     | `launch_fixed12_minibatch3.sh`（12 任务，96 条 session，3 次更新）                        |
+| 训练入口     | `launch.sh`（12 任务，96 条 session，3 次更新）                                           |
 | agent 子进程 | `app/agent.py`，由 Relax 以 `python -m app.agent --input-json ... --output-json ...` 拉起 |
 | session 配置 | `app/osworld_config_t30i2.yaml`（可被 `OSWORLD_CONFIG_PATH` 覆盖）                        |
 | 参考硬件     | 8 x H20（97871 MiB），2 NUMA node                                                         |
@@ -85,7 +85,7 @@ ______________________________________________________________________
 先启动可用的 Ray 集群，再从仓库根目录运行：
 
 ```bash
-bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
+bash examples/osworld_agentic/launch.sh
 ```
 
 入口默认从 base 模型和新 optimizer 开始，跑 10 个 rollout step，不执行独立 eval；
@@ -95,24 +95,24 @@ bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
 每步覆盖全部 12 个任务，每任务采样 8 条，96 条 session 分为 3 个原生 optimizer batch，
 每条样本训练一次。`NUM_ROLLOUT` 可调整步数，`OSWORLD_LEARNING_RATE` 默认 `1e-6`。
 
-`train_fixed_tasks.py` 接入固定任务数据源和整组补采；`train_fixed12_minibatch3.py`
+`train.py` 接入固定任务数据源和整组补采；`train.py`
 校验 96/32 的分批设置。
 公用的 `run_qwen3vl_8B_osworld_outcome.sh` 负责模型、训练参数和 Ray 提交。
 
 ### 每轮一次更新，训练 100 步
 
-设置 `OSWORLD_NATIVE_MINIBATCH3=0` 后，96 条 session 合成一个 global batch，
+设置 `OSWORLD_UPDATES_PER_ROLLOUT=1` 后，96 条 session 合成一个 global batch，
 每个 rollout step 只执行一次 optimizer 更新，每条样本仍只训练一次。
-此模式使用 `train_fixed_tasks.py`；默认三批模式保持不变。
+此模式使用 `train.py`；默认三批模式保持不变。
 
 先在 `env.sh` 中设置新的 `SAVE_DIR`，并确保它不会覆盖下面的环境变量，再执行：
 
 ```bash
 unset OSWORLD_RESUME_DIR RESUME_FROM_SAVE
-OSWORLD_NATIVE_MINIBATCH3=0 \
+OSWORLD_UPDATES_PER_ROLLOUT=1 \
 NUM_ROLLOUT=100 \
 OSWORLD_LR_DECAY_ITERS=100 \
-bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
+bash examples/osworld_agentic/launch.sh
 ```
 
 这个入口从 base 模型和新 optimizer 开始，不执行独立 eval。
@@ -195,3 +195,23 @@ ______________________________________________________________________
 
 - Agentic rollout 在 session 内复用截图张量，按完整任务组分批传入 TensorQueue，传输后释放源端像素，降低 CPU 内存峰值。
 - `RECOMPUTE_GRANULARITY` 默认 `selective`。可按显存需求改为 `full`，结合 `RECOMPUTE_METHOD` 和 `RECOMPUTE_NUM_LAYERS` 配置重算。
+
+## Task set and update count
+
+| Variable                      | Values                         | Meaning                                                                       |
+| ----------------------------- | ------------------------------ | ----------------------------------------------------------------------------- |
+| `OSWORLD_TASK_SET`            | `fixed12` (default) / `full74` | Which task set to train on                                                    |
+| `OSWORLD_UPDATES_PER_ROLLOUT` | `1` / `3`                      | Optimizer updates per rollout; defaults to 3 for `fixed12` and 1 for `full74` |
+
+`fixed12` selects 12 tasks through `scripts/manifests/train_fixed12.txt` and builds
+`${DATA_DIR}/osworld/fixed12/train.parquet`. `full74` reuses the existing
+`${DATA_DIR}/osworld/data/train.parquet` and fails fast when that file is missing,
+because rebuilding without a manifest would emit every discovered task rather than 74.
+
+Each rollout samples `ROLLOUT_BATCH_SIZE x 8` trajectories and splits them into whole
+GRPO groups. Three updates means those samples are trained in three batches, each sample
+once, not the same batch three times. The launcher refuses combinations that cannot be
+split evenly, such as `full74` with three updates.
+
+`OSWORLD_NATIVE_MINIBATCH3=0/1` still maps to 1/3 updates; an explicit
+`OSWORLD_UPDATES_PER_ROLLOUT` wins.

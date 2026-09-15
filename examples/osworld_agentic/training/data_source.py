@@ -5,7 +5,7 @@ from relax.engine.rollout.data_source import RolloutDataSourceWithBuffer
 from relax.utils.types import Sample
 
 
-class FixedTaskDataSource(RolloutDataSourceWithBuffer):
+class OSWorldTaskDataSource(RolloutDataSourceWithBuffer):
     """Bound each rollout to one dataset pass; never replace a dropped
     group."""
 

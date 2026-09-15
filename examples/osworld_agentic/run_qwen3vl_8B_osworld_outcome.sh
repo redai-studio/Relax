@@ -176,12 +176,16 @@ ROLLOUT_ARGS=(
 # Opt in to one complete, ordered task set per synchronous rollout.
 # The example entry point selects custom hooks after framework argument parsing.
 TRAIN_ENTRYPOINT=(relax/entrypoints/train.py)
-if [ "${OSWORLD_FIXED_TASK_BATCH:-0}" = "1" ]; then
-    TRAIN_ENTRYPOINT=(-m examples.osworld_agentic.train_fixed_tasks)
-  if [ "${OSWORLD_NATIVE_MINIBATCH3:-0}" = "1" ]; then
-    TRAIN_ENTRYPOINT=(-m examples.osworld_agentic.train_fixed12_minibatch3)
-    ROLLOUT_ARGS+=(--num-steps-per-rollout 3)
+if [ "${OSWORLD_TASK_SET_MODE:-${OSWORLD_FIXED_TASK_BATCH:-0}}" = "1" ]; then
+  TRAIN_ENTRYPOINT=(-m examples.osworld_agentic.train)
+  if [ -n "${OSWORLD_UPDATES_PER_ROLLOUT:-}" ]; then
+    TRAIN_UPDATES="${OSWORLD_UPDATES_PER_ROLLOUT}"
+  elif [ "${OSWORLD_NATIVE_MINIBATCH3:-0}" = "1" ]; then
+    TRAIN_UPDATES=3
+  else
+    TRAIN_UPDATES=1
   fi
+  ROLLOUT_ARGS+=(--num-steps-per-rollout "${TRAIN_UPDATES}")
 else
     ROLLOUT_ARGS+=(--rollout-shuffle --use-streaming-dataset)
 fi

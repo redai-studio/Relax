@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Fixed 12 tasks x 8 sessions: three updates by default; set OSWORLD_NATIVE_MINIBATCH3=0 for one.
+# OSWorld task-set training: OSWORLD_TASK_SET picks the task set, OSWORLD_UPDATES_PER_ROLLOUT the update count.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [ ! -f "${SCRIPT_DIR}/env.sh" ] || source "${SCRIPT_DIR}/env.sh"
@@ -26,27 +26,63 @@ export PYTHONUNBUFFERED=1 CUDA_DEVICE_MAX_CONNECTIONS=1
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}" MASTER_PORT="${MASTER_PORT:-23456}"
 export RAY_ADDRESS="${RAY_ADDRESS:-auto}" RELAX_ENTRYPOINT_MODE=existing
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
-export OSWORLD_RUN_TAG="${OSWORLD_RUN_TAG:-osworld-fixed12-$(date +%Y%m%d-%H%M%S)}"
+export OSWORLD_TASK_SET="${OSWORLD_TASK_SET:-fixed12}"
+case "${OSWORLD_TASK_SET}" in
+  fixed12)
+    OSWORLD_TASK_COUNT=12
+    OSWORLD_TASK_DEFAULT_UPDATES=3
+    OSWORLD_TASK_MANIFEST="${SCRIPT_DIR}/scripts/manifests/train_fixed12.txt"
+    OSWORLD_TASK_DATA_DEFAULT="${DATA_DIR}/osworld/fixed12/train.parquet"
+    ;;
+  full74)
+    OSWORLD_TASK_COUNT=74
+    OSWORLD_TASK_DEFAULT_UPDATES=1
+    OSWORLD_TASK_MANIFEST=""
+    OSWORLD_TASK_DATA_DEFAULT="${DATA_DIR}/osworld/data/train.parquet"
+    ;;
+  *) echo "OSWORLD_TASK_SET must be fixed12 or full74." >&2; exit 1 ;;
+esac
+export OSWORLD_RUN_TAG="${OSWORLD_RUN_TAG:-osworld-${OSWORLD_TASK_SET}-$(date +%Y%m%d-%H%M%S)}"
 if [ -n "${OSWORLD_TRAIN_DATA:-}" ] && [ ! -s "${OSWORLD_TRAIN_DATA}" ]; then
   echo "OSWORLD_TRAIN_DATA must point to an existing task parquet." >&2
   exit 1
 fi
-export OSWORLD_TRAIN_DATA="${OSWORLD_TRAIN_DATA:-${DATA_DIR}/osworld/fixed12/train.parquet}"
+export OSWORLD_TRAIN_DATA="${OSWORLD_TRAIN_DATA:-${OSWORLD_TASK_DATA_DEFAULT}}"
 if [ ! -s "${OSWORLD_TRAIN_DATA}" ]; then
+  if [ -z "${OSWORLD_TASK_MANIFEST}" ]; then
+    echo "OSWORLD_TASK_SET=${OSWORLD_TASK_SET} expects an existing ${OSWORLD_TRAIN_DATA}." >&2
+    echo "Rebuilding without a manifest would emit every discovered task, not ${OSWORLD_TASK_COUNT}." >&2
+    exit 1
+  fi
   python3 "${SCRIPT_DIR}/scripts/prepare_data.py" \
     --input-dir "${OSWORLD_TASK_DIR:-${OSWORLD_REPO}/evaluation_examples}" \
     --output-dir "$(dirname -- "${OSWORLD_TRAIN_DATA}")" \
-    --train-manifest "${SCRIPT_DIR}/scripts/manifests/train_fixed12.txt" \
-    --eval-manifest "${SCRIPT_DIR}/scripts/manifests/train_fixed12.txt"
+    --train-manifest "${OSWORLD_TASK_MANIFEST}" \
+    --eval-manifest "${OSWORLD_TASK_MANIFEST}"
 fi
-export OSWORLD_FIXED_TASK_BATCH=1 OSWORLD_DISABLE_EVAL=1
-export OSWORLD_NATIVE_MINIBATCH3="${OSWORLD_NATIVE_MINIBATCH3:-1}"
-export ROLLOUT_BATCH_SIZE=12 N_SAMPLES_PER_PROMPT=8
-case "${OSWORLD_NATIVE_MINIBATCH3}" in
-  0) export GLOBAL_BATCH_SIZE=96; OSWORLD_DEFAULT_LR_DECAY_ITERS=45 ;;
-  1) export GLOBAL_BATCH_SIZE=32; OSWORLD_DEFAULT_LR_DECAY_ITERS=135 ;;
-  *) echo "OSWORLD_NATIVE_MINIBATCH3 must be 0 (one update) or 1 (three updates)." >&2; exit 1 ;;
+export OSWORLD_TASK_SET_MODE=1 OSWORLD_DISABLE_EVAL=1
+# Each task set has its own default; the previous boolean still selects 1 or 3.
+if [ -z "${OSWORLD_UPDATES_PER_ROLLOUT:-}" ]; then
+  case "${OSWORLD_NATIVE_MINIBATCH3:-}" in
+    "") OSWORLD_UPDATES_PER_ROLLOUT="${OSWORLD_TASK_DEFAULT_UPDATES}" ;;
+    0) OSWORLD_UPDATES_PER_ROLLOUT=1 ;;
+    1) OSWORLD_UPDATES_PER_ROLLOUT=3 ;;
+    *) echo "OSWORLD_NATIVE_MINIBATCH3 must be 0 or 1." >&2; exit 1 ;;
+  esac
+fi
+export OSWORLD_UPDATES_PER_ROLLOUT
+export ROLLOUT_BATCH_SIZE="${OSWORLD_TASK_COUNT}" N_SAMPLES_PER_PROMPT=8
+case "${OSWORLD_UPDATES_PER_ROLLOUT}" in
+  1) OSWORLD_DEFAULT_LR_DECAY_ITERS=45 ;;
+  3) OSWORLD_DEFAULT_LR_DECAY_ITERS=135 ;;
+  *) echo "OSWORLD_UPDATES_PER_ROLLOUT must be 1 or 3." >&2; exit 1 ;;
 esac
+OSWORLD_ROLLOUT_SAMPLES=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
+if [ $((OSWORLD_ROLLOUT_SAMPLES % (OSWORLD_UPDATES_PER_ROLLOUT * N_SAMPLES_PER_PROMPT))) -ne 0 ]; then
+  echo "OSWORLD_TASK_SET=${OSWORLD_TASK_SET} cannot split ${OSWORLD_ROLLOUT_SAMPLES} samples into ${OSWORLD_UPDATES_PER_ROLLOUT} batches of whole groups." >&2
+  exit 1
+fi
+export GLOBAL_BATCH_SIZE=$((OSWORLD_ROLLOUT_SAMPLES / OSWORLD_UPDATES_PER_ROLLOUT))
 export NUM_ROLLOUT="${NUM_ROLLOUT:-10}" NUM_EPOCH="${NUM_ROLLOUT:-10}"
 # Preserve the default 45-rollout cosine horizon in optimizer-update units.
 export OSWORLD_LR_DECAY_ITERS="${OSWORLD_LR_DECAY_ITERS:-${OSWORLD_DEFAULT_LR_DECAY_ITERS}}"
