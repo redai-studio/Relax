@@ -1742,6 +1742,8 @@ def _compute_server_args(
 
     if args.use_rollout_routing_replay:
         kwargs["enable_return_routed_experts"] = True
+    if getattr(args, "use_rollout_indexer_replay", False):
+        kwargs["enable_return_indexer_topk"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]

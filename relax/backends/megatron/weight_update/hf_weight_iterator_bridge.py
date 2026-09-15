@@ -4,6 +4,7 @@ import dataclasses
 import re
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
@@ -37,8 +38,47 @@ logger = get_logger(__name__)
 
 _NON_BLOCKING = device_utils.use_non_blocking_copy()
 
-# Weight names that must appear in the same chunk for SGLang's MLA fusion.
-_MLA_PAIRED_SUFFIXES = ("q_a_proj.weight", "kv_a_proj_with_mqa.weight")
+# Name fragments that SGLang fuses pairwise inside a single load_weights() call,
+# so both halves must land in the same sync chunk:
+#   - MLA HF-style : q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
+#   - MLA DSv4-native: wq_a + wkv -> wqkv_a (deepseek_v4.py `fuse_wqa_wkv`)
+#   - DSv4 compressor: wkv + wgate (deepseek_v4.py COMPRESSOR_PART)
+# Each of those asserts its pending-pair cache is empty when the call ends.
+#
+# Matching replaces the fragment with a sentinel, so the REST of the name -- the
+# `.weight` vs `.weight_scale_inv` tail included -- becomes the pairing key. That
+# matters: quantize_params_fp8 emits weight and scale adjacently, so keying on a
+# stripped suffix alone would pair wq_a.weight with wq_a.weight_scale_inv instead
+# of with its wkv counterpart.
+#
+# Longest fragment wins, because ".wkv." is a substring of ".compressor.wkv.".
+_FUSED_PAIR_FRAGMENTS = (
+    (".q_a_proj.", ".kv_a_proj_with_mqa."),
+    (".wq_a.", ".wkv."),
+    (".compressor.wkv.", ".compressor.wgate."),
+)
+_PAIR_SENTINEL = "\x00"
+
+
+def _fused_pair_key(name: str) -> str | None:
+    """Key that both halves of a fused pair map to, or None if `name` is not
+    one.
+
+    The sentinel carries the pair index, because two different families can
+    leave identical text around their fragment: replacing ".wq_a." in
+    `layers.N.attn.wq_a.weight` and ".compressor.wkv." in
+    `layers.N.attn.compressor.wkv.weight` both yield `layers.N.attn<S>weight`,
+    which would let a q_a half pair with a compressor half.
+    """
+    best = None  # (fragment, pair_index)
+    for index, pair in enumerate(_FUSED_PAIR_FRAGMENTS):
+        for fragment in pair:
+            if fragment in name and (best is None or len(fragment) > len(best[0])):
+                best = (fragment, index)
+    if best is None:
+        return None
+    fragment, index = best
+    return name.replace(fragment, f"{_PAIR_SENTINEL}{index}{_PAIR_SENTINEL}", 1)
 
 
 class HfWeightIteratorBridge(HfWeightIteratorBase):
@@ -47,10 +87,18 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bridge_converter = BridgeConverter(
             args=self.args, model=self.model, quantization_config=self.quantization_config
         )
+        # All ranks must initialize Bridge tasks before buffer filtering because
+        # task construction contains PP collectives.
+        self._bridge_converter.init_tasks()
         self.lora_merge_mode = is_lora_enabled(self.args) and is_lora_merge_mode(self.args)
         self.lora_adapter_mode = is_lora_enabled(self.args) and is_lora_adapter_mode(self.args)
         collect_adapters = self.lora_merge_mode or self.lora_adapter_mode
-        buckets_result = _build_param_info_buckets(self.args, self.model, collect_adapters=collect_adapters)
+        buckets_result = _build_param_info_buckets(
+            self.args,
+            self.model,
+            buffer_is_mapped=self._bridge_converter.can_convert,
+            collect_adapters=collect_adapters,
+        )
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
@@ -229,7 +277,7 @@ def _adapter_base_prefix(name):
     return name.replace(".adapter.linear_in.weight", "").replace(".adapter.linear_out.weight", "")
 
 
-def _build_param_info_buckets(args, model, collect_adapters=False):
+def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], bool], collect_adapters=False):
     """Build ParamInfo buckets and vanilla-key mapping at init time.
 
     Exchanges parameter metadata across PP/EP ranks so every rank knows about
@@ -253,13 +301,15 @@ def _build_param_info_buckets(args, model, collect_adapters=False):
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     ep_size = mpu.get_expert_model_parallel_world_size()
 
-    vanilla_iter = named_params_and_buffers(args, model, convert_to_global_name=False)
-    global_iter = named_params_and_buffers(args, model, convert_to_global_name=True)
+    vanilla_iter = named_params_and_buffers(args, model, convert_to_global_name=False, include_persistent_buffers=True)
+    global_iter = named_params_and_buffers(args, model, convert_to_global_name=True, include_persistent_buffers=True)
 
     local_infos = {}
     vanilla_key_map = {}
     adapter_map: dict[str, dict[str, str]] = {}
     for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+        if not isinstance(v_param, torch.nn.Parameter) and not buffer_is_mapped(g_name):
+            continue
         if collect_adapters and is_lora_adapter_param(g_name):
             # LoRA adapter param: keep it out of the conversion buckets (no standalone
             # bridge mapping) and record its vanilla key for load-time merging.
@@ -658,32 +708,28 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group)
 
 
 def _chunk_with_mla_pairing(named_params, chunk_size):
-    """Chunk weights by size while keeping MLA weight pairs together.
+    """Chunk weights by size while keeping fused weight pairs together.
 
-    SGLang's ``do_load_weights`` fuses ``q_a_proj`` and ``kv_a_proj_with_mqa``
-    into ``fused_qkv_a_proj_with_mqa`` using a per-call ``cached_a_proj`` dict.
-    Each chunk triggers a separate ``load_weights`` call, so the two weights
-    **must** be in the same chunk for the fusion to succeed.
+    SGLang fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` into
+    ``fused_qkv_a_proj_with_mqa``, and the DSv4 compressor's ``wkv`` + ``wgate``
+    into one param, each via a per-call cache dict. Every chunk triggers a
+    separate ``load_weights`` call, so both halves **must** be in the same chunk
+    -- DSv4 even asserts its cache is empty when the call ends.
 
-    Strategy: buffer any unpaired MLA weight and flush it together with its
-    partner when the partner arrives.  All other weights pass through to the
-    normal size-based chunking logic.
+    Strategy: buffer any unpaired half and flush it together with its partner
+    when the partner arrives.  All other weights pass through to the normal
+    size-based chunking logic.
     """
     bucket: list[tuple[str, torch.Tensor]] = []
     bucket_size = 0
-    pending_mla: OrderedDict[str, tuple[str, torch.Tensor]] = OrderedDict()
+    pending_pairs: OrderedDict[str, tuple[str, torch.Tensor]] = OrderedDict()
 
     for name, tensor in named_params:
-        is_mla = any(name.endswith(suffix) for suffix in _MLA_PAIRED_SUFFIXES)
+        pair_key = _fused_pair_key(name)
 
-        if is_mla:
-            for suffix in _MLA_PAIRED_SUFFIXES:
-                if name.endswith(suffix):
-                    layer_key = name[: -len(suffix)]
-                    break
-
-            if layer_key in pending_mla:
-                partner_name, partner_tensor = pending_mla.pop(layer_key)
+        if pair_key is not None:
+            if pair_key in pending_pairs:
+                partner_name, partner_tensor = pending_pairs.pop(pair_key)
                 pair = [(partner_name, partner_tensor), (name, tensor)]
                 pair_size = partner_tensor.nbytes + tensor.nbytes
 
@@ -695,7 +741,7 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
                 bucket.extend(pair)
                 bucket_size += pair_size
             else:
-                pending_mla[layer_key] = (name, tensor)
+                pending_pairs[pair_key] = (name, tensor)
         else:
             obj_size = tensor.nbytes
             if bucket and (bucket_size + obj_size) >= chunk_size:
@@ -706,9 +752,9 @@ def _chunk_with_mla_pairing(named_params, chunk_size):
             bucket.append((name, tensor))
             bucket_size += obj_size
 
-    for layer_key, (name, tensor) in pending_mla.items():
+    for pair_key, (name, tensor) in pending_pairs.items():
         if dist.get_rank() == 0:
-            logger.warning("[Bridge Export] Unpaired MLA weight: %s (layer_key=%s)", name, layer_key)
+            logger.warning("[Bridge Export] Unpaired fused weight: %s (pair_key=%r)", name, pair_key)
         obj_size = tensor.nbytes
         if bucket and (bucket_size + obj_size) >= chunk_size:
             yield bucket

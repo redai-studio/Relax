@@ -1,3 +1,19 @@
+diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/c_plan.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/c_plan.cuh
+index c86b921354..5e9164717b 100644
+--- a/python/sglang/kernels/jit/csrc/deepseek_v4/c_plan.cuh
++++ b/python/sglang/kernels/jit/csrc/deepseek_v4/c_plan.cuh
+@@ -150,11 +150,6 @@ __global__ __launch_bounds__(1024, 1)  //
+     counter_c = 0;
+     counter_w = 0;
+   }
+-  if (tx < kNumWarps) {
+-    warp_max[tx] = 0;
+-    warp_min[tx] = 0xFFFFFFFFu;
+-  }
+-
+   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
+   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
+   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
 diff --git a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py b/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
 index 610267b..c592353 100644
 --- a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
@@ -1530,7 +1546,7 @@ index a45d122f..0334e353 100755
          ):
              # Even the last remaining request cannot fit in memory.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a9615a14..3fa13809 100644
+index a9615a14c5..aca7bd7061 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
@@ -1550,7 +1566,16 @@ index a9615a14..3fa13809 100644
      UpdateWeightFromDiskReqInput,
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
-@@ -1539,6 +1542,10 @@ class Scheduler(
+@@ -280,6 +283,8 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.speculative.dflash_utils import validate_dflash_request
+ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
++from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
++from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
+ from sglang.srt.utils import (
+     DynamicGradMode,
+     configure_gc_logger,
+@@ -1539,6 +1544,10 @@ class Scheduler(
                      UpdateWeightsFromIPCReqInput,
                      self.weight_updater.update_weights_from_ipc,
                  ),
@@ -1561,7 +1586,7 @@ index a9615a14..3fa13809 100644
                  (
                      GetWeightsByNameReqInput,
                      self.weight_updater.get_weights_by_name,
-@@ -1571,6 +1578,10 @@ class Scheduler(
+@@ -1571,6 +1580,10 @@ class Scheduler(
                      LoadLoRAAdapterFromTensorsReqInput,
                      self.load_lora_adapter_from_tensors,
                  ),
@@ -1572,7 +1597,16 @@ index a9615a14..3fa13809 100644
                  (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                  (PauseGenerationReqInput, self.pause_generation),
                  (ContinueGenerationReqInput, self.continue_generation),
-@@ -4457,6 +4468,12 @@ class Scheduler(
+@@ -1627,6 +1640,8 @@ class Scheduler(
+         self.tree_cache.release_host_resources()
+         if self.decode_offload_manager is not None:
+             self.decode_offload_manager.release_host_resources()
++        destroy_global_experts_capturer()
++        destroy_global_indexer_capturer()
+ 
+     def run_event_loop(self) -> None:
+         """Run the scheduler's event loop.
+@@ -4457,6 +4472,12 @@ class Scheduler(
                  # The request will still run one decode forward pass.
                  # Then we reuse all existing code to clean up the KV cache allocation.
                  logger.debug(f"Abort running request. {req.rid=}")
@@ -1585,7 +1619,7 @@ index a9615a14..3fa13809 100644
                  req.to_finish = FINISH_ABORT()
  
      def _pause_engine(self) -> Tuple[List[Req], int]:
-@@ -4669,6 +4686,14 @@ class Scheduler(
+@@ -4669,6 +4690,14 @@ class Scheduler(
          result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
          return result
  
@@ -2174,6 +2208,176 @@ index 08c47b99..06a222fe 100644
              q, k, v, gate = self.forward_prepare_fused_gate(
                  positions=positions,
                  hidden_states=hidden_states,
+
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 65dd555499..655d905df9 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -538,11 +538,17 @@ class MqaAttentionBase(nn.Module):
+         self.rope_base = (
+             config.compress_rope_theta if self.compress_ratio else rope_theta
+         )
+-        original_seq_len: int = (
+-            rope_original_seq_len
+-            if rope_original_seq_len is not None
+-            else scaling["original_max_position_embeddings"]
+-        )
++        # PR #34788: YaRN only on compressed layers; pure SWA (compress_ratio==0)
++        # uses original_seq_len=0 so precompute_freqs_cis yields the plain
++        # unscaled RoPE. Upstream #25144 made this unconditional, which applied
++        # YaRN to sliding-window-only layers as well.
++        original_seq_len: int
++        if rope_original_seq_len is not None:
++            original_seq_len = rope_original_seq_len
++        elif self.compress_ratio:
++            original_seq_len = scaling["original_max_position_embeddings"]
++        else:
++            original_seq_len = 0
+         freqs_cis = precompute_freqs_cis(
+             dim=self.qk_rope_head_dim,
+             seqlen=config.max_position_embeddings,
+@@ -567,6 +573,22 @@ class MqaAttentionBase(nn.Module):
+             self._attn_sink_local = sink
+         return self._attn_sink_local
+ 
++    def refresh_attn_sink_cache(self):
++        # ``_local_attn_sink`` caches the rank-local slice on first use and never
++        # invalidates it, so a weight update would keep serving the stale copy.
++        # Refresh in place (not by dropping the cache) because the tensor may
++        # already be baked into a captured CUDA graph.
++        if self.attn_tp_size == 1:
++            return
++        num_heads = self.n_local_heads
++        if self._attn_sink_local is None:
++            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
++            self._attn_sink_local = self.attn_sink.new_zeros(padded_num_heads)
++        rank = self.attn_tp_rank
++        self._attn_sink_local[:num_heads].copy_(
++            self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
++        )
++
+     @contextmanager
+     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+         ctx = get_cp_decode_attn_tp_ctx()
+@@ -619,14 +641,21 @@ class MQALayer(MqaAttentionBase):
+             compress_ratio=compress_ratio_override,
+         )
+ 
+-        if self.rope_scaling:
+-            self.rope_scaling["rope_type"] = "deepseek_yarn"
++        # PR #34788: layer-level RoPE. Pure SWA layers (compress_ratio==0) use
++        # plain unscaled RoPE; only C4/C128 compressed layers use the compressed
++        # YaRN RoPE. Copy instead of mutating, because get_rope_config returns
++        # the config's own dict -- mutating it leaks "deepseek_yarn" into the
++        # SWA layers built after the first compressed one.
++        active_rope_scaling = None
++        if self.compress_ratio and self.rope_scaling:
++            active_rope_scaling = dict(self.rope_scaling)
++            active_rope_scaling["rope_type"] = "deepseek_yarn"
+         self.rotary_emb = get_rope_wrapper(
+             head_size=self.rope_head_dim,
+             rotary_dim=self.rope_head_dim,
+             max_position=config.max_position_embeddings,
+             base=self.rope_base,
+-            rope_scaling=self.rope_scaling,
++            rope_scaling=active_rope_scaling,
+             is_neox_style=False,
+             device=get_device().device,
+         )
+@@ -854,8 +883,6 @@ class MQALayer(MqaAttentionBase):
+                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+             )
+ 
+-        del qkv_a
+-
+         if self.compressor is not None:
+             with torch.cuda.stream(stream_compressor):
+                 attn_backend.forward_core_compressor(
+@@ -866,6 +893,7 @@ class MQALayer(MqaAttentionBase):
+         current_stream.wait_stream(stream_kv)
+         current_stream.wait_stream(stream_compressor)
+         current_stream.wait_stream(stream_indexer)
++        del qkv_a
+ 
+         return q
+ 
+@@ -1854,7 +1882,9 @@ class DeepseekV4DecoderLayer(nn.Module):
+             )
+             if _do_shared_local and local_hidden_states.shape[0] > 0:
+                 _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
++            # self_attn has already reduced across attention TP, so these hidden
++            # states are replicated and must not be summed by a partial gather.
++            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
+         if _use_tp_attn_a2a_scatter:
+             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
+@@ -2372,7 +2402,10 @@ class DeepseekV4Model(nn.Module):
+             )
+             # Token ids are replicated within an attention-TP group. Use replicate
+             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
+-            dp_gather_replicate(input_ids_global, input_ids[:, None], forward_batch)
++            # Clone because the MAX_LEN gather may zero its local input in place.
++            dp_gather_replicate(
++                input_ids_global, input_ids[:, None].clone(), forward_batch
++            )
+             input_ids_global = input_ids_global.squeeze(-1)
+         else:
+             input_ids_global = input_ids
+@@ -2688,6 +2721,7 @@ class DeepseekV4ForCausalLM(nn.Module):
+             ):
+                 self_attn.indexer.compressor.apply_ape_hotfix()
+             layer.refresh_mhc_norm_weight_cache()
++            self_attn.refresh_attn_sink_cache()
+ 
+     @staticmethod
+     def remap_weight_name_to_dpsk_hf_format(
+@@ -3160,9 +3194,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 for skipped_checking_pattern in skipped_checking_patterns
+             )
+         }
+-        if unloaded_params:
++        # Relax syncs weights in ~1GB chunks and load_weights() runs once per chunk, so
++        # `unloaded_params` then means "everything not in this chunk" -- ~1457 names per
++        # call, tens of thousands of calls, 1.8GB of log for one run. Keep the check for
++        # the full initial load (where it is a real integrity signal) and bound the text.
++        if unloaded_params and len(loaded_params) * 2 >= len(params_dict):
+             logger.warning(
+-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
++                "Some weights are not initialized from checkpoints: %d of %d, e.g. %s",
++                len(unloaded_params),
++                len(params_dict),
++                sorted(unloaded_params)[:8],
+             )
+ 
+         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+diff --git a/python/sglang/srt/models/deepseek_v4_nextn.py b/python/sglang/srt/models/deepseek_v4_nextn.py
+index f8d0395247..bfadeff15a 100644
+--- a/python/sglang/srt/models/deepseek_v4_nextn.py
++++ b/python/sglang/srt/models/deepseek_v4_nextn.py
+@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
+     is_dsa_prefill_cp_round_robin_split,
+ )
+ from sglang.srt.layers.dp_attention import (
+-    dp_gather_partial,
++    dp_gather_replicate,
+     get_global_dp_buffer_len,
+     is_dp_attention_enabled,
+ )
+@@ -162,7 +162,12 @@ class DeepseekV4ModelNextN(nn.Module):
+                 dtype=input_ids.dtype,
+                 device=input_ids.device,
+             )
+-            dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
++            # Token IDs are replicated within an attention-TP group. Use replicate
++            # gather to avoid summing duplicated IDs when attention_tp_size > 1.
++            # Clone because the MAX_LEN gather may zero its local input in place.
++            dp_gather_replicate(
++                input_ids_global, input_ids[:, None].clone(), forward_batch
++            )
+             input_ids_global = input_ids_global.squeeze(-1)
+         else:
+             input_ids_global = input_ids
 diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
 index 83697f14..aae8b5c8 100644
 --- a/python/sglang/srt/models/qwen3_vl.py
@@ -2451,4 +2655,239 @@ index 6636d06a..53142e01 100644
 +        "Relax.",
          "torch_npu.",
      }
+ 
+diff --git a/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
+index e2a60a21acf5..af01f8a11f06 100644
+--- a/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsa/dequant_k_cache.py
+@@ -134,7 +134,7 @@ def _dequantize_k_cache_fast_kernel(
+     DIM_NOPE: tl.constexpr,
+     DIM_ROPE: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+@@ -249,8 +249,8 @@ def _dequantize_k_cache_paged_kernel(
+     DIM_NOPE: tl.constexpr,
+     DIM_ROPE: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
+-    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int32)
++    token_id = tl.program_id(0).to(tl.int64)
++    token_id_paged = tl.load(page_table_1_ptr + token_id).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+diff --git a/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py b/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
+index 5454071b897d..adaa948e1ea8 100644
+--- a/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsa/quant_k_cache.py
+@@ -283,7 +283,7 @@ def _quantize_k_cache_fast_kernel(
+     FP8_MIN: tl.constexpr,
+     FP8_MAX: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     raw_block_id = tl.program_id(1)
+ 
+     if raw_block_id < NUM_NOPE_BLOCKS:
+diff --git a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+index 01ad58aadc08..a9b97a939613 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsv4/dequant_k_cache.py
+@@ -105,7 +105,7 @@ def _dequantize_k_cache_paged_kernel(
+ ):
+     # One program per token: load page_table[token_id] once and emit all
+     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+     page_idx = loc // PAGE_SIZE
+     in_page = loc % PAGE_SIZE
+diff --git a/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py b/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
+index 21d44f33d3f6..6cca6be04761 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
++++ b/python/sglang/kernels/ops/attention/dsv4/quant_k_cache.py
+@@ -26,7 +26,7 @@ def _quant_k_cache_fused_kernel(
+     FP8_MAX: tl.constexpr,
+     EPS: tl.constexpr,
+ ):
+-    token_id = tl.program_id(0)
++    token_id = tl.program_id(0).to(tl.int64)
+     tile_id = tl.program_id(1)
+ 
+     if tile_id == NUM_TILES:
+diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
+index 131bec476da4..d1afa4ff21c3 100644
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -168,6 +168,16 @@ if _is_hip:
+         dynamic_mxfp4_quant = e8m0_shuffle = err
+ 
+ 
++def _pad_hopper_mxfp4_scale(scale, k_size):
++    # triton_kernels' HOPPER_SCALE branch (matmul_ogs_details/_matmul_ogs.py)
++    # loads weight scales unmasked over cdiv(k_size, 128) tiles.
++    mxfp4_block = 32
++    want = round_up(k_size, 128) // mxfp4_block
++    if scale.shape[-1] >= want:
++        return scale
++    return torch.nn.functional.pad(scale, (0, want - scale.shape[-1]), value=_UE8M0_ONE)
++
++
+ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
+     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
+@@ -192,6 +202,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
+             "split_k": 1,
+         }
+         opt_flags.update_opt_flags_constraints(constraints)
++        k_size = quant_tensor.shape[-1] * 2  # packed e2m1: 2 fp4 values per byte
++        scale = _pad_hopper_mxfp4_scale(scale=scale, k_size=k_size)
+     # transpose the tensor so that the quantization axis is on dim1
+     quant_tensor = quant_tensor.transpose(-2, -1)
+     scale = scale.transpose(-2, -1)
+diff --git a/python/sglang/srt/state_capturer/base.py b/python/sglang/srt/state_capturer/base.py
+index 7bedeb4451..6f6b875784 100644
+--- a/python/sglang/srt/state_capturer/base.py
++++ b/python/sglang/srt/state_capturer/base.py
+@@ -5,10 +5,19 @@ from typing import Optional
+ import torch
+ 
+ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
++from sglang.srt.mem_cache.pool_host.common import (
++    ALLOC_MEMORY_FUNCS,
++    HostTensorAllocator,
++    _cuda_host_unregister,
++)
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.utils import is_cuda, is_hip
+ 
+ logger = logging.getLogger(__name__)
+ 
++_is_cuda = is_cuda()
++_is_hip = is_hip()
++
+ _GB = 1024 * 1024 * 1024
+ _MB = 1024 * 1024
+ 
+@@ -52,19 +61,31 @@ class BaseDeviceCache:
+ 
+ 
+ class BaseHostCache:
+-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
+-        self.buffer = torch.zeros(
++    def __init__(
++        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
++    ):
++        alloc = ALLOC_MEMORY_FUNCS[device]
++        self.buffer = alloc(
+             (num_tokens, num_layers, topk_size),
+             dtype=torch.int32,
+             device="cpu",
+             pin_memory=True,
++            allocator=HostTensorAllocator(),
+         )
++        self.buffer.zero_()
+         self.num_tokens = num_tokens
+         self.num_layers = num_layers
+         self.topk_size = topk_size
+         self.name = name
+         self._log_allocation()
+ 
++    def destroy(self):
++        if self.buffer is None:
++            return
++        if _is_cuda or _is_hip:
++            _cuda_host_unregister(self.buffer)
++        self.buffer = None
++
+     def get_buffer_size_bytes(self):
+         return get_tensor_size_bytes(self.buffer)
+ 
+@@ -115,7 +136,9 @@ class BaseTopkCapturer:
+         self.num_layers = num_layers
+         self.topk_size = topk_size
+ 
+-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
++        self.host_cache = BaseHostCache(
++            num_tokens, num_layers, topk_size, name=name, device=device
++        )
+         self.device_cache = BaseDeviceCache(
+             max_batch_size,
+             num_layers,
+@@ -127,6 +150,9 @@ class BaseTopkCapturer:
+     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+         self.device_cache.capture(layer_id, topk_indices)
+ 
++    def destroy(self):
++        self.host_cache.destroy()
++
+     def _get_local_slice(
+         self,
+         forward_batch: ForwardBatch,
+@@ -176,9 +202,10 @@ class BaseTopkCapturer:
+             forward_batch, can_run_graph, cuda_graph_batch
+         )
+         if no_copy_to_cpu:
++            # Clone before the next overlapping forward reuses these buffers.
+             return TopkCaptureOutput(
+-                out_cache_loc=forward_batch.out_cache_loc,
+-                topk=slice_gpu,
++                out_cache_loc=forward_batch.out_cache_loc.clone(),
++                topk=slice_gpu.clone(),
+                 host_cache=self.host_cache,
+             )
+         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+diff --git a/python/sglang/srt/state_capturer/indexer_topk.py b/python/sglang/srt/state_capturer/indexer_topk.py
+index de55546489..cbbe070516 100644
+--- a/python/sglang/srt/state_capturer/indexer_topk.py
++++ b/python/sglang/srt/state_capturer/indexer_topk.py
+@@ -56,6 +56,12 @@ def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
+     get_resources().indexer_capturer = capturer
+ 
+ 
++def destroy_global_indexer_capturer():
++    if (capturer := get_global_indexer_capturer()) is not None:
++        capturer.destroy()
++    set_global_indexer_capturer(None)
++
++
+ def maybe_capture_indexer_topk(
+     layer_id: int, topk_indices: Optional[torch.Tensor]
+ ) -> Optional[torch.Tensor]:
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index 1207b13f95..9619f12e14 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -149,6 +149,12 @@ def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
+     get_resources().experts_capturer = capturer
+ 
+ 
++def destroy_global_experts_capturer():
++    if (capturer := get_global_experts_capturer()) is not None:
++        capturer.destroy()
++    set_global_experts_capturer(None)
++
++
+ def extract_routed_experts_from_meta_info(data):
+     # To solve the performance issue, we return the experts_ids in base64
+     # We left this function for user to change it back to normal int32
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 15b84ed239..670ecd3ea6 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -240,7 +240,10 @@
+         return config.num_hidden_layers
+     if is_deepseek_v4(config):
+         compress_ratios = getattr(config, "compress_ratios", None) or []
+-        return sum(1 for r in compress_ratios if r == 4)
++        # Reduced checkpoints can retain trailing ratios from the full model.
++        return sum(
++            1 for r in compress_ratios[: config.num_hidden_layers] if r == 4
++        )
+     return getattr(config, "num_indexer_layers", 0)
+ 
  

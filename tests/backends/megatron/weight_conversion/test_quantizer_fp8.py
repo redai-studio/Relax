@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -71,6 +72,110 @@ qf = _load_module()
 
 
 # ---------------------------------------------------------------------------
+# Online weight-scale policy: stock TE blockwise recipe vs checkpoint metadata
+# ---------------------------------------------------------------------------
+
+
+class TestResolveOnlineWeightScaleFormat:
+    _BLOCK = [128, 128]
+
+    def test_bf16_defaults_to_pre_5392_ordinary_scales(self, monkeypatch):
+        monkeypatch.delenv("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", raising=False)
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8=None, fp8_recipe="delayed"), "ue8m0", self._BLOCK
+        )
+
+        assert resolved is None
+
+    def test_bf16_can_opt_in_to_checkpoint_ue8m0_grid(self, monkeypatch):
+        monkeypatch.setenv("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", "1")
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8=None, fp8_recipe="delayed"), "ue8m0", self._BLOCK
+        )
+
+        assert resolved == "ue8m0"
+
+    def test_bf16_rejects_invalid_ue8m0_grid_switch(self, monkeypatch):
+        monkeypatch.setenv("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", "yes")
+
+        with pytest.raises(ValueError, match="must be 0 or 1"):
+            qf._resolve_online_weight_scale_fmt(SimpleNamespace(fp8=None, fp8_recipe="delayed"), "ue8m0", self._BLOCK)
+
+    def test_blockwise_fp32_scales_override_checkpoint_ue8m0(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setenv("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", "not-read-by-fp8")
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), "ue8m0", self._BLOCK
+        )
+
+        assert resolved is None
+
+    def test_blockwise_pow2_scales_keep_checkpoint_ue8m0(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "0")
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), "ue8m0", self._BLOCK
+        )
+
+        assert resolved == "ue8m0"
+
+    @pytest.mark.parametrize("bf16_switch", ["0", "1", "not-read-by-fp8"])
+    def test_custom_recipe_does_not_follow_bf16_or_stock_blockwise_policy(self, monkeypatch, bf16_switch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setenv("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", bf16_switch)
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8="e4m3", fp8_recipe="custom"), "ue8m0", self._BLOCK
+        )
+
+        assert resolved == "ue8m0"
+
+    def test_existing_ordinary_scale_format_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setattr(
+            qf,
+            "should_deepgemm_weight_requant_ue8m0",
+            lambda **_: (_ for _ in ()).throw(AssertionError("runtime check must not run")),
+        )
+
+        resolved = qf._resolve_online_weight_scale_fmt(
+            SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), None, self._BLOCK
+        )
+
+        assert resolved is None
+
+    def test_blockwise_fp32_scales_require_matching_block_shape(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+
+        with pytest.raises(RuntimeError, match="requires a 128x128 online weight block"):
+            qf._resolve_online_weight_scale_fmt(
+                SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), "ue8m0", [64, 128]
+            )
+
+    def test_blockwise_fp32_scales_reject_packed_ue8m0_runtime(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: True)
+
+        with pytest.raises(RuntimeError, match="requires packed UE8M0 scales"):
+            qf._resolve_online_weight_scale_fmt(
+                SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), "ue8m0", self._BLOCK
+            )
+
+    def test_blockwise_fp32_scales_require_runtime_capability_check(self, monkeypatch):
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", None)
+
+        with pytest.raises(RuntimeError, match="runtime capability check is unavailable"):
+            qf._resolve_online_weight_scale_fmt(
+                SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"), "ue8m0", self._BLOCK
+            )
+
+
+# ---------------------------------------------------------------------------
 # _checkpoint_module_name: HF fused-module name resolution
 # ---------------------------------------------------------------------------
 
@@ -111,14 +216,14 @@ class TestCheckpointModuleName:
 
 class TestQuantizeByIgnoreList:
     @staticmethod
-    def _stub_quantize_param(name, param, weight_block_size):
+    def _stub_quantize_param(name, param, weight_block_size, scale_fmt=None):
         """Deterministic marker so we can assert *which* params were
         quantized."""
         return [(name, "Q"), (name.replace(".weight", ".weight_scale"), "S")]
 
     def _run(self, monkeypatch, params, ignore):
         monkeypatch.setattr(qf, "_quantize_param", self._stub_quantize_param)
-        return qf._quantize_params_fp8_by_ignore_list(params, set(ignore), weight_block_size=None)
+        return qf._quantize_params_fp8_by_ignore_list(params, set(ignore), weight_block_size=None, scale_fmt=None)
 
     def test_quantizes_eligible_and_passes_through_rest(self, monkeypatch):
         w2d = torch.zeros(4, 4, dtype=torch.float32)
@@ -177,8 +282,8 @@ class TestDispatch:
     def test_routes_to_ignore_list_when_present(self, monkeypatch):
         recorded = {}
 
-        def _recorder(converted, ignore_set, weight_block_size):
-            recorded["args"] = (converted, ignore_set, weight_block_size)
+        def _recorder(converted, ignore_set, weight_block_size, scale_fmt):
+            recorded["args"] = (converted, ignore_set, weight_block_size, scale_fmt)
             return "SENTINEL"
 
         monkeypatch.setattr(qf, "_quantize_params_fp8_by_ignore_list", _recorder)
@@ -191,10 +296,70 @@ class TestDispatch:
         )
 
         assert result == "SENTINEL"
-        got_converted, got_ignore, got_block = recorded["args"]
+        got_converted, got_ignore, got_block, got_scale_fmt = recorded["args"]
         assert got_converted is converted
         assert got_ignore == {"a.b", "c.d"}  # list -> set
         assert got_block == [128, 128]
+        assert got_scale_fmt is None
+
+    def test_blockwise_fp32_scale_policy_reaches_quantizer(self, monkeypatch):
+        recorded = {}
+
+        def _recorder(converted, ignore_set, weight_block_size, scale_fmt):
+            recorded["scale_fmt"] = scale_fmt
+            return "SENTINEL"
+
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+        monkeypatch.setattr(qf, "_quantize_params_fp8_by_ignore_list", _recorder)
+        config = {
+            **self._BASE_CONFIG,
+            "modules_to_not_convert": ["model.embed_tokens"],
+            "weight_block_size": [128, 128],
+            "scale_fmt": "ue8m0",
+        }
+
+        result = qf.quantize_params_fp8(
+            args=SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"),
+            megatron_name="whatever",
+            converted_named_params=[],
+            quantization_config=config,
+        )
+
+        assert result == "SENTINEL"
+        assert recorded["scale_fmt"] is None
+
+    def test_blockwise_fp32_scale_policy_reaches_legacy_quantizer(self, monkeypatch):
+        recorded = {}
+
+        def _recorder(name, param, weight_block_size, scale_fmt):
+            recorded["args"] = (name, param, weight_block_size, scale_fmt)
+            return [(name, "Q")]
+
+        monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+        monkeypatch.setattr(qf, "_quantize_param", _recorder)
+        weight = torch.zeros(128, 128, dtype=torch.bfloat16)
+        name = "model.layers.0.self_attn.o_proj.weight"
+        config = {
+            **self._BASE_CONFIG,
+            "weight_block_size": [128, 128],
+            "scale_fmt": "ue8m0",
+        }
+
+        result = qf.quantize_params_fp8(
+            args=SimpleNamespace(fp8="e4m3", fp8_recipe="blockwise"),
+            megatron_name="module.module.decoder.layers.0.self_attention.linear_proj.weight",
+            converted_named_params=[(name, weight)],
+            quantization_config=config,
+        )
+
+        assert result == [(name, "Q")]
+        got_name, got_weight, got_block, got_scale_fmt = recorded["args"]
+        assert got_name == name
+        assert got_weight is weight
+        assert got_block == [128, 128]
+        assert got_scale_fmt is None
 
     def test_empty_ignore_list_uses_legacy_path(self, monkeypatch):
         # An empty ``modules_to_not_convert`` is falsy -> legacy per-name matching.
@@ -230,3 +395,67 @@ class TestDispatch:
             quantization_config=dict(self._BASE_CONFIG),
         )
         assert out is converted
+
+
+# ---------------------------------------------------------------------------
+# _quantize_param: quantization grid vs runtime scale storage
+# ---------------------------------------------------------------------------
+
+
+class TestQuantizeParamScaleFormat:
+    _NAME = "model.layers.0.self_attn.q_proj.weight"
+    _BLOCK = [128, 128]
+
+    @staticmethod
+    def _weight():
+        return torch.ones(128, 128, dtype=torch.bfloat16)
+
+    def test_ue8m0_grid_is_used_on_hopper_without_packing(self, monkeypatch):
+        qweight = torch.ones(128, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(1, 1, dtype=torch.float32)
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+        monkeypatch.setattr(qf, "quant_weight_ue8m0", lambda *_a, **_k: (qweight, scale))
+        monkeypatch.setattr(
+            qf,
+            "blockwise_cast_to_fp8_triton",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must preserve the UE8M0 grid")),
+        )
+        monkeypatch.setattr(
+            qf,
+            "transform_scale_ue8m0",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Hopper stores FP32 scales")),
+        )
+
+        out = dict(qf._quantize_param(self._NAME, self._weight(), self._BLOCK, scale_fmt="ue8m0"))
+
+        assert out[self._NAME] is qweight
+        assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is scale
+
+    def test_blackwell_runtime_packs_ue8m0_scale(self, monkeypatch):
+        qweight = torch.ones(128, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(1, 1, dtype=torch.float32)
+        packed = torch.ones(1, 1, dtype=torch.int32)
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: True)
+        monkeypatch.setattr(qf, "quant_weight_ue8m0", lambda *_a, **_k: (qweight, scale))
+        monkeypatch.setattr(qf, "transform_scale_ue8m0", lambda value, mn: packed)
+
+        out = dict(qf._quantize_param(self._NAME, self._weight(), self._BLOCK))
+
+        assert out[self._NAME] is qweight
+        assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is packed
+
+    def test_plain_scale_config_keeps_legacy_quantizer(self, monkeypatch):
+        qweight = torch.ones(128, 128, dtype=torch.float8_e4m3fn)
+        scale = torch.ones(1, 1, dtype=torch.float32)
+        monkeypatch.setattr(qf, "should_deepgemm_weight_requant_ue8m0", lambda **_: False)
+        monkeypatch.setattr(qf, "blockwise_cast_to_fp8_triton", lambda *_a, **_k: (qweight, scale))
+        monkeypatch.setattr(
+            qf,
+            "quant_weight_ue8m0",
+            lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("plain scales use the legacy path")),
+        )
+
+        out = dict(qf._quantize_param(self._NAME, self._weight(), self._BLOCK))
+
+        assert out[self._NAME] is qweight
+        assert out[self._NAME.replace(".weight", ".weight_scale_inv")] is scale

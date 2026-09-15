@@ -20,6 +20,7 @@ class CanonicalMessage:
     # [{"type": "function", "function": {"name": ..., "arguments": {...}}}].
     # Passed through to the chat template unchanged.
     tool_calls: list[dict] | None = None
+    reasoning_content: str | None = None
 
     def __post_init__(self) -> None:
         if self.role not in VALID_ROLES:

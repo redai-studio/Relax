@@ -399,13 +399,17 @@ class Controller:
             raise
 
     def _cancel_pending_tasks(self) -> None:
-        """Cancel all pending service ObjectRefs to unblock the main thread.
+        """Cancel all pending service task handles to unblock the main thread.
 
         Must be called BEFORE ray.shutdown() during global restart. Without
         this, the main thread remains blocked awaiting ObjectRefs that become
         dangling after ray.shutdown(), causing a fatal C++ crash:
         ``TryReadObjectRefStream API can be used only when the stream has been
         created and not removed.``
+
+        Ray Serve task handles expose ``cancel()``; ObjectRefs require
+        ``ray.cancel()``. Use the appropriate API for each handle and report
+        cancellation failures, which can block restart recovery.
         """
         with self._pending_task_refs_lock:
             refs_to_cancel = list(self._pending_task_refs)
@@ -415,12 +419,26 @@ class Controller:
             return
 
         logger.info(f"[Global Restart] Cancelling {len(refs_to_cancel)} pending task ref(s)...")
+        cancelled = 0
         for ref in refs_to_cancel:
             try:
-                ray.cancel(ref, force=True)
+                # DeploymentResponse / DeploymentResponseGenerator carry their own
+                # cancel(); plain ObjectRefs go through ray.cancel().
+                if isinstance(ref, ray.ObjectRef):
+                    ray.cancel(ref, force=True)
+                elif hasattr(ref, "cancel"):
+                    ref.cancel()
+                else:
+                    logger.warning(
+                        f"[Global Restart] Don't know how to cancel {type(ref).__name__}; "
+                        "the main thread may stay blocked in run_all_services()"
+                    )
+                    continue
+                cancelled += 1
             except Exception as e:
-                logger.debug(f"[Global Restart] Failed to cancel task ref (may already be done): {e}")
-        logger.info("[Global Restart] All pending task refs cancelled")
+                # Cancellation failures must remain visible because they can block restart recovery.
+                logger.warning(f"[Global Restart] Failed to cancel {type(ref).__name__} (may already be done): {e!r}")
+        logger.info(f"[Global Restart] Cancelled {cancelled}/{len(refs_to_cancel)} pending task ref(s)")
 
     def _consume_restart_cycle(self) -> tuple[str, Optional[BaseException]]:
         """Snapshot one completed restart before acknowledging its

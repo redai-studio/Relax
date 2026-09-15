@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +18,82 @@ from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+# DeepSeek-V4 mHC stores one scalar nn.Parameter per alpha; the checkpoint stores
+# them as a single 3-element `hc_*_scale`. Bridge ships _HCAlphaMapping for this,
+# but its megatron_to_hf() reads alpha_post/alpha_res straight off the live module
+# instead of using the tensors Relax hands it. During colocate weight sync the
+# module's parameter storage has already been released by torch_memory_saver, so
+# those reads return dangling device pointers and fault (observed: alpha_pre at
+# 0x7f21... copies fine, alpha_post/alpha_res at 0xe91cc... raise CUDA "invalid
+# argument", then torch.cat escalates to an illegal memory access).
+# Relax converts every parameter separately and always passes a valid tensor, so
+# buffer the three alphas here and emit the concatenation ourselves.
+_HC_ALPHA_RE = re.compile(r"^(?P<group>.*)\.alpha_(?P<which>pre|post|res)$")
+_HC_ALPHA_ORDER = ("pre", "post", "res")
+
+# Schema aliases accepted by released checkpoints.  The emitted name is
+# selected against the checkpoint key set instead of pinning the fast path to
+# whichever spelling a particular Bridge version happens to use.
+_HF_NAME_ALIAS_PAIRS = ((".indexer.scorer.weights_proj.", ".indexer.weights_proj."),)
+
+
+def _resolve_hf_name_against_checkpoint(hf_name: str, checkpoint_keys: Collection[str]) -> str:
+    """Resolve a known bidirectional alias against the source checkpoint
+    schema."""
+    if hf_name in checkpoint_keys:
+        return hf_name
+
+    for first, second in _HF_NAME_ALIAS_PAIRS:
+        if first in hf_name:
+            candidate = hf_name.replace(first, second, 1)
+        elif second in hf_name:
+            candidate = hf_name.replace(second, first, 1)
+        else:
+            continue
+        if candidate in checkpoint_keys:
+            return candidate
+
+    return hf_name
+
+
+def _get_hf_checkpoint_keys(bridge: Any) -> frozenset[str] | None:
+    """Read checkpoint keys without materializing tensors.
+
+    ``None`` means that this Bridge version exposes neither the current public
+    key API nor the older source API.  An empty set means key inspection worked
+    and the checkpoint is empty.
+    """
+    state = getattr(getattr(bridge, "hf_pretrained", None), "state", None)
+    if state is None:
+        return None
+
+    keys = getattr(state, "keys", None)
+    if callable(keys):
+        try:
+            return frozenset(keys())
+        except (AttributeError, NotImplementedError):
+            # Older/lazy StateDict implementations expose ``keys`` but defer
+            # enumeration to the source object below.  Do not swallow I/O or
+            # checkpoint corruption errors.
+            pass
+
+    source = getattr(state, "source", None)
+    get_all_keys = getattr(source, "get_all_keys", None)
+    if callable(get_all_keys):
+        return frozenset(get_all_keys())
+
+    return None
+
+
+def _normalize_global_name(name: str) -> str:
+    global_name = strip_param_name_prefix(name)
+    if global_name.startswith("vp_stages."):
+        parts = global_name.split(".", 2)
+        if len(parts) >= 3:
+            global_name = parts[2]
+    return global_name
 
 
 def _noop_gather_from_ep_ranks(self_m, megatron_weights, megatron_module, hf_param_name):
@@ -46,6 +122,10 @@ class BridgeConverter:
         self._bridge_mapping_registry: Any = None
         self._bridge_expert_transposes_down: bool = True
         self._configs_broadcast_done: bool = False
+        self._hf_alias_checkpoint_keys: frozenset[str] | None = None
+        # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
+        self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
+        self._hc_alpha_hf_name: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -74,28 +154,52 @@ class BridgeConverter:
         from relax.utils.megatron_bridge_utils import patch_megatron_model
 
         bridge = AutoBridge.from_hf_pretrained(self._args.hf_checkpoint, trust_remote_code=True)
+        checkpoint_keys = _get_hf_checkpoint_keys(bridge)
+        if checkpoint_keys is not None:
+            self._hf_alias_checkpoint_keys = frozenset(
+                key
+                for key in checkpoint_keys
+                if any(first in key or second in key for first, second in _HF_NAME_ALIAS_PAIRS)
+            )
         with patch_megatron_model(self._model):
             tasks = bridge.get_conversion_tasks(self._model)
 
         self._bridge_task_map = {}
         for task in tasks:
-            if task.param_weight is not None:
+            # Bridge's task builder may leave a ``None`` entry when a mapping
+            # does not apply to the source checkpoint on this rank.
+            if task is not None and task.param_weight is not None:
                 self._bridge_task_map[task.global_param_name] = task
 
         self._bridge_mapping_registry = bridge._model_bridge.mapping_registry()
         mapping_registry = self._bridge_mapping_registry
-        for name, _param in named_params_and_buffers(self._args, self._model):
-            global_name = strip_param_name_prefix(name)
-            if global_name not in self._bridge_task_map:
-                mapping = mapping_registry.megatron_to_hf_lookup(global_name)
-                if mapping is not None:
-                    self._bridge_task_map[global_name] = WeightConversionTask(
-                        param_name=global_name,
-                        global_param_name=global_name,
-                        mapping=mapping,
-                        megatron_module=None,
-                        param_weight=_param,
+        for name, _param in named_params_and_buffers(self._args, self._model, include_persistent_buffers=True):
+            global_name = _normalize_global_name(name)
+            if global_name in self._bridge_task_map:
+                continue
+            # Keep the existing registry fallback for parameters. It also lets
+            # older Bridge releases add persistent buffers they did not
+            # enumerate. For buffers, repeat Bridge's HF-schema check so a
+            # registry entry alone cannot revive an inapplicable mapping.
+            mapping = mapping_registry.megatron_to_hf_lookup(global_name)
+            if mapping is not None:
+                if (
+                    not isinstance(_param, torch.nn.Parameter)
+                    and checkpoint_keys is not None
+                    and not mapping.allow_hf_name_mismatch
+                ):
+                    hf_param_names = (
+                        [mapping.hf_param] if isinstance(mapping.hf_param, str) else mapping.hf_param.values()
                     )
+                    if any(hf_name not in checkpoint_keys for hf_name in hf_param_names):
+                        continue
+                self._bridge_task_map[global_name] = WeightConversionTask(
+                    param_name=global_name,
+                    global_param_name=global_name,
+                    mapping=mapping,
+                    megatron_module=None,
+                    param_weight=_param,
+                )
 
         for task in self._bridge_task_map.values():
             mapping = task.mapping
@@ -138,6 +242,14 @@ class BridgeConverter:
                 break
 
         logger.info("Bridge task map initialized with %d local tasks", len(self._bridge_task_map))
+
+    def can_convert(self, name: str) -> bool:
+        """Return whether Bridge has a mapping for a parameter or persistent
+        buffer."""
+        self.init_tasks()
+        assert self._bridge_task_map is not None
+        global_name = _normalize_global_name(name)
+        return global_name in self._bridge_task_map
 
     def broadcast_and_apply_configs(self) -> None:
         """Broadcast ``_config_map`` across PP ranks and patch remaining tasks.
@@ -240,6 +352,40 @@ class BridgeConverter:
     # Per-parameter conversion
     # ------------------------------------------------------------------
 
+    def _convert_hc_alpha(self, name, global_name, param, task, match) -> list[tuple[str, torch.Tensor]]:
+        """Buffer DSv4 mHC alphas and emit `hc_*_scale` once all three arrived.
+
+        Returns an empty list for the first two alphas of a group; the third
+        one emits ``{hf_param: cat([pre, post, res])}``. Only the ``alpha_pre``
+        task carries the resolved HF name (the other two map to no-op
+        secondaries), so the name is remembered independently of arrival order.
+        """
+        group = match.group("group")
+        which = match.group("which")
+
+        hf_param = getattr(task.mapping, "hf_param", None)
+        if isinstance(hf_param, str) and hf_param:
+            self._hc_alpha_hf_name[group] = hf_param
+
+        buf = self._hc_alpha_buf.setdefault(group, {})
+        buf[which] = param.detach().reshape(-1).float()
+
+        if len(buf) < len(_HC_ALPHA_ORDER):
+            return []
+
+        hf_name = self._hc_alpha_hf_name.get(group)
+        self._hc_alpha_buf.pop(group, None)
+        if hf_name is None:
+            logger.warning(
+                "mHC alpha group %s completed but no HF name was seen; dropping (mapping=%s)",
+                group,
+                type(task.mapping).__name__,
+            )
+            return []
+        self._hc_alpha_hf_name.pop(group, None)
+        scale = torch.cat([buf[k] for k in _HC_ALPHA_ORDER])
+        return quantize_params(self._args, name, [(hf_name, scale)], self._quantization_config)
+
     def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.
 
@@ -253,11 +399,7 @@ class BridgeConverter:
         """
         self.init_tasks()
 
-        global_name = strip_param_name_prefix(name)
-        if global_name.startswith("vp_stages."):
-            parts = global_name.split(".", 2)
-            if len(parts) >= 3:
-                global_name = parts[2]
+        global_name = _normalize_global_name(name)
 
         global_name, task = self._lookup_task(global_name)
 
@@ -291,6 +433,10 @@ class BridgeConverter:
                 inner_tp._detected_type = "replicated"
                 inner_tp._mapping = inner_tp._get_or_create_mapping("replicated")
             self._bridge_task_map[global_name] = task
+
+        hc_alpha = _HC_ALPHA_RE.match(global_name)
+        if hc_alpha is not None:
+            return self._convert_hc_alpha(name, global_name, param, task, hc_alpha)
 
         mapping = task.mapping
         all_mappings = self.collect_all_mappings(mapping)
@@ -336,7 +482,16 @@ class BridgeConverter:
                 if "gather_from_ep_ranks" in cls.__dict__:
                     del cls.gather_from_ep_ranks
 
-        converted_named_tensors = list(converted_dict.items())
+        converted_named_tensors = []
+        for hf_name, tensor in converted_dict.items():
+            if self._hf_alias_checkpoint_keys is None:
+                # Preserve the original Relax fallback for Bridge versions that
+                # do not expose checkpoint keys.
+                first, second = _HF_NAME_ALIAS_PAIRS[0]
+                resolved_name = hf_name.replace(first, second)
+            else:
+                resolved_name = _resolve_hf_name_against_checkpoint(hf_name, self._hf_alias_checkpoint_keys)
+            converted_named_tensors.append((resolved_name, tensor))
 
         # Post-process expert weights: split fused gate_up_proj, fix transposes
         expert_id_match = re.search(r"weight(\d+)", global_name)
