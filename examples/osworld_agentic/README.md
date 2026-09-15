@@ -99,6 +99,26 @@ bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
 校验 96/32 的分批设置，并关闭不适用于此次多 batch 更新的零 advantage 剔除。
 公用的 `run_qwen3vl_8B_osworld_outcome.sh` 负责模型、训练参数和 Ray 提交。
 
+### 每轮一次更新，训练 100 步
+
+设置 `OSWORLD_NATIVE_MINIBATCH3=0` 后，96 条 session 合成一个 global batch，
+每个 rollout step 只执行一次 optimizer 更新，每条样本仍只训练一次。
+此模式使用 `train_fixed_tasks.py`；默认三批模式保持不变。
+
+先在 `env.sh` 中设置新的 `SAVE_DIR`，并确保它不会覆盖下面的环境变量，再执行：
+
+```bash
+unset OSWORLD_RESUME_DIR RESUME_FROM_SAVE
+OSWORLD_NATIVE_MINIBATCH3=0 \
+NUM_ROLLOUT=100 \
+OSWORLD_LR_DECAY_ITERS=100 \
+bash examples/osworld_agentic/launch_fixed12_minibatch3.sh
+```
+
+这个入口从 base 模型和新 optimizer 开始，不执行独立 eval。
+`OSWORLD_LR_DECAY_ITERS` 的单位是 optimizer 更新次数：单次更新模式默认 45，
+三批模式默认 135；修改总步数时需显式设置衰减周期，100 步分别对应 100 / 300。
+
 ______________________________________________________________________
 
 ## 5. 可调开关（默认值对应 12 任务入口）

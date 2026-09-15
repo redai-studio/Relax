@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Fixed 12 tasks x 8 sessions: three native optimizer batches of 32, no eval.
+# Fixed 12 tasks x 8 sessions: three updates by default; set OSWORLD_NATIVE_MINIBATCH3=0 for one.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [ ! -f "${SCRIPT_DIR}/env.sh" ] || source "${SCRIPT_DIR}/env.sh"
@@ -39,11 +39,17 @@ if [ ! -s "${OSWORLD_TRAIN_DATA}" ]; then
     --train-manifest "${SCRIPT_DIR}/scripts/manifests/train_fixed12.txt" \
     --eval-manifest "${SCRIPT_DIR}/scripts/manifests/train_fixed12.txt"
 fi
-export OSWORLD_FIXED_TASK_BATCH=1 OSWORLD_NATIVE_MINIBATCH3=1 OSWORLD_DISABLE_EVAL=1
-export ROLLOUT_BATCH_SIZE=12 N_SAMPLES_PER_PROMPT=8 GLOBAL_BATCH_SIZE=32
+export OSWORLD_FIXED_TASK_BATCH=1 OSWORLD_DISABLE_EVAL=1
+export OSWORLD_NATIVE_MINIBATCH3="${OSWORLD_NATIVE_MINIBATCH3:-1}"
+export ROLLOUT_BATCH_SIZE=12 N_SAMPLES_PER_PROMPT=8
+case "${OSWORLD_NATIVE_MINIBATCH3}" in
+  0) export GLOBAL_BATCH_SIZE=96; OSWORLD_DEFAULT_LR_DECAY_ITERS=45 ;;
+  1) export GLOBAL_BATCH_SIZE=32; OSWORLD_DEFAULT_LR_DECAY_ITERS=135 ;;
+  *) echo "OSWORLD_NATIVE_MINIBATCH3 must be 0 (one update) or 1 (three updates)." >&2; exit 1 ;;
+esac
 export NUM_ROLLOUT="${NUM_ROLLOUT:-10}" NUM_EPOCH="${NUM_ROLLOUT:-10}"
-# Preserve the validated 45-rollout cosine horizon (135 optimizer updates).
-export OSWORLD_LR_DECAY_ITERS="${OSWORLD_LR_DECAY_ITERS:-135}"
+# Preserve the default 45-rollout cosine horizon in optimizer-update units.
+export OSWORLD_LR_DECAY_ITERS="${OSWORLD_LR_DECAY_ITERS:-${OSWORLD_DEFAULT_LR_DECAY_ITERS}}"
 export OSWORLD_LEARNING_RATE="${OSWORLD_LEARNING_RATE:-1e-6}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-1}" MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-3}"
 export GPUS=8 GPUS_PER_ENGINE=2 TP_SIZE=4
