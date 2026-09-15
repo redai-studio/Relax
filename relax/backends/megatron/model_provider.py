@@ -288,13 +288,26 @@ def get_model_provider_func(
             "sequence_parallel",
             "pipeline_model_parallel_size",
             "virtual_pipeline_model_parallel_size",
+            # Let a launch script pass an explicit --pipeline-model-parallel-layout
+            # (mcore-native, str form "Ett|tt|..|ttL").
+            # Must NOT be combined with --decoder-first/last-pipeline-num-layers
+            # (mcore raises "pipeline_model_parallel_layout cannot be set with other pipeline
+            # layout arguments"); drop those flags in the script when using a layout.
+            "pipeline_model_parallel_layout",
             "context_parallel_size",
+            "cp_partition_mode",
+            "sequence_packing_scheduler",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
             "dsa_indexer_loss_coeff",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            # Bridge mode bypasses core_transformer_config_from_args(), so FP8
+            # compute flags must be copied onto the provider explicitly.
+            "fp8",
+            "fp8_recipe",
+            "fp8_quantizer_factory",
             "masked_softmax_fusion",
             "bias_dropout_fusion",
             "apply_rope_fusion",
@@ -355,6 +368,7 @@ def get_model_provider_func(
             "moe_router_topk_scaling_factor",
             "moe_router_score_function",
             "moe_ffn_hidden_size",
+            "activation_func_clamp_shared_expert",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Dynamic CP related args
             "dynamic_context_parallel",
@@ -407,6 +421,64 @@ def get_model_provider_func(
             provider.fp16 = False
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
+
+        # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
+        # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge
+        # auto-installs one in apply_overrides_and_finalize(), which we bypass.
+        if (
+            getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid"
+            and (getattr(provider, "pipeline_model_parallel_size", 1) or 1) > 1
+            and getattr(provider, "pipeline_model_parallel_layout", None) is None
+        ):
+            from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
+                set_deepseek_v4_pipeline_model_parallel_layout,
+            )
+
+            set_deepseek_v4_pipeline_model_parallel_layout(provider)
+            logger.info(f"Set provider.pipeline_model_parallel_layout: {provider.pipeline_model_parallel_layout}")
+
+            # mcore rejects a layout that coexists with num_layers_in_first/last_pipeline_stage
+            # ("pipeline_model_parallel_layout cannot be set with other pipeline layout
+            # arguments"), but Megatron's own validate_args only skips its
+            # "num_layers % pipeline_model_parallel_size == 0" check when
+            # --decoder-first/last-pipeline-num-layers is set -- and DSv4-Flash has 43
+            # layers, a prime, so no PP > 1 divides it. Those flags therefore exist purely
+            # to get past arg validation; the layout already encodes the real split, so
+            # drop their provider-side effect here (lines 311-314 above set them).
+            if (
+                provider.num_layers_in_first_pipeline_stage is not None
+                or provider.num_layers_in_last_pipeline_stage is not None
+            ):
+                logger.info(
+                    "Clearing provider.num_layers_in_first/last_pipeline_stage "
+                    f"({provider.num_layers_in_first_pipeline_stage}/"
+                    f"{provider.num_layers_in_last_pipeline_stage}); superseded by the DSv4 layout."
+                )
+                provider.num_layers_in_first_pipeline_stage = None
+                provider.num_layers_in_last_pipeline_stage = None
+
+        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
+        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
+        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
+        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
+        # radius structural rather than an argument about current mcore internals.
+        #
+        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
+        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
+        # unless the user opts out -- while the TransformerConfig field defaults to False
+        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
+        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
+        # unfused reference path whose gather backward is quadratic in sequence length
+        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
+        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
+            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
+                logger.info(
+                    "Override provider.apply_dsa_kernel_fusion: "
+                    f"{provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
+                )
+                provider.apply_dsa_kernel_fusion = want_fusion
 
         provider.finalize()
 

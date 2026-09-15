@@ -27,6 +27,8 @@ from relax.utils.training.ppo_utils import (
     use_sequence_classification_lm_head_for_hf_load,
 )
 
+from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load
+
 
 try:
     # Here we patch out the `validate_non_overlapping_shards_metadata` in both functions
@@ -517,6 +519,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
     if exist and _is_megatron_checkpoint(load_path):
         _alias_renamed_transfer_queue_enum()
+        if (
+            optimizer is not None
+            and getattr(args, "optimizer_cpu_offload", False)
+            and patch_hybrid_optimizer_native_fp32_checkpoint_load()
+        ):
+            logger.info("Applied Megatron-LM 86e928a compatibility fix for native-FP32 optimizer checkpoint load")
         lora_metadata = _read_lora_checkpoint_metadata(load_path)
         try:
             if lora_metadata is None:

@@ -190,6 +190,7 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
                 content=raw["content"],
                 learn=learn,
                 tool_calls=raw.get("tool_calls"),
+                reasoning_content=raw.get("reasoning_content"),
             )
         )
     if require_response and not has_learn:

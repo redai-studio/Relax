@@ -71,20 +71,14 @@ echo "=== Cleaning up residual Relax/SGLang worker processes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
 # ── reserve sglang port range from kernel ephemeral pool ────────────────────
-# Some worker nodes ship with net.ipv4.ip_local_port_range="10000 65500", which
-# includes sglang's well-known port range (15670-15900). Megatron's 294 process
-# groups grab ephemeral ports for NCCL/Gloo bootstrap; on those nodes a PG can
-# land on a port sglang wants and crash the engine with
-# "scheduler_input_port at 15855 is not available in 120 seconds. holder=ray::MegatronTrainRayActor".
-# Reserve sglang's range so the kernel never picks it for ephemeral.
+# Keep NCCL/Gloo ephemeral bootstrap ports from overlapping SGLang's ports.
 echo "=== Reserving sglang port ranges on all GPU nodes ==="
-# Reserve two ranges:
-#   15000-16800 — sglang port range. SGLang's dp-attention schedulers use ports
-#                 starting from ~15100 (base_port + offsets for DP/TP ranks), so
-#                 the range must start well below 15400 to cover all scheduler
-#                 input/output/NCCL bootstrap ports.
-#   30000-32768 — secondary safe zone (fallback if sglang port_base needs adjustment)
-python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768" || echo "reserve_ports failed (non-fatal)"
+# Reserved ranges:
+#   15000-20000 — SGLang scheduler and bootstrap ports.
+#   30000-32768 — fallback range for SGLang port_base adjustments.
+#   65001-65500 — exclude the upper ephemeral range to avoid bootstrap conflicts
+#                 on nodes whose ip_local_port_range extends above 65000.
+python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768,65001-65500" || echo "reserve_ports failed (non-fatal)"
 
 # Two run scenarios, distinguished by whether we are inside a ray job driver:
 #   A) Entry-point mode — `bash ray-job.sh <run-script>`: this script runs in the
