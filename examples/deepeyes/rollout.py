@@ -95,6 +95,7 @@ def _encode_observation_for_generation(
     else:
         formatted_prompt = [message]
 
+    rollout_prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
     multimodal_inputs = None
     multimodal_train_inputs = None
     if processor:
@@ -108,15 +109,16 @@ def _encode_observation_for_generation(
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
         } or None
     else:
-        prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        prompt_ids = rollout_prompt_ids
 
     if trim_length:
         prompt_ids = prompt_ids[trim_length:]
+        rollout_prompt_ids = rollout_prompt_ids[trim_length:]
 
     image_data = []
     if multimodal_inputs and multimodal_inputs.get("images"):
         image_data = [encode_image_for_rollout_engine(img) for img in multimodal_inputs["images"]]
-    return prompt_ids, image_data, multimodal_inputs, multimodal_train_inputs
+    return prompt_ids, rollout_prompt_ids, image_data, multimodal_inputs, multimodal_train_inputs
 
 
 def _merge_multimodal_train_inputs(chunks: list[dict | None]) -> dict | None:
@@ -158,23 +160,24 @@ def _initialize_resources(args: Any, sample: Sample):
 
 
 def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
+    rollout_prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
     if processor:
         processor_output = processor(text=sample.prompt, **(sample.multimodal_inputs or {}))
         prompt_ids = processor_output["input_ids"][0]
         init_mm_train = {k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]} or None
     else:
-        prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
+        prompt_ids = rollout_prompt_ids
         init_mm_train = None
 
     image_data = []
     if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
         image_data = [encode_image_for_rollout_engine(img) for img in sample.multimodal_inputs["images"]]
-    return prompt_ids, image_data, init_mm_train
+    return prompt_ids, rollout_prompt_ids, image_data, init_mm_train
 
 
 async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict, is_resuming: bool = False):
     loop = asyncio.get_running_loop()
-    prompt_ids, image_data, init_mm_train = await loop.run_in_executor(
+    prompt_ids, rollout_prompt_ids, image_data, init_mm_train = await loop.run_in_executor(
         get_encode_executor(),
         _prepare_initial_inputs,
         sample,
@@ -198,6 +201,8 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
 
     if not sample.tokens:
         sample.tokens = list(prompt_ids)
+    if not sample.rollout_tokens:
+        sample.rollout_tokens = list(rollout_prompt_ids)
     response_tokens: list[int] = sample.tokens[len(prompt_ids) :] if len(sample.tokens) >= len(prompt_ids) else []
     sample.loss_mask = sample.loss_mask or []
     sample.rollout_log_probs = sample.rollout_log_probs or []
@@ -247,11 +252,17 @@ async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokeniz
         result = await result
     observation, done, info = result
     if done:
-        return None, None, None, None, True, info
+        return None, None, None, None, None, True, info
 
     next_user_message = env.format_observation(observation)
     loop = asyncio.get_running_loop()
-    obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs = await loop.run_in_executor(
+    (
+        obs_prompt_ids,
+        obs_rollout_prompt_ids,
+        obs_image_data,
+        obs_multimodal_inputs,
+        obs_multimodal_train_inputs,
+    ) = await loop.run_in_executor(
         get_encode_executor(),
         _encode_observation_for_generation,
         tokenizer,
@@ -265,18 +276,30 @@ async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokeniz
     bos_id = tokenizer.bos_token_id
     if bos_id is not None and obs_prompt_ids and obs_prompt_ids[0] == bos_id:
         obs_prompt_ids = obs_prompt_ids[1:]
+    if bos_id is not None and obs_rollout_prompt_ids and obs_rollout_prompt_ids[0] == bos_id:
+        obs_rollout_prompt_ids = obs_rollout_prompt_ids[1:]
 
-    return obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs, False, info
+    return (
+        obs_prompt_ids,
+        obs_rollout_prompt_ids,
+        obs_image_data,
+        obs_multimodal_inputs,
+        obs_multimodal_train_inputs,
+        False,
+        info,
+    )
 
 
 def _append_to_sample(
     sample: Sample,
     response_tokens: list[int],
     tokens_to_add: list[int],
+    rollout_tokens_to_add: list[int],
     logprobs: list[float],
     loss_mask_val: int,
 ) -> None:
     sample.tokens.extend(tokens_to_add)
+    sample.rollout_tokens.extend(rollout_tokens_to_add)
     response_tokens.extend(tokens_to_add)
     sample.loss_mask.extend([loss_mask_val] * len(tokens_to_add))
     sample.rollout_log_probs.extend(logprobs)
@@ -469,7 +492,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 sample.metadata["_current_turn_response_start"] = len(response_tokens)
 
             turn_record = trace_recorder.start(
-                turn_idx, sample.tokens, cur_sampling_params, current_image_data, active_budget
+                turn_idx, sample.rollout_tokens, cur_sampling_params, current_image_data, active_budget
             )
 
             inference_start_ts = time.time()
@@ -481,7 +504,13 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                     finish_type,
                     meta_info,
                 ) = await _run_inference_step(
-                    state, url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
+                    state,
+                    url,
+                    sample.rollout_tokens,
+                    cur_sampling_params,
+                    current_image_data,
+                    state.tokenizer,
+                    args=args,
                 )
             except GenerationAborted:
                 # Abort was signalled before this turn's request went out. Mirror the
@@ -496,7 +525,14 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)
             )
-            _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
+            _append_to_sample(
+                sample,
+                response_tokens,
+                new_response_tokens,
+                new_response_tokens,
+                new_response_log_probs,
+                loss_mask_val=1,
+            )
             context_budget = _update_budget(context_budget, len(new_response_tokens))
             generation_budget = _update_budget(generation_budget, len(new_response_tokens))
 
@@ -522,6 +558,7 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             env_start_ts = time.time()
             (
                 obs_prompt_ids,
+                obs_rollout_prompt_ids,
                 obs_image_data,
                 obs_multimodal_inputs,
                 obs_multimodal_train_inputs,
@@ -545,7 +582,14 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
                 break
 
             obs_log_probs = [0.0] * len(obs_prompt_ids)
-            _append_to_sample(sample, response_tokens, obs_prompt_ids, obs_log_probs, loss_mask_val=0)
+            _append_to_sample(
+                sample,
+                response_tokens,
+                obs_prompt_ids,
+                obs_rollout_prompt_ids,
+                obs_log_probs,
+                loss_mask_val=0,
+            )
             context_budget = _update_budget(context_budget, len(obs_prompt_ids))
             sample.metadata.pop("_current_turn_response_start", None)
 
