@@ -169,7 +169,10 @@ class Service:
         """Run the service with fault supervision.
 
         Returns:
-            A Ray ObjectRef for the async task.
+            A Ray Serve ``DeploymentResponse`` (``self.handle`` is a
+            DeploymentHandle, so ``.remote()`` does NOT return an ObjectRef).
+            Callers must not pass it to ``ray.cancel()``; use its own
+            ``.cancel()`` -- see Controller._cancel_pending_tasks.
         """
         self.healthy.set_task_status.remote(self.role, True)
         self._start_heartbeat()

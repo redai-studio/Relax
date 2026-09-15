@@ -354,10 +354,13 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_REPRO_PROFILE_EXIT_AFTER_DUMP = EnvProperty("RELAX_REPRO_PROFILE_EXIT_AFTER_DUMP", str, "0")
     RELAX_REPRO_PROFILE_STEPS = EnvProperty("RELAX_REPRO_PROFILE_STEPS", int, 50)
     RELAX_REPRO_PROFILE_WARMUP = EnvProperty("RELAX_REPRO_PROFILE_WARMUP", int, 5)
+    RELAX_DEBUG_DSV4_CP_P2P_WARMUP = EnvProperty("RELAX_DEBUG_DSV4_CP_P2P_WARMUP", bool, False)
+    RELAX_DEBUG_DSV4_PP_GROUP_WARMUP = EnvProperty("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP", bool, False)
 
     # ------------- NCCL / FP8 -------------
     NCCL_CUMEM_ENABLE = EnvProperty("NCCL_CUMEM_ENABLE", str, "0")
     NVTE_FP8_BLOCK_SCALING_FP32_SCALES = EnvProperty("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", str, "1")
+    RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID = EnvProperty("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", str, "0")
 
 
 def iter_env_properties() -> Iterator[Tuple[str, EnvProperty]]:
