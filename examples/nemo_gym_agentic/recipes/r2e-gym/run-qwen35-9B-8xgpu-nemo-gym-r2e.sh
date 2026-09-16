@@ -53,7 +53,7 @@ CKPT_ARGS=(
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
    --save "${SAVE_DIR}/nemo-gym/r2e-gym/Qwen3.5-9B/"
-   --save-interval 100
+   --save-interval 200
 )
 
 ROLLOUT_ARGS=(
@@ -75,7 +75,7 @@ ROLLOUT_ARGS=(
      "NEMO_GYM_LEASE_S=120"
    --agent-timeout 1260
    --agentic-tool-call-parser qwen3_coder
-   --num-rollout 32
+   --num-rollout 200
    --rollout-batch-size 8
    --n-samples-per-prompt 8
    --rollout-max-prompt-len 8192
@@ -83,8 +83,6 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len 51200
    --rollout-temperature 0.7
    --global-batch-size 64
-
-   # --debug-rollout-only
 )
 
 PERF_ARGS=(
