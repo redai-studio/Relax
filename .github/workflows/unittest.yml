@@ -1,0 +1,99 @@
+name: GPU Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-unittest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: Unit Tests (H20, 4 GPUs)
+    runs-on: [self-hosted, linux, x64, h20, gpu]
+    timeout-minutes: 30
+    env:
+      CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
+      CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Set CI_GPU_DEVICES in each runner's .env before starting its service:
+      # runner 1: 0,1,2,3; runner 2: 4,5,6,7. Never infer free GPUs at job startup.
+      - name: Create test container
+        run: |
+          set -euo pipefail
+          : "${CI_GPU_DEVICES:?Set CI_GPU_DEVICES to the four GPUs assigned to this runner}"
+          IFS=',' read -r -a gpu_devices <<< "$CI_GPU_DEVICES"
+          if [[ ${#gpu_devices[@]} -ne 4 ]]; then
+            echo "CI_GPU_DEVICES must list exactly four GPU indices or UUIDs" >&2
+            exit 1
+          fi
+          uv_cache_dir="${CI_UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+          artifact_dir="$RUNNER_TEMP/unittest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$uv_cache_dir" "$artifact_dir"
+          uv_cache_dir="$(cd -- "$uv_cache_dir" && pwd)"
+
+          # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
+          # Create before starting so cancellation during a pull cannot start tests.
+          docker create --pull always --rm --init \
+            --name "$CI_CONTAINER_NAME" \
+            --gpus "\"device=$CI_GPU_DEVICES\"" \
+            --shm-size=32g \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/source,readonly" \
+            --mount "type=bind,source=$artifact_dir,target=/artifacts" \
+            --mount "type=bind,source=$uv_cache_dir,target=/uv-cache" \
+            --workdir /workspace/Relax \
+            --env CUDA_VISIBLE_DEVICES=0,1,2,3 \
+            --env RELAX_RUN_SMOKE=0 \
+            --env UV_CACHE_DIR=/uv-cache \
+            --env UV_LINK_MODE=copy \
+            --env "http_proxy=${http_proxy:-${HTTP_PROXY:-}}" \
+            --env "https_proxy=${https_proxy:-${HTTPS_PROXY:-}}" \
+            --env "no_proxy=${no_proxy:-${NO_PROXY:-localhost,127.0.0.1}}" \
+            --entrypoint /bin/bash "$CI_IMAGE" -c 'sleep infinity'
+          docker inspect --format 'Test image: {{.Config.Image}} ({{.Image}})' "$CI_CONTAINER_NAME"
+          docker start "$CI_CONTAINER_NAME"
+
+      - name: Prepare workspace and show GPUs
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euc '
+            cp -a --no-preserve=ownership /source/. /workspace/Relax/
+            nvidia-smi
+          '
+
+      - name: Install dependencies
+        run: |
+          docker exec "$CI_CONTAINER_NAME" uv pip install \
+            --system --break-system-packages -r requirements.txt \
+            --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+      - name: Run unittest
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
+              2>&1 | tee /artifacts/pytest.log
+          '
+
+      - name: Remove test container
+        if: always()
+        run: docker rm --force "$CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unittest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 14
