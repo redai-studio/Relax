@@ -55,6 +55,13 @@ ROLLOUT_ARGS=(
    --rollout-temperature 1.0
 )
 
+if [ "${SGLANG_NATIVE_GROUP_SAMPLING:-0}" = "1" ]; then
+   ROLLOUT_ARGS+=(--group-rm --sglang-native-group-sampling)
+   ROLLOUT_ARGS+=(--sglang-router-policy "${SGLANG_ROUTER_POLICY:-round_robin}")
+elif [ -n "${SGLANG_ROUTER_POLICY:-}" ]; then
+   ROLLOUT_ARGS+=(--sglang-router-policy "${SGLANG_ROUTER_POLICY}")
+fi
+
 PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
