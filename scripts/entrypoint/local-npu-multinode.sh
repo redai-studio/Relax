@@ -78,7 +78,7 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
     # ── set entrypoint mode ────────────────────────────────────────────────────
     export RELAX_ENTRYPOINT_MODE="npu-multinode"
 
-    # Runtime env for multi-node 
+    # Runtime env for multi-node
     export RUNTIME_ENV_JSON="{
     \"env_vars\": {
         \"PYTHONUNBUFFERED\": \"1\",
