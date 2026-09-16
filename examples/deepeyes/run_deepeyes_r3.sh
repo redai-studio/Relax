@@ -98,7 +98,6 @@ ROLLOUT_ARGS=(
 
 ROUTING_REPLAY_ARGS=(
     --use-rollout-routing-replay
-    --use-slime-router
 )
 
 ###############################################################################
@@ -152,7 +151,6 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
     --sglang-mem-fraction-static 0.8
-    --sglang-external-model-package examples.deepeyes.sglang_patch
 )
 
 ###############################################################################
