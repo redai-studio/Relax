@@ -81,10 +81,16 @@ async function main() {
     fs.writeFileSync(path.join(directory, 'pid'), String(child.pid));
     console.log(`Waiting for ${config.count} ${
         config.backend} device(s), timeout ${config.timeout}s`);
-    while (!fs.existsSync(resultPath)) {
+    let logOffset = 0;
+    while (true) {
+      const finished = fs.existsSync(resultPath);
+      const log = fs.readFileSync(logPath, 'utf8');
+      process.stdout.write(log.slice(logOffset));
+      logOffset = log.length;
+      if (finished)
+        break;
       if (child.exitCode !== null || child.signalCode !== null) {
-        throw new Error(`Device holder exited before allocation: ${
-            fs.readFileSync(logPath, 'utf8')}`);
+        throw new Error('Device holder exited before allocation');
       }
       await sleep(50);
     }

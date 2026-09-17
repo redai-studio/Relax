@@ -77,6 +77,8 @@ def cancelled(directory: Path, parent_pid: int) -> bool:
 def acquire(directory: Path, config: dict, devices: list[str], deadline: float) -> tuple[list[str], list[IO[str]]]:
     lock_dir = Path(config["lock_dir"])
     lock_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    next_report = started
     while not cancelled(directory, config["parent_pid"]):
         selected: list[str] = []
         handles: list[IO[str]] = []
@@ -102,7 +104,18 @@ def acquire(directory: Path, config: dict, devices: list[str], deadline: float) 
         # A partial allocation must never block another request while waiting.
         for handle in handles:
             handle.close()
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= next_report:
+            locked = [device for device in devices if device not in selected]
+            sys.stdout.write(
+                f"Waiting for {config['count']} {config['backend']} devices ({now - started:.0f}s elapsed): "
+                f"{len(selected)}/{len(devices)} available\n"
+                f"  Available: {', '.join(selected) or 'none'}\n"
+                f"  Locked: {', '.join(locked) or 'none'}\n"
+            )
+            sys.stdout.flush()
+            next_report = now + 30
+        if now >= deadline:
             raise TimeoutError(f"Timed out waiting for {config['count']} {config['backend']} devices")
         time.sleep(min(random.uniform(0.1, 0.3), max(0, deadline - time.monotonic())))
     raise RuntimeError("Device acquisition cancelled")

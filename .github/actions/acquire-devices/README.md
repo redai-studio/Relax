@@ -56,6 +56,11 @@ sets `CUDA_VISIBLE_DEVICES`, specify `devices` explicitly to avoid confusing
 CUDA logical indices with physical `nvidia-smi` indices. The explicit pool is
 authoritative and the action replaces the inherited visibility value.
 
+When devices are unavailable, the action logs the candidate pool's lock status
+immediately and every 30 seconds while waiting: elapsed time, available count,
+and the UUIDs of available and locked devices. This reports cooperative device
+reservations, not GPU utilization or memory usage.
+
 ## Docker workloads
 
 Acquire on the host **before** creating the workload container, then pass the
