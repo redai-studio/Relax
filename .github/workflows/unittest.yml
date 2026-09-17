@@ -29,6 +29,12 @@ jobs:
           persist-credentials: false
 
       - name: Create test container
+        env:
+          CUDA_VISIBLE_DEVICES: 0,1,2,3
+          RELAX_RUN_SMOKE: "0"
+          UV_CACHE_DIR: /home/relax-ci/.cache/uv
+          UV_LINK_MODE: copy
+          ARTIFACT_DIR: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           : "${CI_GPU_DEVICES:?Set CI_GPU_DEVICES to the four GPUs assigned to this runner}"
@@ -37,9 +43,7 @@ jobs:
             echo "CI_GPU_DEVICES must list exactly four GPU indices or UUIDs" >&2
             exit 1
           fi
-          uv_cache_dir="$HOME/.cache/uv"
-          artifact_dir="$RUNNER_TEMP/unittest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir -p "$uv_cache_dir" "$artifact_dir"
+          mkdir -p "$UV_CACHE_DIR" "$ARTIFACT_DIR"
 
           # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
           # Create before starting so cancellation during a pull cannot start tests.
@@ -47,14 +51,14 @@ jobs:
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_GPU_DEVICES\"" \
             --shm-size=32g \
-            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/source,readonly" \
-            --mount "type=bind,source=$artifact_dir,target=/artifacts" \
-            --mount "type=bind,source=$uv_cache_dir,target=/uv-cache" \
+            -v "$GITHUB_WORKSPACE:/source:ro" \
+            -v "$ARTIFACT_DIR:/artifacts" \
+            -v "$UV_CACHE_DIR:$UV_CACHE_DIR" \
             --workdir /workspace/Relax \
-            --env CUDA_VISIBLE_DEVICES=0,1,2,3 \
-            --env RELAX_RUN_SMOKE=0 \
-            --env UV_CACHE_DIR=/uv-cache \
-            --env UV_LINK_MODE=copy \
+            --env CUDA_VISIBLE_DEVICES \
+            --env RELAX_RUN_SMOKE \
+            --env UV_CACHE_DIR \
+            --env UV_LINK_MODE \
             --env http_proxy \
             --env https_proxy \
             --env no_proxy \
