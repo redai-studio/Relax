@@ -76,10 +76,10 @@ an already-started job-level `container:`.
     timeout: 900
 - name: Create workload container
   env:
-    DEVICES: ${{ steps.devices.outputs.devices }}
+    CI_DEVICES: ${{ steps.devices.outputs.devices }}
   run: |
     docker create --rm --init --name "$CI_CONTAINER_NAME" \
-      --gpus "\"device=$DEVICES\"" \
+      --gpus "\"device=$CI_DEVICES\"" \
       "$CI_IMAGE" sleep infinity
     docker start "$CI_CONTAINER_NAME"
 - name: Run tests

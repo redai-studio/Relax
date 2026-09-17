@@ -38,7 +38,7 @@ jobs:
 
       - name: Create test container
         env:
-          DEVICES: ${{ steps.devices.outputs.devices }}
+          CI_DEVICES: ${{ steps.devices.outputs.devices }}
           HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
           UV_CACHE_DIR: /uv-cache
           UV_LINK_MODE: copy
@@ -51,7 +51,7 @@ jobs:
           # Create before starting so cancellation during a pull cannot start tests.
           docker create --pull always --rm --init \
             --name "$CI_CONTAINER_NAME" \
-            --gpus "\"device=$DEVICES\"" \
+            --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \
             -v "$GITHUB_WORKSPACE:/source:ro" \
             -v "$ARTIFACT_DIR:/artifacts" \
