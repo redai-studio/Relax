@@ -17,6 +17,7 @@ tensor fed to ``MTPLossAutoScaler.apply`` is identical. Pure CPU, no distributed
 from __future__ import annotations
 
 import types
+from collections.abc import Iterator
 
 import pytest
 import torch
@@ -33,6 +34,18 @@ except Exception as exc:  # pragma: no cover
 
 
 S, B, H, V, LAYERS = 16, 2, 8, 32, 2
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _single_threaded_cpu() -> Iterator[None]:
+    """Run bitwise CPU comparisons with one thread, then restore the previous
+    setting."""
+    previous_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_num_threads)
 
 
 class _FakeHead(nn.Module):
