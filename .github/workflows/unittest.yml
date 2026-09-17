@@ -28,8 +28,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # Set CI_GPU_DEVICES in each runner's .env before starting its service:
-      # runner 1: 0,1,2,3; runner 2: 4,5,6,7. Never infer free GPUs at job startup.
       - name: Create test container
         run: |
           set -euo pipefail
@@ -58,9 +56,9 @@ jobs:
             --env RELAX_RUN_SMOKE=0 \
             --env UV_CACHE_DIR=/uv-cache \
             --env UV_LINK_MODE=copy \
-            --env "http_proxy=${http_proxy:-${HTTP_PROXY:-}}" \
-            --env "https_proxy=${https_proxy:-${HTTPS_PROXY:-}}" \
-            --env "no_proxy=${no_proxy:-${NO_PROXY:-localhost,127.0.0.1}}" \
+            --env http_proxy \
+            --env https_proxy \
+            --env no_proxy \
             --entrypoint /bin/bash "$CI_IMAGE" -c 'sleep infinity'
           docker inspect --format 'Test image: {{.Config.Image}} ({{.Image}})' "$CI_CONTAINER_NAME"
           docker start "$CI_CONTAINER_NAME"
