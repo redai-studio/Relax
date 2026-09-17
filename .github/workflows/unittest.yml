@@ -20,8 +20,8 @@ jobs:
     runs-on: [self-hosted, linux, x64, h20, gpu]
     timeout-minutes: 30
     env:
-      TEST_IMAGE: ghcr.io/redai-studio/relaxrl:latest
-      TEST_CONTAINER: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
+      CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
           # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
           # Create before starting so cancellation during a pull cannot start tests.
           docker create --pull always --rm --init \
-            --name "$TEST_CONTAINER" \
+            --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$DEVICES\"" \
             --shm-size=32g \
             -v "$GITHUB_WORKSPACE:/source:ro" \
@@ -62,26 +62,26 @@ jobs:
             --env http_proxy \
             --env https_proxy \
             --env no_proxy \
-            --entrypoint /bin/bash "$TEST_IMAGE" -c 'sleep infinity'
-          docker inspect --format 'Test image: {{.Config.Image}} ({{.Image}})' "$TEST_CONTAINER"
-          docker start "$TEST_CONTAINER"
+            --entrypoint /bin/bash "$CI_IMAGE" -c 'sleep infinity'
+          docker inspect --format 'Test image: {{.Config.Image}} ({{.Image}})' "$CI_CONTAINER_NAME"
+          docker start "$CI_CONTAINER_NAME"
 
       - name: Prepare workspace and show GPUs
         run: |
-          docker exec "$TEST_CONTAINER" bash -euc '
+          docker exec "$CI_CONTAINER_NAME" bash -euc '
             cp -a --no-preserve=ownership /source/. /workspace/Relax/
             nvidia-smi
           '
 
       - name: Install dependencies
         run: |
-          docker exec "$TEST_CONTAINER" uv pip install \
+          docker exec "$CI_CONTAINER_NAME" uv pip install \
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run unittest
         run: |
-          docker exec "$TEST_CONTAINER" bash -euo pipefail -c '
+          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
               2>&1 | tee /artifacts/pytest.log
           '
@@ -89,8 +89,8 @@ jobs:
       - name: Remove test container
         if: always()
         run: |
-          if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
-            docker rm --force "$TEST_CONTAINER"
+          if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+            docker rm --force "$CI_CONTAINER_NAME"
           fi
 
       - name: Upload test results

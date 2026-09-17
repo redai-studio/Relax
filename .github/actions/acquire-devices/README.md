@@ -73,21 +73,21 @@ an already-started job-level `container:`.
   env:
     DEVICES: ${{ steps.devices.outputs.devices }}
   run: |
-    docker create --rm --init --name "$TEST_CONTAINER" \
+    docker create --rm --init --name "$CI_CONTAINER_NAME" \
       --gpus "\"device=$DEVICES\"" \
-      "$TEST_IMAGE" sleep infinity
-    docker start "$TEST_CONTAINER"
+      "$CI_IMAGE" sleep infinity
+    docker start "$CI_CONTAINER_NAME"
 - name: Run tests
-  run: docker exec "$TEST_CONTAINER" python -m pytest tests/
+  run: docker exec "$CI_CONTAINER_NAME" python -m pytest tests/
 - name: Stop workload before releasing devices
   if: always()
   run: |
-    if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
-      docker rm --force "$TEST_CONTAINER"
+    if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+      docker rm --force "$CI_CONTAINER_NAME"
     fi
 ```
 
-Set `TEST_IMAGE` and a unique `TEST_CONTAINER` in the job environment. Prepare
+Set `CI_IMAGE` and a unique `CI_CONTAINER_NAME` in the job environment. Prepare
 the test workspace/dependencies in the container as appropriate. Container
 cleanup runs before the action's post step. Do not pass host numeric indices
 into the container's `CUDA_VISIBLE_DEVICES`; use UUIDs or let Docker expose
