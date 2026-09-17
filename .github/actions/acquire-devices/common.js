@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Relax Authors. All Rights Reserved.
-const fs = require('node:fs');
-const path = require('node:path');
-const {setTimeout : sleep} = require('node:timers/promises');
+import fs from 'node:fs';
+import path from 'node:path';
+import {setTimeout as sleep} from 'node:timers/promises';
 
-function writeCommand(file, name, value) {
+export function writeCommand(file, name, value) {
   if (!file)
     throw new Error(`Missing GitHub command file for ${name}`);
   // All exported values are validated single-line IDs, integers, or paths.
@@ -12,12 +12,12 @@ function writeCommand(file, name, value) {
   fs.appendFileSync(file, `${name}=${value}\n`);
 }
 
-function requestRelease(directory) {
+export function requestRelease(directory) {
   if (fs.existsSync(directory))
     fs.writeFileSync(path.join(directory, 'release'), '');
 }
 
-async function release(directory) {
+export async function release(directory) {
   if (!directory || !fs.existsSync(directory))
     return;
   requestRelease(directory);
@@ -43,7 +43,7 @@ async function release(directory) {
   fs.rmSync(directory, {recursive : true, force : true});
 }
 
-function reportError(error) {
+export function reportError(error) {
   const message = String(error.message || error)
                       .replaceAll('%', '%25')
                       .replaceAll('\r', '%0D')
@@ -51,11 +51,3 @@ function reportError(error) {
   console.error(`::error::${message}`);
   process.exitCode = 1;
 }
-
-module.exports = {
-  writeCommand,
-  requestRelease,
-  release,
-  reportError,
-  sleep
-};

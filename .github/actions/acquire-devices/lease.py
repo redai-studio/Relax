@@ -124,8 +124,6 @@ def main(directory: Path) -> None:
         signal.signal(signum, terminate)
     try:
         config = json.loads((directory / "config.json").read_text())
-        if config["backend"] != "nvidia":
-            raise ValueError(f"Unsupported backend: {config['backend']}")
         devices, visibility_env = discover_nvidia(config["devices"])
         if not 1 <= config["count"] <= len(devices):
             raise ValueError(f"count must be between 1 and the candidate pool size ({len(devices)})")

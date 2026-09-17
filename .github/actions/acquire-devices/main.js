@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Relax Authors. All Rights Reserved.
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const {spawn} = require('node:child_process');
-const {writeCommand, requestRelease, release, reportError, sleep} =
-    require('./common.js');
+import {spawn} from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {setTimeout as sleep} from 'node:timers/promises';
+
+import {release, reportError, requestRelease, writeCommand} from './common.js';
 
 function input(name, fallback) {
   return (process.env[`INPUT_${name.toUpperCase()}`] ?? fallback).trim();
@@ -62,14 +63,14 @@ async function main() {
     const log = fs.openSync(logPath, 'a');
     let child;
     try {
-      child =
-          spawn('python3', [ path.join(__dirname, 'lease.py'), directory ], {
-            detached : true,
-            stdio : [ 'ignore', log, log ],
-            // Preserve RUNNER_TRACKING_ID for the runner's final orphan
-            // cleanup.
-            env : process.env,
-          });
+      child = spawn('python3',
+                    [ path.join(import.meta.dirname, 'lease.py'), directory ], {
+                      detached : true,
+                      stdio : [ 'ignore', log, log ],
+                      // Preserve RUNNER_TRACKING_ID for the runner's final
+                      // orphan cleanup.
+                      env : process.env,
+                    });
     } finally {
       fs.closeSync(log);
     }

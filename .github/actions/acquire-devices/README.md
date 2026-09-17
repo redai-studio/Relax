@@ -73,21 +73,21 @@ an already-started job-level `container:`.
   env:
     DEVICES: ${{ steps.devices.outputs.devices }}
   run: |
-    docker create --rm --init --name "$CI_CONTAINER_NAME" \
+    docker create --rm --init --name "$TEST_CONTAINER" \
       --gpus "\"device=$DEVICES\"" \
-      "$CI_IMAGE" sleep infinity
-    docker start "$CI_CONTAINER_NAME"
+      "$TEST_IMAGE" sleep infinity
+    docker start "$TEST_CONTAINER"
 - name: Run tests
-  run: docker exec "$CI_CONTAINER_NAME" python -m pytest tests/
+  run: docker exec "$TEST_CONTAINER" python -m pytest tests/
 - name: Stop workload before releasing devices
   if: always()
   run: |
-    if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
-      docker rm --force "$CI_CONTAINER_NAME"
+    if docker inspect "$TEST_CONTAINER" >/dev/null 2>&1; then
+      docker rm --force "$TEST_CONTAINER"
     fi
 ```
 
-Set `CI_IMAGE` and a unique `CI_CONTAINER_NAME` in the job environment. Prepare
+Set `TEST_IMAGE` and a unique `TEST_CONTAINER` in the job environment. Prepare
 the test workspace/dependencies in the container as appropriate. Container
 cleanup runs before the action's post step. Do not pass host numeric indices
 into the container's `CUDA_VISIBLE_DEVICES`; use UUIDs or let Docker expose
@@ -117,14 +117,3 @@ only the selected devices.
   is no TTL that silently frees devices still used by a workload. Recover by
   stopping the abandoned workloads and their holder on the host, never by
   deleting shared lock files. Runner orphan cleanup is only a fallback.
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests/actions -p test_acquire_devices.py -v
-```
-
-These tests use synthetic device discovery and real separate Action/holder
-processes. They cover contention, partial allocation rollback, UUID/index
-aliases, cross-step lifetime, cancellation during acquisition, and idempotent
-post cleanup without requiring accelerator hardware.
