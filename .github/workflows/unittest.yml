@@ -37,10 +37,9 @@ jobs:
             echo "CI_GPU_DEVICES must list exactly four GPU indices or UUIDs" >&2
             exit 1
           fi
-          uv_cache_dir="${CI_UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
+          uv_cache_dir="$HOME/.cache/uv"
           artifact_dir="$RUNNER_TEMP/unittest-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           mkdir -p "$uv_cache_dir" "$artifact_dir"
-          uv_cache_dir="$(cd -- "$uv_cache_dir" && pwd)"
 
           # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
           # Create before starting so cancellation during a pull cannot start tests.
