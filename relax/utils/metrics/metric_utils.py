@@ -111,6 +111,113 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
     return log_dict
 
 
+def compute_num_turn_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Pure aggregation of per-sample rollout turn counts.
+
+    Turns are read from ``sample.metadata["rollout_turns"]`` and normalized
+    (see ``_normalize_rollout_turns``): non-negative integers are kept, finite
+    non-negative integral floats are converted to int, and every other value —
+    including missing or None metadata — falls back to the historical
+    single-turn default of 1. ``num_turn/mean|max|min`` therefore keep their
+    semantics for normal inputs, and the added tail percentiles surface
+    long-tail trajectories.
+
+    The four percentiles come from a single ``np.percentile`` call with the
+    default linear interpolation; single-sample batches report the same Python
+    scalar for all seven statistics.
+
+    Returns {} for empty input; reads only the samples it is given.
+    """
+    if not samples:
+        return {}
+    turns = [_normalize_rollout_turns(sample) for sample in samples]
+    quantiles = np.percentile(turns, [50, 90, 95, 99])
+    metrics = {
+        "num_turn/mean": np.mean(turns).item(),
+        "num_turn/max": np.max(turns).item(),
+        "num_turn/min": np.min(turns).item(),
+    }
+    metrics |= {f"num_turn/p{p}": q.item() for p, q in zip((50, 90, 95, 99), quantiles)}
+    return metrics
+
+
+def compute_stop_reason_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Pure aggregation of the stop-reason distribution over rollout samples.
+
+    Each sample lands in exactly one bucket resolved by
+    ``_resolve_rollout_stop_reason`` — the legacy ``rollout_stop_reason``
+    metadata field first, the agentic ``stop_reason`` metadata field second,
+    and an explicit ``unknown`` fallback — so the emitted
+    ``stop_reason/{reason}/ratio`` values sum to 1 over the whole batch. The
+    denominator is every input sample: no filtering by reward, status, group,
+    or session. Counts are reported alongside as float integers for
+    small-batch debugging, and only categories present in the current batch
+    are emitted (nothing is accumulated across calls).
+
+    Keys embed the raw reason strings (e.g. ``stop_reason/max_turns/count``).
+    Relax ships explicit metric dicts with no key-substring-based reduction,
+    so reasons containing "max"/"min" are safe here, unlike aggregators that
+    infer the reduction from key names.
+
+    Returns {} for empty input; reads only the samples it is given.
+    """
+    if not samples:
+        return {}
+    counts: dict[str, int] = {}
+    for sample in samples:
+        reason = _resolve_rollout_stop_reason(sample)
+        counts[reason] = counts.get(reason, 0) + 1
+    total = len(samples)
+    metrics: dict[str, float] = {}
+    for reason in sorted(counts):
+        count = counts[reason]
+        metrics[f"stop_reason/{reason}/count"] = float(count)
+        metrics[f"stop_reason/{reason}/ratio"] = count / total
+    return metrics
+
+
+def _resolve_rollout_stop_reason(sample: Sample) -> str:
+    """Resolve the stop-reason bucket for one sample (first valid wins).
+
+    1. ``metadata["rollout_stop_reason"]`` — legacy field written by the
+       DeepEyes rollout (e.g. ``max_turns`` / ``env_done``).
+    2. ``metadata["stop_reason"]`` — field returned by agentic apps
+       (e.g. ``examples/deepeyes_agentic/app/agent.py``) and merged into
+       sample metadata by the session service.
+    3. ``"unknown"`` when neither field holds a valid value.
+
+    Valid values are strings with non-blank content; surrounding whitespace is
+    stripped while case and inner content are preserved. The stop reason is
+    never derived from ``Sample.status`` or per-request finish reasons.
+    """
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    for key in ("rollout_stop_reason", "stop_reason"):
+        reason = metadata.get(key)
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()
+    return "unknown"
+
+
+def _normalize_rollout_turns(sample: Sample) -> int:
+    """Normalize ``metadata["rollout_turns"]`` to a committed-response count.
+
+    Non-negative Python/NumPy integers are kept as-is (0 is valid), finite non-
+    negative integral floats (e.g. ``2.0``) are converted to int, and every
+    other value — None, bools, strings, fractional floats, negatives, NaN/inf,
+    containers, or missing/None metadata — falls back to the historical single-
+    turn default of 1 without parsing or truncation.
+    """
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else None
+    value = metadata.get("rollout_turns") if metadata else None
+    if value is None or isinstance(value, (bool, str, list, tuple, dict)):
+        return 1
+    if isinstance(value, (int, np.integer)):
+        return int(value) if value >= 0 else 1
+    if isinstance(value, (float, np.floating)) and np.isfinite(value) and value >= 0 and float(value).is_integer():
+        return int(value)
+    return 1
+
+
 def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
     """Compute leave-one-out diagnostics from training rollout samples.
 

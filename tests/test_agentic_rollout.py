@@ -42,6 +42,7 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
+from relax.utils.metrics.metric_utils import compute_num_turn_metrics, compute_stop_reason_metrics
 from relax.utils.types import Sample
 
 
@@ -331,6 +332,12 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
     assert sample.metadata["agentic_trace"]["turn_count"] == 1
+    assert sample.metadata["rollout_turns"] == sample.metadata["agentic_trace"]["turn_count"] == 1
+    assert compute_stop_reason_metrics([sample]) == {
+        "stop_reason/unknown/count": 1.0,
+        "stop_reason/unknown/ratio": 1.0,
+    }
+    assert sample.metadata["seed_stage"] == "bootstrap"
     sample.sampling_params = {"temperature": 0.2}
     (session_spec,) = _build_session_specs(
         [sample],
@@ -345,6 +352,55 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     )
     assert session_spec.sampling_params == {"temperature": 0.2}
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_session_forest_multi_turn_export_feeds_metadata_metrics() -> None:
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sess-multi-turn",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "go"}]}],
+        train_token_delta=_chars("go"),
+        rollout_token_delta=_chars("go"),
+        rollout_id=3,
+        group_index=0,
+        index=0,
+    )
+    first_resp = forest.append_resp(
+        parent_state_hash=initial_obs.state_hash,
+        rollout_id=3,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "call"}]}],
+        token_delta=_chars("call"),
+        logprob_delta=[-0.1],
+        status="completed",
+    )
+    middle_obs = forest.append_obs(
+        parent_state_hash=first_resp.state_hash,
+        rollout_id=3,
+        abort_count=0,
+        messages_delta=[{"role": "user", "content": [{"type": "text", "text": "result"}]}],
+        train_token_delta=_chars("result"),
+        rollout_token_delta=_chars("result"),
+    )
+    leaf = forest.append_resp(
+        parent_state_hash=middle_obs.state_hash,
+        rollout_id=3,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "done"}]}],
+        token_delta=_chars("done"),
+        logprob_delta=[-0.2],
+        status="completed",
+        export_metadata_patch={"stop_reason": "env_done"},
+    )
+    sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
+
+    assert sample.metadata["rollout_turns"] == 2
+    assert sample.metadata["agentic_trace"]["turn_count"] == 2
+    assert compute_stop_reason_metrics([sample]) == {
+        "stop_reason/env_done/count": 1.0,
+        "stop_reason/env_done/ratio": 1.0,
+    }
+    assert compute_num_turn_metrics([sample])["num_turn/p95"] == 2
+    assert sample.metadata["stop_reason"] == "env_done"
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:
