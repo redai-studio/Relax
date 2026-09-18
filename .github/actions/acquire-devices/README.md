@@ -58,8 +58,10 @@ authoritative and the action replaces the inherited visibility value.
 
 When devices are unavailable, the action logs the candidate pool's lock status
 immediately and every 30 seconds while waiting: elapsed time, available count,
-and the UUIDs of available and locked devices. This reports cooperative device
-reservations, not GPU utilization or memory usage.
+and available/locked devices as `physical-index (UUID)`. The successful reservation
+log uses the same format. Indices are the host's `nvidia-smi` indices; Action
+outputs and visibility variables use UUIDs. The waiting log reports cooperative
+device reservations, not GPU utilization or memory usage.
 
 ## Docker workloads
 

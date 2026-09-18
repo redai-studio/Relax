@@ -11,11 +11,12 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from relax.algorithms import get_algorithm
+from relax.algorithms.rewards import REWARD_NORMALIZERS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
-from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 from relax.utils.types import Sample
 
 
@@ -208,52 +209,19 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         return raw_rewards, processed_rewards
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-
+    # This explicit custom-advantage hook replaces the registered reward
+    # normalizer wholesale by design.
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return raw_rewards, [sample.custom_advantage for sample in samples]
 
-    if (
-        args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
-        and args.rewards_normalization
-    ):
-        # group norm
-        rewards = torch.tensor(raw_rewards, dtype=torch.float)
-        positions_by_group: dict[int, list[int]] = {}
-        for position, sample in enumerate(samples):
-            if sample.group_index is None:
-                raise ValueError("Sample.group_index is required for group reward normalization.")
-            if sample.group_index not in positions_by_group:
-                positions_by_group[sample.group_index] = []
-            positions_by_group[sample.group_index].append(position)
+    if not args.rewards_normalization:
+        return raw_rewards, raw_rewards
 
-        normalized_rewards = torch.empty_like(rewards)
-        for group_index, positions in positions_by_group.items():
-            if len(positions) != args.n_samples_per_prompt:
-                raise ValueError(
-                    f"Reward group {group_index} has {len(positions)} samples, expected {args.n_samples_per_prompt}."
-                )
-            group_rewards = rewards[positions]
-            if args.advantage_estimator == "rloo":
-                finite_mask = torch.isfinite(group_rewards)
-                if not finite_mask.all():
-                    invalid_group_positions = (~finite_mask).nonzero(as_tuple=False).flatten().tolist()
-                    invalid_sample_positions = [positions[position] for position in invalid_group_positions]
-                    invalid_values = group_rewards[~finite_mask].tolist()
-                    raise ValueError(
-                        f"RLOO group_index={group_index} contains non-finite reward(s) at "
-                        f"group position(s) {invalid_group_positions}, sample position(s) "
-                        f"{invalid_sample_positions}: {invalid_values}."
-                    )
-                group_rewards = compute_rloo_leave_one_out_rewards(group_rewards)
-            else:
-                group_rewards = group_rewards - group_rewards.mean()
-                if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
-                    group_rewards = group_rewards / (group_rewards.std() + 1e-6)
-            normalized_rewards[positions] = group_rewards
-
-        return raw_rewards, normalized_rewards.tolist()
-
-    return raw_rewards, raw_rewards
+    # Which normalization to apply is declared by the algorithm registry rather
+    # than by a whitelist of estimator names maintained here.
+    spec = get_algorithm(args.advantage_estimator)
+    normalizer = REWARD_NORMALIZERS[spec.reward_normalizer]
+    return raw_rewards, normalizer(args, samples, raw_rewards)
 
 
 def dict_to_tensordict(
@@ -525,7 +493,7 @@ def get_debug_data(args, rollout_id: int, batch_size, dp_rank: int) -> Dict[str,
         original_num_rows = len(data)
         if (
             args.custom_reward_post_process_path is None
-            and args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
+            and get_algorithm(args.advantage_estimator).requires_complete_reward_groups
             and args.rewards_normalization
         ):
             group_ids = list(dict.fromkeys(sample.group_index for sample in data))

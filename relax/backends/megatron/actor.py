@@ -27,6 +27,7 @@ except ImportError:
 from tensordict import TensorDict
 from transformers import AutoConfig, AutoTokenizer
 
+from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
@@ -1561,7 +1562,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
         # rest of the pipeline can assume same-device inputs.
-        if self.args.advantage_estimator == "ppo":
+        if algorithm_needs_critic(self.args):
             cur_device = torch.cuda.current_device()
             for key in ("values", "loss_masks"):
                 tensors = rollout_data.get(key)
@@ -1602,7 +1603,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # advantages/returns via TransferQueue; every other path (including
             # PPO colocate) computes GAE inline from critic's ``values``.
             should_compute_gae_in_actor = self.args.compute_advantages_and_returns and not (
-                self.args.advantage_estimator == "ppo" and self.args.fully_async and not self.args.hybrid
+                algorithm_needs_critic(self.args) and self.args.fully_async and not self.args.hybrid
             )
 
             if should_compute_old_log_probs:
@@ -3174,7 +3175,7 @@ class MegatronTrainRayActor(TrainRayActor):
             run(self.data_system_client.async_put(data=output_dict, metadata=batch_meta))
 
     def _put_critic_values_to_transfer_queue(self, rollout_data: RolloutBatch) -> None:
-        if getattr(self.args, "advantage_estimator", None) != "ppo":
+        if not algorithm_needs_critic(self.args):
             return
 
         values = rollout_data.get("values")

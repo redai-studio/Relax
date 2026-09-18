@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import IO
 
 
-def discover_nvidia(pool: str) -> tuple[list[str], str]:
+def discover_nvidia(pool: str) -> tuple[dict[str, str], str]:
     """Resolve physical nvidia-smi indices to stable whole-GPU UUIDs."""
     if "CUDA_VISIBLE_DEVICES" in os.environ and not pool:
         raise ValueError("CUDA_VISIBLE_DEVICES is already set; specify devices using physical indices or full UUIDs")
@@ -30,12 +30,14 @@ def discover_nvidia(pool: str) -> tuple[list[str], str]:
         timeout=10,
     )
     aliases: dict[str, str] = {}
+    indices: dict[str, str] = {}
     mig_devices: set[str] = set()
     for line in result.stdout.splitlines():
         index, uuid, mig = (part.strip() for part in line.split(","))
         if not index.isdigit() or not re.fullmatch(r"GPU-[0-9a-fA-F-]+", uuid):
             raise ValueError(f"Unexpected nvidia-smi device: {line!r}")
         aliases[index] = aliases[uuid] = uuid
+        indices[uuid] = index
         if mig.lower() == "enabled":
             mig_devices.add(uuid)
     if pool:
@@ -49,7 +51,11 @@ def discover_nvidia(pool: str) -> tuple[list[str], str]:
         raise ValueError("Device pool must be nonempty and contain no duplicate physical devices")
     if mig_devices.intersection(devices):
         raise ValueError("MIG-enabled GPUs are not supported; choose a pool of whole GPUs")
-    return devices, "CUDA_VISIBLE_DEVICES"
+    return {device: indices[device] for device in devices}, "CUDA_VISIBLE_DEVICES"
+
+
+def format_devices(devices: list[str], indices: dict[str, str]) -> str:
+    return ", ".join(f"{indices[device]} ({device})" for device in devices) or "none"
 
 
 def lock_path(directory: Path, backend: str, device: str) -> Path:
@@ -74,7 +80,9 @@ def cancelled(directory: Path, parent_pid: int) -> bool:
     return not (directory / "accepted").exists() and not parent_alive(parent_pid)
 
 
-def acquire(directory: Path, config: dict, devices: list[str], deadline: float) -> tuple[list[str], list[IO[str]]]:
+def acquire(
+    directory: Path, config: dict, devices: dict[str, str], deadline: float
+) -> tuple[list[str], list[IO[str]]]:
     lock_dir = Path(config["lock_dir"])
     lock_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -110,8 +118,8 @@ def acquire(directory: Path, config: dict, devices: list[str], deadline: float) 
             sys.stdout.write(
                 f"Waiting for {config['count']} {config['backend']} devices ({now - started:.0f}s elapsed): "
                 f"{len(selected)}/{len(devices)} available\n"
-                f"  Available: {', '.join(selected) or 'none'}\n"
-                f"  Locked: {', '.join(locked) or 'none'}\n"
+                f"  Available: {format_devices(selected, devices)}\n"
+                f"  Locked: {format_devices(locked, devices)}\n"
             )
             sys.stdout.flush()
             next_report = now + 30
@@ -142,7 +150,14 @@ def main(directory: Path) -> None:
             raise ValueError(f"count must be between 1 and the candidate pool size ({len(devices)})")
         deadline = time.monotonic() + config["timeout"]
         selected, handles = acquire(directory, config, devices, deadline)
-        write_result(directory, {"devices": selected, "visibility_env": visibility_env})
+        write_result(
+            directory,
+            {
+                "devices": selected,
+                "display_devices": format_devices(selected, devices),
+                "visibility_env": visibility_env,
+            },
+        )
         while not cancelled(directory, config["parent_pid"]):
             time.sleep(0.1)
     except Exception as error:
