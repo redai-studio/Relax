@@ -69,6 +69,15 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 ###############################################################################
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
+if ! [[ "${ROLLOUT_NUM_GPUS_PER_ENGINE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: ROLLOUT_NUM_GPUS_PER_ENGINE must be a positive integer." >&2
+    exit 1
+fi
+if ((8 % ROLLOUT_NUM_GPUS_PER_ENGINE != 0)); then
+    echo "ERROR: ROLLOUT_NUM_GPUS_PER_ENGINE must divide the 8 rollout GPUs." >&2
+    exit 1
+fi
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -199,7 +208,7 @@ MEGATRON_ARGS=(
 ###############################################################################
 
 RAY_RESOURCE_ARGS=(
-    --rollout-num-gpus-per-engine 1
+    --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
     --resource '{"actor": [1, 8], "rollout": [1, 8]}'
     --max-staleness 0
     --num-data-storage-units 1

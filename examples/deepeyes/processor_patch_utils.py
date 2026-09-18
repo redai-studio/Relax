@@ -9,8 +9,11 @@ from typing import Any, Awaitable, Callable
 
 from packaging.version import Version
 
+from relax.utils.logging_utils import get_logger
+
 
 SUPPORTED_SGLANG_VERSION = Version("0.5.12.post1")
+logger = get_logger(__name__)
 
 
 def collapse_consecutive_image_tokens(input_ids: Any, image_token_id: int) -> Any:
@@ -99,6 +102,16 @@ async def process_preexpanded_inputs(
         raise RuntimeError(
             "DeepEyes processor registration received an unsupported SGLang output type "
             f"{type(output).__name__}; review the processor contract for this SGLang release."
+        )
+
+    hit_count = getattr(processor, "_deepeyes_processor_hit_count", 0) + 1
+    processor._deepeyes_processor_hit_count = hit_count
+    if hit_count == 1:
+        logger.info(
+            "DeepEyes processor first hit: class=%s rid=%s input_tokens=%s",
+            type(processor).__name__,
+            getattr(request_obj, "rid", "anonymous_rid"),
+            len(original_input_ids),
         )
 
     mrope_items = merge_mrope_grid_items(output.mm_items)

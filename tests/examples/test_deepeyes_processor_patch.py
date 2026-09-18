@@ -62,6 +62,16 @@ def test_deepeyes_does_not_overwrite_sglang_installation():
     assert not (repo_root / "examples/deepeyes/qwen_vl.py").exists()
 
 
+def test_r3_recipe_exposes_validated_rollout_tensor_parallelism():
+    repo_root = Path(__file__).resolve().parents[2]
+    run_script = (repo_root / "examples/deepeyes/run_deepeyes_r3.sh").read_text()
+
+    assert 'ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"' in run_script
+    assert "ROLLOUT_NUM_GPUS_PER_ENGINE must be a positive integer" in run_script
+    assert "8 % ROLLOUT_NUM_GPUS_PER_ENGINE" in run_script
+    assert '--rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"' in run_script
+
+
 def test_patch_preserves_upstream_outputs_and_recomputes_mrope():
     calls = []
     processor_cls = _processor_class(calls)
@@ -84,6 +94,7 @@ def test_patch_preserves_upstream_outputs_and_recomputes_mrope():
     assert output.mm_items == ["image"]
     assert output.mrope_positions == "restored positions"
     assert output.mrope_position_delta == "restored delta"
+    assert processor._deepeyes_processor_hit_count == 1
 
 
 def test_merge_mrope_grid_items_combines_multi_turn_image_grids():

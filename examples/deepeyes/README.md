@@ -44,6 +44,30 @@ bash benchmark.sh run_deepeyes
 bash examples/deepeyes/run_deepeyes.sh
 ```
 
+R3 配方默认启用动态 processor：
+
+```bash
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+SAVE_DIR=/path/to/save \
+bash examples/deepeyes/run_deepeyes_r3.sh
+```
+
+`run_deepeyes_r3.sh` 默认保持单卡 rollout engine，适用于已验证的
+8×H800 80GB 环境。在 8×RTX A6000 48GB 等单卡无法容纳 30B rollout
+模型的环境中，应显式使用两卡 tensor parallel；该设置只改变 SGLang
+engine 的模型分片，不改变 processor patch 行为：
+
+```bash
+ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
+MODEL_DIR=/path/to/models \
+DATA_DIR=/path/to/data \
+SAVE_DIR=/path/to/save \
+bash examples/deepeyes/run_deepeyes_r3.sh
+```
+
+`ROLLOUT_NUM_GPUS_PER_ENGINE` 必须是正整数，并且应能整除脚本为 rollout
+角色分配的 8 张 GPU；无效值会在提交 Ray job 前直接报错。
 在单机 8×H800（80GB）上运行 `run_deepeyes.sh` 时的 GPU 使用率监控（平均约 66%）：
 
 ![单机 8×H800（80GB）运行 run_deepeyes.sh 的 GPU 使用率](../../docs/public/deepeyes-h800.png)
