@@ -1,0 +1,1012 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "logical_cpus": 12,
+    "python": "3.13.9 | packaged by Anaconda, Inc. | (main, Oct 21 2025, 19:09:58) [MSC v.1929 64 bit (AMD64)]",
+    "zlib_build": "1.2.13",
+    "zlib_runtime": "1.3.1"
+  },
+  "configuration": {
+    "window_size": 10000,
+    "stride": 5000,
+    "threshold": 10.0
+  },
+  "repeats": 7,
+  "seed": 20260918,
+  "methodology": {
+    "isolation": "Fresh subprocess per case, length and API; one unmeasured warmup.",
+    "timing": "Seconds per response; full calls batched to approximately 100 ms to mitigate CPU clock quantization. Input/imports and tracemalloc excluded. p95 uses nearest rank.",
+    "process_peak": "OS peak working set/RSS in bytes; includes interpreter, imports, input and warmup. Captured before tracemalloc; not an incremental allocation estimate.",
+    "tracemalloc": "Separate scan peak in bytes, tracing started after input/imports; includes allocations visible to Python tracer, not all native allocations.",
+    "boolean": "May stop at first hit. Control must scan every window; detailed always scans all.",
+    "middle_repeat": "Middle half repeated, first/last quarters deterministic random text. 10k mixed window may correctly remain below threshold."
+  },
+  "results": [
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "control",
+      "api": "detailed",
+      "calls_per_timing_batch": 297,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": 1,
+      "cpu_seconds": {
+        "median": 5.260942760942761e-05,
+        "minimum": 5.260942760942761e-05,
+        "p95_nearest_rank": 0.00010521885521885521,
+        "runs": [
+          0.00010521885521885521,
+          5.260942760942761e-05,
+          5.260942760942761e-05,
+          0.00010521885521885521,
+          5.260942760942761e-05,
+          5.260942760942761e-05,
+          0.00010521885521885521
+        ]
+      },
+      "wall_seconds": {
+        "median": 6.761885544454509e-05,
+        "minimum": 6.320202050523626e-05,
+        "p95_nearest_rank": 7.060740765510284e-05,
+        "runs": [
+          6.761885544454509e-05,
+          7.000942761548842e-05,
+          6.657239027722716e-05,
+          7.060740765510284e-05,
+          6.51936024828792e-05,
+          6.320202050523626e-05,
+          6.896734036981859e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 24895488,
+      "process_peak_bytes": 25227264,
+      "scan_tracemalloc_peak_bytes": 311442
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "control",
+      "api": "boolean",
+      "calls_per_timing_batch": 655,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 7.156488549618321e-05,
+        "minimum": 4.770992366412214e-05,
+        "p95_nearest_rank": 7.156488549618321e-05,
+        "runs": [
+          7.156488549618321e-05,
+          4.770992366412214e-05,
+          7.156488549618321e-05,
+          7.156488549618321e-05,
+          4.770992366412214e-05,
+          7.156488549618321e-05,
+          7.156488549618321e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 6.269236639113599e-05,
+        "minimum": 6.134152671905191e-05,
+        "p95_nearest_rank": 6.536122141334847e-05,
+        "runs": [
+          6.269236639113599e-05,
+          6.173679388291735e-05,
+          6.134152671905191e-05,
+          6.191923659835153e-05,
+          6.469618315801366e-05,
+          6.527435123380132e-05,
+          6.536122141334847e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 25481216,
+      "process_peak_bytes": 25804800,
+      "scan_tracemalloc_peak_bytes": 311850
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 852,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": 1,
+      "cpu_seconds": {
+        "median": 3.6678403755868545e-05,
+        "minimum": 3.6678403755868545e-05,
+        "p95_nearest_rank": 5.501760563380282e-05,
+        "runs": [
+          3.6678403755868545e-05,
+          5.501760563380282e-05,
+          3.6678403755868545e-05,
+          5.501760563380282e-05,
+          3.6678403755868545e-05,
+          5.501760563380282e-05,
+          3.6678403755868545e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 4.4791431941240674e-05,
+        "minimum": 4.265727702104115e-05,
+        "p95_nearest_rank": 4.656443660947639e-05,
+        "runs": [
+          4.484201877098093e-05,
+          4.4791431941240674e-05,
+          4.265727702104115e-05,
+          4.545046946256828e-05,
+          4.656443660947639e-05,
+          4.444612674371387e-05,
+          4.352546956154033e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 25399296,
+      "process_peak_bytes": 25575424,
+      "scan_tracemalloc_peak_bytes": 311442
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 1124,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 5.560498220640569e-05,
+        "minimum": 4.170373665480427e-05,
+        "p95_nearest_rank": 6.950622775800712e-05,
+        "runs": [
+          5.560498220640569e-05,
+          6.950622775800712e-05,
+          5.560498220640569e-05,
+          4.170373665480427e-05,
+          5.560498220640569e-05,
+          4.170373665480427e-05,
+          5.560498220640569e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 5.17110321032765e-05,
+        "minimum": 4.587989324103921e-05,
+        "p95_nearest_rank": 5.922820288571943e-05,
+        "runs": [
+          5.922820288571943e-05,
+          5.816895012607884e-05,
+          5.7309341668300467e-05,
+          4.9857206346825085e-05,
+          5.17110321032765e-05,
+          4.650311386278993e-05,
+          4.587989324103921e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 25378816,
+      "process_peak_bytes": 25559040,
+      "scan_tracemalloc_peak_bytes": 311850
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "repeated",
+      "api": "detailed",
+      "calls_per_timing_batch": 884,
+      "has_repetition": true,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": 1,
+      "cpu_seconds": {
+        "median": 1.767533936651584e-05,
+        "minimum": 1.767533936651584e-05,
+        "p95_nearest_rank": 3.535067873303168e-05,
+        "runs": [
+          3.535067873303168e-05,
+          1.767533936651584e-05,
+          3.535067873303168e-05,
+          1.767533936651584e-05,
+          1.767533936651584e-05,
+          3.535067873303168e-05,
+          1.767533936651584e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 2.371527152388816e-05,
+        "minimum": 2.240101813140633e-05,
+        "p95_nearest_rank": 2.820927602854216e-05,
+        "runs": [
+          2.820927602854216e-05,
+          2.686142535854923e-05,
+          2.6676018155554974e-05,
+          2.240101813140633e-05,
+          2.2731561000918236e-05,
+          2.371527152388816e-05,
+          2.2432692317351093e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 24858624,
+      "process_peak_bytes": 25100288,
+      "scan_tracemalloc_peak_bytes": 311442
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 10000,
+      "case": "repeated",
+      "api": "boolean",
+      "calls_per_timing_batch": 964,
+      "has_repetition": true,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 1.620850622406639e-05,
+        "minimum": 1.620850622406639e-05,
+        "p95_nearest_rank": 3.241701244813278e-05,
+        "runs": [
+          3.241701244813278e-05,
+          1.620850622406639e-05,
+          1.620850622406639e-05,
+          3.241701244813278e-05,
+          1.620850622406639e-05,
+          3.241701244813278e-05,
+          1.620850622406639e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 2.183008304298604e-05,
+        "minimum": 2.129927385768455e-05,
+        "p95_nearest_rank": 2.2773443976285793e-05,
+        "runs": [
+          2.216898338169756e-05,
+          2.2773443976285793e-05,
+          2.1431016512562936e-05,
+          2.2519502066137632e-05,
+          2.183008304298604e-05,
+          2.129927385768455e-05,
+          2.135134858071526e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 25137152,
+      "process_peak_bytes": 25329664,
+      "scan_tracemalloc_peak_bytes": 311850
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 30000,
+      "case": "chinese_middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 237,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": 1,
+      "cpu_seconds": {
+        "median": 0.00026371308016877635,
+        "minimum": 0.00026371308016877635,
+        "p95_nearest_rank": 0.00032964135021097045,
+        "runs": [
+          0.00032964135021097045,
+          0.00026371308016877635,
+          0.00026371308016877635,
+          0.00026371308016877635,
+          0.00032964135021097045,
+          0.00026371308016877635,
+          0.00032964135021097045
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.00029352742624528047,
+        "minimum": 0.0002786569618561034,
+        "p95_nearest_rank": 0.00031039282681522614,
+        "runs": [
+          0.00027899282693642855,
+          0.0002786569618561034,
+          0.00029352742624528047,
+          0.00031039282681522614,
+          0.0003101936711454253,
+          0.00030241308012733605,
+          0.0002887852319009319
+        ]
+      },
+      "process_peak_bytes_before_timing": 25464832,
+      "process_peak_bytes": 25587712,
+      "scan_tracemalloc_peak_bytes": 331442
+    },
+    {
+      "characters": 10000,
+      "utf8_bytes": 30000,
+      "case": "chinese_middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 173,
+      "has_repetition": false,
+      "full_scan_windows": 1,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.000361271676300578,
+        "minimum": 0.0002709537572254335,
+        "p95_nearest_rank": 0.000361271676300578,
+        "runs": [
+          0.000361271676300578,
+          0.000361271676300578,
+          0.000361271676300578,
+          0.0002709537572254335,
+          0.0002709537572254335,
+          0.0002709537572254335,
+          0.000361271676300578
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.0003237861270526413,
+        "minimum": 0.00027969768782270095,
+        "p95_nearest_rank": 0.00042081734090182135,
+        "runs": [
+          0.0003398433529551146,
+          0.00042081734090182135,
+          0.00039660115591707944,
+          0.00027969768782270095,
+          0.0002885774569316751,
+          0.0003008057802075768,
+          0.0003237861270526413
+        ]
+      },
+      "process_peak_bytes_before_timing": 25575424,
+      "process_peak_bytes": 25706496,
+      "scan_tracemalloc_peak_bytes": 331850
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "control",
+      "api": "detailed",
+      "calls_per_timing_batch": 57,
+      "has_repetition": false,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": 19,
+      "cpu_seconds": {
+        "median": 0.001644736842105263,
+        "minimum": 0.0013706140350877192,
+        "p95_nearest_rank": 0.001918859649122807,
+        "runs": [
+          0.001918859649122807,
+          0.001918859649122807,
+          0.001918859649122807,
+          0.0013706140350877192,
+          0.001644736842105263,
+          0.001644736842105263,
+          0.0013706140350877192
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.0016900210522866825,
+        "minimum": 0.0016279263164553988,
+        "p95_nearest_rank": 0.0019823263150133322,
+        "runs": [
+          0.001845963158350634,
+          0.0019823263150133322,
+          0.0016900210522866825,
+          0.0017641140352281039,
+          0.0016279263164553988,
+          0.001687717544356067,
+          0.0016486789467499445
+        ]
+      },
+      "process_peak_bytes_before_timing": 26935296,
+      "process_peak_bytes": 26935296,
+      "scan_tracemalloc_peak_bytes": 321771
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "control",
+      "api": "boolean",
+      "calls_per_timing_batch": 26,
+      "has_repetition": false,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.0018028846153846155,
+        "minimum": 0.0018028846153846155,
+        "p95_nearest_rank": 0.003605769230769231,
+        "runs": [
+          0.003605769230769231,
+          0.002403846153846154,
+          0.0018028846153846155,
+          0.0018028846153846155,
+          0.0018028846153846155,
+          0.0018028846153846155,
+          0.0018028846153846155
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.0018702576948831289,
+        "minimum": 0.0017611846112861084,
+        "p95_nearest_rank": 0.00339131153976688,
+        "runs": [
+          0.00339131153976688,
+          0.0023048500028940346,
+          0.002114896152096872,
+          0.0017697115366060573,
+          0.0018702576948831289,
+          0.0018471384626956512,
+          0.0017611846112861084
+        ]
+      },
+      "process_peak_bytes_before_timing": 26841088,
+      "process_peak_bytes": 26841088,
+      "scan_tracemalloc_peak_bytes": 322179
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 83,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": 19,
+      "cpu_seconds": {
+        "median": 0.0011295180722891566,
+        "minimum": 0.0009412650602409639,
+        "p95_nearest_rank": 0.0013177710843373493,
+        "runs": [
+          0.0009412650602409639,
+          0.0011295180722891566,
+          0.0011295180722891566,
+          0.0011295180722891566,
+          0.0009412650602409639,
+          0.0013177710843373493,
+          0.0011295180722891566
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.001152910843368126,
+        "minimum": 0.0009979301199586276,
+        "p95_nearest_rank": 0.0013277277109179511,
+        "runs": [
+          0.0009979301199586276,
+          0.0011779373492035701,
+          0.001152910843368126,
+          0.0010387421689411424,
+          0.0010351048198988639,
+          0.0013277277109179511,
+          0.0013186915662610926
+        ]
+      },
+      "process_peak_bytes_before_timing": 26611712,
+      "process_peak_bytes": 26611712,
+      "scan_tracemalloc_peak_bytes": 323419
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 191,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.00040903141361256544,
+        "minimum": 0.0003272251308900524,
+        "p95_nearest_rank": 0.0004908376963350785,
+        "runs": [
+          0.00040903141361256544,
+          0.0003272251308900524,
+          0.00040903141361256544,
+          0.00040903141361256544,
+          0.0004908376963350785,
+          0.00040903141361256544,
+          0.0004908376963350785
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.00043809738227151607,
+        "minimum": 0.00040373403130401493,
+        "p95_nearest_rank": 0.0005426099475141595,
+        "runs": [
+          0.00040373403130401493,
+          0.00041947068088244235,
+          0.00041869005215164096,
+          0.00043809738227151607,
+          0.0005120534031695798,
+          0.0005426099475141595,
+          0.0004473120420293502
+        ]
+      },
+      "process_peak_bytes_before_timing": 27164672,
+      "process_peak_bytes": 27164672,
+      "scan_tracemalloc_peak_bytes": 322179
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "repeated",
+      "api": "detailed",
+      "calls_per_timing_batch": 168,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": 19,
+      "cpu_seconds": {
+        "median": 0.0004650297619047619,
+        "minimum": 0.0003720238095238095,
+        "p95_nearest_rank": 0.0004650297619047619,
+        "runs": [
+          0.0003720238095238095,
+          0.0004650297619047619,
+          0.0004650297619047619,
+          0.0004650297619047619,
+          0.0004650297619047619,
+          0.0004650297619047619,
+          0.0004650297619047619
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.00045542261934661797,
+        "minimum": 0.0004261339282883065,
+        "p95_nearest_rank": 0.00048392619022966495,
+        "runs": [
+          0.00045123095263815705,
+          0.0004261339282883065,
+          0.00043959345272187854,
+          0.00048392619022966495,
+          0.000468080357504299,
+          0.00046342559480330064,
+          0.00045542261934661797
+        ]
+      },
+      "process_peak_bytes_before_timing": 25415680,
+      "process_peak_bytes": 25628672,
+      "scan_tracemalloc_peak_bytes": 324707
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 100000,
+      "case": "repeated",
+      "api": "boolean",
+      "calls_per_timing_batch": 696,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 4.489942528735632e-05,
+        "minimum": 2.244971264367816e-05,
+        "p95_nearest_rank": 4.489942528735632e-05,
+        "runs": [
+          4.489942528735632e-05,
+          4.489942528735632e-05,
+          2.244971264367816e-05,
+          4.489942528735632e-05,
+          4.489942528735632e-05,
+          2.244971264367816e-05,
+          2.244971264367816e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 3.5546695440204747e-05,
+        "minimum": 2.9419971316860155e-05,
+        "p95_nearest_rank": 7.484942519416411e-05,
+        "runs": [
+          7.484942519416411e-05,
+          5.08923850279173e-05,
+          3.131724132663816e-05,
+          4.337399434592661e-05,
+          3.5546695440204747e-05,
+          3.364324705520024e-05,
+          2.9419971316860155e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 25571328,
+      "process_peak_bytes": 25767936,
+      "scan_tracemalloc_peak_bytes": 321987
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 300000,
+      "case": "chinese_middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 13,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": 19,
+      "cpu_seconds": {
+        "median": 0.007211538461538462,
+        "minimum": 0.004807692307692308,
+        "p95_nearest_rank": 0.007211538461538462,
+        "runs": [
+          0.007211538461538462,
+          0.007211538461538462,
+          0.006009615384615385,
+          0.007211538461538462,
+          0.004807692307692308,
+          0.007211538461538462,
+          0.007211538461538462
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.006745930770053887,
+        "minimum": 0.006632207686869571,
+        "p95_nearest_rank": 0.008037123076904278,
+        "runs": [
+          0.006845415381786342,
+          0.0068160615359934475,
+          0.00670711538539483,
+          0.006688792312231202,
+          0.006632207686869571,
+          0.008037123076904278,
+          0.006745930770053887
+        ]
+      },
+      "process_peak_bytes_before_timing": 32858112,
+      "process_peak_bytes": 32858112,
+      "scan_tracemalloc_peak_bytes": 353436
+    },
+    {
+      "characters": 100000,
+      "utf8_bytes": 300000,
+      "case": "chinese_middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 28,
+      "has_repetition": true,
+      "full_scan_windows": 19,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.00390625,
+        "minimum": 0.002232142857142857,
+        "p95_nearest_rank": 0.004464285714285714,
+        "runs": [
+          0.00390625,
+          0.0027901785714285715,
+          0.00390625,
+          0.00390625,
+          0.004464285714285714,
+          0.0033482142857142855,
+          0.002232142857142857
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.003935485716543293,
+        "minimum": 0.0031559642853348385,
+        "p95_nearest_rank": 0.0041359357128385454,
+        "runs": [
+          0.0035654071460677578,
+          0.003935485716543293,
+          0.003976785715037424,
+          0.0041359357128385454,
+          0.004005182143633387,
+          0.0033905321407863604,
+          0.0031559642853348385
+        ]
+      },
+      "process_peak_bytes_before_timing": 32628736,
+      "process_peak_bytes": 32628736,
+      "scan_tracemalloc_peak_bytes": 352196
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "control",
+      "api": "detailed",
+      "calls_per_timing_batch": 6,
+      "has_repetition": false,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": 199,
+      "cpu_seconds": {
+        "median": 0.018229166666666668,
+        "minimum": 0.015625,
+        "p95_nearest_rank": 0.020833333333333332,
+        "runs": [
+          0.020833333333333332,
+          0.015625,
+          0.018229166666666668,
+          0.020833333333333332,
+          0.018229166666666668,
+          0.020833333333333332,
+          0.018229166666666668
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.018700716667808592,
+        "minimum": 0.017582250002305955,
+        "p95_nearest_rank": 0.02101489998555432,
+        "runs": [
+          0.018700716667808592,
+          0.017582250002305955,
+          0.017782283345392596,
+          0.02101489998555432,
+          0.01901680000203972,
+          0.019358516670763493,
+          0.018583516667907436
+        ]
+      },
+      "process_peak_bytes_before_timing": 38998016,
+      "process_peak_bytes": 38998016,
+      "scan_tracemalloc_peak_bytes": 321771
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "control",
+      "api": "boolean",
+      "calls_per_timing_batch": 6,
+      "has_repetition": false,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.018229166666666668,
+        "minimum": 0.013020833333333334,
+        "p95_nearest_rank": 0.018229166666666668,
+        "runs": [
+          0.018229166666666668,
+          0.015625,
+          0.018229166666666668,
+          0.018229166666666668,
+          0.018229166666666668,
+          0.013020833333333334,
+          0.018229166666666668
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.01744929999889185,
+        "minimum": 0.01729358333007743,
+        "p95_nearest_rank": 0.018285683336822938,
+        "runs": [
+          0.01744929999889185,
+          0.01756274998964121,
+          0.01740730000892654,
+          0.01772603332453097,
+          0.01729358333007743,
+          0.017342566667745512,
+          0.018285683336822938
+        ]
+      },
+      "process_peak_bytes_before_timing": 39669760,
+      "process_peak_bytes": 39669760,
+      "scan_tracemalloc_peak_bytes": 322179
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 7,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": 199,
+      "cpu_seconds": {
+        "median": 0.011160714285714286,
+        "minimum": 0.008928571428571428,
+        "p95_nearest_rank": 0.013392857142857142,
+        "runs": [
+          0.013392857142857142,
+          0.008928571428571428,
+          0.008928571428571428,
+          0.011160714285714286,
+          0.011160714285714286,
+          0.011160714285714286,
+          0.011160714285714286
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.011420800001360476,
+        "minimum": 0.010802600000585829,
+        "p95_nearest_rank": 0.011976371436113757,
+        "runs": [
+          0.011976371436113757,
+          0.011572542866425855,
+          0.011415328564388412,
+          0.011420800001360476,
+          0.01170742857669081,
+          0.011004985709275519,
+          0.010802600000585829
+        ]
+      },
+      "process_peak_bytes_before_timing": 39976960,
+      "process_peak_bytes": 39976960,
+      "scan_tracemalloc_peak_bytes": 338627
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 19,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.004934210526315789,
+        "minimum": 0.004111842105263158,
+        "p95_nearest_rank": 0.004934210526315789,
+        "runs": [
+          0.004934210526315789,
+          0.004934210526315789,
+          0.004934210526315789,
+          0.004111842105263158,
+          0.004934210526315789,
+          0.004111842105263158,
+          0.004934210526315789
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.004851636838314957,
+        "minimum": 0.004639399997693927,
+        "p95_nearest_rank": 0.005079205264337361,
+        "runs": [
+          0.005079205264337361,
+          0.0046742894735775494,
+          0.004639399997693927,
+          0.004900084214137965,
+          0.004851636838314957,
+          0.004642021051902128,
+          0.004917873688483317
+        ]
+      },
+      "process_peak_bytes_before_timing": 39964672,
+      "process_peak_bytes": 39964672,
+      "scan_tracemalloc_peak_bytes": 322179
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "repeated",
+      "api": "detailed",
+      "calls_per_timing_batch": 22,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": 199,
+      "cpu_seconds": {
+        "median": 0.004261363636363636,
+        "minimum": 0.004261363636363636,
+        "p95_nearest_rank": 0.004971590909090909,
+        "runs": [
+          0.004261363636363636,
+          0.004261363636363636,
+          0.004261363636363636,
+          0.004261363636363636,
+          0.004261363636363636,
+          0.004261363636363636,
+          0.004971590909090909
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.0043845045412043955,
+        "minimum": 0.004245213640388101,
+        "p95_nearest_rank": 0.004638009090823206,
+        "runs": [
+          0.004485245455395092,
+          0.004344686363104053,
+          0.004638009090823206,
+          0.004555322727273134,
+          0.0043845045412043955,
+          0.004245213640388101,
+          0.004353827273007482
+        ]
+      },
+      "process_peak_bytes_before_timing": 27230208,
+      "process_peak_bytes": 27287552,
+      "scan_tracemalloc_peak_bytes": 357339
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 1000000,
+      "case": "repeated",
+      "api": "boolean",
+      "calls_per_timing_batch": 559,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 2.795169946332737e-05,
+        "minimum": 0.0,
+        "p95_nearest_rank": 2.795169946332737e-05,
+        "runs": [
+          2.795169946332737e-05,
+          2.795169946332737e-05,
+          2.795169946332737e-05,
+          2.795169946332737e-05,
+          0.0,
+          2.795169946332737e-05,
+          2.795169946332737e-05
+        ]
+      },
+      "wall_seconds": {
+        "median": 2.1607334532296828e-05,
+        "minimum": 2.0491771070096703e-05,
+        "p95_nearest_rank": 2.2434883780964053e-05,
+        "runs": [
+          2.21663684049398e-05,
+          2.128300540255839e-05,
+          2.195402498361996e-05,
+          2.2434883780964053e-05,
+          2.1094096656255623e-05,
+          2.1607334532296828e-05,
+          2.0491771070096703e-05
+        ]
+      },
+      "process_peak_bytes_before_timing": 26972160,
+      "process_peak_bytes": 26972160,
+      "scan_tracemalloc_peak_bytes": 321987
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 3000000,
+      "case": "chinese_middle_repeat",
+      "api": "detailed",
+      "calls_per_timing_batch": 2,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": 199,
+      "cpu_seconds": {
+        "median": 0.078125,
+        "minimum": 0.078125,
+        "p95_nearest_rank": 0.0859375,
+        "runs": [
+          0.0859375,
+          0.078125,
+          0.078125,
+          0.0859375,
+          0.0859375,
+          0.078125,
+          0.078125
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.08643019996816292,
+        "minimum": 0.07728690002113581,
+        "p95_nearest_rank": 0.0873806499876082,
+        "runs": [
+          0.08643019996816292,
+          0.07728690002113581,
+          0.0873806499876082,
+          0.08465049997903407,
+          0.08655690000159666,
+          0.08690624998416752,
+          0.08178930002031848
+        ]
+      },
+      "process_peak_bytes_before_timing": 99885056,
+      "process_peak_bytes": 99885056,
+      "scan_tracemalloc_peak_bytes": 368644
+    },
+    {
+      "characters": 1000000,
+      "utf8_bytes": 3000000,
+      "case": "chinese_middle_repeat",
+      "api": "boolean",
+      "calls_per_timing_batch": 3,
+      "has_repetition": true,
+      "full_scan_windows": 199,
+      "actual_scanned_windows": null,
+      "cpu_seconds": {
+        "median": 0.036458333333333336,
+        "minimum": 0.036458333333333336,
+        "p95_nearest_rank": 0.046875,
+        "runs": [
+          0.036458333333333336,
+          0.041666666666666664,
+          0.036458333333333336,
+          0.046875,
+          0.036458333333333336,
+          0.041666666666666664,
+          0.036458333333333336
+        ]
+      },
+      "wall_seconds": {
+        "median": 0.040639433350103595,
+        "minimum": 0.036428300004142024,
+        "p95_nearest_rank": 0.04866896666741619,
+        "runs": [
+          0.0432012000043566,
+          0.037892433310238026,
+          0.040639433350103595,
+          0.04265456666083386,
+          0.039855999988503754,
+          0.04866896666741619,
+          0.036428300004142024
+        ]
+      },
+      "process_peak_bytes_before_timing": 100257792,
+      "process_peak_bytes": 100257792,
+      "scan_tracemalloc_peak_bytes": 352196
+    }
+  ]
+}

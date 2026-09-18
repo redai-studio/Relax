@@ -8,10 +8,7 @@ from collections.abc import Callable, Iterable
 from functools import lru_cache
 from typing import Any, Dict
 
-import ray
 import torch
-
-from relax.utils.http_utils import is_port_available
 
 
 def create_namespace(args_dict: Dict[str, Any]) -> Namespace:
@@ -74,6 +71,8 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
 
 
 def get_current_node_ip():
+    import ray
+
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")
@@ -81,6 +80,8 @@ def get_current_node_ip():
 
 
 def get_free_port(start_port=10000, consecutive=1, max_port=None):
+    from relax.utils.http_utils import is_port_available
+
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
     #
     # max_port (optional, additive): when set, the highest port in the returned
