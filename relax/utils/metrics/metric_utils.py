@@ -6,6 +6,11 @@ import numpy as np
 import torch
 
 from relax.algorithms.spec import get_algorithm
+
+# Repetition detection lives in relax.utils.repetition, which imports only the
+# standard library so offline diagnosis runs without torch or the metrics
+# service stack. Re-exported here so the historical import path keeps working.
+from relax.utils.repetition import has_repetition, scan_repetition  # noqa: F401
 from relax.utils.types import Sample
 
 
@@ -275,13 +280,6 @@ def compression_ratio(
     ratio = original / comp_len
     savings_pct = 100.0 * (1.0 - comp_len / original)
     return ratio, savings_pct
-
-
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
 
 
 def compute_rollout_step(args, rollout_id):
