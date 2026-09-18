@@ -1,5 +1,7 @@
 import taskLists from 'markdown-it-task-lists'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
+import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
@@ -215,6 +217,12 @@ export default defineConfig({
     math: true,
     config(md) {
       md.use(taskLists)
+      md.use(sourceLinks, {
+        repo: 'https://github.com/redai-studio/Relax',
+        branch: 'main',
+        repoRoot: fileURLToPath(new URL('../..', import.meta.url)),
+        docsRoot: 'docs'
+      })
     }
   },
   

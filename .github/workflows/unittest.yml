@@ -18,7 +18,7 @@ jobs:
   unittest:
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -28,34 +28,36 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Acquire test devices
+        id: devices
+        uses: $/.github/actions/acquire-devices
+        timeout-minutes: 35
+        with:
+          backend: nvidia
+          count: 4
+          timeout: 1800
+
       - name: Create test container
         env:
-          CUDA_VISIBLE_DEVICES: 0,1,2,3
+          CI_DEVICES: ${{ steps.devices.outputs.devices }}
           HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
           UV_CACHE_DIR: /uv-cache
           UV_LINK_MODE: copy
           ARTIFACT_DIR: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          : "${CI_GPU_DEVICES:?Set CI_GPU_DEVICES to the four GPUs assigned to this runner}"
-          IFS=',' read -r -a gpu_devices <<< "$CI_GPU_DEVICES"
-          if [[ ${#gpu_devices[@]} -ne 4 ]]; then
-            echo "CI_GPU_DEVICES must list exactly four GPU indices or UUIDs" >&2
-            exit 1
-          fi
           mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
 
           # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
           # Create before starting so cancellation during a pull cannot start tests.
           docker create --pull always --rm --init \
             --name "$CI_CONTAINER_NAME" \
-            --gpus "\"device=$CI_GPU_DEVICES\"" \
+            --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \
             -v "$GITHUB_WORKSPACE:/source:ro" \
             -v "$ARTIFACT_DIR:/artifacts" \
             -v "$HOST_UV_CACHE_DIR:$UV_CACHE_DIR" \
             --workdir /workspace/Relax \
-            --env CUDA_VISIBLE_DEVICES \
             --env UV_CACHE_DIR \
             --env UV_LINK_MODE \
             --env http_proxy \
@@ -87,7 +89,10 @@ jobs:
 
       - name: Remove test container
         if: always()
-        run: docker rm --force "$CI_CONTAINER_NAME" >/dev/null 2>&1 || true
+        run: |
+          if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+            docker rm --force "$CI_CONTAINER_NAME"
+          fi
 
       - name: Upload test results
         if: always()
