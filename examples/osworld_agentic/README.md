@@ -7,10 +7,12 @@ outcome 配方：8 GPU、12 任务 × 8 session、每轮 3 次 optimizer update�
 ## 环境配置
 
 仓库中的 [env.sh](env.sh) **是环境配置示例**，只包含占位值。
-将实际路径和凭据放到被 Git 忽略的 `env.local.sh`；两个启动脚本都会先读取
-`env.local.sh`，再用 `env.sh` 补齐未设置的默认值。已有 `env.local.sh` 时直接使用，不要覆盖。
+将实际路径和凭据放到 `env.local.sh`，按下面的命令将它加入本地
+`.git/info/exclude`（不会随 PR 提交）。两个启动脚本都会先读取 `env.local.sh`，
+再用 `env.sh` 补齐未设置的默认值。已有 `env.local.sh` 时直接使用，不要覆盖。
 
 ```bash
+printf '%s\n' '/examples/osworld_agentic/env.local.sh' >> "$(git rev-parse --git-path info/exclude)"
 cp -n examples/osworld_agentic/env.sh examples/osworld_agentic/env.local.sh
 chmod 600 examples/osworld_agentic/env.local.sh
 ```
