@@ -140,6 +140,8 @@ def diagnose_dumps(
             stream.write("}\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if os.name == "posix" and output.exists():
+            temporary.chmod(output.stat().st_mode & 0o777)
         os.replace(temporary, output)
     finally:
         if temporary is not None:

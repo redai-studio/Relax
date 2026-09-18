@@ -30,6 +30,8 @@ Relax 在完整 `Sample.response` 上检测高度可压缩的窗口，包括工�
 
 ## 快速开始
 
+训练指标同样使用全文布尔扫描，不限制窗口数量。对于无重复样本，每个窗口都需要压缩；窗口和步长固定时，CPU 成本随批次内响应字符总数线性增长。每个 rollout step 承担该批次全部样本的扫描耗时。下文检测器基准没有测量整个批次的指标聚合或训练吞吐，评估训练开销时应结合实际批次大小与响应长度另行测量。
+
 在可使用 Python 的仓库目录运行。JSONL 路径使用标准库，不需要 Ray、Megatron 或 PyTorch：
 
 ```bash
@@ -66,6 +68,8 @@ JSONL 每个非空行是一个样本对象，必须包含字符串 `response`，
 每个样本包含 `has_repetition`、`response_chars`、`scanned_windows`、`hits`（含 `start`、`end`、`compression_ratio`）、`max_compression_ratio` 和 `covered_chars`。报告不复制响应原文。顶层记录 `schema_version`、偏移约定、检测配置、来源、样本及汇总；汇总包含样本计数、`repetition_frac`、响应及覆盖字符统计、扫描窗口数、全局最大压缩比和耗时。命中摘要也会写入日志。
 
 JSON 损坏、记录不是对象、响应缺失或不是字符串时，会带来源位置报错，不会静默丢弃。报告流式写入临时文件，成功后原子替换；失败保留已有报告。禁止用报告覆盖显式输入文件。JSONL 内存随单条记录及其命中数增长；Torch 反序列化会加载整个 dump。
+
+在 POSIX 系统中，新报告仅允许所有者访问（`0600`）。替换已有报告时保留其读、写、执行权限；所有者、ACL 和扩展属性不会复制。需要共享访问时，应明确设置报告权限，后续更新会保留这些权限。生成过程中的临时文件保持仅所有者可访问。Windows 访问权限由文件系统 ACL 管理。
 
 ::: warning 旧版 Torch dump
 默认使用受限的 `torch.load(..., weights_only=True)`。若自行生成的可信旧版 dump 含自定义 pickle 对象，可显式添加 `--trusted-torch`。该选项允许任意 pickle 代码执行，不可对不可信文件启用。受限加载失败时不会自动回退到不安全模式。

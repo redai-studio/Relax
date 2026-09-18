@@ -30,6 +30,8 @@ Detailed diagnostics scan every window and report the maximum ratio over **all**
 
 ## Quick Start
 
+Training metrics also use the full-response boolean scan without a window limit. For nonrepetitive samples, every window is compressed; with fixed window and stride sizes, CPU cost grows linearly with the total response characters in the batch. Each rollout step pays the sum of its samples' scan costs. The detector benchmarks below do not measure whole-batch aggregation or training throughput. Measure these separately for your batch size and response lengths when evaluating training overhead.
+
 Run from a checkout with Python available. The JSONL path uses the standard library and does not require Ray, Megatron, or PyTorch:
 
 ```bash
@@ -66,6 +68,8 @@ The report preserves `source`, zero-based `record_index`, one-based JSONL `line_
 Each sample includes `has_repetition`, `response_chars`, `scanned_windows`, `hits` (`start`, `end`, `compression_ratio`), `max_compression_ratio`, and `covered_chars`. Raw responses are not copied into the report. The top level records `schema_version`, offset conventions, detection settings, sources, samples, and a summary with sample counts, `repetition_frac`, scanned/covered character statistics, scanned windows, global maximum ratio, and elapsed seconds. Hit summaries are also logged.
 
 Malformed JSON, non-object records, and absent/non-string responses fail with the source location rather than being silently omitted. Reports are streamed to a temporary file and published atomically after success; failure preserves an existing report. An explicit input cannot be overwritten by the report. JSONL memory scales with one record and its hits, whereas Torch deserialization loads one entire dump.
+
+On POSIX systems, a new report is private to its owner (`0600`). Replacing an existing report preserves its read/write/execute permission bits; ownership, ACLs, and extended attributes are not copied. For shared access, set the report's desired permissions explicitly before subsequent updates. Temporary files remain private while the report is being generated. Windows access is governed by its filesystem ACLs.
 
 ::: warning Legacy Torch dumps
 The default uses restricted `torch.load(..., weights_only=True)`. If your own trusted legacy dump contains custom pickled objects, explicitly add `--trusted-torch`. This permits arbitrary pickle execution; never enable it for untrusted files. A restricted-load error does not trigger an automatic unsafe fallback.
