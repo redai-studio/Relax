@@ -21,7 +21,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: $/.github/actions/acquire-devices
+      - uses: ./.github/actions/acquire-devices
         id: devices
         with:
           backend: nvidia
@@ -30,9 +30,9 @@ jobs:
       - run: python -m pytest tests/
 ```
 
-`$/` references the action from the running workflow's repository and commit,
-independently of the workspace checkout. It requires GitHub.com; GitHub
-Enterprise Server does not currently support this syntax.
+`./` loads the action from the checked-out workspace. Run `actions/checkout`
+before this step; the action uses that checkout's version without a separate
+action repository download.
 
 ## Inputs and outputs
 
@@ -70,7 +70,8 @@ UUID output to Docker. A step action cannot configure the device allocation of
 an already-started job-level `container:`.
 
 ```yaml
-- uses: $/.github/actions/acquire-devices
+- uses: actions/checkout@v7
+- uses: ./.github/actions/acquire-devices
   id: devices
   with:
     backend: nvidia

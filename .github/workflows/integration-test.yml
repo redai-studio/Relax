@@ -1,4 +1,4 @@
-name: GPU Unit Tests
+name: GPU Integration Tests
 
 on:
   push:
@@ -11,17 +11,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: gpu-unittest-${{ github.ref }}
+  group: gpu-integration-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  unittest:
-    name: Unit Tests (H20, 4 GPUs)
+  integration:
+    name: ${{ matrix.case }}
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 60
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: Qwen3-4B-4xgpu-async
+            script: scripts/training/text/run-qwen3-4B-4xgpu-async.sh
+            gpus: 4
+          - case: Qwen3-VL-4B-2xgpu
+            script: scripts/training/multimodal/run-qwen3-vl-4B-2xgpu.sh
+            gpus: 2
     env:
       CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
-      CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_CONTAINER_NAME: relax-integration-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      TRAINING_SCRIPT: ${{ matrix.script }}
+      ARTIFACT_NAME: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -34,22 +46,23 @@ jobs:
         timeout-minutes: 35
         with:
           backend: nvidia
-          count: 4
+          count: ${{ matrix.gpus }}
           timeout: 1800
 
       - name: Create test container
         env:
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
-          HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
+          NUM_GPUS: ${{ matrix.gpus }}
           UV_CACHE_DIR: /uv-cache
           UV_LINK_MODE: copy
-          ARTIFACT_DIR: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
         run: |
           set -euo pipefail
+          HOST_UV_CACHE_DIR="$HOME/.cache/uv"
           mkdir -p "$HOST_UV_CACHE_DIR" "$ARTIFACT_DIR"
 
-          # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
-          # Create before starting so cancellation during a pull cannot start tests.
+          # Each runner provisions the cases' model and dataset files in ~/model and ~/data.
+          # Keep Ray processes, network, IPC and /tmp private to this container.
           docker create --pull always --rm --init \
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_DEVICES\"" \
@@ -57,7 +70,15 @@ jobs:
             -v "$GITHUB_WORKSPACE:/source:ro" \
             -v "$ARTIFACT_DIR:/artifacts" \
             -v "$HOST_UV_CACHE_DIR:$UV_CACHE_DIR" \
+            --mount "type=bind,source=$HOME/model,target=/models,readonly" \
+            --mount "type=bind,source=$HOME/data,target=/data,readonly" \
             --workdir /workspace/Relax \
+            --env NUM_GPUS \
+            --env NUM_ROLLOUT=4 \
+            --env MODEL_DIR=/models \
+            --env DATA_DIR=/data \
+            --env EXP_DIR=/artifacts \
+            --env CLEARML_OFFLINE_MODE=1 \
             --env UV_CACHE_DIR \
             --env UV_LINK_MODE \
             --env http_proxy \
@@ -80,12 +101,23 @@ jobs:
             --system --break-system-packages -r requirements.txt \
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
-      - name: Run unittest
+      - name: Run integration test
+        timeout-minutes: 25
         run: |
-          docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
-            python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
-              2>&1 | tee /artifacts/pytest.log
+          docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+            unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
+            export no_proxy="*" NO_PROXY="*"
+            bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
           '
+
+      - name: Collect Ray logs
+        if: always()
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR/ray"
+          docker cp "$CI_CONTAINER_NAME:/tmp/ray/session_latest/logs/." "$ARTIFACT_DIR/ray/" || true
 
       - name: Remove test container
         if: always()
@@ -98,7 +130,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: unittest-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/unittest-${{ github.run_id }}-${{ github.run_attempt }}/
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}/
           if-no-files-found: warn
           retention-days: 14
