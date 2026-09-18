@@ -655,7 +655,7 @@ index 4be974017..0dfdb0928 100644
          """
          Maintain the expert bias in float32.
 diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core/transformer/multi_token_prediction.py
-index 2edb652bf..58fb89c4e 100755
+index 2edb652bf..7a068271b 100755
 --- a/megatron/core/transformer/multi_token_prediction.py
 +++ b/megatron/core/transformer/multi_token_prediction.py
 @@ -586,6 +586,102 @@ class MTPLossAutoScaler(torch.autograd.Function):
@@ -857,6 +857,42 @@ index 2edb652bf..58fb89c4e 100755
                  )
  
          if self.config.recompute_method == 'uniform':
+@@ -1053,7 +1192,7 @@ class MultiTokenPredictionBlock(MegatronModule):
+         self._build_layers(pg_collection)
+         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
+         self.cp_group = pg_collection.cp
+-
++        self._register_mtp_grad_hooks()
+     def _build_layers(self, pg_collection):
+         def build_layer(layer_spec, layer_number):
+             fp8_init_context = get_fp8_context(self.config, is_init=True)
+@@ -1074,6 +1213,26 @@ class MultiTokenPredictionBlock(MegatronModule):
+             ]
+         )
+ 
++    def _register_mtp_grad_hooks(self):
++        if len(self.layers) == 0:
++            return
++
++        def _make_sync_hook():
++            def _hook(grad):
++                torch.npu.synchronize()
++            return _hook
++
++        sync_keys = [
++            "self_attention.linear_qkv.weight",
++            "eh_proj.weight",                    
++        ]
++
++        for name, param in self.layers[0].named_parameters():
++            for key in sync_keys:
++                if key in name:
++                    param.register_hook(_make_sync_hook())
++                    break
++
+     def forward(
+         self,
+         input_ids: Tensor,
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
 index eaae58590..0f01f6bc0 100644
 --- a/megatron/core/transformer/transformer_config.py

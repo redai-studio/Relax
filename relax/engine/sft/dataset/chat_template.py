@@ -11,15 +11,24 @@ Two paths (spec §7.5):
 """
 
 import hashlib
+import os
 import re
+import threading
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Protocol
 
 import torch
 
 from relax.engine.sft.dataset.chat_template_patch import TemplatePatchResult, apply_chat_template_patchers
+from relax.engine.sft.dataset.deepseek_chat_template_patch import (
+    _EMBEDDED_THINK_INDICES_KEY,
+    split_embedded_thinking,
+    try_patch_deepseek_chat_template,
+)
+from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
 from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
-from relax.engine.sft.dataset.sample import CanonicalSample
+from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.logging_utils import get_logger
 
 
@@ -30,8 +39,9 @@ logger = get_logger(__name__)
 # form for the purpose of marking assistant-token spans, so they should be
 # recognised as the same marker.
 _GENERATION_MARKER_RE = re.compile(r"{%-?\s*generation\s*-?%}")
-_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template,)
+_CHAT_TEMPLATE_PATCHERS = (try_patch_qwen_chat_template, try_patch_deepseek_chat_template, try_patch_gemma4_thinking)
 _FALLBACK_WARNED: set[int] = set()  # tokenizer id → warned once
+_EMPTY_THINK_UNSUPPORTED_WARNED: set[int] = set()  # tokenizer id → warned once
 _TEMPLATE_LOGGED: set[tuple[int, int, str]] = set()  # tokenizer id + template hash + preserve mode
 
 
@@ -41,16 +51,37 @@ def HAS_GENERATION_MARKER(template_str: str | None) -> bool:  # noqa: N802
     return bool(_GENERATION_MARKER_RE.search(template_str))
 
 
-def _to_chat_messages(sample: CanonicalSample) -> list[dict[str, Any]]:
+def _to_chat_messages(
+    sample: CanonicalSample,
+    *,
+    normalize_deepseek_reasoning: bool = False,
+) -> list[dict[str, Any]]:
     """Convert CanonicalMessage list to dict format expected by
     apply_chat_template."""
     out = []
     for m in sample.messages:
-        d: dict[str, Any] = {"role": m.role, "content": m.content}
+        content = m.content
+        reasoning_content = m.reasoning_content
+        if normalize_deepseek_reasoning and m.role == "assistant" and reasoning_content is None:
+            reasoning_content, content = split_embedded_thinking(content)
+        d: dict[str, Any] = {"role": m.role, "content": content}
+        if reasoning_content is not None:
+            d["reasoning_content"] = reasoning_content
         if m.tool_calls is not None:
             d["tool_calls"] = m.tool_calls
         out.append(d)
     return out
+
+
+def _last_round_learn_indices(sample: CanonicalSample) -> set[int]:
+    """Learnable messages belonging to the final user round.
+
+    "Last round" is every learnable response after the final user query, not
+    just the last assistant message: an assistant tool-call, its tool response,
+    and the final answer are all one round.
+    """
+    last_user_index = max((i for i, m in enumerate(sample.messages) if m.role == "user"), default=-1)
+    return {i for i, m in enumerate(sample.messages) if i > last_user_index and m.learn}
 
 
 def _render_with_assistant_mask(
@@ -58,16 +89,28 @@ def _render_with_assistant_mask(
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    normalize_deepseek_reasoning: bool = False,
+    last_turn_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 1: ask tokenizer for the assistant-only mask directly."""
+    apply_chat_template_kwargs = _thread_local_chat_template_kwargs(
+        tokenizer,
+        apply_chat_template_kwargs,
+    )
+    messages, template_kwargs = _prepare_chat_messages(
+        sample,
+        apply_chat_template_kwargs,
+        last_turn_only=last_turn_only,
+        normalize_deepseek_reasoning=normalize_deepseek_reasoning,
+    )
     result = tokenizer.apply_chat_template(
-        _to_chat_messages(sample),
+        messages,
         tools=sample.tools,
         tokenize=True,
         return_tensors="pt",
         return_dict=True,
         return_assistant_tokens_mask=True,
-        **(apply_chat_template_kwargs or {}),
+        **template_kwargs,
     )
     input_ids = result["input_ids"]
     masks = result["assistant_masks"]
@@ -77,10 +120,82 @@ def _render_with_assistant_mask(
         input_ids = input_ids.squeeze(0)
     if masks.dim() == 2:
         masks = masks.squeeze(0)
-    return input_ids.long(), masks.long()
+    masks = masks.long()
+    if last_turn_only:
+        # HF's assistant_masks mark every assistant span with a run of 1s
+        # (0s over tool/user turns between them). The last round can span
+        # several such runs (tool-call + answer), so keep one trailing run per
+        # learnable assistant message in it — not just the final run, which
+        # would drop an earlier tool-call span and diverge from Path 2.
+        n_runs = _last_round_assistant_run_count(sample)
+        masks = _keep_last_n_mask_runs(masks, n_runs)
+    return input_ids.long(), masks
+
+
+# Roles that apply_chat_template wraps in a {% generation %} block, so HF's
+# return_assistant_tokens_mask marks them with a run of 1s. Tool/user/system
+# turns are never marked, so they separate assistant runs with 0s.
+_ASSISTANT_MASKED_ROLES = {"assistant", "function_call"}
+
+
+def _last_round_assistant_run_count(sample: CanonicalSample) -> int:
+    """Number of learnable assistant-masked messages in the final user round.
+
+    Assumes one message renders as exactly one ``{% generation %}`` block (one
+    run of 1s), which holds for every shipped template. A custom template that
+    split a message across two blocks would keep one run too few — dropping,
+    never over-including, a supervised span (fails safe).
+    """
+    last_round = _last_round_learn_indices(sample)
+    return sum(1 for i in last_round if sample.messages[i].role in _ASSISTANT_MASKED_ROLES)
+
+
+def _keep_last_n_mask_runs(masks: torch.Tensor, n: int) -> torch.Tensor:
+    """Zero out all but the final ``n`` contiguous runs of 1s in a 1D 0/1 mask.
+
+    ``n <= 0`` clears the mask; ``n`` >= the number of runs is a no-op.
+    """
+    if masks.numel() == 0 or int(masks.sum()) == 0:
+        return masks
+    if n <= 0:
+        return torch.zeros_like(masks)
+    m = masks.tolist()
+    total = len(m)
+    out = [0] * total
+    runs_kept = 0
+    i = total - 1
+    while i >= 0 and runs_kept < n:
+        if m[i] == 0:
+            i -= 1
+            continue
+        # walk back over this contiguous run of 1s, copying it into out
+        while i >= 0 and m[i] == 1:
+            out[i] = 1
+            i -= 1
+        runs_kept += 1
+    return torch.tensor(out, dtype=masks.dtype)
+
+
+def _thread_local_chat_template_kwargs(tokenizer, apply_chat_template_kwargs: dict | None) -> dict:
+    """Avoid sharing HF AssistantTracker state across prefetch threads.
+
+    Transformers caches compiled Jinja templates by the template string. The
+    compiled environment owns the ``AssistantTracker`` used by
+    ``return_assistant_tokens_mask=True``, and that tracker is not thread-safe.
+    Appending a Jinja comment makes each prefetch thread use a distinct
+    compiled environment without changing rendered text.
+    """
+    kwargs = dict(apply_chat_template_kwargs or {})
+    template = kwargs.get("chat_template") or getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str):
+        kwargs["chat_template"] = f"{template}{{# relax_thread={threading.get_ident()} #}}"
+    return kwargs
 
 
 _THINK_OPEN = "<think>\n"
+_THINK_OPEN_TAG = "<think>"
+_THINK_CLOSE_TAG = "</think>"
+_NON_THINKING_PREFIX = "<think>\n\n</think>\n\n"
 _IM_END = "<|im_end|>"
 # Qwen3.5 wraps tool messages inside a user block as
 # `<tool_response>\n{content}\n</tool_response>`, so role=="tool" has no
@@ -88,12 +203,294 @@ _IM_END = "<|im_end|>"
 _TOOL_RESPONSE_OPEN = "<tool_response>\n"
 _TOOL_RESPONSE_CLOSE = "\n</tool_response>"
 
+# DeepSeek-V4 markers — copied byte-for-byte from the model's chat_template.jinja
+# (fullwidth vertical bar U+FF5C `｜` and the U+2581 `▁` in the EOS token). These
+# are NOT ChatML, so the ChatML fallback cannot parse them.
+_DS_USER = "<｜User｜>"
+_DS_ASSISTANT = "<｜Assistant｜>"
+_DS_EOS = "<｜end▁of▁sentence｜>"
+
+
+@dataclass(frozen=True)
+class _MsgSpan:
+    """Character span of one rendered message, for loss-mask projection.
+
+    ``learn_start``/``span_end`` bound the chars to mark when ``msg.learn`` is
+    True; ``next_cursor`` is where the scan resumes for the following message
+    (it can differ from ``span_end`` — e.g. ChatML tool wrappers end the learn
+    region before the closing tag but resume past it).
+    """
+
+    learn_start: int
+    span_end: int
+    next_cursor: int
+
+
+class _ChatTemplateDialect(Protocol):
+    """Locates each rendered message's span for the offset-mapping fallback.
+
+    A dialect only knows how to find message boundaries in the rendered text;
+    the shared render + sanity-check + char→token projection stay in
+    ``_render_per_message_fallback``.
+    """
+
+    name: str
+
+    def matches(self, template: str | None) -> bool: ...
+
+    def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan: ...
+
+
+class _ChatMLDialect:
+    """Qwen-style ChatML: ``<|im_start|>{role}\\n…<|im_end|>`` with tool
+    messages wrapped in ``<tool_response>…</tool_response>``.
+
+    The implicit default.
+    """
+
+    name = "chatml"
+
+    def matches(self, template: str | None) -> bool:
+        return bool(template) and "<|im_start|>" in template
+
+    def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
+        if msg.role == "tool":
+            open_pos = text.find(_TOOL_RESPONSE_OPEN, cursor)
+            if open_pos < 0:
+                raise RuntimeError(
+                    f"could not locate <tool_response> for tool message after cursor {cursor} "
+                    f"in rendered chat template output"
+                )
+            content_start = open_pos + len(_TOOL_RESPONSE_OPEN)
+            close_pos = text.find(_TOOL_RESPONSE_CLOSE, content_start)
+            if close_pos < 0:
+                raise RuntimeError("could not locate </tool_response> for tool message")
+            span_end = close_pos
+            next_cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
+        else:
+            header = f"<|im_start|>{msg.role}\n"
+            header_pos = text.find(header, cursor)
+            if header_pos < 0:
+                raise RuntimeError(
+                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
+                )
+            content_start = header_pos + len(header)
+            end_pos = text.find(_IM_END, content_start)
+            if end_pos < 0:
+                raise RuntimeError(f"could not locate <|im_end|> for {msg.role!r} message")
+            span_end = end_pos + len(_IM_END)
+            if span_end < len(text) and text[span_end] == "\n":
+                span_end += 1
+            next_cursor = span_end
+
+        learn_start = content_start
+        # Keep the leading `<think>\n` opener out of the loss (it's a scaffold tag).
+        if msg.role == "assistant" and text[content_start : content_start + len(_THINK_OPEN)] == _THINK_OPEN:
+            learn_start += len(_THINK_OPEN)
+        return _MsgSpan(learn_start=learn_start, span_end=span_end, next_cursor=next_cursor)
+
+
+class _DeepSeekV4Dialect:
+    """DeepSeek-V4: ``<｜User｜>`` / ``<｜Assistant｜>`` … ``<｜end▁of▁sentence｜>``.
+
+    Each assistant turn skips its leading thinking/plain-mode scaffold, then
+    learns the reasoning body, closing ``</think>``, answer content,
+    ``<｜DSML｜tool_calls>`` block, and ``<｜end▁of▁sentence｜>``. Non-assistant
+    turns (system / user / developer / tool / latest_reminder) are never
+    learned and never move the cursor, so multi-turn + system + tool_calls +
+    tool-return agent sessions work: DeepSeek merges tool results into the user
+    block with no own ``<｜User｜>`` opener, so only the forward
+    ``<｜Assistant｜>`` scan is reliable. (Two consecutive assistant turns with
+    no encoder-emitted prefix fall back to learning from the cursor.)
+    """
+
+    name = "deepseek_v4"
+
+    def matches(self, template: str | None) -> bool:
+        return bool(template) and _DS_ASSISTANT in template and _DS_USER in template
+
+    def locate(self, text: str, cursor: int, msg: CanonicalMessage) -> _MsgSpan:
+        if msg.role == "assistant":
+            # Locate the assistant turn between its optional `<｜Assistant｜>`
+            # prompt and inclusive EOS. The leading mode scaffold is trimmed
+            # from the learn region below.
+            end_pos = text.find(_DS_EOS, cursor)
+            if end_pos < 0:
+                raise RuntimeError(f"could not locate {_DS_EOS!r} for assistant message after cursor {cursor}")
+            prefix_pos = text.find(_DS_ASSISTANT, cursor)
+            if 0 <= prefix_pos < end_pos:
+                learn_start = prefix_pos + len(_DS_ASSISTANT)
+            else:
+                # No own `<｜Assistant｜>` prefix (e.g. consecutive assistant turns, where
+                # the encoder emits no transition): learn from the current cursor.
+                learn_start = cursor
+            # Match the ChatML/Qwen scaffold contract: prompt-format tokens that
+            # select thinking/plain mode are context, not prediction targets.
+            # Keep the reasoning body, its closing `</think>`, answer/tool calls,
+            # and EOS supervised. In plain mode DeepSeek emits only a leading
+            # `</think>` scaffold, which is excluded in full.
+            if text.startswith(_THINK_CLOSE_TAG, learn_start):
+                learn_start += len(_THINK_CLOSE_TAG)
+            if text.startswith(_THINK_OPEN, learn_start):
+                learn_start += len(_THINK_OPEN)
+            elif text.startswith(_THINK_OPEN_TAG, learn_start):
+                learn_start += len(_THINK_OPEN_TAG)
+            span_end = end_pos + len(_DS_EOS)  # EOS inclusive — model learns to stop
+            return _MsgSpan(learn_start=learn_start, span_end=span_end, next_cursor=span_end)
+
+        # Non-learned turns (system / user / developer / tool / latest_reminder): do NOT
+        # advance the cursor by marker. In DeepSeek-V4 a `tool` result merges into the
+        # current user block with NO own `<｜User｜>` opener (chat_template.jinja:96-103),
+        # and consecutive user/tool turns share one `<｜User｜>`, so any per-message marker
+        # search mis-advances the cursor and breaks the next `<｜Assistant｜>` scan. Since
+        # these turns contribute nothing to the loss, leave the cursor put — the assistant
+        # branch forward-finds the next `<｜Assistant｜>`, correctly skipping this content.
+        # This is what makes multi-turn + system + tool_calls + tool-return sessions work.
+        return _MsgSpan(learn_start=cursor, span_end=cursor, next_cursor=cursor)
+
+
+# ChatML is the implicit default: unknown non-ChatML templates degrade to it
+# rather than mis-parsing. Non-default dialects are sniffed from the effective
+# template first.
+_NON_DEFAULT_DIALECTS: tuple[_ChatTemplateDialect, ...] = (_DeepSeekV4Dialect(),)
+_DEFAULT_DIALECT: _ChatTemplateDialect = _ChatMLDialect()
+
+
+def _select_dialect(template: str | None) -> _ChatTemplateDialect:
+    for dialect in _NON_DEFAULT_DIALECTS:
+        if dialect.matches(template):
+            return dialect
+    return _DEFAULT_DIALECT
+
+
+@dataclass(frozen=True)
+class _Dialect:
+    """Turn delimiters for the fallback's text scan.
+
+    ChatML and gemma-4 frame turns differently; same scan, other delimiters.
+    """
+
+    name: str
+    role_names: dict  # canonical role -> the name the template renders
+    header_fmt: str  # "{role}" placeholder
+    end: str
+    think_open: str | None  # None: nothing to exclude — the whole reply is learned
+    think_close: str | None  # None: skip only the opener (ChatML <think>\n)
+    supports_tools: bool
+
+    def header(self, role: str) -> str:
+        return self.header_fmt.format(role=self.role_names.get(role, role))
+
+
+_CHATML = _Dialect(
+    name="chatml",
+    role_names={},
+    header_fmt="<|im_start|>{role}\n",
+    end=_IM_END,
+    think_open=_THINK_OPEN,
+    think_close=None,
+    supports_tools=True,
+)
+
+# gemma-4 renders the assistant role as "model". Reasoning is a delimited block,
+# so the mask must resume after <channel|> rather than after a fixed-length
+# opener. Matches THUDM/slime's gen_multi_turn_loss_mask_gemma4.
+_GEMMA4 = _Dialect(
+    name="gemma4",
+    role_names={"assistant": "model"},
+    header_fmt="<|turn>{role}\n",
+    end="<turn|>",
+    think_open="<|channel>thought\n",
+    think_close="<channel|>",
+    supports_tools=False,
+)
+
+# Same delimiters, but the reasoning block stays IN the loss. Only reachable via
+# GEMMA4_SFT_THINKING=1, which patches the Jinja to emit an empty thought block
+# on every assistant turn -- see gemma4_chat_template_patch.py.
+_GEMMA4_THINKING = replace(_GEMMA4, name="gemma4_thinking", think_open=None, think_close=None)
+
+
+def _detect_dialect(rendered_text: str) -> _Dialect:
+    """Pick delimiters from what the template actually emitted."""
+    if "<|turn>" in rendered_text and "<turn|>" in rendered_text:
+        if os.environ.get("GEMMA4_SFT_THINKING", "0") in ("1", "true", "True"):
+            return _GEMMA4_THINKING
+        return _GEMMA4
+    return _CHATML
+
+
+def _prepare_chat_messages(
+    sample: CanonicalSample,
+    apply_chat_template_kwargs: dict | None,
+    *,
+    last_turn_only: bool,
+    normalize_deepseek_reasoning: bool = False,
+) -> tuple[list[dict[str, Any]], dict]:
+    """Prepare template input, including the ms-swift non-thinking prefix.
+
+    ``add_non_thinking_prefix`` is an ms-swift preprocessing option rather than
+    a Hugging Face chat-template variable.  Consume it here so launchers can
+    request the same training input without forwarding an inert kwarg to Jinja.
+    With last-round loss, ms-swift only adds the prefix to assistant messages
+    after the final user query; otherwise it considers every assistant message.
+    """
+    template_kwargs = dict(apply_chat_template_kwargs or {})
+    add_non_thinking_prefix = bool(template_kwargs.pop("add_non_thinking_prefix", False))
+    messages = _to_chat_messages(sample, normalize_deepseek_reasoning=normalize_deepseek_reasoning)
+    if not add_non_thinking_prefix:
+        return messages, template_kwargs
+
+    start_index = (
+        max((i for i, message in enumerate(messages) if message["role"] == "user"), default=-1)
+        if last_turn_only
+        else -1
+    )
+    for index, message in enumerate(messages):
+        content = message.get("content")
+        if (
+            index >= start_index
+            and message["role"] == "assistant"
+            and isinstance(content, str)
+            and message.get("reasoning_content") is None
+            and not content.startswith((_THINK_OPEN_TAG, _NON_THINKING_PREFIX))
+        ):
+            message["content"] = _NON_THINKING_PREFIX + content
+    return messages, template_kwargs
+
+
+def _empty_think_region_end(rendered_text: str, content_start: int, span_end: int) -> int:
+    """If the assistant content at ``content_start`` opens with a `<think>`
+    block whose inner text is empty/whitespace, return the char offset just
+    past the closing `</think>` and any trailing whitespace (so the whole
+    empty-think region can be kept out of the loss). Otherwise return -1.
+
+    Handles both `<think>\\n\\n</think>` (Qwen3.5 non-thinking default) and
+    `<think></think>`. Only the region up to ``span_end`` is considered.
+    """
+    if rendered_text[content_start : content_start + len(_THINK_OPEN_TAG)] != _THINK_OPEN_TAG:
+        return -1
+    inner_start = content_start + len(_THINK_OPEN_TAG)
+    close_pos = rendered_text.find(_THINK_CLOSE_TAG, inner_start, span_end)
+    if close_pos < 0:
+        return -1
+    if rendered_text[inner_start:close_pos].strip() != "":
+        return -1  # non-empty think — keep it (only default opener-skip applies)
+    end = close_pos + len(_THINK_CLOSE_TAG)
+    # swallow trailing whitespace/newlines after </think> so they don't train
+    while end < span_end and rendered_text[end] in (" ", "\n", "\t", "\r"):
+        end += 1
+    return end
+
 
 def _render_per_message_fallback(
     sample: CanonicalSample,
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    effective_template: str | None = None,
+    last_turn_only: bool = False,
+    ignore_empty_think: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Path 2: single full render + char-level mask projected back through
     `offset_mapping`.
@@ -109,18 +506,26 @@ def _render_per_message_fallback(
       1. ``apply_chat_template(messages, tokenize=False)`` → ``rendered_text``
       2. fast-tokenize that text with ``return_offsets_mapping=True``
       3. sanity-check the re-tokenize matches the direct tokenize
-      4. scan the text for ChatML ``<|im_start|>{role}\\n…<|im_end|>`` spans
-         in declaration order, marking chars 1 for messages where
-         ``learn=True`` (skipping the leading ``<think>\\n`` opener inside
-         an assistant turn so the tag itself stays out of the loss)
+      4. scan the text for per-message spans using the marker DIALECT selected
+         from ``effective_template`` (ChatML by default, DeepSeek-V4 for its
+         ``<｜User｜>``/``<｜Assistant｜>`` markers), marking chars 1 for messages
+         where ``learn=True``
       5. project char-mask → token-mask via a prefix-sum on ``offset_mapping``
 
-    Requires a fast tokenizer; raises ``ValueError`` otherwise. Assumes
-    Qwen-style ChatML wrapping — non-ChatML templates should expose
+    Requires a fast tokenizer; raises ``ValueError`` otherwise. Templates
+    outside the supported ChatML, DeepSeek-V4, and Gemma4 dialects should expose
     ``{% generation %}`` markers so Path 1 handles them natively.
     """
-    msgs = _to_chat_messages(sample)
-    extra_kwargs = apply_chat_template_kwargs or {}
+    deepseek_dialect = _select_dialect(effective_template)
+    msgs, extra_kwargs = _prepare_chat_messages(
+        sample,
+        apply_chat_template_kwargs,
+        last_turn_only=last_turn_only,
+        normalize_deepseek_reasoning=(
+            deepseek_dialect.name == "deepseek_v4"
+            and _EMBEDDED_THINK_INDICES_KEY in (apply_chat_template_kwargs or {})
+        ),
+    )
     rendered_text = tokenizer.apply_chat_template(msgs, tools=sample.tools, tokenize=False, **extra_kwargs)
 
     tokenized = tokenizer(rendered_text, add_special_tokens=False, return_offsets_mapping=True)
@@ -148,10 +553,25 @@ def _render_per_message_fallback(
             "via offset_mapping would be unreliable."
         )
 
+    last_round_learn_indices = _last_round_learn_indices(sample) if last_turn_only else set()
+
     char_mask = bytearray(len(rendered_text))  # zeros
+    dialect = _detect_dialect(rendered_text)
     cursor = 0
-    for msg in sample.messages:
+    for msg_idx, msg in enumerate(sample.messages):
+        if deepseek_dialect.name == "deepseek_v4":
+            span = deepseek_dialect.locate(rendered_text, cursor, msg)
+            if msg.learn and (not last_turn_only or msg_idx in last_round_learn_indices):
+                for pos in range(span.learn_start, span.span_end):
+                    char_mask[pos] = 1
+            cursor = span.next_cursor
+            continue
         if msg.role == "tool":
+            if not dialect.supports_tools:
+                raise RuntimeError(
+                    f"tool messages are not supported by the {dialect.name!r} loss-mask dialect; "
+                    f"add its tool-call delimiters to _Dialect first"
+                )
             open_pos = rendered_text.find(_TOOL_RESPONSE_OPEN, cursor)
             if open_pos < 0:
                 raise RuntimeError(
@@ -165,27 +585,51 @@ def _render_per_message_fallback(
             span_end = close_pos
             cursor = close_pos + len(_TOOL_RESPONSE_CLOSE)
         else:
-            header = f"<|im_start|>{msg.role}\n"
+            header = dialect.header(msg.role)
             header_pos = rendered_text.find(header, cursor)
             if header_pos < 0:
                 raise RuntimeError(
-                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat template output"
+                    f"could not locate {msg.role!r} message after cursor {cursor} in rendered chat "
+                    f"template output (dialect={dialect.name!r}, header={header!r})"
                 )
             content_start = header_pos + len(header)
-            end_pos = rendered_text.find(_IM_END, content_start)
+            end_pos = rendered_text.find(dialect.end, content_start)
             if end_pos < 0:
-                raise RuntimeError(f"could not locate <|im_end|> for {msg.role!r} message")
-            span_end = end_pos + len(_IM_END)
+                raise RuntimeError(
+                    f"could not locate {dialect.end!r} for {msg.role!r} message (dialect={dialect.name!r})"
+                )
+            span_end = end_pos + len(dialect.end)
             if span_end < len(rendered_text) and rendered_text[span_end] == "\n":
                 span_end += 1
             cursor = span_end
 
         if not msg.learn:
             continue
+        if last_turn_only and msg_idx not in last_round_learn_indices:
+            continue
 
         mask_start = content_start
-        if msg.role == "assistant" and rendered_text[content_start : content_start + len(_THINK_OPEN)] == _THINK_OPEN:
-            mask_start += len(_THINK_OPEN)
+        if msg.role == "assistant":
+            think_end = (
+                _empty_think_region_end(rendered_text, content_start, span_end)
+                if ignore_empty_think and dialect is _CHATML
+                else -1
+            )
+            if think_end >= 0:
+                # empty `<think>…</think>` region (plus trailing whitespace)
+                # stays out of the loss.
+                mask_start = think_end
+            elif dialect.think_open is not None and rendered_text.startswith(dialect.think_open, content_start):
+                if dialect.think_close is None:
+                    # ChatML: only the opener is excluded; the reasoning body is learned.
+                    mask_start += len(dialect.think_open)
+                else:
+                    # Delimited block (gemma-4): the whole reasoning span stays out of
+                    # the loss, so training targets only the visible reply.
+                    close_pos = rendered_text.find(dialect.think_close, content_start, span_end)
+                    if close_pos < 0:
+                        raise RuntimeError(f"found {dialect.think_open!r} without a matching {dialect.think_close!r}")
+                    mask_start = close_pos + len(dialect.think_close)
         for pos in range(mask_start, span_end):
             char_mask[pos] = 1
 
@@ -238,6 +682,8 @@ def render_with_loss_mask(
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
+    ignore_empty_think: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Render a single sample.
 
@@ -249,6 +695,15 @@ def render_with_loss_mask(
     native chat template — useful when the native template is designed
     for inference and silently drops content needed for training
     (e.g. DeepSeek-R1 distill templates strip ``<think>...</think>``).
+
+    ``last_turn_only``: when True, only the final learnable round contributes to
+    the loss; earlier assistant/function_call turns are masked. Applied to both
+    render paths.
+
+    ``ignore_empty_think``: when True, an empty ``<think></think>`` block inside
+    an assistant turn is kept entirely out of the loss (not just its opener tag).
+    Only supported on the per-message fallback path (the ``{% generation %}``
+    template path has no think info).
     """
     patch_result = _resolve_sft_template_kwargs(
         sample,
@@ -291,7 +746,20 @@ def render_with_loss_mask(
         _TEMPLATE_LOGGED.add(log_key)
 
     if HAS_GENERATION_MARKER(effective_template):
-        return _render_with_assistant_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
+        if ignore_empty_think and tok_id not in _EMPTY_THINK_UNSUPPORTED_WARNED:
+            logger.warning(
+                "--sft-ignore-empty-think has no effect on the {%% generation %%} "
+                "template path (HF assistant_masks are token-level with no think "
+                "info). It only applies to the per-message fallback path."
+            )
+            _EMPTY_THINK_UNSUPPORTED_WARNED.add(tok_id)
+        return _render_with_assistant_mask(
+            sample,
+            tokenizer=tokenizer,
+            apply_chat_template_kwargs=merged,
+            normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in merged,
+            last_turn_only=last_turn_only,
+        )
 
     if tok_id not in _FALLBACK_WARNED:
         logger.warning(
@@ -301,7 +769,14 @@ def render_with_loss_mask(
             "(This warning is shown once per tokenizer instance.)"
         )
         _FALLBACK_WARNED.add(tok_id)
-    return _render_per_message_fallback(sample, tokenizer=tokenizer, apply_chat_template_kwargs=merged)
+    return _render_per_message_fallback(
+        sample,
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs=merged,
+        effective_template=effective_template,
+        last_turn_only=last_turn_only,
+        ignore_empty_think=ignore_empty_think,
+    )
 
 
 def render_to_text(
@@ -309,6 +784,7 @@ def render_to_text(
     *,
     tokenizer,
     apply_chat_template_kwargs: dict | None = None,
+    last_turn_only: bool = False,
 ) -> str:
     """Render a sample to the chat-template text WITHOUT tokenizing.
 
@@ -322,9 +798,15 @@ def render_to_text(
         tokenizer=tokenizer,
         apply_chat_template_kwargs=apply_chat_template_kwargs,
     )
+    messages, template_kwargs = _prepare_chat_messages(
+        sample,
+        patch_result.kwargs,
+        last_turn_only=last_turn_only,
+        normalize_deepseek_reasoning=_EMBEDDED_THINK_INDICES_KEY in patch_result.kwargs,
+    )
     return tokenizer.apply_chat_template(
-        _to_chat_messages(sample),
+        messages,
         tools=sample.tools,
         tokenize=False,
-        **patch_result.kwargs,
+        **template_kwargs,
     )

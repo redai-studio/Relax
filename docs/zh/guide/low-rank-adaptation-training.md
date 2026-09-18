@@ -207,13 +207,12 @@ bash scripts/training/text/run-qwen3-4B-lora-adapter-8xgpu-async.sh
 
 ## Checkpoint 与导出
 
-启用 LoRA 后，保存 checkpoint 时还会在 `<checkpoint_dir>/lora_adapter/` 下写出一个**可移植的 HF-PEFT 适配器**（`relax/backends/megatron/checkpoint.py`）：
+默认情况下，`--save` 写入常规的完整 Megatron 分布式 checkpoint。增加 `--save-lora-only` 后，改为写入更小、可续训的 actor checkpoint：其中包含 LoRA 张量以及 optimizer、scheduler、RNG、iteration 和 common state；恢复时，冻结的基座权重从 `--hf-checkpoint` 重新加载。
 
-- `adapter_config.json` + `adapter_model.safetensors`——标准 HF-PEFT 布局，可用 `peft.PeftModel.from_pretrained` 加载。
-- `relax_lora_meta.json`——Relax 元数据（rank、alpha、target modules、dropout、模式）。单独成文件，以免干扰标准 PEFT 加载器。
+`--save-lora-only` 与全量 checkpoint 导出互斥：它要求同步 BF16 `torch_dist` checkpoint，不能与 `--async-save`、`--rotate-ckpt`、`--no-save-optim`、`--no-save-rng`、`--fp16`、`--fp8` 或 `--save-hf` 同时使用。如果存在任何非 LoRA 的可训练模型参数，也会直接报错，防止生成无法完整续训的产物。
 
 ::: tip
-这个 `lora_adapter/` 目录是供外部 / 推理使用的**导出产物**——它**不是**续训的来源。LoRA 参数作为普通模型参数保存在主 Megatron checkpoint 内，因此 `--load` 会像加载其他权重一样恢复它们。
+轻量 checkpoint 是分片的 Megatron 续训产物，不是可移植的 HF-PEFT adapter。显式使用 `--save-hf` 时仍可导出包含 `adapter_config.json`、`adapter_model.safetensors` 和 `relax_lora_meta.json` 的 `lora_adapter/`；该目录仅供外部或推理使用，不是续训来源。
 :::
 
 ### 离线合并为独立 HF checkpoint

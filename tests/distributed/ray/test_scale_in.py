@@ -3,13 +3,15 @@
 """Tests for scale-in request creation, engine selection, draining, removal,
 and cleanup."""
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
 try:
     from relax.distributed.ray.rollout import (
+        EngineGroupLifecycle,
         ScaleInRequest,
         ScaleInStatus,
         ScaleOutRequest,
@@ -233,7 +235,8 @@ class TestSelectEnginesForRemoval:
         )
         assert manager._select_engines_for_removal(req, srv) == []
 
-    def test_by_engine_urls(self, patch_ray_get):
+    @pytest.mark.asyncio
+    async def test_by_engine_urls(self, patch_ray_get):
         """Select engines matching specific URLs."""
         e1 = make_mock_engine(url="http://a:1")
         e2 = make_mock_engine(url="http://b:2")
@@ -246,10 +249,12 @@ class TestSelectEnginesForRemoval:
             status=ScaleInStatus.PENDING,
             engine_urls=["http://a:1"],
         )
-        infos = manager._select_engines_for_removal(req, srv)
+        candidates = await manager._resolve_scale_in_url_candidates(req, srv)
+        infos = manager._select_engines_for_removal(req, srv, url_candidates=candidates)
         assert len(infos) == 1
 
-    def test_by_engine_urls_normalization(self, patch_ray_get):
+    @pytest.mark.asyncio
+    async def test_by_engine_urls_normalization(self, patch_ray_get):
         """URL normalization: http://host:port matches host:port."""
         e1 = make_mock_engine(url="http://a:1")
         g = make_engine_group(engines=[e1], is_scaled_out=True)
@@ -261,10 +266,12 @@ class TestSelectEnginesForRemoval:
             status=ScaleInStatus.PENDING,
             engine_urls=["a:1"],
         )
-        infos = manager._select_engines_for_removal(req, srv)
+        candidates = await manager._resolve_scale_in_url_candidates(req, srv)
+        infos = manager._select_engines_for_removal(req, srv, url_candidates=candidates)
         assert len(infos) == 1
 
-    def test_dead_engines_skipped(self, patch_ray_get):
+    @pytest.mark.asyncio
+    async def test_dead_engines_skipped(self, patch_ray_get):
         """Dead (None) engines are not candidates."""
         g = make_engine_group(engines=[None, None], is_scaled_out=True)
         srv = make_rollout_server(engine_groups=[g])
@@ -276,8 +283,93 @@ class TestSelectEnginesForRemoval:
             num_replicas=0,
             engine_urls=["a:1"],
         )
-        infos = manager._select_engines_for_removal(req, srv)
+        candidates = await manager._resolve_scale_in_url_candidates(req, srv)
+        infos = manager._select_engines_for_removal(req, srv, url_candidates=candidates)
         assert len(infos) == 0
+
+    @pytest.mark.asyncio
+    async def test_url_probe_does_not_block_eviction_fence(self, patch_ray_get):
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def blocked_url():
+            probe_started.set()
+            await release_probe.wait()
+            return "http://elastic:1"
+
+        engine = make_mock_engine(url="http://elastic:1")
+        engine.get_url.remote.return_value = blocked_url()
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        group.pg = (MagicMock(), [], [])
+        srv = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": srv})
+        req = ScaleInRequest(
+            request_id="r-url",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["elastic:1"],
+        )
+        manager._scale_in_requests[req.request_id] = req
+
+        resolve_task = asyncio.create_task(manager._resolve_scale_in_url_candidates(req, srv))
+        await asyncio.wait_for(probe_started.wait(), timeout=1)
+
+        manager._handle_evictions([("default", group, 0)])
+
+        assert group.eviction_requested is True
+        assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
+        release_probe.set()
+        assert await resolve_task == [(group, 0, engine)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mutation", ["replace_actor", "remove_group"])
+    async def test_url_candidates_are_revalidated_before_claim(self, patch_ray_get, mutation):
+        engine = make_mock_engine(url="http://elastic:1")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        srv = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": srv})
+        req = ScaleInRequest(
+            request_id="r-url",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["elastic:1"],
+        )
+
+        candidates = await manager._resolve_scale_in_url_candidates(req, srv)
+        if mutation == "replace_actor":
+            group.all_engines[0] = make_mock_engine(url="http://elastic:1")
+        else:
+            srv.engine_groups.remove(group)
+
+        assert manager._select_engines_for_removal(req, srv, url_candidates=candidates) == []
+
+    @pytest.mark.asyncio
+    async def test_url_probes_run_concurrently(self, patch_ray_get):
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_probes = asyncio.Event()
+
+        async def blocked_url(started, url):
+            started.set()
+            await release_probes.wait()
+            return url
+
+        first = make_mock_engine(url="http://first:1")
+        second = make_mock_engine(url="http://second:2")
+        first.get_url.remote.return_value = blocked_url(first_started, "http://first:1")
+        second.get_url.remote.return_value = blocked_url(second_started, "http://second:2")
+        group = make_engine_group(engines=[first, second], is_scaled_out=True)
+        srv = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": srv})
+        req = ScaleInRequest(
+            request_id="r-url",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["first:1", "second:2"],
+        )
+
+        resolve_task = asyncio.create_task(manager._resolve_scale_in_url_candidates(req, srv))
+        await asyncio.wait_for(asyncio.gather(first_started.wait(), second_started.wait()), timeout=1)
+        release_probes.set()
+
+        assert await resolve_task == [(group, 0, first), (group, 1, second)]
 
 
 # ========================= _drain_engines ==================================
@@ -336,6 +428,125 @@ class TestDrainEngines:
 
 class TestScaleInExecution:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("force", [False, True])
+    async def test_scale_in_fence_rejects_update_started_during_removal(self, force, patch_ray_get):
+        engine = make_mock_engine(url="http://elastic:1")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        request = ScaleInRequest(
+            request_id="r-fence",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            timeout_secs=5,
+            force=force,
+        )
+        removal_started = asyncio.Event()
+        finish_removal = asyncio.Event()
+
+        async def _remove(*_args, **_kwargs):
+            removal_started.set()
+            await finish_removal.wait()
+            return ["group_0_engine_0"], []
+
+        manager._remove_live_engines = _remove
+        scale_in_task = asyncio.create_task(manager._scale_in(request))
+        await removal_started.wait()
+
+        assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
+        assert manager.set_weight_updating(True) is False
+        assert manager._training_weight_updating is False
+
+        finish_removal.set()
+        await scale_in_task
+
+        assert request.status is ScaleInStatus.COMPLETED
+        assert group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner", ["_training_weight_updating", "_scale_out_weight_updating"])
+    async def test_scale_in_fence_waits_for_existing_weight_update(self, owner, patch_ray_get):
+        engine = make_mock_engine(url="http://elastic:1")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+        setattr(manager, owner, True)
+        manager._remove_live_engines = AsyncMock(return_value=(["engine"], []))
+        request = ScaleInRequest(
+            request_id="r-existing-update",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            timeout_secs=5,
+        )
+
+        scale_in_task = asyncio.create_task(manager._scale_in(request))
+        while group.lifecycle_status is not EngineGroupLifecycle.DRAINING:
+            await asyncio.sleep(0)
+
+        manager._remove_live_engines.assert_not_called()
+        assert manager.set_weight_updating(True) is False
+
+        if owner == "_training_weight_updating":
+            assert manager.set_weight_updating(False) is True
+        else:
+            manager._scale_out_weight_updating = False
+        await scale_in_task
+
+        manager._remove_live_engines.assert_awaited_once()
+        assert request.status is ScaleInStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_scale_in_fence_timeout_restores_active_without_cleanup(self, patch_ray_get):
+        engine = make_mock_engine(url="http://elastic:1")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+        manager._training_weight_updating = True
+        manager._remove_live_engines = MagicMock()
+        request = ScaleInRequest(
+            request_id="r-timeout",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            timeout_secs=0.01,
+        )
+
+        await manager._scale_in(request)
+
+        assert request.status is ScaleInStatus.FAILED
+        assert "weight-update fence" in request.error_message
+        assert group.lifecycle_status is EngineGroupLifecycle.ACTIVE
+        manager._remove_live_engines.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sigterm_during_explicit_scale_in_timeout_keeps_persistent_fence(self, patch_ray_get):
+        engine = make_mock_engine(url="http://elastic:1")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        group.pg = (MagicMock(), [], [])
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+        manager._training_weight_updating = True
+        manager._remove_live_engines = MagicMock()
+        request = ScaleInRequest(
+            request_id="r-timeout-sigterm",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            timeout_secs=0.01,
+        )
+        manager._scale_in_requests[request.request_id] = request
+
+        scale_in_task = asyncio.create_task(manager._scale_in(request))
+        while group.lifecycle_status is not EngineGroupLifecycle.DRAINING:
+            await asyncio.sleep(0)
+
+        manager._handle_evictions([("default", group, 0)])
+        assert group.eviction_requested is True
+
+        await scale_in_task
+
+        assert request.status is ScaleInStatus.FAILED
+        assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
+        assert group.eviction_requested is True
+        assert manager.set_weight_updating(True) is False
+        manager._remove_live_engines.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_force_removes_only_engines_unregistered_from_router(self, patch_ray_get):
         removable = make_mock_engine(url="http://a:1")
         kept = make_mock_engine(url="http://b:2")
@@ -365,6 +576,130 @@ class TestScaleInExecution:
         monitor.mark_intentionally_removed.assert_called_once_with(0)
 
 
+@pytest.mark.asyncio
+async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_get):
+    events = []
+    engine = make_mock_engine()
+    engine.unregister_from_router.remote.side_effect = lambda **_kwargs: (
+        events.append("router") or AwaitableValue(True)
+    )
+    engine.unregister_dcs.remote.side_effect = lambda: events.append("dcs") or AwaitableValue(None)
+    engine.shutdown.remote.side_effect = lambda: events.append("shutdown") or AwaitableValue(None)
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    group.pg = (MagicMock(), [], [])
+    server = make_rollout_server(engine_groups=[group])
+    manager = create_test_manager(servers={"default": server})
+
+    async def _sleep(_seconds):
+        events.append("drain")
+
+    with (
+        patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=_sleep),
+        patch(
+            "relax.distributed.ray.rollout.ray.util.remove_placement_group",
+            side_effect=lambda _pg: events.append("pg"),
+        ),
+    ):
+        removed, failed = await manager._remove_live_engines(
+            server,
+            [(group, 0)],
+            drain_timeout=1,
+            shutdown_timeout=2,
+            force=False,
+        )
+
+    assert removed == ["group_0_engine_0"]
+    assert failed == []
+    assert events == ["router", "drain", "dcs", "shutdown", "pg"]
+
+
+@pytest.mark.asyncio
+async def test_batch_live_removal_runs_each_phase_concurrently_and_drains_once(patch_ray_get):
+    events = []
+
+    def concurrent_phase(name):
+        started = 0
+        both_started = asyncio.Event()
+
+        async def run():
+            nonlocal started
+            started += 1
+            events.append(f"{name}_start_{started}")
+            if started == 2:
+                both_started.set()
+            await both_started.wait()
+            events.append(f"{name}_end")
+            return True
+
+        return run
+
+    router_phase = concurrent_phase("router")
+    dcs_phase = concurrent_phase("dcs")
+    shutdown_phase = concurrent_phase("shutdown")
+    groups = []
+    for rank_offset in (1, 2):
+        engine = make_mock_engine()
+        engine.unregister_from_router.remote.side_effect = lambda **_kwargs: router_phase()
+        engine.unregister_dcs.remote.side_effect = lambda: dcs_phase()
+        engine.shutdown.remote.side_effect = lambda: shutdown_phase()
+        group = make_engine_group(engines=[engine], is_scaled_out=True, rank_offset=rank_offset)
+        group.pg = (MagicMock(), [], [])
+        groups.append(group)
+
+    server = make_rollout_server(engine_groups=groups)
+    manager = create_test_manager(servers={"default": server})
+
+    async def drain_once(_seconds):
+        events.append("drain")
+
+    with (
+        patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=drain_once) as sleep,
+        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg,
+    ):
+        removed, failed = await manager._remove_live_engines(
+            server,
+            [(groups[0], 0), (groups[1], 0)],
+            drain_timeout=1,
+            shutdown_timeout=2,
+            force=False,
+        )
+
+    assert removed == ["group_1_engine_0", "group_2_engine_0"]
+    assert failed == []
+    sleep.assert_awaited_once_with(1)
+    assert events.count("drain") == 1
+    assert events.index("router_start_2") < events.index("router_end") < events.index("drain")
+    assert events.index("drain") < events.index("dcs_start_1")
+    assert events.index("dcs_start_2") < events.index("dcs_end")
+    assert events.index("dcs_end") < events.index("shutdown_start_1")
+    assert events.index("shutdown_start_2") < events.index("shutdown_end")
+    assert remove_pg.call_count == 2
+    assert server.engine_groups == []
+
+
+@pytest.mark.asyncio
+async def test_dcs_failure_warns_and_continues_shutdown(patch_ray_get):
+    engine = make_mock_engine()
+    engine.unregister_dcs.remote.side_effect = RuntimeError("DCS unavailable")
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    server = make_rollout_server(engine_groups=[group])
+    manager = create_test_manager(servers={"default": server})
+
+    removed, failed = await manager._remove_live_engines(
+        server,
+        [(group, 0)],
+        drain_timeout=1,
+        shutdown_timeout=2,
+        force=True,
+    )
+
+    assert removed == ["group_0_engine_0"]
+    assert failed == []
+    engine.shutdown.remote.assert_called_once()
+    assert group.all_engines[0] is None
+    assert server.engine_groups == []
+
+
 # ========================= _remove_engine ==================================
 
 
@@ -391,6 +726,20 @@ class TestRemoveEngine:
             await manager._remove_engine(g, 0, shutdown_timeout=1)
             mock_kill.assert_called_once_with(e1)
         assert g.all_engines[0] is None
+
+    @pytest.mark.asyncio
+    async def test_dcs_failure_still_shuts_down_engine(self):
+        engine = make_mock_engine()
+        engine.unregister_dcs.remote.side_effect = RuntimeError("DCS unavailable")
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        manager = create_test_manager()
+
+        with patch("ray.kill") as kill:
+            await manager._remove_engine(group, 0, shutdown_timeout=1)
+
+        assert group.all_engines[0] is None
+        engine.shutdown.remote.assert_called_once()
+        kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_multi_node_engine_removal(self, patch_ray_get):

@@ -3,14 +3,15 @@
 Agentic rollout 将已有 agent app (harness) 接入 Relax 训练。Relax 为每个 Session 启动并管理一个 agent process，
 由该 process 运行原有 harness。Relax 记录已提交的 conversation，并把选中的 context 转换为训练 sample。
 
-**当您已经有一个使用 OpenAI-compatible Chat Completions API 的可运行 agent 时，这项功能尤其合适；agent
-既可以 standalone 运行，也可以由集中式平台统一执行。**
+**当您已经有一个通过 OpenAI-compatible Chat Completions API 调用模型的 agent application (harness) 时，
+Agentic rollout 尤其适合将其接入 Relax。使用 OpenAI Responses 或 Anthropic Messages 的 agent 也可以接入。
+Agent 既可以 standalone 运行，也可以由集中式平台统一执行。**
 
 ::: tip 推荐工作流
 评估和接入 agent app (harness)、检查启动配置或开展实验时，建议使用仓库 `skills/agentic-rollout/` 下的
 `agentic-rollout` skill。该 skill 会检查当前 checkout，并按阶段检查 context topology、parser、export 与 credit、
-timeout、并发容量和 runtime 证据。实验仍需用户明确授权；本文继续说明 Chat Completions 请求与响应格式、API 和
-export 契约。
+timeout、并发容量和 runtime 证据。实验仍需用户明确授权；本文继续说明 model API 请求与响应格式、API 和 export
+契约。
 
 手动阅读时：
 
@@ -26,20 +27,20 @@ export 契约。
 ## 核心能力
 
 1. **用已有 agent 做 Agentic RL**
-   通过 OpenAI-compatible Chat Completions API endpoint 接入已有 agent app (harness)，并连接到 Relax 训练。
+   通过 Chat Completions、Responses 或 Messages endpoint 接入已有 agent app (harness)，并连接到 Relax 训练。
 
 2. **Agent process warmup**
    在 rollout 执行前提前启动 agent process，隐藏进程启动、tool setup 和环境初始化耗时。
 
 3. **Request-level partial rollout**
-   在 Relax 内部中断和恢复 active model request，同时让 agent 继续使用普通 chat-completion 流程。
+   无需修改 agent，即可跨 rollout step 中断并恢复 model generation。
 
 ## 准备 Agent
 
 先让 agent 在 Relax 外独立运行，使用它原有的 task input 和 model endpoint。继续接入前，确认 agent 能够：
 
 - 通过原有输入接口接收一个真实任务；
-- 调用非流式 Chat Completions endpoint；
+- 调用一个受支持的 model endpoint；
 - 完成一次完整的 harness 运行，需要时包含多个 turn；
 - 写出最终结果；
 - 正常退出，不产生错误。
@@ -115,7 +116,7 @@ Agentic rollout 会在 agent process 读取前，自动把该输入转换成 Ope
 | --- | --- |
 | 标准 Relax dataset 路径 | `--multimodal-keys` 把 dataset image 插入 prompt，并提取 model media input |
 | Agentic Session Input | Process 启动前，Relax 把内部 image item 转换为 OpenAI `image_url` content |
-| Agent Chat request | Relax 读取 `image_url`，为 SGLang 准备 backend media，并构造 processor-expanded training input |
+| Agent model request | Relax 读取 `image_url`，为 SGLang 准备 backend media，并构造 processor-expanded training input |
 
 在 process boundary，已有的 `data:image/...`、`http://` 或 `https://` URL 会保持原样。Local path、byte payload 或
 内存中的 image 会被加载、转换成 RGB PNG，并编码为 data URI。
@@ -180,14 +181,42 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-上面的 `timeout=9999` 是 agent 向 `RELAX_BASE_URL` 发起单次 Chat Completions request 的 wall-clock timeout。
-Prelaunch、partial rollout 的 abort/resume 或 fully async 执行可能会 hold 住同一个 request，因此 client timeout
-需要覆盖最长的等待时间。
+上面的 `timeout=9999` 是 agent 向 `RELAX_BASE_URL` 发起单次 model request 的 wall-clock timeout。Prelaunch、
+partial rollout 的 abort/resume 或 fully async 执行可能会 hold 住同一个 request，因此 client timeout 需要覆盖
+最长的等待时间。
 
 使用 `model_dump()` 保存完整 assistant message。Reasoning content 与 tool call 才能参与后续 turn 和 SessionForest
 matching。
 
-### Chat Completions Contract
+### Model API
+
+Relax 接收 Chat Completions request，以及下文列出的 Responses 和 Messages request 结构。三者使用相同的
+generation 与 SessionForest core。每个 endpoint 都使用 `Authorization: Bearer <RELAX_SESSION_ID>` 鉴权。
+
+| Interface | Endpoint | 完整 history 字段 | Turn limit |
+| --- | --- | --- | --- |
+| OpenAI Chat Completions | `/v1/chat/completions` | `messages` | `max_completion_tokens`，或旧版 `max_tokens` |
+| OpenAI Responses | `/v1/responses` | typed `input` Items | `max_output_tokens` |
+| Anthropic Messages | `/v1/messages` | `system` 与 `messages` | 必填 `max_tokens` |
+
+::: tip 不使用标准 client 时
+标准 client 应原样接收 `RELAX_BASE_URL`，由 client 自动追加 resource path。自行发送 HTTP request 时，使用
+`RELAX_BASE_URL.rstrip("/") + endpoint`，其中 endpoint 取自上表。拼接时需要保留已有 service path；部分 URL
+helper 会把前导 `/` 解析到 origin 根路径，从而丢弃 `/agentic_api`。
+:::
+
+::: warning 当前 API 限制
+Model request 必须通过 HTTP 发送。省略 `stream` 或设为 `false` 时返回 JSON；`stream=true` 使用 Buffered SSE，
+并在完整 generation 结束后发送 model-content events。当前不支持 WebSocket 和 token-level streaming。每条
+request 都必须重放所属 conversation branch 的完整 history。Responses request 必须包含完整 `input`；
+Relax 不使用 `previous_response_id`。
+:::
+
+Relax 把三种 interface 的 request 规范化为 canonical `messages`、function `tools` 和 `chat_template_kwargs`，再用
+该 state 完成 SessionForest matching 与 generation。API response 按当前 request 使用的 interface 返回。`model`
+字段会回显到 response，但不选择 Relax inference backend。下表之外的 request field 不会改变 generation。
+
+#### Chat Completions
 
 训练配置提供 `temperature` 和 `top_p`。Request 中的这两个字段会被忽略。
 
@@ -202,19 +231,66 @@ matching。
 | `seed` | 当前 turn 的 sampling seed |
 | `logprobs` | 在 response 中返回 generated-token logprobs |
 
-::: warning Chat Completions 兼容范围
-Endpoint 使用非流式响应。省略 `stream` 或设为 `false`；省略 `n` 或设为 `1`。不支持 `top_logprobs`、旧版
-`functions` 和 `function_call`。使用 `max_completion_tokens` 设置当前 turn 上限；`max_tokens` 可作为旧版别名。
-`tool_choice` 和未列出的 request field 不会被消费。
-
+::: warning Chat Completions message 契约
 Message role 使用 `user`、`assistant`、`tool` 或 `system`。User、system 与 tool message 需要非空 content；tool
 返回 `None` 或 `""` 时，使用稳定的非空表示。Assistant 包含 tool call 或 reasoning 时可以省略文本 content。Harness
-发送 `developer` 时，应配置为 `system`，或者在接入前确认该语义转换。`add_generation_prompt`、`tokenize` 与
-`tools` 由 Relax 管理，不要在 request `chat_template_kwargs` 中设置。
+发送 Chat `developer` message 时，需要在 harness 侧转换为 `system`。`add_generation_prompt`、`tokenize` 与
+`tools` 由 Relax 管理，请勿在 request `chat_template_kwargs` 中设置。
 :::
 
 使用了 `tools` 或 `chat_template_kwargs` 的 request 必须持续传入这些字段。模型和 chat template 需要时，配置
 `--agentic-reasoning-parser` 和 `--agentic-tool-call-parser`。
+
+#### Responses
+
+Relax 投影以下 typed `input` Items：
+
+| Item | 投影结果 |
+| --- | --- |
+| Top-level `instructions` string | 放在 `input` 之前的 canonical system message |
+| 带 `user`、`assistant`、`system` 或 `developer` role 的 `message` | Canonical message；`developer` 转换为 `system` |
+| `input_text` / `output_text` | Message text |
+| 带 `image_url` string 的 user `input_image` | Canonical `image_url` content |
+| `summary` 或 `content` 中带可读文本的 `reasoning` | Assistant `reasoning_content` |
+| `function_call` | 保持同一 `call_id` 的 assistant function tool call |
+| 带 text output 的 `function_call_output` | 保持同一 `call_id` 的 tool message |
+
+Responses function tool 使用扁平的 `type`、`name`、`parameters` 和可选 `description` 结构。输出 reasoning、
+assistant text 与 function call 会变成相应 Responses Item。`function_call_output` 接受 string 或 `input_text`
+block。因长度限制结束的结果使用 `status: "incomplete"`；其他成功结果使用 `status: "completed"`。
+
+#### Anthropic Messages
+
+Relax 投影以下 Messages block：
+
+| Block | 投影结果 |
+| --- | --- |
+| `system` string 或 text block | Canonical system message |
+| User 或 assistant `text` | Canonical message text |
+| 带 URL 或 base64 source 的 user `image` | Canonical `image_url` content |
+| Assistant `thinking` | Assistant `reasoning_content` |
+| Assistant `tool_use` | 保持同一 ID 的 assistant function tool call |
+| 带 text content 的 user `tool_result` | 保持同一 tool-use ID 的 tool message |
+
+Messages tool 使用 `name`、`input_schema` 和可选 `description`；省略 tool `type` 或设置 `type: "custom"` 时，
+会投影为 canonical function tool。Anthropic response 使用 text、thinking 和 tool-use block，并提供 Anthropic stop reason。
+`stop_sequences` 会作为当前 turn 的 stop string 传给 generation。
+
+#### Buffered SSE
+
+Buffered SSE 会在完整 generation 执行期间保持 HTTP request 打开。Relax 先发送 connection frame；generation
+等待期间每 15 秒发送一次 heartbeat。完成后，Relax 把当前协议的完整 terminal event sequence 一起发出，
+不会暴露 token-by-token delta。
+
+| 协议 | Terminal sequence |
+| --- | --- |
+| Chat Completions | 一个带 `usage` 的完整 `chat.completion.chunk`，随后是 `[DONE]`；失败时发送 OpenAI error data 和 `[DONE]` |
+| Responses | `response.created`、每个 output Item 对应一个 `response.output_item.done`，随后是 `response.completed`、`response.incomplete` 或 `response.failed` |
+| Messages | `message_start`、完整 content-block events、`message_delta`，随后是 `message_stop`；失败时使用 `event: error` |
+
+Chat 与 Responses 使用 SSE comment 作为 connection 和 heartbeat frame。Messages 使用 `event: ping`。JSON 与
+Buffered SSE 共享 normalized request、generation、SessionForest commit、usage accounting 和 finish reason。每个
+成功的 Chat terminal chunk 都包含完整 usage，不依赖 `stream_options.include_usage`；Relax 不会额外发送 usage chunk。
 
 ### Agent Process Contract
 
@@ -225,7 +301,7 @@ Relax 向每个 agent process 注入：
 | `RELAX_INPUT_JSON` | Session input JSON path |
 | `RELAX_OUTPUT_JSON` | Session output path |
 | `RELAX_SESSION_IO_DIR` | Per-session 临时目录 |
-| `RELAX_BASE_URL` | Chat Completions API base URL |
+| `RELAX_BASE_URL` | Agentic model API base URL |
 | `RELAX_SESSION_ID` | Session ID 与 API credential |
 | `RELAX_ROLLOUT_MODE` | `train` 或 `eval` |
 | `RELAX_GROUP_ID` | Runtime Group ID |
@@ -321,6 +397,10 @@ JSONL record 表示一个训练 context，而不是一个 agent process。导出
 
 每条 record 必须匹配一个 committed SessionForest state。完整保留 generation 使用的 assistant message、reasoning
 content、tool call、tools 与 template arguments。Relax 训练 JSONL 中出现的 record；未写入的 context 不参与训练。
+
+即使 agent 调用 Responses 或 Messages，显式 export record 仍使用上文 canonical Chat-shaped `messages`、嵌套
+function `tools` 和 `chat_template_kwargs`。请复用能够匹配 committed SessionForest state 的 normalized value；
+raw Responses `input` list 或 Anthropic block list 不是显式 export record。
 
 Context 数量与 process 数量无关。一个 process 可以导出多个 context。Multi-agent application 可以导出一个或
 多个 context。Eval 可以仅导出 `main`，training 则可以导出更多 context。
@@ -512,9 +592,6 @@ prompt Group 为单位。无论使用 ordinary RM 还是 Group RM，dataset `d` 
 内部使用 singleton Runtime Group，但不会改变该总数。多个 Eval dataset 串行执行，因此 Train 与 Eval 使用独立
 executor 时，分别为 `T` 和 `E_peak` 配置容量。
 
-Partial rollout 与 fully async 是互斥的执行模式。两者都可以跨 rollout step 保留未完成的 Session；请选择其中
-一种。继续使用最小 application 中的长 Chat Completions timeout。
-
 Retriever、environment server 等 cross-session service 应在 per-session agent command 外启动。
 
 Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload 的可选能力。参见
@@ -525,7 +602,7 @@ Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload �
 ### Session Lifecycle
 
 一个 dataset sample 创建一个 Session。Session 拥有一个 agent process、一个 SessionForest、rollout mode
-和 active-time budget。Process 可以顺序或并发调用 Chat Completions。Process 退出后，Relax 选择指定 Forest
+和 active-time budget。Process 可以顺序或并发调用 model API。Process 退出后，Relax 选择指定 Forest
 state、计算训练 credit，并把 sample 发送到训练侧。
 
 主要 runtime 路径是：
@@ -547,9 +624,9 @@ IDs、rollout logprobs 与可训练 loss mask。沿同一 normalized history 的
 
 #### State Identity 与 Prefix Matching
 
-每条 request 携带完整 message history。Relax 查找 tools 和 template arguments 相同的最长 committed message
-prefix。未匹配的 suffix 成为新的 observation。完整匹配会从已有 state 创建 branch；没有匹配时从 technical root
-开始。
+每种协议的 request 都携带完整 history，Relax 会先把它投影为 canonical messages。Relax 查找 tools 和 template
+arguments 相同的最长 committed message prefix。未匹配的 suffix 成为新的 observation。完整匹配会从已有 state
+创建 branch；没有匹配时从 technical root 开始。
 
 <details>
 <summary>参考实现</summary>
@@ -647,7 +724,6 @@ status、turn count、request timing、abort count 与 weight-version 信息。
 
 - **Agent 没有启动或异常退出：** 检查 `--agent-cwd` 和 `--agent-command`，然后查看 `run.log`。Relax 会把 agent
   stdout 与 stderr 的末尾内容附加到 `AgentExecutionError`。
-- **Client 请求 streaming：** 使用非流式 response；不支持 `stream=true`。
 - **第一条 request 长时间等待：** Group 获得 Runtime lease 前，request 会保持等待；client 应配置长 timeout。
 - **显式导出无法匹配：** 保留 generation 实际使用的完整 normalized `messages`、`tools` 和
   `chat_template_kwargs`。

@@ -114,8 +114,12 @@ def _compute_hash_dict(tensors: dict[str, torch.Tensor]):
 
 def _compute_hash_tensor(x: torch.Tensor):
     # Not a real/good hash, but pretty fast
-    x = x.contiguous()
-    x = x.view(-1)
-    x = x.view(torch.uint32)
-    x = x.sum()
-    return x.item()
+    raw = x.contiguous().view(-1).view(torch.uint8)
+    full_word_bytes = raw.numel() // 4 * 4
+    if full_word_bytes == 0:
+        return raw.to(torch.uint32).sum().item()
+
+    value = raw[:full_word_bytes].view(torch.uint32).sum()
+    if full_word_bytes != raw.numel():
+        value = value + raw[full_word_bytes:].to(torch.uint32).sum()
+    return value.item()

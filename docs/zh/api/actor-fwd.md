@@ -37,5 +37,5 @@ ActorFwd 运行后台循环：
 
 ## 源码
 
-- 实现：[`relax/components/actor_fwd.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/actor_fwd.py)
-- 基类：[`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- 实现：[`relax/components/actor_fwd.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/actor_fwd.py)
+- 基类：[`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

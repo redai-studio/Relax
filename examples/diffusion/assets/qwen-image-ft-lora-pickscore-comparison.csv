@@ -1,0 +1,334 @@
+run,metric,step,value
+Relax full fine-tune,eval,0,0.813100
+Relax full fine-tune,eval,9,0.827500
+Relax full fine-tune,eval,19,0.844800
+Relax full fine-tune,eval,29,0.848000
+Relax full fine-tune,eval,39,0.850600
+Relax full fine-tune,eval,49,0.855900
+Relax full fine-tune,eval,59,0.857500
+Relax full fine-tune,eval,69,0.858500
+Relax full fine-tune,eval,79,0.859600
+Relax full fine-tune,eval,89,0.860700
+Relax full fine-tune,eval,99,0.860700
+Relax full fine-tune,reward,0,0.806500
+Relax full fine-tune,reward,1,0.818900
+Relax full fine-tune,reward,2,0.808800
+Relax full fine-tune,reward,3,0.793000
+Relax full fine-tune,reward,4,0.801300
+Relax full fine-tune,reward,5,0.795900
+Relax full fine-tune,reward,6,0.807800
+Relax full fine-tune,reward,7,0.812500
+Relax full fine-tune,reward,8,0.819000
+Relax full fine-tune,reward,9,0.821400
+Relax full fine-tune,reward,10,0.804200
+Relax full fine-tune,reward,11,0.819300
+Relax full fine-tune,reward,12,0.828700
+Relax full fine-tune,reward,13,0.834800
+Relax full fine-tune,reward,14,0.814600
+Relax full fine-tune,reward,15,0.822200
+Relax full fine-tune,reward,16,0.836000
+Relax full fine-tune,reward,17,0.822800
+Relax full fine-tune,reward,18,0.830600
+Relax full fine-tune,reward,19,0.839700
+Relax full fine-tune,reward,20,0.836900
+Relax full fine-tune,reward,21,0.817400
+Relax full fine-tune,reward,22,0.835400
+Relax full fine-tune,reward,23,0.841900
+Relax full fine-tune,reward,24,0.837100
+Relax full fine-tune,reward,25,0.846200
+Relax full fine-tune,reward,26,0.841900
+Relax full fine-tune,reward,27,0.816900
+Relax full fine-tune,reward,28,0.855800
+Relax full fine-tune,reward,29,0.842800
+Relax full fine-tune,reward,30,0.837300
+Relax full fine-tune,reward,31,0.848900
+Relax full fine-tune,reward,32,0.854200
+Relax full fine-tune,reward,33,0.854800
+Relax full fine-tune,reward,34,0.843300
+Relax full fine-tune,reward,35,0.843800
+Relax full fine-tune,reward,36,0.846800
+Relax full fine-tune,reward,37,0.843500
+Relax full fine-tune,reward,38,0.834600
+Relax full fine-tune,reward,39,0.843300
+Relax full fine-tune,reward,40,0.836200
+Relax full fine-tune,reward,41,0.866900
+Relax full fine-tune,reward,42,0.840300
+Relax full fine-tune,reward,43,0.855200
+Relax full fine-tune,reward,44,0.844300
+Relax full fine-tune,reward,45,0.840100
+Relax full fine-tune,reward,46,0.864200
+Relax full fine-tune,reward,47,0.852600
+Relax full fine-tune,reward,48,0.865800
+Relax full fine-tune,reward,49,0.865100
+Relax full fine-tune,reward,50,0.852700
+Relax full fine-tune,reward,51,0.860500
+Relax full fine-tune,reward,52,0.852600
+Relax full fine-tune,reward,53,0.845000
+Relax full fine-tune,reward,54,0.859800
+Relax full fine-tune,reward,55,0.858200
+Relax full fine-tune,reward,56,0.855100
+Relax full fine-tune,reward,57,0.845800
+Relax full fine-tune,reward,58,0.864600
+Relax full fine-tune,reward,59,0.843200
+Relax full fine-tune,reward,60,0.866100
+Relax full fine-tune,reward,61,0.865200
+Relax full fine-tune,reward,62,0.831900
+Relax full fine-tune,reward,63,0.852300
+Relax full fine-tune,reward,64,0.865300
+Relax full fine-tune,reward,65,0.842000
+Relax full fine-tune,reward,66,0.880700
+Relax full fine-tune,reward,67,0.845000
+Relax full fine-tune,reward,68,0.856100
+Relax full fine-tune,reward,69,0.842000
+Relax full fine-tune,reward,70,0.852300
+Relax full fine-tune,reward,71,0.867500
+Relax full fine-tune,reward,72,0.876700
+Relax full fine-tune,reward,73,0.843000
+Relax full fine-tune,reward,74,0.849700
+Relax full fine-tune,reward,75,0.840100
+Relax full fine-tune,reward,76,0.851900
+Relax full fine-tune,reward,77,0.829900
+Relax full fine-tune,reward,78,0.886100
+Relax full fine-tune,reward,79,0.864200
+Relax full fine-tune,reward,80,0.850600
+Relax full fine-tune,reward,81,0.838900
+Relax full fine-tune,reward,82,0.840500
+Relax full fine-tune,reward,83,0.839900
+Relax full fine-tune,reward,84,0.846100
+Relax full fine-tune,reward,85,0.875700
+Relax full fine-tune,reward,86,0.865500
+Relax full fine-tune,reward,87,0.841600
+Relax full fine-tune,reward,88,0.823800
+Relax full fine-tune,reward,89,0.849900
+Relax full fine-tune,reward,90,0.860600
+Relax full fine-tune,reward,91,0.856900
+Relax full fine-tune,reward,92,0.866200
+Relax full fine-tune,reward,93,0.848800
+Relax full fine-tune,reward,94,0.851600
+Relax full fine-tune,reward,95,0.844700
+Relax full fine-tune,reward,96,0.829200
+Relax full fine-tune,reward,97,0.846600
+Relax full fine-tune,reward,98,0.868200
+Relax full fine-tune,reward,99,0.860100
+Relax LoRA fine-tune,eval,0,0.813100
+Relax LoRA fine-tune,eval,9,0.821900
+Relax LoRA fine-tune,eval,19,0.832100
+Relax LoRA fine-tune,eval,29,0.838800
+Relax LoRA fine-tune,eval,39,0.849100
+Relax LoRA fine-tune,eval,49,0.854300
+Relax LoRA fine-tune,eval,59,0.856100
+Relax LoRA fine-tune,eval,69,0.858800
+Relax LoRA fine-tune,eval,79,0.859800
+Relax LoRA fine-tune,eval,89,0.863200
+Relax LoRA fine-tune,eval,99,0.864300
+Relax LoRA fine-tune,reward,0,0.806600
+Relax LoRA fine-tune,reward,1,0.812900
+Relax LoRA fine-tune,reward,2,0.811100
+Relax LoRA fine-tune,reward,3,0.793300
+Relax LoRA fine-tune,reward,4,0.801600
+Relax LoRA fine-tune,reward,5,0.799600
+Relax LoRA fine-tune,reward,6,0.800500
+Relax LoRA fine-tune,reward,7,0.811700
+Relax LoRA fine-tune,reward,8,0.813800
+Relax LoRA fine-tune,reward,9,0.816600
+Relax LoRA fine-tune,reward,10,0.789700
+Relax LoRA fine-tune,reward,11,0.816300
+Relax LoRA fine-tune,reward,12,0.819000
+Relax LoRA fine-tune,reward,13,0.824500
+Relax LoRA fine-tune,reward,14,0.805900
+Relax LoRA fine-tune,reward,15,0.806500
+Relax LoRA fine-tune,reward,16,0.823700
+Relax LoRA fine-tune,reward,17,0.803600
+Relax LoRA fine-tune,reward,18,0.815000
+Relax LoRA fine-tune,reward,19,0.827800
+Relax LoRA fine-tune,reward,20,0.815400
+Relax LoRA fine-tune,reward,21,0.804200
+Relax LoRA fine-tune,reward,22,0.815700
+Relax LoRA fine-tune,reward,23,0.827900
+Relax LoRA fine-tune,reward,24,0.824000
+Relax LoRA fine-tune,reward,25,0.831900
+Relax LoRA fine-tune,reward,26,0.830900
+Relax LoRA fine-tune,reward,27,0.807700
+Relax LoRA fine-tune,reward,28,0.841600
+Relax LoRA fine-tune,reward,29,0.833900
+Relax LoRA fine-tune,reward,30,0.827800
+Relax LoRA fine-tune,reward,31,0.837900
+Relax LoRA fine-tune,reward,32,0.848500
+Relax LoRA fine-tune,reward,33,0.847800
+Relax LoRA fine-tune,reward,34,0.840500
+Relax LoRA fine-tune,reward,35,0.832000
+Relax LoRA fine-tune,reward,36,0.839800
+Relax LoRA fine-tune,reward,37,0.840600
+Relax LoRA fine-tune,reward,38,0.827100
+Relax LoRA fine-tune,reward,39,0.838000
+Relax LoRA fine-tune,reward,40,0.834700
+Relax LoRA fine-tune,reward,41,0.863800
+Relax LoRA fine-tune,reward,42,0.840100
+Relax LoRA fine-tune,reward,43,0.850600
+Relax LoRA fine-tune,reward,44,0.843800
+Relax LoRA fine-tune,reward,45,0.839300
+Relax LoRA fine-tune,reward,46,0.861100
+Relax LoRA fine-tune,reward,47,0.848400
+Relax LoRA fine-tune,reward,48,0.861700
+Relax LoRA fine-tune,reward,49,0.862900
+Relax LoRA fine-tune,reward,50,0.849300
+Relax LoRA fine-tune,reward,51,0.858300
+Relax LoRA fine-tune,reward,52,0.852400
+Relax LoRA fine-tune,reward,53,0.845600
+Relax LoRA fine-tune,reward,54,0.857800
+Relax LoRA fine-tune,reward,55,0.856300
+Relax LoRA fine-tune,reward,56,0.854400
+Relax LoRA fine-tune,reward,57,0.846500
+Relax LoRA fine-tune,reward,58,0.865200
+Relax LoRA fine-tune,reward,59,0.841800
+Relax LoRA fine-tune,reward,60,0.863600
+Relax LoRA fine-tune,reward,61,0.865400
+Relax LoRA fine-tune,reward,62,0.834200
+Relax LoRA fine-tune,reward,63,0.850700
+Relax LoRA fine-tune,reward,64,0.863500
+Relax LoRA fine-tune,reward,65,0.843000
+Relax LoRA fine-tune,reward,66,0.878200
+Relax LoRA fine-tune,reward,67,0.847100
+Relax LoRA fine-tune,reward,68,0.852800
+Relax LoRA fine-tune,reward,69,0.842500
+Relax LoRA fine-tune,reward,70,0.848000
+Relax LoRA fine-tune,reward,71,0.864400
+Relax LoRA fine-tune,reward,72,0.877800
+Relax LoRA fine-tune,reward,73,0.841800
+Relax LoRA fine-tune,reward,74,0.848500
+Relax LoRA fine-tune,reward,75,0.842200
+Relax LoRA fine-tune,reward,76,0.853700
+Relax LoRA fine-tune,reward,77,0.829600
+Relax LoRA fine-tune,reward,78,0.884300
+Relax LoRA fine-tune,reward,79,0.864900
+Relax LoRA fine-tune,reward,80,0.852100
+Relax LoRA fine-tune,reward,81,0.838100
+Relax LoRA fine-tune,reward,82,0.840000
+Relax LoRA fine-tune,reward,83,0.840700
+Relax LoRA fine-tune,reward,84,0.847200
+Relax LoRA fine-tune,reward,85,0.879300
+Relax LoRA fine-tune,reward,86,0.866400
+Relax LoRA fine-tune,reward,87,0.843900
+Relax LoRA fine-tune,reward,88,0.825200
+Relax LoRA fine-tune,reward,89,0.853600
+Relax LoRA fine-tune,reward,90,0.863600
+Relax LoRA fine-tune,reward,91,0.859000
+Relax LoRA fine-tune,reward,92,0.865600
+Relax LoRA fine-tune,reward,93,0.847700
+Relax LoRA fine-tune,reward,94,0.851500
+Relax LoRA fine-tune,reward,95,0.845800
+Relax LoRA fine-tune,reward,96,0.830600
+Relax LoRA fine-tune,reward,97,0.845200
+Relax LoRA fine-tune,reward,98,0.870500
+Relax LoRA fine-tune,reward,99,0.864700
+Reference baseline,eval,0,0.815200
+Reference baseline,eval,9,0.814700
+Reference baseline,eval,19,0.826200
+Reference baseline,eval,29,0.831700
+Reference baseline,eval,39,0.816400
+Reference baseline,eval,49,0.837600
+Reference baseline,eval,59,0.846700
+Reference baseline,eval,69,0.842100
+Reference baseline,eval,79,0.856100
+Reference baseline,eval,89,0.857000
+Reference baseline,eval,99,0.862000
+Reference baseline,reward,0,0.805000
+Reference baseline,reward,1,0.813200
+Reference baseline,reward,2,0.806800
+Reference baseline,reward,3,0.791000
+Reference baseline,reward,4,0.803700
+Reference baseline,reward,5,0.802000
+Reference baseline,reward,6,0.805900
+Reference baseline,reward,7,0.817000
+Reference baseline,reward,8,0.811500
+Reference baseline,reward,9,0.818700
+Reference baseline,reward,10,0.793600
+Reference baseline,reward,11,0.814400
+Reference baseline,reward,12,0.818300
+Reference baseline,reward,13,0.826500
+Reference baseline,reward,14,0.807700
+Reference baseline,reward,15,0.803900
+Reference baseline,reward,16,0.823100
+Reference baseline,reward,17,0.800300
+Reference baseline,reward,18,0.808300
+Reference baseline,reward,19,0.825000
+Reference baseline,reward,20,0.815100
+Reference baseline,reward,21,0.804300
+Reference baseline,reward,22,0.818400
+Reference baseline,reward,23,0.825000
+Reference baseline,reward,24,0.823000
+Reference baseline,reward,25,0.827400
+Reference baseline,reward,26,0.829500
+Reference baseline,reward,27,0.805500
+Reference baseline,reward,28,0.836000
+Reference baseline,reward,29,0.832500
+Reference baseline,reward,30,0.824800
+Reference baseline,reward,31,0.830300
+Reference baseline,reward,32,0.835900
+Reference baseline,reward,33,0.834700
+Reference baseline,reward,34,0.819500
+Reference baseline,reward,35,0.813400
+Reference baseline,reward,36,0.803300
+Reference baseline,reward,37,0.811200
+Reference baseline,reward,38,0.797500
+Reference baseline,reward,39,0.807400
+Reference baseline,reward,40,0.796800
+Reference baseline,reward,41,0.832000
+Reference baseline,reward,42,0.815400
+Reference baseline,reward,43,0.823400
+Reference baseline,reward,44,0.817900
+Reference baseline,reward,45,0.812300
+Reference baseline,reward,46,0.828600
+Reference baseline,reward,47,0.822300
+Reference baseline,reward,48,0.841100
+Reference baseline,reward,49,0.842900
+Reference baseline,reward,50,0.838000
+Reference baseline,reward,51,0.843300
+Reference baseline,reward,52,0.838300
+Reference baseline,reward,53,0.836000
+Reference baseline,reward,54,0.851300
+Reference baseline,reward,55,0.849600
+Reference baseline,reward,56,0.844300
+Reference baseline,reward,57,0.837400
+Reference baseline,reward,58,0.854900
+Reference baseline,reward,59,0.833100
+Reference baseline,reward,60,0.857200
+Reference baseline,reward,61,0.858800
+Reference baseline,reward,62,0.827400
+Reference baseline,reward,63,0.844400
+Reference baseline,reward,64,0.854400
+Reference baseline,reward,65,0.835900
+Reference baseline,reward,66,0.869100
+Reference baseline,reward,67,0.836400
+Reference baseline,reward,68,0.846400
+Reference baseline,reward,69,0.835000
+Reference baseline,reward,70,0.837600
+Reference baseline,reward,71,0.851200
+Reference baseline,reward,72,0.859800
+Reference baseline,reward,73,0.830600
+Reference baseline,reward,74,0.842900
+Reference baseline,reward,75,0.833900
+Reference baseline,reward,76,0.845800
+Reference baseline,reward,77,0.828400
+Reference baseline,reward,78,0.880100
+Reference baseline,reward,79,0.861800
+Reference baseline,reward,80,0.847300
+Reference baseline,reward,81,0.832800
+Reference baseline,reward,82,0.838100
+Reference baseline,reward,83,0.837800
+Reference baseline,reward,84,0.843200
+Reference baseline,reward,85,0.875200
+Reference baseline,reward,86,0.865000
+Reference baseline,reward,87,0.841500
+Reference baseline,reward,88,0.821300
+Reference baseline,reward,89,0.849000
+Reference baseline,reward,90,0.858300
+Reference baseline,reward,91,0.854600
+Reference baseline,reward,92,0.863800
+Reference baseline,reward,93,0.846100
+Reference baseline,reward,94,0.851200
+Reference baseline,reward,95,0.844900
+Reference baseline,reward,96,0.831000
+Reference baseline,reward,97,0.844000
+Reference baseline,reward,98,0.866500
+Reference baseline,reward,99,0.862200

@@ -1,0 +1,60 @@
+# Qwen-Image T2I full fine-tune (FlowGRPO + PickScore). Layers on common/full_ft.yaml.
+# See docs/draft/multimodal-gen-rl-design.md §4.2 / §13.
+generation_task: t2i
+model_path: ${MODEL_DIR}/Qwen-Image
+model_revision: null
+model_adapter_path: relax.models.qwen_image.adapter.QwenImageAdapter
+
+input_key: prompt
+# Produced by examples/diffusion/curate_data.py --prefix pickapic_ (see README).
+prompt_data: ${DATA_DIR}/processed/t2i/pickapic_train.jsonl
+artifact_root: ${ARTIFACT_ROOT}/t2i
+multimodal_keys: null
+
+resource:
+  actor: [1, 8]
+  rollout: [1, 8]
+
+rollout_num_gpus_per_engine: 1
+rollout_batch_size: 48
+n_samples_per_prompt: 16
+global_batch_size: 768
+micro_batch_size: 1
+
+sampling:
+  height: 384
+  width: 384
+  num_inference_steps: 12
+  guidance_scale: 1.0
+  eta: 0.7
+  num_sde_steps: 3
+  # Three trained SDE steps in the early high-sigma half of the schedule, drawn
+  # per rollout from a pool that EXCLUDES step 0. At step 0 sigma == 1 exactly,
+  # so the SDE coefficient sqrt(sigma / (1 - sigma)) is singular and only an
+  # arbitrary sigma_max clamp keeps it finite; the replayed Gaussian then
+  # disagrees with the one the sampler drew from (measured std_dev_t 7.0 vs
+  # ~2.92, plus a sign flip on the `sample` coefficient of prev_sample_mean), so
+  # the gradient on the most influential trained step is wrong. Preflight
+  # rejects a trained step 0. Do NOT go back to sde_timestep_fraction here:
+  # [0.0, 0.5] over 12 steps resolves to [0, 2, 4], which trains that step.
+  sde_indices: [1, 3, 5]
+  sde_resample_per_rollout: true
+  sde_pool: [1, 2, 3, 4, 5]
+
+training:
+  trainable_mode: full
+  trainable_attr: transformer
+  param_dtype: bf16
+  activation_checkpointing: true
+  lr: 1.0e-5
+
+reward:
+  runtime: colocate
+  scorer_path: relax.engine.rewards.pickscore.PickScoreScorer
+  required_components: [pickscore]
+  component_weights: {pickscore: 1.0}
+
+weight_sync:
+  mode: full
+  wire_dtype: bf16
+  bucket_size_mb: 512

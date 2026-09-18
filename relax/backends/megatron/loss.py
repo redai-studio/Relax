@@ -448,8 +448,13 @@ def get_log_probs_and_entropy(
     if gather_topk_token_ids is not None:
         res["topk_log_probs"] = topk_log_probs_list
 
-    # we need to turn the all gather kv into zigzag ring attn kv
-    if args.allgather_cp:
+    # we need to turn the all gather kv into zigzag ring attn kv. Guard on
+    # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
+    # rank already holds the full sequence and get_responses returned per-sample
+    # log_probs of length response_length, so redistribution is a no-op — and
+    # its prompt_length==0 (SFT) path would otherwise mis-pad the first sample
+    # by +1 (logit_global_start=-1 at seq_start=0).
+    if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         _allgather_cp_redistribute(
             res,
             logits=logits,
@@ -553,7 +558,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     """
     log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-    rewards: list[float] = rollout_data.get("rewards")
+    rewards: list[float] | list[torch.Tensor] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
@@ -586,7 +591,6 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         ]
 
     if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo", "m2po", "rloo"]:
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         advantages = returns.copy()
 

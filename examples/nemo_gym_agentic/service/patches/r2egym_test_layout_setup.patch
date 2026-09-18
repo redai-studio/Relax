@@ -1,0 +1,26 @@
+diff --git a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
+--- a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
+@@ -1,6 +1,8 @@
+ #!/bin/bash
+ set -e
+ set -x
++
++test_layout_patch="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/r2egym_test_layout.patch"
+ 
+ # Variables
+ setup_dir=$SETUP_DIR
+@@ -40,6 +42,13 @@
+ echo "Checking out $eval_harness_commit..."
+ git checkout $eval_harness_commit
+ 
++if git apply --reverse --check "$test_layout_patch" >/dev/null 2>&1; then
++    echo "R2E-Gym test layout patch already applied."
++else
++    git apply --check "$test_layout_patch"
++    git apply "$test_layout_patch"
++fi
++
+ echo "Installing Python 3.12 to portable location..."
+ uv python install 3.12
+ 

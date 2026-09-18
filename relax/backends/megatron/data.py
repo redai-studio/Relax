@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
-from collections.abc import Sequence
-from copy import deepcopy
+from collections.abc import Callable, Sequence
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +41,18 @@ logger = get_logger(__name__)
 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY = "rollout_mini_local_sample_counts"
 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY = "rollout_mini_global_sample_counts"
 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY = "rollout_mini_prompt_group_counts"
+
+
+class PrepackedBatch(dict):
+    """Marker dict for SFT micro-batches that have already gone through
+    ``get_batch`` on the prefetch worker.
+
+    ``get_batch`` short-circuits on ``isinstance(batch, PrepackedBatch)`` so
+    the second pass on the training thread only moves data to device without
+    re-doing CP splitting / packed-seq bookkeeping.
+    """
+
+    __slots__ = ()
 
 
 @dataclass(frozen=True)
@@ -189,12 +201,90 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
     )
 
 
+def _get_first_fit_partitions(total_lengths: Sequence[int], capacity: int) -> list[list[int]]:
+    partitions: list[list[int]] = []
+    partition_token_counts: list[int] = []
+    for sample_idx, length in enumerate(total_lengths):
+        length = int(length)
+        for partition_idx, token_count in enumerate(partition_token_counts):
+            if token_count + length <= capacity:
+                partitions[partition_idx].append(sample_idx)
+                partition_token_counts[partition_idx] += length
+                break
+        else:
+            partitions.append([sample_idx])
+            partition_token_counts.append(length)
+    return partitions
+
+
+def _partitions_fit_capacity_or_singleton_oversize(
+    partitions: Sequence[Sequence[int]],
+    partition_token_counts: Sequence[int],
+    total_lengths: Sequence[int],
+    capacity: int,
+) -> bool:
+    return all(
+        token_count <= capacity or (len(partition) == 1 and int(total_lengths[partition[0]]) > capacity)
+        for partition, token_count in zip(partitions, partition_token_counts)
+    )
+
+
+def _get_capacity_safe_balanced_partitions(
+    total_lengths: Sequence[int], num_partitions: int, capacity: int
+) -> list[list[int]]:
+    partitions = get_seqlen_balanced_partitions(total_lengths, num_partitions, equal_size=False)
+    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+    if _partitions_fit_capacity_or_singleton_oversize(partitions, partition_token_counts, total_lengths, capacity):
+        return partitions
+
+    balanced_max_tokens = max(partition_token_counts)
+    partitions = _get_first_fit_partitions(total_lengths, capacity)
+    partition_token_counts = [sum(int(total_lengths[idx]) for idx in partition) for partition in partitions]
+    if len(partitions) > num_partitions or not _partitions_fit_capacity_or_singleton_oversize(
+        partitions, partition_token_counts, total_lengths, capacity
+    ):
+        raise RuntimeError(
+            "first-fit dynamic microbatch partitions cannot satisfy the synchronised schedule: "
+            f"first_fit_partitions={len(partitions)}, num_partitions={num_partitions}, capacity={capacity}"
+        )
+
+    while len(partitions) < num_partitions:
+        splittable = [idx for idx, partition in enumerate(partitions) if len(partition) > 1]
+        if not splittable:
+            raise RuntimeError(
+                "dynamic microbatch partitions cannot be split into the synchronised number of non-empty batches: "
+                f"current={len(partitions)}, requested={num_partitions}"
+            )
+        partition_idx = max(splittable, key=lambda idx: (partition_token_counts[idx], -idx))
+        partition = partitions[partition_idx]
+        sample_idx = max(partition, key=lambda idx: (int(total_lengths[idx]), -idx))
+        partition.remove(sample_idx)
+        sample_length = int(total_lengths[sample_idx])
+        partition_token_counts[partition_idx] -= sample_length
+        partitions.append([sample_idx])
+        partition_token_counts.append(sample_length)
+
+    flat_indices = [idx for partition in partitions for idx in partition]
+    if sorted(flat_indices) != list(range(len(total_lengths))) or not _partitions_fit_capacity_or_singleton_oversize(
+        partitions, partition_token_counts, total_lengths, capacity
+    ):
+        raise RuntimeError("capacity-safe dynamic microbatch partitioning produced an invalid partition")
+
+    logger.warning(
+        "Balanced dynamic microbatches violated token capacity; using first-fit partitions with any oversized "
+        "samples isolated: "
+        f"balanced_max_tokens={balanced_max_tokens}, capacity={capacity}, num_partitions={num_partitions}"
+    )
+    return partitions
+
+
 def _get_seqlen_partitions_with_dummy_padding(
     seqlens: list[int],
     num_partitions: int,
+    capacity: int,
 ) -> tuple[list[list[int]], set[int]]:
     real_partition_count = min(len(seqlens), num_partitions)
-    partitions = get_seqlen_balanced_partitions(seqlens, real_partition_count, equal_size=False)
+    partitions = _get_capacity_safe_balanced_partitions(seqlens, real_partition_count, capacity)
     dummy_offsets: set[int] = set()
     if real_partition_count < num_partitions:
         shortest_partition = min(partitions, key=lambda partition: sum(seqlens[index] for index in partition))
@@ -265,6 +355,39 @@ def pad_and_flatten(
     return torch.cat(padded_list, dim=0), num_items
 
 
+def _build_allgather_thd_metadata(
+    sequence_lengths: Sequence[int], physical_total_length: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
+    """Build separate real and physical THD metadata for allgather CP."""
+    if not sequence_lengths:
+        raise ValueError("allgather THD metadata requires at least one sequence")
+
+    real_cu_list = [0]
+    for sequence_length in sequence_lengths:
+        real_cu_list.append(real_cu_list[-1] + int(sequence_length))
+
+    real_total_length = real_cu_list[-1]
+    if physical_total_length < real_total_length:
+        raise ValueError(
+            f"physical_total_length={physical_total_length} is smaller than real_total_length={real_total_length}"
+        )
+
+    real_cu_seqlens = torch.tensor(real_cu_list, dtype=torch.int32, device=device)
+    padded_cu_list = real_cu_list
+    if physical_total_length == real_total_length:
+        padded_cu_seqlens = real_cu_seqlens
+        padding_mask = None
+    else:
+        padded_cu_list = real_cu_list.copy()
+        padded_cu_list[-1] = physical_total_length
+        padded_cu_seqlens = torch.tensor(padded_cu_list, dtype=torch.int32, device=device)
+        padding_mask = torch.zeros(physical_total_length, dtype=torch.bool, device=device)
+        padding_mask[real_total_length:] = True
+
+    max_seqlen = max(end - start for start, end in zip(padded_cu_list[:-1], padded_cu_list[1:], strict=True))
+    return real_cu_seqlens, padded_cu_seqlens, max_seqlen, padding_mask
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -272,6 +395,7 @@ def get_batch(
     qkv_format: str = "thd",
     allgather_cp: bool = False,
     is_vl_model: bool = False,
+    pack_device: torch.device | None = None,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """Generate a CP-ready micro-batch with packed sequence parameters.
 
@@ -311,7 +435,18 @@ def get_batch(
     else:
         batch, _ = next(data_iterator)
 
+    if isinstance(batch, PrepackedBatch):
+        return batch
+
+    if pack_device is not None:
+        for key, dtype in (("tokens", torch.long), ("loss_masks", torch.int)):
+            values = batch.get(key)
+            if values is not None:
+                batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
+
     use_dynamic_context_parallel = getattr(get_args(), "dynamic_context_parallel", False)
+    if use_dynamic_context_parallel and pack_device is not None and pack_device.type == "cpu":
+        raise ValueError("CPU prepacking does not support dynamic context parallelism.")
     if use_dynamic_context_parallel:
         # Pick this mb's CP size with the SAME per-GPU token budget the iterator was packed
         # with: forward-only iterators carry log_probs_max_tokens_per_gpu, the training
@@ -332,6 +467,7 @@ def get_batch(
         cp_rank = mpu.get_context_parallel_rank()
 
     tokens = batch["tokens"]
+    batch_device = pack_device or tokens[0].device
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
@@ -371,17 +507,20 @@ def get_batch(
         if needs_unsplit_input and cp_size > 1:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             align_size = tp_size * cp_size * 2
-            device = device_utils.make_current_torch_device()
+            device = batch_device
 
-            seqlens = torch.tensor([t.size(0) for t in tokens], dtype=torch.int32, device=device)
-            seqlens_padded = (seqlens + align_size - 1) // align_size * align_size
+            seqlens = [t.size(0) for t in tokens]
+            seqlens_padded = [(s + align_size - 1) // align_size * align_size for s in seqlens]
             cu_seqlens_padded = torch.zeros(len(tokens) + 1, dtype=torch.int32, device=device)
-            cu_seqlens_padded[1:] = torch.cumsum(seqlens_padded, dim=0)
-            max_seqlen_padded = int(seqlens_padded.max().item())
+            cu_seqlens_padded[1:] = torch.cumsum(torch.tensor(seqlens_padded, dtype=torch.int32, device=device), dim=0)
+            max_seqlen_padded = max(seqlens_padded)
 
             unsplit_tokens = pad_sequence(tokens, batch_first=True, padding_value=pad_token_id)
+            # Bridge treats a single-row input as an already packed THD stream.
+            # Its physical length must match cu_seqlens, including TP/CP padding.
+            unsplit_tokens = F.pad(unsplit_tokens, (0, max_seqlen_padded - unsplit_tokens.size(1)), value=pad_token_id)
             unsplit_attention_mask = torch.zeros_like(unsplit_tokens, dtype=torch.bool)
-            for i, s in enumerate(seqlens.tolist()):
+            for i, s in enumerate(seqlens):
                 unsplit_attention_mask[i, :s] = True
 
             batch["unsplit_tokens"] = unsplit_tokens
@@ -401,15 +540,12 @@ def get_batch(
             batch["vlm_packed_seq_params"] = vlm_packed_seq_params
             # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
-            batch["padded_total_lengths"] = seqlens_padded.tolist()
+            batch["padded_total_lengths"] = seqlens_padded
 
         if allgather_cp:
             # DSA mode: concatenate all sequences first, then slice once with CP.
             # We also pad the *global* concatenated stream to make per-rank chunks equal.
-            cu_seqlens_list: list[int] = [0]
-            for t in tokens:
-                cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
-
+            sequence_lengths = [t.size(0) for t in tokens]
             tokens = torch.cat(tokens, dim=0)
 
             # Pad global stream so (1) divisible by cp_size (equal chunks),
@@ -418,11 +554,17 @@ def get_batch(
             pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-                cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(
-                cu_seqlens_list, dtype=torch.int, device=device_utils.make_current_torch_device()
+            cu_seqlens, cu_seqlens_padded, max_seqlen, global_padding_mask = _build_allgather_thd_metadata(
+                sequence_lengths,
+                tokens.size(0),
+                batch_device,
             )
+            if global_padding_mask is not None:
+                batch["padding_mask"] = global_padding_mask.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
+            cu_seqlens_cpu = [0]
+            for sequence_length in sequence_lengths:
+                cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + sequence_length)
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [
@@ -443,21 +585,41 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
-            cu_seqlens = (
-                torch.tensor(cu_seqlens, dtype=torch.int).to(device_utils.make_current_torch_device()) * cp_size
-            )
+            cu_seqlens_cpu = [offset * cp_size for offset in cu_seqlens]
+            cu_seqlens = torch.tensor(cu_seqlens_cpu, dtype=torch.int, device=batch_device)
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if not allgather_cp:
+            max_seqlen = max(end - start for start, end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:]))
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded if allgather_cp else None,
+            cu_seqlens_kv_padded=cu_seqlens_padded if allgather_cp else None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
+            pad_between_seqs=pad != 0 if allgather_cp else None,
         )
+        # Python boundaries let attention implementations iterate packed
+        # subsequences without synchronizing individual accelerator scalars.
+        packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
+
+        # DSv4 hybrid attention rejects the default 'zigzag' layout and reads the
+        # *_padded cu_seqlens to rebuild per-rank position ids and the sliding-window
+        # boundary exchange (csa_cp_utils). The allgather-CP branch above already
+        # produces exactly mcore's contiguous layout -- one global stream, rank r
+        # taking rows [r*L/cp, (r+1)*L/cp) -- and pads the stream to a multiple of
+        # cp_size. The real and physical endpoints remain distinct so DSA and
+        # MoE can identify the tail padding instead of treating it as data.
+        if cp_size > 1 and getattr(get_args(), "cp_partition_mode", "zigzag") == "contiguous":
+            assert allgather_cp, (
+                "--cp-partition-mode contiguous requires --allgather-cp; the default "
+                "per-sample zigzag split does not produce a contiguous global stream."
+            )
+            packed_seq_params.cp_partition_mode = "contiguous"
 
         tokens = tokens.unsqueeze(0)
     else:
@@ -524,11 +686,22 @@ def get_batch(
             pad_to = int(pad_to)
             t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
             m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            # This VL/THD path bypasses MCore's default label construction, so
+            # labels must be pre-shifted by one here (label[t] = x[t+1]); MCore's
+            # per-depth roll advances label and mask together afterwards.
+            #
+            # The mask must NOT be shifted: ``m_padded`` (from
+            # ``full_per_sample_loss_masks`` via ``align_loss_mask_for_sft``) is
+            # already in the same next-token-aligned frame as the shifted label.
+            # Shifting it again would leave it leading the label by one token, so
+            # each MTP depth would supervise the position one past what it predicts.
+            mtp_labels_padded = F.pad(t_padded[1:], (0, 1), value=pad_token_id)
+            mtp_loss_mask_padded = m_padded
             chunk = pad_to // (2 * cp_size)
             s1, e1 = chunk * cp_rank, chunk * (cp_rank + 1)
             s2, e2 = chunk * (2 * cp_size - cp_rank - 1), chunk * (2 * cp_size - cp_rank)
-            mtp_label_chunks.append(torch.cat([t_padded[s1:e1], t_padded[s2:e2]]))
-            mtp_loss_chunks.append(torch.cat([m_padded[s1:e1], m_padded[s2:e2]]))
+            mtp_label_chunks.append(torch.cat([mtp_labels_padded[s1:e1], mtp_labels_padded[s2:e2]]))
+            mtp_loss_chunks.append(torch.cat([mtp_loss_mask_padded[s1:e1], mtp_loss_mask_padded[s2:e2]]))
         batch["unsplit_mtp_labels"] = torch.cat(mtp_label_chunks).unsqueeze(0)
         batch["unsplit_mtp_loss_mask"] = torch.cat(mtp_loss_chunks).unsqueeze(0)
 
@@ -602,7 +775,25 @@ def get_batch(
                 ]
 
     batch = move_tensors_to_device(batch, batch["tokens"].device)
+    if pack_device is not None:
+        batch = PrepackedBatch(batch)
     return batch
+
+
+def prepack_sft_micro_batch_cpu(args: Namespace, batch: RolloutBatch) -> PrepackedBatch:
+    """Build one complete SFT micro-batch on CPU for background prefetch."""
+    iterator = iter([(batch, None)])
+    packed = get_batch(
+        iterator,
+        ["tokens"],
+        args.data_pad_size_multiplier,
+        args.qkv_format,
+        args.allgather_cp,
+        getattr(args, "is_vl_model", False),
+        pack_device=torch.device("cpu"),
+    )
+    pinned = pin_tensors(packed)
+    return pinned if isinstance(pinned, PrepackedBatch) else PrepackedBatch(pinned)
 
 
 def gather_log_data(
@@ -877,6 +1068,15 @@ def get_data_iterator(
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
         assert _max_tokens is not None
+        micro_batch_token_capacity = _max_tokens * cp_size
+        if getattr(args, "allgather_cp", False):
+            pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+            if pad_size <= 0 or _max_tokens < pad_size:
+                raise ValueError(
+                    "allgather CP padding must fit within max_tokens_per_gpu: "
+                    f"max_tokens_per_gpu={_max_tokens}, local_pad_size={pad_size}"
+                )
+            micro_batch_token_capacity = cp_size * (_max_tokens // pad_size) * pad_size
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
@@ -885,12 +1085,13 @@ def get_data_iterator(
         for i in range(num_steps_per_rollout):
             start = step_offsets[i]
             end = step_offsets[i + 1]
-            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
+            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], micro_batch_token_capacity))
 
-        num_microbatches = torch.tensor(
+        required_num_microbatches = torch.tensor(
             num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
         )
-        dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        dist.all_reduce(required_num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
+        num_microbatches = required_num_microbatches
 
         if vpp_size > 1:
             # vpp requires the number of microbatches to be divisible by vpp_size
@@ -898,21 +1099,21 @@ def get_data_iterator(
 
         num_microbatches = num_microbatches.tolist()
 
-        # balance the each micro batch
-        samples = rollout_data["total_lengths"]
-        # balance the number of mirobatches across steps
+        # Prefer Karmarkar-Karp balancing when it respects capacity. If it
+        # overflows, first-fit reconstructs the schedule used to derive the
+        # local K, keeping indivisible oversized samples isolated, then
+        # deterministically splits it to the DP/VPP K.
         micro_batch_indices = []
         dummy_micro_batch_offsets: set[int] = set()
         for i, num_mbs in enumerate(num_microbatches):
             start = step_offsets[i]
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
-            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(step_samples, num_mbs)
+            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
+                step_samples, num_mbs, micro_batch_token_capacity
+            )
             base_offset = len(micro_batch_indices)
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] = start + partitions[j][k]
-            micro_batch_indices.extend(partitions)
+            micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
             dummy_micro_batch_offsets.update(base_offset + offset for offset in local_dummy_offsets)
 
         if getattr(args, "dynamic_context_parallel", False):
@@ -935,7 +1136,16 @@ def get_data_iterator(
             micro_batch_indices = ordered
             dummy_micro_batch_offsets = ordered_dummy_offsets
 
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
+        flat_micro_batch_indices = [
+            idx
+            for offset, partition in enumerate(micro_batch_indices)
+            if offset not in dummy_micro_batch_offsets
+            for idx in partition
+        ]
+        if len(flat_micro_batch_indices) != num_local_samples or sorted(flat_micro_batch_indices) != list(
+            range(num_local_samples)
+        ):
+            raise RuntimeError("dynamic microbatch partitions must contain every local sample exactly once")
         logger.info(
             f"After dynamic batching, num_microbatches: {num_microbatches}, micro_batch_indices: {micro_batch_indices}, "
             f"dummy_microbatches={len(dummy_micro_batch_offsets)}"
@@ -1023,6 +1233,7 @@ def log_rollout_data(
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     use_sample_mean = key in [
+                        "rewards",
                         "log_probs",
                         "ref_log_probs",
                         "rollout_log_probs",
@@ -1071,7 +1282,7 @@ def log_rollout_data(
             stats = torch.tensor(
                 [max(total_lengths), -min(total_lengths)],
                 dtype=torch.int64,
-                device=loss_masks[0].device,
+                device=device_utils.make_current_torch_device(),
             )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX, group=dp_group)
             log_dict["total_lengths/max"] = int(stats[0].item())
@@ -1222,17 +1433,65 @@ def sync_actor_critic_data(
     )
 
 
-def move_tensors_to_device(data, device):
+def _map_packed_seq_params(data: PackedSeqParams, map_value: Callable[[Any], Any]) -> PackedSeqParams:
+    mapped = copy(data)
+    for name, value in vars(data).items():
+        setattr(mapped, name, map_value(value))
+    return mapped
+
+
+def move_tensors_to_device(data: Any, device: torch.device, *, non_blocking: bool = False) -> Any:
     """Recursively move tensors in a (nested) dict/list to the specified
     device.
 
     Non-tensor values are left unchanged.
     """
     if isinstance(data, dict):
-        return {k: move_tensors_to_device(v, device) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [move_tensors_to_device(v, device) for v in data]
+        return {k: move_tensors_to_device(v, device, non_blocking=non_blocking) for k, v in data.items()}
+    if isinstance(data, list):
+        return [move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data]
+    if isinstance(data, tuple):
+        return tuple(move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data)
+    if isinstance(data, PackedSeqParams):
+        return _map_packed_seq_params(
+            data,
+            lambda value: move_tensors_to_device(value, device, non_blocking=non_blocking),
+        )
+    if isinstance(data, torch.Tensor):
+        return data.to(device, non_blocking=non_blocking)
+    return data  # e.g., int, str, None, etc.
+
+
+def pin_tensors(data: Any) -> Any:
+    """Recursively pin CPU tensors in a pre-packed micro-batch."""
+    if isinstance(data, dict):
+        return {k: pin_tensors(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [pin_tensors(v) for v in data]
+    if isinstance(data, tuple):
+        return tuple(pin_tensors(v) for v in data)
+    if isinstance(data, PackedSeqParams):
+        return _map_packed_seq_params(data, pin_tensors)
+    if isinstance(data, torch.Tensor) and data.device.type == "cpu":
+        try:
+            return data.contiguous().pin_memory()
+        except RuntimeError as exc:
+            from relax.utils.data.micro_batch_ring import _raise_pin_memory_failure
+
+            _raise_pin_memory_failure("pin_tensors", exc)
+    return data
+
+
+def record_tensors_on_stream(data: Any, stream: Any) -> None:
+    """Keep asynchronously copied tensors alive on the consuming stream."""
+    if isinstance(data, dict):
+        for value in data.values():
+            record_tensors_on_stream(value, stream)
+    elif isinstance(data, (list, tuple)):
+        for value in data:
+            record_tensors_on_stream(value, stream)
+    elif isinstance(data, PackedSeqParams):
+        for value in vars(data).values():
+            record_tensors_on_stream(value, stream)
     elif isinstance(data, torch.Tensor):
-        return data.to(device)
-    else:
-        return data  # e.g., int, str, None, etc.
+        data.record_stream(stream)

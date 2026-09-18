@@ -26,11 +26,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 from relax.utils.device import is_npu_available, make_current_torch_device
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     _lora_module_key,
     build_lora_peft,
     count_adapter_parameters,
+    exclude_frozen_lora_target_modules,
     install_gdn_gate_mask_hooks,
     is_lora_adapter_mode,
     is_lora_adapter_param,
@@ -114,6 +116,41 @@ def _dump_provider_config(provider: Any, save_path: str) -> None:
 # context parallelism actually splits the sequence dimension at the attention input.
 # Compare seq_len across CP=1 vs CP=2 runs — it must halve.  Remove after verifying.
 _CP_PROBE_INSTALLED = False
+
+
+def _patch_bridge_vision_cp_all_gather(bridge_model_module: Any, all_gather_vision_embeddings: Any) -> bool:
+    """Make Bridge's Qwen3-VL CP vision all-gather accept keyword arguments.
+
+    The Bridge Qwen3-VL forward currently calls ``autograd.Function.apply``
+    with ``cp_group=...``.  PyTorch only accepts positional arguments for
+    ``apply``, so the vision CP path fails before the first forward.  Keep the
+    autograd function unchanged and adapt only its call surface in the Bridge
+    model module.
+    """
+    if getattr(bridge_model_module, "AllGatherVisionEmbeddings", None) is not all_gather_vision_embeddings:
+        return False
+
+    class _AllGatherVisionEmbeddingsCompat:
+        @staticmethod
+        def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            return all_gather_vision_embeddings.apply(input, seqlens_on_cp_ranks, cp_group)
+
+    bridge_model_module.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsCompat
+    return True
+
+
+def _install_bridge_vision_cp_all_gather_compat() -> None:
+    """Install the Qwen3-VL Bridge compatibility patch when that model is
+    present."""
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import model as bridge_qwen3_vl_model
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import AllGatherVisionEmbeddings
+    except ImportError:
+        return
+
+    if _patch_bridge_vision_cp_all_gather(bridge_qwen3_vl_model, AllGatherVisionEmbeddings):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Patched Bridge Qwen3-VL vision CP all-gather for PyTorch autograd.apply compatibility.")
 
 
 def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -251,19 +288,33 @@ def get_model_provider_func(
             "sequence_parallel",
             "pipeline_model_parallel_size",
             "virtual_pipeline_model_parallel_size",
+            # Let a launch script pass an explicit --pipeline-model-parallel-layout
+            # (mcore-native, str form "Ett|tt|..|ttL").
+            # Must NOT be combined with --decoder-first/last-pipeline-num-layers
+            # (mcore raises "pipeline_model_parallel_layout cannot be set with other pipeline
+            # layout arguments"); drop those flags in the script when using a layout.
+            "pipeline_model_parallel_layout",
             "context_parallel_size",
+            "cp_partition_mode",
+            "sequence_packing_scheduler",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
             "variable_seq_lengths",
             "dsa_indexer_loss_coeff",
             "dsa_indexer_use_sparse_loss",
             "attention_softmax_in_fp32",
+            # Bridge mode bypasses core_transformer_config_from_args(), so FP8
+            # compute flags must be copied onto the provider explicitly.
+            "fp8",
+            "fp8_recipe",
+            "fp8_quantizer_factory",
             "masked_softmax_fusion",
             "bias_dropout_fusion",
             "apply_rope_fusion",
             "recompute_granularity",
             "recompute_method",
             "recompute_num_layers",
+            "recompute_modules",
             "distribute_saved_activations",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
@@ -278,7 +329,7 @@ def get_model_provider_func(
             "freeze_vision_projection",
             "freeze_audio_model",
             "freeze_audio_projection",
-            # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
+            # https://github.com/redai-studio/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
@@ -286,6 +337,11 @@ def get_model_provider_func(
             "cross_entropy_fusion_impl",
             "mtp_num_layers",
             "mtp_loss_scaling_factor",
+            # Reuse one physical MTP layer across all mtp_num_layers depths. Must
+            # be copied onto the bridge provider or it stays at the default (False)
+            # even when --mtp-use-repeated-layer is passed, so the model builds N
+            # physical layers (layers.1/2 unloaded/random).
+            "mtp_use_repeated_layer",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
@@ -312,6 +368,7 @@ def get_model_provider_func(
             "moe_router_topk_scaling_factor",
             "moe_router_score_function",
             "moe_ffn_hidden_size",
+            "activation_func_clamp_shared_expert",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Dynamic CP related args
             "dynamic_context_parallel",
@@ -328,6 +385,21 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
+        # the vision encoder input before its CP all-gather.  Relax's public
+        # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
+        # Without this compatibility mapping the parsed flag is silently
+        # ignored, so every CP rank repeats the full vision forward.
+        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+            if not provider.vision_dp_when_cp:
+                logger.info(
+                    "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
+                )
+            provider.vision_dp_when_cp = True
+
+        if getattr(provider, "vision_dp_when_cp", False):
+            _install_bridge_vision_cp_all_gather_compat()
 
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
@@ -349,6 +421,64 @@ def get_model_provider_func(
             provider.fp16 = False
             provider.bf16 = True
             provider.params_dtype = torch.bfloat16
+
+        # DSv4's hash-routed MoE layers must share a stage with the embedding, so mcore
+        # requires an explicit pipeline_model_parallel_layout when PP > 1. The bridge
+        # auto-installs one in apply_overrides_and_finalize(), which we bypass.
+        if (
+            getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid"
+            and (getattr(provider, "pipeline_model_parallel_size", 1) or 1) > 1
+            and getattr(provider, "pipeline_model_parallel_layout", None) is None
+        ):
+            from megatron.bridge.models.deepseek.deepseek_v4_bridge import (
+                set_deepseek_v4_pipeline_model_parallel_layout,
+            )
+
+            set_deepseek_v4_pipeline_model_parallel_layout(provider)
+            logger.info(f"Set provider.pipeline_model_parallel_layout: {provider.pipeline_model_parallel_layout}")
+
+            # mcore rejects a layout that coexists with num_layers_in_first/last_pipeline_stage
+            # ("pipeline_model_parallel_layout cannot be set with other pipeline layout
+            # arguments"), but Megatron's own validate_args only skips its
+            # "num_layers % pipeline_model_parallel_size == 0" check when
+            # --decoder-first/last-pipeline-num-layers is set -- and DSv4-Flash has 43
+            # layers, a prime, so no PP > 1 divides it. Those flags therefore exist purely
+            # to get past arg validation; the layout already encodes the real split, so
+            # drop their provider-side effect here (lines 311-314 above set them).
+            if (
+                provider.num_layers_in_first_pipeline_stage is not None
+                or provider.num_layers_in_last_pipeline_stage is not None
+            ):
+                logger.info(
+                    "Clearing provider.num_layers_in_first/last_pipeline_stage "
+                    f"({provider.num_layers_in_first_pipeline_stage}/"
+                    f"{provider.num_layers_in_last_pipeline_stage}); superseded by the DSv4 layout."
+                )
+                provider.num_layers_in_first_pipeline_stage = None
+                provider.num_layers_in_last_pipeline_stage = None
+
+        # Fused DSA kernels (FlashMLA forward + cuDNN DSA backward). Deliberately NOT in
+        # bridge_keys: that loop assigns unconditionally, so every bridge-mode model would
+        # get this field set. Only csa.py (DSv4-only) and the dsv4_hybrid branch of
+        # TransformerConfig.__post_init__ read it today, but gating here makes the blast
+        # radius structural rather than an argument about current mcore internals.
+        #
+        # Note the arg polarity: mcore auto-generates only `--no-dsa-kernel-fusion`
+        # (store_false, dest=apply_dsa_kernel_fusion, default True), so args say True
+        # unless the user opts out -- while the TransformerConfig field defaults to False
+        # and DeepSeekV4Bridge sets it False on SM < 10.0. Taking args as authoritative
+        # turns fusion ON for DSv4 by default; without it the CSA layers fall back to the
+        # unfused reference path whose gather backward is quadratic in sequence length
+        # (82GB at 8K tokens). If flash_mla / cuDNN DSA are missing, mcore raises a clear
+        # ValueError naming --no-dsa-kernel-fusion as the escape hatch.
+        if getattr(provider, "experimental_attention_variant", None) == "dsv4_hybrid":
+            want_fusion = bool(getattr(args, "apply_dsa_kernel_fusion", False))
+            if getattr(provider, "apply_dsa_kernel_fusion", False) != want_fusion:
+                logger.info(
+                    "Override provider.apply_dsa_kernel_fusion: "
+                    f"{provider.apply_dsa_kernel_fusion!r} -> {want_fusion!r}"
+                )
+                provider.apply_dsa_kernel_fusion = want_fusion
 
         provider.finalize()
 
@@ -550,6 +680,10 @@ def wrap_model_provider_with_lora(original_provider, args):
             scope = getattr(args, "lora_scope", "all")
             if scope != "all":
                 peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+                peft.target_modules = exclude_frozen_lora_target_modules(
+                    model, list(peft.target_modules), args.freeze_params_name_list
+                )
             model = peft(model, training=True)
             ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0

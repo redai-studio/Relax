@@ -12,6 +12,14 @@
 | Qwen3.5-9B      | DAPO     | √    | √     | 910C 2卡         | `scripts/training/text/run-qwen35-9B-4xnpu-colocate.sh`       |
 | Qwen3.5-35B-A3B | DAPO     | √    | √     | 910C 8卡         | `scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh` |
 
+## 特性支持
+
+| 模型            | 训练场景 | 多模态 | MTP | CP  | 训练所需最小卡数 | 参考脚本                                                       |
+| --------------- | -------- | ------ | --- | --- | ---------------- | -------------------------------------------------------------- |
+| Qwen3.5-9B      | DAPO     | -      | -   | √   | 910C 8卡         | `scripts/training/text/run-qwen35-9B-16xnpu-cp.sh`             |
+| Qwen3.5-9B      | DAPO     | -      | √   | -   | 910C 4卡         | `scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh`         |
+| Qwen3.5-35B-A3B | SFT      | √      | √   | -   | 910C 4卡         | `scripts/training/sft/run_qwen35-35B-pokemon-sft-mtp-8xnpu.sh` |
+
 ## 环境准备
 
 ### 前置准备
@@ -19,7 +27,7 @@
 - 资源类型：`Ascend910 Snt9b23`
 - 驱动版本：`Software Version 25.5.1`
 - 固件版本：`Firmware Version 7.8.0.6.201`
-- 基础镜像：`quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11`
+- 基础镜像：`quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11`
 
 ### 环境检查
 
@@ -49,7 +57,7 @@ REGISTRY=<registry> make docker-ascend
 REGISTRY=<registry> ASCEND_DOCKER_BUILDKIT=0 make docker-ascend
 ```
 
-可配置变量：`BASE_IMAGE`（默认 `quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11`）、`SOC_VERSION`（默认 `ascend910_9391`）、`REGISTRY`、`DO_PUSH`（默认 `1`，设为 `0` 时不推送并检查本地镜像）、`ASCEND_DOCKER_BUILDKIT`（默认 `1`）。远端已存在同名镜像时会跳过构建。
+可配置变量：`BASE_IMAGE`（默认 `quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11`）、`SOC_VERSION`（默认 `ascend910_9391`）、`REGISTRY`、`DO_PUSH`（默认 `1`，设为 `0` 时不推送并检查本地镜像）、`ASCEND_DOCKER_BUILDKIT`（默认 `1`）。远端已存在同名镜像时会跳过构建。
 
 （可选，内部 QS 镜像）复用 `ml-engine/tools/relax-ci` 的 `docker/Dockerfile.qs`（纯 Python 依赖，架构无关，ARM64 可直接构建）。由 CI 先 checkout relax-ci，再指向其 `Dockerfile.qs`：
 
@@ -146,6 +154,10 @@ bash scripts/training/text/run-qwen3-4B-8xgpu-async-npu.sh
 
   > MISC_ARGS，显示启用FlashAttention实现 `--use-flash-attn`
 
+### MTP 特性说明
+
+开启 MTP 训练时，`MTP_NUM_LAYERS`（MTP 头层数，脚本透传给训练参数 `--mtp-num-layers`）只能为 `1`：由于 Qwen3.5 原始 checkpoint 中仅包含 1 层 MTP 权重（`mtp_num_hidden_layers=1`），MTP 相关启动脚本（`scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh`、`scripts/training/sft/run_qwen35-35B-pokemon-sft-mtp-8xnpu.sh`）已加入校验，当该参数被设置为非 `1` 的值时脚本会报错退出
+
 ## 下一步
 
-- [ ] 特性支持：多模态、CP长序列、MTP 等
+- [ ] 性能优化：Qwen3.5-35B-A3B 等

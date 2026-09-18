@@ -30,9 +30,12 @@ Start every response with the current stage letter and name, evidence available,
 - Apply export, credit, and dynamic-batching rules to exported contexts per Session. The number of resident Sessions is a different dimension.
 - Choosing resident Agentic rollout (`--use-agentic-rollout`) gives Agentic ownership of train and Eval generation;
   `--custom-generate-function-path` is ignored on this path.
-- Distinguish the timeout of each Relax-facing Chat Completions request from `--agent-timeout`. The former must let one
-  request survive prelaunch, partial, or fully-async holds; the latter is a Runtime active-time safety budget intended
-  to contain a stuck agent loop or tool execution.
+- Distinguish the timeout of each Relax-facing model API request from `--agent-timeout`. The former must let one request
+  survive prelaunch, partial, or fully-async holds; the latter is a Runtime active-time safety budget intended to
+  contain a stuck agent loop or tool execution.
+- Identify whether the agent uses Chat Completions, OpenAI Responses, or Anthropic Messages, and compare its payload
+  with the supported fields, Items, and blocks. Record the request's `stream` setting and require complete history on
+  every request. Use [runtime-operations.md](references/runtime-operations.md) for transport-specific response checks.
 - Inspect fixed internal widths only when the large-scale risk gate is triggered.
 - Keep this skill Agentic-specific. Route RL algorithms, OPD/TIS/loss details, generic TransferQueue sampling, model backends, and Ray scheduling to their dedicated experts or skills after checking the Agentic boundary.
 - Never assume a remote agent platform has enough slots. Unknown capacity produces an `UNVERIFIED` Stage C result.
@@ -45,9 +48,11 @@ Goal: decide whether the existing agent can connect without corrupting context, 
 
 1. Read the agent entry point, Relax-facing agent client, its request and outer task timeouts, tool loop, context store,
    compaction/retry logic, and final-output path.
-2. Capture or reconstruct exact model request and response payloads. Prefer wire payloads over internal message classes.
-   Check for `developer` roles and missing, `null`, or zero-length user/system/tool content, especially tools that
-   return `None` or `""`.
+2. Capture or reconstruct exact model request and response payloads. Prefer the HTTP payload over internal message
+   classes. Record the endpoint, protocol, `stream` value, authentication header, complete-history representation,
+   reasoning/tool blocks, and missing, `null`, or zero-length content. Resolve the final request URL after
+   client-specific path handling; determine whether the client appends its resource path or constructs the endpoint
+   itself, and verify that the Relax route prefix is preserved.
 3. Determine the raw reasoning and tool-call syntax produced by the model under the exact chat template. Identify the
    compatible SGLang parser names or prove that no parser is required.
 4. Read [context-linearity.md](references/context-linearity.md) and classify every transition as append, intentional fork, accidental fork, or reset.
@@ -78,15 +83,19 @@ Enter only when the user asks for implementation and Stage A has no unresolved b
 2. Map dataset fields with `--input-key`, `--metadata-key`, and `--multimodal-keys`; decide whether the harness receives
    ready-to-use messages or constructs them from metadata at runtime.
 3. Wire the complete agent environment in [integration-contract.md](references/integration-contract.md).
-4. Configure the agent application's client that calls `RELAX_BASE_URL` so the timeout of each Chat Completions request
-   can span every applicable prelaunch, partial-rollout, or fully-async hold. Keep this client timeout separate from
+4. Configure the agent application's client that calls `RELAX_BASE_URL` so the timeout of each model API request can
+   span every applicable prelaunch, partial-rollout, or fully-async hold. Keep this client timeout separate from
    `--agent-timeout`, which bounds the agent process's Runtime active time.
-5. Send complete normalized histories and stable tools/template arguments on every model request.
+5. Send complete histories on every model request: Chat uses `messages`, Responses uses typed `input` Items, and
+   Messages uses `system + messages`. Keep tools and applicable template arguments stable. Do not use Responses
+   `previous_response_id` as a continuation mechanism.
 6. When canonicalization is needed, ask before changing `developer` semantics, choose a stable nonempty representation
    for empty tool results, and reuse the canonical payload in later turns and explicit export.
 7. Configure `--agentic-reasoning-parser` and `--agentic-tool-call-parser` when required by the verified model/template
    format. Do not copy parser names from a different model recipe.
 8. Use [agentic-training-contract.md](references/agentic-training-contract.md) for export, credit, logical identity, and dynamic-batching decisions. Implicit export is reserved for audited linear history; nonlinear history requires explicit export.
+   Explicit export remains canonical Chat-shaped `messages`, nested function `tools`, and `chat_template_kwargs`
+   regardless of the request protocol.
 9. Define reward ownership. One exported context needs an exported reward or configured reward producer. Multiple
    exported contexts require `--agentic-custom-advantage-path` and dynamic batching; ordinarily avoid
    `--custom-rm-path` in this mode.
@@ -107,7 +116,7 @@ Goal: produce a launch verdict without starting the job.
 1. Re-read the final agent adapter and launch script.
 2. Read [parameter-preflight.md](references/parameter-preflight.md). Resolve every applicable Agentic parameter after
    defaults and validation, then check its dependencies and runtime evidence.
-3. Audit context linearity again from the integrated wire payloads.
+3. Audit context linearity again from the integrated HTTP payloads.
 4. Read [resident-lifecycle.md](references/resident-lifecycle.md). Verify Group size, first-request barrier, and cleanup.
 5. When agents use a capacity-limited external platform, read
    [external-agent-capacity.md](references/external-agent-capacity.md). Otherwise report `External capacity: N/A`.
@@ -118,9 +127,9 @@ Goal: produce a launch verdict without starting the job.
 7. When the agent uses explicit export, nonlinear history, multiple contexts, custom credit, `--log-passrate`, a reward
    object or `--reward-key`, a configured RM, or `--group-rm`, read
    [agentic-training-contract.md](references/agentic-training-contract.md).
-8. Read [runtime-operations.md](references/runtime-operations.md). Verify endpoint compatibility, the per-request
-   Relax-facing client timeout, reasoning/tool-call parsers, the agent process timeout, optional KV/admission flags,
-   errors, and observable evidence.
+8. Read [runtime-operations.md](references/runtime-operations.md). Verify protocol and transport compatibility, the
+   per-request Relax-facing client timeout, reasoning/tool-call parsers, the agent process timeout, optional
+   KV/admission flags, errors, and observable evidence.
 9. When prelaunch, partial rollout, or fully async is enabled, read [partial-and-async-lifecycle.md](references/partial-and-async-lifecycle.md) and verify the applicable cross-step state transitions.
 10. Report unknown remote capacity, internal scale evidence, or networking as blockers rather than optimistic assumptions.
 
@@ -151,8 +160,8 @@ Enter only after explicit user authorization and a passing Stage C check. Use th
 Validate in order:
 
 1. one complete Group reaches the first-request barrier;
-2. the full model/tool loop completes, with expected `content`, `reasoning_content`, `tool_calls`, call IDs, arguments,
-   and finish reasons in the Relax response;
+2. the full model/tool loop completes, with expected text, reasoning, tool calls, call IDs, arguments, finish reasons,
+   usage, and protocol-specific JSON or Buffered SSE terminal shape in the Relax response;
 3. request payloads preserve context lineage and stable tools/template arguments;
 4. SessionForest commits the intended leaf or branches;
 5. export, reward, and custom credit match the selected contexts; if custom advantage can return `None`, the whole-Group drop and replenishment path is observed;

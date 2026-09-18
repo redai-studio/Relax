@@ -134,9 +134,13 @@ class _ChainFutureFilter(logging.Filter):
     The error is harmless but pollutes every run.
     """
 
-    def filter(self, record):
+    def filter(self, record: logging.LogRecord) -> bool:
         try:
-            return "_chain_future" not in record.getMessage()
+            return not (
+                "Exception in callback _chain_future.<locals>._set_state" in record.getMessage()
+                and record.exc_info is not None
+                and isinstance(record.exc_info[1], AssertionError)
+            )
         except Exception:
             return True
 

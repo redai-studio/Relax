@@ -421,7 +421,7 @@ index bd9d7eafa1..f53a32abc0 100644
  @app.post("/update_weight_version")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def update_weight_version(
-@@ -1451,6 +1474,19 @@ async def load_lora_adapter_from_tensors(
+@@ -1451,6 +1476,19 @@ async def load_lora_adapter_from_tensors(
      return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
  
  

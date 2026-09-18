@@ -29,6 +29,17 @@ from conftest import (
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
+def test_engine_rank_allocator_never_reuses_removed_rank():
+    group = make_engine_group(engines=[make_mock_engine()], rank_offset=4)
+    manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+
+    first = manager._reserve_engine_ranks(1)
+    group.all_engines[0] = None
+    second = manager._reserve_engine_ranks(1)
+
+    assert (first, second) == (5, 6)
+
+
 # ==================== create_scale_out_request =============================
 
 

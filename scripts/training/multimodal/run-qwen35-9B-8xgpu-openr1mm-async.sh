@@ -74,9 +74,9 @@ PERF_ARGS=(
    
    --context-parallel-size 1
 
-   # --recompute-granularity full
-   # --recompute-method uniform
-   # --recompute-num-layers 1
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --calculate-per-token-loss
    --use-dynamic-batch-size
    --max-tokens-per-gpu 10240

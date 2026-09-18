@@ -4,15 +4,16 @@ Agentic rollout connects an existing agent app (harness) to Relax training. For 
 supervises an agent process that runs the existing harness. Relax records committed conversations and turns selected
 contexts into training samples.
 
-**This feature is especially useful when you already have a working agent that uses an OpenAI-compatible Chat
-Completions API, whether it runs standalone or through a centralized execution platform.**
+**Agentic rollout is especially useful when you already have an agent application (harness) that calls an
+OpenAI-compatible Chat Completions API. Agents using OpenAI Responses or Anthropic Messages can also connect to Relax.
+The agent may run standalone or through a centralized execution platform.**
 
 ::: tip Recommended workflow
 For agent app (harness) assessment, integration, launch checks, and experiments, we recommend using the repository's
 `agentic-rollout` skill under `skills/agentic-rollout/`. It checks the current checkout and guides context topology,
 parsers, export and credit, timeouts, concurrency, and runtime evidence by stage. Experiments still require explicit
-user authorization, and this guide remains the contract reference for Chat Completions request and response formats,
-APIs, and export.
+user authorization, and this guide remains the contract reference for model API request and response formats, APIs,
+and export.
 
 For manual reading:
 
@@ -30,20 +31,21 @@ For manual reading:
 ## Core Capabilities
 
 1. **Agentic RL with existing agents**
-   Connect an existing agent app (harness) to Relax by changing its model endpoint.
+   Connect an existing agent app (harness) through Chat Completions, Responses, or Messages by changing its model
+   endpoint.
 
 2. **Agent process warmup**
    Start agent processes early to hide application, tool, and environment initialization time.
 
 3. **Request-level partial rollout**
-   Interrupt and resume model requests while the agent continues to use a normal Chat Completions flow.
+   Interrupt and resume model generation across rollout steps without requiring changes to the agent.
 
 ## Prepare Your Agent
 
 Run the agent outside Relax first. Use its normal task input and model endpoint. Before continuing, confirm that it can:
 
 - accept one real task through its normal input interface;
-- call a non-streaming Chat Completions endpoint;
+- call one supported model endpoint;
 - complete a full harness run, including multiple turns when needed;
 - write a final result;
 - exit without an error.
@@ -121,7 +123,7 @@ path applies to the initial input prepared from the dataset.
 | --- | --- |
 | Standard Relax dataset path | `--multimodal-keys` inserts the dataset image into the prompt and extracts model media inputs |
 | Agentic Session Input | Before the process starts, Relax converts each internal image item to OpenAI `image_url` content |
-| Agent Chat request | Relax reads `image_url`, prepares backend media for SGLang, and builds processor-expanded training inputs |
+| Agent model request | Relax reads `image_url`, prepares backend media for SGLang, and builds processor-expanded training inputs |
 
 At the process boundary, an existing `data:image/...`, `http://`, or `https://` URL is kept. A local path, byte payload,
 or in-memory image is loaded, converted to RGB PNG, and encoded as a data URI.
@@ -187,14 +189,44 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The `timeout=9999` above is the wall-clock timeout for one Chat Completions request sent to `RELAX_BASE_URL`. A single
-request may be held during prelaunch, partial-rollout abort and resume, or fully-async execution, so configure this
-client timeout to cover the longest such wait.
+The `timeout=9999` above is the wall-clock timeout for one model request sent to `RELAX_BASE_URL`. A single request may
+be held during prelaunch, partial-rollout abort and resume, or fully-async execution, so configure this client timeout
+to cover the longest such wait.
 
 Keep the complete assistant message returned by `model_dump()`. Reasoning content and tool calls can then be used by
 later turns and by SessionForest matching.
 
-### Chat Completions Contract
+### Model APIs
+
+Relax accepts Chat Completions requests and the Responses and Messages request shapes described below. All three use the
+same generation and SessionForest core. Every endpoint authenticates with
+`Authorization: Bearer <RELAX_SESSION_ID>`.
+
+| Interface | Endpoint | Complete-history field | Turn limit |
+| --- | --- | --- | --- |
+| OpenAI Chat Completions | `/v1/chat/completions` | `messages` | `max_completion_tokens`, or legacy `max_tokens` |
+| OpenAI Responses | `/v1/responses` | typed `input` Items | `max_output_tokens` |
+| Anthropic Messages | `/v1/messages` | `system` and `messages` | required `max_tokens` |
+
+::: tip Sending requests without a standard client
+Pass `RELAX_BASE_URL` unchanged to standard clients; they append their own resource paths. For direct HTTP requests,
+use `RELAX_BASE_URL.rstrip("/") + endpoint`, where `endpoint` comes from the table above. Preserve the existing service
+path: URL helpers that resolve a leading `/` from the origin may discard `/agentic_api`.
+:::
+
+::: warning Current API limits
+Model requests must use HTTP. Omitting `stream` or setting it to `false` returns JSON; `stream=true` uses Buffered SSE
+and emits model-content events after the complete generation finishes. WebSocket and token-level streaming are not
+supported. Every request must replay the complete history for its conversation branch. Responses
+requests must include the complete `input`; Relax does not use `previous_response_id`.
+:::
+
+Relax normalizes requests from all three interfaces to canonical `messages`, function `tools`, and
+`chat_template_kwargs`, then uses that state for SessionForest matching and generation. The API response is rendered in
+the interface used by the request. The `model` field is echoed in the response and does not select the Relax inference
+backend. Request fields outside the tables below do not alter generation.
+
+#### Chat Completions
 
 The training configuration supplies `temperature` and `top_p`. Request values for these fields are ignored.
 
@@ -209,20 +241,68 @@ The training configuration supplies `temperature` and `top_p`. Request values fo
 | `seed` | Sampling seed for this turn |
 | `logprobs` | Include generated-token logprobs in the response |
 
-::: warning Chat Completions compatibility
-The endpoint is non-streaming. Omit `stream` or set it to `false`. Omit `n` or set it to `1`. `top_logprobs` and the
-legacy `functions` and `function_call` fields are unsupported. Use `max_completion_tokens` for the turn limit.
-`max_tokens` is accepted as a legacy alias. `tool_choice` and unspecified request fields are not consumed.
-
+::: warning Chat Completions message contract
 Use `user`, `assistant`, `tool`, or `system` roles. User, system, and tool messages require nonempty content; represent a
 tool result of `None` or `""` with a stable nonempty value. Assistant messages may omit text content when tool calls or
-reasoning are present. If the harness emits `developer`, configure it to use `system` or review that semantic conversion
-before integration. Relax manages `add_generation_prompt`, `tokenize`, and `tools`; do not set them in request
-`chat_template_kwargs`.
+reasoning are present. Chat `developer` messages need a harness-side conversion to `system`. Relax manages
+`add_generation_prompt`, `tokenize`, and `tools`; do not set them in request `chat_template_kwargs`.
 :::
 
 Pass `tools` and `chat_template_kwargs` on every request that uses them. Configure `--agentic-reasoning-parser` and
 `--agentic-tool-call-parser` when the model and chat template require them.
+
+#### Responses
+
+Relax projects these typed `input` Items:
+
+| Item | Projection |
+| --- | --- |
+| Top-level `instructions` string | Canonical system message before `input` |
+| `message` with `user`, `assistant`, `system`, or `developer` role | Canonical message; `developer` becomes `system` |
+| `input_text` / `output_text` | Message text |
+| User `input_image` with an `image_url` string | Canonical `image_url` content |
+| `reasoning` with readable `summary` or `content` text | Assistant `reasoning_content` |
+| `function_call` | Assistant function tool call with the same `call_id` |
+| `function_call_output` with text output | Tool message with the same `call_id` |
+
+Responses function tools use the flat `type`, `name`, `parameters`, and optional `description` shape. Output reasoning,
+assistant text, and function calls become corresponding Responses Items. `function_call_output` accepts a string or
+`input_text` blocks. A length-limited result has `status: "incomplete"`; other successful results have `status:
+"completed"`.
+
+#### Anthropic Messages
+
+Relax projects these Messages blocks:
+
+| Block | Projection |
+| --- | --- |
+| `system` string or text blocks | Canonical system message |
+| User or assistant `text` | Canonical message text |
+| User `image` with URL or base64 source | Canonical `image_url` content |
+| Assistant `thinking` | Assistant `reasoning_content` |
+| Assistant `tool_use` | Assistant function tool call with the same ID |
+| User `tool_result` with text content | Tool message with the same tool-use ID |
+
+Messages tools use `name`, `input_schema`, and optional `description`; a missing tool `type` and `type: "custom"` are
+projected as canonical function tools. Anthropic responses use text, thinking, and tool-use blocks with Anthropic stop
+reasons. `stop_sequences` is passed to generation as the turn's stop strings.
+
+#### Buffered SSE
+
+Buffered SSE keeps the HTTP request open while the complete generation runs. Relax sends an initial connection frame
+and a heartbeat every 15 seconds while generation is pending. After completion, it emits the protocol's complete
+terminal event sequence together; it does not expose token-by-token deltas.
+
+| Protocol | Terminal sequence |
+| --- | --- |
+| Chat Completions | One complete `chat.completion.chunk` with `usage`, then `[DONE]`; failures send OpenAI error data, then `[DONE]` |
+| Responses | `response.created`, one `response.output_item.done` per output Item, then `response.completed`, `response.incomplete`, or `response.failed` |
+| Messages | `message_start`, complete content-block events, `message_delta`, then `message_stop`; failures use `event: error` |
+
+Chat and Responses use SSE comments for connection and heartbeat frames. Messages uses `event: ping`. JSON and Buffered
+SSE share the same normalized request, generation, SessionForest commit, usage accounting, and finish reason. Every
+successful Chat terminal chunk includes complete usage, independent of `stream_options.include_usage`; Relax does not
+emit a separate usage chunk.
 
 ### Agent Process Contract
 
@@ -233,7 +313,7 @@ Relax injects these variables into every agent process:
 | `RELAX_INPUT_JSON` | Session input JSON path |
 | `RELAX_OUTPUT_JSON` | Session output path |
 | `RELAX_SESSION_IO_DIR` | Per-session temporary directory |
-| `RELAX_BASE_URL` | Chat Completions API base URL |
+| `RELAX_BASE_URL` | Agentic model API base URL |
 | `RELAX_SESSION_ID` | Session ID and API credential |
 | `RELAX_ROLLOUT_MODE` | `train` or `eval` |
 | `RELAX_GROUP_ID` | Runtime Group ID |
@@ -331,6 +411,11 @@ Write one JSONL record for each context selected for training:
 Each record must match a committed SessionForest state. Include the full assistant messages, reasoning content, tool
 calls, tools, and template arguments used during generation. Relax trains the records present in the JSONL output.
 Omitted contexts are not trained.
+
+Explicit export records always use the canonical Chat-shaped `messages`, nested function `tools`, and
+`chat_template_kwargs` shown above, including when the agent called Responses or Messages. Reuse the normalized values
+that matched the committed SessionForest state; a raw Responses `input` list or Anthropic block list is not an explicit
+export record.
 
 The context count does not depend on the process count. One process can export several contexts. A multi-agent
 application can export one context or several. Evaluation can export only `main` while training exports more contexts.
@@ -526,9 +611,6 @@ unset. Both options count logical prompt Groups. Dataset `d` owns `E_d` sessions
 ordinary RM uses singleton Runtime Groups internally without changing that total. Eval datasets run serially, so with
 dedicated train and Eval executors, provision `T` and `E_peak` separately.
 
-Partial rollout and fully async are mutually exclusive execution modes. Both can keep unfinished Sessions across
-rollout steps; choose one. Keep the long Chat Completions timeout shown in the minimal application.
-
 Start retrievers, environment servers, and other cross-session services outside the per-session agent command.
 
 Session KV lifecycle and program-aware admission are optional controls for long-running workloads. See
@@ -539,7 +621,7 @@ Session KV lifecycle and program-aware admission are optional controls for long-
 ### Session Lifecycle
 
 One dataset sample creates one Session. The Session owns one agent process, one SessionForest, its rollout mode,
-and its active-time budget. The process can make sequential or concurrent Chat Completions requests. When the process
+and its active-time budget. The process can make sequential or concurrent model API requests. When the process
 exits, Relax selects the requested Forest states, computes training credit, and sends the samples to training.
 
 The main runtime path is:
@@ -561,9 +643,9 @@ histories form separate branches. The exported leaves determine the training con
 
 #### State Identity and Prefix Matching
 
-Every request carries a complete message history. Relax finds the longest committed message prefix with the same tools
-and template arguments. The unmatched suffix becomes a new observation. A full match creates a branch from the existing
-state. A request with no match starts from the technical root.
+Every protocol request carries complete history, which Relax projects to canonical messages. Relax finds the longest
+committed message prefix with the same tools and template arguments. The unmatched suffix becomes a new observation. A
+full match creates a branch from the existing state. A request with no match starts from the technical root.
 
 <details>
 <summary>Reference implementation</summary>
@@ -662,7 +744,6 @@ status, turn count, request timing, abort count, and weight-version information.
 
 - **The agent does not start or exits with an error:** check `--agent-cwd` and `--agent-command`, then inspect `run.log`.
   Relax adds a bounded tail of the agent's stdout and stderr to `AgentExecutionError`.
-- **The client requests streaming:** use a non-streaming response. `stream=true` is unsupported.
 - **The first request waits:** it is held until the Group receives a Runtime lease. Use a long client timeout.
 - **Explicit export does not match:** preserve the exact normalized `messages`, `tools`, and `chat_template_kwargs` used
   during generation.

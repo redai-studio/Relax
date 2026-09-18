@@ -4,9 +4,12 @@
 Relax."""
 
 import re
+from fnmatch import fnmatchcase
 from typing import Iterable, Tuple
 
 import torch
+
+from relax.utils.env import Envs, is_env_set
 
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout
@@ -354,6 +357,33 @@ def scope_target_modules_to_region(model, target_modules: list[str], scope: str)
     return scoped or [_LORA_NO_MATCH_SENTINEL]
 
 
+def exclude_frozen_lora_target_modules(model, target_modules: list[str], freeze_patterns: Iterable[str]) -> list[str]:
+    """Resolve LoRA targets to full module paths and drop frozen regions.
+
+    PEFT adapters still execute their dropout path after their parameters are
+    frozen.  For strict numerical comparisons this advances the RNG even when
+    the zero-initialized adapter contributes nothing to the forward output.
+    Filtering before injection avoids that side effect while preserving any
+    explicitly unfrozen subregion, such as a vision merger excluded by a
+    negative-lookahead freeze regex.
+    """
+    patterns = tuple(freeze_patterns)
+    filtered: list[str] = []
+    for full_name, _module in model.named_modules():
+        if not full_name:
+            continue
+        leaf = full_name.rsplit(".", 1)[-1]
+        if not any(
+            leaf == target or full_name == target or fnmatchcase(full_name, target) for target in target_modules
+        ):
+            continue
+        if any(re.search(pattern, full_name) for pattern in patterns):
+            continue
+        filtered.append(full_name)
+
+    return filtered or [_LORA_NO_MATCH_SENTINEL]
+
+
 def lora_module_category(name: str) -> str:
     """Bucket a LoRA-wrapped module (or adapter param) by architectural role.
 
@@ -419,6 +449,7 @@ def build_hf_peft_config_dict(
     lora_alpha: int,
     target_modules,
     lora_dropout: float,
+    task_type: str = "CAUSAL_LM",
 ) -> dict:
     """Build the HF-PEFT adapter config dict (the content of
     ``adapter_config.json``).
@@ -428,6 +459,9 @@ def build_hf_peft_config_dict(
     SGLang's ``LoRAConfig.from_dict``. JSON-safe (no enums). ``target_modules``
     must already be HF-style names (see
     ``convert_megatron_to_hf_target_modules``).
+
+    ``task_type`` defaults to the LLM value; diffusion DiTs must pass
+    ``FEATURE_EXTRACTION`` or a PEFT loader will try to attach a causal-LM head.
     """
     return {
         "r": lora_rank,
@@ -436,7 +470,7 @@ def build_hf_peft_config_dict(
         "lora_dropout": lora_dropout,
         "bias": "none",
         "peft_type": "LORA",
-        "task_type": "CAUSAL_LM",
+        "task_type": task_type,
     }
 
 
@@ -448,6 +482,7 @@ def write_hf_peft_adapter(
     lora_alpha: int,
     target_modules,
     lora_dropout: float,
+    task_type: str = "CAUSAL_LM",
 ) -> str:
     """Write a merged LoRA adapter as a standard HF-PEFT directory.
 
@@ -460,6 +495,7 @@ def write_hf_peft_adapter(
         adapter_dir: Target directory (created if missing).
         lora_rank/lora_alpha/target_modules/lora_dropout: PEFT config written to
             ``adapter_config.json`` (HF-style target module names).
+        task_type: PEFT task type; ``FEATURE_EXTRACTION`` for diffusion DiTs.
 
     Returns:
         The adapter directory path as a string.
@@ -478,6 +514,7 @@ def write_hf_peft_adapter(
         lora_alpha=lora_alpha,
         target_modules=target_modules,
         lora_dropout=lora_dropout,
+        task_type=task_type,
     )
     with open(adapter_dir / "adapter_config.json", "w") as f:
         json.dump(config_dict, f)
@@ -600,6 +637,16 @@ def build_lora_peft(args):
         "dropout": args.lora_dropout,
         "bias": "none",
     }
+    # Megatron-Bridge defaults to Xavier A initialization and one adapter
+    # shared by all local experts.  Some external PEFT baselines use Kaiming
+    # initialization and one adapter per expert instead.  Keep Relax defaults
+    # unchanged, but allow launchers doing strict numerical comparisons to
+    # select those Bridge-native options without adding framework CLI flags.
+    lora_a_init_method = Envs.RELAX_LORA_A_INIT_METHOD.strip()
+    if lora_a_init_method:
+        peft_config["lora_A_init_method"] = lora_a_init_method
+    if is_env_set("RELAX_LORA_SHARE_EXPERT_ADAPTERS"):
+        peft_config["share_expert_adapters"] = Envs.RELAX_LORA_SHARE_EXPERT_ADAPTERS
     return create_peft(peft_config)
 
 
@@ -621,5 +668,6 @@ __all__ = [
     "repack_gdn_adapter_for_sglang",
     "summarize_lora_modules",
     "scope_target_modules_to_region",
+    "exclude_frozen_lora_target_modules",
     "VISION_REGION_TOKENS",
 ]

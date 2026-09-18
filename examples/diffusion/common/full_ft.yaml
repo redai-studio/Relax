@@ -1,0 +1,41 @@
+# Shared invariants for native generative RL (FlowGRPO / FSDP2 / colocate / full sync).
+# Task YAMLs layer model / adapter / condition mapping / sampling / reward / resource
+# on top of this. The canonical launch path is scripts/training/diffusion/*.sh;
+# keep these YAMLs as reference fragments for config comparison (design doc 8.4 / 13).
+#
+# Nested blocks (`training:`, `weight_sync:`, plus the task YAMLs' `sampling:` /
+# `reward:`) are the ONE convention here. The merge maps them onto the flat
+# --fsdp-* / --weight-sync-* CLI dests AFTER the deep-merge, so a flat key set
+# alongside a nested one would be silently overwritten by the nested value.
+
+# --- backend & algorithm ---
+train_backend: fsdp
+advantage_estimator: grpo
+loss_type: policy_loss
+colocate: true
+fully_async: false
+offload_train: true
+offload_rollout: true
+
+# --- rollout / driver hooks (resolved by the FSDP + native-generation wiring) ---
+rollout_engine_class_path: relax.backends.sglang.diffusion_engine.SGLangNativeGenerationEngine
+rollout_function_path: relax.engine.rollout.native_generation.generate_rollout
+custom_convert_samples_to_train_data_path: relax.engine.rollout.native_generation.convert_samples_to_train_data
+custom_reward_post_process_path: relax.engine.rewards.generative.post_process
+
+# --- FSDP2 full fine-tune (design doc 10.1) ---
+training:
+  trainable_mode: full
+  trainable_attr: transformer
+  param_dtype: bf16
+  reduce_dtype: fp32
+  activation_checkpointing: true
+
+# --- full weight sync transaction (design doc 10) ---
+weight_sync:
+  mode: full
+  wire_dtype: bf16
+  bucket_size_mb: 512
+
+# --- data ---
+input_key: prompt

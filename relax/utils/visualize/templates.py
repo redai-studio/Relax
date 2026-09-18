@@ -1802,7 +1802,7 @@ def get_jsonl_viewer_html(data_dir: str, base_path: str = "") -> str:
                     <span class="logo-icon">📊</span>
                     <div>
                         <h1>
-                            <a href="https://github.com/redai-infra/Relax" target="_blank" rel="noopener"
+                            <a href="https://github.com/redai-studio/Relax" target="_blank" rel="noopener"
                                style="color: inherit; text-decoration: none;">Relax</a>
                             Rollout Result Viewer
                         </h1>
@@ -1810,7 +1810,7 @@ def get_jsonl_viewer_html(data_dir: str, base_path: str = "") -> str:
                     </div>
                 </div>
                 <div class="theme-toggle">
-                    <a class="theme-btn" href="https://github.com/redai-infra/Relax" target="_blank"
+                    <a class="theme-btn" href="https://github.com/redai-studio/Relax" target="_blank"
                        rel="noopener" title="Relax on GitHub"
                        style="text-decoration: none; display: inline-flex; align-items: center;">
                         <svg height="18" width="18" viewBox="0 0 16 16" fill="currentColor"

@@ -5,6 +5,7 @@
 import asyncio
 import json
 import threading
+import time
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Callable, Iterable, Optional
@@ -189,6 +190,7 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
                 content=raw["content"],
                 learn=learn,
                 tool_calls=raw.get("tool_calls"),
+                reasoning_content=raw.get("reasoning_content"),
             )
         )
     if require_response and not has_learn:
@@ -344,6 +346,8 @@ class SFTStreamingDataset:
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",
         classification_sentinel_token_id: int | None = None,
+        loss_last_turn_only: bool = False,
+        loss_ignore_empty_think: bool = False,
     ) -> None:
         self.path = path
         self.tokenizer = tokenizer
@@ -384,6 +388,9 @@ class SFTStreamingDataset:
                 raise ValueError("SFTStreamingDataset seq_cls mode requires a sentinel token id")
             if self.capacity is not None and self.capacity < 2:
                 raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
+        self.loss_last_turn_only = loss_last_turn_only
+        self.loss_ignore_empty_think = loss_ignore_empty_think
+
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
             raise ValueError(f"oversize_strategy must be one of {sorted(valid_strategies)}, got {oversize_strategy!r}")
@@ -442,7 +449,7 @@ class SFTStreamingDataset:
             raise ValueError(f"training size must be in [1, {len(self.reader)}], got {size}")
         self.restrict_training_indices(range(size))
 
-    def restrict_training_indices(self, indices: Iterable[int]) -> None:
+    def restrict_training_indices(self, indices: Iterable[int], *, dataset_seed_offset: int = 0) -> None:
         """Restrict epoch shuffling to the provided physical row IDs."""
         if self.index_manager.current_epoch >= 0 or self.index_manager.position != 0:
             raise RuntimeError("training indices must be restricted before the dataset is shuffled or consumed")
@@ -453,7 +460,12 @@ class SFTStreamingDataset:
             raise ValueError("training indices must be unique")
         if any(not isinstance(index, int) or index < 0 or index >= len(self.reader) for index in index_pool):
             raise ValueError(f"training indices must be integers in [0, {len(self.reader)})")
-        self.index_manager = IndexManager(len(index_pool), seed=self.index_manager.seed, index_pool=index_pool)
+        self.index_manager = IndexManager(
+            len(index_pool),
+            seed=self.index_manager.seed,
+            index_pool=index_pool,
+            dataset_seed_offset=dataset_seed_offset,
+        )
 
     def shuffle(self, epoch_id: int, position: int = 0) -> None:
         self.index_manager.shuffle(epoch_id)
@@ -474,7 +486,7 @@ class SFTStreamingDataset:
 
     async def get_batch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
         if self._prefetch is not None:
-            return self._get_batch_prefetch(n)
+            return await self._get_batch_prefetch_async(n)
         return await self._get_batch_async_gather(n)
 
     def get_batch_in_order(self, start: int, n: int) -> list[ProcessedSample]:
@@ -600,16 +612,16 @@ class SFTStreamingDataset:
         while len(samples) < n and attempts < max_attempts:
             indices, epoch_crossed = self.index_manager.get_next_indices(1)
             attempts += 1
-            if epoch_crossed and not crossed_epoch:
+            idx = indices[0]
+            if epoch_crossed:
                 crossed_epoch = True
-                remaining = self.index_manager.indices[self.index_manager.position :]
+                remaining = [idx, *self.index_manager.indices[self.index_manager.position :]]
                 assert self._prefetch is not None
-                self._prefetch.set_index_order(list(remaining))
+                self._prefetch.set_index_order(remaining)
                 logger.info(
                     f"SFTStreamingDataset: epoch boundary crossed, prefetch re-primed "
                     f"(epoch={self.index_manager.current_epoch}, remaining={len(remaining)})"
                 )
-            idx = indices[0]
             assert self._prefetch is not None
             sample = self._prefetch.get(idx)
             if sample is None:
@@ -623,6 +635,62 @@ class SFTStreamingDataset:
         if len(samples) < n:
             logger.warning(
                 f"SFTStreamingDataset.get_batch: returned {len(samples)}/{n} samples after {attempts} attempts."
+            )
+        return samples, crossed_epoch
+
+    async def _get_batch_prefetch_async(self, n: int) -> tuple[list[ProcessedSample], bool]:
+        self._raise_if_failed()
+        samples: list[ProcessedSample] = []
+        crossed_epoch = False
+        max_attempts = max(n * 10, 32)
+        attempts = 0
+        prefetch_wait_timeout_s = 300.0
+        prefetch_wait_poll_s = 0.02
+        assert self._prefetch is not None
+        while len(samples) < n and attempts < max_attempts:
+            indices, epoch_crossed = self.index_manager.get_next_indices(1)
+            attempts += 1
+            idx = indices[0]
+            if epoch_crossed:
+                crossed_epoch = True
+                remaining = [idx, *self.index_manager.indices[self.index_manager.position :]]
+                self._prefetch.set_index_order(remaining)
+                logger.info(
+                    f"SFTStreamingDataset: epoch boundary crossed, prefetch re-primed "
+                    f"(epoch={self.index_manager.current_epoch}, remaining={len(remaining)})"
+                )
+            found, sample = self._prefetch.get_cached(idx)
+            wait_started = time.monotonic()
+            while not found:
+                self._raise_if_failed()
+                if not self._prefetch.is_alive:
+                    found, sample = self._prefetch.get_cached(idx, record_miss=False)
+                    if found:
+                        break
+                    raise RuntimeError(
+                        f"SFTStreamingDataset: prefetch worker exited before sample idx={idx} was cached "
+                        f"(cache_size={self._prefetch.cache_size})"
+                    )
+                if time.monotonic() - wait_started >= prefetch_wait_timeout_s:
+                    raise TimeoutError(
+                        f"SFTStreamingDataset: timed out waiting for prefetched sample idx={idx} "
+                        f"after {prefetch_wait_timeout_s:.1f}s "
+                        f"(cache_size={self._prefetch.cache_size}, prefetch_alive={self._prefetch.is_alive})"
+                    )
+                await asyncio.sleep(prefetch_wait_poll_s)
+                found, sample = self._prefetch.get_cached(idx, record_miss=False)
+            if sample is None:
+                # Cached None means the background worker processed this index
+                # and decided it should be skipped. Surface any latched error;
+                # otherwise keep refilling the batch.
+                self._raise_if_failed()
+            else:
+                samples.append(sample)
+        self._raise_if_failed()
+        if len(samples) < n:
+            logger.warning(
+                f"SFTStreamingDataset.get_batch_async (prefetch): returned {len(samples)}/{n} samples "
+                f"after {attempts} attempts."
             )
         return samples, crossed_epoch
 
@@ -650,12 +718,13 @@ class SFTStreamingDataset:
 
     async def _get_batch_async_gather(self, n: int) -> tuple[list[ProcessedSample], bool]:
         self._raise_if_failed()
-        rendered: list[_RenderedSample] = []
+        out: list[ProcessedSample] = []
         crossed_epoch = False
         max_attempts = max(n * 10, 32)
         attempts = 0
-        while len(rendered) < n and attempts < max_attempts:
-            need = n - len(rendered)
+        while len(out) < n and attempts < max_attempts:
+            rendered: list[_RenderedSample] = []
+            need = n - len(out)
             indices, ec = self.index_manager.get_next_indices(need)
             crossed_epoch = crossed_epoch or ec
             for idx in indices:
@@ -663,15 +732,15 @@ class SFTStreamingDataset:
                 pre = self._render_one(idx)
                 if pre is not None:
                     rendered.append(pre)
-        if len(rendered) < n:
+            if not rendered:
+                continue
+            coros = [self._finalize_async(r) for r in rendered]
+            finalized = await asyncio.gather(*coros)
+            out.extend(r for r in finalized if r is not None)
+        if len(out) < n:
             logger.warning(
-                f"SFTStreamingDataset.get_batch_async: rendered {len(rendered)}/{n} after {attempts} attempts."
+                f"SFTStreamingDataset.get_batch_async: returned {len(out)}/{n} samples after {attempts} attempts."
             )
-        if not rendered:
-            return [], crossed_epoch
-        coros = [self._finalize_async(r) for r in rendered]
-        finalized = await asyncio.gather(*coros)
-        out = [r for r in finalized if r is not None]
         return out, crossed_epoch
 
     def _process_one_safe(self, idx: int) -> ProcessedSample | None:
@@ -694,11 +763,16 @@ class SFTStreamingDataset:
         rendered = self._render_one(idx)
         if rendered is None:
             return None
-        prompt_ids, mm_inputs = preprocess_multimodal(
-            rendered.sample,
-            processor_pool=self.processor_pool,
-            rendered_text=rendered.rendered_text or "",
-        )
+        try:
+            prompt_ids, mm_inputs = preprocess_multimodal(
+                rendered.sample,
+                processor_pool=self.processor_pool,
+                rendered_text=rendered.rendered_text or "",
+            )
+        except Exception as exc:
+            if not self._skip_multimodal_processing_error(rendered, exc):
+                raise
+            return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
 
     def _render_one(self, idx: int) -> "_RenderedSample | None":
@@ -713,7 +787,11 @@ class SFTStreamingDataset:
             logger.warning(f"SFTStreamingDataset[invalid-multimodal=skip]: {exc} Skipping.")
             return None
         short_ids, short_mask = render_with_loss_mask(
-            sample, tokenizer=self.tokenizer, apply_chat_template_kwargs=self.apply_chat_template_kwargs
+            sample,
+            tokenizer=self.tokenizer,
+            apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            last_turn_only=self.loss_last_turn_only,
+            ignore_empty_think=self.loss_ignore_empty_think,
         )
         n = int(short_ids.shape[0])
         effective_n = n + 1 if self.task_type == "seq_cls" else n
@@ -723,15 +801,14 @@ class SFTStreamingDataset:
                 f"exceeds per-GPU capacity {self.capacity}; skipping."
             )
             return None
-        rendered_text = (
-            render_to_text(
+        rendered_text = None
+        if has_multimodal_content(sample):
+            rendered_text = render_to_text(
                 sample,
                 tokenizer=self.tokenizer,
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                last_turn_only=self.loss_last_turn_only,
             )
-            if has_multimodal_content(sample)
-            else None
-        )
         return _RenderedSample(
             idx=idx,
             sample=sample,
@@ -743,12 +820,27 @@ class SFTStreamingDataset:
         )
 
     async def _finalize_async(self, rendered: "_RenderedSample") -> ProcessedSample | None:
-        prompt_ids, mm_inputs = await preprocess_multimodal_async(
-            rendered.sample,
-            processor_pool=self.processor_pool,
-            rendered_text=rendered.rendered_text or "",
-        )
+        try:
+            prompt_ids, mm_inputs = await preprocess_multimodal_async(
+                rendered.sample,
+                processor_pool=self.processor_pool,
+                rendered_text=rendered.rendered_text or "",
+            )
+        except Exception as exc:
+            if not self._skip_multimodal_processing_error(rendered, exc):
+                raise
+            return None
         return self._build_processed(rendered, prompt_ids, mm_inputs)
+
+    def _skip_multimodal_processing_error(self, rendered: "_RenderedSample", exc: Exception) -> bool:
+        if self._invalid_multimodal_strategy == "error":
+            return False
+        logger.warning(
+            f"SFTStreamingDataset[invalid-multimodal=skip]: sample idx={rendered.idx} in "
+            f"{self.source_name!r} failed media loading or preprocessing: "
+            f"{type(exc).__name__}: {exc}. Skipping."
+        )
+        return True
 
     def _build_processed(
         self,
@@ -959,8 +1051,8 @@ def pack_samples_for_tq(
 ) -> Optional[dict]:
     if not samples:
         return None
-    tokens = [s.tokens.tolist() for s in samples]
-    loss_masks = [s.loss_mask.tolist() for s in samples]
+    tokens = [s.tokens for s in samples]
+    loss_masks = [s.loss_mask for s in samples]
     total_lengths = [s.total_length for s in samples]
     has_mm = force_multimodal_field or any(s.multimodal_train_inputs is not None for s in samples)
     is_classification = any(s.classification_label is not None for s in samples)

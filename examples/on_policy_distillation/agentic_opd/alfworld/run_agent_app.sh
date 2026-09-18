@@ -10,10 +10,15 @@
 # script via `--agent-env`, so they are already in this process's environment on
 # every node (multi-node safe). The defaults below are only a single-node fallback.
 
-# Activate the ALFWorld conda environment (see README.md for setup).
-CONDA_HOME="${CONDA_HOME:-/root/miniconda3}"
-source "${CONDA_HOME}/etc/profile.d/conda.sh"
-conda activate "${ALFWORLD_CONDA_ENV:-relax-opd-alfworld}"
+# Activate the ALFWorld environment (see README.md for setup). A plain venv is
+# used when ALFWORLD_VENV points at one; otherwise fall back to conda.
+if [ -n "${ALFWORLD_VENV:-}" ]; then
+    source "${ALFWORLD_VENV}/bin/activate"
+else
+    CONDA_HOME="${CONDA_HOME:-/root/miniconda3}"
+    source "${CONDA_HOME}/etc/profile.d/conda.sh"
+    conda activate "${ALFWORLD_CONDA_ENV:-relax-opd-alfworld}"
+fi
 
 export ALFWORLD_DATA="${ALFWORLD_DATA:-/root/alfworld}"
 export OPENAI_BASE_URL="${RELAX_BASE_URL}"

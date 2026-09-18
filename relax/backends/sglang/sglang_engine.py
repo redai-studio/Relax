@@ -265,7 +265,6 @@ def _resolve_external_model_arch(package_name):
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
 
     # Each SGLang patch is controlled by its own env flag and applied
     # independently (see ``_launch_server_with_patches`` and
@@ -373,72 +372,22 @@ class SGLangEngine(RayActor):
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
         self._evicted = threading.Event()
-        self._is_weight_updating: bool = False
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
-    def set_weight_updating(self, is_updating: bool) -> None:
-        """Set whether a weight update is currently in progress.
-
-        Called by RolloutManager before and after each weight sync so that the
-        SIGTERM handler can wait for the update to finish before unregistering
-        from the router.
-        """
-        self._is_weight_updating = is_updating
-
     def _register_sigterm_handler(self):
         """Register SIGTERM handler for platform-initiated pod eviction.
 
-        When the platform needs to evict or replace a pod, it sends SIGTERM to the
-        user process. We catch this signal and perform lightweight cleanup so the
-        RolloutManager can detect the eviction and treat it as a scale-in event.
-
-        If a weight update is in progress (``_is_weight_updating``), the handler
-        blocks until the update finishes before unregistering from the router, to
-        avoid disrupting NCCL communication groups. The k8s PreStop timeout
-        (default 30s) serves as the hard deadline.
+        The signal handler only publishes an intent. RolloutManager owns the
+        weight-update fence and the live-actor removal sequence; doing I/O or
+        waiting here could block the actor RPC that releases an active update.
         """
         self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-        def _handle_sigterm(signum, frame):
-            actor_id = ""
-            try:
-                actor_id = ray.get_runtime_context().get_actor_id()
-            except Exception:
-                pass
-            logger.warning(
-                f"[SGLangEngine] Received SIGTERM (rank={self.rank}, actor_id={actor_id}), "
-                f"marking as evicted for graceful scale-in"
-            )
+        def _handle_sigterm(_signum, _frame):
             self._evicted.set()
-
-            # Wait for any in-progress weight update to finish before cleaning up,
-            # so we don't disrupt NCCL communication groups during weight sync.
-            # k8s PreStop hard deadline is typically 30s; leave a safety margin.
-            weight_update_timeout = 20
-            wait_start = time.time()
-            while self._is_weight_updating:
-                if time.time() - wait_start > weight_update_timeout:
-                    logger.warning(
-                        f"[SGLangEngine] Weight update did not finish within {weight_update_timeout}s, "
-                        f"proceeding with eviction cleanup (rank={self.rank})"
-                    )
-                    break
-                logger.warning(
-                    f"[SGLangEngine] SIGTERM received but weight update in progress "
-                    f"(rank={self.rank}, actor_id={actor_id}), waiting..."
-                )
-                time.sleep(1)
-
-            # Best-effort: unregister from router so new requests are not routed here.
-            # This is a quick HTTP call; if it fails the router will detect the engine
-            # as unhealthy anyway.
-            try:
-                self.unregister_from_router()
-            except Exception as e:
-                logger.warning(f"[SGLangEngine] Failed to unregister from router during SIGTERM handling: {e}")
 
         signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -608,6 +557,7 @@ class SGLangEngine(RayActor):
 
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
+        server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         bootstrap_port = (
@@ -1811,6 +1761,8 @@ def _compute_server_args(
 
     if args.use_rollout_routing_replay:
         kwargs["enable_return_routed_experts"] = True
+    if getattr(args, "use_rollout_indexer_replay", False):
+        kwargs["enable_return_indexer_topk"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]

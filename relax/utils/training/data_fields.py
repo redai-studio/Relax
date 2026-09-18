@@ -69,6 +69,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
+    if getattr(args, "use_rollout_indexer_replay", False):
+        fields.append("rollout_indexer_topk")
     if is_ppo:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces

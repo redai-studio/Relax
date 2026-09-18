@@ -496,6 +496,29 @@ class TestSyncWeightsFromSeedEngine:
         manager._weight_sync_lock.release.remote.assert_called()
 
     @pytest.mark.asyncio
+    async def test_scale_out_claims_lifecycle_owner_before_weight_sync_lock(self, patch_async_helpers):
+        seed = make_mock_engine(url="http://seed:1", weight_version="v1")
+        group = make_engine_group(engines=[seed])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+
+        def acquire_lock():
+            assert manager._scale_out_weight_updating is True
+            return AwaitableValue(True)
+
+        manager._weight_sync_lock.acquire.remote.side_effect = acquire_lock
+
+        ok = await manager._sync_weights_from_seed_engine(
+            [make_mock_engine()],
+            timeout=60,
+            model_name="default",
+        )
+
+        assert ok is True
+        assert manager._scale_out_weight_updating is False
+        manager._weight_sync_lock.release.remote.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_sync_failure_releases_weight_sync_lock(self, patch_async_helpers):
         """A sync that fails on every attempt still ALWAYS releases the shared
         weight-sync lock (P0 invariant).

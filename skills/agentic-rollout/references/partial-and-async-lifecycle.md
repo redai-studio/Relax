@@ -28,10 +28,10 @@ RPC.
 
 ## Timeout boundary
 
-One call made by the agent application's Relax-facing Chat Completions client remains the same HTTP request while it is
-held by prelaunch, or while its backend attempt is aborted, parked, and resumed. Fully async can likewise retain an
-unfinished request across a training boundary. The request's read/overall timeout continues on wall-clock time
-throughout that wait.
+One call made by the agent application's Relax-facing Chat Completions, Responses, or Messages client remains the same
+HTTP request while it is held by prelaunch, or while its backend attempt is aborted, parked, and resumed. Fully async
+can likewise retain an unfinished request across a training boundary. The request's read/overall timeout continues on
+wall-clock time throughout that wait. Buffered SSE connection frames and heartbeats do not change this lifecycle.
 
 `--agent-timeout` is a separate active process budget for containing defects in the agent itself, such as a stuck loop
 or tool execution. Gated normal Sessions pause it and resumed Sessions restore it. Raising it does not extend the

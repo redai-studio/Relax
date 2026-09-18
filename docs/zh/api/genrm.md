@@ -39,11 +39,15 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 
 完整配置参见 [GenRM 示例](/zh/examples/generative-reward-model)。
 
+### 多实例（`route_key`）
+
+一次 GenRM 部署可以同时托管多个独立的评判模型（用 `--genrm-instances` 配置），由请求体里的 `route_key` 字段选择具体调用哪一个。不传 `route_key`（或服务仍使用旧的 `--genrm-model-path` 单实例配置）时，请求会落到唯一的 `"__default__"` 实例。配置格式、`/health` 与 `/metrics` 的按实例明细，以及 agentic 场景下按模块路由的写法，参见 [GenRM 示例 · 多实例 GenRM](/zh/examples/generative-reward-model#多实例-genrm一个服务托管多个评判模型)。
+
 ## HTTP 端点
 
 <SwaggerUI specUrl="/Relax/openapi/genrm.json" />
 
 ## 源码
 
-- 实现：[`relax/components/genrm.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/genrm.py)
-- 基类：[`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- 实现：[`relax/components/genrm.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/genrm.py)
+- 基类：[`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

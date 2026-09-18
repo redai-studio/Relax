@@ -75,6 +75,20 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = get_logger(__name__)
 
 
+def _resolve_rollout_engine_class(args):
+    """Return the rollout engine class for the configured run.
+
+    ``rollout_engine_class_path`` (a dotpath) selects a custom engine such as
+    the native-diffusion generation engine; when unset the default text
+    ``SGLangEngine`` is returned so existing runs are unaffected (design doc
+    8.3).
+    """
+    class_path = getattr(args, "rollout_engine_class_path", None)
+    if class_path:
+        return load_function(class_path)
+    return SGLangEngine
+
+
 @dataclasses.dataclass
 class EngineGroupConfig:
     """Configuration for a single engine group.
@@ -406,6 +420,13 @@ class ScaleInRequest:
         }
 
 
+class EngineGroupLifecycle(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    DRAINING = "DRAINING"
+    REMOVING = "REMOVING"
+    REMOVED = "REMOVED"
+
+
 @dataclasses.dataclass
 class EngineGroup:
     """A group of homogeneous SGLang engines with the same configuration.
@@ -429,6 +450,8 @@ class EngineGroup:
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
+    lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
+    eviction_requested: bool = False
 
     @property
     def nodes_per_engine(self):
@@ -472,7 +495,7 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -741,13 +764,21 @@ class RolloutServer:
 
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
-        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in self.engine_groups]
+        groups = list(self.engine_groups)
+        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         all_handles = []
         port_cursors: dict[int, int] = {}
         groups_to_remove = []
 
-        for g_idx, g in enumerate(self.engine_groups):
+        for g_idx, g in enumerate(groups):
+            if g.is_scaled_out and g.pg is not None and g.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
+                if any(engine is None for engine in g.all_engines):
+                    logger.warning(
+                        "Skipping recovery for non-active scaled engine group at rank offset %s",
+                        g.rank_offset,
+                    )
+                continue
             if g.pg is None:
                 failed_indices = g.healthcheck_engines()
                 if failed_indices:
@@ -764,7 +795,9 @@ class RolloutServer:
             all_handles.extend(handles)
 
         for g_idx in reversed(groups_to_remove):
-            self.engine_groups.pop(g_idx)
+            group = groups.pop(g_idx)
+            if group in self.engine_groups:
+                self.engine_groups.remove(group)
             dead_per_group.pop(g_idx)
             logger.info(f"Removed dead external engine group {g_idx}")
 
@@ -773,8 +806,8 @@ class RolloutServer:
 
         release_handles = []
         new_engines_all = []
-        for g, dead_indices in zip(self.engine_groups, dead_per_group, strict=True):
-            if g.pg is None:
+        for g, dead_indices in zip(groups, dead_per_group, strict=True):
+            if g.pg is None or (g.is_scaled_out and g.lifecycle_status is not EngineGroupLifecycle.ACTIVE):
                 continue
             logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
@@ -894,6 +927,12 @@ class RolloutManager(ReloadableMixin):
         self.rollout_id = -1
         self._metric_checker = MetricChecker.maybe_create(args)
         self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
+        self._engine_lifecycle_lock = threading.RLock()
+        existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
+        self._next_engine_rank = max(
+            (group.rank_offset + len(group.all_engines) for group in existing_groups),
+            default=0,
+        )
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -924,7 +963,8 @@ class RolloutManager(ReloadableMixin):
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
-        self._is_weight_updating: bool = False
+        self._training_weight_updating: bool = False
+        self._scale_out_weight_updating: bool = False
         # Distributed mutex shared with the Actor process to ensure DCS weight
         # sync (update_weights_fully_async) and sglang remote instance weight sync
         # (_sync_weights_from_seed_engine) never run concurrently.
@@ -942,6 +982,19 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
+        """Allocate ranks monotonically so a removed elastic rank is not
+        reused."""
+        with self._engine_lifecycle_lock:
+            rank_offset = ((self._next_engine_rank + alignment - 1) // alignment) * alignment
+            self._next_engine_rank = rank_offset + count
+            return rank_offset
+
+    @property
+    def _is_weight_updating(self) -> bool:
+        with self._engine_lifecycle_lock:
+            return self._training_weight_updating or self._scale_out_weight_updating
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is
@@ -1436,17 +1489,32 @@ class RolloutManager(ReloadableMixin):
 
     def _find_active_scale_request(self) -> Optional[dict]:
         """Return info about any active (non-terminal) scale-out or scale-in
-        request.
+        request or claimed graceful eviction.
 
         Returns None if no active request exists, otherwise a dict with
         ``type``, ``request_id``, and ``status`` of the blocking request.
         """
-        for r in self._scale_out_requests.values():
-            if not r.is_terminal():
-                return {"type": "scale_out", "request_id": r.request_id, "status": r.status.value}
-        for r in self._scale_in_requests.values():
-            if not r.is_terminal():
-                return {"type": "scale_in", "request_id": r.request_id, "status": r.status.value}
+        with self._engine_lifecycle_lock:
+            # Explicit requests take precedence because an active scale-in may
+            # itself have already moved a group into DRAINING.
+            for r in self._scale_out_requests.values():
+                if not r.is_terminal():
+                    return {"type": "scale_out", "request_id": r.request_id, "status": r.status.value}
+            for r in self._scale_in_requests.values():
+                if not r.is_terminal():
+                    return {"type": "scale_in", "request_id": r.request_id, "status": r.status.value}
+            for model_name, srv in self.servers.items():
+                for group in srv.engine_groups:
+                    if (
+                        group.is_scaled_out
+                        and group.eviction_requested
+                        and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                    ):
+                        return {
+                            "type": "graceful_eviction",
+                            "request_id": f"{model_name}:{group.rank_offset}",
+                            "status": group.lifecycle_status.value,
+                        }
         return None
 
     @ray.method(concurrency_group="scale_coordination")
@@ -1589,8 +1657,22 @@ class RolloutManager(ReloadableMixin):
                 timeout_secs=timeout_secs or self.args.scale_out_timeout,
             )
 
-        self._scale_out_requests[request.request_id] = request
-        self._gc_terminal_requests()
+        # Recheck and insert under the same lifecycle lock used by graceful
+        # eviction claims.  Validation above may be slow enough for eviction
+        # to win after the initial fast-path check.
+        with self._engine_lifecycle_lock:
+            active = self._find_active_scale_request()
+            if active is not None:
+                return {
+                    "request_id": str(uuid.uuid4()),
+                    "status": "CONFLICT",
+                    "message": (
+                        f"Another {active['type']} request is in progress: "
+                        f"request_id={active['request_id']}, status={active['status']}"
+                    ),
+                }
+            self._scale_out_requests[request.request_id] = request
+            self._gc_terminal_requests()
         return request.to_dict()
 
     @ray.method(concurrency_group="scale_out")
@@ -1685,6 +1767,7 @@ class RolloutManager(ReloadableMixin):
                 return
 
             gpus_per_engine = self.args.rollout_num_gpus_per_engine
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
@@ -1719,9 +1802,7 @@ class RolloutManager(ReloadableMixin):
             # generic "All N replicas failed".
             failure_reasons: list[ScaleOutFailure] = []
 
-            # Track the running engine offset (may change as replicas succeed)
-            base_engine_offset = sum(len(g.all_engines) for g in srv.engine_groups)
-            logger.info(f"[ScaleOut] Current total engines (base offset): {base_engine_offset}")
+            logger.info(f"[ScaleOut] Next monotonic engine rank: {self._next_engine_rank}")
 
             # Phase A: Wait for PGs to become ready, with incremental processing
             while pending_indices:
@@ -1776,8 +1857,13 @@ class RolloutManager(ReloadableMixin):
                 # Pre-allocate engine offsets so each coroutine gets a unique rank_offset
                 # without racing on srv.engine_groups mutations.
                 if newly_ready:
-                    current_offset = sum(len(g.all_engines) for g in srv.engine_groups)
-                    replica_offsets = {idx: current_offset + i for i, idx in enumerate(newly_ready)}
+                    replica_offsets = {
+                        idx: self._reserve_engine_ranks(
+                            actors_per_replica,
+                            alignment=actors_per_replica,
+                        )
+                        for idx in newly_ready
+                    }
 
                     async def _bring_up_one(idx: int) -> tuple[int, bool, "ScaleOutFailure | None", int]:
                         r = await self._bring_up_single_replica(
@@ -2034,7 +2120,7 @@ class RolloutManager(ReloadableMixin):
                 # Create SGLangEngine actor (connecting mode).
                 # No GPU needed: this actor is an RPC proxy to the external engine;
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
-                RolloutRayActor = ray.remote(SGLangEngine)
+                RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
                     self.args,
@@ -2835,18 +2921,43 @@ class RolloutManager(ReloadableMixin):
             _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "no healthy seed engine"))
             return False
 
-        # Acquire the distributed lock to prevent concurrent DCS weight sync
-        # (update_weights_fully_async on the Actor side) from overlapping with
-        # this remote instance weight sync.  Both use the seed engine's NCCL stack.
-        acquired = False
-        while not acquired:
-            acquired = await asyncio.to_thread(ray.get, self._weight_sync_lock.acquire.remote())
-            if not acquired:
+        sync_succeeded = False
+        scale_out_owner_acquired = False
+        weight_sync_lock_acquired = False
+        try:
+            # Claim the lifecycle owner before taking the distributed lock.
+            # Otherwise scale-out can hold that lock while waiting for a
+            # DRAINING group whose eviction is waiting for a training update
+            # blocked on the same lock.
+            owner_deadline = time.monotonic() + timeout
+            while True:
+                with self._engine_lifecycle_lock:
+                    has_draining_elastic_group = any(
+                        group.is_scaled_out and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                        for srv in self.servers.values()
+                        for group in srv.engine_groups
+                    )
+                    if not has_draining_elastic_group:
+                        self._scale_out_weight_updating = True
+                        scale_out_owner_acquired = True
+                        break
+                if time.monotonic() >= owner_deadline:
+                    _record(
+                        ScaleOutFailure(
+                            ScaleOutFailureCategory.WEIGHT_SYNC_FAILED,
+                            "timed out waiting for elastic removal",
+                        )
+                    )
+                    return False
                 await asyncio.sleep(0.5)
 
-        self._is_weight_updating = True
-        sync_succeeded = False
-        try:
+            # Prevent Actor-side DCS weight sync from overlapping with this
+            # remote instance sync. Both use the seed engine's NCCL stack.
+            while not weight_sync_lock_acquired:
+                weight_sync_lock_acquired = await asyncio.to_thread(ray.get, self._weight_sync_lock.acquire.remote())
+                if not weight_sync_lock_acquired:
+                    await asyncio.sleep(0.5)
+
             # Pause generation on all new engines before weight sync
             # This ensures no pending requests during flush_cache
             logger.info("[ScaleOut][WeightSync] Pausing generation on new engines...")
@@ -3029,11 +3140,13 @@ class RolloutManager(ReloadableMixin):
                         logger.warning(f"[ScaleOut][WeightSync] Some continue_generation calls failed: {e}")
             else:
                 logger.warning("[ScaleOut][WeightSync] Keeping failed new engines paused for rollback")
-            self._is_weight_updating = False
-            # Always release the distributed weight-sync lock. This is the SAME
-            # lock every training weight update acquires; retaining it as an
-            # isolation mechanism would spin the next training update forever.
-            ray.get(self._weight_sync_lock.release.remote())
+            if scale_out_owner_acquired:
+                with self._engine_lifecycle_lock:
+                    self._scale_out_weight_updating = False
+            if weight_sync_lock_acquired:
+                # This is the SAME lock every training weight update acquires;
+                # retaining it would spin the next training update forever.
+                ray.get(self._weight_sync_lock.release.remote())
 
     async def _health_check_engines(self, engines: list, timeout: float = 60.0) -> bool:
         """Check health of engines.
@@ -3392,19 +3505,22 @@ class RolloutManager(ReloadableMixin):
         return result
 
     @ray.method(concurrency_group="scale_in")
-    def set_weight_updating(self, is_updating: bool) -> None:
-        self._is_weight_updating = is_updating
+    def set_weight_updating(self, is_updating: bool) -> bool:
+        """Acquire or release the fully-async topology lease.
 
-        # Mirror the flag to every live engine so their SIGTERM handlers can
-        # check it locally without an extra Ray RPC.
-        refs = []
-        for srv in self.servers.values():
-            for group in srv.engine_groups:
-                for engine in group.all_engines:
-                    if engine is not None:
-                        refs.append(engine.set_weight_updating.remote(is_updating))
-        if refs:
-            ray.get(refs)
+        A DRAINING group owns the scale-in fence, so a new update must retry.
+        An update admitted first may finish; scale-in waits for this owner to
+        release instead of mutating the live NCCL topology underneath it.
+        """
+        with self._engine_lifecycle_lock:
+            if is_updating and any(
+                group.is_scaled_out and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                for srv in self.servers.values()
+                for group in srv.engine_groups
+            ):
+                return False
+            self._training_weight_updating = is_updating
+            return True
 
     @ray.method(concurrency_group="scale_in")
     async def sync_weights_for_scaled_out_engines(
@@ -3567,8 +3683,20 @@ class RolloutManager(ReloadableMixin):
             force=force,
             dry_run=dry_run,
         )
-        self._scale_in_requests[request.request_id] = request
-        self._gc_terminal_requests()
+        # Recheck and insert atomically against graceful eviction claims.
+        with self._engine_lifecycle_lock:
+            active = self._find_active_scale_request()
+            if active is not None:
+                return {
+                    "request_id": str(uuid.uuid4()),
+                    "status": "CONFLICT",
+                    "message": (
+                        f"Another {active['type']} request is in progress: "
+                        f"request_id={active['request_id']}, status={active['status']}"
+                    ),
+                }
+            self._scale_in_requests[request.request_id] = request
+            self._gc_terminal_requests()
         return request.to_dict()
 
     @ray.method(concurrency_group="scale_in")
@@ -3594,68 +3722,85 @@ class RolloutManager(ReloadableMixin):
             request.update_status(ScaleInStatus.FAILED, f"Model '{request.model_name}' not found (no rollout server)")
             return
 
-        # P1-3: Wait for any in-progress weight update to complete before draining.
-        # Draining engines during a weight update could break NCCL communication groups.
-        if self._is_weight_updating:
-            logger.info("[ScaleIn] Weight update in progress, waiting for it to complete...")
-            wait_start = time.time()
-            weight_update_timeout = request.timeout_secs
-            while self._is_weight_updating and (time.time() - wait_start) < weight_update_timeout:
-                await asyncio.sleep(1)
-            if self._is_weight_updating:
-                logger.warning(
-                    f"[ScaleIn] Weight update still in progress after {weight_update_timeout}s, proceeding anyway"
-                )
-            else:
-                logger.info(f"[ScaleIn] Weight update completed after {time.time() - wait_start:.1f}s, proceeding")
-
+        selected_groups: dict[int, EngineGroup] = {}
+        completed_eviction_groups: set[int] = set()
         try:
-            engine_infos = self._select_engines_for_removal(request, srv)
-            if not engine_infos:
-                if request.num_replicas > 0:
-                    request.update_status(ScaleInStatus.COMPLETED)
-                    logger.info(
-                        f"[ScaleIn] No-op: already at or below target replicas (target={request.num_replicas})"
-                    )
+            url_candidates = None
+            if request.engine_urls:
+                url_candidates = await self._resolve_scale_in_url_candidates(request, srv)
+
+            with self._engine_lifecycle_lock:
+                # Selection and lifecycle claim are one transaction with the
+                # SIGTERM handler. Whichever enters first determines whether
+                # a pending eviction is adopted into this target scale-in.
+                if request.selected_engines:
+                    logger.warning("[ScaleIn] Request %s already has claimed targets", request.request_id)
                     return
-                request.update_status(ScaleInStatus.FAILED, "No engines selected for removal")
-                return
+                engine_infos = self._select_engines_for_removal(request, srv, url_candidates=url_candidates)
+                if not engine_infos:
+                    if request.num_replicas > 0:
+                        request.update_status(ScaleInStatus.COMPLETED)
+                        logger.info(
+                            f"[ScaleIn] No-op: already at or below target replicas (target={request.num_replicas})"
+                        )
+                        return
+                    request.update_status(ScaleInStatus.FAILED, "No engines selected for removal")
+                    return
 
-            request.selected_engines = [f"group_{g.rank_offset}_engine_{node0_idx}" for g, node0_idx in engine_infos]
-            logger.info(f"[ScaleIn] Selected {len(engine_infos)} engines for removal: {request.selected_engines}")
+                request.selected_engines = [
+                    f"group_{group.rank_offset}_engine_{node0_idx}" for group, node0_idx in engine_infos
+                ]
+                logger.info(f"[ScaleIn] Selected {len(engine_infos)} engines for removal: {request.selected_engines}")
 
-            if request.dry_run:
-                request.update_status(ScaleInStatus.COMPLETED)
-                logger.info("[ScaleIn] Dry-run complete, no engines removed")
-                return
+                if request.dry_run:
+                    request.update_status(ScaleInStatus.COMPLETED)
+                    logger.info("[ScaleIn] Dry-run complete, no engines removed")
+                    return
+
+                selected_groups = {id(group): group for group, _ in engine_infos}
+                if any(
+                    group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    for group in selected_groups.values()
+                ):
+                    request.update_status(ScaleInStatus.FAILED, "Selected engine group is already being removed")
+                    return
+                for group in selected_groups.values():
+                    group.lifecycle_status = EngineGroupLifecycle.DRAINING
+
+            # Publish DRAINING before waiting. Existing transfers may finish,
+            # but a new fully-async lease cannot enter while removal is pending.
+            wait_start = time.monotonic()
+            while self._is_weight_updating:
+                elapsed = time.monotonic() - wait_start
+                if elapsed >= request.timeout_secs:
+                    request.update_status(
+                        ScaleInStatus.FAILED,
+                        f"Timed out waiting {request.timeout_secs}s for the weight-update fence",
+                    )
+                    logger.warning("[ScaleIn] Timed out waiting for weight update; aborting scale-in")
+                    return
+                await asyncio.sleep(min(1.0, request.timeout_secs - elapsed))
 
             drain_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0)
             shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
 
             request.update_status(ScaleInStatus.DRAINING)
-            unregistered_engine_infos, router_failed = await self._drain_engines(
+            removed, failed = await self._remove_live_engines(
+                srv,
                 engine_infos,
-                timeout=drain_timeout,
+                drain_timeout=drain_timeout,
+                shutdown_timeout=shutdown_timeout,
                 force=request.force,
             )
 
             request.update_status(ScaleInStatus.REMOVING)
-            removed = []
-            failed = list(router_failed)
-            for group, node0_idx in unregistered_engine_infos:
-                engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
-                try:
-                    await self._remove_engine(group, node0_idx, shutdown_timeout=shutdown_timeout)
-                    removed.append(engine_id)
-                    logger.info(f"[ScaleIn] Removed engine {engine_id}")
-                except Exception as e:
-                    failed.append(engine_id)
-                    logger.warning(f"[ScaleIn] Failed to remove engine {engine_id}: {e}")
-
             request.removed_engines = removed
             request.failed_engines = failed
-
-            self._cleanup_engine_groups(srv)
+            completed_eviction_groups = {
+                id(group)
+                for group, node0_idx in engine_infos
+                if group.eviction_requested and f"group_{group.rank_offset}_engine_{node0_idx}" in removed
+            }
 
             if failed:
                 failure_prefix = "Scale-in partially failed" if removed else "Scale-in failed"
@@ -3673,8 +3818,40 @@ class RolloutManager(ReloadableMixin):
         except Exception as e:
             request.update_status(ScaleInStatus.FAILED, f"Scale-in failed: {e}")
             logger.exception(f"[ScaleIn] Unhandled error in scale-in for request {request.request_id}")
+        finally:
+            with self._engine_lifecycle_lock:
+                for group in selected_groups.values():
+                    if id(group) in completed_eviction_groups:
+                        group.eviction_requested = False
+                    if not group.eviction_requested and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                        group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
-    def _select_engines_for_removal(self, request: ScaleInRequest, srv) -> list:
+    async def _resolve_scale_in_url_candidates(self, request: ScaleInRequest, srv) -> list:
+        """Resolve URL targets without holding the lifecycle lock."""
+        target_urls = {self._normalize_engine_addr(url) for url in request.engine_urls}
+        with self._engine_lifecycle_lock:
+            snapshots = [
+                (group, node0_idx, engine)
+                for group in srv.engine_groups
+                if group.is_scaled_out
+                and group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                for node0_idx, engine in enumerate(group.engines)
+                if engine is not None
+            ]
+
+        async def _resolve(group, node0_idx, engine):
+            try:
+                url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
+                if url and self._normalize_engine_addr(url) in target_urls:
+                    return group, node0_idx, engine
+            except Exception as e:
+                logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
+            return None
+
+        results = await asyncio.gather(*[_resolve(*snapshot) for snapshot in snapshots])
+        return [result for result in results if result is not None]
+
+    def _select_engines_for_removal(self, request: ScaleInRequest, srv, *, url_candidates: list | None = None) -> list:
         """Select engines eligible for removal during scale-in.
 
         Only engines belonging to groups that were added via scale-out
@@ -3682,40 +3859,99 @@ class RolloutManager(ReloadableMixin):
         touched, regardless of how ``num_replicas`` / ``engine_urls`` are
         specified.
         """
-        # Collect candidates: only from scale-out groups
-        engine_infos = []
-        for group in srv.engine_groups:
-            if not group.is_scaled_out:
-                continue
-            for node0_idx, engine in enumerate(group.engines):
-                if engine is not None:
-                    engine_infos.append((group, node0_idx))
+        # Collect one coherent snapshot.  A DRAINING group can be a SIGTERM
+        # intent claimed after this request was inserted; prefer it so a
+        # target-based scale-in does not remove a second elastic engine.
+        with self._engine_lifecycle_lock:
+            engine_snapshots = []
+            for group in srv.engine_groups:
+                if not group.is_scaled_out or group.lifecycle_status not in (
+                    EngineGroupLifecycle.ACTIVE,
+                    EngineGroupLifecycle.DRAINING,
+                ):
+                    continue
+                for node0_idx, engine in enumerate(group.engines):
+                    if engine is not None:
+                        engine_snapshots.append((group, node0_idx, engine))
+            current_total = sum(1 for group in srv.engine_groups for engine in group.engines if engine is not None)
 
         if request.num_replicas > 0:
             # Count ALL live engines (initial + scaled-out) to decide how many
             # to remove so the cluster reaches the target size.
-            current_total = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
             num_to_remove = current_total - request.num_replicas
             if num_to_remove <= 0:
                 return []
-            # Remove from the tail (most recently added) first; never exceed
-            # the number of eligible scale-out engines.
-            engine_infos = engine_infos[-num_to_remove:]
+            draining = [item for item in engine_snapshots if item[0].lifecycle_status is EngineGroupLifecycle.DRAINING]
+            active = [item for item in engine_snapshots if item[0].lifecycle_status is EngineGroupLifecycle.ACTIVE]
+            # Adopt SIGTERM intents first, then remove the most recently added
+            # ACTIVE engines only for the remaining target delta.
+            engine_snapshots = draining[:num_to_remove]
+            remaining = num_to_remove - len(engine_snapshots)
+            if remaining > 0:
+                engine_snapshots.extend(active[-remaining:])
         elif request.engine_urls:
-            # Match by engine URLs (normalize both sides so http:// prefix doesn't matter)
-            target_urls = {self._normalize_engine_addr(u) for u in request.engine_urls}
-            matched_infos = []
-            for g, idx in engine_infos:
-                engine = g.engines[idx]
-                try:
-                    url = ray.get(engine.get_url.remote(), timeout=5)
-                    if url and self._normalize_engine_addr(url) in target_urls:
-                        matched_infos.append((g, idx))
-                except Exception as e:
-                    logger.warning(f"Failed to get URL for engine group_{g.rank_offset}_engine_{idx}: {e}")
-            engine_infos = matched_infos
+            # URL probes happen outside the lifecycle lock. Revalidate actor
+            # identity against the current topology before claiming removal.
+            resolved_by_slot = {(id(group), node0_idx): engine for group, node0_idx, engine in (url_candidates or [])}
+            engine_snapshots = [
+                (group, node0_idx, engine)
+                for group, node0_idx, engine in engine_snapshots
+                if resolved_by_slot.get((id(group), node0_idx)) is engine
+            ]
 
-        return engine_infos
+        return [(group, node0_idx) for group, node0_idx, _ in engine_snapshots]
+
+    async def _remove_live_engines(
+        self,
+        srv,
+        engine_infos: list,
+        *,
+        drain_timeout: float,
+        shutdown_timeout: float,
+        force: bool,
+    ) -> tuple[list[str], list[str]]:
+        """Remove live actors in Router -> drain -> DCS -> shutdown -> PG
+        order."""
+        unregistered_engine_infos, router_failed = await self._drain_engines(
+            engine_infos,
+            timeout=drain_timeout,
+            force=force,
+        )
+
+        removal_targets = [
+            (
+                group,
+                node0_idx,
+                f"group_{group.rank_offset}_engine_{node0_idx}",
+                self._get_live_engine_actors(group, node0_idx),
+            )
+            for group, node0_idx in unregistered_engine_infos
+        ]
+        dcs_results = await asyncio.gather(
+            *[self._unregister_engine_dcs(engine_id, live_actors) for _, _, engine_id, live_actors in removal_targets],
+            return_exceptions=True,
+        )
+        removed = []
+        failed = list(router_failed)
+        shutdown_targets = []
+        for target, result in zip(removal_targets, dcs_results):
+            _, _, engine_id, _ = target
+            if isinstance(result, BaseException):
+                logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
+            shutdown_targets.append(target)
+
+        await asyncio.gather(
+            *[
+                self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
+                for group, _, engine_id, live_actors in shutdown_targets
+            ]
+        )
+        for _, _, engine_id, _ in shutdown_targets:
+            removed.append(engine_id)
+            logger.info(f"[ScaleIn] Removed engine {engine_id}")
+
+        self._cleanup_engine_groups(srv)
+        return removed, failed
 
     async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> tuple[list, list[str]]:
         """Remove all engines from the router, then wait once for the drain
@@ -3784,60 +4020,97 @@ class RolloutManager(ReloadableMixin):
 
         return unregistered_engine_infos, failed_engine_ids
 
-    async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
-        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+    @staticmethod
+    def _get_live_engine_actors(group, node0_idx: int) -> list[tuple[int, object]]:
         nodes_per_engine = group.nodes_per_engine
         indices = range(node0_idx * nodes_per_engine, (node0_idx + 1) * nodes_per_engine)
+        return [
+            (i, group.all_engines[i])
+            for i in indices
+            if i < len(group.all_engines) and group.all_engines[i] is not None
+        ]
 
-        for i in indices:
-            if i >= len(group.all_engines):
-                continue
-            engine = group.all_engines[i]
-            if engine is None:
-                continue
+    @staticmethod
+    async def _unregister_engine_dcs(engine_id: str, live_actors: list[tuple[int, object]]) -> None:
+        async def _unregister_dcs(engine):
+            return await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
 
-            try:
-                await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
-            except Exception as e:
-                logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}[{i}]: {e}")
+        dcs_results = await asyncio.gather(
+            *[_unregister_dcs(engine) for _, engine in live_actors],
+            return_exceptions=True,
+        )
+        dcs_failures = [
+            (i, result) for (i, _), result in zip(live_actors, dcs_results) if isinstance(result, BaseException)
+        ]
+        if dcs_failures:
+            failed_indices = ", ".join(str(i) for i, _ in dcs_failures)
+            raise RuntimeError(f"Failed to unregister DCS for engine {engine_id}[{failed_indices}]")
 
-            shutdown_ok = False
-            try:
-                await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
-                shutdown_ok = True
-            except Exception as e:
-                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {e}")
+    async def _shutdown_engine_actors(
+        self,
+        group,
+        engine_id: str,
+        live_actors: list[tuple[int, object]],
+        shutdown_timeout: float,
+    ) -> None:
+        async def _shutdown(engine):
+            return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
-            if not shutdown_ok:
+        shutdown_results = await asyncio.gather(
+            *[_shutdown(engine) for _, engine in live_actors],
+            return_exceptions=True,
+        )
+        for (i, engine), result in zip(live_actors, shutdown_results):
+            if isinstance(result, BaseException):
+                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
                 try:
                     ray.kill(engine)
                 except Exception as e:
                     logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]: {e}")
 
-            group.all_engines[i] = None
+        with self._engine_lifecycle_lock:
+            for i, _ in live_actors:
+                group.all_engines[i] = None
+
+    async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
+        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+        live_actors = self._get_live_engine_actors(group, node0_idx)
+        try:
+            await self._unregister_engine_dcs(engine_id, live_actors)
+        except Exception as e:
+            logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {e}")
+        await self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
 
     def _cleanup_engine_groups(self, srv) -> None:
-        monitors_to_remove = []
-        groups_to_remove = []
-
-        for group in srv.engine_groups:
-            if all(e is None for e in group.all_engines):
-                groups_to_remove.append(group)
-                for monitor in self._health_monitors:
-                    if monitor._engine_group is group:
-                        monitors_to_remove.append(monitor)
+        with self._engine_lifecycle_lock:
+            groups_to_remove = [
+                group
+                for group in srv.engine_groups
+                if group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                and all(engine is None for engine in group.all_engines)
+            ]
+            monitors_to_remove = [
+                monitor
+                for monitor in self._health_monitors
+                if any(monitor._engine_group is group for group in groups_to_remove)
+            ]
+            for group in groups_to_remove:
+                group.lifecycle_status = EngineGroupLifecycle.REMOVING
+                srv.engine_groups.remove(group)
+            for monitor in monitors_to_remove:
+                self._health_monitors.remove(monitor)
 
         for monitor in monitors_to_remove:
             monitor.stop()
-            self._health_monitors.remove(monitor)
 
         for group in groups_to_remove:
-            srv.engine_groups.remove(group)
             if group.pg is not None:
                 try:
                     ray.util.remove_placement_group(group.pg[0])
                 except Exception as e:
                     logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
+            with self._engine_lifecycle_lock:
+                group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
         if groups_to_remove:
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
@@ -3953,120 +4226,160 @@ class RolloutManager(ReloadableMixin):
                 logger.exception("[Eviction] Unhandled error in eviction monitor loop")
 
     def _check_and_handle_evictions(self):
-        """Check all engines for SIGTERM eviction and handle evicted ones as
-        scale-in.
-
-        This method polls every live engine via ``is_evicted()`` in parallel.
-        Evicted engines are removed from the engine group and cleaned up,
-        similar to the existing scale-in flow but without requiring an external
-        API call.
-        """
-        # Collect all live engines with their (server_name, group, node0_idx)
-        engine_refs = []
-        engine_info_map = []
-        for srv_name, srv in self.servers.items():
-            for group in srv.engine_groups:
-                for node0_idx, engine in enumerate(group.engines):
-                    if engine is None:
+        """Poll live elastic actors independently for graceful SIGTERM
+        intent."""
+        pending = []
+        with self._engine_lifecycle_lock:
+            for server_name, srv in self.servers.items():
+                for group in srv.engine_groups:
+                    if (
+                        not group.is_scaled_out
+                        or group.pg is None
+                        or group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    ):
                         continue
-                    try:
-                        ref = engine.is_evicted.remote()
-                        engine_refs.append(ref)
-                        engine_info_map.append((srv_name, group, node0_idx, engine))
-                    except Exception:
-                        # Engine actor may already be dead
-                        pass
+                    for actor_idx, engine in enumerate(group.all_engines):
+                        if engine is None:
+                            continue
+                        try:
+                            pending.append(
+                                (
+                                    engine.is_evicted.remote(),
+                                    server_name,
+                                    group,
+                                    actor_idx // group.nodes_per_engine,
+                                )
+                            )
+                        except Exception as e:
+                            logger.debug("[Eviction] Failed to submit graceful probe: %s", e)
 
-        if not engine_refs:
+        if not pending:
             return
 
-        # Parallel poll with timeout — an engine that's already dead will
-        # raise; we treat that as "not evicted" (the health monitor handles dead actors).
+        refs = [item[0] for item in pending]
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=5)
+        ready_set = set(ready)
+        handled = set()
+        evicted_engine_infos = []
+        for ref, server_name, group, node0_idx in pending:
+            if ref not in ready_set or (id(group), node0_idx) in handled:
+                continue
+            try:
+                if ray.get(ref):
+                    handled.add((id(group), node0_idx))
+                    evicted_engine_infos.append((server_name, group, node0_idx))
+            except Exception as e:
+                # Hard actor failure belongs to the fault-recovery follow-up,
+                # not this graceful-eviction path.
+                logger.debug("[Eviction] Graceful probe failed: %s", e)
+
+        if evicted_engine_infos:
+            self._handle_evictions(evicted_engine_infos)
+
+    def _handle_evictions(self, eviction_infos: list[tuple[str, EngineGroup, int]]) -> None:
+        """Fence a ready eviction batch before performing one live removal."""
+        claimed = []
+        with self._engine_lifecycle_lock:
+            for srv_name, group, node0_idx in eviction_infos:
+                srv = self.servers.get(srv_name)
+                if (
+                    srv is None
+                    or group not in srv.engine_groups
+                    or group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    or not group.is_scaled_out
+                    or group.pg is None
+                    or node0_idx >= len(group.engines)
+                    or group.engines[node0_idx] is None
+                ):
+                    continue
+                group.eviction_requested = True
+                group.lifecycle_status = EngineGroupLifecycle.DRAINING
+                claimed.append((srv_name, srv, group, node0_idx))
+
+            if not claimed:
+                return
+
+            # Signal-first fence: every ready intent is DRAINING before any
+            # owner wait or cleanup.  An explicit scale-in remains the sole
+            # removal owner and adopts matching DRAINING engines.
+            active = self._find_active_scale_request()
+            if active is not None and active["type"] == "scale_in":
+                engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
+                logger.info(
+                    "[Eviction] Scale-in request %s will adopt pending evictions %s (%s)",
+                    active["request_id"],
+                    engine_ids,
+                    active["status"],
+                )
+                return
+            if active is not None and active["type"] not in ("scale_out", "graceful_eviction"):
+                return
+
+        engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
+        logger.info("[Eviction] Gracefully removing engines %s", engine_ids)
         try:
-            results = ray.get(engine_refs, timeout=5)
-        except ray.exceptions.GetTimeoutError:
-            logger.warning("[Eviction] Timed out polling engines for eviction status")
+            wait_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0
+            deadline = time.monotonic() + wait_timeout
+            while self._is_weight_updating:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("[Eviction] Timed out waiting for the weight-update fence for %s", engine_ids)
+                    return
+                time.sleep(min(1.0, remaining))
+
+            batches: dict[str, tuple[RolloutServer, list[tuple[EngineGroup, int]]]] = {}
+            for srv_name, srv, group, node0_idx in claimed:
+                if srv_name not in batches:
+                    batches[srv_name] = (srv, [])
+                batches[srv_name][1].append((group, node0_idx))
+
+            async def _remove_batches():
+                batch_items = list(batches.items())
+                results = await asyncio.gather(
+                    *[
+                        self._remove_live_engines(
+                            srv,
+                            infos,
+                            drain_timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
+                            shutdown_timeout=getattr(self.args, "scale_in_shutdown_timeout", 20.0),
+                            force=False,
+                        )
+                        for _, (srv, infos) in batch_items
+                    ],
+                    return_exceptions=True,
+                )
+                return [(srv_name, result) for (srv_name, _), result in zip(batch_items, results)]
+
+            batch_results = asyncio.run(_remove_batches())
+        except Exception:
+            logger.exception("[Eviction] Graceful removal failed for %s", engine_ids)
             return
-        except Exception as e:
-            logger.debug(f"[Eviction] Error polling engines: {e}")
-            return
 
-        evicted = [
-            (srv_name, group, node0_idx, engine)
-            for (srv_name, group, node0_idx, engine), is_evict in zip(engine_info_map, results)
-            if is_evict
-        ]
-        if not evicted:
-            return
+        removed_by_server = {}
+        for srv_name, result in batch_results:
+            if isinstance(result, BaseException):
+                logger.warning("[Eviction] Graceful removal batch failed for %s: %s", srv_name, result)
+                removed_by_server[srv_name] = set()
+            else:
+                removed, _ = result
+                removed_by_server[srv_name] = set(removed)
 
-        logger.info(
-            f"[Eviction] Detected {len(evicted)} evicted engine(s), "
-            f"processing as scale-in: "
-            f"{[(srv_name, f'group_{g.rank_offset}_engine_{idx}') for srv_name, g, idx, _ in evicted]}"
-        )
+        claimed_by_group: dict[int, tuple[EngineGroup, list[tuple[str, str]]]] = {}
+        for srv_name, _, group, node0_idx in claimed:
+            engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+            claimed_by_group.setdefault(id(group), (group, []))[1].append((srv_name, engine_id))
 
-        for srv_name, group, node0_idx, engine in evicted:
-            self._handle_single_eviction(srv_name, group, node0_idx)
-
-    def _handle_single_eviction(self, srv_name: str, group, node0_idx: int):
-        """Handle a single evicted engine: unregister DCS, kill actor, clean
-        up.
-
-        This mirrors the scale-in removal path but is triggered by eviction
-        rather than an API request.  The SIGTERM handler in SGLangEngine
-        already unregistered the engine from the router, so we skip the drain
-        step.
-        """
-        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
-        logger.info(f"[Eviction] Handling evicted engine: {engine_id}")
-
-        # Mark as intentionally removed in health monitor so it doesn't
-        # try to recover the engine.
-        for monitor in self._health_monitors:
-            if monitor._engine_group is group:
-                monitor.mark_intentionally_removed(node0_idx)
-
-        nodes_per_engine = group.nodes_per_engine
-        indices = range(node0_idx * nodes_per_engine, (node0_idx + 1) * nodes_per_engine)
-
-        for i in indices:
-            if i >= len(group.all_engines):
-                continue
-            engine = group.all_engines[i]
-            if engine is None:
-                continue
-
-            # Best-effort DCS unregister
-            try:
-                ray.get(engine.unregister_dcs.remote(), timeout=5)
-            except Exception as e:
-                logger.warning(f"[Eviction] Failed to unregister DCS for {engine_id}[{i}]: {e}")
-
-            # Best-effort shutdown — the process may already be terminating
-            try:
-                ray.get(engine.shutdown.remote(), timeout=10)
-            except Exception as e:
-                logger.debug(f"[Eviction] Engine shutdown failed (expected if pod is terminating): {e}")
-
-            # Kill the Ray actor
-            try:
-                ray.kill(engine)
-            except Exception as e:
-                logger.debug(f"[Eviction] ray.kill failed for {engine_id}[{i}] (may already be dead): {e}")
-
-            group.all_engines[i] = None
-
-        logger.info(f"[Eviction] Engine {engine_id} removed from engine group")
-
-        # Clean up empty engine groups
-        srv = self.servers.get(srv_name)
-        if srv:
-            self._cleanup_engine_groups(srv)
-            remaining = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
-            logger.info(
-                f"[Eviction] Server '{srv_name}' now has {remaining} live engine(s) "
-                f"across {len(srv.engine_groups)} group(s)"
-            )
+        with self._engine_lifecycle_lock:
+            # Restore a surviving group only when every eviction claimed for
+            # that group completed. Any timeout/failure remains fail-closed.
+            for group, group_claims in claimed_by_group.values():
+                completed = all(
+                    engine_id in removed_by_server.get(srv_name, set()) for srv_name, engine_id in group_claims
+                )
+                if completed:
+                    group.eviction_requested = False
+                if completed and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                    group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
 
 def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):

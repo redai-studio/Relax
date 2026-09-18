@@ -23,6 +23,8 @@
 # Environment variables (optional):
 #   MEGATRON      - Path to Megatron-LM (default: /root/Megatron-LM/)
 #   RELAX         - Path to Relax project (default: ../../)
+#   RELAX_KERNEL_CACHE_DIR - Shared directory for portable Inductor/Triton cache deltas.
+#   RELAX_KERNEL_CACHE_KEY - Optional graph/topology profile key. Defaults to a hash of the run script and overrides.
 
 # Guard: skip if already sourced by another entrypoint
 if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
@@ -32,7 +34,7 @@ fi
 # ── mode detection ──────────────────────────────────────────────────────────
 # Entry-point mode: directly executed AND first arg is an existing .sh file.
 # Otherwise act as a sourced setup script.
-_RAY_JOB_RUN_SCRIPT=""
+_RAY_JOB_RUN_SCRIPT="${_RAY_JOB_RUN_SCRIPT:-}"
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     _RAY_JOB_FIRST_ARG="${1:-}"
     if [ -n "$_RAY_JOB_FIRST_ARG" ] && [ -f "$_RAY_JOB_FIRST_ARG" ] && [[ "$_RAY_JOB_FIRST_ARG" == *.sh ]]; then
@@ -42,32 +44,41 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "Usage: $0 <run-script.sh> [extra-args...]" >&2
         exit 1
     fi
+elif [ -z "${_RAY_JOB_RUN_SCRIPT}" ]; then
+    for _caller in "${BASH_SOURCE[@]:1}"; do
+        if [[ "${_caller}" == */scripts/training/*.sh ]]; then
+            _RAY_JOB_RUN_SCRIPT="${_caller}"
+            break
+        fi
+    done
 fi
 
 set -eo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./kernel-cache.sh
+source "${DIR}/kernel-cache.sh"
 
-# ── clean up residual python/sglang processes (NOT ray) ─────────────────────
+# ── clean up residual Relax/SGLang WORKER processes (NOT ray daemons) ────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
-echo "=== Cleaning up residual python/sglang processes ==="
+# kill_for_ray.sh was rewritten to a WHITELIST (positive-match) that only kills
+# MegatronTrainRayActor / relax.entrypoints.train / sglang workers, with a hard guard
+# against ray start/raylet/gcs_server/dashboard/log_monitor/etc. The old blacklist version
+# SIGKILLed `/usr/bin/python3 ... ray start --head` on the head node → GCS reset → jobs
+# vanished + SSH/dashboard flapped (see project memory "ray-job.sh kills head"). The new
+# script is structurally incapable of hitting a ray daemon, so it is safe to run clusterwide.
+echo "=== Cleaning up residual Relax/SGLang worker processes ==="
 python ${DIR}/../tools/run_on_each_ray_node.py ${DIR}/../tools/kill_for_ray.sh || echo "failed"
 
 # ── reserve sglang port range from kernel ephemeral pool ────────────────────
-# Some worker nodes ship with net.ipv4.ip_local_port_range="10000 65500", which
-# includes sglang's well-known port range (15670-15900). Megatron's 294 process
-# groups grab ephemeral ports for NCCL/Gloo bootstrap; on those nodes a PG can
-# land on a port sglang wants and crash the engine with
-# "scheduler_input_port at 15855 is not available in 120 seconds. holder=ray::MegatronTrainRayActor".
-# Reserve sglang's range so the kernel never picks it for ephemeral.
+# Keep NCCL/Gloo ephemeral bootstrap ports from overlapping SGLang's ports.
 echo "=== Reserving sglang port ranges on all GPU nodes ==="
-# Reserve two ranges:
-#   15000-16800 — sglang port range. SGLang's dp-attention schedulers use ports
-#                 starting from ~15100 (base_port + offsets for DP/TP ranks), so
-#                 the range must start well below 15400 to cover all scheduler
-#                 input/output/NCCL bootstrap ports.
-#   30000-32768 — secondary safe zone (fallback if sglang port_base needs adjustment)
-python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768" || echo "reserve_ports failed (non-fatal)"
+# Reserved ranges:
+#   15000-20000 — SGLang scheduler and bootstrap ports.
+#   30000-32768 — fallback range for SGLang port_base adjustments.
+#   65001-65500 — exclude the upper ephemeral range to avoid bootstrap conflicts
+#                 on nodes whose ip_local_port_range extends above 65000.
+python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768,65001-65500" || echo "reserve_ports failed (non-fatal)"
 
 # Two run scenarios, distinguished by whether we are inside a ray job driver:
 #   A) Entry-point mode — `bash ray-job.sh <run-script>`: this script runs in the
@@ -187,6 +198,9 @@ NVSHMEM_LIB_PATH="${NVSHMEM_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/nv
 TORCH_LIB_PATH="${TORCH_LIB_PATH:-/usr/local/lib/python3.12/dist-packages/torch/lib}"
 CURRENT_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${NVSHMEM_LIB_PATH}:${TORCH_LIB_PATH}"
 
+relax_kernel_cache_configure "${_RAY_JOB_RUN_SCRIPT}" "$@"
+relax_kernel_cache_start_agents cluster
+
 # Cap OMP/MKL/OpenBLAS threads (default 24) to avoid CPU oversubscription when colocating multiple Ray actors per node.
 export RUNTIME_ENV_JSON="{
 \"worker_process_setup_hook\": \"relax.utils.logging_utils.install_asyncio_noise_filter\",
@@ -212,6 +226,8 @@ export RUNTIME_ENV_JSON="{
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 }
 }"
+
+relax_kernel_cache_inject_runtime_env
 
 echo "=== Ray-job environment ready ==="
 

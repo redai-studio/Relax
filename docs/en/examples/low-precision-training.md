@@ -112,9 +112,9 @@ Output:
 For the FP8 training workflow you usually do **not** need this script — bridge mode (`--megatron-to-hf-mode bridge`) reads the FP8 HF directly. This tool is for offline conversion when you need a BF16 HF as input to a different pipeline (e.g. as a `--ref-load` source for another recipe, or to feed `convert_hf_to_int4.py`).
 :::
 
-### `convert_hf_to_int4.py`
+### `convert_hf_to_int4.py` {#convert-hf-to-int4}
 
-Quantize a BF16 HF checkpoint to W4A16 (compressed-tensors). Uses the `fake_int4_quant_cuda` kernel, which must be built first (see [Build the int4_qat kernel](#build-the-int4_qat-kernel)).
+Quantize a BF16 HF checkpoint to W4A16 (compressed-tensors). Uses the `fake_int4_quant_cuda` kernel, which must be built first (see [Build the int4_qat kernel](#build-int4-qat-kernel)).
 
 ```bash
 python scripts/tools/convert_hf_to_int4.py \
@@ -183,9 +183,9 @@ Relax ships two reference recipes for Qwen3-30B-A3B (8-GPU colocate): **FP8 nati
 ### Common Prerequisites
 
 1. A BF16 HF checkpoint (e.g. `Qwen3-30B-A3B`).
-2. The Megatron patch at `docker/patch/megatron/20260506-85bced0ae.patch` applied (baked into the project Dockerfile). It provides both the FP8 overrides and the INT4 `_FakeInt4QuantizationSTE` that overrides `TEGroupedLinear._get_weight_tensors()`.
+2. The Megatron versions pinned by the project Dockerfile, with `docker/patch/latest/megatron.patch` applied. The current Megatron Core provides INT4 fake-QAT in `megatron/core/extensions/transformer_engine_int4_fake_qat.py`, called once by `TEGroupedLinear._get_weight_tensors()`; the Relax patch does not add a second quantization pass.
 
-The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise scaling support. The INT4 recipe additionally needs the `fake_int4_quant_cuda` CUDA extension built — see [Build the int4_qat kernel](#build-the-int4-qat-kernel) below.
+The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise scaling support. The INT4 recipe additionally needs the `fake_int4_quant_cuda` CUDA extension built — see [Build the int4_qat kernel](#build-int4-qat-kernel) below.
 
 ### FP8 Recipe
 
@@ -216,6 +216,8 @@ The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise s
 
 
 ### INT4 fake-QAT Recipe
+
+INT4 fake-QAT requires `--no-gradient-accumulation-fusion`: the STE replaces weight tensors, while TE fused weight-gradient accumulation requires attributes on the original tensors. This disables the fused optimization while retaining gradient accumulation. The Qwen3 and Kimi INT4 scripts already include this flag; keep it when adapting them.
 
 #### Build the int4_qat kernel
 
@@ -312,7 +314,7 @@ Both scripts share the same parallelism and INT4 plumbing:
 | Setting                                            | Value                                                                                  | Notes                                                                                                  |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | Parallelism                                        | TP=8, PP=8, CP=4, EP=32, ETP=1                                                         | 256 GPUs total. INT4 QAT only changes the weight-update path, not parallelism.                         |
-| `OPEN_TRAINING_INT4_FAKE_QAT_FLAG`                 | `1`                                                                                    | Trips the `_FakeInt4QuantizationSTE` inside `TEGroupedLinear._get_weight_tensors()`.                   |
+| `OPEN_TRAINING_INT4_FAKE_QAT_FLAG`                 | `1`                                                                                    | Enables the Megatron INT4 fake-QAT helper called by `TEGroupedLinear._get_weight_tensors()`.           |
 | `OPEN_TRAINING_INT4_GROUP_SIZE`                    | `32`                                                                                   | Matches the W4A16 release's per-group scale layout (Kimi uses **32**, not 128 as in the Qwen3-30B recipe). |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`   | `256`                                                                                  | DeepEP low-latency dispatch buffer; default 128 collides with cuda_graph capture at bs=128.            |
 | `--rollout-num-gpus-per-engine`                    | `16`                                                                                   | One SGLang engine per 16 GPUs → 16 engines across 256 GPUs.                                            |
@@ -331,5 +333,5 @@ Do not swap `--sglang-hf-checkpoint` to the BF16 cast for "consistency". SGLang'
 :::
 
 ::: tip
-This recipe assumes the W4A16 release was produced with **symmetric** quantization (matching the training-side STE). If you regenerate the W4A16 from BF16 via `convert_hf_to_int4.py`, always pass `--is-symmetric` — see the warning in the [Offline Quantization Tools](#convert_hf_to_int4-py) section above.
+This recipe assumes the W4A16 release was produced with **symmetric** quantization (matching the training-side STE). If you regenerate the W4A16 from BF16 via `convert_hf_to_int4.py`, always pass `--is-symmetric` — see the warning in the [Offline Quantization Tools](#convert-hf-to-int4) section above.
 :::

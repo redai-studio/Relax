@@ -170,12 +170,19 @@ class RolloutDataSource(DataSource):
         self.dataset = None
 
         if args.rollout_global_dataset:
-            prepare_model_maybe_update_args(args, completeness="metadata")
-            tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-            processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+            if getattr(args, "hf_checkpoint", None):
+                prepare_model_maybe_update_args(args, completeness="metadata")
+                tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+                processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+            else:
+                # Native generation (diffusion/flow): prompts are strings consumed
+                # by the rollout engine; no LLM tokenizer/processor is needed at the
+                # data source. Condition media is loaded via multimodal_keys.
+                tokenizer = None
+                processor = None
 
             # TODO move (during the refactor)
-            if (d := args.dump_details) is not None:
+            if (d := args.dump_details) is not None and tokenizer is not None:
                 tokenizer.save_pretrained(Path(d) / "tokenizer")
                 if processor:
                     processor.save_pretrained(Path(d) / "processor")

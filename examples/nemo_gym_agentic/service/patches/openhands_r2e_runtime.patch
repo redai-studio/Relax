@@ -76,3 +76,31 @@ index 485d2c831..ace42c99a 100644
          git_patch = return_val['git_patch']
          logger.info(
              f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
+diff --git a/openhands/memory/conversation_memory.py b/openhands/memory/conversation_memory.py
+--- a/openhands/memory/conversation_memory.py
++++ b/openhands/memory/conversation_memory.py
+@@ -16,9 +16,11 @@
+     CmdRunAction,
+     FileEditAction,
+     FileReadAction,
++    FunctionCallNotExistsAction,
+     IPythonRunCellAction,
+     MessageAction,
+     TaskTrackingAction,
++    ValidationFailureAction,
+ )
+ from openhands.events.action.mcp import MCPAction
+ from openhands.events.action.opencode import (
+@@ -259,10 +261,12 @@
+                 IPythonRunCellAction,
+                 FileEditAction,
+                 FileReadAction,
++                FunctionCallNotExistsAction,
+                 BrowseInteractiveAction,
+                 BrowseURLAction,
+                 MCPAction,
+                 TaskTrackingAction,
++                ValidationFailureAction,
+                 # OpenCode-style actions
+                 GlobAction,
+                 GrepAction,

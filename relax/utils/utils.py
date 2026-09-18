@@ -12,7 +12,7 @@ import torch
 from tensordict import TensorDict
 
 from relax.utils.device import get_ray_accelerator_name
-from relax.utils.env import Envs, validate_env
+from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.training.data_fields import needs_multimodal_fields
@@ -96,10 +96,26 @@ def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
 
 def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[Sample]]):
     """Convert inference generated samples to training data."""
+    # Native generative RL emits a lightweight diffusion TQ row (numeric-only)
+    # via a declared hook, so the default token converter below is bypassed
+    # (design doc 8.3). When unset the standard token path runs unchanged.
+    custom_convert_path = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    if custom_convert_path is not None:
+        custom_convert_func = load_function(custom_convert_path)
+        return custom_convert_func(args, samples)
+
     raw_rewards, rewards = post_process_rewards(args, samples)
 
     assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
+
+    if any(isinstance(reward, list) for reward in rewards):
+        if args.advantage_estimator not in ("grpo", "gspo", "sapo", "cispo", "m2po", "rloo"):
+            raise ValueError(f"dense rewards are not supported for {args.advantage_estimator!r}")
+        rewards = [
+            reward if isinstance(reward, list) else [reward] * sample.response_length
+            for reward, sample in zip(rewards, samples, strict=True)
+        ]
 
     sample_indices = [sample.index for sample in samples]
     train_data = {
@@ -149,6 +165,26 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
 
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+
+    if getattr(args, "use_rollout_indexer_replay", False):
+        indexer_topk = [getattr(sample, "rollout_indexer_topk", None) for sample in samples]
+        if any(value is None for value in indexer_topk):
+            raise RuntimeError("Every training sample must contain rollout_indexer_topk when replay is enabled")
+        widths = set()
+        for sample, value in zip(samples, indexer_topk, strict=False):
+            if not isinstance(value, np.ndarray):
+                raise TypeError(f"rollout_indexer_topk must be a numpy array, got {type(value)}")
+            if value.ndim != 2 or value.shape[0] != len(sample.tokens) - 1:
+                raise RuntimeError(
+                    "rollout_indexer_topk must be a 2-D array with one row per input token except the last, "
+                    f"got replay={value.shape}, tokens={len(sample.tokens)}"
+                )
+            if value.dtype != np.int32:
+                raise RuntimeError(f"rollout_indexer_topk must use int32, got {value.dtype}")
+            widths.add(value.shape[1])
+        if len(widths) != 1:
+            raise RuntimeError(f"Inconsistent rollout_indexer_topk widths in one batch: {sorted(widths)}")
+        train_data["rollout_indexer_topk"] = indexer_topk
 
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -249,10 +285,11 @@ def dict_to_tensordict(
     batch_size: Union[int, torch.Size, None] = None,
     device: Optional[torch.device] = None,
 ) -> TensorDict:
-    """Convert a nested-list dictionary to a TensorDict.
+    """Convert a nested-list / tensor-list dictionary to a TensorDict.
 
     Args:
-        data: Mapping of keys to nested lists (supports depth 1 or 2).
+        data: Mapping of keys to nested lists (supports depth 1 or 2) or
+            lists of per-sample tensors.
         batch_size: Optional batch size. If None, caller may set an appropriate
             batch size (TensorDict accepts None or an int/torch.Size).
         device: Optional target torch.device for created tensors.
@@ -287,6 +324,12 @@ def dict_to_tensordict(
         tensors = [torch.tensor(seq, dtype=dtype, device=device) for seq in lst]
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
 
+    def _to_nested_tensor_from_tensor_list(lst):
+        if not all(isinstance(item, torch.Tensor) for item in lst):
+            raise TypeError("Mixed tensor and non-tensor values are not supported")
+        tensors = [tensor.to(device=device) for tensor in lst] if device is not None else lst
+        return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
     result = {}
 
     for key, value in data.items():
@@ -314,6 +357,27 @@ def dict_to_tensordict(
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
             continue
+        if key == "rollout_indexer_topk":
+            # Normalize each replay payload to 2-D (seq_i, flattened replay width)
+            # so NestedTensor jagged layout can handle variable seq_len efficiently.
+            # This avoids NonTensorStack wrapping which forces slow pickle serialization
+            # during dist.broadcast_object_list (~377 MB pickle -> ~14s overhead).
+            tensors = [
+                torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
+            ]
+            result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            continue
+        if key == "trajectory_refs":
+            # Serialized Ray ObjectRefs are padded to a fixed width per batch.
+            # Keep them as dense uint8 so TransferQueue and the rank-0 broadcast
+            # do not pay NestedTensor metadata/serialization overhead.
+            result[key] = torch.tensor(value, dtype=torch.uint8, device=device)
+            continue
+
+        if value and isinstance(value[0], torch.Tensor):
+            result[key] = _to_nested_tensor_from_tensor_list(value)
+            continue
+
         depth = _nesting_depth(value)
         if depth == 0:  # empty list []
             tensor = torch.empty(0)
@@ -412,6 +476,20 @@ def post_process_env(args, env):
     extra_modules = Envs.RELAX_EXTRA_MODULES
     if extra_modules and "RELAX_EXTRA_MODULES" not in env["env_vars"]:
         env["env_vars"]["RELAX_EXTRA_MODULES"] = extra_modules
+
+    # Producer and consumer derive the same TransferQueue partition names from
+    # this value, so it must be identical in every Serve and Megatron actor.
+    if "RELAX_SFT_TQ_SHARDS" not in env["env_vars"]:
+        env["env_vars"]["RELAX_SFT_TQ_SHARDS"] = str(Envs.RELAX_SFT_TQ_SHARDS)
+
+    # ray-job.sh prepares the node-local cache before launching the inner Ray
+    # job. Carry its resolved session into the runtime env that Controller
+    # explicitly forwards through detached Serve deployments to TrainGroup.
+    # actor_group.py then exposes the compiler-specific paths only to training
+    # actors, so Serve/TQ workers do not write into the cache.
+    for name in KERNEL_CACHE_ENV_NAMES:
+        if name not in env["env_vars"] and (value := os.environ.get(name)) is not None:
+            env["env_vars"][name] = value
 
     # Generic env-var passthrough for overlay packages. Comma-separated list
     # of env-var names the driver wants forwarded to every Ray actor. Each

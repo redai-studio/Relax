@@ -10,7 +10,7 @@ from typing import Any, ByteString, Dict, Optional, Tuple, Union
 
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageFile
 
 from relax.utils.env import Envs
 
@@ -18,6 +18,11 @@ from .config import MultimodalConfig, get_image_max_token_num, get_image_min_tok
 
 
 SPATIAL_MERGE_SIZE = 2
+QWEN_VL_MAX_ASPECT_RATIO = 200
+QWEN_VL_SAFE_ASPECT_RATIO = 199
+
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 ImageInput = Union[
@@ -26,6 +31,30 @@ ImageInput = Union[
     ByteString,
     str,
 ]
+
+
+def resize_qwen_vl_extreme_aspect_ratio(image: Image.Image) -> Image.Image:
+    """Resize images that exceed Qwen-VL's hard aspect-ratio limit.
+
+    Qwen-VL processors reject images whose long-to-short-side ratio is greater
+    than 200 before their normal pixel and patch-alignment resize runs. Expand
+    only the short side to keep the long-side pixels intact; Qwen's processor
+    remains responsible for its checkpoint-specific pixel and patch limits.
+    """
+    height, width = image.height, image.width
+    short_side = max(min(height, width), 1)
+    aspect_ratio = max(height, width) / short_side
+    if aspect_ratio <= QWEN_VL_MAX_ASPECT_RATIO:
+        return image
+
+    target_short_side = math.ceil(max(height, width) / QWEN_VL_SAFE_ASPECT_RATIO)
+    if height > width:
+        target_height = height
+        target_width = target_short_side
+    else:
+        target_width = width
+        target_height = target_short_side
+    return image.resize((target_width, target_height), Image.LANCZOS)
 
 
 def get_resize_height_width(

@@ -144,6 +144,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
     if not isinstance(messages, list):
         raise TypeError(f"messages must be a list, got {type(messages)}")
 
+    system_chunks: list[str] = []
     ensured: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -176,7 +177,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
                 raise ValueError(f"messages[{index}].content must not be empty")
             content = ""
         elif isinstance(content, str):
-            if not content and not assistant_allows_empty_content:
+            if not content and role != "tool" and not assistant_allows_empty_content:
                 raise ValueError(f"messages[{index}].content must not be empty")
         elif isinstance(content, list):
             if not content:
@@ -188,6 +189,12 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
                     raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
+        if role == "system":
+            if isinstance(content, str):
+                system_chunks.append(content)
+            else:
+                system_chunks.extend(part["text"] for part in content if isinstance(part.get("text"), str))
+            continue
         rendered_message = {"role": role, "content": copy.deepcopy(content)}
         if has_reasoning_content:
             rendered_message["reasoning_content"] = reasoning_content
@@ -196,6 +203,8 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
         if role == "tool" and tool_call_id is not None:
             rendered_message["tool_call_id"] = tool_call_id
         ensured.append(rendered_message)
+    if system_chunks:
+        return [{"role": "system", "content": "\n\n".join(system_chunks)}, *ensured]
     return ensured
 
 
@@ -208,7 +217,16 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             raise TypeError(f"tools[{index}] must be a dict, got {type(tool)}")
-        normalized.append(tool)
+        function = tool.get("function")
+        if tool.get("type") != "function" or not isinstance(function, dict):
+            continue
+        normalized_function = {
+            "name": function.get("name"),
+            "parameters": function.get("parameters"),
+        }
+        if function.get("description") is not None:
+            normalized_function["description"] = function["description"]
+        normalized.append({"type": "function", "function": normalized_function})
     return normalized
 
 
@@ -749,6 +767,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
+        response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
@@ -770,7 +789,9 @@ class SessionForest:
                 if first_response_node is None:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
+                response_node_spans.append([response_start, len(continuation_train_tokens)])
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
@@ -824,6 +845,7 @@ class SessionForest:
             response=_decode_tokens(tokenizer=tokenizer, token_ids=continuation_train_tokens),
             response_length=len(continuation_train_tokens),
             label=self.label,
+            custom_advantage=response_node_spans,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
             rollout_log_probs=rollout_log_probs,

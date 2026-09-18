@@ -1,0 +1,38 @@
+{
+  "Relax LoRA fine-tune": {
+    "eval_delta": 0.05119999999999991,
+    "eval_final": 0.8643,
+    "eval_points": 11,
+    "eval_start": 0.8131,
+    "reward_final": 0.8647,
+    "reward_first10_mean": 0.80677,
+    "reward_last10_delta_vs_first10": 0.04764999999999997,
+    "reward_last10_mean": 0.85442,
+    "reward_points": 100,
+    "reward_start": 0.8066
+  },
+  "Relax full fine-tune": {
+    "eval_delta": 0.047599999999999976,
+    "eval_final": 0.8607,
+    "eval_points": 11,
+    "eval_start": 0.8131,
+    "reward_final": 0.8601,
+    "reward_first10_mean": 0.8085100000000001,
+    "reward_last10_delta_vs_first10": 0.04477999999999993,
+    "reward_last10_mean": 0.85329,
+    "reward_points": 100,
+    "reward_start": 0.8065
+  },
+  "Reference baseline": {
+    "eval_delta": 0.04679999999999995,
+    "eval_final": 0.862,
+    "eval_points": 11,
+    "eval_start": 0.8152,
+    "reward_final": 0.8622,
+    "reward_first10_mean": 0.80748,
+    "reward_last10_delta_vs_first10": 0.04478000000000004,
+    "reward_last10_mean": 0.85226,
+    "reward_points": 100,
+    "reward_start": 0.805
+  }
+}

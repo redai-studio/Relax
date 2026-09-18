@@ -7,8 +7,11 @@ Run with: pytest tests/utils/data/test_streaming_dataset.py -v
 import json
 import os
 import tempfile
+import threading
+import time
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 
@@ -282,6 +285,86 @@ class TestSampleBuffer:
         assert buffer.get(0) is None
 
 
+class TestPrefetchBuffer:
+    """Tests for PrefetchBuffer race behavior."""
+
+    def test_chunk_size_is_clamped_to_cache_capacity(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        def process_fn(idx: int) -> str:
+            return f"sample-{idx}"
+
+        buffer = PrefetchBuffer(process_fn, chunk_size=8, max_cached=1, num_workers=1)
+        buffer.set_index_order([0])
+        try:
+            assert buffer.wait_for(0, timeout=2)
+            found, sample = buffer.get_cached(0)
+            assert found is True
+            assert sample == "sample-0"
+        finally:
+            buffer.stop()
+
+    def test_missed_inflight_index_is_not_stored_as_stale_cache(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        background_started = threading.Event()
+        release_background = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+
+        def process_fn(idx: int) -> str:
+            thread_name = threading.current_thread().name
+            with calls_lock:
+                calls.append((idx, thread_name))
+            if idx == 0 and thread_name.startswith("pf"):
+                background_started.set()
+                assert release_background.wait(timeout=2)
+            return f"sample-{idx}-{thread_name}"
+
+        buffer = PrefetchBuffer(process_fn, chunk_size=1, max_cached=4, num_workers=1)
+        buffer.set_index_order([0, 1])
+        try:
+            assert background_started.wait(timeout=2)
+
+            sample = buffer.get(0)
+            assert sample.startswith("sample-0-")
+
+            release_background.set()
+            for _ in range(200):
+                with buffer._lock:
+                    cached_keys = set(buffer._cache)
+                    stale_drops = buffer._prefetch_stale_drops
+                if 1 in cached_keys and stale_drops:
+                    break
+                time.sleep(0.01)
+
+            with buffer._lock:
+                assert 0 not in buffer._cache
+                assert 1 in buffer._cache
+                assert buffer._prefetch_stale_drops == 1
+
+            assert any(idx == 0 and name.startswith("pf") for idx, name in calls)
+            assert any(idx == 0 and not name.startswith("pf") for idx, name in calls)
+        finally:
+            release_background.set()
+            buffer.stop()
+
+    def test_wait_for_returns_false_when_no_thread_started(self):
+        from relax.utils.data.streaming_dataset import PrefetchBuffer
+
+        buffer = PrefetchBuffer(lambda idx: f"sample-{idx}", chunk_size=1, max_cached=1, num_workers=1)
+        result = []
+
+        waiter = threading.Thread(target=lambda: result.append(buffer.wait_for(0, timeout=None)), daemon=True)
+        waiter.start()
+        try:
+            waiter.join(timeout=0.5)
+            assert not waiter.is_alive()
+            assert result == [False]
+        finally:
+            buffer.stop()
+
+
 class TestIndexManager:
     """Tests for IndexManager class."""
 
@@ -296,6 +379,20 @@ class TestIndexManager:
         manager2.shuffle(0)
 
         assert manager1.indices == manager2.indices
+
+    def test_shuffle_matches_huggingface_dataset(self):
+        """Match ms-swift's dataset shuffle followed by Megatron's sampler."""
+        from relax.utils.data.streaming_dataset import IndexManager
+
+        manager = IndexManager(total_size=100, seed=42)
+        manager.shuffle(0)
+
+        import torch
+
+        dataset_seed = int(np.random.RandomState(42).randint(0, np.iinfo(np.int32).max))
+        dataset_indices = np.random.default_rng(dataset_seed).permutation(100)
+        sampler_indices = torch.randperm(100, generator=torch.Generator().manual_seed(0)).numpy()
+        assert manager.indices == dataset_indices[sampler_indices].tolist()
 
     def test_shuffle_different_epochs(self):
         """Test that different epochs produce different shuffles."""
@@ -568,7 +665,7 @@ class TestStreamingDataset:
                 if os.path.exists(path):
                     os.unlink(path)
 
-    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer, monkeypatch):
+    def test_dataset_multi_file_global_slice_get_batch_across_epoch(self, mock_tokenizer):
         """Test get_batch preserves the sliced multi-file domain across epoch
         wraparound."""
         from relax.utils.data.streaming_dataset import StreamingDataset
@@ -583,8 +680,6 @@ class TestStreamingDataset:
                         f.write(json.dumps(item) + "\n")
                     files.append(f.name)
 
-            monkeypatch.setattr("random.shuffle", lambda seq: None)
-
             path = f"[{files[0]},{files[1]}]@[1:5]"
             dataset = StreamingDataset(
                 path=path,
@@ -597,7 +692,10 @@ class TestStreamingDataset:
             samples1, crossed1 = dataset.get_batch(3)
             samples2, crossed2 = dataset.get_batch(3)
 
-            assert [sample.prompt for sample in samples1] == ["A1", "A2", "B0"]
+            prompts1 = [sample.prompt for sample in samples1]
+            assert len(prompts1) == 3
+            assert len(set(prompts1)) == 3
+            assert set(prompts1).issubset({"A1", "A2", "B0", "B1"})
             prompts2 = [sample.prompt for sample in samples2]
             # The public contract is that batching stays within the sliced
             # multi-file domain and wraps across epochs when needed. The

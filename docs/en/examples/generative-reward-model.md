@@ -98,7 +98,7 @@ Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three f
  └─────────────────────────────────────────────────┘
 ```
 
-All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
+All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
 
 ## Scripts
 
@@ -106,7 +106,7 @@ All three colocate sub-modes reclaim every GPU for the Actor during training. Ro
 | :---------------------------------------------- | :------------------------- | :----------------------------------------------------------------------------- |
 | `run-qwen3-4B-8xgpu-colocated.sh`               | Split (small GenRM)        | Qwen3-4B policy + small GenRM on 8 GPU; disjoint bundles, inline reward        |
 | `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split (large GenRM)        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; 8+8 disjoint shards, inline reward  |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; shared bundles, two-phase sleep-wake swap, batched reward via [`post_process_genrm_swap.py`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap        | 35B-A3B policy + 397B FP8 GenRM on 16 GPU; shared bundles, two-phase sleep-wake swap, batched reward via [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
 | `run-qwen3-4B-8xgpu-async.sh`                   | (Fully Async)              | Independent GPU pools per role; rollout & training fully overlapped             |
 
 ### Resource Layout
@@ -268,7 +268,7 @@ On `--colocate` with GenRM, the GPU layout picks Split vs Shared automatically:
 | `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (same bundles) |
 | Anything else                                        | Rejected at startup with a clear error |
 
-Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
+Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
 :::
 
 ::: warning Set `mem_fraction_static` in Shared / Co-resident
@@ -287,6 +287,140 @@ python3 relax/entrypoints/train.py \
     --fully-async \
     --rm-type dapo-genrm
 ```
+
+## Multi-Instance GenRM (multiple judge models behind one service)
+
+Everything above deploys a single judge model. `--genrm-instances` lets **one GenRM Serve deployment host several independent judge models at once** — different sizes, different checkpoints, different scoring criteria — each addressed by a `route_key` string the caller supplies per request. The Serve deployment, HTTP route (`/genrm`), and health/metrics endpoints stay the same; only the request payload gains one field.
+
+This is the natural fit for:
+
+- **Multi-objective reward** — e.g. one instance scores answer correctness, another scores safety/harmlessness, and your reward function combines both into a single training signal.
+- **Agentic pipelines** — different modules along an agent's trajectory (planner, tool-caller, final-answer judge, ...) can each be scored by a judge suited to that module, without standing up a separate GenRM deployment (and a separate GPU carve-out) per module.
+
+### `--genrm-instances` CLI Argument
+
+| Argument            | Type   | Default | Description                                                                                   |
+| :------------------- | :----- | :------ | :---------------------------------------------------------------------------------------------- |
+| `--genrm-instances` | `JSON` | `None`  | JSON dict of `{route_key: instance_spec}`. Setting this takes **priority** over `--genrm-model-path` (the legacy single-instance flags are ignored with a warning if both are set). |
+
+Each `instance_spec` is a dict with these keys:
+
+| Key                   | Type    | Required | Description                                                                 |
+| :--------------------- | :------ | :------- | :----------------------------------------------------------------------------- |
+| `model_path`           | `str`   | ✅ yes   | Path to this instance's judge model                                            |
+| `num_gpus`             | `int`   | ✅ yes   | GPU budget for this instance. **No implicit even split** across instances — every instance must state its own budget explicitly. |
+| `num_gpus_per_engine`  | `int`   | no       | GPUs per SGLang engine for this instance. Defaults to the global `--genrm-num-gpus-per-engine`. |
+| `engine_config`        | `dict`  | no       | Per-instance engine config (e.g. `max_context_len`, `mem_fraction_static`). Defaults to the global `--genrm-engine-config`. |
+| `sampling_config`      | `dict`  | no       | Per-instance sampling params. Defaults to the global `--genrm-sampling-config`. |
+
+The legacy `--genrm-model-path` config still works unchanged — internally it is normalized into a single-instance `--genrm-instances` config under a reserved `"__default__"` key, so requests that omit `route_key` (or scripts that never adopt `--genrm-instances`) keep working exactly as before.
+
+### Example: Two Judges, Split Bundles
+
+The following mirrors [`run-qwen3-4B-8xgpu-dual-genrm-split.sh`](https://github.com/xhs-tech/Relax/blob/main/examples/generate_reward_model/run-qwen3-4B-8xgpu-dual-genrm-split.sh): an 8-GPU Split layout where rollout gets 4 GPU and two GenRM instances share the other 4 GPU (2 GPU each):
+
+```bash
+python3 relax/entrypoints/train.py \
+    --genrm-instances '{
+        "quality": {"model_path": "/path/to/quality-judge", "num_gpus": 2, "num_gpus_per_engine": 2,
+                     "sampling_config": {"temperature": 0.1, "max_response_len": 64}},
+        "safety":  {"model_path": "/path/to/safety-judge",  "num_gpus": 2, "num_gpus_per_engine": 2,
+                     "sampling_config": {"temperature": 0.1, "max_response_len": 32,
+                                          "chat_template_kwargs": {"enable_thinking": false}}}
+    }' \
+    --rollout-num-gpus 4 \
+    --resource '{"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]}' \
+    --colocate \
+    --custom-rm-path examples.generate_reward_model.reward_dual_genrm_quality_safety.reward_func \
+    --reward-key score
+```
+
+`--resource`'s `"genrm"` entry must equal the **sum** of every instance's `num_gpus` (`2 + 2 = 4` here); the Split-vs-Shared bundle math from [Configuration](#configuration) above otherwise applies unchanged to the combined total.
+
+::: tip Disable "thinking" mode for judges that must answer tersely
+If a judge model defaults to emitting a long reasoning trace before its verdict (common for reasoning-tuned models), the reward function's loose parser may fail to find a clean `1`/`0` and silently score everything `0`. Pass `"chat_template_kwargs": {"enable_thinking": false}` inside that instance's `sampling_config` to force a direct answer, as shown for `safety` above.
+:::
+
+### Calling a Specific Instance: `route_key`
+
+From a reward function (or any code holding a `GenRMClient`), pass `route_key` to select which instance answers the call:
+
+```python
+from relax.utils.genrm_client import get_genrm_client
+
+genrm_client = get_genrm_client()
+
+quality_response = await genrm_client.generate(
+    messages=[{"role": "user", "content": "Judge correctness..."}],
+    route_key="quality",
+)
+safety_response = await genrm_client.generate(
+    messages=[{"role": "user", "content": "Judge safety..."}],
+    route_key="safety",
+)
+```
+
+Over HTTP, `route_key` is just one more field in the `/generate` request body:
+
+```bash
+curl -X POST http://localhost:8000/genrm/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Judge safety..."}],
+    "route_key": "safety"
+  }'
+```
+
+Omitting `route_key` routes to the sole `"__default__"` instance — this is exactly what happens when the service was configured with the legacy `--genrm-model-path` flag instead of `--genrm-instances`. Passing a `route_key` that was never declared in `--genrm-instances` fails the request with a clear "no GenRM instance registered" error rather than a silent misroute.
+
+The `/health` and `/metrics` endpoints report **per-instance** detail once `--genrm-instances` is used:
+
+```bash
+curl http://localhost:8000/genrm/health
+```
+
+```json
+{
+  "status": "healthy",
+  "service": "genrm",
+  "instances": {
+    "quality": {"status": "healthy"},
+    "safety": {"status": "healthy"}
+  }
+}
+```
+
+### Agentic Example: Routing by Module
+
+In an agentic rollout, different trajectory steps typically already carry `metadata` identifying which module produced them (planner step, tool call, final answer, ...). A custom reward function can read that field and map it directly to a `route_key`, instead of hardcoding two fixed calls the way `reward_dual_genrm_quality_safety.py` does:
+
+```python
+# --genrm-instances '{"planner_judge": {...}, "tool_call_judge": {...}, "final_answer_judge": {...}}'
+
+MODULE_TO_ROUTE_KEY = {
+    "plan": "planner_judge",
+    "tool_call": "tool_call_judge",
+    "final_answer": "final_answer_judge",
+}
+
+async def agentic_reward_func(args, sample, **kwargs) -> dict:
+    genrm_client = get_genrm_client()
+    per_step_scores = []
+    for step in sample.metadata["trajectory_steps"]:
+        route_key = MODULE_TO_ROUTE_KEY[step["module"]]
+        judge_response = await genrm_client.generate(
+            messages=_format_step_messages(step),
+            route_key=route_key,
+        )
+        per_step_scores.append(_parse_judgement(judge_response))
+
+    # Aggregation is entirely up to you: weighted average, min() for a
+    # "weakest-link" penalty, or scoring only the final step and treating
+    # earlier ones as process reward — Relax does not prescribe one.
+    return {"score": sum(per_step_scores) / len(per_step_scores)}
+```
+
+Size each judge's GPU budget for its role in the pipeline (a fast small model for high-frequency tool-call checks, a larger model for the final-answer judge that runs once per trajectory), and make sure the sum of every instance's `num_gpus` still satisfies the Split/Shared bundle equation from [Configuration](#configuration).
 
 ## Script Walkthrough
 
@@ -425,12 +559,14 @@ print(response)  # "1" or "0"
 5. **Use low sampling temperature**: A temperature of 0.1 produces deterministic evaluations; increase only if evaluation diversity is desired.
 6. **Monitor health**: Periodically check the `/health` endpoint to ensure GenRM engines are running properly.
 7. **Match GPU allocation to model size**: For large GenRM models (e.g., 30B), use shared mode with `--genrm-num-gpus-per-engine` set to the full cluster size.
+8. **State every instance's `num_gpus` explicitly under `--genrm-instances`**: there is no automatic even split across instances, so undersized or oversized instances are a config mistake, not a framework default — size each one to the judge model it runs.
+9. **Disable "thinking" mode for judges expected to answer tersely**: reasoning-tuned models often emit a long trace before a short verdict by default; set `"chat_template_kwargs": {"enable_thinking": false}` in that instance's `sampling_config` if your parser expects a bare `1`/`0`.
 
 ## Troubleshooting
 
 ### GenRM Not Enabled
 
-Ensure `--genrm-model-path` is set. GenRM is only activated when this argument is not `None`.
+Ensure `--genrm-model-path` (or `--genrm-instances`) is set. GenRM is only activated when at least one instance is configured.
 
 ### Resource Allocation Error in Colocated Mode
 
@@ -455,7 +591,15 @@ If GenRM engines fail to initialize:
 
 ### GenRM Always Returns 0
 
-The DAPO-GenRM reward function uses strict equality to parse responses — only an exact `"1"` string yields a positive score. If the GenRM model outputs anything else (e.g., `"1."`, `"Yes"`, or multi-line text), the score will be 0. Verify that the GenRM model and prompt template produce clean `"1"` / `"0"` outputs.
+The DAPO-GenRM reward function uses strict equality to parse responses — only an exact `"1"` string yields a positive score. If the GenRM model outputs anything else (e.g., `"1."`, `"Yes"`, or multi-line text), the score will be 0. Verify that the GenRM model and prompt template produce clean `"1"` / `"0"` outputs. If the judge is a reasoning-tuned model, check whether it is emitting a `<think>` trace before its verdict — see the "thinking mode" tip under [Multi-Instance GenRM](#multi-instance-genrm-multiple-judge-models-behind-one-service).
+
+### `--genrm-instances`: "missing required key 'num_gpus'"
+
+Every instance in `--genrm-instances` must state its own `num_gpus` explicitly — there is no implicit even split across instances (unlike some multi-teacher scheduling elsewhere in Relax). Add `"num_gpus": <n>` to the instance's config.
+
+### "No GenRM instance registered for route_key=..."
+
+The reward function (or direct HTTP caller) passed a `route_key` that doesn't match any key in `--genrm-instances`. Check for a typo, or confirm the service was actually started with `--genrm-instances` rather than the legacy `--genrm-model-path` (which only exposes the `"__default__"` key — passing any other `route_key` against a single-instance deployment fails the same way).
 
 ## File Structure
 
@@ -466,7 +610,9 @@ examples/generate_reward_model/
 ├── run-qwen3-4B-8xgpu-colocated.sh                        # 4B colocate mode
 ├── run-qwen3-4B-8xgpu-async.sh                            # 4B fully async mode
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B, split-bundle inline reward
-└── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B, shared-bundle two-phase swap
+├── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B, shared-bundle two-phase swap
+├── run-qwen3-4B-8xgpu-dual-genrm-split.sh                 # 4B policy + two GenRM instances (--genrm-instances), split-bundle
+└── reward_dual_genrm_quality_safety.py                    # Custom reward routing to two GenRM instances via route_key
 ```
 
 ## Further Reading

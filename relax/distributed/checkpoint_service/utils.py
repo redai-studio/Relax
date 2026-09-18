@@ -13,12 +13,13 @@ logger = get_logger(__name__)
 
 
 def load_weight(args, model, weights: list[tuple[str, torch.Tensor]]) -> None:
-    """Load a list of (name, tensor) weights into the local model parameters.
+    """Load a list of (name, tensor) weights into the local model state.
 
     Handles expert index remapping and TP chunking to map the received full
-    tensors into each rank's sharded parameter.
+    tensors into each rank's sharded parameter or persistent buffer.
     """
     params_dict = dict(model[0].named_parameters())
+    params_dict.update(model[0].named_buffers())
     if args.num_experts:
         num_local_experts = args.num_experts // args.expert_model_parallel_size
         local_experts_range = list(
@@ -30,8 +31,8 @@ def load_weight(args, model, weights: list[tuple[str, torch.Tensor]]) -> None:
 
     for name, loaded_weight in weights:
         name = name.removeprefix("module.")
-        if "mlp.experts" in name:
-            m = re.search(r"weight(\d+)$", name)
+        m = re.search(r"weight(\d+)$", name) if args.num_experts and "mlp.experts" in name else None
+        if m is not None:
             if int(m.group(1)) in local_experts_range:
                 name = name[: m.start()] + f"weight{int(m.group(1)) % num_local_experts}"
             else:

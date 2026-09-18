@@ -1,11 +1,17 @@
 # Context linearity
 
-Audit the exact model-visible sequence for each logical agent context:
+Audit the exact model-visible sequence for each logical agent context after protocol projection:
 
 ```text
-request = messages + tools + chat_template_kwargs
-response = choices[0].message
+Chat messages | Responses input Items | Messages system + messages
+-> canonical messages + function tools + chat_template_kwargs
+-> canonical assistant response
+-> protocol response
 ```
+
+Chat, Responses, and Messages requests must replay complete history. Responses `previous_response_id` does not
+contribute lineage state. Preserve the interface payload required by the client and compare the projected canonical
+state for SessionForest identity.
 
 ## Linear transition
 
@@ -62,7 +68,8 @@ For changing tools:
   design.
 
 Implicit export is reserved for an audited strictly linear history. Any retained nonlinear topology uses explicit
-export. Multiple exported contexts require custom advantage and dynamic batching.
+export. Explicit records use canonical Chat-shaped messages and tools even when requests used Responses or Messages.
+Multiple exported contexts require custom advantage and dynamic batching.
 
 ## Audit output
 
@@ -70,7 +77,7 @@ export. Multiple exported contexts require custom advantage and dynamic batching
 Context ID:
 Transition: append | fork | concurrent sibling | reset
 Matched committed parent:
-Messages prefix preserved: yes/no
+Canonical messages prefix preserved: yes/no
 Tools fingerprint stable: yes/no
 Template kwargs stable: yes/no
 Intentional: yes/no/unknown

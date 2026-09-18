@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping, QKVMapping, ReplicatedMapping
-from megatron.bridge.models.hf_pretrained.vlm import PreTrainedVLM
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from transformers import Qwen3OmniMoeForConditionalGeneration
 
 from relax.models.qwen_omni.modeling_qwen3_omni.model import Qwen3OmniMoeModel
@@ -42,7 +42,7 @@ class Qwen3OmniMoEBridge(MegatronModelBridge):
         super().__init__()
         self.hf_weights_cache = {}
 
-    def provider_bridge(self, hf_pretrained: PreTrainedVLM) -> Qwen3OmniModelProvider:
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Qwen3OmniModelProvider:
         """Create a Qwen3OmniModelProvider from a HuggingFace pretrained MoE
         model.
 

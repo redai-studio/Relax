@@ -194,15 +194,15 @@ SOURCE_SHA=$(git rev-parse HEAD)
 VALIDATE_BRANCH=sync/validate-github-main-$(git rev-parse --short HEAD)
 
 git push github HEAD:refs/heads/$VALIDATE_BRANCH
-gh workflow run ci.yml -R redai-infra/Relax --ref $VALIDATE_BRANCH
-gh run list -R redai-infra/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
+gh workflow run ci.yml -R redai-studio/Relax --ref $VALIDATE_BRANCH
+gh run list -R redai-studio/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
 ```
 
 盯 run：
 
 ```bash
-gh run watch <run-id> -R redai-infra/Relax
-gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headBranch,headSha,url
+gh run watch <run-id> -R redai-studio/Relax
+gh run view <run-id> -R redai-studio/Relax --json status,conclusion,headBranch,headSha,url
 ```
 
 门禁：
@@ -215,11 +215,11 @@ gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headBranch,he
 失败处置：
 
 ```bash
-gh run view <run-id> -R redai-infra/Relax --log-failed
+gh run view <run-id> -R redai-studio/Relax --log-failed
 ```
 
 - 需要改代码：本地修 → commit → push 到验证分支 → 重新 `gh workflow run ci.yml`。旧 run 不能证明新代码。
-- 确认瞬时失败且代码未变：`gh run rerun <run-id> -R redai-infra/Relax --failed`。
+- 确认瞬时失败且代码未变：`gh run rerun <run-id> -R redai-studio/Relax --failed`。
 
 CI 全绿前禁止执行下一步。
 

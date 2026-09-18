@@ -57,12 +57,17 @@ sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768
 
 # ── environment setup ───────────────────────────────────────────────────────
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./kernel-cache.sh
+source "${DIR}/kernel-cache.sh"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
 export RELAX=${RELAX:-${DIR}/../../}
 export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
+
+relax_kernel_cache_configure "${RUN_SCRIPT}" "$@"
+relax_kernel_cache_prepare_local
 
 # ── NVLink detection ────────────────────────────────────────────────────────
 if [ -e /dev/xpuctrl ]; then
@@ -83,24 +88,6 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 # ── multi-node parameters ──────────────────────────────────────────────────
 NUM_GPUS="${NUM_GPUS:-8}"
 NNODES="${WORLD_SIZE:-2}"
-
-# infer cpu threads num ──────────────────────────────────────────────────
-NUM_GPUS_TOTAL="${NUM_GPUS_TOTAL:-8}"
-if [ -z "${CPU_THREADS_PER_ACTOR:-}" ]; then
-    _cores_per_socket=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket:/ {gsub(/ /,"",$2); print $2; exit}')
-    _sockets=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\):/ {gsub(/ /,"",$2); print $2; exit}')
-    if [ -n "${_cores_per_socket}" ] && [ -n "${_sockets}" ] && [ "${_sockets}" -gt 0 ]; then
-        _total_phys=$((_cores_per_socket * _sockets))
-        CPU_THREADS_PER_ACTOR=$((_total_phys / NUM_GPUS_TOTAL))
-        # clamp to [4, 64], avoid bad values
-        [ "${CPU_THREADS_PER_ACTOR}" -lt 4 ] && CPU_THREADS_PER_ACTOR=4
-        [ "${CPU_THREADS_PER_ACTOR}" -gt 64 ] && CPU_THREADS_PER_ACTOR=64
-    else
-        CPU_THREADS_PER_ACTOR=24
-    fi
-fi
-echo "[cpu-threads] NUM_GPUS_TOTAL=${NUM_GPUS_TOTAL} CPU_THREADS_PER_ACTOR=${CPU_THREADS_PER_ACTOR}"
-export CPU_THREADS_PER_ACTOR
 
 # ── head node vs worker node ───────────────────────────────────────────────
 if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
@@ -132,6 +119,8 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
             sleep 5
         fi
     done
+
+    relax_kernel_cache_start_agents attach
 
     # Delegate to the training script
     echo "=== Launching training script: $RUN_SCRIPT ==="
@@ -165,6 +154,7 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
 
 }
 }"
+    relax_kernel_cache_inject_runtime_env
     exec bash "$RUN_SCRIPT" "$@"
 else
     # ── WORKER NODE ─────────────────────────────────────────────────────────

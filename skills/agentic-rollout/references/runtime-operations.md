@@ -1,7 +1,7 @@
 # Runtime operations
 
 Contents: [process](#agent-process-contract), [client timeout](#relax-facing-agent-client-timeout),
-[Chat API](#chat-api-compatibility), [parsers](#parser-preflight), [optional controls](#optional-runtime-controls),
+[model APIs](#model-api-contract), [parsers](#parser-preflight), [optional controls](#optional-runtime-controls),
 [errors](#error-and-cleanup-categories), [evidence](#observable-evidence).
 
 ## Agent process contract
@@ -15,8 +15,9 @@ and it does not bound the first-request barrier, backend abort, or finalization 
 
 ## Relax-facing agent client timeout
 
-The **agent client** in this skill means the client inside the agent application that sends Chat Completions requests to
-`RELAX_BASE_URL` and authenticates with `RELAX_SESSION_ID`. Its timeout applies to each individual request.
+The **agent client** in this skill means the client inside the agent application that sends Chat Completions, Responses,
+or Messages requests to `RELAX_BASE_URL` and authenticates with `RELAX_SESSION_ID`. Its timeout applies to each
+individual request.
 
 One Relax-facing request can remain open without a final response while:
 
@@ -42,24 +43,32 @@ such as `timeout=9999` is evidence only after comparing it with the real run's w
 | `UNSAFE` | A known timeout is shorter than a possible prelaunch, partial-rollout, or fully-async wait |
 | `UNVERIFIED` | Client construction or intermediary idle timeouts are unknown |
 
-## Chat API compatibility
+## Model API contract
 
-| Capability | Contract |
+| Capability | Shared contract |
 | --- | --- |
-| Authentication | Bearer token is the Relax Session ID |
-| Context | Complete `messages`; stable `tools` and `chat_template_kwargs` |
-| Message roles | `user`, `assistant`, `tool`, and `system`; `developer` needs a harness-side compatibility decision |
-| Empty content | User/system/tool content cannot be missing, `null`, `""`, or an empty list; assistant may omit text content with tool calls or nonempty reasoning |
-| Template controls | `add_generation_prompt`, `tokenize`, and `tools` are reserved in `chat_template_kwargs`; send tools at top level |
-| Streaming / fanout | `stream=false`; `n=1` |
-| Logprobs | `logprobs` may be returned; `top_logprobs` is unsupported |
-| Legacy functions | `functions` and legacy `function_call` are unsupported |
-| Tool steering | `tool_choice` and `parallel_tool_calls` do not steer generation |
-| Sampling | Training supplies temperature/top-p; request values are not authoritative |
-| Turn controls | `max_completion_tokens` and legacy `max_tokens` are supported; the newer field wins; `stop` and `seed` are supported |
-| Response parsing | Optional Relax-side reasoning parser runs before the optional tool-call parser; tool parsing requires `tools` |
+| Authentication | `Authorization: Bearer <RELAX_SESSION_ID>` |
+| Context | Complete history on every request; stable tools and applicable template arguments |
+| Canonical state | Protocol payload projects to `messages + function tools + chat_template_kwargs` before SessionForest matching |
+| Transport | JSON for missing/false `stream`; Buffered SSE for `stream=true` |
+| Buffered SSE | Connection frame and 15-second heartbeats while pending; complete terminal events after generation |
+| Model | Request `model` is echoed and does not select the backend |
+| Sampling | Training supplies temperature/top-p; request values do not control them |
+| Response parsing | Optional reasoning parser runs before the optional tool-call parser; tool parsing requires normalized tools |
 
-Verify the current source before adapting a client. Do not infer full OpenAI compatibility from a successful basic request.
+| Interface | Consumed request shape | Response shape |
+| --- | --- | --- |
+| Chat Completions | Complete `messages`; nested function `tools`; `chat_template_kwargs`; `max_completion_tokens` or legacy `max_tokens`; `stop`; `seed`; `logprobs` | Chat completion JSON, or one complete chunk with usage plus `[DONE]`; `include_usage` does not change this shape |
+| Responses | Optional `instructions`; complete typed `input` with message/reasoning/function-call Items; flat function `tools`; `max_output_tokens` | Response JSON, or created/output-item-done/completed, incomplete, or failed events |
+| Messages | Complete `system + messages` with text/image/thinking/tool blocks; `input_schema` tools; required `max_tokens`; `stop_sequences` | Anthropic message JSON, or ping/content-block/message terminal events |
+
+Pass `RELAX_BASE_URL` unchanged to a standard client that appends its own resource path. For a custom HTTP client, build
+the final URL as `RELAX_BASE_URL.rstrip("/") + endpoint`, using the endpoint from the interface table. Verify the final
+URL rather than the configured base alone, and preserve the existing Relax route prefix during URL resolution.
+
+Responses `previous_response_id` does not continue Relax state. Explicit export uses canonical Chat-shaped records for
+all request protocols. Verify the current source before adapting a client; a successful basic request does not prove
+that every client payload shape is consumed.
 
 ## Parser preflight
 
@@ -92,8 +101,8 @@ SGLang request permits are independent from external agent slots and program-adm
 | Agent exits/fails under the process contract | Controlled Session failure; Group is dropped |
 | Runtime/backend/transport failure | `RuntimeGroupError` |
 | Explicit export misses committed state | Non-finalizable Session; its Runtime Group is dropped |
-| Context length exceeded | OpenAI-style 400 |
-| Unknown/discarded Session | OpenAI-style 404 |
+| Context length exceeded | HTTP 400 in the endpoint's JSON error envelope, or terminal SSE error after streaming starts |
+| Unknown/discarded Session | HTTP 404 in the endpoint's error envelope |
 | Process active-time exhausted | Process-group termination |
 | Relax-facing client deadline expires | Agent-side request failure or disconnect before Relax completes the Session request |
 

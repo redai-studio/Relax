@@ -94,6 +94,56 @@ def test_rollout_minibatch_plan_rejects_non_divisible_prompt_groups(monkeypatch)
         data_module.build_rollout_minibatch_plan(args, dp_size=2)
 
 
+def test_log_rollout_data_creates_collective_stats_on_training_device(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    loss_masks = [torch.tensor([0, 1]), torch.tensor([0, 1, 1])]
+    requested_devices = []
+    original_tensor = torch.tensor
+
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        data_module.mpu,
+        "get_data_parallel_group",
+        lambda with_context_parallel=True: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: "training-device")
+
+    def capture_tensor(*args, **kwargs):
+        requested_devices.append(kwargs.get("device"))
+        kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(data_module.torch, "tensor", capture_tensor)
+    monkeypatch.setattr(data_module.dist, "all_reduce", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(data_module, "gather_log_data", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *_args, **_kwargs: None)
+
+    args = Namespace(
+        qkv_format="thd",
+        is_vl_model=False,
+        uses_unsplit_forward=False,
+        dynamic_context_parallel=False,
+        use_opd=False,
+        rollout_batch_size=2,
+        n_samples_per_prompt=1,
+        ci_test=False,
+        log_multi_turn=False,
+        log_correct_samples=False,
+    )
+    rollout_data = {
+        "total_lengths": [4, 6],
+        "response_lengths": [2, 3],
+        "loss_masks": loss_masks,
+    }
+
+    data_module.log_rollout_data(rollout_id=0, args=args, rollout_data=rollout_data)
+
+    assert requested_devices == ["training-device"]
+
+
 def test_concat_rollout_batches_preserves_order_and_scalar_metadata(monkeypatch):
     data_module = _load_data_module(monkeypatch)
 
