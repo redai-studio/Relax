@@ -1,11 +1,15 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import logging
 import math
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import torch
 
 from relax.algorithms.spec import get_algorithm
+from relax.utils.repetition import compression_ratio as compression_ratio
+from relax.utils.repetition import has_repetition as has_repetition
 from relax.utils.types import Sample
 
 
@@ -231,57 +235,6 @@ def compute_rollout_reward_metrics(
 
 
 compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
-
-
-def compression_ratio(
-    data: str | bytes,
-    *,
-    encoding: str = "utf-8",
-    algorithm: Literal["zlib", "gzip", "bz2", "lzma"] = "zlib",
-    level: int = 9,
-) -> tuple[float, float]:
-    if isinstance(data, str):
-        raw = data.encode(encoding)
-    else:
-        raw = data
-
-    original = len(raw)
-    if original == 0:
-        return float("inf"), 0.0
-
-    if algorithm == "zlib":
-        import zlib
-
-        compressed = zlib.compress(raw, level)
-    elif algorithm == "gzip":
-        import gzip
-
-        compressed = gzip.compress(raw, compresslevel=level)
-    elif algorithm == "bz2":
-        import bz2
-
-        compressed = bz2.compress(raw, compresslevel=level)
-    elif algorithm == "lzma":
-        import lzma
-
-        compressed = lzma.compress(raw, preset=level)
-    else:
-        raise ValueError(f"Unsupported algorithm: {algorithm}")
-
-    comp_len = len(compressed)
-    if comp_len == 0:
-        return float("inf"), 100.0
-
-    ratio = original / comp_len
-    savings_pct = 100.0 * (1.0 - comp_len / original)
-    return ratio, savings_pct
-
-
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
 
 
 def compute_rollout_step(args, rollout_id):
