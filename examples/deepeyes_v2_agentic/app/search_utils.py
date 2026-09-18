@@ -2,8 +2,10 @@
 
 """Search tool helpers for the DeepEyesV2 env.
 
-* :func:`search` is a placeholder web-search returning canned snippets so the
-  recipe runs end-to-end without a real backend.
+* :func:`search` dispatches to the pluggable backend selected by
+  ``DEEPEYES_V2_SEARCH_BACKEND`` (mock / retriever / external — see
+  :mod:`app.search_backends`), retrying transient failures and keeping the
+  ``"Error"`` sentinel contract the env relies on.
 * :func:`image_search` serves cached results keyed by ``data_idx`` from JSON
   files listed in ``DEEPEYES_V2_SEARCH_CACHE_PATHS`` (colon/comma-separated).
   Missing / unparsable caches degrade to returning ``"Error"`` so the env
@@ -15,11 +17,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
 import time
+
+from app.search_backends import get_max_retries, get_search_backend
 
 
 logger = logging.getLogger(__name__)
+
+_RETRY_BACKOFF_SECONDS = 1.0
 
 
 def _load_image_search_cache() -> dict:
@@ -64,32 +69,35 @@ def _get_image_search_cache() -> dict:
 
 
 def search(query: str, size: int = 5):
-    """Web-search placeholder. Returns canned snippets in the shape::
+    """Text web-search via the configured backend (see
+    ``app.search_backends``).
 
-        {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"?}, ...]}
+    Returns the unified shape::
 
-    Replace with a real backend (Serper / Google / Bing / internal) for
-    production training.
+        {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"}, ...]}
+
+    Backend configuration errors fail fast; transient backend failures are
+    retried ``DEEPEYES_V2_SEARCH_MAX_RETRIES`` times with a fixed backoff.
+    Every failure path returns the ``"Error"`` sentinel so the env surfaces a
+    clean ``search_failed`` observation instead of crashing the agent process.
     """
-    max_try = 3
+    try:
+        backend = get_search_backend()
+    except Exception as e:
+        logger.warning(f"[search] failed to initialise search backend: {e}")
+        return "Error"
+
+    max_try = get_max_retries()
     result = "Error"
     for try_idx in range(max_try):
         try:
-            result = {"elapsed_time": 0.0, "data": []}
-            for i in range(size):
-                result["data"].append(
-                    {
-                        "snippet": f"This is a placeholder snippet for query: {query}",
-                        "title": f"Placeholder Title {i}",
-                        "link": f"http://example.com/{i}",
-                    }
-                )
+            result = backend.search(query, size)
             break
         except Exception as e:
             logger.warning(f"[search] attempt {try_idx + 1}/{max_try} failed: {e}")
             result = "Error"
             if try_idx < max_try - 1:
-                time.sleep((try_idx + 1) * random.randint(1, 5))
+                time.sleep(_RETRY_BACKOFF_SECONDS * (try_idx + 1))
     return result
 
 

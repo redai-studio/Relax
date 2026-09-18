@@ -105,6 +105,71 @@ and propagates it to every Ray worker via `--runtime-env-json`. Set
 `APPTAINER_IMAGE_PATH` explicitly to override (e.g. shared NFS path for
 multi-node).
 
+## Web-search backend (text `search` tool)
+
+The `<tool_call>search</tool_call>` tool dispatches to a pluggable backend
+(`app/search_backends.py`), selected via `DEEPEYES_V2_SEARCH_BACKEND`:
+
+| Backend   | Value       | Notes                                                                        |
+| --------- | ----------- | ---------------------------------------------------------------------------- |
+| Mock      | `mock`      | Default. Deterministic canned snippets — fully offline, no keys, no service. |
+| Retriever | `retriever` | Search-R1 compatible `POST /retrieve` service (see `examples/search_r1`).    |
+| External  | `external`  | Any external search API via a JSON config (built-in defaults target Serper). |
+
+All backends return the unified shape
+`{"elapsed_time", "data": [{"title", "link", "snippet", "date" | null}]}`.
+Timeouts, server errors and malformed responses are retried
+(`DEEPEYES_V2_SEARCH_MAX_RETRIES`, default 3) and then degrade to the env's
+`Error` → `search_failed` convention — the agent process never crashes.
+
+### Environment variables
+
+| Variable                              | Default                           | Scope                        |
+| ------------------------------------- | --------------------------------- | ---------------------------- |
+| `DEEPEYES_V2_SEARCH_BACKEND`          | `mock`                            | backend selection            |
+| `DEEPEYES_V2_SEARCH_TIMEOUT_SECONDS`  | `10`                              | HTTP timeout (real backends) |
+| `DEEPEYES_V2_SEARCH_MAX_RETRIES`      | `3`                               | retry attempts               |
+| `DEEPEYES_V2_SEARCH_RETRIEVER_URL`    | `http://127.0.0.1:17389/retrieve` | retriever endpoint           |
+| `DEEPEYES_V2_SEARCH_RETRIEVER_TOPK`   | the tool's `size` (5)             | retriever top-k              |
+| `DEEPEYES_V2_SEARCH_EXTERNAL_CONFIG`  | built-in Serper mapping           | external JSON config file    |
+| `DEEPEYES_V2_SEARCH_EXTERNAL_API_KEY` | none                              | external API key (env only)  |
+
+The launcher propagates all of them to every Ray worker.
+
+### Example: Search-R1 retriever
+
+```bash
+export DEEPEYES_V2_SEARCH_BACKEND=retriever
+export DEEPEYES_V2_SEARCH_RETRIEVER_URL=http://127.0.0.1:17389/retrieve
+export DEEPEYES_V2_SEARCH_RETRIEVER_TOPK=5
+```
+
+### Example: Serper (external)
+
+```bash
+export DEEPEYES_V2_SEARCH_BACKEND=external
+export DEEPEYES_V2_SEARCH_EXTERNAL_API_KEY="$SERPER_API_KEY"
+```
+
+To adapt a different API, point `DEEPEYES_V2_SEARCH_EXTERNAL_CONFIG` at a JSON
+file overriding any subset of the defaults — endpoint, HTTP method, auth
+header/scheme, request field mapping and response field mapping:
+
+```json
+{
+  "endpoint": "https://google.serper.dev/search",
+  "method": "POST",
+  "auth_header": "X-API-KEY",
+  "auth_scheme": "",
+  "request_map": { "query": "q", "size": "num" },
+  "response_map": { "results": "organic", "title": "title", "link": "link", "snippet": "snippet", "date": "date" }
+}
+```
+
+`response_map.results` is a dot path to the result list (e.g. `"data.items"`);
+the other entries rename each per-result field. Keep the API key in the env
+var — never in the config file or the repo.
+
 ## Image-search cache (optional, only for the `search` split)
 
 The `<tool_call>image_search</tool_call>` branch hits a precomputed
@@ -135,7 +200,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | `app/agent.py`                   | Per-session agent driver                                                                 |
 | `app/env_deepeyes_v2.py`         | Tool handlers (exec_code / exec_tool / close)                                            |
 | `app/prompt.py`                  | Observation templates + sandbox init code                                                |
-| `app/search_utils.py`            | Text + image-search backend                                                              |
+| `app/search_utils.py`            | `search()` dispatch (retry + `Error` convention) + image-search cache                    |
+| `app/search_backends.py`         | Pluggable text-search backends (mock / retriever / external)                             |
 | `app/sandboxes/`                 | Jupyter sandbox abstraction + apptainer backend                                          |
 | `reward_deepeyes_v2.py`          | Post-trajectory scorer (data_source-routed, LLM-judge)                                   |
 | `convert_tool/`                  | `rl_data_convert.py` (data_source injection) + `cache_convert.py` (search cache rewrite) |
