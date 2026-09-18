@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """OSWorld agentic-stack session driver.
 
-One process per Relax-managed session. Drives the vendored HybridAgentLocal
+One process per Relax-managed session. Drives the external HybridAgentLocal
 (``RelaxHybridAgent``) against a session-owned OSWorld VM (``OSWorldEnv``).
 
 Input JSON is written by Relax's ``AgenticPipeline._write_agent_input`` — it
@@ -39,8 +39,7 @@ logger = logging.getLogger("osworld_agentic.agent")
 
 
 def _load_config() -> dict[str, Any]:
-    path = Path(os.environ.get("OSWORLD_CONFIG_PATH", DEFAULT_CONFIG_PATH))
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 def read_session_input(path: str | Path) -> dict[str, Any]:
@@ -54,7 +53,7 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
     up with one leaf per turn and Relax's implicit export (which insists on a
     single committed leaf) drops the whole session. We therefore use the
     explicit path: one JSONL record per turn, each carrying the exact
-    conversation state that turn committed. See PITFALLS.md section 11.
+    conversation state that turn committed. See README.md.
     """
     records = payload.pop("_turn_records", []) or []
     metadata = payload.get("metadata", {})
@@ -95,15 +94,14 @@ def _extract_task_config(session_input: dict[str, Any]) -> dict[str, Any]:
 
     Two accepted layouts, in priority order:
 
-    1. ``session_input["task_config"]`` — full OSWorld task JSON dumped inline
-       by our data-prep pipeline (``scripts/prepare_data.py``).
-    2. ``session_input["metadata"]["task_config"]`` — same but nested (Relax
-       preserves arbitrary metadata fields).
+    1. ``session_input["task_config"]`` — full OSWorld task JSON passed inline.
+    2. ``session_input["metadata"]["task_config"]`` — nested task JSON from
+       ``scripts/prepare_data.py`` (Relax preserves arbitrary metadata fields).
     """
 
     def _coerce(value: Any) -> dict[str, Any] | None:
         # prepare_data.py stores the config as a JSON string (Arrow cannot type
-        # the heterogeneous struct); smoke_test.sh passes a plain dict.
+        # the heterogeneous struct); callers may also pass a plain dict.
         if isinstance(value, dict):
             return value
         if isinstance(value, str) and value.strip():
@@ -150,7 +148,7 @@ async def run_session(
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     config = _load_config()
-    max_turns = int(os.environ.get("OSWORLD_MAX_TURNS") or config["max_turns"])  # env override (2026-09-05)
+    max_turns = int(config["max_turns"])
     task_config = _extract_task_config(session_input)
     instruction = task_config.get("instruction") or metadata.get("instruction") or ""
     shotdump.init((task_config or {}).get("id", ""), instruction)
@@ -166,7 +164,7 @@ async def run_session(
     )
 
     agent = RelaxHybridAgent(
-        # Vendor-side knobs
+        # External agent settings
         platform="ubuntu",
         model=os.environ.get("OPENAI_MODEL", "model"),
         max_steps=max_turns,
@@ -225,7 +223,7 @@ async def run_session(
             if info.get("parse_failed") or action_type == "parse_failed":
                 parse_failed_steps += 1
 
-            # Terminate signals from the vendor agent
+            # Terminate signals from the external agent
             if any(a in ("DONE", "FAIL") for a in pyautogui_actions):
                 stop_reason = "agent_done" if "DONE" in pyautogui_actions else "agent_fail"
                 # Still call env.step so DesktopEnv marks the final action

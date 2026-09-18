@@ -8,9 +8,7 @@ Thin async facade over the nex-OSWorld `desktop_env.DesktopEnv`:
 - Exposes primitives the session driver needs: `reset`, `exec_pyautogui`,
   `exec_mcp`, `evaluate`, `close`.
 
-For P0/P1 the VM lifecycle is session-internal (one container per session).
-P2+ will swap this for `vm_pool_client.py` that acquires a pre-warmed VM
-from an external gateway.
+DesktopEnv and its Nex provider come from the external OSWorld checkout.
 """
 
 from __future__ import annotations
@@ -25,32 +23,13 @@ import logging
 import os
 import os as _os
 import random as _random
-import sys
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
-from pathlib import Path
 from typing import Any, Optional
 
+from desktop_env.desktop_env import DesktopEnv
 from PIL import Image
-
-
-# Make the vendored trees importable without polluting site-packages.
-_VENDOR_ROOT = Path(__file__).resolve().parent.parent / "vendor"
-for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "agents"):
-    p_str = str(_p)
-    if p_str not in sys.path:
-        sys.path.insert(0, p_str)
-
-# desktop_env is NOT vendored: it comes from the nex-enabled OSWorld checkout
-# (providers/nex + MCP-aware DesktopEnv). Appended so vendor mm_agents still wins.
-_OSWORLD_REPO = os.environ.get("OSWORLD_REPO", "")
-if not _OSWORLD_REPO:
-    raise RuntimeError("OSWORLD_REPO must point at the OSWorld-main-nex checkout")
-if _OSWORLD_REPO not in sys.path:
-    sys.path.append(_OSWORLD_REPO)
-
-from desktop_env.desktop_env import DesktopEnv  # noqa: E402
 
 
 logger = logging.getLogger("osworld_agentic.env")
@@ -116,7 +95,7 @@ class OSWorldEnv:
         # OSWorld setup regularly hits transient guest failures (HTTP 500 on the
         # file upload, sandbox-creation lock timeouts). Retry on a fresh sandbox:
         # a session that dies in here never reports back to Relax and deadlocks
-        # the whole rollout batch. See PITFALLS.md section 12.
+        # the rollout batch. Retry and cleanup stay local to this adapter.
         last_error: Exception | None = None
         for attempt in range(_RESET_ATTEMPTS):
             try:

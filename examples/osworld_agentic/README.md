@@ -1,217 +1,129 @@
-# OSWorld Agentic RL
+# OSWorld agentic RL
 
-Qwen3-VL-8B-Thinking 在 OSWorld 上的 agentic RL recipe。沙箱由 Nex 平台提供，每个
-rollout session 独占一台虚拟桌面，agent 靠截图 + pyautogui / MCP 操作，按任务最终
-是否完成给 outcome reward（GRPO，无 critic）。
+用外部 OSWorld 的 `HybridAgentLocal` 和 Nex `DesktopEnv`，通过 Relax 原生
+Agentic rollout 训练 Qwen3-VL-8B-Thinking。本目录只保留 Relax 适配和一个已跑通的
+outcome 配方：8 GPU、12 任务 × 8 session、每轮 3 次 optimizer update。
 
-|              |                                                                                           |
-| ------------ | ----------------------------------------------------------------------------------------- |
-| 训练入口     | `launch.sh`（12 任务，96 条 session，3 次更新）                                           |
-| agent 子进程 | `app/agent.py`，由 Relax 以 `python -m app.agent --input-json ... --output-json ...` 拉起 |
-| session 配置 | `app/osworld_config_t30i2.yaml`（可被 `OSWORLD_CONFIG_PATH` 覆盖）                        |
-| 参考硬件     | 8 x H20（97871 MiB），2 NUMA node                                                         |
+## 环境配置
 
-______________________________________________________________________
-
-## 1. 环境准备
-
-复制 `env.sh.example` 为本目录的 `env.sh`，填写 `NEX_API_KEY`、
-`NEX_WORKSPACE_ID`、`MODEL_DIR`、`DATA_DIR`、`SAVE_DIR`、`MEGATRON` 和
-`OSWORLD_REPO`。`env.sh` 已被 Git 忽略；密钥不要写进仓库或日志。
-`MODEL_DIR` 下应有 `Qwen3-VL-8B-Thinking`，`SAVE_DIR` 使用新的输出目录。
-外部 OSWorld checkout 提供 `desktop_env` 和 `mm_agents`，依赖边界见 [VENDOR.md](VENDOR.md)。
+仓库中的 [env.sh](env.sh) **是环境配置示例**，只包含占位值。
+将实际路径和凭据放到被 Git 忽略的 `env.local.sh`；两个启动脚本都会先读取
+`env.local.sh`，再用 `env.sh` 补齐未设置的默认值。已有 `env.local.sh` 时直接使用，不要覆盖。
 
 ```bash
-cp examples/osworld_agentic/env.sh.example examples/osworld_agentic/env.sh
-chmod 600 examples/osworld_agentic/env.sh
+cp -n examples/osworld_agentic/env.sh examples/osworld_agentic/env.local.sh
+chmod 600 examples/osworld_agentic/env.local.sh
 ```
 
-______________________________________________________________________
+填写 `MEGATRON`、`MODEL_DIR`、`DATA_DIR`、`SAVE_DIR`、`OSWORLD_REPO`、
+`OSWORLD_CACHE_DIR`、`MCP_SRC_ROOT` 和 Nex 配置。`MODEL_DIR` 下需要有
+`Qwen3-VL-8B-Thinking`；每次从 base 模型训练时使用新的 `SAVE_DIR`。
+`NEX_API_KEY` 在 `env.local.sh` 中设置，或从私有凭据文件读取。
+如需下载代理，使用 evaluator 的 `download_proxy`；不要让访问 Nex guest 的请求走 HTTP 代理。
 
-## 2. 安装依赖
+这里依赖**包含 Nex provider、MCP 支持和 HybridAgentLocal 的 OSWorld 版本**。
+外部目录需要保持以下布局；工具注册表和 prompt 由外部 agent 维护：
 
-OSWorld 的 `requirements.txt` 直接装会跟训练栈打架（它要 `protobuf<5`、`Pillow~=11.0`，
-会把 Ray / torchvision 拖坏），resolver 还会 ResolutionImpossible。所以核心包一律
-`--no-deps`，缺的传递依赖单独补：
+```text
+external_root/
+├── OSWorld-main-nex/           # OSWORLD_REPO
+│   ├── desktop_env/
+│   ├── mm_agents/hybrid_agent_local.py
+│   └── evaluation_examples/
+├── agents/tool_retriever.py
+├── prompts/
+└── tools/tools_registry.json
+```
+
+训练环境需要预先安装 Relax 和该外部 OSWorld 的运行依赖；仅有标准上游
+OSWorld checkout 不足以运行此配方。所有 Ray 节点需要能够访问相同路径的
+Relax、外部 OSWorld、MCP 源码、模型和本地环境配置。
+
+## 启动与参数
+
+先准备可用的 Ray 集群，再从 Relax 仓库根目录执行：
 
 ```bash
-# 2.1 核心包 —— 必须 --no-deps
-pip install --break-system-packages --no-deps \
-  gymnasium easyocr pyautogui python-xlib fuzzywuzzy odfpy openpyxl pypdf python-docx \
-  python-pptx mss beautifulsoup4 xmltodict rapidfuzz func_timeout filetype borb pdfplumber \
-  PyMuPDF wrapt_timeout_decorator IMAPClient pyacoustid pygame pytesseract translate send2trash \
-  pyperclip pynput python-Levenshtein playwright pydrive oauth2client requests_toolbelt formulas \
-  tldextract requests_file imagehash backoff json5 dashscope qwen-agent
-
-# 2.2 google 客户端 —— 这个要带依赖装（需要 httplib2 / uritemplate）
-pip install --break-system-packages google-api-python-client google-auth google-auth-oauthlib
-
-# 2.3 立刻把 protobuf 钉回来（上一步会把它降到 5.29）
-pip install --break-system-packages -U 'protobuf>=6.31.1'
+bash examples/osworld_agentic/run_qwen3vl_8B_osworld_outcome.sh
 ```
 
-**`qwen-agent` 别漏。** `mm_agents/agent_function_call.py` 顶部就 `from qwen_agent.tools.base import BaseTool, register_tool`；缺了它 agent 子进程会以 code 1 退出，而 Relax 侧只会
-刷 `Dropping group ... because an agent exited before every first IR existed`，看不出真正
-原因——必须去 `examples/osworld_agentic/log/agent/<最新时间戳>/` 翻 session 日志才能看到
-`ModuleNotFoundError`。
+脚本直接提交 `relax/entrypoints/train.py`，使用框架默认数据源和 Agentic rollout。
+首次运行如果 `$DATA_DIR/osworld/train.parquet` 不存在，会根据
+[scripts/train_tasks.txt](scripts/train_tasks.txt) 的 12 个任务 ID，从外部
+`evaluation_examples` 生成数据。修改任务列表后，需要重新运行 `scripts/prepare_data.py`
+覆盖已有 parquet；生成命令见该脚本说明。配方不运行独立 eval，session 内仍由
+OSWorld evaluator 给每条轨迹评分。
 
-______________________________________________________________________
+| 参数                          | 默认值         | 含义                                                  |
+| ----------------------------- | -------------- | ----------------------------------------------------- |
+| `ROLLOUT_BATCH_SIZE`          | 12             | 脚本内固定的任务组数                                  |
+| `N_SAMPLES_PER_PROMPT`        | 8              | 脚本内固定的每组 session 数，共 96 条                 |
+| `OSWORLD_UPDATES_PER_ROLLOUT` | 3              | 96 条 session 分成 3 个 batch，每条只训练一次         |
+| `OSWORLD_LEARNING_RATE`       | `1e-6`         | 学习率                                                |
+| `NUM_ROLLOUT`                 | 10             | rollout 总轮数                                        |
+| `OSWORLD_LR_DECAY_ITERS`      | `45 × updates` | optimizer 更新次数；默认 135，不随 `NUM_ROLLOUT` 改变 |
 
-## 3. 环境验证
+后四项可用环境变量覆盖；当前 DP=2，更新次数可选 1、2、3、6，使每批任务组能够均分。
+默认全局 batch size 由框架计算为 `96 / 3 = 32`，无需单独配置。例如只增加 rollout 数：
 
 ```bash
-FX=/path/to/workspace   # 底下有 Relax/ 和 OSWorld-main-nex/
-
-python3 -c "import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda)"
-python3 -c "import ray, sglang, megatron; from torch.utils.tensorboard import SummaryWriter; print('training stack ok')"
-
-# 整条 agent import 链 —— 一定要 import app.agent，不要只 import 子模块
-cd $FX/Relax/examples/osworld_agentic && \
-  OSWORLD_REPO=$FX/OSWorld-main-nex PYTHONPATH=$FX/OSWorld-main-nex:. \
-  python3 -c "import app.agent; print('agent chain ok')"
-
-command -v numactl && numactl -H | grep -c '^node [0-9]* size'   # 应输出 2
+NUM_ROLLOUT=20 bash examples/osworld_agentic/run_qwen3vl_8B_osworld_outcome.sh
 ```
 
-第三条特别强调：`app/agent.py` 第 27 行 import `app.env_osworld`、第 28 行才 import
-`app.hybrid_agent`。只测 `app.env_osworld` 会得到假绿灯——真正缺包的是第 28 行往下那条链
-（`app.hybrid_agent` → `mm_agents.hybrid_agent_local` → `mm_agents.agent_function_call`
-→ `qwen_agent`）。**只有 `import app.agent` 才走完整条链。**
+此时 LR 衰减仍为 135 次更新。若设置 `OSWORLD_UPDATES_PER_ROLLOUT=1`，
+全局 batch size 为 96，默认衰减周期为 45 次更新。
 
-______________________________________________________________________
+数据按列表顺序循环使用。正常情况下每轮对应 12 个任务；session 失败或任务组被
+丢弃时，按框架默认策略补采，**不再额外保证每轮恰好包含 12 个不同任务**。
 
-## 4. 启动 12 任务训练
+TP=4、每个 rollout engine 使用 2 GPU、selective recompute、CPU optimizer offload、
+KL/ref 更新、图像缓存和传输设置保留为启动脚本中的固定配置。
+唯一的 session 配置是 [app/osworld_config.yaml](app/osworld_config.yaml)：
+最多 30 turns、保留 2 张历史截图、`context_policy: baseline`、采样温度和 top-p 均为 1。
 
-先启动可用的 Ray 集群，再从仓库根目录运行：
+## 模块职责
 
-```bash
-bash examples/osworld_agentic/launch.sh
-```
+| 文件                                | 职责                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------- |
+| `run_qwen3vl_8B_osworld_outcome.sh` | 实验参数、数据准备、Ray 环境和训练提交                                    |
+| `run_agent_app.sh`                  | 读取本地环境，设置外部导入路径和 Relax session endpoint，启动 agent       |
+| `env.sh`                            | 可复制的环境配置示例                                                      |
+| `scripts/train_tasks.txt`           | 12 个训练任务 ID                                                          |
+| `scripts/prepare_data.py`           | 把外部任务 JSON 转为 Relax parquet                                        |
+| `app/agent.py`                      | session 主循环：动作执行、评估、清理和逐 turn 导出                        |
+| `app/hybrid_agent.py`               | 将外部 HybridAgentLocal 的 LLM 请求接到 Relax，保留逐 turn 对话记录       |
+| `app/env_osworld.py`                | 外部 DesktopEnv 的异步适配、Nex 创建重试、并发限制和清理                  |
+| `app/task_setup_compat.py`          | 任务 setup 配置兼容处理                                                   |
+| `app/reward_post_process.py`        | 按任务组和 session 聚合奖励，将优势分配给各 turn                          |
+| `reward_osworld.py`                 | 未携带 session reward 时的 RM 回调；正常路径使用 session evaluator 的结果 |
+| `app/shotdump.py`                   | 可选的截图和动作采集                                                      |
+| `scripts/analyze_run.py`            | 分析 reward dump 中的成功率和组内奖励统计                                 |
 
-入口默认从 base 模型和新 optimizer 开始，跑 10 个 rollout step，不执行独立 eval；
-每条训练轨迹仍由 OSWorld evaluator 评分。`scripts/manifests/train_fixed12.txt`
-列出固定的 12 个任务 ID。首次运行从 `$OSWORLD_REPO/evaluation_examples` 自动生成
-`$DATA_DIR/osworld/fixed12/train.parquet`，也可用 `OSWORLD_TASK_DIR` 指定任务 JSON 目录。
-每步覆盖全部 12 个任务，每任务采样 8 条，96 条 session 分为 3 个原生 optimizer batch，
-每条样本训练一次。`NUM_ROLLOUT` 可调整步数，`OSWORLD_LEARNING_RATE` 默认 `1e-6`。
+逐 turn 导出仍然需要保留：外部 agent 会重建 prompt、裁剪截图历史，连续 turn
+不是严格的追加关系。`hybrid_agent.py` 记录每次实际请求的对话，`agent.py` 将每个
+turn 输出成独立 JSONL 记录；reward 后处理按 session 聚合，避免把这些 turn
+误当成不同的 GRPO 样本。
 
-`train.py` 接入固定任务数据源和整组补采；`train.py`
-校验 96/32 的分批设置。
-公用的 `run_qwen3vl_8B_osworld_outcome.sh` 负责模型、训练参数和 Ray 提交。
+奖励后处理保留当前配方：成功/失败为 ±1，按轮数扣除长度惩罚，达到 30 turns
+额外扣分；组内标准化后复制到各 turn，关闭按轨迹长度再归一化。
+全成功或全失败组的优势为 0。`OSWORLD_MAX_STEPS_REF=30` 和
+`OSWORLD_PER_TRAJ_NORM=0` 已固定在启动脚本中。
 
-### 每轮一次更新，训练 100 步
+## 运行产物与排查
 
-设置 `OSWORLD_UPDATES_PER_ROLLOUT=1` 后，96 条 session 合成一个 global batch，
-每个 rollout step 只执行一次 optimizer 更新，每条样本仍只训练一次。
-此模式使用 `train.py`；默认三批模式保持不变。
+| 内容         | 路径                                                 |
+| ------------ | ---------------------------------------------------- |
+| 训练日志     | `$SAVE_DIR/osworld-outcome-<时间戳>.log`             |
+| checkpoint   | `$SAVE_DIR/Qwen3-VL-8B-osworld-outcome/`             |
+| session 日志 | `log/agent/<run_tag>/<session_id>.log`（相对本目录） |
+| 奖励明细     | `$SAVE_DIR/reward_dump.jsonl`                        |
 
-先在 `env.sh` 中设置新的 `SAVE_DIR`，并确保它不会覆盖下面的环境变量，再执行：
+遇到导入错误或 session 提前退出，先查 session 日志。奖励明细中可以查看
+`agent_turns`、`stop_reason`、`advantage`、`group_std` 和 `group_kept`；
+其中 `step` 是 reward 后处理调用序号，分批传输时不等于 rollout 编号。
+可选截图通过在 `env.local.sh` 设置 `OSWORLD_SHOT_DUMP_DIR` 开启；
+`OSWORLD_SHOT_EVERY_N_TASKS` 控制按任务 ID 哈希抽样的频率，默认 37。
+更多运行注意事项见 [PITFALLS.md](PITFALLS.md)。
 
-```bash
-unset OSWORLD_RESUME_DIR RESUME_FROM_SAVE
-OSWORLD_UPDATES_PER_ROLLOUT=1 \
-NUM_ROLLOUT=100 \
-OSWORLD_LR_DECAY_ITERS=100 \
-bash examples/osworld_agentic/launch.sh
-```
-
-这个入口从 base 模型和新 optimizer 开始，不执行独立 eval。
-`OSWORLD_LR_DECAY_ITERS` 的单位是 optimizer 更新次数：单次更新模式默认 45，
-三批模式默认 135；修改总步数时需显式设置衰减周期，100 步分别对应 100 / 300。
-
-______________________________________________________________________
-
-## 5. 可调开关（默认值对应 12 任务入口）
-
-### 规模 / 并发
-
-| 变量                            | 默认 | 说明                                               |
-| ------------------------------- | ---- | -------------------------------------------------- |
-| `ROLLOUT_BATCH_SIZE`            | 12   | 每步固定覆盖全部任务                               |
-| `N_SAMPLES_PER_PROMPT`          | 8    | 每个 prompt 采多少条轨迹（GRPO 的组大小）          |
-| `GLOBAL_BATCH_SIZE`             | 32   | 96 条 session 分成 3 次 optimizer update           |
-| `OSWORLD_MAX_CONCURRENT_GROUPS` | 20   | 并发组数，实际沙箱数 = 它 × `N_SAMPLES_PER_PROMPT` |
-| `PREPARE_POOL_SIZE`             | 20   | 预热池大小，一般跟上面取同值                       |
-
-### session 行为
-
-| 变量                    | 默认                            | 说明                                                              |
-| ----------------------- | ------------------------------- | ----------------------------------------------------------------- |
-| `OSWORLD_CONFIG_PATH`   | `app/osworld_config_t30i2.yaml` | session 配置文件                                                  |
-| `OSWORLD_MAX_TURNS`     | 30                              | 单条轨迹最多几个 turn                                             |
-| `OSWORLD_MAX_STEPS_REF` | 30                              | reward shaping 的 `T_ref`（paper Eq.3），**必须等于 `max_turns`** |
-| `AGENT_TIMEOUT`         | 21600                           | 单个 session 墙钟上限（秒）                                       |
-
-yaml 里另有 `max_image_history_length`（prompt 里保留最近几张截图，**没有环境变量能覆盖**）、
-`temperature` / `top_p` / `max_tokens` / `context_policy`。
-
-### 训练性能
-
-| 变量                    | 默认        | 说明                                       |
-| ----------------------- | ----------- | ------------------------------------------ |
-| `RECOMPUTE_GRANULARITY` | `selective` | `full` / `selective` / `none`              |
-| `RECOMPUTE_METHOD`      | `uniform`   | 仅 `full` 时生效                           |
-| `RECOMPUTE_NUM_LAYERS`  | 1           | 仅 `full` 时生效                           |
-| `TRUE_ON_POLICY`        | 0           | 公用 runner 的可选开关；本 recipe 保持关闭 |
-
-### 轨迹落盘（调试用）
-
-| 变量                         | 默认       | 说明                                    |
-| ---------------------------- | ---------- | --------------------------------------- |
-| `OSWORLD_SHOT_DUMP_DIR`      | 空（关闭） | 设了就按 task 抽样存每 turn 截图 + 动作 |
-| `OSWORLD_SHOT_EVERY_N_TASKS` | 35         | 对 `task_id` 取 md5，`% N == 0` 才存    |
-
-抽样是按 `task_id` 哈希的确定性抽样，所以：同一个 task 的**整组样本会被完整抓下来**
-（可以横着比同组 8 条轨迹为什么 advantage 是 0），而且**每个 step 抓的是同一批 task**
-（可以竖着看这些任务有没有学会）。
-
-______________________________________________________________________
-
-## 6. 产物在哪
-
-| 内容                                        | 路径                                                                                   |
-| ------------------------------------------- | -------------------------------------------------------------------------------------- |
-| 训练主日志                                  | `osworld-*.log`（启动命令里自己重定向的）                                              |
-| 每条 session 的 reward / turn 数 / 停止原因 | `$OSWORLD_REWARD_DUMP`（jsonl，一行一个 session）                                      |
-| 完整 rollout 轨迹（prompt / 输出 / token）  | `$SAVE_DIR/<exp>/rollout_result/train/<step>.jsonl`                                    |
-| 轨迹截图 + 动作                             | `$OSWORLD_SHOT_DUMP_DIR/<task_id>/<时间戳>_<session>/{NNN.png, traj.jsonl, meta.json}` |
-| checkpoint                                  | `$SAVE_DIR/<exp>/iter_XXXXXXX/`（Megatron 分布式格式 `.distcp`，**不是 `.pt`**）       |
-| agent 子进程日志                            | `examples/osworld_agentic/log/agent/<时间戳>/`                                         |
-
-reward dump 每行的字段：
-
-```
-ts run_tag step group_index session task_id data_source
-session_wallclock_s agent_turns stop_reason parse_failed_steps last_error
-action_types outcome turns records shaped advantage group_std mean_succ group_kept
-```
-
-排查梯度信号时同时看 `advantage`、`group_std` 和 `group_kept`；除了组内零方差，
-reward 后处理的准确率阈值也会屏蔽整组。`stop_reason` 用来核对终止原因。
-
-______________________________________________________________________
-
-## 7. 性能设计
-
-- Agentic rollout 在 session 内复用截图张量，按完整任务组分批传入 TensorQueue，传输后释放源端像素，降低 CPU 内存峰值。
-- `RECOMPUTE_GRANULARITY` 默认 `selective`。可按显存需求改为 `full`，结合 `RECOMPUTE_METHOD` 和 `RECOMPUTE_NUM_LAYERS` 配置重算。
-
-## Task set and update count
-
-| Variable                      | Values                         | Meaning                                                                       |
-| ----------------------------- | ------------------------------ | ----------------------------------------------------------------------------- |
-| `OSWORLD_TASK_SET`            | `fixed12` (default) / `full74` | Which task set to train on                                                    |
-| `OSWORLD_UPDATES_PER_ROLLOUT` | `1` / `3`                      | Optimizer updates per rollout; defaults to 3 for `fixed12` and 1 for `full74` |
-
-`fixed12` selects 12 tasks through `scripts/manifests/train_fixed12.txt` and builds
-`${DATA_DIR}/osworld/fixed12/train.parquet`. `full74` reuses the existing
-`${DATA_DIR}/osworld/data/train.parquet` and fails fast when that file is missing,
-because rebuilding without a manifest would emit every discovered task rather than 74.
-
-Each rollout samples `ROLLOUT_BATCH_SIZE x 8` trajectories and splits them into whole
-GRPO groups. Three updates means those samples are trained in three batches, each sample
-once, not the same batch three times. The launcher refuses combinations that cannot be
-split evenly, such as `full74` with three updates.
-
-`OSWORLD_NATIVE_MINIBATCH3=0/1` still maps to 1/3 updates; an explicit
-`OSWORLD_UPDATES_PER_ROLLOUT` wins.
+历史统计脚本 `scripts/analyze_run.py` 用于本配方时需传 `--groups-per-step 12`；
+其 `cap` 列仍采用旧的 50-turn 阈值，30-turn 到顶情况请查看奖励明细的 `stop_reason`。

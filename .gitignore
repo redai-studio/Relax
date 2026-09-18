@@ -54,6 +54,8 @@ tensorboard_log
 # .github
 .github/copilot-instructions.md
 env.sh
+!/examples/osworld_agentic/env.sh
+/examples/osworld_agentic/env.local.sh
 
 # ---- OSWorld agentic RL: 运行产物 (不入库) ----
 osworld-*.log

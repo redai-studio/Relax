@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Relax-side subclass of the vendored HybridAgentLocal.
+"""Relax-side subclass of the external HybridAgentLocal.
 
 The upstream `HybridAgentLocal.call_llm` POSTs to a local vLLM endpoint via
 raw httpx. When integrating with Relax we want it to talk to the
@@ -8,29 +8,18 @@ per-session AgenticChatAPIService — the URL is passed in via `OPENAI_BASE_URL`
 and the API key is the session id.
 
 Everything else — prompt building, tool retriever, image history, parse
-retries — is inherited unchanged. Keeping the diff surface tiny is the point
-of the vendor snapshot.
+retries — is inherited from the external OSWorld installation.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
-from pathlib import Path
 from typing import Any
 
 import httpx
-
-
-_VENDOR_ROOT = Path(__file__).resolve().parent.parent / "vendor"
-for _p in (_VENDOR_ROOT, _VENDOR_ROOT / "agents"):
-    p_str = str(_p)
-    if p_str not in sys.path:
-        sys.path.insert(0, p_str)
-
-from mm_agents.hybrid_agent_local import HybridAgentLocal  # noqa: E402
+from mm_agents.hybrid_agent_local import HybridAgentLocal
 
 
 logger = logging.getLogger("osworld_agentic.hybrid_agent")
@@ -73,7 +62,7 @@ class RelaxHybridAgent(HybridAgentLocal):
         self._backoff_seconds = float(backoff_seconds)
         self._stop_token_ids = list(stop_token_ids) if stop_token_ids else []
         # One entry per committed turn; app/agent.py turns these into the
-        # explicit export records Relax needs (see PITFALLS.md section 11).
+        # explicit export records Relax needs (see README.md).
         self.turn_records: list[dict[str, Any]] = []
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")

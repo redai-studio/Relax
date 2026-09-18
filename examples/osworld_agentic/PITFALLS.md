@@ -56,9 +56,7 @@ ______________________________________________________________________
 ```bash
 --agent-env
     "AGENT_DEBUG_LOG_DIR=..."
-    "OSWORLD_CONFIG_PATH=..."
     "OSWORLD_CACHE_DIR=..."
-    "OSWORLD_MCP_BONUS=..."
     "OPENAI_MODEL=..."
 ```
 
@@ -99,7 +97,7 @@ SDK 会把当前 chat 补齐 + retry，僵尸 request 能占满整个客户端 t
 
 1. `RelaxHybridAgent` 里 `max_llm_call_retries` / `llm_call_timeout_s` 都
    可以从 yaml 调（默认 3 次 × 600s，比默认 2×900 更保守）。
-2. `--agent-timeout 1500`（约 5 倍单 chat timeout）在 launcher 里显式设过。
+2. outcome 启动脚本固定 `--agent-timeout 21600`，为完整 session 留出执行时间。
 3. `session_discarded` / `context_length_exceeded` 的错误码在
    `hybrid_agent.py` 里被解析并即时抛出，避免 retry 一个 404。
 

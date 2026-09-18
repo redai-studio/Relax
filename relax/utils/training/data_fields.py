@@ -3,6 +3,17 @@
 from argparse import Namespace
 
 
+def needs_multimodal_fields(args: Namespace) -> bool:
+    """Whether consumers must fetch multimodal tensors from the rollout.
+
+    Agentic VL sessions supply images at runtime without dataset multimodal
+    keys.
+    """
+    if getattr(args, "multimodal_keys", None) is not None:
+        return True
+    return bool(getattr(args, "use_agentic_rollout", False) and getattr(args, "is_vl_model", False))
+
+
 def _base_rollout_fields(args: Namespace) -> list[str]:
     fields = [
         "tokens",
@@ -18,7 +29,7 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
     ]
     if getattr(args, "use_rollout_routing_replay", False):
         fields.append("rollout_routed_experts")
-    if getattr(args, "multimodal_keys", None) is not None:
+    if needs_multimodal_fields(args):
         fields.append("multimodal_train_inputs")
     return fields
 
@@ -33,7 +44,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
-        if args.multimodal_keys is not None:
+        if needs_multimodal_fields(args):
             fields.append("multimodal_train_inputs")
         return fields
 

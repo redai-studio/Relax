@@ -72,7 +72,7 @@ from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
-from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.data_fields import build_data_fields, needs_multimodal_fields
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -1101,7 +1101,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_ref_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
 
         if self._use_streaming_fwd():
@@ -1145,7 +1145,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 os.environ["ROUTING_REPLAY_STAGE"] = "record"
         logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for compute_actor_log_prob.")
         data_fields = ["tokens", "total_lengths", "response_lengths", "loss_masks", "rollout_log_probs"]
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
 
         if self._use_streaming_fwd():
@@ -1405,7 +1405,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
-                if self.args.multimodal_keys is not None:
+                if needs_multimodal_fields(self.args):
                     data_fields.append("multimodal_train_inputs")
                 if self.args.use_opd and self.args.opd_type == "sglang":
                     data_fields.append("teacher_log_probs")
@@ -1591,7 +1591,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_fields.append("log_probs")
         if self.args.kl_coef != 0 or self.args.use_kl_loss:
             data_fields.append("ref_log_probs")
-        if self.args.multimodal_keys is not None:
+        if needs_multimodal_fields(self.args):
             data_fields.append("multimodal_train_inputs")
         if self.args.use_opd:
             consume_opd_train_data(data_fields, self.args)

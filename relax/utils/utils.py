@@ -15,6 +15,7 @@ from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import Envs, validate_env
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
+from relax.utils.training.data_fields import needs_multimodal_fields
 from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
 from relax.utils.types import Sample
 
@@ -152,7 +153,10 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
-    if args.multimodal_keys is not None:
+    # Rollout actors may lack the backend's is_vl_model flag; also inspect samples.
+    if needs_multimodal_fields(args) or any(
+        getattr(sample, "multimodal_train_inputs", None) is not None for sample in samples
+    ):
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
     if args.use_opd:

@@ -6,11 +6,10 @@ Mirrors hybrid-routing-agent's `outcome_only_rl` recipe:
   reward/osworld_rl_reward.py:891-900       (the two penalty formulas)
   reward/osworld_rl_reward.py:580-624       (_groupwise_standardize_inplace)
 
-Why the shaping lives here and not in reward_osworld.py: Relax's agentic
-rollout path never invokes `--custom-rm-path` (no reference to custom_rm /
-rm_type anywhere in relax/agentic/rollout.py), so that module is dead config.
-`--custom-reward-post-process-path` IS invoked, once per step, with every
-sample of the batch -- so this is the only hook that can shape the reward.
+Session exports already carry the evaluator's outcome. This batch hook groups
+turn records by session before shaping and standardizing rewards; the generic
+per-record reward path cannot represent those trajectory groups. It is called
+per transfer batch, which can be smaller than a full rollout.
 
 Reward (per trajectory, upstream's `raw_reward`):
     outcome    = +1 if the VM evaluator passed else -1
@@ -24,10 +23,9 @@ not a competing objective.
 
 Advantage (upstream _groupwise_standardize_inplace):
     per group (= one task's N attempts): z-score the trajectory returns, then
-    broadcast to every turn record of that trajectory DIVIDED BY its length.
-    Without the division a 50-turn trajectory contributes 10x the gradient of
-    a 5-turn one at equal advantage, handing never-terminate trajectories
-    disproportionate influence -- exactly the regime we are in (turn median 50).
+    broadcast to every turn record of that trajectory. OSWORLD_PER_TRAJ_NORM
+    optionally divides by the record count; the outcome launcher disables it
+    and sets max_steps_ref to 30 to match the session config.
 
 Knobs (env, so ablations need no code edit):
     OSWORLD_LENGTH_PENALTY_COEF  default 0.05   (0 disables)

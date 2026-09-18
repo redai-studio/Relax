@@ -26,12 +26,12 @@ Usage
 
     python3 examples/osworld_agentic/scripts/prepare_data.py \
         --input-dir /path/to/evaluation_examples \
-        --output-dir ${DATA_DIR}/osworld/data \
-        --train-manifest examples/osworld_agentic/scripts/manifests/train_74.txt \
-        --eval-manifest  examples/osworld_agentic/scripts/manifests/eval_309.txt
+        --output-dir ${DATA_DIR}/osworld \
+        --train-manifest examples/osworld_agentic/scripts/train_tasks.txt \
+        --eval-manifest examples/osworld_agentic/scripts/train_tasks.txt
 
 If neither manifest is provided, every discovered task is emitted to both
-``train.parquet`` and ``eval.parquet`` — good enough for smoke tests.
+``train.parquet`` and ``eval.parquet``.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def _read_manifest(path: Path) -> list[str]:
 
 def _build_row(task_id: str, task_config: dict[str, Any]) -> dict[str, Any]:
     instruction = task_config.get("instruction") or ""
-    # The rollout worker embeds this prompt into the chat template; the vendor
+    # The rollout worker embeds this prompt into the chat template; the external agent
     # HybridAgentLocal ignores it and builds its own system+user prompt from
     # ``instruction`` inside the session. Kept minimal to avoid double-prompting.
     prompt = [{"role": "user", "content": instruction}]
