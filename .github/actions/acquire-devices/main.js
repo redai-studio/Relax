@@ -106,7 +106,7 @@ async function main() {
     fs.writeFileSync(path.join(directory, 'accepted'), '');
     child.unref();
     console.log(
-        `Reserved ${config.backend} devices: ${result.devices.join(',')}`);
+        `Reserved ${config.backend} devices: ${result.display_devices}`);
   } catch (error) {
     await release(directory);
     throw error;
