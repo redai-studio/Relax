@@ -42,7 +42,7 @@ jobs:
 
       - name: Acquire test devices
         id: devices
-        uses: $/.github/actions/acquire-devices
+        uses: ./.github/actions/acquire-devices
         timeout-minutes: 35
         with:
           backend: nvidia
