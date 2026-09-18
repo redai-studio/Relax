@@ -14,6 +14,15 @@ now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SGLANG_ROUTER_POLICY="${SGLANG_ROUTER_POLICY:-cache_aware}"
+case "${SGLANG_ROUTER_POLICY}" in
+    cache_aware|round_robin) ;;
+    *)
+        echo "SGLANG_ROUTER_POLICY must be cache_aware or round_robin, got: ${SGLANG_ROUTER_POLICY}" >&2
+        exit 2
+        ;;
+esac
+
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
@@ -102,6 +111,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
+   --sglang-router-policy "${SGLANG_ROUTER_POLICY}"
 )
 
 WANDB_ARGS=(
@@ -141,4 +151,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
-   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-vl-4b-GRPO-gpu8-${now}.log
+   "${MISC_ARGS[@]}" \
+   "$@" 2>&1 | tee log/qwen3-vl-4b-GRPO-gpu8-${now}.log
