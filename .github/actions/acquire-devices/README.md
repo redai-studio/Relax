@@ -26,7 +26,7 @@ jobs:
         with:
           backend: nvidia
           count: 4
-          timeout: 600
+          timeout: 1800
       - run: python -m pytest tests/
 ```
 
@@ -41,7 +41,7 @@ Enterprise Server does not currently support this syntax.
 | `backend`  | `nvidia`               | Device discovery/visibility backend. Currently only `nvidia` is supported.                                                         |
 | `count`    | `1`                    | Positive integer; reserve this many devices from the candidate pool.                                                               |
 | `devices`  | All discovered devices | Optional comma-separated candidate pool of physical `nvidia-smi` indices or full GPU UUIDs. It is a pool, not an additional count. |
-| `timeout`  | `600`                  | Nonnegative integer seconds waiting for locks, after discovery. `0` tries once. This does not expire an acquired reservation.      |
+| `timeout`  | `1800`                 | Nonnegative integer seconds waiting for locks, after discovery. `0` tries once. This does not expire an acquired reservation.      |
 | `lock-dir` | `/tmp/acquire-devices` | Absolute local directory shared by all competing runners on the host.                                                              |
 
 Outputs are `devices` (comma-separated canonical UUIDs) and `count`. NVIDIA
@@ -73,7 +73,7 @@ an already-started job-level `container:`.
   with:
     backend: nvidia
     count: 4
-    timeout: 900
+    timeout: 1800
 - name: Create workload container
   env:
     CI_DEVICES: ${{ steps.devices.outputs.devices }}

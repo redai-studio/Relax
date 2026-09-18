@@ -18,7 +18,7 @@ jobs:
   unittest:
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -31,10 +31,11 @@ jobs:
       - name: Acquire test devices
         id: devices
         uses: $/.github/actions/acquire-devices
+        timeout-minutes: 35
         with:
           backend: nvidia
           count: 4
-          timeout: 600
+          timeout: 1800
 
       - name: Create test container
         env:

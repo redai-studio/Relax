@@ -13,7 +13,7 @@ inputs:
     default: ''
   timeout:
     description: Maximum seconds to wait for an allocation (0 means try once)
-    default: '600'
+    default: '1800'
   lock-dir:
     description: Host directory shared by every runner competing for the same devices
     default: /tmp/acquire-devices

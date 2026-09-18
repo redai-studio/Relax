@@ -27,7 +27,7 @@ async function main() {
     backend : input('backend', 'nvidia'),
     count : integer('count', '1', 1),
     devices : input('devices', ''),
-    timeout : integer('timeout', '600', 0),
+    timeout : integer('timeout', '1800', 0),
     lock_dir : input('lock-dir', '/tmp/acquire-devices'),
     parent_pid : process.pid,
   };
