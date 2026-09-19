@@ -1,5 +1,6 @@
 import logging
 import math
+from collections import Counter
 from typing import Any, Literal
 
 import numpy as np
@@ -87,6 +88,48 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
         "max": np.max(values).item(),
         "min": np.min(values).item(),
     }
+
+
+def _get_stop_reason(metadata: dict) -> str:
+    # ``rollout_stop_reason`` is the canonical field written by rollout
+    # functions and is reported as is.
+    reason = metadata.get("rollout_stop_reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    # Agentic apps report ``stop_reason``, which may carry free-form details
+    # (e.g. ``env_error:<message>``); keep only the category before ``:``.
+    reason = metadata.get("stop_reason")
+    if isinstance(reason, str):
+        category = reason.split(":", 1)[0].strip()
+        if category:
+            return category
+    return "unknown"
+
+
+def compute_stop_reason_and_num_turn_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Aggregate stop reason distribution and turn count statistics.
+
+    Every sample is counted once, so the ratios sum to 1. Samples without a
+    stop reason fall into ``unknown`` and samples without ``rollout_turns``
+    count as a single turn.
+    """
+    if not samples:
+        return {}
+
+    log_dict = {}
+    reason_counts = Counter(_get_stop_reason(sample.metadata) for sample in samples)
+    for reason, count in sorted(reason_counts.items()):
+        log_dict[f"stop_reason/{reason}/count"] = count
+        log_dict[f"stop_reason/{reason}/ratio"] = count / len(samples)
+
+    num_turns = [sample.metadata.get("rollout_turns", 1) for sample in samples]
+    log_dict["num_turn/mean"] = np.mean(num_turns).item()
+    log_dict["num_turn/max"] = np.max(num_turns).item()
+    log_dict["num_turn/min"] = np.min(num_turns).item()
+    percentiles = (50, 90, 95, 99)
+    for percentile, value in zip(percentiles, np.percentile(num_turns, percentiles), strict=True):
+        log_dict[f"num_turn/p{percentile}"] = value.item()
+    return log_dict
 
 
 def is_rollout_numeric_metric_value(value) -> bool:
