@@ -52,6 +52,7 @@ from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
+from relax.utils.rollout_stats import compute_rollout_stop_and_turn_metrics
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
     prepare_model_maybe_update_args,
@@ -4836,6 +4837,9 @@ def compute_metrics_from_samples(
     rollout_id: int | None = None,
     include_rloo_diagnostics: bool = True,
 ):
+    if not samples:
+        return {}
+
     rewarded_samples = [sample for sample in samples if sample.reward is not None]
     reward_cat_key = args.log_reward_category
     reward_category_samples = (
@@ -4864,11 +4868,11 @@ def compute_metrics_from_samples(
     log_dict |= compute_mopd_metrics(args, rewarded_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
-    log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
+    log_dict |= compute_rollout_stop_and_turn_metrics(samples)
     if rollout_id is not None and args.partial_rollout and not args.fully_async:
-        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
+        staleness_gaps = [
+            rollout_id - (sample.metadata or {}).get("start_rollout_id", rollout_id) for sample in samples
+        ]
         log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
         log_dict["staleness/max"] = np.max(staleness_gaps).item()
         log_dict["staleness/min"] = np.min(staleness_gaps).item()
