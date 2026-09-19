@@ -125,7 +125,6 @@ turn 输出成独立 JSONL 记录；reward 后处理按 session 聚合，避免�
 其中 `step` 是 reward 后处理调用序号，分批传输时不等于 rollout 编号。
 可选截图通过在 `env.local.sh` 设置 `OSWORLD_SHOT_DUMP_DIR` 开启；
 `OSWORLD_SHOT_EVERY_N_TASKS` 控制按任务 ID 哈希抽样的频率，默认 37。
-更多运行注意事项见 [PITFALLS.md](PITFALLS.md)。
 
 历史统计脚本 `scripts/analyze_run.py` 用于本配方时需传 `--groups-per-step 12`；
 其 `cap` 列仍采用旧的 50-turn 阈值，30-turn 到顶情况请查看奖励明细的 `stop_reason`。
