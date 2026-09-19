@@ -454,16 +454,20 @@ def _project_function_tools(tools: Any, *, protocol: str) -> list[dict[str, Any]
         raise AgenticChatRequestError("tools must be a list", param="tools")
     parameters_key, allowed_types = _FUNCTION_TOOL_FIELDS[protocol]
     canonical = []
-    for tool in tools:
+    for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
-            continue
+            raise AgenticChatRequestError(f"tools[{index}] must be a JSON object", param="tools")
         if tool.get("type") not in allowed_types:
-            continue
-        name = _required_nonempty_string(tool.get("name"), field="tools.name", param="tools")
+            expected_types = ", ".join("null" if item is None else item for item in sorted(allowed_types, key=str))
+            raise AgenticChatRequestError(
+                f"tools[{index}].type must be one of: {expected_types}",
+                param="tools",
+            )
+        name = _required_nonempty_string(tool.get("name"), field=f"tools[{index}].name", param="tools")
         parameters = tool.get(parameters_key)
         if not isinstance(parameters, dict):
             raise AgenticChatRequestError(
-                f"tools.{parameters_key} must be a JSON object",
+                f"tools[{index}].{parameters_key} must be a JSON object",
                 param="tools",
             )
         canonical.append(
@@ -492,10 +496,16 @@ def _normalized_generation_request(
 ) -> dict[str, Any]:
     try:
         messages = check_messages(messages)
-        tools = normalize_tools(tools)
-        chat_template_kwargs = normalize_template_kwargs(chat_template_kwargs)
     except (TypeError, ValueError) as error:
         raise AgenticChatRequestError(str(error), param=messages_param) from error
+    try:
+        tools = normalize_tools(tools)
+    except (TypeError, ValueError) as error:
+        raise AgenticChatRequestError(str(error), param="tools") from error
+    try:
+        chat_template_kwargs = normalize_template_kwargs(chat_template_kwargs)
+    except (TypeError, ValueError) as error:
+        raise AgenticChatRequestError(str(error), param="chat_template_kwargs") from error
     if not messages:
         raise AgenticChatRequestError(
             f"{messages_param} projected to zero supported messages",
@@ -549,7 +559,7 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
         for index, part in enumerate(content):
             part_field = f"{field}[{index}]"
             if not isinstance(part, dict):
-                continue
+                raise AgenticChatRequestError(f"{part_field} must be a JSON object", param="input")
             part_type = part.get("type")
             if part_type in {"input_text", "output_text"}:
                 text = part.get("text")
@@ -565,6 +575,11 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     )
                 canonical_parts.append({"type": "image_url", "image_url": {"url": image_url}})
                 has_image = True
+            else:
+                raise AgenticChatRequestError(
+                    f"{part_field}.type is not supported for role {role}",
+                    param="input",
+                )
         if not canonical_parts:
             return ""
         if not has_image:
@@ -625,10 +640,15 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
     for index, item in enumerate(items):
         field = f"input[{index}]"
         if not isinstance(item, dict):
-            continue
+            raise AgenticChatRequestError(f"{field} must be a JSON object", param="input")
         item_type = item.get("type")
         role = item.get("role")
-        if item_type in (None, "message") and role in {"user", "assistant", "system", "developer"}:
+        if item_type in (None, "message"):
+            if role not in {"user", "assistant", "system", "developer"}:
+                raise AgenticChatRequestError(
+                    f"{field}.role must be one of: assistant, developer, system, user",
+                    param="input",
+                )
             canonical_role = "system" if role == "developer" else cast(str, role)
             if canonical_role != "assistant":
                 flush_assistant()
@@ -716,10 +736,13 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
     for message_index, raw_message in enumerate(raw_messages):
         field = f"messages[{message_index}]"
         if not isinstance(raw_message, dict):
-            continue
+            raise AgenticChatRequestError(f"{field} must be a JSON object", param="messages")
         role = raw_message.get("role")
         if role not in {"user", "assistant"}:
-            continue
+            raise AgenticChatRequestError(
+                f"{field}.role must be one of: assistant, user",
+                param="messages",
+            )
         content = raw_message.get("content")
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
@@ -733,7 +756,7 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
             for block_index, block in enumerate(content):
                 block_field = f"{field}.content[{block_index}]"
                 if not isinstance(block, dict):
-                    continue
+                    raise AgenticChatRequestError(f"{block_field} must be a JSON object", param="messages")
                 block_type = block.get("type")
                 if block_type == "text":
                     text = block.get("text")
@@ -759,6 +782,8 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                             param="messages",
                         )
                     tool_calls.append(_function_tool_call(tool_id, name, arguments))
+                else:
+                    raise AgenticChatRequestError(f"{block_field}.type is not supported", param="messages")
             assistant: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
             if reasoning_parts:
                 assistant["reasoning_content"] = "\n\n".join(reasoning_parts)
@@ -783,7 +808,7 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
         for block_index, block in enumerate(content):
             block_field = f"{field}.content[{block_index}]"
             if not isinstance(block, dict):
-                continue
+                raise AgenticChatRequestError(f"{block_field} must be a JSON object", param="messages")
             block_type = block.get("type")
             if block_type == "text":
                 text = block.get("text")
@@ -793,6 +818,11 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
             elif block_type == "image":
                 pending_user_parts.append(image_block(block, field=block_field))
             elif block_type == "tool_result":
+                if "content" not in block:
+                    raise AgenticChatRequestError(
+                        f"{block_field}.content is required",
+                        param="messages",
+                    )
                 flush_user()
                 messages.append(
                     {
@@ -812,6 +842,8 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                         ),
                     }
                 )
+            else:
+                raise AgenticChatRequestError(f"{block_field}.type is not supported", param="messages")
         flush_user()
         if len(messages) == message_start:
             raise AgenticChatRequestError(
@@ -844,7 +876,14 @@ def _session_id_from_request(request: Request) -> str:
 def _normalized_chat_request(payload: dict[str, Any]) -> dict[str, Any]:
     messages = payload.get("messages")
 
-    chat_template_kwargs = payload.get("chat_template_kwargs") or {}
+    chat_template_kwargs = payload.get("chat_template_kwargs")
+    if chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    if not isinstance(chat_template_kwargs, dict):
+        raise AgenticChatRequestError(
+            f"chat_template_kwargs must be a dict, got {type(chat_template_kwargs)}",
+            param="chat_template_kwargs",
+        )
     reserved = sorted({"add_generation_prompt", "tokenize", "tools"}.intersection(chat_template_kwargs))
     if reserved:
         raise AgenticChatRequestError(
