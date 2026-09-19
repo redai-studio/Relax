@@ -464,7 +464,7 @@ def _project_function_tools(tools: Any, *, protocol: str) -> list[dict[str, Any]
                 param="tools",
             )
         name = _required_nonempty_string(tool.get("name"), field=f"tools[{index}].name", param="tools")
-        parameters = tool.get(parameters_key)
+        parameters = tool.get(parameters_key, {})
         if not isinstance(parameters, dict):
             raise AgenticChatRequestError(
                 f"tools[{index}].{parameters_key} must be a JSON object",
@@ -818,11 +818,6 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
             elif block_type == "image":
                 pending_user_parts.append(image_block(block, field=block_field))
             elif block_type == "tool_result":
-                if "content" not in block:
-                    raise AgenticChatRequestError(
-                        f"{block_field}.content is required",
-                        param="messages",
-                    )
                 flush_user()
                 messages.append(
                     {

@@ -793,24 +793,6 @@ def test_protocols_reject_empty_message_sequences(
     _assert_request_error(normalizer, payload, path=path, param=param)
 
 
-def test_anthropic_rejects_tool_result_without_content() -> None:
-    _assert_request_error(
-        _normalized_anthropic_request,
-        {
-            "max_tokens": 8,
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "call_1", "name": "search", "input": {}}],
-                },
-                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1"}]},
-            ],
-        },
-        path="messages[1].content[0].content",
-        param="messages",
-    )
-
-
 def _mismatched_tool_result_payloads() -> tuple[tuple[Normalizer, dict[str, Any], str], ...]:
     chat = {
         "messages": [
@@ -908,6 +890,20 @@ def test_empty_tool_result_is_preserved_consistently() -> None:
     assert normalized[0]["messages"][-1]["content"] == ""
 
 
+def test_anthropic_empty_tool_result_may_omit_content() -> None:
+    request = {
+        "max_tokens": 8,
+        "messages": [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "call_1", "name": "search", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1"}]},
+        ],
+    }
+
+    normalized = _normalized_anthropic_request(request)
+
+    assert normalized["messages"][-1] == {"role": "tool", "tool_call_id": "call_1", "content": ""}
+
+
 @pytest.mark.parametrize(
     ("arguments", "error"),
     [
@@ -937,9 +933,12 @@ def test_tool_arguments_reject_noncanonical_values(arguments: str, error: str) -
     )
 
 
-def test_tool_definitions_require_stable_function_schema() -> None:
+def test_tool_definitions_accept_omitted_parameter_schemas_as_empty_objects() -> None:
+    assert normalize_tools([{"type": "function", "function": {"name": "search"}}]) == [
+        {"type": "function", "function": {"name": "search", "parameters": {}}}
+    ]
     with pytest.raises(TypeError, match=r"tools\[0\]\.function\.parameters"):
-        normalize_tools([{"type": "function", "function": {"name": "search"}}])
+        normalize_tools([{"type": "function", "function": {"name": "search", "parameters": []}}])
     with pytest.raises(ValueError, match=r"tools\[0\]\.function\.name"):
         normalize_tools([{"type": "function", "function": {"parameters": {}}}])
 
@@ -953,32 +952,25 @@ def test_responses_rejects_tool_without_function_type() -> None:
     )
 
 
-MISSING_TOOL_SCHEMA_CASES = (
+@pytest.mark.parametrize(
+    ("normalizer", "payload"),
     (
-        _normalized_chat_request,
-        {
-            "messages": [{"role": "user", "content": "x"}],
-            "tools": [{"type": "function", "function": {"name": "search"}}],
-        },
-        "tools[0].function.parameters",
-    ),
-    (
-        _normalized_responses_request,
-        {"input": "x", "tools": [{"type": "function", "name": "search"}]},
-        "tools[0].parameters",
-    ),
-    (
-        _normalized_anthropic_request,
-        {"max_tokens": 8, "messages": [{"role": "user", "content": "x"}], "tools": [{"name": "search"}]},
-        "tools[0].input_schema",
+        (
+            _normalized_chat_request,
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "tools": [{"type": "function", "function": {"name": "search"}}],
+            },
+        ),
+        (_normalized_responses_request, {"input": "x", "tools": [{"type": "function", "name": "search"}]}),
+        (
+            _normalized_anthropic_request,
+            {"max_tokens": 8, "messages": [{"role": "user", "content": "x"}], "tools": [{"name": "search"}]},
+        ),
     ),
 )
-
-
-@pytest.mark.parametrize(("normalizer", "payload", "path"), MISSING_TOOL_SCHEMA_CASES)
-def test_protocols_reject_tools_without_parameter_schemas(
+def test_protocols_accept_tools_without_parameter_schemas(
     normalizer: Normalizer,
     payload: dict[str, Any],
-    path: str,
 ) -> None:
-    _assert_request_error(normalizer, payload, path=path, param="tools")
+    assert normalizer(payload)["tools"] == [{"type": "function", "function": {"name": "search", "parameters": {}}}]

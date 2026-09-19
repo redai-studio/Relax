@@ -269,7 +269,7 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         name = function.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError(f"tools[{index}].function.name must be a non-empty string")
-        parameters = function.get("parameters")
+        parameters = function.get("parameters", {})
         if not isinstance(parameters, dict):
             raise TypeError(f"tools[{index}].function.parameters must be a dict, got {type(parameters)}")
         normalized_function = {

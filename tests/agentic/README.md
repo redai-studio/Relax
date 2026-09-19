@@ -39,8 +39,8 @@
 1. 非法、空字符串、非字符串或缺失的 role。
 2. 空字符串、空列表、错误类型或不支持的内容块。
 3. 缺失或空的 tool call ID，缺失 function、函数名或 arguments。
-4. 缺失、重复或不匹配的 tool result 关联 ID，以及 Anthropic tool result 缺失 content。
-5. 缺失工具参数 schema，或不稳定的工具定义 JSON 值。
+4. 缺失、重复或不匹配的 tool result 关联 ID。Anthropic 空 tool result 可以省略 `content`，并规范化为空字符串。
+5. 工具参数 schema 的错误类型，或不稳定的工具定义 JSON 值。省略 schema 的无参数函数规范化为空对象。
 6. 缺失图片源、错误图片块类型、错误图片 URL、错误 media type 和无效 base64 数据。
 7. 空消息序列和规范化后没有受支持消息的请求。
 8. 每项拒绝测试检查 `AgenticChatRequestError`、HTTP 400、`param` 和原始协议请求结构中的字段路径。
