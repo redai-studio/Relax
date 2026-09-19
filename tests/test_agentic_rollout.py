@@ -311,7 +311,7 @@ def test_session_forest_build_sample_and_session_spec() -> None:
         index=7,
         label="lab",
         train_metadata={"loss": "grpo"},
-        metadata={"seed_stage": "bootstrap"},
+        metadata={"seed_stage": "bootstrap", "stop_reason": "env_done"},
     )
     response_kwargs = {
         "parent_state_hash": initial_obs.state_hash,
@@ -331,6 +331,30 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
     assert sample.metadata["agentic_trace"]["turn_count"] == 1
+    assert sample.metadata["rollout_turns"] == sample.metadata["agentic_trace"]["turn_count"]
+    assert sample.metadata["stop_reason"] == "env_done"
+
+    tool_obs = forest.append_obs(
+        parent_state_hash=leaf.state_hash,
+        rollout_id=11,
+        abort_count=0,
+        messages_delta=[{"role": "tool", "tool_call_id": "call-build", "content": "result"}],
+        train_token_delta=_chars("result"),
+        rollout_token_delta=_chars("result"),
+    )
+    second_leaf = forest.append_resp(
+        parent_state_hash=tool_obs.state_hash,
+        rollout_id=11,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": "done"}],
+        token_delta=_chars("done"),
+        logprob_delta=[-0.1] * 4,
+        export_metadata_patch={"stop_reason": "max_turns"},
+    )
+    multi_turn_sample = forest.build_sample(leaf_state_hash=second_leaf.state_hash, tokenizer=_FakeTokenizer())
+    assert multi_turn_sample.metadata["rollout_turns"] == 2
+    assert multi_turn_sample.metadata["agentic_trace"]["turn_count"] == 2
+    assert multi_turn_sample.metadata["stop_reason"] == "max_turns"
     sample.sampling_params = {"temperature": 0.2}
     (session_spec,) = _build_session_specs(
         [sample],
