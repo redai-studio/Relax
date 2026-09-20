@@ -12,11 +12,59 @@ carried as sglang base64 fields, decoded into numpy arrays.
 import numpy as np
 import pybase64
 
+from relax.engine.rollout.on_policy_distillation import (
+    _insert_teacher_response_prefix,
+    _replace_response_eos_for_teacher,
+)
 from relax.utils.opd.opd_main_worker import LogprobResponse, TopkWorker
 
 
 def _b64(arr: np.ndarray) -> str:
     return pybase64.b64encode(arr.tobytes()).decode("utf-8")
+
+
+def test_replace_response_eos_for_teacher_only_changes_first_response_eos() -> None:
+    input_ids = [151643, 10, 20, 151643, 30, 151643]
+
+    teacher_input_ids = _replace_response_eos_for_teacher(
+        input_ids,
+        prompt_length=3,
+        response_length=3,
+        student_eos_token_id=151643,
+        teacher_eos_token_id=151645,
+    )
+
+    assert teacher_input_ids == [151643, 10, 20, 151645, 30, 151643]
+    assert input_ids == [151643, 10, 20, 151643, 30, 151643]
+
+
+def test_replace_response_eos_for_teacher_is_noop_for_truncated_response() -> None:
+    input_ids = [10, 20, 30, 40]
+
+    teacher_input_ids = _replace_response_eos_for_teacher(
+        input_ids,
+        prompt_length=2,
+        response_length=2,
+        student_eos_token_id=151643,
+        teacher_eos_token_id=151645,
+    )
+
+    assert teacher_input_ids == input_ids
+    assert teacher_input_ids is not input_ids
+
+
+def test_insert_teacher_response_prefix_updates_prompt_length_only() -> None:
+    input_ids = [10, 20, 151645, 30]
+
+    teacher_input_ids, teacher_prompt_length = _insert_teacher_response_prefix(
+        input_ids,
+        prompt_length=2,
+        prefix_token_ids=[151667, 271, 151668, 271],
+    )
+
+    assert teacher_input_ids == [10, 20, 151667, 271, 151668, 271, 151645, 30]
+    assert teacher_prompt_length == 6
+    assert input_ids == [10, 20, 151645, 30]
 
 
 def test_teacher_prefill_self_topk_keeps_token_id_zero_and_takes_tail() -> None:
