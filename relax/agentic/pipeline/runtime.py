@@ -50,7 +50,7 @@ from relax.utils.types import Sample
 # pure overhead: 2x RAM in the rollout buffers and 2x pickle on every transfer.
 # Mirrors the reference repo's cast_pixel_fp16 (train/osworld_vlm_preprocess_shards.py).
 _MM_PIXEL_DTYPE_NAME = os.environ.get("RELAX_MM_PIXEL_DTYPE", "fp32").strip().lower()
-_MM_PIXEL_DTYPE = {
+_MM_PIXEL_DTYPES = {
     "fp32": None,
     "float32": None,
     "bf16": torch.bfloat16,
@@ -58,7 +58,14 @@ _MM_PIXEL_DTYPE = {
     "fp16": torch.float16,
     "float16": torch.float16,
     "half": torch.float16,
-}[_MM_PIXEL_DTYPE_NAME]
+}
+try:
+    _MM_PIXEL_DTYPE = _MM_PIXEL_DTYPES[_MM_PIXEL_DTYPE_NAME]
+except KeyError as exc:
+    valid_values = ", ".join(sorted(_MM_PIXEL_DTYPES))
+    raise ValueError(
+        f"Invalid RELAX_MM_PIXEL_DTYPE={_MM_PIXEL_DTYPE_NAME!r}; expected one of: {valid_values}"
+    ) from exc
 
 
 def _cast_pixel_values(mm: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

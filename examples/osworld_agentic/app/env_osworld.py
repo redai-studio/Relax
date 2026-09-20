@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno as _errno
 import fcntl as _fcntl
 import hashlib as _hashlib
 import json
@@ -347,26 +348,35 @@ async def _acquire_env_group_slot_async(task_key):
     while True:
         mfd = _os.open(mutex_path, _os.O_CREAT | _os.O_RDWR, 0o666)
         try:
-            _fcntl.flock(mfd, _fcntl.LOCK_EX)
-            if _flock_is_held(my_path):
-                fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
-                _fcntl.flock(fd, _fcntl.LOCK_SH)
-                return fd
-            busy = 0
-            for name in _os.listdir(_ENV_SLOT_DIR):
-                if name.startswith("task_") and name != my_name and _flock_is_held(_os.path.join(_ENV_SLOT_DIR, name)):
-                    busy += 1
-            if busy < _ENV_GROUP_LIMIT:
-                fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
-                _fcntl.flock(fd, _fcntl.LOCK_SH)
-                logger.info(
-                    "[env_gate] group slot %d/%d -> task %s (queued %.0fs)",
-                    busy + 1,
-                    _ENV_GROUP_LIMIT,
-                    task_key[:12],
-                    waited,
-                )
-                return fd
+            try:
+                _fcntl.flock(mfd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in (_errno.EACCES, _errno.EAGAIN):
+                    raise
+            else:
+                if _flock_is_held(my_path):
+                    fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
+                    _fcntl.flock(fd, _fcntl.LOCK_SH)
+                    return fd
+                busy = 0
+                for name in _os.listdir(_ENV_SLOT_DIR):
+                    if (
+                        name.startswith("task_")
+                        and name != my_name
+                        and _flock_is_held(_os.path.join(_ENV_SLOT_DIR, name))
+                    ):
+                        busy += 1
+                if busy < _ENV_GROUP_LIMIT:
+                    fd = _os.open(my_path, _os.O_CREAT | _os.O_RDWR, 0o666)
+                    _fcntl.flock(fd, _fcntl.LOCK_SH)
+                    logger.info(
+                        "[env_gate] group slot %d/%d -> task %s (queued %.0fs)",
+                        busy + 1,
+                        _ENV_GROUP_LIMIT,
+                        task_key[:12],
+                        waited,
+                    )
+                    return fd
         finally:
             _os.close(mfd)
         step = 8.0 + 7.0 * _random.random()
