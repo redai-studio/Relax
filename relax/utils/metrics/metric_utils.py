@@ -5,6 +5,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from relax.algorithms.spec import get_algorithm
 from relax.utils.types import Sample
 
 
@@ -111,7 +112,13 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
 
 
 def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
-    """Compute RLOO-specific diagnostics from training rollout samples.
+    """Compute leave-one-out diagnostics from training rollout samples.
+
+    Gated on the algorithm registry's ``reward_normalizer`` rather than on the
+    estimator's name: what makes these numbers meaningful is that the reward
+    stage produced a leave-one-out baseline, so any algorithm declaring that
+    normalizer gets them. The ``rloo/`` key prefix stays as-is -- those metric
+    names are already published to dashboards.
 
     These keys are returned with an ``rloo/`` prefix. The training rollout
     logger adds the outer ``rollout/`` prefix before publishing them.
@@ -124,7 +131,8 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     length and therefore remains distinct from a sample whose response exists
     but is fully masked.
     """
-    if getattr(args, "advantage_estimator", None) != "rloo":
+    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    if spec.reward_normalizer != "group_leave_one_out":
         return {}
     if (
         getattr(args, "custom_reward_post_process_path", None) is not None

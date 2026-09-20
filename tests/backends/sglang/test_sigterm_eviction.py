@@ -6,6 +6,11 @@ import signal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+pytest.importorskip("sglang.srt.server_args")
+
 from relax.backends.sglang.sglang_engine import SGLangEngine
 
 

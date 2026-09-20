@@ -1,0 +1,31 @@
+name: Acquire devices
+description: Reserve accelerator devices on a shared runner host until the end of the job
+
+inputs:
+  backend:
+    description: Device discovery and visibility backend (currently nvidia)
+    default: nvidia
+  count:
+    description: Number of devices to reserve
+    default: '1'
+  devices:
+    description: Optional candidate pool of comma-separated physical indices or full UUIDs
+    default: ''
+  timeout:
+    description: Maximum seconds to wait for an allocation (0 means try once)
+    default: '1800'
+  lock-dir:
+    description: Host directory shared by every runner competing for the same devices
+    default: /tmp/acquire-devices
+
+outputs:
+  devices:
+    description: Comma-separated canonical IDs of the reserved devices
+  count:
+    description: Number of reserved devices
+
+runs:
+  using: node24
+  main: main.js
+  post: post.js
+  post-if: always()
