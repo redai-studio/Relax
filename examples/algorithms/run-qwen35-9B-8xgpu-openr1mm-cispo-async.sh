@@ -38,7 +38,7 @@ CKPT_ARGS=(
    --ref-load ${MODEL_DIR}/Qwen3.5-9B
    # --hf-checkpoint ${MODEL_DIR}/Qwen3-VL-4B-Instruct
    # --ref-load ${MODEL_DIR}/Qwen3-VL-4B-Instruct
-   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/ 
+   --load ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save ${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu/
    --save-interval 100
    --max-actor-ckpt-to-keep 1

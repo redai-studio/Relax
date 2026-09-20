@@ -338,6 +338,8 @@ def destroy_process_groups(post_destroy_delay: float = 2.0):
     """Destroy all reloadable process groups."""
     if _should_skip_reload_and_destroy():
         return
+    if device_utils.is_npu_available:
+        post_destroy_delay = 0.0
     ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
 
 

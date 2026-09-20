@@ -12,6 +12,7 @@ ARG NO_PROXY
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
+ARG SOC_VERSION_FOR_SGL_BUILD="Ascend910_9392"
 
 ENV http_proxy=${HTTP_PROXY} \
     https_proxy=${HTTPS_PROXY} \
@@ -136,31 +137,26 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     git add . && git commit -m "install info" && \
     git fetch && \
     git cherry-pick ece02ffc9cc32e94382d4f1b553b2c755f83f722 && \
-    patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch && \
-    git add . && git commit -m "sglang-npu.patch"
+    git am /root/Relax/docker/npu_patch/sglang-npu.patch
 
 # Install SGLang NPU kernels.
 RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
     cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
-    patch -p1 < /root/Relax/docker/npu_patch/sgl-kernel-npu.patch && \
-    git add . && git commit -m "sgl-kernel-npu.patch" && \
-    bash build.sh && \
+    git submodule update --init third_party/catlass third_party/pto-isa && \
+    git am /root/Relax/docker/npu_patch/sgl-kernel-npu.patch && \
+    bash build.sh -a kernels ${SOC_VERSION_FOR_SGL_BUILD} && bash build.sh -a memory-saver && bash build.sh -a deepep && \
     pip install output/*.whl && \
     cd /root && rm -rf /root/sgl-kernel-npu
 
 # Install AscendC FLA
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu.git /root/flash-linear-attention-npu && \
-    cd /root/flash-linear-attention-npu && git checkout v26.1.0 && \
+    cd /root/flash-linear-attention-npu && git checkout v26.6.0 && \
     apt update && apt-get install -y --no-install-recommends gawk && \
-    # 编译命令，注意--soc=${soc_version}需要指定为当前机器的芯片类型{ascend910b/ascend910_93/ascend950}
-    bash build.sh --soc=ascend910_93 --pkg --ops=causal_conv1d,chunk_bwd_dv_local,chunk_bwd_dqkwg,chunk_gated_delta_rule_bwd_dhu,prepare_wy_repr_bwd_da,prepare_wy_repr_bwd_full,chunk_fwd_o,chunk_gated_delta_rule_fwd_h,recurrent_gated_delta_rule,recompute_wu_fwd && \
-    # 安装run包
-    ./build_out/cann-*.run && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
     source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh && \
-    # 一键编译安装脚本，先调用torchnpugen自动接入算子，再运行setup编whl包，最后安装whl包
-    cd torch_custom/fla_npu && bash build.sh
+    FLA_NPU_SOC=ascend910_93 python -m pip wheel --no-build-isolation --no-deps . -w dist && \
+    python -m pip install --force-reinstall --no-deps dist/flash_linear_attention_npu-*.whl
 
 FROM train as relax
 
@@ -168,7 +164,7 @@ WORKDIR /root
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt --no-cache-dir && \
-    pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6
+    pip install --index-url https://pypi.org/simple ray==2.55.1 protobuf==6.33.6 fastokens==0.3.1
 
 # Clean caches.
 RUN pip cache purge && \

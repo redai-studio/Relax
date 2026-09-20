@@ -69,9 +69,9 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 3
-   # --decoder-last-pipeline-num-layers 
+   # --decoder-last-pipeline-num-layers
    --decoder-first-pipeline-num-layers 8
-   
+
    --context-parallel-size 1
 
    --recompute-granularity full
