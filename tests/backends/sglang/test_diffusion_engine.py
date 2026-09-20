@@ -269,9 +269,9 @@ def test_map_responses_requires_exactly_one_candidate():
 
 
 def test_post_decodes_sglang_msgpack_response(monkeypatch):
-    import msgspec
     import requests
 
+    msgspec = pytest.importorskip("msgspec")
     payload = [{"request_id": "r1", "generated_output": {"__tensor__": True, "data": b"tensor"}}]
 
     class Response:

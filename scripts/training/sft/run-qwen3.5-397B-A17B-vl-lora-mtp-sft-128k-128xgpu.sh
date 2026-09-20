@@ -208,7 +208,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --calculate-per-token-loss
-   
+
    --freeze-vision-model
    --use-precision-aware-optimizer
    --cross-entropy-loss-fusion

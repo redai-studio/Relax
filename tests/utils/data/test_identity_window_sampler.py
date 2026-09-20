@@ -1,6 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import pytest
+
+
+pytest.importorskip("transfer_queue")
+
+from transfer_queue import StreamingTokenBudgetSampler
+
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+
+
+pytestmark = pytest.mark.skipif(
+    not callable(getattr(StreamingTokenBudgetSampler, "sample", None)),
+    reason="requires the real TransferQueue sampler, not the CI import stub",
+)
 
 
 class _Partition:

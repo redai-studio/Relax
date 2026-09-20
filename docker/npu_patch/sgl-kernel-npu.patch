@@ -1,3 +1,86 @@
+From 9b321f1e34e7ae4adcf283a845b14852cce0a783 Mon Sep 17 00:00:00 2001
+From: liyongwen <1310439159@qq.com>
+Date: Sat, 29 Aug 2026 08:44:22 +0000
+Subject: [PATCH] sgl-kernel-npu optimize for qwen3.5 9B&35B
+
+---
+ build.sh                                      |   6 +-
+ .../python/torch_memory_saver/entrypoint.py   |   8 +-
+ csrc/CMakeLists.txt                           |  56 ++
+ .../op_host/cache_loc_assign.cpp              |  36 +-
+ .../op_host/tiling/cache_loc_assign.h         |   5 +
+ .../op_kernel/cache_loc_assign_kernel.cpp     |  10 +-
+ csrc/causal_conv1d/op_host/causal_conv1d.cpp  |   6 +-
+ csrc/causal_conv1d/op_kernel/causal_conv1d.h  |  14 +-
+ .../op_kernel/causal_conv1d_fn_tasks.h        |   7 +-
+ .../op_kernel/causal_conv1d_tiling_data.h     |   8 +
+ .../op_host/fused_qkvzba_conv1d.cpp           | 408 ++++++++++
+ .../op_host/fused_qkvzba_conv1d.h             |  37 +
+ .../stub/aclrtlaunch_fused_qkvzba_conv1d.h    |  15 +
+ .../op_kernel/fused_qkvzba_conv1d_kernel.cpp  | 168 ++++
+ .../fused_sigmoid_gating_recurrent.cpp        | 167 ++++
+ .../op_host/fused_sigmoid_gating_recurrent.h  |  45 ++
+ ...d_sigmoid_gating_recurrent_bf16_kernel.cpp |  16 +
+ ...d_sigmoid_gating_recurrent_fp32_kernel.cpp |  16 +
+ ...used_sigmoid_gating_recurrent_kernel_lib.h | 720 ++++++++++++++++++
+ csrc/pytorch_extensions.cpp                   |  46 +-
+ include/sgl_kenel_npu_ops.h                   |   6 +-
+ .../fla/fused_sigmoid_gating_recurrent.py     |  36 +-
+ ...gmoid_gating_recurrent_decode_optimized.py | 328 ++++++++
+ .../sgl_kernel_npu/fla/utils.py               |  13 +-
+ .../sgl_kernel_npu/moe/moe_front_routing.py   | 182 +++++
+ .../sgl_kernel_npu/moe/persistent_gmm.py      | 218 ++++++
+ .../sgl_kernel_npu/sample/__init__.py         |  13 +
+ .../sample/chain_speculative_sampling.py      | 354 +++++++++
+ .../sgl_kernel_npu/sample/probability.py      |  40 +
+ .../tree_speculative_sampling_target_only.py  | 383 ++++++++++
+ .../test_chain_speculative_sampling.py        | 138 ++++
+ .../test_speculative_probability.py           |  31 +
+ ...t_tree_speculative_sampling_target_only.py | 595 +++++++++++++++
+ 33 files changed, 4093 insertions(+), 38 deletions(-)
+ create mode 100644 csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp
+ create mode 100644 csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h
+ create mode 100644 csrc/fused_qkvzba_conv1d/op_host/stub/aclrtlaunch_fused_qkvzba_conv1d.h
+ create mode 100644 csrc/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp
+ create mode 100644 csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp
+ create mode 100644 csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h
+ create mode 100644 csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp
+ create mode 100644 csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp
+ create mode 100644 csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent_decode_optimized.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/chain_speculative_sampling.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/probability.py
+ create mode 100644 python/sgl_kernel_npu/sgl_kernel_npu/sample/tree_speculative_sampling_target_only.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_chain_speculative_sampling.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_speculative_probability.py
+ create mode 100644 tests/python/sgl_kernel_npu/test_tree_speculative_sampling_target_only.py
+
+diff --git a/build.sh b/build.sh
+index a7fc35b..32f4cb9 100755
+--- a/build.sh
++++ b/build.sh
+@@ -93,6 +93,10 @@ else
+ fi
+ 
+ echo "Use SOC_VERSION: $SOC_VERSION"
++if [[ "$BUILD_KERNELS_MODULE" == "ON" && ! "$SOC_VERSION" =~ ^Ascend910_93[0-9]{2}$ ]]; then
++    echo "Error: tp_ascendc_fusion kernels require Ascend910_93xx, got: $SOC_VERSION"
++    exit 1
++fi
+ 
+ echo "=== Fixing ASCConfig for CANN 8.3 / A2 ==="
+ 
+@@ -168,7 +172,7 @@ function build_kernels()
+     -DASCEND_INCLUDE_DIR=$ASCEND_INCLUDE_DIR \
+     -DCMAKE_PREFIX_PATH="$ASC_CMAKE_DIR" \
+     -DASC_DIR="$ASC_CMAKE_DIR" \
+-    -DSOC_VERSION=Ascend910_9382 \
++    -DSOC_VERSION="$SOC_VERSION" \
+     -DDEEPEP_IS_A5_BUILD=$([[ "$SOC_VERSION" == "Ascend950" ]] && echo "ON" || echo "OFF") \
+     -DBUILD_DEEPEP_MODULE=$BUILD_DEEPEP_MODULE \
+     -DBUILD_KERNELS_MODULE=$BUILD_KERNELS_MODULE \
 diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
 index b14c561..7b0508d 100644
 --- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
@@ -48,6 +131,94 @@ index b14c561..7b0508d 100644
 -        )
 +        )
 \ No newline at end of file
+diff --git a/csrc/CMakeLists.txt b/csrc/CMakeLists.txt
+index e8ec532..86801a9 100644
+--- a/csrc/CMakeLists.txt
++++ b/csrc/CMakeLists.txt
+@@ -29,6 +29,9 @@ FILE(GLOB OP_SRCS
+     ${PROJECT_OP_SRC_BASE}/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule.cpp
+     ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_host/causal_conv1d.cpp
+     ${PROJECT_OP_SRC_BASE}/apply_token_bitmask/op_host/apply_token_bitmask.cpp
++    # TP_FUSION: fused_qkvzba_conv1d + fused_sigmoid_gating_recurrent
++    ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp
++    ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp
+     )
+ if(BUILD_CATLASS_MODULE)
+     list(APPEND OP_SRCS
+@@ -114,6 +117,55 @@ ascendc_compile_definitions(workspace_kernel PRIVATE
+        -DHAVE_TILING
+ )
+ 
++# The two TP_FUSION kernels live in dedicated libraries with --cce-auto-sync
++# pinned explicitly so the global default cannot drift. Both kernels use fully
++# manual synchronization (explicit PipeBarrier/SetFlag) and are correct either
++# way.
++#
++# The two kernels must be in separate libraries: under
++# HAVE_WORKSPACE/HAVE_TILING the toolchain auto_gen launch wrapper expands the
++# signature per the "last two params = workspace/tiling" convention.
++# fused_qkvzba_conv1d ends in GM_ADDR workspace/tiling and matches;
++# fused_sigmoid_gating_recurrent has no workspace/tiling and ends in 8
++# by-value scalar params, so in the same library auto_gen would mistake the
++# second-to-last float softplusThreshold for a workspace pointer. Hence
++# recurrent goes alone into tp_fusion_recurrent_kernel, without
++# HAVE_WORKSPACE/HAVE_TILING.
++ascendc_library(tp_fusion_kernel STATIC
++    ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp
++)
++ascendc_include_directories(tp_fusion_kernel PRIVATE
++    ${PROJECT_OP_SRC_BASE}/utils/kernel
++    ${PROJECT_OP_SRC_BASE}/causal_conv1d_update/op_kernel
++    ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_kernel
++)
++ascendc_compile_definitions(tp_fusion_kernel PRIVATE
++       -DHAVE_WORKSPACE
++       -DHAVE_TILING
++)
++ascendc_compile_options(tp_fusion_kernel PRIVATE
++       --cce-auto-sync=on
++)
++
++# The bf16/fp32 recurrent entries must be one kernel per file:
++# KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple kernels in one file
++# — only the first kernel registers; the rest fail with RegisterAscendBinary
++# aiv ret 107000 and launch hangs with the kernel not found.
++# Shared classes live in op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h.
++ascendc_library(tp_fusion_recurrent_kernel STATIC
++    ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp
++    ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp
++)
++# Pin =off: this kernel is a double-buffered pipeline with fully manual event
++# discipline (AllocEventID events + DrainEvents draining at the end) and does
++# not use the TQue programming model — auto-sync only applies to the canonical
++# model (EnQue/DeQue/AllocTensor/FreeTensor). =on gains nothing here and only
++# inserts extra compiler-owned events at scalar GetValue/SetValue (same
++# hardware pool as the manual events).
++ascendc_compile_options(tp_fusion_recurrent_kernel PRIVATE
++       --cce-auto-sync=off
++)
++
+ set(MEGA_CHUNK_GDN_KERNEL_TARGETS)
+ set(MEGA_CHUNK_GDN_KERNEL_TARGETS mega_chunk_gdn_kernel)
+ ascendc_library(mega_chunk_gdn_kernel STATIC
+@@ -139,6 +191,8 @@ target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
+         ${MEGA_CHUNK_GDN_KERNEL_TARGETS}
+         workspace_kernel
+         no_workspace_kernel
++        tp_fusion_kernel
++        tp_fusion_recurrent_kernel
+         torch_npu
+         ascendcl
+         tiling_api
+@@ -161,6 +215,8 @@ target_include_directories(${OP_PLUGIN_NAME} PRIVATE
+         ${PROJECT_OP_SRC_BASE}/causal_conv1d_update/op_host
+         ${PROJECT_OP_SRC_BASE}/causal_conv1d_update/op_host/stub
+         ${PROJECT_OP_SRC_BASE}/causal_conv1d/op_host
++        ${PROJECT_OP_SRC_BASE}/fused_qkvzba_conv1d/op_host
++        ${PROJECT_OP_SRC_BASE}/fused_sigmoid_gating_recurrent/op_host
+         ${TORCH_DIR}/include
+         ${TORCH_DIR}/include/torch/csrc/api/include
+         ${TORCH_NPU_DIR}/include
 diff --git a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp b/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
 index 5fbecbe..b42f5bc 100644
 --- a/csrc/cache_location_assign/op_host/cache_loc_assign.cpp
@@ -210,11 +381,1834 @@ index 109f604..c78f303 100644
      uint64_t cacheLocSize;
  
      int64_t cacheIdxStart{0};
+diff --git a/csrc/causal_conv1d/op_host/causal_conv1d.cpp b/csrc/causal_conv1d/op_host/causal_conv1d.cpp
+index cf76fbd..66a44b3 100644
+--- a/csrc/causal_conv1d/op_host/causal_conv1d.cpp
++++ b/csrc/causal_conv1d/op_host/causal_conv1d.cpp
+@@ -70,6 +70,7 @@ struct CausalConv1dTilingKey {
+     int64_t hasCacheIndices;
+     int64_t hasInitialState;
+     int64_t hasNumAccept;
++    int64_t xRowStride;  // x physical row stride goes into the hash; always = dim for the standalone op
+ };
+ 
+ struct CausalConv1dTilingKeyHash {
+@@ -97,6 +98,7 @@ struct CausalConv1dTilingKeyHash {
+         h = HashCombine(h, static_cast<std::size_t>(k.hasCacheIndices));
+         h = HashCombine(h, static_cast<std::size_t>(k.hasInitialState));
+         h = HashCombine(h, static_cast<std::size_t>(k.hasNumAccept));
++        h = HashCombine(h, static_cast<std::size_t>(k.xRowStride));
+         return h;
+     }
+ };
+@@ -176,6 +178,7 @@ void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t ba
+     std::memset(&td, 0, sizeof(td));
+ 
+     td.dim = dim;
++    td.xRowStride = dim;  // the standalone op's row stride is always dim (numVHeads stays 0 via memset)
+     td.cuSeqlen = cuSeqlen;
+     td.seqLen = seqLen;
+     td.inputMode = inputMode;
+@@ -362,7 +365,8 @@ HOST_API at::Tensor causal_conv1d_impl(const at::Tensor &x, const at::Tensor &we
+                               hasBias ? 1 : 0,
+                               hasCacheIndices ? 1 : 0,
+                               hasInitialState ? 1 : 0,
+-                              hasNumAccept ? 1 : 0};
++                              hasNumAccept ? 1 : 0,
++                              dim};
+     uint64_t hashValue = CausalConv1dTilingKeyHash{}(key);
+ 
+     static auto globalTilingBuffer = at::empty({tilingSize * static_cast<int64_t>(MAX_CAPTURE_NUM)},
+diff --git a/csrc/causal_conv1d/op_kernel/causal_conv1d.h b/csrc/causal_conv1d/op_kernel/causal_conv1d.h
+index 2689ed4..a7d52d8 100644
+--- a/csrc/causal_conv1d/op_kernel/causal_conv1d.h
++++ b/csrc/causal_conv1d/op_kernel/causal_conv1d.h
+@@ -345,6 +345,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
+     const int32_t stateLen = tilingData_->stateLen;
+     const int32_t width = static_cast<int32_t>(tilingData_->width);
+     const int32_t ringStart = MAX_WIDTH - width;
++    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
+     LocalTensor<T> ring = inBuf.Get<T>();
+ 
+     for (int32_t i = 0; i < ringStart; ++i) {
+@@ -372,7 +373,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRing(int32_t cacheIdx, bool hasI
+ 
+     if (len > 0) {
+         const int32_t slot0 = SlotCurr(0);
+-        const int64_t xOffset = static_cast<int64_t>(start) * dim + channelStart;
++        const int64_t xOffset = static_cast<int64_t>(start) * xRowStride + channelStart;
+         DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
+         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
+     }
+@@ -402,6 +403,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
+     LocalTensor<T> outT = outBuf.Get<T>();
+     const bool hasBias = HasBias();
+     const bool hasActivation = HasActivation();
++    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
+     for (int32_t t = 0; t < len; ++t) {
+         const int32_t slotCurr = SlotCurr(t);
+ 
+@@ -409,7 +411,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeq(int32_t start, int32_t len, i
+ 
+         if (t + 1 < len) {
+             const int32_t slotNext = SlotPrefetch(t);
+-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
++            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
+             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
+             DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
+             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
+@@ -642,6 +644,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
+     LocalTensor<T> ring = inBuf.Get<T>();
+     LocalTensor<T> outT = outBuf.Get<T>();
+     const bool hasActivation = HasActivation();
++    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
+     RestoreFnLocalPartials(baseDim);
+ 
+     for (int32_t t = 0; t < len; ++t) {
+@@ -651,7 +654,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::RunSeqFnRolling(int32_t start, int32
+ 
+         if (t + 1 < len) {
+             const int32_t slotNext = SlotPrefetch(t);
+-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
++            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
+             WaitFlag<HardEvent::V_MTE2>(inputVToMte2Event_);
+             DataCopy(ring[slotNext * MAX_BLOCK_DIM], xGm[xOffsetNext], baseDim);
+             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slotNext]);
+@@ -735,6 +738,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
+ {
+     const int32_t width = static_cast<int32_t>(tilingData_->width);
+     const int32_t stateLen = tilingData_->stateLen;
++    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
+     if (len <= 0) {
+         return;
+     }
+@@ -788,7 +792,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
+         WaitFlag<HardEvent::MTE3_MTE2>(stateShiftMte3ToMte2Event_);
+     }
+ 
+-    const int64_t xOffset0 = static_cast<int64_t>(start) * dim + channelStart;
++    const int64_t xOffset0 = static_cast<int64_t>(start) * xRowStride + channelStart;
+     DataCopy(buf0, xGm[xOffset0], baseDim);
+     SetFlag<HardEvent::MTE2_MTE3>(specWritebackMte2ToMte3Event_[0]);
+ 
+@@ -801,7 +805,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::WriteBackStateSpec(int32_t cacheIdx,
+         WaitFlag<HardEvent::MTE2_MTE3>(specWritebackMte2ToMte3Event_[curr]);
+ 
+         if (t + 1 < len) {
+-            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * dim + channelStart;
++            const int64_t xOffsetNext = static_cast<int64_t>(start + t + 1) * xRowStride + channelStart;
+             if (t > 0) {
+                 WaitFlag<HardEvent::MTE3_MTE2>(specWritebackMte3ToMte2Event_[next]);
+             }
+diff --git a/csrc/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h b/csrc/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h
+index d467dc4..fee7984 100644
+--- a/csrc/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h
++++ b/csrc/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h
+@@ -108,14 +108,15 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t seq, int32_
+     bool hasGmHistoryCopy = false;
+     bool hasVectorInit = false;
+     const int64_t stateBaseOffset = static_cast<int64_t>(cacheIdx) * stateLen * dim + channelStart;
+-    int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * dim + channelStart;
++    const int64_t xRowStride = tilingData_->xRowStride;  // x physical row stride (elements); always = dim for the standalone op
++    int64_t xHistoryOffset = static_cast<int64_t>(historyStartTok) * xRowStride + channelStart;
+ 
+     for (int32_t i = 0; i < ringStart; ++i) {
+         Duplicate(ring[i * MAX_BLOCK_DIM], static_cast<T>(0), baseDim);
+         hasVectorInit = true;
+     }
+ 
+-    for (int32_t i = 0, srcTok = historyStartTok; i < historyCount; ++i, ++srcTok, xHistoryOffset += dim) {
++    for (int32_t i = 0, srcTok = historyStartTok; i < historyCount; ++i, ++srcTok, xHistoryOffset += xRowStride) {
+         LocalTensor<T> histSlot = ring[(ringStart + i) * MAX_BLOCK_DIM];
+         if (srcTok >= seqStart) {
+             DataCopy(histSlot, xGm[xHistoryOffset], baseDim);
+@@ -147,7 +148,7 @@ __aicore__ inline void CAUSAL_CONV1D_CLASS::InitRingSeqSplit(int32_t seq, int32_
+ 
+     if (tileLen > 0) {
+         const int32_t slot0 = SlotCurr(0);
+-        const int64_t xOffset = static_cast<int64_t>(tileStart) * dim + channelStart;
++        const int64_t xOffset = static_cast<int64_t>(tileStart) * xRowStride + channelStart;
+         DataCopy(ring[slot0 * MAX_BLOCK_DIM], xGm[xOffset], baseDim);
+         SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_[slot0]);
+     }
+diff --git a/csrc/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h b/csrc/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h
+index 6360deb..4610e34 100644
+--- a/csrc/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h
++++ b/csrc/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h
+@@ -62,5 +62,13 @@ struct CausalConv1dTilingData {
+     int64_t runModeKey;
+     int64_t widthKey;
+     int64_t fnPlanKey;
++
++    int64_t xRowStride;  // x physical row stride (elements); the standalone op's host always fills = dim
++    int64_t numVHeads;   // for fused_qkvzba_conv1d's b/a copy; always 0 (memset) in the standalone op, unread
++    // fused_qkvzba_conv1d accepts row-stride view inputs (direct read of packed GEMM non-contiguous output):
++    // zWidth is carried explicitly, not derived as xRowStride - dim; baRowStride replaces hardcoded 2*numVHeads.
++    // Always 0 (memset) in the standalone op, unread.
++    int64_t zWidth;
++    int64_t baRowStride;
+ };
+ #endif  // CUSTOM_CAUSAL_CONV1D_TILING_DATA_H_
+diff --git a/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp b/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp
+new file mode 100644
+index 0000000..828de1f
+--- /dev/null
++++ b/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.cpp
+@@ -0,0 +1,408 @@
++// fused_qkvzba_conv1d (GDN decode: fused split + causal_conv1d) host implementation
++/**
++ * This program is free software, you can redistribute it and/or modify it.
++ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
++ * LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file fused_qkvzba_conv1d.cpp
++ * \brief fused_qkvzba_conv1d host-side implementation
++ *
++ * Fused semantics (matching fla/utils.py fused_qkvzba_split_reshape_cat_contiguous + torch.ops.npu.causal_conv1d):
++ *   y[B, qkvWidth]   = causal_conv1d(qkvz[:, :qkvWidth], ...)   -- x rows are read with stride xRowStride = qkvz.stride(0)
++ *   z[B, nv, head_v] = qkvz[:, qkvWidth : qkvWidth+nv*head_v]   -- copied by the same kernel
++ *   b[B, nv]         = mixed_ba[:, :nv]
++ *   a[B, nv]         = mixed_ba[:, nv : 2nv]
++ * The conv part is bit-exact with causal_conv1d run_mode=1 (UPDATE): same tiling struct, same device class,
++ * only dim = qkvWidth and xRowStride = physical row stride of qkvz. Decode empty-call convention:
++ * has_initial_state / num_accepted_tokens are always treated as empty.
++ *
++ * qkvz / mixed_ba accept row-stride views (stride(1)==1, row stride >= logical width), e.g. non-contiguous
++ * slices of packed GEMM output: xRowStride = stride(0) (== size(1) when contiguous); zWidth is carried
++ * explicitly in tiling (it cannot be derived as xRowStride - dim when the row stride includes pack padding);
++ * the ba row stride is carried as baRowStride. Alignment contract: xRowStride must still be a multiple of 16
++ * (32B alignment of z row starts); the ba copy uses DataCopyPad and requires no alignment.
++ */
++
++#include <cstring>
++#include <limits>
++#include <tuple>
++#include <unordered_map>
++#include "acl/acl.h"
++#include <ATen/Operators.h>
++#include <torch/all.h>
++#include <torch/library.h>
++#include "torch_npu/csrc/core/npu/NPUStream.h"
++#include "torch_npu/csrc/core/npu/DeviceUtils.h"
++#include "tiling/platform/platform_ascendc.h"
++#include "stub/aclrtlaunch_fused_qkvzba_conv1d.h"
++#include "defines.h"
++#include "torch_helper.h"
++#include "common.h"
++#include "fused_qkvzba_conv1d.h"
++#include "../../causal_conv1d/op_kernel/causal_conv1d_tiling_data.h"  // shared tiling struct (with xRowStride/numVHeads)
++
++namespace sglang {
++namespace npu_kernel {
++
++constexpr uint32_t PADDING_BYTE = 32U;
++constexpr int64_t MAX_DIM_TILE = 4096;
++constexpr int32_t MAX_WIDTH = 4;
++constexpr int32_t MIN_WIDTH = 2;
++constexpr uint32_t MAX_CAPTURE_NUM = 1024;
++constexpr int64_t Z_COPY_MAX_BYTES = 65535;  // single-block DataCopy blockLen limit (bytes); z row copy is never split
++
++constexpr uint32_t CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE = 1;
++
++// Op-local tiling cache (same field-hash + global device buffer scheme as the causal_conv1d host,
++// with xRowStride / numVHeads added so entries never collide with the standalone op or other shapes)
++static uint32_t g_fusedQkvzbaConv1dCaptureNum = 0;
++static std::unordered_map<uint64_t, uint32_t> g_fusedQkvzbaConv1dCaptureMap;
++
++struct FusedQkvzbaConv1dTilingKey {
++    int64_t dim;
++    int64_t cuSeqlen;
++    int64_t seqLen;
++    int64_t batch;
++    int64_t inputMode;
++    int64_t width;
++    int64_t stateLen;
++    int64_t numCacheLines;
++    int64_t activationMode;
++    int64_t padSlotId;
++    int64_t runMode;
++    int64_t hasBias;
++    int64_t hasCacheIndices;
++    int64_t hasInitialState;
++    int64_t hasNumAccept;
++    int64_t xRowStride;
++    int64_t numVHeads;
++    int64_t zWidth;       // hashed explicitly (not derived as xRowStride - dim)
++    int64_t baRowStride;  // ba physical row stride (== 2*numVHeads when contiguous)
++};
++
++struct FusedQkvzbaConv1dTilingKeyHash {
++    static inline std::size_t HashCombine(std::size_t seed, std::size_t value)
++    {
++        seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
++        return seed;
++    }
++
++    std::size_t operator()(const FusedQkvzbaConv1dTilingKey &k) const
++    {
++        std::size_t h = 0;
++        h = HashCombine(h, static_cast<std::size_t>(k.dim));
++        h = HashCombine(h, static_cast<std::size_t>(k.cuSeqlen));
++        h = HashCombine(h, static_cast<std::size_t>(k.seqLen));
++        h = HashCombine(h, static_cast<std::size_t>(k.batch));
++        h = HashCombine(h, static_cast<std::size_t>(k.inputMode));
++        h = HashCombine(h, static_cast<std::size_t>(k.width));
++        h = HashCombine(h, static_cast<std::size_t>(k.stateLen));
++        h = HashCombine(h, static_cast<std::size_t>(k.numCacheLines));
++        h = HashCombine(h, static_cast<std::size_t>(k.activationMode));
++        h = HashCombine(h, static_cast<std::size_t>(k.padSlotId));
++        h = HashCombine(h, static_cast<std::size_t>(k.runMode));
++        h = HashCombine(h, static_cast<std::size_t>(k.hasBias));
++        h = HashCombine(h, static_cast<std::size_t>(k.hasCacheIndices));
++        h = HashCombine(h, static_cast<std::size_t>(k.hasInitialState));
++        h = HashCombine(h, static_cast<std::size_t>(k.hasNumAccept));
++        h = HashCombine(h, static_cast<std::size_t>(k.xRowStride));
++        h = HashCombine(h, static_cast<std::size_t>(k.numVHeads));
++        h = HashCombine(h, static_cast<std::size_t>(k.zWidth));
++        h = HashCombine(h, static_cast<std::size_t>(k.baRowStride));
++        return h;
++    }
++};
++
++namespace {
++
++inline int64_t CeilDiv(int64_t x, int64_t y)
++{
++    return (x + y - 1) / y;
++}
++
++struct UpdateDimTileChoice {
++    int64_t baseDim = 0;
++    int64_t baseDimCnt = 0;
++    int64_t gridSize = 0;
++};
++
++// Mirrors the causal_conv1d host's ChooseUpdateBaseDimChoice (GE update-mode tiling policy);
++// here dim = qkvWidth participates in the choice, identical to the old mixed_qkv path.
++UpdateDimTileChoice ChooseUpdateBaseDimChoice(int64_t batch, int64_t dim, int32_t numCores)
++{
++    const int64_t candidates[] = {4096, 2048, 1024, 512, 384, 192};
++    const int64_t coreNum = (numCores > 0) ? static_cast<int64_t>(numCores) : 1;
++
++    auto chooseOnce = [&](bool requireExactDiv) -> UpdateDimTileChoice {
++        UpdateDimTileChoice bestOver;
++        int64_t bestOverGap = std::numeric_limits<int64_t>::max();
++        UpdateDimTileChoice bestUnder;
++
++        for (int64_t candBaseDim : candidates) {
++            if (candBaseDim <= 0) {
++                continue;
++            }
++            if (requireExactDiv && (dim % candBaseDim != 0)) {
++                continue;
++            }
++            const int64_t baseDimCnt = requireExactDiv ? (dim / candBaseDim) : CeilDiv(dim, candBaseDim);
++            const int64_t gridSize = batch * baseDimCnt;
++            if (gridSize <= 0) {
++                continue;
++            }
++            if (gridSize >= coreNum) {
++                const int64_t gap = gridSize - coreNum;
++                if (gap < bestOverGap) {
++                    bestOver = {candBaseDim, baseDimCnt, gridSize};
++                    bestOverGap = gap;
++                }
++            } else if (gridSize > bestUnder.gridSize ||
++                       (gridSize == bestUnder.gridSize && candBaseDim < bestUnder.baseDim)) {
++                bestUnder = {candBaseDim, baseDimCnt, gridSize};
++            }
++        }
++        return (bestOver.baseDim != 0) ? bestOver : bestUnder;
++    };
++
++    UpdateDimTileChoice result = chooseOnce(true);
++    if (result.baseDim == 0) {
++        result = chooseOnce(false);
++    }
++    return result;
++}
++
++// Mirrors the causal_conv1d host's ComputeTilingData, keeping only the decode (run_mode=1 UPDATE) path,
++// with hasInitialState=false / hasNumAccept=false per the empty-call convention.
++// zWidth / baRowStride go into tiling explicitly (cannot be derived from xRowStride for row-stride views).
++void ComputeTilingData(int64_t dim, int64_t cuSeqlen, int64_t seqLen, int64_t batch, int64_t inputMode, int64_t width,
++                       int64_t stateLen, int64_t numCacheLines, int64_t activationMode, int64_t padSlotId, bool hasBias,
++                       bool hasCacheIndices, bool isBf16, int32_t numCores, int64_t xRowStride, int64_t numVHeads,
++                       int64_t zWidth, int64_t baRowStride, CausalConv1dTilingData &td)
++{
++    (void)padSlotId;
++    std::memset(&td, 0, sizeof(td));
++
++    td.dim = dim;
++    td.xRowStride = xRowStride;  // x rows are read with this stride (= qkvz.stride(0))
++    td.numVHeads = numVHeads;    // head count for the b/a copy
++    td.zWidth = zWidth;          // z column width carried explicitly (= numVHeads * head_v_dim)
++    td.baRowStride = baRowStride;  // mixed_ba physical row stride (== 2*numVHeads when contiguous)
++    td.cuSeqlen = cuSeqlen;
++    td.seqLen = seqLen;
++    td.inputMode = inputMode;
++    td.width = width;
++    td.stateLen = stateLen;
++    td.numCacheLines = numCacheLines;
++    td.batch = batch;
++    td.activationMode = activationMode;
++    td.padSlotId = padSlotId;
++    td.hasBias = hasBias ? 1 : 0;
++    td.hasCacheIndices = hasCacheIndices ? 1 : 0;
++    td.hasInitialStateMode = 0;   // decode empty call: no has_initial_state
++    td.hasInitStateWorkspace = 0;
++    td.hasNumAcceptedTokens = 0;  // decode empty call: no num_accepted_tokens (non-speculative path)
++
++    td.dtypeKey = isBf16 ? 0 : 1;
++    td.runModeKey = CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE;
++    td.widthKey = (width == 2) ? 1 : (width == 3) ? 2 : 3;  // same WIDTH_2/3/4 encoding as the old host
++
++    UpdateDimTileChoice choice = ChooseUpdateBaseDimChoice(batch, dim, numCores);
++    if (choice.baseDim <= 0 || choice.baseDimCnt <= 0) {
++        choice.baseDim = (dim > 0 && dim <= MAX_DIM_TILE) ? dim : MAX_DIM_TILE;
++        choice.baseDimCnt = (choice.baseDim > 0) ? CeilDiv(dim, choice.baseDim) : 1;
++        if (choice.baseDimCnt <= 0) {
++            choice.baseDimCnt = 1;
++        }
++    }
++    td.baseDim = choice.baseDim;
++    td.baseDimCnt = choice.baseDimCnt;
++    td.fnPlanKey = 0;  // CAUSAL_CONV1D_TPL_FN_PLAN_INVALID
++    td.tokenBlockSize = 0;
++    td.tokenBlockCnt = 0;
++
++    td.hasExplicitTokenSeqRanges = 0;
++    td.explicitTokenSeqRangeCount = 0;
++}
++
++}  // namespace
++
++HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_conv1d_impl(
++    const at::Tensor &qkvz, const at::Tensor &weight, const at::Tensor &conv_states, const at::Tensor &mixed_ba,
++    int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim, int64_t head_v_dim, const at::Tensor &bias,
++    const at::Tensor &query_start_loc, const at::Tensor &cache_indices, int64_t activation_mode, int64_t pad_slot_id)
++{
++    TORCH_CHECK(qkvz.defined(), "qkvz tensor must be defined");
++    TORCH_CHECK(weight.defined(), "weight tensor must be defined");
++    TORCH_CHECK(conv_states.defined(), "conv_states tensor must be defined");
++    TORCH_CHECK(mixed_ba.defined(), "mixed_ba tensor must be defined");
++
++    TORCH_CHECK(qkvz.dim() == 2, "qkvz must be 2D tensor");
++    TORCH_CHECK(weight.dim() == 2, "weight must be 2D tensor");
++    TORCH_CHECK(conv_states.dim() == 3, "conv_states must be 3D tensor");
++    TORCH_CHECK(mixed_ba.dim() == 2, "mixed_ba must be 2D tensor");
++
++    const at::ScalarType dtype = qkvz.scalar_type();
++    TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf, "Only BF16 and FP16 are supported");
++    TORCH_CHECK(weight.scalar_type() == dtype, "weight dtype must match qkvz dtype");
++    TORCH_CHECK(conv_states.scalar_type() == dtype, "conv_states dtype must match qkvz dtype");
++    TORCH_CHECK(mixed_ba.scalar_type() == dtype, "mixed_ba dtype must match qkvz dtype");
++
++    // Row-stride views (non-contiguous slices of packed GEMM output) are accepted: contiguous within a row
++    // (stride(1)==1) and row stride >= logical width; contiguous tensors satisfy this trivially.
++    TORCH_CHECK(qkvz.stride(1) == 1 && qkvz.stride(0) >= qkvz.size(1),
++                "qkvz must be row-contiguous (stride(1)==1 and stride(0)>=size(1)); contiguous or pack row-stride view");
++    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
++    TORCH_CHECK(conv_states.is_contiguous(), "conv_states must be contiguous");
++    TORCH_CHECK(mixed_ba.stride(1) == 1 && mixed_ba.stride(0) >= mixed_ba.size(1),
++                "mixed_ba must be row-contiguous (stride(1)==1 and stride(0)>=size(1))");
++
++    TORCH_CHECK(num_k_heads > 0 && num_v_heads > 0 && head_k_dim > 0 && head_v_dim > 0,
++                "num_k_heads/num_v_heads/head_k_dim/head_v_dim must be positive");
++
++    const int64_t qkvWidth = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim;
++    const int64_t zWidth = num_v_heads * head_v_dim;
++    TORCH_CHECK(qkvz.size(1) == qkvWidth + zWidth, "qkvz.size(1) must equal qkvWidth + zWidth = ",
++                qkvWidth + zWidth);
++    TORCH_CHECK(mixed_ba.size(1) == 2 * num_v_heads, "mixed_ba.size(1) must equal 2 * num_v_heads");
++    TORCH_CHECK(mixed_ba.size(0) == qkvz.size(0), "mixed_ba and qkvz must have the same row count");
++
++    const int64_t dim = qkvWidth;  // conv consumes only the first qkvWidth columns of each row (= the old path's split-out mixed_qkv)
++    const int64_t xRowStride = qkvz.stride(0);       // physical row stride (== size(1) when contiguous)
++    const int64_t baRowStride = mixed_ba.stride(0);  // physical row stride (== 2*numVHeads when contiguous)
++
++    const int64_t width = weight.size(0);
++    TORCH_CHECK(width >= MIN_WIDTH && width <= MAX_WIDTH, "Only support width in [2,4]");
++    TORCH_CHECK(weight.size(1) == dim, "weight must be [width, qkvWidth]");
++
++    // Alignment contract for the z/b/a copy: z row start byte offset = element_size * (t * xRowStride + qkvWidth)
++    // and z row bytes = element_size * zWidth must both be 32B aligned (the kernel uses plain DataCopy);
++    // for bf16/fp16 this means qkvWidth / xRowStride must be multiples of 16 (the pack side pads the packed N
++    // to a multiple of 16; when contiguous, xRowStride == size(1) == qkvWidth + zWidth).
++    TORCH_CHECK(qkvWidth % 16 == 0 && xRowStride % 16 == 0,
++                "qkvWidth and qkvz.stride(0) must be multiples of 16 (32B alignment for z DataCopy)");
++    TORCH_CHECK(zWidth * static_cast<int64_t>(qkvz.element_size()) <= Z_COPY_MAX_BYTES,
++                "z row bytes exceed single-block DataCopy limit");
++
++    // decode is fixed to 2D varlen semantics (the old host's inputMode=0 path): batch is derived from query_start_loc
++    const int64_t inputMode = 0;
++    const int64_t seqLen = 0;
++    const int64_t cuSeqlen = qkvz.size(0);
++    TORCH_CHECK(query_start_loc.defined() && query_start_loc.numel() >= 2,
++                "query_start_loc must have at least 2 elements");
++    const int64_t batch = query_start_loc.size(0) - 1;
++    TORCH_CHECK(batch == cuSeqlen, "decode requires qkvz.size(0) == query_start_loc.size(0) - 1");
++
++    const int64_t numCacheLines = conv_states.size(0);
++    const int64_t stateLen = conv_states.size(1);
++    TORCH_CHECK(conv_states.size(2) == dim, "conv_states must be [slots, stateLen, qkvWidth]");
++
++    bool hasBias = bias.defined() && bias.numel() > 0;
++    bool hasCacheIndices = cache_indices.defined() && cache_indices.numel() > 0;
++    bool isBf16 = (dtype == at::kBFloat16);
++
++    at::Tensor y = at::empty({batch, qkvWidth}, qkvz.options());
++    at::Tensor z = at::empty({batch, num_v_heads, head_v_dim}, qkvz.options());
++    at::Tensor b = at::empty({batch, num_v_heads}, qkvz.options());
++    at::Tensor a = at::empty({batch, num_v_heads}, qkvz.options());
++
++    // None -> empty conversion for optional args, matching the old host (causal_conv1d.cpp)
++    at::Tensor bias_tensor = hasBias ? bias : at::empty({0}, qkvz.options());
++    at::Tensor query_start_loc_tensor = query_start_loc.to(at::kLong);
++    at::Tensor cache_indices_tensor =
++        hasCacheIndices ? cache_indices.to(at::kLong) : at::empty({0}, qkvz.options().dtype(at::kLong));
++    at::Tensor has_initial_state_tensor = at::empty({0}, qkvz.options().dtype(at::kLong));  // decode empty call
++    at::Tensor num_accepted_tokens_tensor = at::empty({0}, qkvz.options().dtype(at::kInt));  // decode empty call
++
++    auto ascendc_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
++    int32_t maxAivCore = static_cast<int32_t>(ascendc_platform->GetCoreNumAiv());
++
++    CausalConv1dTilingData tilingData;
++    ComputeTilingData(dim, cuSeqlen, seqLen, batch, inputMode, width, stateLen, numCacheLines, activation_mode,
++                      pad_slot_id, hasBias, hasCacheIndices, isBf16, maxAivCore, xRowStride, num_v_heads,
++                      zWidth, baRowStride, tilingData);
++
++    // run_mode=1 (UPDATE): totalBlocks = batch * baseDimCnt (matching the old host)
++    int64_t totalBlocks = tilingData.batch * tilingData.baseDimCnt;
++    int32_t blockDim = std::min(maxAivCore, static_cast<int32_t>(totalBlocks));
++    if (blockDim <= 0) {
++        blockDim = 1;
++    }
++
++    int32_t libApiWorkspaceSize = static_cast<int32_t>(ascendc_platform->GetLibApiWorkSpaceSize());
++    // decode empty call has no hasInitialState workspace: totalWorkspace = libApiWorkspaceSize (matching the old host)
++    int64_t totalWorkspace = std::max(static_cast<int64_t>(libApiWorkspaceSize), static_cast<int64_t>(0));
++    if (totalWorkspace <= 0) {
++        totalWorkspace = libApiWorkspaceSize;
++    }
++
++    int32_t tilingSize =
++        (static_cast<int32_t>(sizeof(CausalConv1dTilingData)) + PADDING_BYTE - 1) / PADDING_BYTE * PADDING_BYTE;
++
++    FusedQkvzbaConv1dTilingKey key{dim,
++                                   cuSeqlen,
++                                   seqLen,
++                                   batch,
++                                   inputMode,
++                                   width,
++                                   stateLen,
++                                   numCacheLines,
++                                   activation_mode,
++                                   pad_slot_id,
++                                   static_cast<int64_t>(CAUSAL_CONV1D_TPL_RUN_MODE_UPDATE),
++                                   hasBias ? 1 : 0,
++                                   hasCacheIndices ? 1 : 0,
++                                   0,  // hasInitialState: decode empty call
++                                   0,  // hasNumAccept: decode empty call
++                                   xRowStride,
++                                   num_v_heads,
++                                   zWidth,
++                                   baRowStride};
++    uint64_t hashValue = FusedQkvzbaConv1dTilingKeyHash{}(key);
++
++    static auto globalTilingBuffer = at::empty({tilingSize * static_cast<int64_t>(MAX_CAPTURE_NUM)},
++                                               at::TensorOptions().dtype(at::kByte).device(qkvz.options().device()));
++
++    auto copyTilingToDevice = [&]() {
++        auto cpuTiling = at::empty({tilingSize}, at::kByte);
++        std::memcpy(cpuTiling.data_ptr(), &tilingData, sizeof(CausalConv1dTilingData));
++        return TorchNpuHelper::CopyTensorHostToDevice(cpuTiling);
++    };
++
++    at::Tensor tilingTensor;
++    if (g_fusedQkvzbaConv1dCaptureMap.find(hashValue) != g_fusedQkvzbaConv1dCaptureMap.end()) {
++        tilingTensor = at::from_blob(
++            globalTilingBuffer.data_ptr<uint8_t>() + (tilingSize * g_fusedQkvzbaConv1dCaptureMap[hashValue]),
++            tilingSize, at::kByte);
++    } else if (g_fusedQkvzbaConv1dCaptureNum >= MAX_CAPTURE_NUM) {
++        tilingTensor = copyTilingToDevice();
++    } else {
++        g_fusedQkvzbaConv1dCaptureMap[hashValue] = g_fusedQkvzbaConv1dCaptureNum;
++        auto deviceTiling = copyTilingToDevice();
++        globalTilingBuffer
++            .slice(0, g_fusedQkvzbaConv1dCaptureNum * tilingSize, g_fusedQkvzbaConv1dCaptureNum * tilingSize + tilingSize)
++            .copy_(deviceTiling);
++        g_fusedQkvzbaConv1dCaptureNum++;
++        tilingTensor = at::from_blob(
++            globalTilingBuffer.data_ptr<uint8_t>() + (tilingSize * g_fusedQkvzbaConv1dCaptureMap[hashValue]),
++            tilingSize, at::kByte);
++    }
++
++    auto workspaceTensor =
++        at::empty({totalWorkspace}, at::TensorOptions().dtype(at::kByte).device(qkvz.options().device()));
++
++    EXEC_KERNEL_CMD(fused_qkvzba_conv1d, blockDim, qkvz, weight, conv_states, mixed_ba, bias_tensor,
++                    query_start_loc_tensor, cache_indices_tensor, has_initial_state_tensor,
++                    num_accepted_tokens_tensor, y, z, b, a, workspaceTensor, tilingTensor);
++
++    return std::make_tuple(y, z, b, a);
++}
++
++}  // namespace npu_kernel
++}  // namespace sglang
+diff --git a/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h b/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h
+new file mode 100644
+index 0000000..b72bf7b
+--- /dev/null
++++ b/csrc/fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h
+@@ -0,0 +1,37 @@
++// fused_qkvzba_conv1d (GDN decode: fused split + causal_conv1d) host declaration
++/**
++ * This program is free software, you can redistribute it and/or modify it.
++ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
++ * LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file fused_qkvzba_conv1d.h
++ * \brief fused_qkvzba_conv1d host-side function declaration
++ */
++
++#ifndef CUSTOM_FUSED_QKVZBA_CONV1D_HOST_H_
++#define CUSTOM_FUSED_QKVZBA_CONV1D_HOST_H_
++
++#include <ATen/ATen.h>
++#include <tuple>
++#include "defines.h"
++
++namespace sglang {
++namespace npu_kernel {
++
++// Returns (y, z, b, a): y=[B, qkvWidth] (conv output), z=[B, num_v_heads, head_v_dim], b/a=[B, num_v_heads]
++HOST_API std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_conv1d_impl(
++    const at::Tensor &qkvz, const at::Tensor &weight, const at::Tensor &conv_states, const at::Tensor &mixed_ba,
++    int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim, int64_t head_v_dim, const at::Tensor &bias,
++    const at::Tensor &query_start_loc, const at::Tensor &cache_indices, int64_t activation_mode, int64_t pad_slot_id);
++
++}  // namespace npu_kernel
++}  // namespace sglang
++
++#endif  // CUSTOM_FUSED_QKVZBA_CONV1D_HOST_H_
+diff --git a/csrc/fused_qkvzba_conv1d/op_host/stub/aclrtlaunch_fused_qkvzba_conv1d.h b/csrc/fused_qkvzba_conv1d/op_host/stub/aclrtlaunch_fused_qkvzba_conv1d.h
+new file mode 100644
+index 0000000..e87ddc9
+--- /dev/null
++++ b/csrc/fused_qkvzba_conv1d/op_host/stub/aclrtlaunch_fused_qkvzba_conv1d.h
+@@ -0,0 +1,15 @@
++// aclrtlaunch declaration for fused_qkvzba_conv1d (handwritten per the causal_conv1d stub convention)
++#ifndef HEADER_ACLRTLAUNCH_CUSTOM_FUSED_QKVZBA_CONV1D_H
++#define HEADER_ACLRTLAUNCH_CUSTOM_FUSED_QKVZBA_CONV1D_H
++#include "acl/acl_base.h"
++
++#ifndef ACLRT_LAUNCH_KERNEL
++#define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
++#endif
++
++extern "C" uint32_t aclrtlaunch_fused_qkvzba_conv1d(uint32_t numBlocks, aclrtStream stream, void *x, void *weight,
++                                                    void *convStates, void *ba, void *bias, void *queryStartLoc,
++                                                    void *cacheIndices, void *hasInitialState,
++                                                    void *numAcceptedTokens, void *y, void *z, void *b, void *a,
++                                                    void *workspace, void *tiling);
++#endif
+diff --git a/csrc/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp b/csrc/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp
+new file mode 100644
+index 0000000..3709aaf
+--- /dev/null
++++ b/csrc/fused_qkvzba_conv1d/op_kernel/fused_qkvzba_conv1d_kernel.cpp
+@@ -0,0 +1,168 @@
++// fused_qkvzba_conv1d kernel entry (GDN decode: fused split + causal_conv1d)
++/**
++ * This program is free software, you can redistribute it and/or modify it.
++ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
++ * LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file fused_qkvzba_conv1d_kernel.cpp
++ * \brief fused_qkvzba_conv1d kernel entry: task 1 = causal_conv1d UPDATE (decode), task 2 = z/b/a split copy
++ *
++ * Bit-exactness rationale: the conv part reuses NsCausalConv1d::RunCausalConv1dUpdate (same device class,
++ * same tiling struct); the only difference is that x GM reads use row stride tilingData->xRowStride
++ * (= qkvz.stride(0), == size(1) when contiguous) instead of dim, and conv consumes only the first
++ * dim = qkvWidth columns of each row, identical in content to the old path's split-out mixed_qkv.
++ * y writeback and conv_states read/write strides remain dim, unchanged.
++ * The z/b/a copy is pure data movement like the old Triton split kernel: a z row = zWidth elements of the
++ * qkvz row starting at offset qkvWidth (zWidth carried explicitly in tiling, ba row stride carried as
++ * baRowStride -- row-stride views of packed GEMM output are supported; padding in the row stride does not
++ * affect z width or b/a content); a b/a row = the first / second numVHeads elements of a mixed_ba row.
++ * The two tasks touch disjoint GM regions, are independent, and need no synchronization.
++ */
++
++// Relative include by contract: the csrc tree has two headers named causal_conv1d_update.h
++// (causal_conv1d_update/op_kernel/ belongs to the old standalone op and lacks NsCausalConv1d::RunCausalConv1dUpdate;
++//  causal_conv1d/op_kernel/ is the intended one). workspace_kernel's -I order places the old op's directory
++// first, so a bare include would resolve to the wrong header; a relative include resolves from this file's
++// directory and avoids the -I ambiguity.
++#include "../../causal_conv1d/op_kernel/causal_conv1d_update.h"  // NsCausalConv1d::RunCausalConv1dUpdate (UPDATE/decode subclass)
++
++using namespace AscendC;
++using namespace NsCausalConv1d;
++
++namespace {
++
++// Task 2: z/b/a split copy. Note: the conv object's TPipe is not reused -- the CausalConv1dUpdate object is
++// locally constructed inside RunCausalConv1dUpdate and destroyed when the call returns (TPipe lifetimes are
++// scope-isolated), so this task builds its own TPipe/TBuf.
++template <typename T>
++__aicore__ inline void FusedCopyZba(GM_ADDR x, GM_ADDR ba, GM_ADDR z, GM_ADDR b, GM_ADDR a,
++                                    const __gm__ CausalConv1dTilingData *tilingData)
++{
++    const int64_t batch = tilingData->batch;
++    const int64_t dim = tilingData->dim;                // = qkvWidth, i.e. the column offset of z within a row
++    const int64_t xRowStride = tilingData->xRowStride;  // qkvz physical row stride (may include pack padding)
++    const int64_t nv = tilingData->numVHeads;
++    // zWidth is carried explicitly in tiling (= nv * head_v_dim); it cannot be derived as xRowStride - dim
++    // because row-stride view inputs include pack padding in the stride, which would leak into z.
++    // When contiguous, xRowStride == dim + zWidth.
++    const int64_t zWidth = tilingData->zWidth;
++    const int64_t baRowStride = tilingData->baRowStride;  // ba physical row stride (== 2*nv when contiguous)
++    if (batch <= 0) {
++        return;
++    }
++
++    const int64_t blockIdx = static_cast<int64_t>(GetBlockIdx());
++    const int64_t blockNum = static_cast<int64_t>(GetBlockNum());
++
++    // z/b/a share one TPipe and one pair of MTE2/MTE3 events (sequential within the task, no concurrent reuse).
++    TPipe copyPipe;
++    TEventID mte2ToMte3Event = GetTPipePtr()->AllocEventID<HardEvent::MTE2_MTE3>();
++    TEventID mte3ToMte2Event = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
++
++    if (zWidth > 0) {
++        GlobalTensor<T> xGm;
++        xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
++        GlobalTensor<T> zGm;
++        zGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(z));
++
++        // z: zWidth elements per row. The host has verified that qkvWidth / xRowStride are multiples of 16
++        // (i.e. 32B-aligned row starts and row bytes a multiple of 32 for bf16/fp16) and that a single row
++        // fits the single-block DataCopy limit, so plain DataCopy is used (same as the DataCopy inside conv).
++        TBuf<QuePosition::VECIN> zBuf;
++        copyPipe.InitBuffer(zBuf, static_cast<uint32_t>(zWidth * sizeof(T)));
++        LocalTensor<T> zLocal = zBuf.Get<T>();
++
++        for (int64_t t = blockIdx; t < batch; t += blockNum) {
++            DataCopy(zLocal, xGm[t * xRowStride + dim], static_cast<int32_t>(zWidth));
++            SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Event);
++            WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Event);
++            DataCopy(zGm[t * zWidth], zLocal, static_cast<int32_t>(zWidth));
++            // wait for this MTE3 write-out before zLocal is reused by the next row
++            // (rows are serialized; at most ceil(batch/blockNum) rows per core, negligible cost)
++            SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event);
++            WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event);
++        }
++    }
++
++    if (nv > 0) {
++        // b/a: nv elements per row (8B for bf16), below 32B alignment, so plain DataCopy is not usable;
++        // bf16 GM scalar access (GlobalTensor GetValue/SetValue) risks wrong values -- do not use it.
++        // Use the DataCopyPad path: GM->UB with padding, UB->GM exact (the padding is discarded automatically).
++        GlobalTensor<T> baGm;
++        baGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(ba));
++        GlobalTensor<T> bGm;
++        bGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(b));
++        GlobalTensor<T> aGm;
++        aGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(a));
++
++        const uint32_t rowBytes = static_cast<uint32_t>(nv) * static_cast<uint32_t>(sizeof(T));
++        const uint32_t bufBytes = (rowBytes + 31U) / 32U * 32U;
++        TBuf<QuePosition::VECIN> bBuf;
++        TBuf<QuePosition::VECIN> aBuf;
++        copyPipe.InitBuffer(bBuf, bufBytes);
++        copyPipe.InitBuffer(aBuf, bufBytes);
++        LocalTensor<T> bLocal = bBuf.Get<T>();
++        LocalTensor<T> aLocal = aBuf.Get<T>();
++
++        DataCopyExtParams copyParams{1, rowBytes, 0, 0, 0};
++        DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
++
++        for (int64_t t = blockIdx; t < batch; t += blockNum) {
++            const int64_t baRow = t * baRowStride;  // ba physical row stride (== 2*nv when contiguous)
++            const int64_t outRow = t * nv;
++            DataCopyPad(bLocal, baGm[baRow], copyParams, padParams);            // b = ba[:, :nv]
++            DataCopyPad(aLocal, baGm[baRow + nv], copyParams, padParams);       // a = ba[:, nv:2nv]
++            SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Event);
++            WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Event);
++            DataCopyPad(bGm[outRow], bLocal, copyParams);
++            DataCopyPad(aGm[outRow], aLocal, copyParams);
++            // wait for this MTE3 write-out before bLocal/aLocal are reused by the next row
++            SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event);
++            WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Event);
++        }
++    }
++
++    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_MTE3>(mte2ToMte3Event);
++    GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2Event);
++}
++
++}  // namespace
++
++extern "C" __global__ __aicore__ void fused_qkvzba_conv1d(GM_ADDR x, GM_ADDR weight, GM_ADDR convStates, GM_ADDR ba,
++                                                          GM_ADDR bias, GM_ADDR queryStartLoc, GM_ADDR cacheIndices,
++                                                          GM_ADDR hasInitialState, GM_ADDR numAcceptedTokens,
++                                                          GM_ADDR y, GM_ADDR z, GM_ADDR b, GM_ADDR a,
++                                                          GM_ADDR workspace, GM_ADDR tiling)
++{
++    REGISTER_TILING_DEFAULT(CausalConv1dTilingData);
++    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIV_1_0);
++    GM_ADDR userWorkspace = workspace;
++    if (workspace != nullptr) {
++        userWorkspace = AscendC::GetUserWorkspace(workspace);
++    }
++
++    auto tilingData = reinterpret_cast<__gm__ CausalConv1dTilingData *>(tiling);
++    auto dtypeKey = static_cast<uint32_t>(tilingData->dtypeKey);
++
++    // The host fixes run_mode=1 (UPDATE/decode); this dispatches by dtypeKey exactly like the UPDATE branch
++    // of the causal_conv1d entry.
++    if (dtypeKey == 0) {
++        // Task 1 (conv): identical to the original causal_conv1d UPDATE path (same device class); the object's
++        // scope is this call and its TPipe is destroyed on return, isolated from the copy task's TPipe below.
++        RunCausalConv1dUpdate<bfloat16_t>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState,
++                                          numAcceptedTokens, y, userWorkspace, tilingData);
++        // Task 2 (z/b/a copy): data-independent from the conv task
++        FusedCopyZba<bfloat16_t>(x, ba, z, b, a, tilingData);
++    } else {
++        RunCausalConv1dUpdate<half>(x, weight, bias, convStates, queryStartLoc, cacheIndices, hasInitialState,
++                                    numAcceptedTokens, y, userWorkspace, tilingData);
++        FusedCopyZba<half>(x, ba, z, b, a, tilingData);
++    }
++}
+diff --git a/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp b/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp
+new file mode 100644
+index 0000000..953dd77
+--- /dev/null
++++ b/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.cpp
+@@ -0,0 +1,167 @@
++// fused_sigmoid_gating_recurrent (AscendC version of GDN decode recurrent) host implementation
++/**
++ * This program is free software, you can redistribute it and/or modify it.
++ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
++ * LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file fused_sigmoid_gating_recurrent.cpp
++ * \brief fused_sigmoid_gating_recurrent host-side implementation
++ *
++ * Semantics: drop-in replacement for the production Triton kernel (sgl_kernel_npu
++ * fla fused_sigmoid_gating_recurrent, strided form): sigmoid gating + recurrent
++ * delta rule update, decode only (one token per sequence, T == N, varlen requires
++ * cu_seqlens). No tiling/workspace: EXEC_KERNEL_CMD direct launch with all kernel
++ * args baked by value/pointer; during graph capture the at::empty output lands in
++ * the graph-private pool and is reused on replay (same pattern as the Triton
++ * wrapper's q.new_empty).
++ *
++ * Hard specializations (the kernel is written for K == V == 128; out-of-range
++ * inputs fail here, the wrapper falls back to stock Triton first — this
++ * TORCH_CHECK is a second line of defense): K == V == 128, HV <= 8, HV % H == 0,
++ * N <= 256, q/k/v bf16, a/b bf16, A_log/dt_bias fp32, pool bf16 or fp32.
++ */
++
++#include <algorithm>
++#include <cmath>
++#include "acl/acl.h"
++#include <ATen/Operators.h>
++#include <torch/all.h>
++#include <torch/library.h>
++#include "torch_npu/csrc/core/npu/NPUStream.h"
++#include "torch_npu/csrc/core/npu/DeviceUtils.h"
++#include "tiling/platform/platform_ascendc.h"
++#include "aclrtlaunch_fused_sigmoid_gating_recurrent_bf16.h"
++#include "aclrtlaunch_fused_sigmoid_gating_recurrent_fp32.h"
++#include "defines.h"
++#include "torch_helper.h"
++#include "fused_sigmoid_gating_recurrent.h"
++
++namespace sglang {
++namespace npu_kernel {
++
++constexpr int64_t FGR_HEAD_DIM = 128;  // kernel-specialized K/V
++constexpr int64_t FGR_MAX_HV = 8;      // kernel gating [8] pad cap
++constexpr int64_t FGR_MAX_N = 256;     // kernel cu/idx UB residency cap
++
++HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
++    const at::Tensor &A_log, const at::Tensor &a, const at::Tensor &dt_bias, double softplus_beta,
++    double softplus_threshold, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, const at::Tensor &b,
++    const at::Tensor &initial_state_source, const at::Tensor &initial_state_indices, double scale,
++    const at::Tensor &cu_seqlens, bool use_qk_l2norm, int64_t q_row_stride, int64_t k_row_stride,
++    int64_t v_row_stride)
++{
++    TORCH_CHECK(q.defined() && k.defined() && v.defined(), "q/k/v must be defined");
++    TORCH_CHECK(a.defined() && b.defined(), "a/b must be defined");
++    TORCH_CHECK(A_log.defined() && dt_bias.defined(), "A_log/dt_bias must be defined");
++    TORCH_CHECK(initial_state_source.defined() && initial_state_indices.defined() && cu_seqlens.defined(),
++                "initial_state_source/initial_state_indices/cu_seqlens must be defined "
++                "(decode-only op: cu_seqlens is required)");
++
++    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D [1, T, H, K] / [1, T, HV, V]");
++    const int64_t T = q.size(1);
++    const int64_t H = q.size(2);
++    const int64_t K = q.size(3);
++    const int64_t HV = v.size(2);
++    const int64_t V = v.size(3);
++    const int64_t N = cu_seqlens.size(0) - 1;
++
++    TORCH_CHECK(q.size(0) == 1 && v.size(0) == 1, "decode requires flattened batch dim B == 1");
++    TORCH_CHECK(k.size(1) == T && v.size(1) == T, "q/k/v token dim mismatch");
++    TORCH_CHECK(k.size(2) == H && k.size(3) == K, "q/k head dims mismatch");
++    TORCH_CHECK(T == N && N >= 1,
++                "decode-only: total tokens must equal sequence count (one token per sequence), got T=", T, " N=", N);
++    TORCH_CHECK(N <= FGR_MAX_N, "N exceeds kernel UB residency cap (256): ", N);
++    TORCH_CHECK(K == FGR_HEAD_DIM && V == FGR_HEAD_DIM, "kernel specialized for K == V == 128, got K=", K, " V=", V);
++    TORCH_CHECK(H >= 1 && HV >= 1 && HV <= FGR_MAX_HV && HV % H == 0,
++                "require 1 <= H <= HV <= 8 and HV % H == 0, got H=", H, " HV=", HV);
++
++    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
++                    v.scalar_type() == at::kBFloat16,
++                "q/k/v must be bf16");
++    TORCH_CHECK(a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16, "a/b must be bf16");
++    TORCH_CHECK(A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat,
++                "A_log/dt_bias must be fp32");
++    const at::ScalarType poolDtype = initial_state_source.scalar_type();
++    TORCH_CHECK(poolDtype == at::kBFloat16 || poolDtype == at::kFloat, "ssm pool must be bf16 or fp32");
++
++    // q/k/v accept strided views; only the last dim must be contiguous and the head dim packed by K/V
++    TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1, "q/k/v last dim must be contiguous");
++    TORCH_CHECK(q.stride(2) == K && k.stride(2) == K, "q/k head dim must be packed (stride(2) == K)");
++    TORCH_CHECK(v.stride(2) == V, "v head dim must be packed (stride(2) == V)");
++    TORCH_CHECK(q_row_stride > 0 && k_row_stride > 0 && v_row_stride > 0, "row strides must be positive");
++
++    TORCH_CHECK(a.dim() == 2 && a.size(0) == T && a.size(1) == HV && a.is_contiguous(),
++                "a must be contiguous [T, HV]");
++    TORCH_CHECK(b.dim() == 2 && b.size(0) == T && b.size(1) == HV && b.is_contiguous(),
++                "b must be contiguous [T, HV]");
++    TORCH_CHECK(A_log.numel() == HV && A_log.is_contiguous(), "A_log must be contiguous [HV]");
++    TORCH_CHECK(dt_bias.numel() == HV && dt_bias.is_contiguous(), "dt_bias must be contiguous [HV]");
++
++    TORCH_CHECK(initial_state_source.dim() == 4 && initial_state_source.size(1) == HV &&
++                    initial_state_source.size(2) == K && initial_state_source.size(3) == V &&
++                    initial_state_source.is_contiguous(),
++                "ssm pool must be contiguous [slots, HV, K, V] (copying a non-contiguous pool would silently drop updates; hard assert)");
++    TORCH_CHECK(initial_state_indices.numel() >= N, "initial_state_indices must have at least N elements");
++    TORCH_CHECK(cu_seqlens.numel() == N + 1, "cu_seqlens must have N+1 elements");
++
++    // conditionally convert int64 indices to int32 (production is int32; skipping the conversion risks a silent copy, keep it explicit)
++    at::Tensor idxI32 = initial_state_indices.scalar_type() == at::kInt
++                            ? initial_state_indices
++                            : initial_state_indices.to(at::kInt);
++    at::Tensor cuI32 = cu_seqlens.scalar_type() == at::kInt ? cu_seqlens : cu_seqlens.to(at::kInt);
++    TORCH_CHECK(idxI32.is_contiguous() && cuI32.is_contiguous(), "indices/cu_seqlens must be contiguous");
++
++    TORCH_CHECK(scale > 0, "scale must be positive");
++    TORCH_CHECK(softplus_beta != 0, "softplus_beta must be non-zero");
++
++    // output same shape/dtype as the Triton wrapper (o = q.new_empty(N,HV,V).view(v.shape):
++    // contiguous [1, T, HV, V], T==N one-to-one)
++    at::Tensor o = at::empty(v.sizes(), q.options());
++
++    auto ascendcPlatform = platform_ascendc::PlatformAscendCManager::GetInstance();
++    const int64_t totalItems = N * HV;
++    uint32_t blockDim = static_cast<uint32_t>(
++        std::min<int64_t>(totalItems, static_cast<int64_t>(ascendcPlatform->GetCoreNumAiv())));
++    if (blockDim == 0) {
++        blockDim = 1;
++    }
++
++    int devidx = q.device().index();
++    c10_npu::set_device(devidx);
++
++    const float scaleF = static_cast<float>(scale);
++    const float spbF = static_cast<float>(softplus_beta);
++    const float invSpbF = 1.0f / spbF;  // same fp32 division as the Triton kernel's 1.0/softplus_beta
++    const float thrF = static_cast<float>(softplus_threshold);
++    const uint32_t useL2 = use_qk_l2norm ? 1U : 0U;
++    // EXEC_KERNEL_CMD's ConvertTypes(Ts&...) takes lvalues only; all scalars must land in named
++    // locals first (passing static_cast rvalues fails to compile)
++    const uint32_t nU32 = static_cast<uint32_t>(N);
++    const uint32_t hU32 = static_cast<uint32_t>(H);
++    const uint32_t hvU32 = static_cast<uint32_t>(HV);
++    const uint32_t qRowStrideU32 = static_cast<uint32_t>(q_row_stride);
++    const uint32_t kRowStrideU32 = static_cast<uint32_t>(k_row_stride);
++    const uint32_t vRowStrideU32 = static_cast<uint32_t>(v_row_stride);
++
++    if (poolDtype == at::kBFloat16) {
++        EXEC_KERNEL_CMD(fused_sigmoid_gating_recurrent_bf16, blockDim, A_log, a, dt_bias, q, k, v, b, o,
++                        initial_state_source, idxI32, cuI32, nU32, hU32, hvU32, qRowStrideU32, kRowStrideU32,
++                        vRowStrideU32, scaleF, spbF, invSpbF, thrF, useL2);
++    } else {
++        EXEC_KERNEL_CMD(fused_sigmoid_gating_recurrent_fp32, blockDim, A_log, a, dt_bias, q, k, v, b, o,
++                        initial_state_source, idxI32, cuI32, nU32, hU32, hvU32, qRowStrideU32, kRowStrideU32,
++                        vRowStrideU32, scaleF, spbF, invSpbF, thrF, useL2);
++    }
++
++    return o;
++}
++
++}  // namespace npu_kernel
++}  // namespace sglang
+diff --git a/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h b/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h
+new file mode 100644
+index 0000000..914471e
+--- /dev/null
++++ b/csrc/fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h
+@@ -0,0 +1,45 @@
++// fused_sigmoid_gating_recurrent (AscendC version of GDN decode recurrent) host declaration
++/**
++ * This program is free software, you can redistribute it and/or modify it.
++ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
++ * You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
++ * LICENSE in the root of the software repository for the full text of the License.
++ */
++
++/*!
++ * \file fused_sigmoid_gating_recurrent.h
++ * \brief fused_sigmoid_gating_recurrent host-side function declaration
++ */
++
++#ifndef CUSTOM_FUSED_SIGMOID_GATING_RECURRENT_HOST_H_
++#define CUSTOM_FUSED_SIGMOID_GATING_RECURRENT_HOST_H_
++
++#include <ATen/ATen.h>
++#include "defines.h"
++
++namespace sglang {
++namespace npu_kernel {
++
++// GDN decode recurrent (sigmoid gating + delta rule update), AscendC AIV version.
++// Drop-in replacement for the production Triton kernel (sgl_kernel_npu fla
++// fused_sigmoid_gating_recurrent, strided form); decode only (T == N, one token
++// per sequence, varlen requires cu_seqlens). initial_state_source = ssm state pool
++// [slots, HV, K, V], updated in place. q/k/v accept strided views with contiguous
++// last dim (row strides passed explicitly in elements; contiguous case:
++// q_row_stride == H*K, v_row_stride == HV*V). Returns o, same shape as v
++// ([1, T, HV, V]).
++HOST_API at::Tensor fused_sigmoid_gating_recurrent_impl(
++    const at::Tensor &A_log, const at::Tensor &a, const at::Tensor &dt_bias, double softplus_beta,
++    double softplus_threshold, const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, const at::Tensor &b,
++    const at::Tensor &initial_state_source, const at::Tensor &initial_state_indices, double scale,
++    const at::Tensor &cu_seqlens, bool use_qk_l2norm, int64_t q_row_stride, int64_t k_row_stride,
++    int64_t v_row_stride);
++
++}  // namespace npu_kernel
++}  // namespace sglang
++
++#endif  // CUSTOM_FUSED_SIGMOID_GATING_RECURRENT_HOST_H_
+diff --git a/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp
+new file mode 100644
+index 0000000..56f4a7e
+--- /dev/null
++++ b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_bf16_kernel.cpp
+@@ -0,0 +1,16 @@
++// fused_sigmoid_gating_recurrent bf16 entry (bf16 pool, production arm).
++// One kernel per file: KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple
++// kernels in one file (only the first registers; the rest fail with
++// RegisterAscendBinary ret 107000 — see the structural constraint in the lib header).
++
++#include "fused_sigmoid_gating_recurrent_kernel_lib.h"
++
++extern "C" __global__ __aicore__ void fused_sigmoid_gating_recurrent_bf16(FGR_KERNEL_ARGS)
++{
++    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
++    TPipe pipe;
++    FusedSigmoidGatingRecurrent<bfloat16_t> op(n, h, hv, qRowStride, kRowStride, vRowStride, scale, softplusBeta,
++                                               invSoftplusBeta, softplusThreshold, useQkL2norm);
++    op.Init(A_log, a, dt_bias, q, k, v, b, o, pool, cache_indices, cu_seqlens, &pipe);
++    op.Process();
++}
+diff --git a/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp
+new file mode 100644
+index 0000000..0657207
+--- /dev/null
++++ b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_fp32_kernel.cpp
+@@ -0,0 +1,16 @@
++// fused_sigmoid_gating_recurrent fp32 entry (fp32 pool, accuracy-regression arm).
++// One kernel per file: KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple
++// kernels in one file (only the first registers; the rest fail with
++// RegisterAscendBinary ret 107000 — see the structural constraint in the lib header).
++
++#include "fused_sigmoid_gating_recurrent_kernel_lib.h"
++
++extern "C" __global__ __aicore__ void fused_sigmoid_gating_recurrent_fp32(FGR_KERNEL_ARGS)
++{
++    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
++    TPipe pipe;
++    FusedSigmoidGatingRecurrent<float> op(n, h, hv, qRowStride, kRowStride, vRowStride, scale, softplusBeta,
++                                          invSoftplusBeta, softplusThreshold, useQkL2norm);
++    op.Init(A_log, a, dt_bias, q, k, v, b, o, pool, cache_indices, cu_seqlens, &pipe);
++    op.Process();
++}
+diff --git a/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h
+new file mode 100644
+index 0000000..8facc60
+--- /dev/null
++++ b/csrc/fused_sigmoid_gating_recurrent/op_kernel/fused_sigmoid_gating_recurrent_kernel_lib.h
+@@ -0,0 +1,720 @@
++// fused_sigmoid_gating_recurrent
++// AscendC AIV kernel for GDN decode recurrent (sigmoid gating + delta rule update).
++//
++// Semantics match the production Triton kernel (sgl_kernel_npu fla
++// fused_sigmoid_gating_recurrent, strided form) statement by statement. Decode
++// only: exactly 1 token per sequence (host enforces T == N), K == V == 128 (host
++// enforced), HV <= 8 (gating vectors padded to [8]). Pool layout [slot, HV, K, V];
++// each (slot, hv) state is one contiguous 32KB (bf16) block — single DataCopyPad
++// per head in/out.
++//
++// Precision design (aligned item by item with the Triton reference):
++//   1. softplus threshold branch verbatim: softplus(x) = (beta*x <= thr) ?
++//      log(1+exp(beta*x))/beta : x — both branches computed (same semantics as
++//      tl.where; the overflowing exp lane is discarded by the scalar select);
++//   2. decay = exp(g), g = -exp(A_log)*softplus, beta = 1/(1+exp(-b)) verbatim
++//      (Div chains; no AscendC Sigmoid shortcut);
++//   3. L2norm keeps the division form q/(sqrt(sum(q^2))+1e-6): ReduceSum + scalar
++//      sqrt (sqrt before +1e-6, same order as Triton) + full-width Duplicate +
++//      vector Div — do NOT switch to vector Rsqrt/Reciprocal (their float
++//      precision fails the 2e-4 requirement, per CANN 9.0.0 docs);
++//   4. h += k x v' uses separate Mul+Add (no MulAddDst/FMA contraction, matching
++//      Triton's two roundings);
++//   5. both K-dim reductions = 2 K slabs (64 rows each) x 5-pass pairwise tree
++//      within a slab + sequential accumulation across slabs;
++//   6. store with CAST_RINT (fp32->bf16 RNE, same as Triton .to(bf16));
++//      bf16->fp32 CAST_NONE is exact;
++//   7. all intermediates fp32 (state cast to fp32 on UB entry, cast back to pool
++//      dtype on store).
++//
++// Two points are not a-priori bitwise: (1) K-dim reduction addition order;
++// (2) Exp/Ln polynomial implementations vs triton-ascend lowering (A3 Div in
++// default INTRINSIC mode is at most 1 ulp, same bucket).
++//
++// Parallelism/pipelining: grid = min(N*HV, AIV core count) (host-side
++// GetCoreNumAiv); each core loops over work items idx = blockIdx,
++// blockIdx+blockDim, ...; double-buffered input prefetch (item i+1's MTE2
++// overlaps item i's V compute). All cross-pipe events explicit:
++//   MTE2_V[p]  DMA-in(i) ready -> V reads (cast stage)
++//   V_MTE2[p]  V done reading qkvBuf_[p] (cast stage ends) -> next-next DMA-in may overwrite
++//   V_MTE3[p]  store-stage cast done -> DMA-out may read stateBuf_/oBuf_
++//   MTE3_V[p]  DMA-out(i-2) done -> V may rewrite stateBuf_[p]/oBuf_[p] (start of
++//              ComputeItem, before any V write; the fp32 arm rewrites stateBuf_ in
++//              place as its work tile, so it must be earliest)
++//   MTE3_MTE2[p] DMA-out(i-2) done -> DMA-in(i) may rewrite stateBuf_[p]/oBuf_[p]
++//              (V-side writes to stateBuf_ are covered transitively via the V_MTE3
++//              chain; qkvBuf_ is never touched by MTE3, hence the separate V_MTE2;
++//              must be a parity pair — a single event would tail with
++//              Set(M-2)->Set(M-1) and no Wait in between, i.e. same-ID consecutive
++//              SetFlag with >=2 work items per core = documented hang UB, see
++//              constraint 3)
++// The first two iterations use iterCnt_ conditions to skip waits whose buffers
++// have no prior accessor (waiting on a never-set flag hangs). KERNEL_TASK_TYPE
++// pinned AIV_ONLY; the kernel uses fully manual sync (explicit
++// PipeBarrier/SetFlag) and the tp_fusion_recurrent_kernel library is built with
++// --cce-auto-sync=off (auto-sync only covers the TQue programming model, unused
++// here; =on would only insert redundant compiler events).
++//
++// Structural constraint 1 (do not merge back): the bf16/fp32 entries must be one
++// kernel per file. KERNEL_TASK_TYPE_DEFAULT does not coexist with multiple
++// kernels in one file — only the first registers; the rest fail with
++// RegisterAscendBinary ret 107000 and the launch hangs on a missing kernel. Hence
++// fused_sigmoid_gating_recurrent_{bf16,fp32}_kernel.cpp, with the class and arg
++// macro centralized here.
++//
++// Structural constraint 2 (do not switch back to Fetch): all events must use
++// AllocEventID (paired with ReleaseEvents at the end). FetchEventID does not
++// occupy an ID (CANN 9.0.0 docs: "this interface does not allocate a TEventID,
++// it only provides an available one"); two calls for the same HardEvent return
++// the SAME TEventID — the parity double-buffer events here (MTE2_V/V_MTE2/V_MTE3/
++// MTE3_V x2 each) would all collapse onto single hardware flags, and with >=2
++// work items per core a collapsed ID sees two consecutive SetFlag with no Wait
++// in between = documented hang UB: kernel hangs, host sync never returns.
++//
++// Structural constraint 3 (do not exit the kernel with unconsumed SetFlag):
++// "SetFlag/WaitFlag must appear in pairs" per the official docs; all production
++// kernels in the tree drain at exit (recurrent_gated_delta_rule's
++// SEvent.release() wait loop, causal_conv1d.h's explicit trailing WaitFlag,
++// fused_qkvzba_conv1d's Set immediately followed by Wait). An unconsumed SetFlag
++// leaves the hardware flag set across launches: the next launch on the same core
++// deterministically gets the same IDs from AllocEventID, and the first SetFlag on
++// a leftover channel is "two consecutive SetFlag on the same ID with no Wait" =
++// documented hang UB — shape-independent, guaranteed on the 2nd launch in the
++// process. DrainEvents waits out all leftover flags with iterCnt_ conditions;
++// MTE3_MTE2 is split into a parity pair (strict Set/Wait alternation per ID).
++//
++// UB budget: bf16 ~155KB / fp32 ~160KB (within the 192KB limit).
++
++#ifndef __FUSED_SIGMOID_GATING_RECURRENT_KERNEL_LIB_H_
++#define __FUSED_SIGMOID_GATING_RECURRENT_KERNEL_LIB_H_
++
++#include "kernel_operator.h"
++
++// event_t / GetTPipePtr() are global-namespace symbols in CANN 9.0.0
++// (cce_aicore_intrinsics.h / kernel_tpipe.h; causal_conv1d.h in-tree does the
++// same) — do not add the AscendC:: qualifier.
++
++using namespace AscendC;
++
++namespace fused_sigmoid_gating_recurrent {
++
++constexpr uint32_t FGR_K = 128;       // head_k_dim (host TORCH_CHECK enforced)
++constexpr uint32_t FGR_V = 128;       // head_v_dim (host TORCH_CHECK enforced)
++constexpr uint32_t FGR_V_SLAB = 64;   // V-dim slab (prod buffer UB budget)
++constexpr uint32_t FGR_K_SLAB = 64;   // K-dim reduction slab (prod buffer UB budget)
++constexpr uint32_t FGR_MAX_HV = 8;    // gating vectors padded to [8] (host enforces HV<=8)
++constexpr uint32_t FGR_STATE = FGR_K * FGR_V;        // 16384 state elements per (slot, head)
++constexpr uint32_t FGR_STATE_HALF = FGR_STATE / 2;   // 8192 = within the 255-repeat x 64 single-instruction cap
++constexpr uint32_t FGR_MAX_N = 256;   // cu_seqlens/cache_indices UB residency cap (production bs<=128)
++constexpr float FGR_L2_EPS = 1e-6f;   // verbatim with the Triton kernel's +1e-6 (added after sqrt)
++
++// element offsets of the qkv parity buffer in UB (bf16: q/k/v 128 elements each, a/b 16-element pad slots each)
++constexpr uint32_t OFF_Q = 0;
++constexpr uint32_t OFF_K = FGR_K;                    // 128
++constexpr uint32_t OFF_V = FGR_K + FGR_K;            // 256
++constexpr uint32_t OFF_A = FGR_K + FGR_K + FGR_V;    // 384 (bf16 16 elements = 32B slot)
++constexpr uint32_t OFF_B = OFF_A + 16;               // 400
++constexpr uint32_t QKV_PARITY_ELEMS = OFF_B + 16;    // 416 elements = 832B
++
++// gating group [8] slots (element offsets, in float)
++enum GateSlot {
++    GS_DT_BIAS = 0,   // dt_bias padded to [8]
++    GS_EXP_ALOG = 8,  // exp(A_log) padded to [8] (computed in the prologue)
++    GS_A_F32 = 16,    // current item's a row (after cast)
++    GS_B_F32 = 24,    // current item's b row (after cast)
++    GS_XA = 32,       // x = a + dt_bias
++    GS_BETAX = 40,    // beta*x
++    GS_E1 = 48,       // exp(beta*x)+1
++    GS_SPV = 56,      // softplus branch value (1/beta)*log(1+exp(beta*x))
++    GS_BETAV = 64,    // sigmoid(b), all lanes
++    GS_G = 72,        // [8] slot of scalar g (lane0 valid)
++    GS_DECAY = 80,    // exp(g) (lane0 valid)
++    GS_ONES = 88,     // all ones (numerator of the beta Div)
++    GS_TMP = 96,      // scratch (exp(-b) chain)
++    GATE_ELEMS = 104  // total elements (104 * 4B = 416B, 32B aligned)
++};
++
++template <typename T>  // ssm pool dtype: bfloat16_t (production) / float (accuracy-regression arm)
++class FusedSigmoidGatingRecurrent {
++public:
++    __aicore__ inline FusedSigmoidGatingRecurrent(uint32_t n, uint32_t h, uint32_t hv, uint32_t qRowStride,
++                                                  uint32_t kRowStride, uint32_t vRowStride, float scale,
++                                                  float softplusBeta, float invSoftplusBeta, float softplusThreshold,
++                                                  uint32_t useQkL2norm)
++    {
++        n_ = n;
++        h_ = h;
++        hv_ = hv;
++        hvPerH_ = (h > 0) ? (hv / h) : 1;  // host enforces hv%h==0
++        qRowStride_ = qRowStride;
++        kRowStride_ = kRowStride;
++        vRowStride_ = vRowStride;
++        scale_ = scale;
++        spb_ = softplusBeta;
++        invSpb_ = invSoftplusBeta;
++        thr_ = softplusThreshold;
++        useL2_ = useQkL2norm;
++    }
++
++    __aicore__ inline void Init(GM_ADDR A_log, GM_ADDR a, GM_ADDR dt_bias, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR b,
++                                GM_ADDR o, GM_ADDR pool, GM_ADDR cache_indices, GM_ADDR cu_seqlens, TPipe *pipe)
++    {
++        pipe_ = pipe;
++        blockIdx_ = GetBlockIdx();
++        blockDim_ = GetBlockNum();
++        iterCnt_ = 0;
++
++        aLogGm_.SetGlobalBuffer((__gm__ float *)A_log);
++        aGm_.SetGlobalBuffer((__gm__ bfloat16_t *)a);
++        dtBiasGm_.SetGlobalBuffer((__gm__ float *)dt_bias);
++        qGm_.SetGlobalBuffer((__gm__ bfloat16_t *)q);
++        kGm_.SetGlobalBuffer((__gm__ bfloat16_t *)k);
++        vGm_.SetGlobalBuffer((__gm__ bfloat16_t *)v);
++        bGm_.SetGlobalBuffer((__gm__ bfloat16_t *)b);
++        oGm_.SetGlobalBuffer((__gm__ bfloat16_t *)o);
++        poolGm_.SetGlobalBuffer((__gm__ T *)pool);
++        idxGm_.SetGlobalBuffer((__gm__ int32_t *)cache_indices);
++        cuGm_.SetGlobalBuffer((__gm__ int32_t *)cu_seqlens);
++
++        // ---- UB allocation (bf16 arm ~155KB / fp32 arm ~160KB, within the 192KB limit) ----
++        pipe_->InitBuffer(stateBuf_[0], FGR_STATE * sizeof(T));
++        pipe_->InitBuffer(stateBuf_[1], FGR_STATE * sizeof(T));
++        if (IsBf16()) {
++            // fp32 work tile (bf16 arm: state is cast here on UB entry; fp32 arm uses stateBuf directly as the work tile)
++            pipe_->InitBuffer(workBuf_, FGR_STATE * sizeof(float));
++        }
++        pipe_->InitBuffer(prodBuf_, FGR_K_SLAB * FGR_V_SLAB * sizeof(float));
++        pipe_->InitBuffer(brcbBuf_, FGR_K * 8 * sizeof(float));
++        pipe_->InitBuffer(qkvBuf_[0], QKV_PARITY_ELEMS * sizeof(bfloat16_t));
++        pipe_->InitBuffer(qkvBuf_[1], QKV_PARITY_ELEMS * sizeof(bfloat16_t));
++        pipe_->InitBuffer(oBuf_[0], FGR_V * sizeof(bfloat16_t));
++        pipe_->InitBuffer(oBuf_[1], FGR_V * sizeof(bfloat16_t));
++        pipe_->InitBuffer(qF32Buf_, FGR_K * sizeof(float));
++        pipe_->InitBuffer(kF32Buf_, FGR_K * sizeof(float));
++        pipe_->InitBuffer(vF32Buf_, FGR_V * sizeof(float));
++        pipe_->InitBuffer(normTmpBuf_, FGR_K * sizeof(float));
++        pipe_->InitBuffer(reduceWorkBuf_, FGR_K * sizeof(float));  // ReduceSum workspace allocated separately
++        pipe_->InitBuffer(sumBuf_, 2 * 8 * sizeof(float));         // [0]=q sum of squares, [8]=k sum of squares
++        pipe_->InitBuffer(denomBuf_, FGR_K * sizeof(float));
++        pipe_->InitBuffer(deltaBuf_, FGR_V * sizeof(float));
++        pipe_->InitBuffer(oF32Buf_, FGR_V * sizeof(float));
++        pipe_->InitBuffer(cuBuf_, (FGR_MAX_N + 8) * sizeof(int32_t));  // 32B aligned
++        pipe_->InitBuffer(idxBuf_, FGR_MAX_N * sizeof(int32_t));
++        pipe_->InitBuffer(gateBuf_, GATE_ELEMS * sizeof(float));
++
++        // ---- events (TPipe forbids self-chosen IDs; must AllocEventID —
++        // FetchEventID does not occupy an ID: repeated Fetch on the same
++        // HardEvent returns the same TEventID, so the parity double-buffer
++        // events would collapse onto a single hardware flag; two consecutive
++        // SetFlag on the same ID with no Wait in between hits the
++        // CANN-documented hang/UB) ----
++        evtVS_ = GetTPipePtr()->AllocEventID<HardEvent::V_S>();
++        evtSV_ = GetTPipePtr()->AllocEventID<HardEvent::S_V>();
++        evtMte2S_ = GetTPipePtr()->AllocEventID<HardEvent::MTE2_S>();
++        evtMte2V_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
++        evtMte2V_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();
++        evtVMte2_[0] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
++        evtVMte2_[1] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();
++        evtVMte3_[0] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
++        evtVMte3_[1] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();
++        evtMte3V_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
++        evtMte3V_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
++        evtMte3Mte2_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
++        evtMte3Mte2_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_MTE2>();
++    }
++
++    __aicore__ inline void Process()
++    {
++        const uint32_t totalItems = n_ * hv_;
++        if (blockIdx_ >= totalItems) {
++            return;  // extra cores have no work items (not triggered when blockDim=min(N*HV, cores); defensive)
++        }
++        Prologue();
++        // software pipeline (iteration handles work item idx, prefetches idx+blockDim; wait
++        // conditions per the event table in the file header, iterCnt_ conditions skip
++        // nonexistent prior accesses in the first two rounds):
++        CopyIn(blockIdx_, 0);
++        uint32_t parity = 0;
++        for (uint32_t idx = blockIdx_; idx < totalItems; idx += blockDim_) {
++            const uint32_t next = idx + blockDim_;
++            const uint32_t p = parity;
++            ComputeItem(idx, p);
++            if (next < totalItems) {
++                CopyIn(next, 1 - p);
++            }
++            CopyOut(idx, p);
++            parity = 1 - parity;
++            iterCnt_++;
++        }
++        DrainEvents();
++        ReleaseEvents();
++    }
++
++    // Exit drain (official "SetFlag/WaitFlag must appear in pairs" constraint, same
++    // discipline as in-tree RGDR SEvent.release() / causal_conv1d trailing WaitFlag):
++    // the SetFlags of the last two iterations have no consumer within this launch and
++    // must each be waited before exit — otherwise set hardware flags persist across
++    // launches, and the next launch's first SetFlag on the same ID is "two consecutive
++    // SetFlag on the same ID with no Wait in between" hang UB (shape-independent,
++    // guaranteed on the 2nd launch in the process).
++    // Conditions are complementary to the skip conditions in CopyIn/ComputeItem: with
++    // iterCnt_ == M, the V_MTE2/MTE3_V/MTE3_MTE2 of parities (M-1)&1 and M&1 are
++    // exactly the set-but-unconsumed flags.
++    __aicore__ inline void DrainEvents()
++    {
++        if (iterCnt_ >= 1) {
++            const uint32_t lastP = (iterCnt_ - 1) & 1;
++            WaitFlag<HardEvent::V_MTE2>(evtVMte2_[lastP]);      // set by ComputeItem(M-1)
++            WaitFlag<HardEvent::MTE3_V>(evtMte3V_[lastP]);      // set by CopyOut(M-1)
++            WaitFlag<HardEvent::MTE3_MTE2>(evtMte3Mte2_[lastP]);  // set by CopyOut(M-1)
++            if (iterCnt_ >= 2) {
++                const uint32_t prevP = iterCnt_ & 1;
++                WaitFlag<HardEvent::V_MTE2>(evtVMte2_[prevP]);      // set by ComputeItem(M-2)
++                WaitFlag<HardEvent::MTE3_V>(evtMte3V_[prevP]);      // set by CopyOut(M-2)
++                WaitFlag<HardEvent::MTE3_MTE2>(evtMte3Mte2_[prevP]);  // set by CopyOut(M-2)
++            }
++        }
++    }
++
++    // paired with AllocEventID (mirrored order, same as causal_conv1d.h; early-exit cores
++    // have no hardware side effects, TPipe is destroyed on kernel exit, pool bookkeeping
++    // only matters within this launch)
++    __aicore__ inline void ReleaseEvents()
++    {
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_S>(evtVS_);
++        GetTPipePtr()->ReleaseEventID<HardEvent::S_V>(evtSV_);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_S>(evtMte2S_);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(evtMte2V_[0]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(evtMte2V_[1]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(evtVMte2_[0]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(evtVMte2_[1]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(evtVMte3_[0]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE3>(evtVMte3_[1]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(evtMte3V_[0]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(evtMte3V_[1]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(evtMte3Mte2_[0]);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_MTE2>(evtMte3Mte2_[1]);
++    }
++
++private:
++    __aicore__ inline bool IsBf16() const
++    {
++        return IsSameType<T, bfloat16_t>::value;
++    }
++
++    __aicore__ inline LocalTensor<float> Gate(uint32_t slot)
++    {
++        return gateBuf_.Get<float>()[slot];
++    }
++
++    __aicore__ inline void Prologue()
++    {
++        // cu_seqlens / cache_indices / A_log / dt_bias enter UB once (subsequent GetValue does zero GM reads)
++        LocalTensor<int32_t> cuLocal = cuBuf_.Get<int32_t>();
++        LocalTensor<int32_t> idxLocal = idxBuf_.Get<int32_t>();
++        DataCopyPadParams padParams;
++        DataCopyParams cuParams{1, static_cast<uint16_t>((n_ + 1) * sizeof(int32_t)), 0, 0};
++        DataCopyPad(cuLocal, cuGm_, cuParams, padParams);
++        DataCopyParams idxParams{1, static_cast<uint16_t>(n_ * sizeof(int32_t)), 0, 0};
++        DataCopyPad(idxLocal, idxGm_, idxParams, padParams);
++
++        LocalTensor<float> dtPad = Gate(GS_DT_BIAS);
++        LocalTensor<float> expAlogPad = Gate(GS_EXP_ALOG);
++        DataCopyParams hvParams{1, static_cast<uint16_t>(hv_ * sizeof(float)), 0, 0};
++        DataCopyPad(dtPad, dtBiasGm_, hvParams, padParams);
++        DataCopyPad(expAlogPad, aLogGm_, hvParams, padParams);
++
++        LocalTensor<float> ones = Gate(GS_ONES);
++        Duplicate(ones, 1.0f, FGR_MAX_HV);  // all-ones numerator for the beta Div
++        // gating inputs ready after MTE2->V
++        SetFlag<HardEvent::MTE2_V>(evtMte2V_[0]);
++        WaitFlag<HardEvent::MTE2_V>(evtMte2V_[0]);
++        PipeBarrier<PIPE_V>();
++        Exp(expAlogPad, expAlogPad, FGR_MAX_HV);  // exp(A_log); pad lanes get 1.0, harmless, never read
++        PipeBarrier<PIPE_V>();
++        // MTE2->S for cu/idx (the only cross-pipe sync of this kind in the kernel; afterwards UB GetValue reads directly)
++        SetFlag<HardEvent::MTE2_S>(evtMte2S_);
++        WaitFlag<HardEvent::MTE2_S>(evtMte2S_);
++    }
++
++    // DMA-in all inputs of work item idx = i_n * HV + i_hv into the parity buffer
++    __aicore__ inline void CopyIn(uint32_t idx, uint32_t p)
++    {
++        // buffer-reuse waits (MTE2 pipe only; skipped while iterCnt_<1 as the parity
++        // buffers have no prior accessor): prior reader of stateBuf_[p]/oBuf_[p] is
++        // DMA-out (MTE3); prior reader of qkvBuf_[p] is the cast stage (V, only needs
++        // waiting before DMA-in reuse)
++        if (iterCnt_ >= 1) {
++            WaitFlag<HardEvent::MTE3_MTE2>(evtMte3Mte2_[p]);
++            WaitFlag<HardEvent::V_MTE2>(evtVMte2_[p]);
++        }
++        const uint32_t iN = idx / hv_;
++        const uint32_t iHv = idx - iN * hv_;
++        LocalTensor<int32_t> cuLocal = cuBuf_.Get<int32_t>();
++        LocalTensor<int32_t> idxLocal = idxBuf_.Get<int32_t>();
++        const int32_t bos = cuLocal.GetValue(iN);
++        const int32_t slot = idxLocal.GetValue(iN);
++        const uint32_t iH = iHv / hvPerH_;
++
++        LocalTensor<bfloat16_t> qkvLocal = qkvBuf_[p].Get<bfloat16_t>();
++        DataCopyPadParams padParams;
++        // q/k rows (strided views addressed by explicit row stride; contiguous case stride == H*K, identical addressing)
++        DataCopyParams rowQKParams{1, static_cast<uint16_t>(FGR_K * sizeof(bfloat16_t)), 0, 0};
++        DataCopyPad(qkvLocal[OFF_Q], qGm_[static_cast<uint64_t>(bos) * qRowStride_ + iH * FGR_K], rowQKParams,
++                    padParams);
++        DataCopyPad(qkvLocal[OFF_K], kGm_[static_cast<uint64_t>(bos) * kRowStride_ + iH * FGR_K], rowQKParams,
++                    padParams);
++        // v row
++        DataCopyParams rowVParams{1, static_cast<uint16_t>(FGR_V * sizeof(bfloat16_t)), 0, 0};
++        DataCopyPad(qkvLocal[OFF_V], vGm_[static_cast<uint64_t>(bos) * vRowStride_ + iHv * FGR_V], rowVParams,
++                    padParams);
++        // a/b rows ([HV] bf16, 8B/16B small transfers go through the pad path)
++        DataCopyParams rowABParams{1, static_cast<uint16_t>(hv_ * sizeof(bfloat16_t)), 0, 0};
++        DataCopyPad(qkvLocal[OFF_A], aGm_[static_cast<uint64_t>(bos) * hv_], rowABParams, padParams);
++        DataCopyPad(qkvLocal[OFF_B], bGm_[static_cast<uint64_t>(bos) * hv_], rowABParams, padParams);
++
++        // state 32KB(bf16)/64KB(fp32) contiguous block; skipped when slot<0 (zero-initialized
++        // in Compute, same semantics as Triton's idx>=0 guard)
++        if (slot >= 0) {
++            LocalTensor<T> stateLocal = stateBuf_[p].Get<T>();
++            DataCopyParams stateParams{FGR_K, static_cast<uint16_t>(FGR_V * sizeof(T)), 0, 0};
++            DataCopyPad(stateLocal, poolGm_[(static_cast<uint64_t>(slot) * hv_ + iHv) * FGR_STATE], stateParams,
++                        padParams);
++        }
++        SetFlag<HardEvent::MTE2_V>(evtMte2V_[p]);
++    }
++
++    // V-side reduction for L2 normalization (shared by q/k); scalar sqrt+1e-6 and the
++    // division are done in ComputeItem's scalar stage / V stage B (division verbatim
++    // with Triton b_x/(sqrt(sum(x^2))+1e-6))
++    __aicore__ inline void L2Norm(LocalTensor<float> xF32, uint32_t sumSlot)
++    {
++        LocalTensor<float> normTmp = normTmpBuf_.Get<float>();
++        LocalTensor<float> sumLocal = sumBuf_.Get<float>();
++        LocalTensor<float> reduceWork = reduceWorkBuf_.Get<float>();
++        Mul(normTmp, xF32, xF32, FGR_K);
++        PipeBarrier<PIPE_V>();
++        ReduceSum<float>(sumLocal[sumSlot], normTmp, reduceWork, FGR_K);
++        PipeBarrier<PIPE_V>();
++    }
++
++    // V-side chain of the softplus dual branch + beta (all [8] small vectors, one head per lane; pad lanes harmless, never read)
++    __aicore__ inline void GatingVecPart()
++    {
++        LocalTensor<float> aF32 = Gate(GS_A_F32);
++        LocalTensor<float> bF32 = Gate(GS_B_F32);
++        LocalTensor<float> dtPad = Gate(GS_DT_BIAS);
++        LocalTensor<float> xa = Gate(GS_XA);
++        LocalTensor<float> betax = Gate(GS_BETAX);
++        LocalTensor<float> e1 = Gate(GS_E1);
++        LocalTensor<float> spv = Gate(GS_SPV);
++        LocalTensor<float> betav = Gate(GS_BETAV);
++        LocalTensor<float> ones = Gate(GS_ONES);
++        LocalTensor<float> tmp = Gate(GS_TMP);
++
++        Add(xa, aF32, dtPad, FGR_MAX_HV);      // x = a + dt_bias
++        PipeBarrier<PIPE_V>();
++        Muls(betax, xa, spb_, FGR_MAX_HV);     // beta*x
++        PipeBarrier<PIPE_V>();
++        Exp(e1, betax, FGR_MAX_HV);            // exp(beta*x) (lanes with bx>thr may overflow;
++        PipeBarrier<PIPE_V>();                 // same two-branch semantics as tl.where, discarded by the scalar select)
++        Adds(e1, e1, 1.0f, FGR_MAX_HV);        // 1+exp
++        PipeBarrier<PIPE_V>();
++        Ln(spv, e1, FGR_MAX_HV);               // log(1+exp)
++        PipeBarrier<PIPE_V>();
++        Muls(spv, spv, invSpb_, FGR_MAX_HV);   // (1/beta)*log(1+exp)
++        PipeBarrier<PIPE_V>();
++        // beta = 1/(1+exp(-b)): verbatim formula (no AscendC Sigmoid shortcut)
++        Muls(tmp, bF32, -1.0f, FGR_MAX_HV);    // -b (multiply by -1.0 flips the sign exactly, no rounding)
++        PipeBarrier<PIPE_V>();
++        Exp(tmp, tmp, FGR_MAX_HV);
++        PipeBarrier<PIPE_V>();
++        Adds(tmp, tmp, 1.0f, FGR_MAX_HV);
++        PipeBarrier<PIPE_V>();
++        Div(betav, ones, tmp, FGR_MAX_HV);
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void ComputeItem(uint32_t idx, uint32_t p)
++    {
++        const uint32_t iN = idx / hv_;
++        const uint32_t iHv = idx - iN * hv_;
++        LocalTensor<int32_t> idxLocal = idxBuf_.Get<int32_t>();
++        const int32_t slot = idxLocal.GetValue(iN);
++
++        LocalTensor<bfloat16_t> qkvLocal = qkvBuf_[p].Get<bfloat16_t>();
++        LocalTensor<float> qF32 = qF32Buf_.Get<float>();
++        LocalTensor<float> kF32 = kF32Buf_.Get<float>();
++        LocalTensor<float> vF32 = vF32Buf_.Get<float>();
++        LocalTensor<float> work = IsBf16() ? workBuf_.Get<float>() : stateBuf_[p].Get<float>();
++
++        WaitFlag<HardEvent::MTE2_V>(evtMte2V_[p]);  // current item's q/k/v/a/b/state ready
++        // out-buffer/work-tile rewrite wait: V may write stateBuf_[p]/oBuf_[p] only
++        // after DMA-out(i-2) (MTE3) completes — the fp32 arm uses stateBuf_[p] as its
++        // work tile and rewrites it in place from V stage C, so the wait must precede
++        // any V write (the bf16 arm's first V write is much later in the store stage;
++        // waiting early costs nothing). Skipped while iterCnt_<2 (no prior DMA-out on
++        // this parity).
++        if (iterCnt_ >= 2) {
++            WaitFlag<HardEvent::MTE3_V>(evtMte3V_[p]);
++        }
++        // ---- V stage A: cast + L2 reduction + gating dual branch ----
++        Cast(qF32, qkvLocal[OFF_Q], RoundMode::CAST_NONE, FGR_K);
++        Cast(kF32, qkvLocal[OFF_K], RoundMode::CAST_NONE, FGR_K);
++        Cast(vF32, qkvLocal[OFF_V], RoundMode::CAST_NONE, FGR_V);
++        Cast(Gate(GS_A_F32), qkvLocal[OFF_A], RoundMode::CAST_NONE, FGR_MAX_HV);
++        Cast(Gate(GS_B_F32), qkvLocal[OFF_B], RoundMode::CAST_NONE, FGR_MAX_HV);
++        PipeBarrier<PIPE_V>();
++        if (IsBf16()) {
++            // state into the work tile (bf16->fp32 exact); zero-init when slot<0 (same semantics as Triton's idx>=0 guard)
++            if (slot >= 0) {
++                Cast(work, stateBuf_[p].Get<T>(), RoundMode::CAST_NONE, FGR_STATE_HALF);
++                Cast(work[FGR_STATE_HALF], stateBuf_[p].Get<T>()[FGR_STATE_HALF], RoundMode::CAST_NONE,
++                     FGR_STATE_HALF);
++            } else {
++                Duplicate(work, 0.0f, FGR_STATE_HALF);
++                Duplicate(work[FGR_STATE_HALF], 0.0f, FGR_STATE_HALF);
++            }
++            PipeBarrier<PIPE_V>();
++        } else if (slot < 0) {
++            Duplicate(work, 0.0f, FGR_STATE_HALF);
++            Duplicate(work[FGR_STATE_HALF], 0.0f, FGR_STATE_HALF);
++            PipeBarrier<PIPE_V>();
++        }
++        // V-side reads of qkvBuf_[p] end here (stateBuf_'s last V-side write is in the
++        // store stage, covered transitively via the V_MTE3->MTE3->MTE3_MTE2 chain, no
++        // separate event needed)
++        SetFlag<HardEvent::V_MTE2>(evtVMte2_[p]);
++        if (useL2_ != 0) {
++            L2Norm(qF32, 0);  // sumBuf_[0]
++            L2Norm(kF32, 8);  // sumBuf_[8]
++        }
++        GatingVecPart();
++        // ---- scalar stage (all scalars within one V_S + one S_V) ----
++        SetFlag<HardEvent::V_S>(evtVS_);
++        WaitFlag<HardEvent::V_S>(evtVS_);
++        LocalTensor<float> sumLocal = sumBuf_.Get<float>();
++        float denomQ = 1.0f;
++        float denomK = 1.0f;
++        if (useL2_ != 0) {
++            // same order as Triton: sqrt first, then +1e-6 (scalar sqrt;
++            // do NOT switch to vector Rsqrt/Reciprocal — float precision fails 2e-4)
++            denomQ = sqrt(sumLocal.GetValue(0)) + FGR_L2_EPS;
++            denomK = sqrt(sumLocal.GetValue(8)) + FGR_L2_EPS;
++        }
++        const float xHv = Gate(GS_XA).GetValue(iHv);
++        const float bxHv = Gate(GS_BETAX).GetValue(iHv);
++        const float spHv = Gate(GS_SPV).GetValue(iHv);
++        const float betaS = Gate(GS_BETAV).GetValue(iHv);
++        const float expAlogS = Gate(GS_EXP_ALOG).GetValue(iHv);
++        // softplus threshold branch (same per-lane semantics as tl.where; each lane here is exactly one head)
++        const float softplusS = (bxHv <= thr_) ? spHv : xHv;
++        const float gS = (-expAlogS) * softplusS;  // g = -exp(A_log)*softplus (sign flip exact)
++        SetFlag<HardEvent::S_V>(evtSV_);
++        WaitFlag<HardEvent::S_V>(evtSV_);
++        // ---- V stage B: division normalization + decay exp ----
++        LocalTensor<float> denom = denomBuf_.Get<float>();
++        if (useL2_ != 0) {
++            Duplicate(denom, denomQ, FGR_K);
++            PipeBarrier<PIPE_V>();
++            Div(qF32, qF32, denom, FGR_K);  // true division (A3 Div in default INTRINSIC mode
++            PipeBarrier<PIPE_V>();          // is at most 1 ulp, counted in the instruction-level difference list)
++            Duplicate(denom, denomK, FGR_K);
++            PipeBarrier<PIPE_V>();
++            Div(kF32, kF32, denom, FGR_K);
++            PipeBarrier<PIPE_V>();
++        }
++        Muls(qF32, qF32, scale_, FGR_K);  // scale after norm (Triton order)
++        PipeBarrier<PIPE_V>();
++        Duplicate(Gate(GS_G), gS, FGR_MAX_HV);
++        PipeBarrier<PIPE_V>();
++        Exp(Gate(GS_DECAY), Gate(GS_G), FGR_MAX_HV);  // decay = exp(g) (lane0 valid)
++        PipeBarrier<PIPE_V>();
++        SetFlag<HardEvent::V_S>(evtVS_);
++        WaitFlag<HardEvent::V_S>(evtVS_);
++        const float decayS = Gate(GS_DECAY).GetValue(0);
++        SetFlag<HardEvent::S_V>(evtSV_);  // S->V sync so decayS is visible as the
++        WaitFlag<HardEvent::S_V>(evtSV_); // scalar operand of the Muls in V stage C
++        // ---- V stage C: delta rule main chain ----
++        // h *= decay (Triton: b_h *= b_decay, before delta)
++        Muls(work, work, decayS, FGR_STATE_HALF);
++        Muls(work[FGR_STATE_HALF], work[FGR_STATE_HALF], decayS, FGR_STATE_HALF);
++        PipeBarrier<PIPE_V>();
++        // k broadcast tile (Brcb: each element widened 8x; with src1BlkStride=0 gives full row x k[k])
++        LocalTensor<float> brcb = brcbBuf_.Get<float>();
++        Brcb(brcb, kF32, FGR_K / 8, {1, 8});
++        PipeBarrier<PIPE_V>();
++        LocalTensor<float> prod = prodBuf_.Get<float>();
++        LocalTensor<float> delta = deltaBuf_.Get<float>();
++        // delta[v] = sum_k h[k,v]*k[k] (2 K slabs: in-slab 5-pass tree leaves 2 rows, merged then accumulated across slabs)
++        for (uint32_t s = 0; s < FGR_V / FGR_V_SLAB; s++) {
++            ReduceKSlab(prod, work, brcb, s, 0);
++            Add(delta[s * FGR_V_SLAB], prod, prod[FGR_V_SLAB], FGR_V_SLAB);  // merge slab-0's two rows into the slot
++            PipeBarrier<PIPE_V>();
++            ReduceKSlab(prod, work, brcb, s, 1);
++            Add(prod, prod, prod[FGR_V_SLAB], FGR_V_SLAB);  // merge slab-1's two rows into prod row 0
++            PipeBarrier<PIPE_V>();
++            Add(delta[s * FGR_V_SLAB], delta[s * FGR_V_SLAB], prod, FGR_V_SLAB);  // cross-slab accumulation
++            PipeBarrier<PIPE_V>();
++        }
++        // v' = (v - delta) * beta (Sub then Muls, two roundings, same as Triton)
++        Sub(vF32, vF32, delta, FGR_V);
++        PipeBarrier<PIPE_V>();
++        Muls(vF32, vF32, betaS, FGR_V);
++        PipeBarrier<PIPE_V>();
++        // h += k x v' (separate Mul+Add, two roundings; no MulAddDst/FMA contraction)
++        for (uint32_t s = 0; s < FGR_V / FGR_V_SLAB; s++) {
++            for (uint32_t ks = 0; ks < FGR_K / FGR_K_SLAB; ks++) {
++                // prod[r, :] = v'[s slot] * k[ks*64+r] (src0RepStride=0: the whole slab reuses the same v' slot)
++                Mul<float>(prod, vF32[s * FGR_V_SLAB], brcb[ks * FGR_K_SLAB * 8], FGR_V_SLAB,
++                           static_cast<uint8_t>(FGR_K_SLAB), {1, 1, 0, 8, 0, 1});
++                PipeBarrier<PIPE_V>();
++                const uint32_t wOff = ks * FGR_K_SLAB * FGR_V + s * FGR_V_SLAB;
++                Add<float>(work[wOff], work[wOff], prod, FGR_V_SLAB, static_cast<uint8_t>(FGR_K_SLAB),
++                           {1, 1, 1, 16, 16, 8});
++                PipeBarrier<PIPE_V>();
++            }
++        }
++        // q broadcast tile (overwrites the k broadcast tile: k unused from here on)
++        Brcb(brcb, qF32, FGR_K / 8, {1, 8});
++        PipeBarrier<PIPE_V>();
++        // o[v] = sum_k h_new[k,v]*q[k] (same shape as delta; uses the rank-1-updated h)
++        LocalTensor<float> oF32 = oF32Buf_.Get<float>();
++        for (uint32_t s = 0; s < FGR_V / FGR_V_SLAB; s++) {
++            ReduceKSlab(prod, work, brcb, s, 0);
++            Add(oF32[s * FGR_V_SLAB], prod, prod[FGR_V_SLAB], FGR_V_SLAB);
++            PipeBarrier<PIPE_V>();
++            ReduceKSlab(prod, work, brcb, s, 1);
++            Add(prod, prod, prod[FGR_V_SLAB], FGR_V_SLAB);
++            PipeBarrier<PIPE_V>();
++            Add(oF32[s * FGR_V_SLAB], oF32[s * FGR_V_SLAB], prod, FGR_V_SLAB);
++            PipeBarrier<PIPE_V>();
++        }
++        // ---- store stage ----
++        LocalTensor<bfloat16_t> oLocal = oBuf_[p].Get<bfloat16_t>();
++        Cast(oLocal, oF32, RoundMode::CAST_RINT, FGR_V);  // RNE, same as Triton .to(bf16)
++        if (IsBf16()) {
++            Cast(stateBuf_[p].Get<T>(), work, RoundMode::CAST_RINT, FGR_STATE_HALF);
++            Cast(stateBuf_[p].Get<T>()[FGR_STATE_HALF], work[FGR_STATE_HALF], RoundMode::CAST_RINT, FGR_STATE_HALF);
++        }
++        PipeBarrier<PIPE_V>();
++        SetFlag<HardEvent::V_MTE3>(evtVMte3_[p]);
++    }
++
++    // prod[r, :] = work[(ks*64+r)*128 + s slot] * brcbVec[ks*64+r], then a 5-pass
++    // pairwise tree reduction (in place, read addresses never below write addresses,
++    // no self-overwrite) leaving 2 rows at prod[0..63] and prod[64..127] (the caller
++    // merges/places them with one Add).
++    __aicore__ inline void ReduceKSlab(LocalTensor<float> prod, LocalTensor<float> work, LocalTensor<float> brcb,
++                                       uint32_t vSlab, uint32_t kSlab)
++    {
++        const uint32_t wOff = kSlab * FGR_K_SLAB * FGR_V + vSlab * FGR_V_SLAB;
++        // src1BlkStride=0: all 8 blocks within a repeat read the same 8-element brcb
++        // block (= scalar x8); src1RepStride=1: advance block by block across repeats
++        // (k/q row by row)
++        Mul<float>(prod, work[wOff], brcb[kSlab * FGR_K_SLAB * 8], FGR_V_SLAB, static_cast<uint8_t>(FGR_K_SLAB),
++                   {1, 1, 0, 8, 16, 1});
++        PipeBarrier<PIPE_V>();
++        // 5-pass tree: 64->32->16->8->4->2 rows (the final two-row merge is done by the caller per slot placement)
++        for (uint32_t repeats = FGR_K_SLAB / 2; repeats >= 2; repeats = repeats / 2) {
++            Add<float>(prod, prod, prod[FGR_V_SLAB], FGR_V_SLAB, static_cast<uint8_t>(repeats), {1, 1, 1, 8, 16, 16});
++            PipeBarrier<PIPE_V>();
++        }
++    }
++
++    __aicore__ inline void CopyOut(uint32_t idx, uint32_t p)
++    {
++        const uint32_t iN = idx / hv_;
++        const uint32_t iHv = idx - iN * hv_;
++        LocalTensor<int32_t> cuLocal = cuBuf_.Get<int32_t>();
++        LocalTensor<int32_t> idxLocal = idxBuf_.Get<int32_t>();
++        const int32_t bos = cuLocal.GetValue(iN);
++        const int32_t slot = idxLocal.GetValue(iN);
++
++        WaitFlag<HardEvent::V_MTE3>(evtVMte3_[p]);  // store-stage cast done
++        // o row store (same addressing as Triton: (bos*HV+i_hv)*V)
++        DataCopyParams oParams{1, static_cast<uint16_t>(FGR_V * sizeof(bfloat16_t)), 0, 0};
++        DataCopyPad(oGm_[(static_cast<uint64_t>(bos) * hv_ + iHv) * FGR_V], oBuf_[p].Get<bfloat16_t>(), oParams);
++        // state writeback (not written when slot<0, same guard as Triton)
++        if (slot >= 0) {
++            DataCopyParams stateParams{FGR_K, static_cast<uint16_t>(FGR_V * sizeof(T)), 0, 0};
++            DataCopyPad(poolGm_[(static_cast<uint64_t>(slot) * hv_ + iHv) * FGR_STATE], stateBuf_[p].Get<T>(),
++                        stateParams);
++        }
++        // two sets: next-round rewrite gates for stateBuf_/oBuf_ (MTE3_V for the V side,
++        // MTE3_MTE2 for the MTE2 side; both per parity — a single MTE3_MTE2 event would
++        // tail with two Sets and no Wait in between = hang UB)
++        SetFlag<HardEvent::MTE3_V>(evtMte3V_[p]);
++        SetFlag<HardEvent::MTE3_MTE2>(evtMte3Mte2_[p]);
++    }
++
++private:
++    GlobalTensor<float> aLogGm_;
++    GlobalTensor<bfloat16_t> aGm_;
++    GlobalTensor<float> dtBiasGm_;
++    GlobalTensor<bfloat16_t> qGm_;
++    GlobalTensor<bfloat16_t> kGm_;
++    GlobalTensor<bfloat16_t> vGm_;
++    GlobalTensor<bfloat16_t> bGm_;
++    GlobalTensor<bfloat16_t> oGm_;
++    GlobalTensor<T> poolGm_;
++    GlobalTensor<int32_t> idxGm_;
++    GlobalTensor<int32_t> cuGm_;
++
++    TPipe *pipe_;
++    TBuf<TPosition::VECCALC> stateBuf_[2];
++    TBuf<TPosition::VECCALC> workBuf_;
++    TBuf<TPosition::VECCALC> prodBuf_;
++    TBuf<TPosition::VECCALC> brcbBuf_;
++    TBuf<TPosition::VECCALC> qkvBuf_[2];
++    TBuf<TPosition::VECCALC> oBuf_[2];
++    TBuf<TPosition::VECCALC> qF32Buf_;
++    TBuf<TPosition::VECCALC> kF32Buf_;
++    TBuf<TPosition::VECCALC> vF32Buf_;
++    TBuf<TPosition::VECCALC> normTmpBuf_;
++    TBuf<TPosition::VECCALC> reduceWorkBuf_;
++    TBuf<TPosition::VECCALC> sumBuf_;
++    TBuf<TPosition::VECCALC> denomBuf_;
++    TBuf<TPosition::VECCALC> deltaBuf_;
++    TBuf<TPosition::VECCALC> oF32Buf_;
++    TBuf<TPosition::VECCALC> cuBuf_;
++    TBuf<TPosition::VECCALC> idxBuf_;
++    TBuf<TPosition::VECCALC> gateBuf_;
++
++    TEventID evtVS_;
++    TEventID evtSV_;
++    TEventID evtMte2S_;
++    TEventID evtMte2V_[2];
++    TEventID evtVMte2_[2];
++    TEventID evtVMte3_[2];
++    TEventID evtMte3V_[2];
++    TEventID evtMte3Mte2_[2];
++
++    uint32_t n_;
++    uint32_t h_;
++    uint32_t hv_;
++    uint32_t hvPerH_;
++    uint32_t qRowStride_;
++    uint32_t kRowStride_;
++    uint32_t vRowStride_;
++    float scale_;
++    float spb_;
++    float invSpb_;
++    float thr_;
++    uint32_t useL2_;
++    uint32_t blockIdx_;
++    uint32_t blockDim_;
++    uint32_t iterCnt_;
++};
++
++}  // namespace fused_sigmoid_gating_recurrent
++
++using fused_sigmoid_gating_recurrent::FusedSigmoidGatingRecurrent;
++
++#define FGR_KERNEL_ARGS                                                                                               \
++    GM_ADDR A_log, GM_ADDR a, GM_ADDR dt_bias, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR b, GM_ADDR o, GM_ADDR pool,   \
++            GM_ADDR cache_indices, GM_ADDR cu_seqlens, uint32_t n, uint32_t h, uint32_t hv, uint32_t qRowStride,      \
++            uint32_t kRowStride, uint32_t vRowStride, float scale, float softplusBeta, float invSoftplusBeta,         \
++            float softplusThreshold, uint32_t useQkL2norm
++
++#endif  // __FUSED_SIGMOID_GATING_RECURRENT_KERNEL_LIB_H_
 diff --git a/csrc/pytorch_extensions.cpp b/csrc/pytorch_extensions.cpp
-index 1cfccb0..8e4ad91 100644
+index 1cfccb0..fb2d90a 100644
 --- a/csrc/pytorch_extensions.cpp
 +++ b/csrc/pytorch_extensions.cpp
-@@ -32,11 +32,11 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
+@@ -17,6 +17,8 @@
+ #include "sgl_kenel_npu_ops.h"
+ #include "causal_conv1d_update/op_host/causal_conv1d_update.h"
+ #include "causal_conv1d/op_host/causal_conv1d.h"
++#include "fused_qkvzba_conv1d/op_host/fused_qkvzba_conv1d.h"
++#include "fused_sigmoid_gating_recurrent/op_host/fused_sigmoid_gating_recurrent.h"
+ 
+ namespace {
+ TORCH_LIBRARY_FRAGMENT(npu, m)
+@@ -32,11 +34,11 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
  
      m.def(
          "cache_loc_assign(Tensor req_indices, Tensor token_pool, Tensor start_offset, Tensor end_offset, Tensor "
@@ -228,6 +2222,59 @@ index 1cfccb0..8e4ad91 100644
  
      m.def(
          "assign_cache_op(Tensor! out, Tensor src, Tensor dst_start_idx, Tensor dst_end_idx, Tensor src_start_idx, "
+@@ -147,6 +149,26 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
+         "Tensor? query_start_loc=None, Tensor? cache_indices=None, Tensor? has_initial_state=None, "
+         "Tensor? num_accepted_tokens=None, int activation_mode=0, int pad_slot_id=-1, "
+         "int run_mode=0) -> Tensor");
++
++    // GDN decode split + causal_conv1d in a single kernel
++    m.def(
++        "fused_qkvzba_conv1d(Tensor qkvz, Tensor weight, Tensor conv_states, Tensor mixed_ba, "
++        "int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim, Tensor? bias=None, "
++        "Tensor? query_start_loc=None, Tensor? cache_indices=None, int activation_mode=0, "
++        "int pad_slot_id=-1) -> (Tensor, Tensor, Tensor, Tensor)");
++
++    // AscendC AIV version of the GDN decode recurrent (sigmoid gating + delta
++    // rule update), decode only (T==N, one token per sequence);
++    // initial_state_source is the ssm state pool and is updated in place;
++    // q/k/v may be strided views with a contiguous last dim (row strides are
++    // passed explicitly).
++    m.def(
++        "fused_sigmoid_gating_recurrent(Tensor A_log, Tensor a, Tensor dt_bias, "
++        "float softplus_beta, float softplus_threshold, "
++        "Tensor q, Tensor k, Tensor v, Tensor b, "
++        "Tensor(a!) initial_state_source, Tensor initial_state_indices, "
++        "float scale, Tensor cu_seqlens, bool use_qk_l2norm, "
++        "int q_row_stride, int k_row_stride, int v_row_stride) -> Tensor");
+ }
+ }  // namespace
+ 
+@@ -246,5 +268,25 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
+             x, weight, bias_or_empty, conv_states, query_start_loc_or_empty, cache_indices_or_empty,
+             has_initial_state_or_empty, num_accepted_tokens_or_empty, activation_mode, pad_slot_id, run_mode);
+     });
++
++    m.impl("fused_qkvzba_conv1d",
++           [](const at::Tensor &qkvz, const at::Tensor &weight, const at::Tensor &conv_states,
++              const at::Tensor &mixed_ba, int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim,
++              int64_t head_v_dim, const c10::optional<at::Tensor> &bias,
++              const c10::optional<at::Tensor> &query_start_loc, const c10::optional<at::Tensor> &cache_indices,
++              int64_t activation_mode, int64_t pad_slot_id) {
++               // Handle optional parameters - convert None to empty tensors
++               auto bias_or_empty = bias.has_value() ? *bias : at::empty({0}, qkvz.options());
++               auto query_start_loc_or_empty =
++                   query_start_loc.has_value() ? *query_start_loc : at::empty({0}, qkvz.options().dtype(at::kLong));
++               auto cache_indices_or_empty =
++                   cache_indices.has_value() ? *cache_indices : at::empty({0}, qkvz.options().dtype(at::kLong));
++
++               return sglang::npu_kernel::fused_qkvzba_conv1d_impl(
++                   qkvz, weight, conv_states, mixed_ba, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
++                   bias_or_empty, query_start_loc_or_empty, cache_indices_or_empty, activation_mode, pad_slot_id);
++           });
++
++    m.impl("fused_sigmoid_gating_recurrent", TORCH_FN(sglang::npu_kernel::fused_sigmoid_gating_recurrent_impl));
+ }
+ }  // namespace
 diff --git a/include/sgl_kenel_npu_ops.h b/include/sgl_kenel_npu_ops.h
 index c6a4fba..ad51c12 100644
 --- a/include/sgl_kenel_npu_ops.h
@@ -250,6 +2297,866 @@ index c6a4fba..ad51c12 100644
  
  bool assign_cache_op(at::Tensor &dst_tensor, const at::Tensor &src_tensor,
                       const at::Tensor &dst_start_idx,
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+index 2c6288e..770bd67 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+@@ -5,7 +5,6 @@ import torch
+ import torch.nn.functional as F
+ import triton
+ import triton.language as tl
+-from sgl_kernel_npu.fla.utils import input_guard
+ 
+ 
+ @triton.heuristics(
+@@ -29,6 +28,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+     h0_source,
+     h0_indices,
+     cu_seqlens,
++    q_row_stride,
++    k_row_stride,
++    v_row_stride,
+     scale,
+     T,
+     B: tl.constexpr,
+@@ -70,9 +72,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+     for i_bhv in range(BHV):
+         i_hv = i_nhv * BHV + i_bhv
+         i_h = i_hv // (HV // H)
+-        p_q = q + (bos * H + i_h) * K + o_k  # q + 0 ~ 127
+-        p_k = k + (bos * H + i_h) * K + o_k  # k + 0 ~ 127
+-        p_v = v + (bos * HV + i_hv) * V + o_v  # v + i_nh * 128 + 0 ~ 15 * 8 + 0 ~ 7
++        p_q = q + bos * q_row_stride + i_h * K + o_k  # q + 0 ~ 127
++        p_k = k + bos * k_row_stride + i_h * K + o_k  # k + 0 ~ 127
++        p_v = v + bos * v_row_stride + i_hv * V + o_v  # v + i_nh * 128 + 0 ~ 15 * 8 + 0 ~ 7
+         p_b = b + bos * HV + i_hv
+         p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+ 
+@@ -88,9 +90,9 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+ 
+         for i in range(T):
+             # Load inputs
+-            b_q = tl.load(p_q + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
+-            b_k = tl.load(p_k + i * H * K, mask=mask_k).to(tl.float32)  # 128 * float32
+-            b_v = tl.load(p_v + i * HV * V, mask=mask_v).to(tl.float32)  # 64 * float32
++            b_q = tl.load(p_q + i * q_row_stride, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_k = tl.load(p_k + i * k_row_stride, mask=mask_k).to(tl.float32)  # 128 * float32
++            b_v = tl.load(p_v + i * v_row_stride, mask=mask_v).to(tl.float32)  # 64 * float32
+             b_b = tl.load(p_b + i * HV).to(tl.float32)
+ 
+             # Compute sigmoid gating
+@@ -166,7 +168,6 @@ def fused_sigmoid_gating_delta_rule_update_npu_kernel(
+             tl.store(p_o + i * HV * V, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+ 
+ 
+-@input_guard
+ def fused_sigmoid_gating_delta_rule_update_npu(
+     A_log: torch.Tensor,
+     a: torch.Tensor,
+@@ -188,7 +189,23 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+     Fused triton implementation of sigmoid gating delta rule update.
+     This function uses a single fused kernel that combines both sigmoid gating computation
+     and the recurrent delta rule update for better performance.
++
++    v1 变更（GDN decode 优化方案B）：去掉 @input_guard 的全量 contiguous——
++    q/k/v 允许非连续视图（仅要求末维 stride==1），kernel 按传入的 token 行 stride
++    寻址，消去 decode 路径每层 3 份 q/k/v 拷贝；连续输入时寻址与原版完全一致
++    （逐 bit 等价，已由 resource/code/gdn_mamba/test_b 验证）。
+     """
++    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
++    assert initial_state_source.is_contiguous()
++    a = a.contiguous()
++    b = b.contiguous()
++    A_log = A_log.contiguous()
++    dt_bias = dt_bias.contiguous()
++    if initial_state_indices is not None:
++        initial_state_indices = initial_state_indices.contiguous()
++    if cu_seqlens is not None:
++        cu_seqlens = cu_seqlens.contiguous()
++
+     B, T, H, K, V = *k.shape, v.shape[-1]
+     HV = v.shape[2]
+     N = B if cu_seqlens is None else len(cu_seqlens) - 1
+@@ -222,6 +239,9 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+         h0_source=initial_state_source,
+         h0_indices=initial_state_indices,
+         cu_seqlens=cu_seqlens,
++        q_row_stride=q.stride(1),
++        k_row_stride=k.stride(1),
++        v_row_stride=v.stride(1),
+         scale=scale,
+         T=T,
+         B=B,
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent_decode_optimized.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent_decode_optimized.py
+new file mode 100644
+index 0000000..a9057c3
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent_decode_optimized.py
+@@ -0,0 +1,328 @@
++# Decode-optimized GDN recurrent state update for Ascend NPU.
++#
++# Based on sgl-kernel-npu PR #740's
++# ``fla/fused_sigmoid_gating_recurrent_decode_optimized.py``, with strided
++# q/k/v support added (``q/k/v_row_stride`` addressing + contiguous-free
++# wrapper). The PR original addresses the packed layout ``(bos*H+i_h)*K`` and
++# its wrapper calls ``.contiguous()`` on non-contiguous inputs — with fused
++# split producing strided views, that costs 3 extra copies per layer.
++#
++# Optimizations (from PR #740): 1-D grid capped at the AIV vector core count,
++# per-program loop over (sequence, value-head) tiles, BV=64 blocking over V
++# with gating computed once per (seq, v-head), num_warps=4, and a lightweight
++# contiguity check instead of the generic input_guard.
++#
++# Limitations: decode only (T=1 per sequence; the wrapper asserts
++# total_tokens == N). NK>1 is unsupported. The target_verify extras
++# (disable_state_update etc.) are unsupported; do not use for verify.
++
++from typing import Optional
++
++import torch
++import triton
++import triton.language as tl
++
++from sgl_kernel_npu.utils.triton_utils import get_device_properties
++
++
++def _maybe_contiguous(x):
++    """Return ``x`` unchanged when already contiguous, else a contiguous copy."""
++    return x if x.is_contiguous() else x.contiguous()
++
++
++@triton.heuristics(
++    {
++        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
++        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
++    }
++)
++@triton.jit(do_not_specialize=["T", "N", "NHV"])
++def _fused_sigmoid_gating_delta_rule_update_decode_kernel(
++    A_log,
++    a,
++    dt_bias,
++    softplus_beta,
++    softplus_threshold,
++    q,
++    k,
++    v,
++    b,
++    o,
++    h0_source,
++    h0_indices,
++    cu_seqlens,
++    q_row_stride,
++    k_row_stride,
++    v_row_stride,
++    scale,
++    T,
++    N,
++    NHV,
++    B: tl.constexpr,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    BHV: tl.constexpr,
++    OVERSUB: tl.constexpr,
++    USE_INITIAL_STATE: tl.constexpr,
++    IS_VARLEN: tl.constexpr,
++    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
++):
++    """
++    Decode-optimized fused gating + recurrent delta rule update.
++
++    Grid: (num_programs,) where num_programs = min(N*NHV, OVERSUB*num_vectorcore).
++    Each program loops over its assigned (sequence, value-head) tiles with
++    stride num_programs, processing the value dimension in BV=64 blocks and
++    reusing the gating computation across those blocks.
++
++    q/k/v are addressed by token row stride: for contiguous inputs
++    q_row_stride == H*K / v_row_stride == HV*V, identical to the PR original.
++    """
++    pid = tl.program_id(0)
++    num_programs = tl.num_programs(0)
++    total_tiles = N * NHV
++
++    o_k = tl.arange(0, BK)
++    o_base_v = tl.arange(0, BV)
++    mask_k = o_k < K
++
++    NV = tl.cdiv(V, BV)
++
++    for g_idx in tl.range(pid, total_tiles, num_programs):
++        i_n = g_idx // NHV
++        i_nhv = g_idx % NHV
++
++        if IS_VARLEN:
++            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
++            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
++            t_len = (eos - bos).to(tl.int32)
++        else:
++            bos = i_n * T
++            t_len = T
++
++        for i_bhv in tl.static_range(0, BHV):
++            i_hv = i_nhv * BHV + i_bhv
++            i_h = i_hv // (HV // H)
++
++            # Gating: compute once per (sequence, value-head).
++            b_A_log = tl.load(A_log + i_hv).to(tl.float32)
++            b_a = tl.load(a + bos * HV + i_hv).to(tl.float32)
++            b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
++            b_b = tl.load(b + bos * HV + i_hv).to(tl.float32)
++
++            x = b_a + b_dt_bias
++            beta_x = softplus_beta * x
++            softplus_x = tl.where(
++                beta_x <= softplus_threshold,
++                (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
++                x,
++            )
++            b_g = -tl.exp(b_A_log) * softplus_x
++            b_decay = tl.exp(b_g)
++            b_beta = 1.0 / (1.0 + tl.exp(-b_b))
++
++            # q/k are shared across the value dimension; set pointers once.
++            p_q = q + bos * q_row_stride + i_h * K + o_k
++            p_k = k + bos * k_row_stride + i_h * K + o_k
++
++            for i_v in tl.range(0, NV):
++                o_v = i_v * BV + o_base_v
++                mask_v = o_v < V
++                mask_h = mask_k[:, None] & mask_v[None, :]
++
++                # v uses v_row_stride likewise; o is a contiguous buffer
++                # owned by this wrapper and keeps the PR-original addressing.
++                p_v = v + bos * v_row_stride + i_hv * V + o_v
++                p_o = o + (bos * HV + i_hv) * V + o_v
++
++                if USE_INITIAL_STATE:
++                    idx = tl.load(h0_indices + i_n)
++                    p_h0 = (
++                        h0_source
++                        + idx * HV * K * V
++                        + i_hv * K * V
++                        + o_k[:, None] * V
++                        + o_v[None, :]
++                    )
++
++                for i in tl.range(0, t_len):
++                    b_q = tl.load(p_q + i * q_row_stride, mask=mask_k).to(tl.float32)
++                    b_k = tl.load(p_k + i * k_row_stride, mask=mask_k).to(tl.float32)
++                    b_v = tl.load(p_v + i * v_row_stride, mask=mask_v).to(tl.float32)
++
++                    if USE_INITIAL_STATE:
++                        if idx >= 0:
++                            b_h = tl.load(p_h0 + i * HV * K * V, mask=mask_h).to(
++                                tl.float32
++                            )
++                        else:
++                            b_h = tl.zeros([BK, BV], dtype=tl.float32)
++                    else:
++                        b_h = tl.zeros([BK, BV], dtype=tl.float32)
++
++                    if USE_QK_L2NORM_IN_KERNEL:
++                        b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
++                        b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
++
++                    b_q = b_q * scale
++
++                    # Recurrent delta rule update.
++                    b_h *= b_decay
++                    b_v -= tl.sum(b_h * b_k[:, None], 0)
++                    b_v *= b_beta
++                    b_h += b_k[:, None] * b_v[None, :]
++                    b_o = tl.sum(b_h * b_q[:, None], 0)
++
++                    if USE_INITIAL_STATE:
++                        if idx >= 0:
++                            tl.store(
++                                p_h0 + i * HV * K * V,
++                                b_h.to(h0_source.dtype.element_ty),
++                                mask=mask_h,
++                            )
++
++                    tl.store(p_o + i * HV * V, b_o.to(o.dtype.element_ty), mask=mask_v)
++
++
++def fused_sigmoid_gating_delta_rule_update_decode_npu(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    dt_bias: torch.Tensor,
++    softplus_beta: float,
++    softplus_threshold: float,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    b: torch.Tensor,
++    initial_state_source: torch.Tensor,
++    initial_state_indices: torch.Tensor,
++    scale: Optional[float] = None,
++    use_qk_l2norm_in_kernel: bool = False,
++    cu_seqlens: Optional[torch.Tensor] = None,
++):
++    """
++    Decode-optimized recurrent delta rule update for Ascend NPU.
++
++    Drop-in replacement for the generic
++    ``fused_sigmoid_gating_delta_rule_update_npu`` on the decode path, with
++    the same algorithm. It launches with num_warps=4 for better small-batch
++    throughput on the AIV vector cores.
++
++    q/k/v may be non-contiguous views (only last-dim stride==1 is required);
++    the kernel addresses them by the passed token row strides, eliminating 3
++    per-layer q/k/v copies on the decode path. Contiguous inputs address
++    identically to the PR original.
++
++    Args / Returns: same as ``fused_sigmoid_gating_delta_rule_update_npu``
++    (return shape matches v; the PR original returns (N, HV, V) and this
++    version ``view``s back to v's shape — under decode the token count == N,
++    so the elements correspond one-to-one).
++    """
++    # q/k/v stay as views; only last-dim stride==1 is asserted, row strides go
++    # to the kernel.
++    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
++    # The pool must be contiguous: copying a non-contiguous pool via
++    # _maybe_contiguous would write state updates back into the copy
++    # (silently losing them), hence the hard assert.
++    assert initial_state_source.is_contiguous()
++    A_log = _maybe_contiguous(A_log)
++    a = _maybe_contiguous(a)
++    dt_bias = _maybe_contiguous(dt_bias)
++    b = _maybe_contiguous(b)
++    if initial_state_indices is not None:
++        initial_state_indices = _maybe_contiguous(initial_state_indices)
++    if cu_seqlens is not None:
++        cu_seqlens = _maybe_contiguous(cu_seqlens)
++
++    with torch.npu.device(q.device.index):
++        B, T, H, K = q.shape
++    HV = v.shape[2]
++    V = v.shape[-1]
++    N = B if cu_seqlens is None else len(cu_seqlens) - 1
++
++    # Decode-only guard: o is addressed by token index (bos) but has only N
++    # rows, valid only with exactly 1 token per sequence — varlen requires
++    # total_tokens == N (production decode has query_start_loc step 1),
++    # non-varlen requires T == 1. verify/prefill must not use this kernel.
++    if cu_seqlens is not None:
++        assert T == N, (
++            f"decode-optimized kernel requires one token per sequence, "
++            f"got total_tokens={T}, sequences={N}"
++        )
++    else:
++        assert T == 1, (
++            f"decode-optimized kernel requires T == 1 without cu_seqlens, got T={T}"
++        )
++
++    BK = triton.next_power_of_2(K)
++    BV = min(triton.next_power_of_2(V), 64)
++    NK = triton.cdiv(K, BK)
++    NV = triton.cdiv(V, BV)
++    assert NK == 1, "NK > 1 is not supported in the decode-optimized kernel"
++
++    if scale is None:
++        scale = K**-0.5
++    else:
++        assert scale > 0, "scale must be positive"
++
++    # Each program handles exactly one value head to keep the UB working set
++    # small and avoid cross-head synchronization.
++    BHV = 1
++    NHV = HV
++
++    o = q.new_empty(N, HV, V)
++
++    # 1-D grid sized to the AIV vector core count; num_warps=4 was tuned for
++    # small-batch decode. Oversubscription does not help because the loop
++    # trip count is already small.
++    num_aicore, num_vectorcore = get_device_properties()
++    OVERSUB = 1
++    num_programs = min(N * NHV, num_vectorcore * OVERSUB)
++    num_programs = max(1, num_programs)
++    grid = (num_programs,)
++
++    num_warps = 4
++    num_stages = 1
++
++    _fused_sigmoid_gating_delta_rule_update_decode_kernel[grid](
++        A_log=A_log,
++        a=a,
++        dt_bias=dt_bias,
++        softplus_beta=softplus_beta,
++        softplus_threshold=softplus_threshold,
++        q=q,
++        k=k,
++        v=v,
++        b=b,
++        o=o,
++        h0_source=initial_state_source,
++        h0_indices=initial_state_indices,
++        cu_seqlens=cu_seqlens,
++        q_row_stride=q.stride(1),
++        k_row_stride=k.stride(1),
++        v_row_stride=v.stride(1),
++        scale=scale,
++        T=T,
++        N=N,
++        NHV=NHV,
++        B=B,
++        H=H,
++        HV=HV,
++        K=K,
++        V=V,
++        BK=BK,
++        BV=BV,
++        BHV=BHV,
++        OVERSUB=OVERSUB,
++        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
++        num_warps=num_warps,
++        num_stages=num_stages,
++        multibuffer=False,
++    )
++    # Match the generic wrapper's return shape (*v.shape); under decode the
++    # token count == N, so the elements correspond one-to-one.
++    return o.view(v.shape)
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/fla/utils.py b/python/sgl_kernel_npu/sgl_kernel_npu/fla/utils.py
+index f3028e2..04f32d0 100644
+--- a/python/sgl_kernel_npu/sgl_kernel_npu/fla/utils.py
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/fla/utils.py
+@@ -603,8 +603,17 @@ def fused_qkvzba_split_reshape_cat_contiguous(
+     total_k = num_heads_qk * head_qk
+     total_v = num_heads_v * head_v
+ 
+-    qkvz_row_stride = total_q + total_k + total_v + total_v
+-    ba_row_stride = num_heads_v * 2
++    # GDN_QKVZBA_PACK: take the row stride from the physical stride(0) — a row
++    # slice view of the packed GEMM output has row stride N_qkvz+N_ba (larger
++    # than the logical width); for contiguous inputs it equals the logical
++    # width, so behavior is unchanged. Non row-major inputs (stride(1) != 1)
++    # fall back to a materialized contiguous copy.
++    if mixed_qkvz.stride(1) != 1:
++        mixed_qkvz = mixed_qkvz.contiguous()
++    if mixed_ba.stride(1) != 1:
++        mixed_ba = mixed_ba.contiguous()
++    qkvz_row_stride = mixed_qkvz.stride(0)
++    ba_row_stride = mixed_ba.stride(0)
+     qkv_row_stride = total_q + total_k + total_v
+     z_row_stride = num_heads_v * head_v
+     ba_out_row_stride = num_heads_v
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py b/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+new file mode 100644
+index 0000000..e628291
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/moe/moe_front_routing.py
+@@ -0,0 +1,182 @@
++# -*- coding: utf-8 -*-
++"""MoE 前段 v2.2 自写 init_routing（Triton / triton-ascend，CANN 9.0.0）。
++
++服务器落点：sgl_kernel_npu 包内 ``sgl_kernel_npu/moe/moe_front_routing.py``
++（namespace 子包，无需 __init__.py；集成方以
++``from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22`` 导入）。
++
++语义契约：与 ``torch.ops.npu.npu_moe_init_routing_v2``（expert_tokens_num_type=1）
++**逐位一致**（RL 精度硬约束，0 容差验收）：
++  - expanded_x：x 行按「expert id 稳定计数排序」的置换（同 expert 内保持
++    flat slot 原序，flat slot 为 t-major：f = t*top_k + k）；
++  - eri[f] = flat slot f 对应的 expanded 行号（= stock expanded_row_idx 逐位）；
++  - counts = per-expert 计数（int64，stock type=1 形态，喂 stock GMM
++    ``group_list_type=1``）。
++顺带原生输出两个前缀和（免任何前置 kernel）：
++  - excl（int32）：exclusive 前缀和，直喂 persistent_gmm 的 ``offsets=``
++    （省 _gmm2_offsets_kernel，~4.4µs/层）；
++  - incl（int64）：inclusive 前缀和，stock GMM ``group_list_type=0`` 形态（备用）。
++
++formulation（v2.2，code/moe_front_fusion 六轮单测定案；
++结果 src/moe_front_fusion_result{,_2.._6}.csv，结论见
++docs/practice/npu-moe-forward-region-probe.md）：
++
++  - rank（eri）：(e,slot) 字典序打包单比较，key = e*PM + slot，「j 排在 i 前」
++    ⟺ key_j < key_i；比较矩阵转置 [PM, BM]、归约走 axis=0（本机实证快方向）；
++    每 program 顺带产**部分直方图**（[BM,PE] axis=0 一次归约），跨 program
++    并行取代串行扫描。
++  - counts/excl/incl：第二个 kernel 对 partials [NP,PE] 做 axis=0 二次归约 +
++    1D tl.cumsum（生产验证原语）直出，i64 直写省 cast；无 atomic、无零初始化。
++  - gather（expanded_x）：独立 kernel 行块向量化 [RPP,H]（RPP=8 为 32KB），
++    **不与 rank 合并**——五轮实证融合版 18.2µs 败（归约链后串接大 tile 访存
++    长链），拆分版部件和仅 6.2µs。
++  - 精度验收：九分布（uniform/random/zipf/skew/first/last 含极端）× 多 seed
++    与 stock 逐位一致 + finalize 闭环 0 diff + 双跑确定（两形态各一轮全绿）。
++  - 性能（graph-loop，T=32/topk=8/E=256/H=2048，µs/层）：全程 10.9 vs
++    stock 17.0~18.2；链路口径 chain_renorm_v22 24.0 vs stock 链 37.4
++    （同 run -13.4）。
++
++形态门（wrapper 内自适应；超出形态由集成方回退 stock）：
++  M = T*top_k ≤ 512 且 M % 8 == 0，H 为 2 的幂（gather 行块要求），
++  x 为 bf16。bm/rpp 按 M 整除自适应（32/16/8 与 8/4/2/1）。
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++try:
++    from sgl_kernel_npu.fla.utils import input_guard
++except ImportError:  # 独立调试（未安装 sgl_kernel_npu）时退化为恒等装饰器
++    def input_guard(fn):
++        return fn
++
++
++def _pow2_ceil(n: int) -> int:
++    p = 1
++    while p < n:
++        p <<= 1
++    return p
++
++
++@triton.jit
++def _rank_hist_kernel(
++    ids_ptr, eri_ptr, part_ptr,
++    M: tl.constexpr, PM: tl.constexpr, PE: tl.constexpr, BM: tl.constexpr,
++):
++    """eri + 部分直方图（grid = M//BM）。
++
++    lt[j, i] = key_j < key_i（[PM, BM]，axis=0 归约——本机实证快方向）；
++    part[pid] = 本 program BM 个 slot 的 expert 直方图（[BM, PE] axis=0）。
++    padding slot 的 key=32768*PM+... 大于一切真实 key，不改变真实名次。
++    """
++    pid = tl.program_id(0)
++    rows = pid * BM + tl.arange(0, BM)
++    jj = tl.arange(0, PM)
++    e_all = tl.load(ids_ptr + jj, mask=jj < M, other=32768).to(tl.int32)
++    e_rows = tl.load(ids_ptr + rows, mask=rows < M, other=-1).to(tl.int32)
++    key_all = e_all * PM + jj
++    key_rows = e_rows * PM + rows
++    lt = key_all[:, None] < key_rows[None, :]       # [PM, BM]
++    rank = tl.sum(lt.to(tl.int16), axis=0)          # [BM]
++    tl.store(eri_ptr + rows, rank.to(tl.int32), mask=rows < M)
++    rngE = tl.arange(0, PE)
++    eq = e_rows[:, None] == rngE[None, :]           # [BM, PE]（-1 不命中任何 expert）
++    part = tl.sum(eq.to(tl.int16), axis=0).to(tl.int32)
++    tl.store(part_ptr + pid * PE + rngE, part)
++
++
++@triton.jit
++def _partials_cumsum_kernel(
++    part_ptr, counts_ptr, excl_ptr, incl_ptr,
++    NP: tl.constexpr, NPP: tl.constexpr, PE: tl.constexpr, E: tl.constexpr,
++):
++    """partials [NP, PE] -> counts(i64) / excl(i32) / incl(i64)，单 program。
++
++    全白名单原语：axis=0 二次归约 + 1D tl.cumsum（GDN 生产路径同款）。
++    """
++    np_ = tl.arange(0, NPP)
++    rngE = tl.arange(0, PE)
++    part = tl.load(part_ptr + np_[:, None] * PE + rngE[None, :],
++                   mask=(np_ < NP)[:, None], other=0)
++    counts = tl.sum(part, axis=0)                   # [PE] i32
++    incl = tl.cumsum(counts, axis=0)
++    excl = incl - counts
++    e_valid = rngE < E
++    tl.store(counts_ptr + rngE, counts.to(tl.int64), mask=e_valid)
++    tl.store(excl_ptr + rngE, excl, mask=e_valid)
++    tl.store(incl_ptr + rngE, incl.to(tl.int64), mask=e_valid)
++
++
++@triton.jit
++def _routing_gather_kernel(
++    x_ptr, eri_ptr, out_ptr,
++    TOPK: tl.constexpr, H: tl.constexpr, RPP: tl.constexpr,
++):
++    """行块置换：out[eri[f]] = x[f // TOPK]，每 program 处理 RPP 个 flat slot。
++
++    [RPP, H] 二维 tile 一次装载/写出（RPP=8 为 32KB），行内 4KB 连续。
++    grid = (M // RPP,)（wrapper 保证 M % RPP == 0，故不带 mask）。
++    """
++    pid = tl.program_id(0)
++    fs = pid * RPP + tl.arange(0, RPP)
++    dest = tl.load(eri_ptr + fs)  # [RPP] int32
++    tok = fs // TOPK
++    hh = tl.arange(0, H)
++    rows = tl.load(x_ptr + tok[:, None] * H + hh[None, :])
++    tl.store(out_ptr + dest[:, None] * H + hh[None, :], rows)
++
++
++def _pick_tile(m: int, candidates) -> int:
++    for c in candidates:
++        if m % c == 0:
++            return c
++    return candidates[-1]
++
++
++@input_guard
++def moe_init_routing_v22(
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    num_experts: int,
++    top_k: int,
++):
++    """v2.2 自写 init_routing（rank_hist + partials_cumsum + gather 三 launch）。
++
++    形态门（调用方负责判定，超出门请回退 stock）：M = T*top_k ≤ 512 且
++    M % 8 == 0；H 为 2 的幂；x 为 bf16 contiguous。
++
++    参数：
++      x:         [T, H] bf16，decode 隐藏状态。
++      topk_ids:  [T, top_k] int32 contiguous（来自 gating 算子）。
++      num_experts / top_k：路由配置。
++
++    返回 (expanded_x, eri, counts_i64, excl_i32, incl_i64)：
++      expanded_x [M, H] bf16 / eri [M] int32 —— 与 stock 逐位一致（0 容差）；
++      counts_i64 [E] —— stock type=1 形态（GMM group_list_type=1）；
++      excl_i32   [E] —— persistent_gmm 的 offsets= 直用（省 4.4µs 前置 kernel）；
++      incl_i64   [E] —— stock GMM group_list_type=0 形态（备用）。
++    """
++    T, H = x.shape
++    M = T * top_k
++    ids_flat = topk_ids.reshape(-1).to(torch.int32)  # 同 dtype 时 .to 不拷贝
++    dev = x.device
++    PM = _pow2_ceil(M)
++    PE = _pow2_ceil(num_experts)
++    bm = _pick_tile(M, (32, 16, 8))
++    rpp = _pick_tile(M, (8, 4, 2, 1))
++    npart = M // bm
++    eri = torch.empty(M, dtype=torch.int32, device=dev)
++    partials = torch.empty((npart, PE), dtype=torch.int32, device=dev)
++    expanded = torch.empty((M, H), dtype=x.dtype, device=dev)
++    counts = torch.empty(num_experts, dtype=torch.int64, device=dev)
++    excl = torch.empty(num_experts, dtype=torch.int32, device=dev)
++    incl = torch.empty(num_experts, dtype=torch.int64, device=dev)
++    _rank_hist_kernel[(npart,)](ids_flat, eri, partials,
++                                M=M, PM=PM, PE=PE, BM=bm, num_stages=1)
++    _routing_gather_kernel[(M // rpp,)](x, eri, expanded,
++                                        TOPK=top_k, H=H, RPP=rpp)
++    _partials_cumsum_kernel[(1,)](partials, counts, excl, incl,
++                                  NP=npart, NPP=_pow2_ceil(npart), PE=PE,
++                                  E=num_experts, num_stages=1)
++    return expanded, eri, counts, excl, incl
+diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py b/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+new file mode 100644
+index 0000000..8e28e82
+--- /dev/null
++++ b/python/sgl_kernel_npu/sgl_kernel_npu/moe/persistent_gmm.py
+@@ -0,0 +1,218 @@
++# -*- coding: utf-8 -*-
++"""Persistent grouped matmul（Triton / triton-ascend），面向 EP1 decode 的 skinny GMM2。
++
++服务器落点：sgl_kernel_npu 包内 ``sgl_kernel_npu/moe/persistent_gmm.py``
++（namespace 子包，无需 __init__.py；集成方以
++``from sgl_kernel_npu.moe.persistent_gmm import persistent_grouped_matmul`` 导入）。
++
++迁移说明（gmm/v1，基线 sglang main@bd3f6a793 + sgl_kernel_npu 3.2.1）：
++  面向 8 卡 16 die / 4 engine（MoE-TP、EP1）decode：E=256, N=2048，
++  K=64(TP8)/128(TP4)，平均 ~1 rows/expert，stock GMM2 实测 ~65us
++  （mac_ratio 6.9%，scalar/fixpipe 接近饱和，AIV 全闲）。瓶颈结构：
++  逐 group 调度与组间流水线排空，而非 FLOPs。
++
++v1.1 修复（2026-08-10，bisect 实证见 src/bisect_result.txt）：
++  v1 的 masked-sum in-kernel offsets（row0 = sum(where(e_rng < e, c_vec, 0))，
++  继承自 old_env v1.2.1，且当年修复后无 rollout 复测记录）在本机工具链
++  （CANN 9.0.0 / triton-ascend，默认 --enable-auto-multi-buffer）下被误编译：
++  persistent 数据依赖控制流中的 scalar-masked reduction 计算出错误的 row0，
++  输出整体错位（stages=3 rel_diff≈1.3；stages=1 直接 1.7e38 垃圾值），
++  rollout 乱码。二分证实：同一 kernel 改用外部 offsets 标量直读后与 stock
++  GMM 逐位一致（max_abs=0.000000，tl.trans / num_stages / base_n 均无辜）。
++  本版 offsets 改为「前置 offsets kernel + 标量直读」：
++    - _gmm2_offsets_kernel：单 program 前缀和；替代 torch.cumsum 链
++      （~58us/层，且其 torch 算子对 graph capture 不友好）。
++    - _persistent_gmm_kernel：row0 = tl.load(offsets_ptr + e) 标量直读，
++      与 bisect 中逐位正确的 ext_off 路径完全一致。
++  若前置 kernel 在本机仍验证不过，回退方案：wrapper 用
++  ``offsets = torch.cumsum(group_list, 0) - group_list``（2 个小算子，
++  见 persistent_grouped_matmul 注释），kernel 无需改动。
++
++v1.2 修复（2026-08-11，rollout 实证：offsets kernel 37us 吞掉全部收益）：
++  v1.1 的两级分组扫描用了 [G,G,G] 三维 tl.where+tl.sum(axis=2)，在本机
++  triton-ascend 上未被向量化、scalarize 成逐元素循环（4096 次标量乘加 ×
++  单 program），实测 ~37us/层，吞掉 persistent kernel 省下的 ~24us/层。
++  （rollout 实测：persistent kernel 本体 41us vs stock 65us 正确且稳定。）
++
++v1.3 修复（2026-08-11）：v1.2 的 Hillis-Steele（全局 scratch 就地
++  store->移位 load）在 ConvertTritonIRToLinalgIR 阶段 PassManager 编译失败。
++  改用 tl.cumsum 一维扫描——该原语在本工具链已被生产验证
++  （sgl_kernel_npu.fla.cumsum 的 chunk_local_cumsum_scalar_kernel，GDN 路径），
++  扫描前先转 int32（int64 reduction 风险的老教训）。目标 <=5-7us/层。
++
++v1.4 调优（2026-08-11，code/moe_whole_process 探针实测）：
++  num_progs 40→24。Ascend910_9382 为 24 AIC/die，静态 round-robin 下
++  p40 有 16 核背 2 个 program 形成慢波、p32 更灾难（8 核双份）；
++  uniform counts（全活跃）单测 64.3→54.1us（1.03→1.24TB/s，达
++  read_only_sum 实测上限 1.33TB/s 的 ~93%，基本贴墙）。
++  同次探针证伪两个假设：
++    - 权重无条件装载（varU，装载移出 if m_i>0）按实际读取字节折算速率
++      与条件装载完全相同（~1.1TB/s）——瓶颈不是 if 阻断跨迭代流水；
++    - num_stages 2/3/4 计时无差异。
++  HBM 可达带宽标定：read 1328 / copy r+w 1275 GB/s（与旧环境
++  1311/1214 一致）；GMM1 生产 profile 61us（implied 2.2TB/s）与该上限
++  矛盾，冷态 floor 应 ~101us，口径待澄清（L2 热或 shape 混入）。
++
++kernel 设计（继承 v1.2.1 结论）：
++
++  - persistent grid：num_progs 个常驻 program，静态 round-robin 领取 (expert, n_tile)
++    任务；任务成本由权重字节主导且各任务均匀（与 M_i 无关），静态调度即够，
++    无需 atomic 队列。
++  - 空 expert（count=0）整任务跳过，死 expert 权重零流量。
++  - 权重 tile 在任务内对所有 m_tile 复用；BASE_M=16 + 内层 m_tile 循环覆盖热点 expert。
++  - fp32 累加（tl.dot 默认），与 torch.ops.npu.npu_grouped_matmul 数值语义一致。
++  - layout="kn" 路径注意：本机工具链 base_n=512 编译期 cbuf overflow，
++    如确需 kn 布局先试 base_n<=256（nk 为生产路径，不受影响）。
++
++输入契约：
++  x:          [total_M, K] bf16，行按 expert 分组连续（npu_moe_init_routing_v2 输出序）
++  w:          [E, N, K] bf16（layout="nk"，生产存储布局）或 [E, K, N] 连续（layout="kn"）。
++              注意：w 必须是 ND 连续存储；集成方在 _gmm2_triton 开启时已跳过
++              w2 的 FRACTAL_NZ cast，NZ 重排存储会让裸指针读取出错。
++  group_list: [E] per-expert counts（count 模式，int32/int64，device）
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++try:
++    from sgl_kernel_npu.fla.utils import input_guard
++except ImportError:  # 独立调试（未安装 sgl_kernel_npu）时退化为恒等装饰器
++    def input_guard(fn):
++        return fn
++
++
++@triton.jit
++def _gmm2_offsets_kernel(
++    counts_ptr, offsets_ptr,
++    E: tl.constexpr, P: tl.constexpr,
++):
++    """exclusive prefix offsets[e] = sum(counts[<e])，int32 [E]，单 program。
++
++    tl.cumsum 一维扫描（P = >=E 的最小 2 的幂）。formulation 选择依据
++    （本机 CANN 9.0.0 / triton-ascend 实证）：
++      - tl.cumsum 在本工具链可用：sgl_kernel_npu.fla.cumsum 的
++        chunk_local_cumsum_scalar_kernel（GDN 生产路径）即用 tl.cumsum；
++      - 先做 int32 转换再扫描：规避 triton-ascend 的 int64 reduction 风险
++        （v1.2.1 起的老教训）；
++      - 禁止 formulation：persistent 动态控制流内 scalar-masked reduction
++        （v1，误编译数值错）；三维 where/sum tile（v1.1，scalarize ~37us）；
++        全局 scratch 就地 store->移位 load 的 Hillis-Steele（v1.2，
++        ConvertTritonIRToLinalgIR PassManager 编译失败）。
++    """
++    rng = tl.arange(0, P)
++    e_mask = rng < E
++    c = tl.load(counts_ptr + rng, mask=e_mask, other=0).to(tl.int32)
++    incl = tl.cumsum(c, axis=0)
++    tl.store(offsets_ptr + rng, incl - c, mask=e_mask)
++
++
++@triton.jit
++def _persistent_gmm_kernel(
++    x_ptr, w_ptr, counts_ptr, offsets_ptr, out_ptr,
++    num_progs,
++    E: tl.constexpr, K: tl.constexpr, N: tl.constexpr,
++    BASE_M: tl.constexpr, BASE_N: tl.constexpr, W_KN: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    N_TILES: tl.constexpr = N // BASE_N
++    TOTAL_TASKS: tl.constexpr = E * N_TILES
++    k_rng = tl.arange(0, K)
++    bm_rng = tl.arange(0, BASE_M)
++    bn_rng = tl.arange(0, BASE_N)
++
++    for t in range(pid, TOTAL_TASKS, num_progs):
++        e = t // N_TILES
++        j = t % N_TILES
++        m_i = tl.load(counts_ptr + e).to(tl.int32)
++        if m_i > 0:
++            # bisect 逐位验证过的形态：外部 offsets + 标量直读。
++            # 严禁改回 kernel 内 masked-sum 推导（本机工具链误编译，rollout 乱码）。
++            row0 = tl.load(offsets_ptr + e)
++            if W_KN:
++                # [E,K,N] 连续：直接读 [K, BASE_N] tile（k 行各 2*BASE_N 字节连续突发）
++                w_t = tl.load(
++                    w_ptr + e.to(tl.int64) * N * K
++                    + k_rng[:, None] * N + (j * BASE_N + bn_rng)[None, :]
++                )
++            else:
++                # [E,N,K] 连续（生产存储布局）：读 [BASE_N, K] 后寄存器转置
++                w_tile = tl.load(
++                    w_ptr + e.to(tl.int64) * N * K
++                    + (j * BASE_N + bn_rng)[:, None] * K + k_rng[None, :]
++                )
++                w_t = tl.trans(w_tile)
++            for m0 in range(0, m_i, BASE_M):
++                rows = row0 + m0 + bm_rng
++                m_mask = (m0 + bm_rng) < m_i
++                x_tile = tl.load(
++                    x_ptr + rows[:, None] * K + k_rng[None, :],
++                    mask=m_mask[:, None], other=0.0,
++                )
++                acc = tl.dot(x_tile, w_t)  # fp32 [BASE_M, BASE_N]
++                tl.store(
++                    out_ptr + rows[:, None] * N + (j * BASE_N + bn_rng)[None, :],
++                    acc.to(tl.bfloat16),
++                    mask=m_mask[:, None],
++                )
++
++
++def _pow2_ceil(n: int) -> int:
++    p = 1
++    while p < n:
++        p <<= 1
++    return p
++
++
++@input_guard
++def persistent_grouped_matmul(
++    x: torch.Tensor,
++    w: torch.Tensor,
++    group_list: torch.Tensor,
++    base_n: int = 512,
++    num_progs: int = 24,
++    num_stages: int = 3,
++    layout: str = "nk",
++    out: torch.Tensor = None,
++    offsets: torch.Tensor = None,
++) -> torch.Tensor:
++    """GMM2 专用 persistent grouped matmul，返回 [total_M, N] bf16。
++
++    base_n:     N 方向 tile（{256,512,1024} 之一，须整除 N）
++    num_progs:  常驻 program 数。默认 24：Ascend910_9382 为 24 AIC/die，
++                静态 round-robin 下与核数相等才负载均衡（v1.4 探针实测：
++                p40 慢 ~19%，p32 最灾难；扫参范围 {20,24,32,40,48}）。
++    num_stages: triton 流水级数（探针实测 2/3/4 无差异，保持默认 3）
++    layout:     "nk" = w 为 [E,N,K]（生产存储布局）；"kn" = w 为 [E,K,N] 连续
++    offsets:    可选外部 exclusive offsets（int32 [E]）；缺省时由本函数内置的
++                offsets 前置 kernel 推导（无 torch 计算，graph capture 友好）。
++                回退形态：offsets = torch.cumsum(group_list, 0) - group_list
++                （to(int32) 后传入），kernel 无需任何改动。
++    """
++    E, N, K = w.shape
++    total_M = x.shape[0]
++    if out is None:
++        out = torch.empty((total_M, N), dtype=torch.bfloat16, device=x.device)
++    if offsets is None:
++        offsets = torch.empty(E, dtype=torch.int32, device=x.device)
++        P = _pow2_ceil(E)
++        _gmm2_offsets_kernel[(1,)](
++            group_list, offsets, E=E, P=P
++        )
++    _persistent_gmm_kernel[(num_progs,)](
++        x_ptr=x,
++        w_ptr=w,
++        counts_ptr=group_list,
++        offsets_ptr=offsets,
++        out_ptr=out,
++        num_progs=num_progs,
++        E=E,
++        K=K,
++        N=N,
++        BASE_M=16,
++        BASE_N=base_n,
++        W_KN=(layout == "kn"),
++        num_stages=num_stages,
++    )
++    return out
 diff --git a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py b/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
 index e69de29..6e7bbd6 100644
 --- a/python/sgl_kernel_npu/sgl_kernel_npu/sample/__init__.py
@@ -1845,3 +4752,5 @@ index 0000000..3c12d53
 +        )
 +    else:
 +        raise SystemExit(pytest.main([__file__]))
+-- 
+2.54.0.windows.1

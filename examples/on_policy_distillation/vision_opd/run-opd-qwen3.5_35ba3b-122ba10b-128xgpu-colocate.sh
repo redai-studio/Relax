@@ -60,8 +60,8 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
 
    --multimodal-keys '{"image":"images"}'
-   --image-min-token-num 64                 
-   --image-max-token-num ${IMG_MAX_TOKEN:-16384}              
+   --image-min-token-num 64
+   --image-max-token-num ${IMG_MAX_TOKEN:-16384}
 
    # pure OPSD: reward is zeroed out by --opd-disable-rl-reward, but RewardWorker does not support rm_type='none';
    --rm-type random

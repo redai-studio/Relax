@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 import transfer_queue
 
+from tests.core.controller_test_utils import load_controller_with_stubbed_dependencies
+
 
 if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
     pytest.skip(
@@ -14,8 +16,8 @@ if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
         allow_module_level=True,
     )
 
-from relax.core import controller
-from relax.core.registry import ROLES
+controller = load_controller_with_stubbed_dependencies("_test_controller_s3_model_cleanup_controller")
+ROLES = controller.ROLES
 
 
 def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
