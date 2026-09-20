@@ -622,6 +622,28 @@ def add_opd_arguments(parser: Any) -> Any:
         ),
     )
     parser.add_argument(
+        "--opd-fkl-entropy-gate",
+        action="store_true",
+        default=False,
+        help=(
+            "EOPD (arXiv 2603.07079): combine sampled-token reverse-KL advantages "
+            "(--opd-kl-coef) with an entropy-gated forward-KL loss on the teacher "
+            "top-k distribution (--opd-loss-coef). The forward-KL applies only at "
+            "positions where the teacher top-k (renormalized) entropy >= "
+            "--opd-fkl-entropy-threshold. Requires --opd-token-selection "
+            "teacher_topk/union and --opd-log-prob-top-k > 0."
+        ),
+    )
+    parser.add_argument(
+        "--opd-fkl-entropy-threshold",
+        type=float,
+        default=0.8,
+        help=(
+            "Entropy threshold tau (nats) for --opd-fkl-entropy-gate, computed on "
+            "the teacher top-k distribution renormalized within top-k."
+        ),
+    )
+    parser.add_argument(
         "--opd-log-prob-min-clamp",
         type=float,
         default=None,
@@ -639,6 +661,34 @@ def add_opd_arguments(parser: Any) -> Any:
         default="student_sampled",
         choices=list(OPD_TOKEN_SELECTIONS),
         help=("Which token set the OPD KL signal is computed on."),
+    )
+    parser.add_argument(
+        "--opd-student-eos-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Optional student EOS token id to replace inside the response before teacher scoring. "
+            "Must be set together with --opd-teacher-eos-token-id."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-eos-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Teacher-side EOS token id used when scoring a student response whose EOS id differs. "
+            "Must be set together with --opd-student-eos-token-id."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-response-prefix-token-ids",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional token ids inserted between the prompt and response for teacher scoring only. "
+            "This supports teacher-specific response prefixes such as Qwen3's empty non-thinking block."
+        ),
     )
     parser.add_argument(
         "--opd-teacher-prompt-key",
@@ -711,6 +761,15 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
         raise ValueError("--opd-teacher-timeout-s must be > 0.")
     if args.opd_log_prob_top_k < 0:
         raise ValueError("--opd-log-prob-top-k must be >= 0.")
+    student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
+    teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
+    if (student_eos_token_id is None) != (teacher_eos_token_id is None):
+        raise ValueError("--opd-student-eos-token-id and --opd-teacher-eos-token-id must be set together.")
+    if student_eos_token_id is not None and (student_eos_token_id < 0 or teacher_eos_token_id < 0):
+        raise ValueError("OPD EOS token ids must be >= 0.")
+    teacher_response_prefix_token_ids = getattr(args, "opd_teacher_response_prefix_token_ids", None) or ()
+    if any(token_id < 0 for token_id in teacher_response_prefix_token_ids):
+        raise ValueError("OPD teacher response prefix token ids must be >= 0.")
     token_selection = args.opd_token_selection
     if token_selection != "student_sampled":
         if args.opd_log_prob_top_k <= 0:
@@ -727,11 +786,26 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
     opd_kl_coef = float(getattr(args, "opd_kl_coef", 0.0) or 0.0)
     opd_loss_coef = float(getattr(args, "opd_loss_coef", 0.0) or 0.0)
 
+    is_eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
     is_adv_mode = opd_kl_coef != 0.0 and opd_loss_coef == 0.0
     is_loss_mode = opd_kl_coef == 0.0 and opd_loss_coef != 0.0
-    if not is_adv_mode and not is_loss_mode:
+    if is_eopd:
+        if opd_kl_coef == 0.0 or opd_loss_coef == 0.0:
+            raise ValueError(
+                "--opd-fkl-entropy-gate (EOPD) requires both --opd-kl-coef != 0 "
+                "(sampled-token reverse-KL advantage) and --opd-loss-coef != 0 "
+                "(entropy-gated forward-KL loss). "
+                f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}."
+            )
+        if getattr(args, "opd_token_selection", None) not in ("teacher_topk", "union"):
+            raise ValueError(
+                "--opd-fkl-entropy-gate requires --opd-token-selection "
+                f"teacher_topk or union, got {getattr(args, 'opd_token_selection', None)}."
+            )
+    elif not is_adv_mode and not is_loss_mode:
         raise ValueError(
-            "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero. "
+            "Exactly one of --opd-kl-coef / --opd-loss-coef must be non-zero "
+            "(unless --opd-fkl-entropy-gate is set). "
             f"Got opd_kl_coef={opd_kl_coef}, opd_loss_coef={opd_loss_coef}. "
             "Use --opd-kl-coef=X --opd-loss-coef=0.0 for advantage mode, or "
             "--opd-kl-coef=0.0 --opd-loss-coef=X for loss mode."
@@ -924,13 +998,17 @@ def _get_opd_transfer_schema(args: Namespace) -> list[str]:
 def consume_opd_train_data(data_fields: list[str], args: Namespace) -> None:
     if not (getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"):
         return
-    data_fields.extend(_get_opd_transfer_schema(args))
+    for _f in _get_opd_transfer_schema(args):
+        if _f not in data_fields:
+            data_fields.append(_f)
 
 
 def consume_opd_advantage_data(data_fields: list[str], args: Namespace) -> None:
     if not getattr(args, "use_opd", False):
         return
-    data_fields.extend(_get_opd_transfer_schema(args))
+    for _f in _get_opd_transfer_schema(args):
+        if _f not in data_fields:
+            data_fields.append(_f)
 
 
 def build_opd_teacher_sample_fields(
@@ -1295,6 +1373,10 @@ def apply_opd_to_advantages(
     token_selection = args.opd_token_selection
     is_topk = token_selection in ("student_topk", "teacher_topk", "union")
 
+    if bool(getattr(args, "opd_fkl_entropy_gate", False)):
+        # EOPD: advantages always use the sampled-token reverse-KL signal; the
+        # top-k tensors feed the entropy-gated forward-KL loss path instead.
+        is_topk = False
     if is_topk:
         student_topk_lp_list = rollout_data.get("opd_topk_student_log_probs")
         teacher_topk_lp_list = rollout_data.get("opd_topk_teacher_log_probs")
@@ -1405,6 +1487,11 @@ def compute_policy_opd_loss(
         k_lengths_list = batch.get("opd_topk_ksz") if token_selection == "union" else None
         device = log_probs.device
         per_token_kl_chunks: list[torch.Tensor] = []
+        _eopd = bool(getattr(args, "opd_fkl_entropy_gate", False))
+        _eopd_tau = float(getattr(args, "opd_fkl_entropy_threshold", 0.8))
+        _eopd_gate_sum = 0.0
+        _eopd_tok_cnt = 0.0
+        _eopd_ent_sum = 0.0
         for i, s_lp_2d in enumerate(student_topk_lp_list):
             t_lp_2d = teacher_topk_lp_list[i].to(device=device).detach()
             s_lp_2d = s_lp_2d.to(device=device)
@@ -1415,17 +1502,29 @@ def compute_policy_opd_loss(
                     kl = kl.to(device=device)
                     max_kp = t_lp_2d.size(-1)
                     mask = torch.arange(max_kp, device=device).unsqueeze(0) < kl.unsqueeze(1)
-            per_token_kl_chunks.append(
-                compute_opd_kl_topk(
-                    s_lp_2d,
-                    t_lp_2d,
-                    kl_type=opd_kl_type,
-                    jsd_alpha=opd_jsd_alpha,
-                    norm_mode=opd_norm_mode,
-                    log_prob_min_clamp=opd_log_prob_min_clamp,
-                    mask=mask,
-                )
+            _chunk = compute_opd_kl_topk(
+                s_lp_2d,
+                t_lp_2d,
+                kl_type=("forward_kl" if _eopd else opd_kl_type),
+                jsd_alpha=opd_jsd_alpha,
+                norm_mode=opd_norm_mode,
+                log_prob_min_clamp=opd_log_prob_min_clamp,
+                mask=mask,
             )
+            if _eopd:
+                # EOPD gate: teacher top-k entropy (renormalized within top-k)
+                _t = t_lp_2d.detach().float()
+                if mask is not None:
+                    _t = _t.masked_fill(~mask, float("-inf"))
+                _t = _t - torch.logsumexp(_t, dim=-1, keepdim=True)
+                _p = torch.exp(_t)
+                _ent = -torch.where(torch.isfinite(_t), _p * _t, torch.zeros_like(_t)).sum(dim=-1)
+                _gate = (_ent >= _eopd_tau).to(dtype=_chunk.dtype)
+                _chunk = _chunk * _gate
+                _eopd_gate_sum += float(_gate.sum().item())
+                _eopd_tok_cnt += float(_gate.numel())
+                _eopd_ent_sum += float(_ent.sum().item())
+            per_token_kl_chunks.append(_chunk)
         opd_per_token_kl = torch.cat(per_token_kl_chunks, dim=0).to(dtype=log_probs.dtype)
     else:
         if "teacher_log_probs" not in batch or batch["teacher_log_probs"] is None:
@@ -1443,6 +1542,9 @@ def compute_policy_opd_loss(
         ).to(dtype=log_probs.dtype)
 
     reported_loss: dict[str, torch.Tensor] = {}
+    if is_topk and bool(getattr(args, "opd_fkl_entropy_gate", False)) and _eopd_tok_cnt > 0:
+        reported_loss["opd_fkl_gate_frac"] = torch.tensor(_eopd_gate_sum / _eopd_tok_cnt)
+        reported_loss["opd_fkl_teacher_topk_entropy"] = torch.tensor(_eopd_ent_sum / _eopd_tok_cnt)
     per_token_clip = getattr(args, "opd_per_token_clip", None)
     if per_token_clip is not None:
         tau = float(per_token_clip)

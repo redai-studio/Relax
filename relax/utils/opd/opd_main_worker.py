@@ -35,13 +35,44 @@ class LogprobResponse:
             return np.array([], dtype=np.dtype(dtype))
         return np.frombuffer(pybase64.b64decode(b64_str), dtype=np.dtype(dtype))
 
+    def _decode_topk_legacy(self, prefix: str, response_length, top_k: int):
+        # Fallback for stock SGLang servers that return list-form top logprobs
+        # (e.g. "input_top_logprobs": [[(lp, id, txt), ...] or None, ...]) instead
+        # of the b64-packed relay fields.
+        legacy = self.meta.get(prefix)
+        if not legacy:
+            return None
+        rows_lp: list = []
+        rows_id: list = []
+        for entry in legacy:
+            if not entry:
+                continue
+            lp = [float(t[0]) for t in entry[:top_k]]
+            ids = [int(t[1]) for t in entry[:top_k]]
+            while len(lp) < top_k and lp:
+                lp.append(lp[-1])
+                ids.append(ids[-1])
+            if len(lp) == top_k:
+                rows_lp.append(lp)
+                rows_id.append(ids)
+        n = len(rows_lp)
+        if n <= 0:
+            return None
+        if response_length is None:
+            response_length = n
+        if response_length <= 0 or n < response_length:
+            return None
+        lps = np.asarray(rows_lp[-response_length:], dtype=np.float32)
+        ids_arr = np.asarray(rows_id[-response_length:], dtype=np.int32)
+        return ids_arr, lps
+
     def _decode_topk_2d(self, prefix: str, response_length: int | None, top_k: int):
         if top_k <= 0:
             return None
         val = self._b64_decode(self.meta.get(f"{prefix}_val_b64"), "float32")
         n = val.size // top_k
         if n <= 0:
-            return None
+            return self._decode_topk_legacy(prefix, response_length, top_k)
         if response_length is None:
             response_length = n
         if response_length <= 0 or n < response_length:
@@ -127,7 +158,7 @@ class TopkWorker:
         return cls(
             args.opd_token_selection,
             args.opd_log_prob_top_k,
-            opd_kl_coef=args.opd_kl_coef,
+            opd_kl_coef=(0.0 if bool(getattr(args, "opd_fkl_entropy_gate", False)) else args.opd_kl_coef),
             opd_loss_coef=args.opd_loss_coef,
         )
 
