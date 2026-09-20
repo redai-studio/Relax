@@ -1,27 +1,42 @@
+import ast
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
-from relax.utils.data.stream_dataloader import _replay_values_and_offsets
 from relax.utils.training.data_fields import build_data_fields
 from relax.utils.types import Sample
 
 
-def test_replay_values_and_offsets_accepts_dense_equal_length_batch():
+@pytest.fixture
+def replay_values_and_offsets():
+    # Exercise the real tensor helper without loading the distributed runtime.
+    source = Path(__file__).resolve().parents[3] / "relax/utils/data/stream_dataloader.py"
+    tree = ast.parse(source.read_text())
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_replay_values_and_offsets"
+    )
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["_replay_values_and_offsets"]
+
+
+def test_replay_values_and_offsets_accepts_dense_equal_length_batch(replay_values_and_offsets):
     field_data = torch.arange(2 * 3 * 4, dtype=torch.int32).reshape(2, 3, 4)
 
-    values, offsets = _replay_values_and_offsets(field_data, "rollout_indexer_topk")
+    values, offsets = replay_values_and_offsets(field_data, "rollout_indexer_topk")
 
     assert torch.equal(values, field_data.reshape(6, 4))
     assert torch.equal(offsets, torch.tensor([0, 3, 6]))
 
 
-def test_replay_values_and_offsets_accepts_jagged_batch():
+def test_replay_values_and_offsets_accepts_jagged_batch(replay_values_and_offsets):
     samples = [torch.ones(2, 4, dtype=torch.int32), torch.full((3, 4), 2, dtype=torch.int32)]
     field_data = torch.nested.as_nested_tensor(samples, layout=torch.jagged)
 
-    values, offsets = _replay_values_and_offsets(field_data, "rollout_indexer_topk")
+    values, offsets = replay_values_and_offsets(field_data, "rollout_indexer_topk")
 
     assert values.shape == (5, 4)
     assert torch.equal(offsets, torch.tensor([0, 2, 5]))

@@ -598,8 +598,9 @@ def get_batch(
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
-            pad_between_seqs=pad != 0 if allgather_cp else None,
         )
+        # TODO: Pass pad_between_seqs to the constructor once the NPU Megatron pin supports it.
+        packed_seq_params.pad_between_seqs = pad != 0 if allgather_cp else None
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
