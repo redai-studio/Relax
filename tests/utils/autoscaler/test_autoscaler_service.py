@@ -4,11 +4,14 @@
 
 import asyncio
 import json
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from relax.utils.autoscaler.autoscaler_service import AutoscalerService, AutoscalerState
 from relax.utils.autoscaler.config import AutoscalerConfig
 from relax.utils.autoscaler.metrics_collector import AggregatedMetrics
-from relax.utils.autoscaler.scaling_decision import ScalingAction, ScalingDecision
+from relax.utils.autoscaler.scaling_decision import ScalingAction, ScalingDecision, ScalingDecisionEngine
 
 
 # Underlying class behind the @serve.deployment decorator.
@@ -55,7 +58,258 @@ def _service(session=None) -> "_ServiceCls":
 
 
 def _engines_payload(engines):
-    return {"models": {"default": {"engine_groups": [{"engines": engines}]}}}
+    return {
+        "models": {"default": {"engine_groups": [{"engines": engines}]}},
+        "observation": {"complete": True, "issues": []},
+    }
+
+
+@pytest.mark.parametrize("action", [ScalingAction.SCALE_OUT, ScalingAction.SCALE_IN])
+def test_evaluate_incomplete_discovery_pauses_new_scaling(action):
+    # Six visible, busy engines must not disguise two missing instances as 6/6 coverage.
+    payload = _engines_payload(
+        [{"rank": i, "url": f"http://e{i}", "status": "active"} for i in range(6)]
+        + [{"rank": i, "status": "active"} for i in range(6, 8)]
+    )
+    payload["observation"] = {
+        "complete": False,
+        "issues": [{"scope": "default/0/6", "reason": "init_pending"}],
+    }
+    svc = _service(_FakeSession(get_payload=payload))
+    svc._state.pending_requests = [{"request_id": "old", "action": "scale_out", "status": "ACTIVE"}]
+    svc.metrics_collector = Mock()
+    svc.metrics_collector.collect_all = AsyncMock(return_value={})
+    svc.metrics_collector.get_aggregated_metrics.return_value = AggregatedMetrics(
+        num_engines=6, avg_token_usage=0.9, coverage=1.0, is_empty=False
+    )
+    svc.decision_engine = Mock()
+    svc.decision_engine.evaluate.return_value = ScalingDecision(action=action, delta=1)
+    svc._execute_scale_out = AsyncMock()
+    svc._execute_scale_in = AsyncMock()
+
+    asyncio.run(svc._evaluate_and_scale())
+
+    assert not svc._state.pending_requests  # Reconciliation still runs before discovery.
+    assert svc._state.total_scale_operations == 1
+    svc.metrics_collector.collect_all.assert_not_awaited()
+    svc.metrics_collector.add_snapshot.assert_not_called()
+    svc.decision_engine.evaluate.assert_not_called()
+    svc.decision_engine.reset_condition_trackers.assert_called_once()
+    svc._execute_scale_out.assert_not_awaited()
+    svc._execute_scale_in.assert_not_awaited()
+    assert svc._state.last_decision.action == ScalingAction.NONE
+    assert svc._state.last_decision.confidence == 0
+    assert "init_pending" in svc._state.last_decision.reason
+
+
+@pytest.mark.parametrize("history", [[], [{"coverage": 1.0}]])
+def test_status_incomplete_discovery_hides_stale_metrics(history):
+    payload = _engines_payload([{"rank": 0, "url": "http://e0", "status": "active"}])
+    payload["observation"] = {
+        "complete": False,
+        "issues": [{"scope": "default/0/1", "reason": "actor_dead_unreconciled"}],
+    }
+    svc = _service(_FakeSession(get_payload=payload))
+    svc.metrics_collector = Mock()
+    svc.metrics_collector.get_history.return_value = history
+    svc.metrics_collector.collect_all = AsyncMock(return_value={})
+    svc.metrics_collector.get_aggregated_metrics.return_value = AggregatedMetrics(coverage=1.0)
+
+    status = asyncio.run(svc.get_autoscaler_status())
+
+    assert status.current_engines == 1  # Visible count, explicitly marked incomplete.
+    assert status.engine_observation == payload["observation"]
+    assert status.recent_metrics is None
+    svc.metrics_collector.collect_all.assert_not_awaited()
+    svc.metrics_collector.add_snapshot.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        None,
+        {},
+        {"complete": "false", "issues": []},
+        {"complete": 1, "issues": []},
+        {"complete": True, "issues": {}},
+        {"complete": True, "issues": [{"scope": "x", "reason": "init_pending"}]},
+        {"complete": False, "issues": []},
+        {"complete": False, "issues": [{"scope": "x"}]},
+        {"complete": False, "issues": [{"scope": 1, "reason": "bad"}]},
+        {"complete": False, "issues": [{"scope": "x", "reason": "bad", "extra": "x"}]},
+    ],
+)
+def test_fetch_engines_rejects_invalid_observation(observation):
+    payload = _engines_payload([{"rank": 0, "url": "http://e0", "status": "active"}])
+    payload["observation"] = observation
+    svc = _service(_FakeSession(get_payload=payload))
+
+    _, observed = asyncio.run(svc._fetch_engines())
+
+    assert observed == {
+        "complete": False,
+        "issues": [{"scope": "response", "reason": "observation_protocol_invalid"}],
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        [],
+        {},
+        {"models": []},
+        {"models": {"default": None}},
+        {"models": {"default": {}}},
+        {"models": {"default": {"engine_groups": {}}}},
+        {"models": {"default": {"engine_groups": [None]}}},
+        {"models": {"default": {"engine_groups": [{}]}}},
+        {"models": {"default": {"engine_groups": [{"engines": {}}]}}},
+        {"models": {"default": {"engine_groups": [{"engines": [None]}]}}},
+    ],
+)
+def test_fetch_engines_rejects_invalid_containers(body):
+    if isinstance(body, dict):
+        body["observation"] = {"complete": True, "issues": []}
+    svc = _service(_FakeSession(get_payload=body))
+
+    _, observed = asyncio.run(svc._fetch_engines())
+
+    assert observed["complete"] is False
+    assert observed["issues"][0]["reason"] == "observation_protocol_invalid"
+
+
+def test_fetch_engines_old_producer_pauses_until_upgraded():
+    payload = _engines_payload([{"rank": 0, "url": "http://e0", "status": "active"}])
+    payload.pop("observation", None)
+    svc = _service(_FakeSession(get_payload=payload))
+
+    engines, observed = asyncio.run(svc._fetch_engines())
+
+    assert len(engines) == 1
+    assert observed == {
+        "complete": False,
+        "issues": [{"scope": "response", "reason": "observation_protocol_missing"}],
+    }
+
+
+@pytest.mark.parametrize("session", [None, _FakeSession(get_status=503)])
+def test_fetch_engines_transport_error_is_incomplete(session):
+    engines, observed = asyncio.run(_service(session)._fetch_engines())
+
+    assert engines == []
+    assert observed == {
+        "complete": False,
+        "issues": [{"scope": "response", "reason": "discovery_error"}],
+    }
+
+
+@pytest.mark.parametrize("error", [TimeoutError("request timed out"), ValueError("invalid JSON")])
+def test_fetch_engines_exception_is_incomplete(error):
+    session = Mock()
+    response = _FakeResp(200, {})
+    response.json = AsyncMock(side_effect=error)
+    session.get.return_value = response
+
+    engines, observed = asyncio.run(_service(session)._fetch_engines())
+
+    assert engines == []
+    assert observed["complete"] is False
+    assert observed["issues"][0]["reason"] == "discovery_error"
+
+
+def test_evaluate_dead_slot_pauses_and_recovery_restarts_debounce():
+    # Initial + [DEAD, A, B, C]: visible=4 but backend counts 5 non-None handles.
+    rows = [{"rank": i, "url": f"http://e{i}", "status": "active"} for i in (0, 2, 3, 4)]
+    dead = {"rank": 1, "status": "dead", "actor_state": "ABSENT"}
+    payload = _engines_payload(rows + [dead])
+    payload["observation"] = {"complete": True, "issues": []}
+    session = _FakeSession(get_payload=payload)
+    svc = _service(session)
+    svc.config.min_engines = 1
+    svc.config.scale_in_policy.condition_duration_secs = 10
+    now = [0.0]
+    svc.decision_engine = ScalingDecisionEngine(svc.config, clock=lambda: now[0])
+    svc.metrics_collector = Mock()
+    svc.metrics_collector.collect_all = AsyncMock(return_value={})
+    svc.metrics_collector.get_aggregated_metrics.return_value = AggregatedMetrics(
+        num_engines=4, avg_token_usage=0.0, coverage=1.0, is_empty=False
+    )
+    svc._execute_scale_out = AsyncMock()
+    svc._execute_scale_in = AsyncMock()
+
+    # Seed an earlier valid streak; an incomplete cycle must break it.
+    asyncio.run(svc._evaluate_and_scale())
+    dead.update(status="active", actor_state="DEAD")
+    payload["observation"] = {
+        "complete": False,
+        "issues": [{"scope": "default/0/1", "reason": "actor_dead_unreconciled"}],
+    }
+    now[0] = 10.0
+    asyncio.run(svc._evaluate_and_scale())
+    svc._execute_scale_in.assert_not_awaited()
+    svc._execute_scale_out.assert_not_awaited()
+    assert "actor_dead_unreconciled" in svc._state.last_decision.reason
+
+    # Original cleanup has now made D -> None; counts agree, but debounce starts anew.
+    dead.update(status="dead", actor_state="ABSENT")
+    payload["observation"] = {"complete": True, "issues": []}
+    now[0] = 11.0
+    asyncio.run(svc._evaluate_and_scale())
+    svc._execute_scale_in.assert_not_awaited()
+    now[0] = 21.0
+    asyncio.run(svc._evaluate_and_scale())
+    svc._execute_scale_in.assert_awaited_once()
+    assert svc._execute_scale_in.call_args.args[1] == 4
+
+
+@pytest.mark.parametrize("evaluation_complete", [True, False])
+def test_evaluate_status_interleaving_keeps_per_call_observation(evaluation_complete):
+    async def run():
+        first = _engines_payload([{"rank": 0, "url": "http://e0", "status": "active"}])
+        first["observation"] = {
+            "complete": evaluation_complete,
+            "issues": [] if evaluation_complete else [{"scope": "default/0/1", "reason": "init_pending"}],
+        }
+        second = _engines_payload([{"rank": 0, "url": "http://e0", "status": "active"}])
+        second["observation"] = {
+            "complete": not evaluation_complete,
+            "issues": [{"scope": "default/0/1", "reason": "init_pending"}] if evaluation_complete else [],
+        }
+        session = _FakeSession(get_payload=first)
+        svc = _service(session)
+        svc.metrics_collector = Mock()
+        svc.metrics_collector.get_history.return_value = [{"coverage": 1.0}]
+        svc.metrics_collector.collect_all = AsyncMock(return_value={})
+        svc.metrics_collector.get_aggregated_metrics.return_value = AggregatedMetrics(coverage=1.0)
+        svc.decision_engine = Mock()
+        svc.decision_engine.evaluate.return_value = ScalingDecision(action=ScalingAction.NONE)
+        fetched, resume = asyncio.Event(), asyncio.Event()
+        original_fetch = svc._fetch_engines
+        calls = 0
+
+        async def interleaved_fetch():
+            nonlocal calls
+            calls += 1
+            result = await original_fetch()
+            if calls == 1:
+                fetched.set()
+                await resume.wait()
+            return result
+
+        svc._fetch_engines = interleaved_fetch
+        evaluation = asyncio.create_task(svc._evaluate_and_scale())
+        await asyncio.wait_for(fetched.wait(), timeout=2)
+        session._get_payload = second
+        status = await svc.get_autoscaler_status()
+        resume.set()
+        await asyncio.wait_for(evaluation, timeout=2)
+
+        assert status.engine_observation["complete"] is not evaluation_complete
+        assert svc.decision_engine.evaluate.call_count == int(evaluation_complete)
+        assert svc.decision_engine.reset_condition_trackers.call_count == int(not evaluation_complete)
+
+    asyncio.run(run())
 
 
 def test_fetch_engines_filters_dead_slots():
@@ -67,7 +321,8 @@ def test_fetch_engines_filters_dead_slots():
         ]
     )
     svc = _service(_FakeSession(get_payload=payload))
-    engines = asyncio.run(svc._fetch_engines())
+    engines, observation = asyncio.run(svc._fetch_engines())
+    assert observation == {"complete": True, "issues": []}
     ids = {e["id"] for e in engines}
     assert ids == {"engine_0", "engine_2"}
     assert all(e["status"] == "active" for e in engines)
@@ -81,7 +336,8 @@ def test_fetch_engines_all_dead_returns_empty():
         ]
     )
     svc = _service(_FakeSession(get_payload=payload))
-    engines = asyncio.run(svc._fetch_engines())
+    engines, observation = asyncio.run(svc._fetch_engines())
+    assert observation == {"complete": True, "issues": []}
     assert engines == []
 
 
@@ -94,7 +350,8 @@ def test_fetch_engines_skips_active_without_url():
         ]
     )
     svc = _service(_FakeSession(get_payload=payload))
-    engines = asyncio.run(svc._fetch_engines())
+    engines, observation = asyncio.run(svc._fetch_engines())
+    assert observation == {"complete": True, "issues": []}
     assert [e["id"] for e in engines] == ["engine_1"]
 
 
@@ -111,7 +368,8 @@ def test_fetch_engines_multinode_counts_logical_engines_only():
         ]
     )
     svc = _service(_FakeSession(get_payload=payload))
-    engines = asyncio.run(svc._fetch_engines())
+    engines, observation = asyncio.run(svc._fetch_engines())
+    assert observation == {"complete": True, "issues": []}
     assert [e["id"] for e in engines] == ["engine_0", "engine_2"]
     assert len(engines) == 2  # logical engines, NOT 4 physical node actors
 
@@ -121,7 +379,7 @@ def test_evaluate_reconciles_pending_when_no_engines():
     called = {"pending": False}
 
     async def _no_engines():
-        return []
+        return [], {"complete": True, "issues": []}
 
     async def _spy_pending():
         called["pending"] = True
@@ -148,7 +406,7 @@ def test_evaluate_resets_debounce_when_no_engines():
     called = {"reset": False}
 
     async def _no_engines():
-        return []
+        return [], {"complete": True, "issues": []}
 
     async def _noop_pending():
         return None
@@ -429,7 +687,7 @@ def test_evaluate_binds_coverage_denominator_to_current_engines():
     collector = _RecordingCollector()
 
     async def _engines():
-        return engines
+        return engines, {"complete": True, "issues": []}
 
     async def _noop_pending():
         return None
@@ -456,7 +714,7 @@ def test_status_binds_coverage_denominator_to_current_engines():
     collector = _RecordingCollector()
 
     async def _engines():
-        return engines
+        return engines, {"complete": True, "issues": []}
 
     svc._fetch_engines = _engines
     svc.metrics_collector = collector
