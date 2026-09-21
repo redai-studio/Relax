@@ -9,7 +9,6 @@ import copy
 import ctypes
 import hashlib
 import json
-import threading
 import time
 from argparse import Namespace
 from collections import deque
@@ -96,13 +95,6 @@ _AGENTIC_SHARD_ALLOCATOR_ENV = {
 # value can starve long-lived chat/progress RPCs, while an unnecessarily large
 # value permits more live Python coroutines and memory pressure.
 _AGENTIC_SHARD_MAX_CONCURRENCY = 4096
-# Ray concurrency-group width for permit-acquire RPCs. Excess acquires queue;
-# the actual fleet generation capacity comes from sglang_server_concurrency.
-_SGLANG_PERMIT_CONCURRENCY = 1024
-# Separate control lane for permit release and lifecycle RPCs. Keeping it
-# independent prevents queued acquires from blocking cleanup; undersizing it
-# delays capacity return and can stall the fleet.
-_SGLANG_PERMIT_CONTROL_CONCURRENCY = 128
 _SESSION_CLOSE_TIMEOUT_S = 2.0
 _ADMISSION_SHUTDOWN_TIMEOUT_S = 5.0
 
@@ -1454,22 +1446,14 @@ class _SessionRecord:
         )
 
 
-@ray.remote(
-    max_concurrency=_AGENTIC_SHARD_MAX_CONCURRENCY,
-    concurrency_groups={
-        "sglang_request_permit": _SGLANG_PERMIT_CONCURRENCY,
-        "sglang_request_control": _SGLANG_PERMIT_CONTROL_CONCURRENCY,
-    },
-)
+@ray.remote(max_concurrency=_AGENTIC_SHARD_MAX_CONCURRENCY)
 class AgenticSessionShard:
     """Group-affine owner of every live Session, IR, process, and barrier."""
 
     def __init__(
         self,
         args: Namespace,
-        sglang_request_capacity: Optional[int],
-        sglang_request_limiter: Optional[Any],
-        admission_coordinator: Optional[Any],
+        admission_coordinator: Any,
     ) -> None:
         self.args = args
         self._groups: Dict[str, ResidentGroup] = {}
@@ -1479,13 +1463,8 @@ class AgenticSessionShard:
         self._train_generation_open = False
         self._state_revision = 0
         self._state_changed = asyncio.Event()
-        self._sglang_request_semaphore = (
-            threading.BoundedSemaphore(sglang_request_capacity) if sglang_request_capacity is not None else None
-        )
-        self._sglang_request_limiter = sglang_request_limiter
-        self._admission_client = (
-            RayAdmissionClient(admission_coordinator) if admission_coordinator is not None else None
-        )
+        self._sglang_request_limiter = admission_coordinator
+        self._admission_client = RayAdmissionClient(admission_coordinator) if args.agentic_program_admission else None
         self._permit_cleanup_tasks: set["asyncio.Task[None]"] = set()
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
@@ -1494,21 +1473,6 @@ class AgenticSessionShard:
             load_agent_app_spec_from_args(args),
             resolve_chat_api_base_url(),
         )
-
-    @ray.method(concurrency_group="sglang_request_permit")
-    async def acquire_sglang_request_permit(self) -> None:
-        """Queue one backend attempt on the fleet-global limit."""
-
-        semaphore = cast(threading.BoundedSemaphore, self._sglang_request_semaphore)
-        while not semaphore.acquire(blocking=False):
-            await asyncio.sleep(0.01)
-
-    @ray.method(concurrency_group="sglang_request_control")
-    async def release_sglang_request_permit(self) -> None:
-        """Return one backend-attempt permit to the fleet."""
-
-        semaphore = cast(threading.BoundedSemaphore, self._sglang_request_semaphore)
-        semaphore.release()
 
     def _notify_state_change(self, group: Optional[ResidentGroup] = None) -> None:
         """Advance the Shard event cursor after owned refs change."""
@@ -1913,7 +1877,6 @@ class AgenticSessionShard:
 
         await finish_before_cancellation(self._shutdown(), "session-shard-shutdown")
 
-    @ray.method(concurrency_group="sglang_request_control")
     async def trim_memory(self) -> Dict[str, Any]:
         """Run allocator maintenance outside Session control flow."""
 
@@ -1935,7 +1898,6 @@ class AgenticSessionShard:
             "active_requests": active_requests,
         }
 
-    @ray.method(concurrency_group="sglang_request_control")
     async def health(self) -> dict[str, Any]:
         """Project liveness from the Shard's current Session refs."""
 
@@ -1950,7 +1912,6 @@ class AgenticSessionShard:
             "ir_queue": {"queued": sum(len(session.queued_irs) for session in sessions)},
         }
 
-    @ray.method(concurrency_group="sglang_request_control")
     async def debug_state(self, *, sample_limit: int = 8) -> dict[str, Any]:
         """Project actor-local refs into a debug dictionary."""
 
@@ -1970,7 +1931,6 @@ class AgenticSessionShard:
             "permit_cleanup_task_count": len(self._permit_cleanup_tasks),
         }
 
-    @ray.method(concurrency_group="sglang_request_control")
     async def agentic_kv_metrics(self, reset: bool = False) -> dict[str, float]:
         if not self.args.agentic_session_lifecycle:
             return {}
@@ -2313,49 +2273,28 @@ class AgenticSessionShard:
         ir.waiter.set_exception(error)
         self._dispatch_queued_irs_locked(session)
 
-    async def _acquire_sglang_request_permit(self) -> None:
-        """Acquire the fleet-global permit before backend entry."""
-
+    async def _cancel_sglang_request_permit(self, permit_id: str) -> None:
         try:
-            if self._sglang_request_semaphore is not None:
-                await self.acquire_sglang_request_permit()
-                return
-
-            acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote()
-            try:
-                await asyncio.shield(acquire_ref)
-            except asyncio.CancelledError:
-                cleanup_task = asyncio.create_task(
-                    self._release_sglang_request_permit_after_cancel(acquire_ref),
-                    name="sglang-permit-cancel",
-                )
-                self._permit_cleanup_tasks.add(cleanup_task)
-                cleanup_task.add_done_callback(self._discard_successful_permit_cleanup)
-                raise
-        except Exception as error:
-            raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
-
-    async def _release_sglang_request_permit(self) -> None:
-        """Return one acquired permit before forwarding cancellation."""
-
-        try:
-            release = (
-                self.release_sglang_request_permit()
-                if self._sglang_request_semaphore is not None
-                else self._sglang_request_limiter.release_sglang_request_permit.remote()
+            await finish_before_cancellation(
+                self._sglang_request_limiter.cancel_request_permit.remote(permit_id),
+                "sglang-permit-cancel",
             )
-            await finish_before_cancellation(release, "sglang-permit-release")
         except Exception as error:
-            raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
+            raise RuntimeGroupError(f"SGLang permit cancellation failed: {type(error).__name__}: {error}") from error
 
-    async def _release_sglang_request_permit_after_cancel(self, acquire_ref: Any) -> None:
-        """Return a remote permit acquired after runner cancellation."""
+    async def _release_sglang_request_permit_after_cancel(self, acquire_ref: Any, permit_id: str) -> None:
+        """Release a remote permit acquired after runner cancellation."""
 
         try:
-            await acquire_ref
+            acquired = await acquire_ref
         except Exception as error:
+            await self._cancel_sglang_request_permit(permit_id)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
-        await self._release_sglang_request_permit()
+        if acquired:
+            await finish_before_cancellation(
+                self._sglang_request_limiter.release_request_permit.remote(permit_id),
+                "sglang-permit-release-after-cancel",
+            )
 
     def _discard_successful_permit_cleanup(self, task: "asyncio.Task[None]") -> None:
         """Release successful compensation refs; retain failures."""
@@ -2401,11 +2340,33 @@ class AgenticSessionShard:
     async def _sglang_request_permit(self):
         """Hold one fleet request permit around backend execution."""
 
-        await self._acquire_sglang_request_permit()
+        permit_id = uuid4().hex
+        acquire_ref = self._sglang_request_limiter.acquire_request_permit.remote(permit_id)
+        try:
+            acquired = await asyncio.shield(acquire_ref)
+        except asyncio.CancelledError:
+            cleanup_task = asyncio.create_task(
+                self._release_sglang_request_permit_after_cancel(acquire_ref, permit_id),
+                name="sglang-permit-cancel",
+            )
+            self._permit_cleanup_tasks.add(cleanup_task)
+            cleanup_task.add_done_callback(self._discard_successful_permit_cleanup)
+            raise
+        except Exception as error:
+            await self._cancel_sglang_request_permit(permit_id)
+            raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
+        if not acquired:
+            raise RuntimeGroupError("SGLang permit acquire was cancelled")
         try:
             yield
         finally:
-            await self._release_sglang_request_permit()
+            try:
+                await finish_before_cancellation(
+                    self._sglang_request_limiter.release_request_permit.remote(permit_id),
+                    "sglang-permit-release",
+                )
+            except Exception as error:
+                raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
 
     async def _run_ir(
         self,
@@ -2999,7 +2960,7 @@ class AgenticSessionShard:
 
 def create_agentic_session_shards(
     config: Namespace,
-    admission_coordinator: Optional[Any],
+    admission_coordinator: Any,
 ) -> Tuple[Tuple[str, Any], ...]:
     """Create the named Shard fleet for one Serve deployment.
 
@@ -3007,9 +2968,6 @@ def create_agentic_session_shards(
     lived Session records and agent processes.
     """
 
-    sglang_request_capacity = (
-        config.sglang_server_concurrency * config.rollout_num_gpus // config.rollout_num_gpus_per_engine
-    )
     shard_entries: list[tuple[str, Any]] = []
     try:
         for placement in range(_DEFAULT_SESSION_SHARD_COUNT):
@@ -3023,8 +2981,6 @@ def create_agentic_session_shards(
                 runtime_env={"env_vars": dict(_AGENTIC_SHARD_ALLOCATOR_ENV)},
             ).remote(
                 config,
-                sglang_request_capacity if placement == 0 else None,
-                shard_entries[0][1] if placement > 0 else None,
                 admission_coordinator,
             )
             shard_entries.append((actor_name, shard))
@@ -3296,9 +3252,8 @@ def deploy_agentic_chat_api_services(
     shard_entries: Tuple[Tuple[str, Any], ...] = ()
     admission_coordinator = None
     try:
-        if config.agentic_program_admission:
-            admission_coordinator = AdmissionCoordinator.options(num_cpus=0, max_restarts=0).remote(config)
-            ray.get(admission_coordinator.start.remote())
+        admission_coordinator = AdmissionCoordinator.options(num_cpus=0, max_restarts=0).remote(config)
+        ray.get(admission_coordinator.start.remote())
         shard_entries = create_agentic_session_shards(
             config=config,
             admission_coordinator=admission_coordinator,
