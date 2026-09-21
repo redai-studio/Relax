@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -33,11 +32,15 @@ from app.prompt import (
 from app.sandboxes.base import BaseSandboxSession, SandboxCapability
 from app.sandboxes.exceptions import SandboxError
 from app.sandboxes.executor import SandboxExecutor
+from app.search_config import NonEmptyString, PositiveInt, StrictConfig
 from app.search_utils import image_search, search
 from PIL import Image, UnidentifiedImageError
+from pydantic import ValidationError
+
+from relax.utils.logging_utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tag patterns (single-source-of-truth, also covered by test_env_extractors.py)
@@ -61,6 +64,11 @@ class ToolObs:
     images: list[Image.Image] = field(default_factory=list)
     done: bool = False
     error: Optional[str] = None
+
+
+class _SearchToolArguments(StrictConfig):
+    query: NonEmptyString
+    size: PositiveInt | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +288,21 @@ class DeepEyesV2Env:
             )
         try:
             result = await asyncio.to_thread(self._dispatch_search, name, args)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[deepeyes-v2] {self.data_index} search failed: {exc}")
+        except ValidationError:
             return ToolObs(
-                body_text=f"Error: {exc} for {self.data_index}",
+                body_text=(
+                    "Error: search arguments must be a non-empty query string or an object with 'query' "
+                    "and optional 'size' (a positive integer or null)."
+                ),
                 done=False,
-                error=str(exc),
+                error="invalid_search_args",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[deepeyes-v2] search failed reason=%s", type(exc).__name__)
+            return ToolObs(
+                body_text="Error: search failed; continue reasoning or answer directly.",
+                done=False,
+                error="search_failed",
             )
         if not result or result.get("status") != "success":
             return ToolObs(
@@ -444,8 +461,10 @@ class DeepEyesV2Env:
                 }
 
         # tool_name == "search"
-        query = tool_args["query"] if isinstance(tool_args, dict) and "query" in tool_args else str(tool_args)
-        result = search(query)
+        values = {"query": tool_args} if isinstance(tool_args, str) else tool_args
+        arguments = _SearchToolArguments.model_validate(values)
+        query = arguments.query
+        result = search(query, size=arguments.size)
         if result == "Error":
             return {"status": "error", "result": "Error", "images": []}
         snippets: list[str] = []
@@ -457,10 +476,10 @@ class DeepEyesV2Env:
                 snippet = ""
                 if page.get("snippet") is not None:
                     snippet = "\n" + page["snippet"]
-                snippets.append(f"{idx + 1}. [{page['title']}]({page['link']}){date_published}{snippet}")
-            content = (
-                f"A Google search for '{query}' found {len(snippets)} results:"
-                f"\n\n## Web Results\n" + "\n\n".join(snippets)
+                title = f"[{page['title']}]({page['link']})" if page["link"] else page["title"]
+                snippets.append(f"{idx + 1}. {title}{date_published}{snippet}")
+            content = f"A text search for '{query}' found {len(snippets)} results:\n\n## Web Results\n" + "\n\n".join(
+                snippets
             )
         except (KeyError, TypeError) as exc:
             return {
