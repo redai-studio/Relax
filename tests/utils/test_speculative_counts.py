@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from relax.utils.speculative import SPEC_TOKEN_COUNT_KEYS, SpeculativeCounts
+from relax.utils.speculative import SPEC_TOKEN_COUNT_KEYS, SpeculativeCounts, SpeculativeGeneration
 from relax.utils.types import Sample, get_spec_token_counts
 
 
@@ -53,6 +53,7 @@ def test_speculative_counts_sample_serialization_and_legacy() -> None:
 def test_speculative_counts_legacy_resume_cannot_recover_availability() -> None:
     legacy = Sample.from_dict({"status": "completed", "spec_info": {"spec_draft_token_num": 0}})
     legacy.spec_info.add({"spec_accepted_drafts": 9, "spec_proposed_drafts": 10})
+    assert legacy.spec_info.legacy_counts_availability is None
     assert legacy.spec_info.counts is None
     assert legacy.spec_info.legacy_counts
     restored = Sample.from_dict(legacy.to_dict())
@@ -92,3 +93,80 @@ def test_speculative_counts_legacy_null_counters_remain_unavailable() -> None:
     assert sample.spec_info.counts is None
     sample.spec_info.add({"spec_accepted_drafts": 1, "spec_proposed_drafts": 2})
     assert sample.spec_info.counts is None
+
+
+def test_speculative_counts_sample_generation_serialization_is_isolated() -> None:
+    sample = Sample(
+        session_id="session",
+        spec_generations=[
+            SpeculativeGeneration(
+                "session",
+                "request",
+                "state",
+                SpeculativeCounts(1, 2, 1, 2),
+            ).to_dict()
+        ],
+    )
+
+    payload = sample.to_dict()
+
+    assert "spec_generation" not in payload
+    assert payload["spec_generations"] == sample.spec_generations
+    assert payload["spec_generations"] is not sample.spec_generations
+
+    payload["spec_generations"][0]["counts"]["accepted"] = 999
+
+    assert sample.spec_generations[0]["counts"]["accepted"] == 1
+
+    restored = Sample.from_dict(sample.to_dict())
+
+    assert restored.spec_generations == sample.spec_generations
+    assert not hasattr(restored, "spec_generation")
+
+
+def test_speculative_counts_legacy_field_availability_survives_roundtrip() -> None:
+    sample = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": {
+                "spec_draft_token_num": 10,
+                "spec_verify_ct": 2,
+                "completion_token_num": None,
+            },
+        }
+    )
+
+    assert sample.spec_info.legacy_counts_availability == SpeculativeCounts(
+        None,
+        10,
+        2,
+        None,
+    )
+
+    restored = Sample.from_dict(sample.to_dict())
+
+    assert restored.spec_info.legacy_counts_availability == SpeculativeCounts(
+        None,
+        10,
+        2,
+        None,
+    )
+
+
+def test_speculative_counts_migrated_legacy_without_availability_stays_unknown() -> None:
+    sample = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": {
+                "spec_accept_token_num": 0,
+                "spec_draft_token_num": 10,
+                "spec_verify_ct": 0,
+                "completion_token_num": 0,
+                "counts": None,
+                "legacy_counts": True,
+            },
+        }
+    )
+
+    assert sample.spec_info.legacy_counts
+    assert sample.spec_info.legacy_counts_availability is None

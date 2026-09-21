@@ -256,6 +256,38 @@ async def test_agentic_speculative_metrics_request_normalizes_backend_values() -
 
 
 @pytest.mark.asyncio
+async def test_agentic_speculative_metrics_request_ignores_invalid_backend_counters() -> None:
+    shard, session, prompt = _session("invalid-counters")
+    request = _request(prompt, "invalid-values")
+    result = _attempt("a", SpeculativeCounts())
+
+    result.meta_info.update(
+        {
+            "spec_num_correct_drafts": "bad",
+            "spec_num_proposed_drafts": "10",
+            "spec_verify_ct": "bad",
+            "completion_tokens": -1,
+        }
+    )
+
+    shard._apply_generate_result(request, result)
+
+    assert request.pending_spec_counts == SpeculativeCounts(
+        None,
+        10,
+        None,
+        None,
+    )
+    assert request.pending_spec_delta["spec_accept_token_num"] == 0
+    assert request.pending_spec_delta["spec_draft_token_num"] == 10
+    assert request.pending_spec_delta["spec_verify_ct"] == 0
+    assert request.pending_spec_delta["completion_token_num"] == 0
+    assert session.forest.committed_generations == {}
+
+    request.waiter.cancel()
+
+
+@pytest.mark.asyncio
 async def test_agentic_speculative_metrics_resume_missing_attempt_and_uncommitted() -> None:
     shard, session, prompt = _session("resume")
     request = _request(prompt, "stable")

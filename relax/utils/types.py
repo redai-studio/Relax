@@ -103,6 +103,7 @@ class Sample:
 
         counts: SpeculativeCounts | None = None
         legacy_counts: bool = False
+        legacy_counts_availability: SpeculativeCounts | None = None
 
         @property
         def spec_accept_rate(self) -> float:
@@ -125,7 +126,9 @@ class Sample:
             ):
                 self.legacy_counts = True
 
-            if not self.legacy_counts:
+            if self.legacy_counts:
+                self.legacy_counts_availability = None
+            else:
                 self.counts = counts if self.counts is None else self.counts.plus(counts)
 
             spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
@@ -140,8 +143,11 @@ class Sample:
                 "spec_draft_token_num": self.spec_draft_token_num,
                 "spec_verify_ct": self.spec_verify_ct,
                 "completion_token_num": self.completion_token_num,
-                "counts": self.counts.to_dict() if self.counts is not None else None,
+                "counts": (self.counts.to_dict() if self.counts is not None else None),
                 "legacy_counts": self.legacy_counts,
+                "legacy_counts_availability": (
+                    self.legacy_counts_availability.to_dict() if self.legacy_counts_availability is not None else None
+                ),
             }
 
         @staticmethod
@@ -164,7 +170,21 @@ class Sample:
             if data.get("counts") is not None:
                 info.counts = SpeculativeCounts.from_dict(data["counts"])
 
-            info.legacy_counts = bool(data.get("legacy_counts", "counts" not in data))
+            original_legacy_payload = "counts" not in data
+            info.legacy_counts = bool(
+                data.get(
+                    "legacy_counts",
+                    original_legacy_payload,
+                )
+            )
+
+            if "legacy_counts_availability" in data:
+                availability = data.get("legacy_counts_availability")
+                if availability is not None:
+                    info.legacy_counts_availability = SpeculativeCounts.from_dict(availability)
+            elif original_legacy_payload:
+                info.legacy_counts_availability = legacy
+
             return info
 
     spec_info: SpecInfo = field(default_factory=SpecInfo)
@@ -203,7 +223,7 @@ class Sample:
         value = self.__dict__.copy()
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
-        value["spec_generation"] = copy.deepcopy(self.spec_generations)
+        value["spec_generations"] = copy.deepcopy(self.spec_generations)
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
         return value
 

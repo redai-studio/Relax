@@ -77,3 +77,131 @@ def test_speculative_logging_legacy_agentic_is_visible_without_global_flag() -> 
     metrics = compute_speculative_log_metrics([sample])
     assert metrics["spec/legacy_sample_count"] == 1
     assert "spec/accept_rate" not in metrics
+
+
+def test_speculative_logging_restores_legacy_ordinary_compatibility_metrics() -> None:
+    legacy = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": {
+                "spec_accept_token_num": 1,
+                "spec_draft_token_num": 2,
+                "spec_verify_ct": 2,
+                "completion_token_num": 6,
+            },
+        }
+    )
+
+    metrics = compute_speculative_log_metrics([legacy])
+
+    assert metrics["spec/legacy_sample_count"] == 1
+    assert metrics["spec_accept_rate"] == 0.5
+    assert metrics["spec_accept_length"] == 3
+    assert "spec/accept_rate" not in metrics
+    assert "spec/sample/accept_rate" not in metrics
+
+
+def test_speculative_logging_restores_legacy_zero_acceptance() -> None:
+    legacy = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": {
+                "spec_accept_token_num": 0,
+                "spec_draft_token_num": 2,
+            },
+        }
+    )
+
+    metrics = compute_speculative_log_metrics([legacy])
+
+    assert metrics["spec_accept_rate"] == 0
+    assert "spec_accept_length" not in metrics
+    assert "spec/accept_rate" not in metrics
+
+
+def test_speculative_logging_legacy_unknown_survives_roundtrip() -> None:
+    sample = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": {
+                "spec_draft_token_num": 10,
+            },
+        }
+    )
+    restored = Sample.from_dict(sample.to_dict())
+
+    metrics = compute_speculative_log_metrics([restored])
+
+    assert "spec_accept_rate" not in metrics
+
+
+def test_speculative_logging_does_not_restore_legacy_agentic_ratios() -> None:
+    legacy = Sample.from_dict(
+        {
+            "status": "completed",
+            "metadata": {
+                "agentic_trace": {},
+            },
+            "spec_info": {
+                "spec_accept_token_num": 9,
+                "spec_draft_token_num": 10,
+                "spec_verify_ct": 2,
+                "completion_token_num": 12,
+            },
+        }
+    )
+
+    metrics = compute_speculative_log_metrics([legacy])
+
+    assert metrics["spec/legacy_sample_count"] == 1
+    assert "spec_accept_rate" not in metrics
+    assert "spec_accept_length" not in metrics
+    assert "spec/accept_rate" not in metrics
+
+
+@pytest.mark.parametrize(
+    ("spec_info", "metric_key"),
+    [
+        (
+            {
+                "spec_draft_token_num": 10,
+            },
+            "spec_accept_rate",
+        ),
+        (
+            {
+                "spec_accept_token_num": None,
+                "spec_draft_token_num": 10,
+            },
+            "spec_accept_rate",
+        ),
+        (
+            {
+                "spec_verify_ct": 2,
+            },
+            "spec_accept_length",
+        ),
+        (
+            {
+                "spec_verify_ct": 2,
+                "completion_token_num": None,
+            },
+            "spec_accept_length",
+        ),
+    ],
+)
+def test_speculative_logging_legacy_missing_numerator_stays_unknown(
+    spec_info: dict,
+    metric_key: str,
+) -> None:
+    sample = Sample.from_dict(
+        {
+            "status": "completed",
+            "spec_info": spec_info,
+        }
+    )
+
+    metrics = compute_speculative_log_metrics([sample])
+
+    assert metrics["spec/legacy_sample_count"] == 1
+    assert metric_key not in metrics

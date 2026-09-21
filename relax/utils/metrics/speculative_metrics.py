@@ -89,14 +89,46 @@ def compute_speculative_metrics(samples: Iterable[Any]) -> dict[str, int | float
     return metrics
 
 
+def _legacy_sample_counts(info: Any) -> SpeculativeCounts | None:
+    if info is None or not getattr(info, "legacy_counts", False):
+        return None
+
+    counts = getattr(info, "legacy_counts_availability", None)
+    if counts is None:
+        return None
+
+    accept_available = counts.accepted is not None and counts.proposed is not None and counts.proposed > 0
+    verify_available = counts.completion is not None and counts.verify is not None and counts.verify > 0
+
+    if not accept_available and not verify_available:
+        return None
+
+    return SpeculativeCounts(
+        accepted=counts.accepted if accept_available else None,
+        proposed=counts.proposed if accept_available else None,
+        verify=counts.verify if verify_available else None,
+        completion=counts.completion if verify_available else None,
+    )
+
+
 def _sample_counts(sample: Any) -> SpeculativeCounts | None:
     """Compatibility cohort for the deprecated arithmetic sample averages."""
     records = getattr(sample, "spec_generations", None)
 
     if records is None:
-        if "agentic_trace" in (getattr(sample, "metadata", None) or {}):
+        metadata = getattr(sample, "metadata", None) or {}
+
+        # Old Agentic samples have no recoverable generation identities.
+        if "agentic_trace" in metadata:
             return None
-        return getattr(getattr(sample, "spec_info", None), "counts", None)
+
+        info = getattr(sample, "spec_info", None)
+        counts = getattr(info, "counts", None)
+
+        if counts is not None:
+            return counts
+
+        return _legacy_sample_counts(info)
 
     if not isinstance(records, list) or not records:
         return None
@@ -182,6 +214,15 @@ def compute_speculative_log_metrics(
     metrics = compute_speculative_metrics(samples)
 
     if not samples or metrics["spec/conflicting_generation_count"] or metrics["spec/invalid_record_count"]:
+        return metrics
+
+    source_counts = (
+        metrics["spec/agentic_sample_count"],
+        metrics["spec/ordinary_sample_count"],
+        metrics["spec/legacy_sample_count"],
+    )
+
+    if sum(count > 0 for count in source_counts) != 1:
         return metrics
 
     for numerator, denominator, key in (
