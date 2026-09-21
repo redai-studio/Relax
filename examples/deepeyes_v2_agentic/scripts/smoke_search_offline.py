@@ -33,15 +33,21 @@ SCENARIOS = ("mock", "retriever-error", "external-error")
 
 
 def require(condition: bool, reason: str) -> None:
+    """在验证条件不满足时立即抛出带固定原因的 RuntimeError."""
+
     if not condition:
         raise RuntimeError(reason)
 
 
 def write_json(path: Path, payload: Any) -> None:
+    """将 smoke 数据写入 UTF-8 JSON，覆盖同名文件，父目录需已经存在."""
+
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def smoke_environment(scenario: str, directory: Path) -> dict[str, str]:
+    """为已验证的 scenario 生成受控环境，错误场景在 directory 写入搜索配置."""
+
     # 认证值仅供本进程中的受控 transport 使用。
     values = {
         "OPENAI_API_KEY": "offline-model-token",
@@ -73,6 +79,8 @@ def smoke_environment(scenario: str, directory: Path) -> dict[str, str]:
 
 
 class OfflineSmoke:
+    """记录受控模型驱动的 agent 搜索流程，验证消息、重试和资源关闭行为."""
+
     def __init__(self, scenario: str) -> None:
         self.scenario = scenario
         self.requests: list[dict[str, Any]] = []
@@ -88,13 +96,19 @@ class OfflineSmoke:
         self.answer = "离线搜索验证完成。" if scenario == "mock" else "搜索暂时不可用，已完成后续回答。"
 
     def deny_network(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """记录同步网络访问尝试并立即终止该访问."""
+
         self.network_attempts += 1
         raise RuntimeError("offline_network_access_forbidden")
 
     async def deny_async_network(self, *args: Any, **kwargs: Any) -> NoReturn:
+        """通过相同检查拒绝异步网络访问."""
+
         self.deny_network(*args, **kwargs)
 
     def model_response(self, request: httpx.Request) -> httpx.Response:
+        """提供受控模型响应，依次要求搜索和给出最终答案."""
+
         require(request.method == "POST" and request.url.path == "/v1/chat/completions", "invalid_model_request")
         self.requests.append(json.loads(request.content))
         self.events.append("model")
@@ -113,6 +127,8 @@ class OfflineSmoke:
         )
 
     def model_client(self, **kwargs: Any) -> openai.AsyncOpenAI:
+        """创建使用内存 transport 的 OpenAI 客户端并登记关闭检查对象."""
+
         client = self.real_model_client(
             **kwargs,
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(self.model_response), trust_env=False),
@@ -121,12 +137,16 @@ class OfflineSmoke:
         return client
 
     def search_response(self, request: httpx.Request) -> httpx.Response:
+        """记录搜索请求并返回受控 503 响应，供重试及错误恢复验证使用."""
+
         self.search_requests.append(request)
         response = httpx.Response(503, json={"error": "offline-unavailable"})
         self.search_responses.append(response)
         return response
 
     def search_client(self, config: search_http.HttpSearchConfig) -> httpx.Client:
+        """为错误场景创建内存 HTTP 客户端，并拒绝 mock 创建网络客户端."""
+
         require(self.scenario != "mock", "mock_created_search_http_client")
         client = httpx.Client(
             transport=httpx.MockTransport(self.search_response),
@@ -138,6 +158,8 @@ class OfflineSmoke:
         return client
 
     def search(self, query: str, size: int | None = None) -> Any:
+        """记录事件和结果，同时调用示例的真实搜索入口."""
+
         self.events.append("search")
         require(query == QUERY and size is None, "unexpected_search_arguments")
         result = search_utils.search(query, size=size)
@@ -145,10 +167,17 @@ class OfflineSmoke:
         return result
 
     async def close_model_clients(self) -> None:
+        """关闭运行器创建的全部模型客户端."""
+
         for client in self.model_clients:
             await client.close()
 
     def verify(self, initial: list[dict[str, Any]], output: dict[str, Any]) -> dict[str, Any]:
+        """核查输入历史、工具观察、最终答案及资源状态，返回可保存的验证报告.
+
+        条件不满足时抛出 RuntimeError，报告包含当前 scenario 的请求次数和错误标记.
+        """
+
         failure = self.scenario != "mock"
         require(self.network_attempts == 0, "network_guard_triggered")
         require(len(self.requests) == 2 and len(self.search_results) == 1, "incomplete_agent_loop")
@@ -204,6 +233,12 @@ class OfflineSmoke:
 
 
 def run_smoke(scenario: str, directory: Path) -> dict[str, Any]:
+    """在禁止网络与 sandbox 访问的环境执行 agent.main，返回并保存验证证据.
+
+    scenario 支持 mock、retriever-error 和 external-error；directory
+    自动创建，同名证据文件会被覆盖. 模型使用内存 HTTP transport，补丁在退出时恢复；验证条件不满足时抛出 RuntimeError.
+    """
+
     require(scenario in SCENARIOS, "invalid_smoke_scenario")
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -261,6 +296,8 @@ def run_smoke(scenario: str, directory: Path) -> dict[str, Any]:
 
 
 def main() -> None:
+    """解析离线 smoke 参数，执行指定场景并输出 JSON 验证报告."""
+
     parser = argparse.ArgumentParser(description="离线执行真实 agent 搜索循环并验证最终答案。")
     parser.add_argument(
         "--scenario", choices=SCENARIOS, default="mock", help="默认使用 mock；错误场景提供受控 503 响应。"

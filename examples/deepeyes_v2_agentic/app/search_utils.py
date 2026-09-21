@@ -94,6 +94,13 @@ _SEARCH_BACKENDS: dict[str, SearchBackend] = {
 
 
 def search(query: str, size: int | None = None) -> SearchResponse | Literal["Error"]:
+    """调用配置选定的搜索后端，返回统一结果或预期失败标记 ``"Error"``.
+
+    query 清理首尾空白后必须非空，size 必须为正整数，None 使用配置的 topk. 默认使用确定性 mock，external 支持配置
+    max_size；结果最多保留请求数量. SearchError 与 Pydantic ValidationError 转换为
+    ``"Error"``，其他异常继续传播.
+    """
+
     stage = "config"
     try:
         config = load_search_config()

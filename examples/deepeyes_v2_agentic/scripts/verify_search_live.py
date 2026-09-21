@@ -40,15 +40,23 @@ LiveConfig = RetrieverSearchConfig | ExternalSearchConfig
 
 
 class VerificationError(ValueError):
+    """表示真实服务验收中可公开报告的固定错误原因."""
+
     pass
 
 
 class VerificationParser(argparse.ArgumentParser):
+    """解析验收参数，并使用固定错误信息保护参数中的敏感内容."""
+
     def error(self, message: str) -> NoReturn:
+        """使用固定提示和状态码 2 结束参数解析."""
+
         self.exit(2, "verify_search_live: invalid_arguments\n")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """解析验收参数，argv 为 None 时读取进程命令行；参数错误以状态码 2 退出."""
+
     parser = VerificationParser(description="调用已部署的搜索服务并保存脱敏验收证据。", add_help=False)
     parser.add_argument("-h", "--help", action="help", help="显示帮助并退出")
     parser.add_argument("--config", type=Path, required=True, help="显式指定 retriever 或 external YAML 配置")
@@ -66,6 +74,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 @contextmanager
 def selected_config(path: Path) -> Iterator[LiveConfig]:
+    """临时选择 retriever 或 external 配置，验证认证信息并返回配置对象.
+
+    配置或认证错误抛出 VerificationError；正常退出及异常退出均恢复原配置环境变量.
+    """
+
     previous = os.environ.get(SEARCH_CONFIG_ENV)
     os.environ[SEARCH_CONFIG_ENV] = str(path)
     try:
@@ -93,6 +106,11 @@ def secret_values(
     sensitive_query_params: list[str] | tuple[str, ...] = (),
     sensitive_headers: list[str] | tuple[str, ...] = (),
 ) -> set[str]:
+    """收集认证值、endpoint 信息和指定敏感字段，返回原文及 URL 编码形式.
+
+    自定义 query 参数与 header 需显式列出；指定名称不存在时抛出 VerificationError.
+    """
+
     url = httpx.URL(str(config.endpoint))
     values = {url.username, url.password, str(url)}
     for name in sensitive_query_params:
@@ -119,6 +137,11 @@ def secret_values(
 
 
 def redact(value: Any, secrets: set[str]) -> Any:
+    """递归替换 JSON 字符串及对象键中的敏感内容，保持其他值及结构.
+
+    较长敏感内容优先匹配；脱敏后对象键冲突时抛出 VerificationError.
+    """
+
     pattern = re.compile("|".join(re.escape(item) for item in sorted(secrets, key=len, reverse=True)))
 
     def clean(item: Any) -> Any:
@@ -140,6 +163,8 @@ def redact(value: Any, secrets: set[str]) -> Any:
 
 
 def read_field(value: object, path: list[str], *, optional: bool = False) -> object:
+    """按对象键路径读取服务字段；允许可选字段缺失，拒绝中间结构错误."""
+
     for key in path:
         if not isinstance(value, dict):
             raise VerificationError("source_validation_failed")
@@ -152,6 +177,11 @@ def read_field(value: object, path: list[str], *, optional: bool = False) -> obj
 
 
 def verify_source(payload: object, normalized: object, config: LiveConfig) -> bool:
+    """按 config.topk 核查统一结果是否对应服务原始字段，并要求至少一条结果.
+
+    验证通过返回 True；结构、耗时或来源不符合要求时抛出 VerificationError.
+    """
+
     if not isinstance(normalized, dict) or not isinstance(normalized.get("data"), list):
         raise VerificationError("invalid_normalized_response")
     elapsed = normalized.get("elapsed_time")
@@ -208,6 +238,8 @@ def verify_source(payload: object, normalized: object, config: LiveConfig) -> bo
 
 @contextmanager
 def observe_requests(attempts: list[dict[str, Any]]) -> Iterator[None]:
+    """通过 HTTPX hooks 记录请求次数、状态码及成功响应，退出时恢复客户端工厂."""
+
     original_factory = search_http._create_client
 
     def request_hook(request: httpx.Request) -> None:
@@ -242,10 +274,17 @@ def observe_requests(attempts: list[dict[str, Any]]) -> Iterator[None]:
 
 
 def reject_json_constant(value: str) -> NoReturn:
+    """拒绝 JSON 中的非有限数值常量."""
+
     raise ValueError("invalid_json_constant")
 
 
 def verify_query(query: str, config: LiveConfig) -> dict[str, Any]:
+    """使用当前已选配置搜索 query，返回尚未脱敏的请求证据及来源验证结果.
+
+    config 应与 selected_config 选择的配置一致；验证失败或调用异常记录在报告中.
+    """
+
     attempts: list[dict[str, Any]] = []
     started = time.monotonic()
     normalized: object = "Error"
@@ -281,6 +320,8 @@ def verify_query(query: str, config: LiveConfig) -> dict[str, Any]:
 
 
 def implementation_hashes() -> dict[str, str]:
+    """计算搜索实现与验收脚本的 SHA-256，标识验证使用的源码版本."""
+
     names = ("search_config.py", "search_utils.py", "search_http.py", "search_retriever.py", "search_external.py")
     values = {f"app/{name}": hashlib.sha256((EXAMPLE_DIR / "app" / name).read_bytes()).hexdigest() for name in names}
     values["scripts/verify_search_live.py"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -288,6 +329,8 @@ def implementation_hashes() -> dict[str, str]:
 
 
 def redact_report(result: dict[str, Any], secrets: set[str]) -> dict[str, Any]:
+    """脱敏查询及响应内容，同时保留验收状态和统一结果的结构字段."""
+
     normalized = result["normalized"]
     if isinstance(normalized, dict):
         if set(normalized) != {"elapsed_time", "data"} or not isinstance(normalized["data"], list):
@@ -311,12 +354,16 @@ def redact_report(result: dict[str, Any], secrets: set[str]) -> dict[str, Any]:
 
 
 def write_json(path: Path, value: object) -> None:
+    """独占创建 UTF-8 JSON 证据文件，拒绝覆盖已有文件或写入非有限数值."""
+
     data = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     with path.open("x", encoding="utf-8") as handle:
         handle.write(data)
 
 
 def read_artifact(path: Path, expected: object) -> None:
+    """重新读取证据文件并比较 JSON 内容，拒绝不一致或非有限数值."""
+
     with path.open(encoding="utf-8") as handle:
         actual = json.load(handle, parse_constant=reject_json_constant)
     if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True, allow_nan=False):
@@ -324,6 +371,12 @@ def read_artifact(path: Path, expected: object) -> None:
 
 
 def run_verification(args: argparse.Namespace) -> bool:
+    """验证至少两条不同的非空查询，在新目录保存脱敏证据并核查全部文件.
+
+    目录已经存在时抛出 VerificationError；全部查询通过时返回 True，其余查询结果返回 False. 最终文件核查失败或中断时移除
+    summary.json，配置环境变量及日志状态在退出时恢复.
+    """
+
     queries = [query.strip() for query in args.query]
     if len(queries) < 2 or any(not query for query in queries) or len(set(queries)) != len(queries):
         raise VerificationError("invalid_queries")
@@ -394,6 +447,11 @@ def run_verification(args: argparse.Namespace) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """执行真实服务验收并输出简短状态，通过返回 0，失败返回 1.
+
+    argv 为 None 时读取进程命令行；参数解析错误以状态码 2 退出.
+    """
+
     args = parse_args(argv)
     try:
         passed = run_verification(args)

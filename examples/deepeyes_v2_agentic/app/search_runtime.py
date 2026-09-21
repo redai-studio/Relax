@@ -45,6 +45,12 @@ RESERVED_AUTH_NAMES = {
 
 
 def prepare_search_environment() -> dict[str, str]:
+    """解析配置文件的绝对路径，更新配置环境变量并返回需传递的搜索环境变量.
+
+    默认使用示例的 mock YAML，相对路径基于当前工作目录；external 同时返回其认证变量. 文件必须已经存在，无效配置或认证信息抛出
+    SearchError.
+    """
+
     config_path = os.environ.get(SEARCH_CONFIG_ENV, str(EXAMPLE_DIR / "search_config.mock.yaml"))
     if not config_path.strip():
         raise SearchError("invalid_config_file")
@@ -89,6 +95,12 @@ def _read_runtime_environment(name: str) -> dict[str, Any]:
 
 
 def build_runtime_environment(profile: str) -> dict[str, Any]:
+    """为 standard 或 klx 入口合并 Ray 配置、示例服务变量和搜索认证信息.
+
+    RUNTIME_ENV_JSON 覆盖 DEEPEYES_V2_BASE_RUNTIME_ENV_JSON 的同名顶层字段，env_vars
+    按键合并后由示例变量覆盖. 配置路径转换为绝对路径，文件需能被 worker 访问；无效 profile 或配置抛出 SearchError.
+    """
+
     if profile not in {"standard", "klx"}:
         raise SearchError("invalid_runtime_profile")
     base = _read_runtime_environment("DEEPEYES_V2_BASE_RUNTIME_ENV_JSON")
@@ -110,6 +122,11 @@ def build_runtime_environment(profile: str) -> dict[str, Any]:
 
 
 def main() -> int:
+    """输出配置路径、Ray JSON 或 agent 启动命令；前两种模式验证搜索配置.
+
+    成功返回 0，配置失败返回 1；命令行参数错误由 argparse 处理.
+    """
+
     parser = argparse.ArgumentParser(description="生成 DeepEyes-V2 示例的搜索运行环境。")
     parser.add_argument("command", choices=("prepare", "runtime", "agent-command"))
     parser.add_argument("--profile", choices=("standard", "klx"), default="standard")

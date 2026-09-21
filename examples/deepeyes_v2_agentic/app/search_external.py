@@ -50,6 +50,11 @@ def _read_path(
 
 
 def parse_external_results(payload: object, *, mapping: ResponseMapping) -> list[SearchResult]:
+    """按 mapping 的对象键路径转换外部结果，必需字段均应为字符串.
+
+    date 未配置、键缺失或值为 None 时返回 None；路径中间结构及字段类型错误抛出 SearchError.
+    """
+
     items = _read_path(payload, mapping.items_path, field="items")
     if not isinstance(items, list):
         _invalid_response("items")
@@ -84,6 +89,12 @@ def _query_params(config: ExternalSearchConfig, fields: dict[str, JsonValue]) ->
 
 
 def search_external(query: str, size: int, config: SearchConfig) -> SearchResponse:
+    """按配置构建外部搜索请求，从环境变量读取认证值并返回统一结果.
+
+    固定字段与 query、size 一起写入 query 参数或 JSON 请求体；认证 prefix 直接拼接凭据.
+    配置类型、认证、请求或响应错误抛出 SearchError，HTTP 超时和重试由共用请求函数处理.
+    """
+
     if not isinstance(config, ExternalSearchConfig):
         raise SearchError("invalid_external_config")
     headers = dict(config.headers)

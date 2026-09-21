@@ -100,6 +100,13 @@ def request_search(
     json_body: Mapping[str, JsonValue] | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> SearchResponse:
+    """执行 HTTP 搜索，返回统一结果及包含重试等待和客户端关闭的总耗时.
+
+    每次调用创建并关闭客户端，HTTP 各阶段使用 timeout_s，最多请求 max_retries + 1 次.
+    408、429、500、502、503、504 及超时、指定连接、读写、协议错误触发重试. parse_results
+    转换服务响应；预期请求或结果验证错误抛出 SearchError.
+    """
+
     started = time.monotonic()
     attempt = 0
     total = config.max_retries + 1
