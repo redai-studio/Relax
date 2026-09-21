@@ -1,0 +1,9 @@
+# 将 endpoint 替换为实际 Search-R1 兼容服务的完整地址。
+backend: retriever
+endpoint: http://retriever-host:17389/retrieve
+topk: 3
+timeout_s: 10.0
+max_retries: 2
+retry_delay_s: 0.5
+retry_max_delay_s: 2.0
+trust_env: false

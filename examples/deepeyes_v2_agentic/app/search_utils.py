@@ -1,25 +1,31 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Search tool helpers for the DeepEyesV2 env.
-
-* :func:`search` is a placeholder web-search returning canned snippets so the
-  recipe runs end-to-end without a real backend.
-* :func:`image_search` serves cached results keyed by ``data_idx`` from JSON
-  files listed in ``DEEPEYES_V2_SEARCH_CACHE_PATHS`` (colon/comma-separated).
-  Missing / unparsable caches degrade to returning ``"Error"`` so the env
-  surfaces a clean failure instead of crashing at import.
-"""
-
 from __future__ import annotations
 
 import json
-import logging
 import os
-import random
-import time
+from collections.abc import Callable
+from typing import Literal
+from urllib.parse import urlencode
+
+from pydantic import ValidationError
+
+from relax.utils.logging_utils import get_logger
+
+from .search_config import (
+    SEARCH_RESPONSE_ADAPTER,
+    ExternalSearchConfig,
+    SearchConfig,
+    SearchError,
+    SearchRequest,
+    SearchResponse,
+    load_search_config,
+)
+from .search_external import search_external
+from .search_retriever import search_retriever
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _load_image_search_cache() -> dict:
@@ -63,34 +69,54 @@ def _get_image_search_cache() -> dict:
     return _IMAGE_SEARCH_CACHE
 
 
-def search(query: str, size: int = 5):
-    """Web-search placeholder. Returns canned snippets in the shape::
+def _search_mock(query: str, size: int, _config: SearchConfig) -> SearchResponse:
+    encoded_query = urlencode({"q": query})
+    return {
+        "elapsed_time": 0.0,
+        "data": [
+            {
+                "snippet": f"[mock] 离线测试资料，查询：{query}",
+                "title": f"[mock] 离线搜索结果 {rank}",
+                "link": f"https://example.com/mock/search?{encoded_query}&rank={rank}",
+                "date": None,
+            }
+            for rank in range(1, size + 1)
+        ],
+    }
 
-        {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"?}, ...]}
 
-    Replace with a real backend (Serper / Google / Bing / internal) for
-    production training.
-    """
-    max_try = 3
-    result = "Error"
-    for try_idx in range(max_try):
-        try:
-            result = {"elapsed_time": 0.0, "data": []}
-            for i in range(size):
-                result["data"].append(
-                    {
-                        "snippet": f"This is a placeholder snippet for query: {query}",
-                        "title": f"Placeholder Title {i}",
-                        "link": f"http://example.com/{i}",
-                    }
-                )
-            break
-        except Exception as e:
-            logger.warning(f"[search] attempt {try_idx + 1}/{max_try} failed: {e}")
-            result = "Error"
-            if try_idx < max_try - 1:
-                time.sleep((try_idx + 1) * random.randint(1, 5))
-    return result
+SearchBackend = Callable[[str, int, SearchConfig], SearchResponse | Literal["Error"]]
+_SEARCH_BACKENDS: dict[str, SearchBackend] = {
+    "mock": _search_mock,
+    "retriever": search_retriever,
+    "external": search_external,
+}
+
+
+def search(query: str, size: int | None = None) -> SearchResponse | Literal["Error"]:
+    stage = "config"
+    try:
+        config = load_search_config()
+        stage = "request"
+        request = SearchRequest(query=query, size=config.topk if size is None else size)
+        if isinstance(config, ExternalSearchConfig):
+            maximum = config.request.max_size
+            if maximum is not None and request.size > maximum:
+                raise SearchError("size_exceeds_maximum")
+        stage = "backend"
+        backend = _SEARCH_BACKENDS.get(config.backend)
+        if backend is None:
+            raise SearchError("backend_unavailable")
+        result = backend(request.query, request.size, config)
+        if result == "Error":
+            return "Error"
+        stage = "response"
+        response = SEARCH_RESPONSE_ADAPTER.validate_python(result, strict=True)
+        response["data"] = response["data"][: request.size]
+        return response
+    except (SearchError, ValidationError):
+        logger.warning("[search] failed during %s", stage)
+        return "Error"
 
 
 def image_search(_query, data_idx: str | None = None):
