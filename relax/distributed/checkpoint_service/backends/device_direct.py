@@ -222,9 +222,9 @@ class DeviceDirectBackend(CommBackend):
         """Build a stable signature of the rollout topology.
 
         Two topologies with the same signature describe the same set of engines
-        (same rank, endpoint and per-engine GPU count, the latter affecting the
-        NCCL group world size), so the existing engines + weight-update group
-        can be reused without a teardown/rebuild.
+        (same actor generation, rank, endpoint and per-engine GPU count, the
+        latter affecting the NCCL group world size), so the existing engines +
+        weight-update group can be reused without a teardown/rebuild.
         """
         sig = set()
         for rank, info in rollout_topology.items():
@@ -235,6 +235,7 @@ class DeviceDirectBackend(CommBackend):
                     info.get("ip") if isinstance(info, dict) else None,
                     info.get("port") if isinstance(info, dict) else None,
                     meta.get("num_gpus_per_engine"),
+                    meta.get("actor_id"),
                 )
             )
         return frozenset(sig)

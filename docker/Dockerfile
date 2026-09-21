@@ -131,7 +131,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps
 
 # sgl-router: override the official wheel (pulled by requirements.txt above) with
 # slime's r3-capable fork. The official sglang-router drops the routed_experts
