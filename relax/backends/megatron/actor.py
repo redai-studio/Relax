@@ -3062,7 +3062,19 @@ class MegatronTrainRayActor(TrainRayActor):
         try:
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
-            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            synced_actor_ids = run(
+                self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only)
+            )
+            if not actor_fwd_only and dist.get_rank(group=get_gloo_group()) == 0 and synced_actor_ids:
+                try:
+                    ray.get(
+                        self.rollout_manager.register_recovered_engines.remote(synced_actor_ids),
+                        timeout=self.args.rollout_http_timeout,
+                    )
+                except Exception:
+                    # Publication is unconfirmed; retry after the next successful
+                    # sync without stranding other ranks at their barrier.
+                    logger.exception("Recovered engine Router publication failed; will retry after weight sync")
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())

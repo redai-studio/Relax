@@ -319,6 +319,37 @@ def test_s3_policy_auto_prefers_ready_shm(monkeypatch):
     assert resolved == {"model_path": "/dev/shm/student", "load_format": "auto"}
 
 
+def test_scaled_out_s3_policy_materializes_full_model(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    monkeypatch.setattr(
+        sglang_engine,
+        "maybe_resolve_s3_model_to_shm",
+        lambda uri, obj: "/dev/shm/student",
+    )
+
+    resolved = sglang_engine._materialize_scaled_out_s3_model(
+        {"model_path": args.model_source.uri, "load_format": "auto"}, args
+    )
+
+    assert resolved == {"model_path": "/dev/shm/student", "load_format": "auto"}
+
+
+def test_scaled_out_s3_policy_ignores_noncanonical_override(monkeypatch):
+    from relax.backends.sglang import sglang_engine
+
+    args = SimpleNamespace(model_source=m.ModelSource("s3://bucket/student/"))
+    monkeypatch.setattr(
+        sglang_engine,
+        "maybe_resolve_s3_model_to_shm",
+        lambda uri, obj: pytest.fail("noncanonical model override must not be materialized"),
+    )
+    server_args = {"model_path": "/models/alternate", "load_format": "auto"}
+
+    assert sglang_engine._materialize_scaled_out_s3_model(server_args, args) is server_args
+
+
 def test_s3_policy_plan_is_noop_when_generic_download_is_disabled(monkeypatch):
     from relax.backends.sglang import sglang_engine
 

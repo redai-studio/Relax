@@ -519,3 +519,39 @@ class TestHighConcurrency:
         assert all(r == 1.0 for r in rewards)
         # worker_index should have advanced by n (each request picks one worker)
         assert executor._worker_index == initial_index + n
+
+    @pytest.mark.asyncio
+    async def test_worker_pool_requests_control_plane_affinity(self, monkeypatch):
+        options_seen = []
+
+        class FakeBoundWorker:
+            @staticmethod
+            def remote():
+                return object()
+
+        class FakeRewardWorker:
+            @classmethod
+            def options(cls, **options):
+                options_seen.append(options)
+                return FakeBoundWorker()
+
+        monkeypatch.setattr("relax.engine.rewards.RewardWorker", FakeRewardWorker)
+        args = _make_args()
+        args.enable_affinity = True
+        args._relax_control_plane_node_group = "stable"
+        executor = RewardExecutor(max_concurrency=2, num_workers=2)
+
+        await executor._ensure_workers(args)
+
+        assert options_seen == [
+            {
+                "name": "reward_worker_0",
+                "get_if_exists": True,
+                "resources": {"stable_cpu": 1},
+            },
+            {
+                "name": "reward_worker_1",
+                "get_if_exists": True,
+                "resources": {"stable_cpu": 1},
+            },
+        ]

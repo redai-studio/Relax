@@ -40,7 +40,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")

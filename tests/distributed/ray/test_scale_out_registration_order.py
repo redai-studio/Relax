@@ -17,7 +17,14 @@ try:
 except ImportError:
     HAS_DEPS = False
 
-from conftest import AwaitableValue, create_test_manager, make_mock_engine, make_rollout_server
+from conftest import (
+    AwaitableValue,
+    create_test_manager,
+    make_engine_group,
+    make_mock_args,
+    make_mock_engine,
+    make_rollout_server,
+)
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -82,6 +89,52 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     assert result.success is False
     assert result.reason is not None and result.reason.category is ScaleOutFailureCategory.WEIGHT_SYNC_FAILED
     manager._rollback_engines.assert_awaited_once_with(group)
+
+
+@pytest.mark.asyncio
+async def test_ray_native_scale_out_inherits_canonical_model_override():
+    args = make_mock_args(hf_checkpoint="/dev/shm/node-local-model")
+    template = make_engine_group(args=args)
+    template.sglang_overrides = {
+        "model_path": "s3://model-bucket/canonical-model/",
+        "load_format": "auto",
+    }
+    server = make_rollout_server(engine_groups=[template])
+    manager = create_test_manager(args=args, servers={"default": server})
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    engine = make_mock_engine()
+    group = SimpleNamespace(engines=[engine])
+    group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
+    manager._finalize_engine_group_registration = AsyncMock(
+        return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
+    )
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("192.0.2.2", 0))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", return_value=group) as engine_group_cls,
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=1,
+            gpus_per_engine=1,
+            engine_offset=4,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    inherited = engine_group_cls.call_args.kwargs["sglang_overrides"]
+    assert inherited == template.sglang_overrides
+    assert inherited is not template.sglang_overrides
+    assert inherited["model_path"] != args.hf_checkpoint
 
 
 @pytest.mark.asyncio

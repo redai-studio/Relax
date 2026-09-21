@@ -8,6 +8,7 @@ from typing import Any, Callable
 import aiohttp
 import ray
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.types import Sample
@@ -217,7 +218,7 @@ class RewardExecutor:
         if self._semaphore is None:
             self._semaphore = asyncio.Semaphore(self._max_concurrency)
 
-    async def _ensure_workers(self):
+    async def _ensure_workers(self, args: Any = None):
         if self._workers:
             return
         if self._worker_init_lock is None:
@@ -228,8 +229,13 @@ class RewardExecutor:
             self._workers = await asyncio.to_thread(
                 lambda: [
                     RewardWorker.options(
-                        name=f"reward_worker_{i}",
-                        get_if_exists=True,
+                        **with_control_plane_affinity(
+                            args,
+                            {
+                                "name": f"reward_worker_{i}",
+                                "get_if_exists": True,
+                            },
+                        )
                     ).remote()
                     for i in range(self._num_workers)
                 ]
@@ -308,7 +314,7 @@ class RewardExecutor:
             if self._custom_reward_is_async[path]:
                 return await function(args, sample, **kwargs)
 
-            await self._ensure_workers()
+            await self._ensure_workers(args)
             worker = self._next_worker()
             ref = await self._submit_worker_call(
                 lambda: worker.compute_custom.remote(path, args, sample, kwargs),
@@ -379,7 +385,7 @@ class RewardExecutor:
             # Default to sync path for any non-empty rm_type not registered
             # as async; unknown types keep failing inside the worker.
             if rm_type:
-                await self._ensure_workers()
+                await self._ensure_workers(args)
                 worker = self._next_worker()
                 ref = worker.compute.remote(rm_type, response, label, metadata=metadata)
                 return await ref

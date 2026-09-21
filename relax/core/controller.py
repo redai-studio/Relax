@@ -312,6 +312,8 @@ class Controller:
     def _initialize_data_system(self):
         algo_key = resolve_sft_algo_key(self.config)
         dp_size = compute_dp_size(self.config)
+        required_node_resources = with_control_plane_affinity(self.config).get("resources", {})
+        required_node_resource = next(iter(required_node_resources), None)
         use_sft_prepack = algo_key == "sft" and getattr(self.config, "sft_async_prepack", False)
         if (
             getattr(self.config, "fully_async", False)
@@ -342,10 +344,12 @@ class Controller:
                 "controller": {
                     "sampler": sampler,
                     "polling_mode": self.config.polling_mode,
+                    "required_node_resource": required_node_resource,
                 },
                 "backend": {
                     "SimpleStorage": {
                         "num_data_storage_units": self.config.num_data_storage_units,
+                        "required_node_resource": required_node_resource,
                     },
                 },
             },
