@@ -1,7 +1,8 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-set -ex
+set -e
+set +x
 set -o pipefail
 
 ###############################################################################
@@ -14,11 +15,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+set +x
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
 fi
+set +x
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
+set +x
 
 ###############################################################################
 #                                    DIRS                                     #
@@ -32,7 +36,7 @@ if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; 
     echo "Example: MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/save bash $0"
     exit 1
 fi
-mkdir -p ${SAVE_DIR}
+mkdir -p "${SAVE_DIR}"
 
 ###############################################################################
 #                             STARTUP CLEANUP                                 #
@@ -57,18 +61,29 @@ if [ ! -f "${APPTAINER_IMAGE_PATH}" ]; then
     echo "Run: DATA_DIR=${DATA_DIR} bash ${SCRIPT_DIR}/scripts/prepare.sh"
     exit 1
 fi
-DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
+export DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
 if [ ! -x "${DEEPEYES_V2_APP_PYTHON}" ]; then
     echo "ERROR: DeepEyes V2 app environment not found at ${DEEPEYES_V2_APP_PYTHON}."
     echo "Run: bash ${SCRIPT_DIR}/scripts/prepare_app_env.sh"
     exit 1
 fi
 
+SEARCH_RUNTIME_HELPER="${SCRIPT_DIR}/app/search_runtime.py"
+DEEPEYES_V2_SEARCH_CONFIG_PATH=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" prepare)
+export DEEPEYES_V2_SEARCH_CONFIG_PATH
+# 保留已有 Ray runtime 配置，服务变量由统一 helper 合并。
+export DEEPEYES_V2_BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
+if [ -z "${DEEPEYES_V2_BASE_RUNTIME_ENV_JSON}" ]; then
+    DEEPEYES_V2_BASE_RUNTIME_ENV_JSON='{}'
+fi
+unset RUNTIME_ENV_JSON
+
 ###############################################################################
 #                              JUDGE MODEL API                                #
 ###############################################################################
 
 source "${SCRIPT_DIR}/sglang_judge_service.sh"
+set +x
 
 ###############################################################################
 #                                  MODEL CONFIG                               #
@@ -104,25 +119,10 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
-# Sandbox env vars propagated into every Ray worker so the per-session
-# agent process can find apptainer / search cache.
-# SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
-# to find the apptainer backend YAML config (image path, bind paths, etc).
-RUNTIME_ENV_JSON=$(cat <<EOF
-{
-  "env_vars": {
-    "SANDBOX_BACKEND": "apptainer_jupyter",
-    "SANDBOX_CONFIG_PATH": "${SCRIPT_DIR}/apptainer_env/apptainer_config.yaml",
-    "DEEPEYES_V2_SEARCH_CACHE_PATHS": "${DEEPEYES_V2_SEARCH_CACHE_PATHS:-}",
-    "DEEPEYES_JUDGE_BASE_URL": "${DEEPEYES_JUDGE_BASE_URL:-}",
-    "DEEPEYES_JUDGE_MODELS": "${DEEPEYES_JUDGE_MODELS:-}",
-    "DEEPEYES_JUDGE_API_KEY": "${DEEPEYES_JUDGE_API_KEY:-}",
-    "APPTAINER_IMAGE_PATH": "${APPTAINER_IMAGE_PATH:-}",
-    "DEEPEYES_V2_APP_PYTHON": "${DEEPEYES_V2_APP_PYTHON}"
-  }
-}
-EOF
-)
+# JSON 序列化负责路径、认证及其他环境变量中的特殊字符。
+RUNTIME_ENV_JSON=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" runtime --profile standard)
+export RUNTIME_ENV_JSON
+AGENT_COMMAND=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" agent-command)
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -133,13 +133,14 @@ ROLLOUT_ARGS=(
     --metadata-key extra_info
     --custom-rm-path examples.deepeyes_v2_agentic.reward_deepeyes_v2.reward_func
     --use-agentic-rollout
-    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-command "${AGENT_COMMAND}"
     --agent-cwd "${SCRIPT_DIR}"
     # Per-run agent log dir: every session's stdout/stderr is tee'd to
     # ${dir}/${session_id}.log (run_agent_app.sh). Successful AND failed
     # sessions are both kept, which is what makes hang/timeout diagnosis
     # possible — Relax's own tmpdir-based capture drops both.
-    --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
+    --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}" \
+        "DEEPEYES_V2_SEARCH_CONFIG_PATH=${DEEPEYES_V2_SEARCH_CONFIG_PATH}"
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
     --micro-batch-size 1
