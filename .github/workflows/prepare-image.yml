@@ -1,0 +1,41 @@
+name: Prepare GPU test image
+
+on:
+  workflow_call:
+    outputs:
+      image-id:
+        description: Local Docker image ID for the tests
+        value: ${{ jobs.image.outputs.image-id }}
+      runner-label:
+        description: Runner label for the host holding the image
+        value: ${{ jobs.image.outputs.runner-label }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Prepare local image
+    runs-on: [self-hosted, linux, x64, h20, gpu]
+    timeout-minutes: 120
+    outputs:
+      image-id: ${{ steps.image.outputs.image-id }}
+      runner-label: ${{ steps.host.outputs.runner-label }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Identify image cache host
+        id: host
+        run: |
+          # Runners sharing a Docker daemon need the same image-cache-<hostname> label.
+          echo "runner-label=image-cache-$(hostname)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        with:
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}

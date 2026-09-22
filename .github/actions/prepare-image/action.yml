@@ -8,9 +8,9 @@ inputs:
   build-args:
     description: Optional Docker build arguments, one KEY=VALUE per line; included in the cache key
     default: ''
-  lock-file:
-    description: Shared lock file for every runner using the same Docker daemon
-    default: /tmp/relax-ci-image-build.lock
+  lock-dir:
+    description: Shared directory for per-cache-key locks on the same Docker daemon
+    default: /tmp/relax-ci-image-build
 
 outputs:
   image-id:
@@ -24,7 +24,7 @@ runs:
       id: image
       shell: bash
       env:
-        IMAGE_LOCK_FILE: ${{ inputs.lock-file }}
+        IMAGE_LOCK_DIR: ${{ inputs.lock-dir }}
         IMAGE_KEY: ${{ inputs.hash-key }}
         BUILD_ARGS: ${{ inputs.build-args }}
       run: |
@@ -40,13 +40,17 @@ runs:
           build_args+=(--build-arg "$argument")
         done <<< "$BUILD_ARGS"
         cache_key="$(printf '%s\0' "$IMAGE_KEY" "${build_args[@]}" | sha256sum)"
-        tag="relaxrl:ci-${cache_key%% *}"
+        cache_key="${cache_key%% *}"
+        tag="relaxrl:ci-$cache_key"
         image_id="$(docker image ls --quiet --no-trunc --filter "reference=$tag")"
 
         if [[ -z "$image_id" ]]; then
-          echo "Waiting for local image build lock: $IMAGE_LOCK_FILE"
-          # Keep the shared lock file; the foreground build inherits fd 9.
-          exec 9>>"$IMAGE_LOCK_FILE"
+          mkdir -p "$IMAGE_LOCK_DIR"
+          lock_file="$IMAGE_LOCK_DIR/$cache_key.lock"
+          echo "Waiting for local image build lock: $lock_file"
+          # Only identical images share a lock; the foreground build inherits fd 9.
+          # Keep the file so every waiter locks the same inode.
+          exec 9>>"$lock_file"
           flock 9
           # Another runner may have finished building while we waited.
           image_id="$(docker image ls --quiet --no-trunc --filter "reference=$tag")"
