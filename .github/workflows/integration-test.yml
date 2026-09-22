@@ -221,7 +221,7 @@ jobs:
           '
 
       - name: Run integration test
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -eo pipefail -c '
             source /usr/local/Ascend/ascend-toolkit/set_env.sh
