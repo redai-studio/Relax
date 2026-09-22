@@ -4,7 +4,7 @@
 
 **Towards Async, Omni-Modal RL at Scale, Just Relax.**
 
-<img src="./assets/Relax.jpg" width="100%" alt="Relax">
+<img src="./assets/Relax.jpg" width="800" alt="Relax">
 
 <p>
   <a href="./LICENSE">
@@ -16,13 +16,13 @@
   <a href="https://arxiv.org/abs/2604.11554">
     <img src="https://img.shields.io/static/v1?label=arXiv&message=Paper&color=red" alt="arXiv">
   </a>
-  <a href="https://redai-infra.github.io/Relax">
+  <a href="https://redai-studio.github.io/Relax">
     <img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Documentation">
   </a>
-  <a href="https://github.com/redai-infra/Relax/discussions/48" target="_blank">
+  <a href="https://github.com/redai-studio/Relax/discussions/48" target="_blank">
     <img src="https://img.shields.io/badge/WeChat-green?logo=wechat" alt="WeChat QR">
   </a>
-  <a href="https://github.com/redai-infra/Relax/discussions/30" target="_blank">
+  <a href="https://github.com/redai-studio/Relax/discussions/30" target="_blank">
     <img src="https://img.shields.io/badge/Docker-Image-blue?logo=docker" alt="Docker Image">
   </a>
 </p>
@@ -34,7 +34,7 @@
 
 ______________________________________________________________________
 
-**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework open-sourced by the Xiaohongshu AI Infra Team for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-infra/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
+**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework open-sourced by the Xiaohongshu AI Infra Team for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-studio/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
 
 ______________________________________________________________________
 
@@ -46,7 +46,7 @@ ______________________________________________________________________
 - 🔁 **Hybrid Mode** — Separate Actor/Rollout placement groups with TransferQueue streaming, while ref / actor_fwd / advantages run in-process on the actor — pairs `--balance-data` with sub-batched forward to minimize GPU waste
 - 🤖 **Agentic RL** — Multi-turn interaction, loss masking, flexible termination, and VLM multimodal context carry-over for closed-loop "execute → observe → decide" training
 - 🔀 **Elastic Rollout Scaling** — Dynamically grow/shrink inference engines mid-training via HTTP REST API, with same-cluster (`ray_native`) and cross-cluster (`external`) federation modes
-- 🧠 **Rich Algorithm Suite** — PPO, GRPO, GSPO, SAPO, CISPO, and On-Policy Distillation out of the box, with pluggable rewards and built-in **GenRM** (LLM-as-judge) mode
+- 🧠 **Rich Algorithm Suite** — PPO, GRPO, M2PO, RLOO, REINFORCE++ variants, GSPO, SAPO, CISPO, and On-Policy Distillation out of the box, with pluggable rewards and built-in **GenRM** (LLM-as-judge) mode
 - 🚀 **Megatron + SGLang Backends** — Megatron-LM (TP/PP/CP/EP) for MoE and deep models, SGLang for high-throughput inference, DCS for NCCL-broadcast weight sync
 - 📦 **Production-Ready Ops** — HealthManager auto-recovery, centralized Metrics Service (WandB / TensorBoard / ClearML), and Apprise real-time notifications
 
@@ -54,11 +54,14 @@ ______________________________________________________________________
 
 ## 📢 News
 
-| 📣 Updates                                                                                                                                                                                         |
-| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **\[05/26/2026\]** 🔁 New **Hybrid** execution mode — streaming data + in-process ref/actor_fwd, with `--balance-data` support. See the [Hybrid Training Guide](docs/en/guide/hybrid-training.md). |
-| **\[05/11/2026\]** 🚀 Support for Qwen3.6 series models (text + VLM)!                                                                                                                              |
-| **\[04/15/2026\]** 🎉 Relax is now open-source!                                                                                                                                                    |
+| 📣 Updates                                                                                                                                                                                                    |
+| :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **\[08/20/2026\]** 🧠 Added **M2PO**, **RLOO**, and two **REINFORCE++** variants, with runnable RLOO and REINFORCE++ recipes plus an [Algorithm Reference](docs/en/examples/algorithms.md) covering all four. |
+| **\[08/19/2026\]** 🤖 Added multi-agent training with multi-context trajectory export and a [Search-R1 reference recipe](examples/search_r1/).                                                                |
+| **\[08/18/2026\]** 🪶 LoRA RL now supports MoE models in both adapter and merge workflows. See the [LoRA Training Guide](docs/en/guide/low-rank-adaptation-training.md).                                      |
+| **\[05/26/2026\]** 🔁 New **Hybrid** execution mode — streaming data + in-process ref/actor_fwd, with `--balance-data` support. See the [Hybrid Training Guide](docs/en/guide/hybrid-training.md).            |
+| **\[05/11/2026\]** 🚀 Support for Qwen3.6 series models (text + VLM)!                                                                                                                                         |
+| **\[04/15/2026\]** 🎉 Relax is now open-source!                                                                                                                                                               |
 
 ______________________________________________________________________
 
@@ -95,12 +98,16 @@ ______________________________________________________________________
 | :------------------------- | :------------------ | :------------------------------------------------ |
 | **PPO**                    | Actor-Critic        | Proximal Policy Optimization                      |
 | **GRPO**                   | Policy Optimization | Group Relative Policy Optimization                |
+| **M2PO**                   | Policy Optimization | Second-Moment Trust Policy Optimization           |
+| **RLOO**                   | Policy Optimization | REINFORCE Leave-One-Out                           |
+| **REINFORCE++**            | Policy Optimization | Token KL-to-go with global normalization          |
+| **REINFORCE++-baseline**   | Policy Optimization | Group-baseline REINFORCE++ variant                |
 | **GSPO**                   | Policy Optimization | Group-wise Sequence-level Policy Optimization     |
 | **SAPO**                   | Policy Optimization | Soft Adaptive Policy Optimization                 |
 | **CISPO**                  | Policy Optimization | Clipped Importance-ratio Soft Policy Optimization |
 | **On-Policy Distillation** | Knowledge Transfer  | Teacher-student KL penalty distillation           |
 
-> 📖 Adding a new algorithm is straightforward — implement a service class, register it in the `ALGOS` registry, and you're done.
+> 📖 See the [Algorithm Reference](docs/en/examples/algorithms.md) for objectives, recipes, and execution-mode constraints.
 
 ______________________________________________________________________
 
@@ -108,18 +115,19 @@ ______________________________________________________________________
 
 Relax is designed for **omni-modal RL training** — text, vision, and audio in one unified framework. Multimodal data is configured via the `--multimodal-keys` flag, with complete image/video/audio processing pipelines under `relax/utils/multimodal/` for fine-grained control over image token counts, video frame sampling, and audio sample rates.
 
-| Model Family                                                    | Sizes             | Modality              | Typical Tasks                                        | Backend  |
-| :-------------------------------------------------------------- | :---------------- | :-------------------- | :--------------------------------------------------- | :------- |
-| **Qwen3**                                                       | 4B, 30B-A3B (MoE) | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
-| **Qwen3-VL**                                                    | 4B, 30B-A3B       | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3.5**                                                     | 30B-A3B           | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **Qwen3-Omni**                                                  | 30B-A3B           | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
-| **Qwen3.6**                                                     | 35B-A3B (MoE)     | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
-| **GLM5**                                                        | 744B-A40B (MoE)   | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
-| **Kimi K2.6**                                                   | ~1T-A32B (MoE)    | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
-| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |
+| Model Family                                                    | Sizes                                      | Modality              | Typical Tasks                                        | Backend  |
+| :-------------------------------------------------------------- | :----------------------------------------- | :-------------------- | :--------------------------------------------------- | :------- |
+| **Qwen3**                                                       | 4B, 30B-A3B (MoE)                          | Text                  | Math reasoning, code, multi-turn dialogue, tool use  | Megatron |
+| **Qwen3-VL**                                                    | 4B, 30B-A3B                                | Vision + Language     | Visual QA, image understanding, multimodal reasoning | Megatron |
+| **Qwen3.5**                                                     | 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B | Text + Vision         | Reasoning, SFT, visual QA, multimodal reasoning      | Megatron |
+| **Qwen3-Omni**                                                  | 30B-A3B                                    | Text + Vision + Audio | Audio-visual QA, omni-modal understanding            | Megatron |
+| **Qwen3.6**                                                     | 27B, 35B-A3B                               | Text + Vision         | Reasoning, visual QA, multimodal reasoning           | Megatron |
+| **Qwen3.8**                                                     | 27B                                        | Text + Vision         | Reasoning, SFT, visual QA, multimodal reasoning      | Megatron |
+| **GLM5**                                                        | 744B-A40B (MoE)                            | Text                  | Math reasoning, code, multi-turn dialogue            | Megatron |
+| **Kimi K2.6**                                                   | ~1T-A32B (MoE)                             | Vision + Language     | Visual QA, multimodal reasoning; INT4 QAT training   | Megatron |
+| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                                         | Vision + Language     | OCR, document understanding, multimodal reasoning    | Megatron |
 
-> 📖 New architectures are integrated via [Megatron Bridge](relax/backends/megatron/mbridge/) for automatic HF ↔ Megatron weight conversion.
+> 📖 New architectures are integrated through Megatron Bridge; see the [External Model Integration Guide](docs/en/guide/external-model-integration.md) for the rollout, training, and weight-conversion hooks.
 
 ______________________________________________________________________
 
@@ -129,15 +137,15 @@ The recommended way to run Relax is via the official Docker image, which ships w
 
 ```bash
 # Pull the official image
-docker pull ghcr.io/redai-infra/relaxrl:latest
+docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # Launch a container with GPUs, shared memory, and your workspace mounted
 docker run -it --gpus all --ipc=host --network=host \
   -v /path/to/your/workspace:/root \
-  ghcr.io/redai-infra/relaxrl:latest bash
+  ghcr.io/redai-studio/relaxrl:latest bash
 
 # Inside the container
-git clone https://github.com/redai-infra/Relax.git /root/Relax
+git clone https://github.com/redai-studio/Relax.git /root/Relax
 cd /root/Relax && pip install -e .
 ```
 
@@ -246,16 +254,20 @@ ______________________________________________________________________
 
 ## 📚 Documentation
 
-Full bilingual documentation is available at **[redai-infra.github.io/Relax](https://redai-infra.github.io/Relax)**.
+Full bilingual documentation is available at **[redai-studio.github.io/Relax](https://redai-studio.github.io/Relax)**.
 
 ______________________________________________________________________
 
 ## 🧪 Examples
 
-| Example                                                      | Description                                           |
-| :----------------------------------------------------------- | :---------------------------------------------------- |
-| [DeepEyes](./examples/deepeyes/)                             | Multi-modal vision-language RL with Qwen3-VL          |
-| [On-Policy Distillation](./examples/on_policy_distillation/) | Teacher-student knowledge distillation via KL penalty |
+| Example                                                      | Description                                             |
+| :----------------------------------------------------------- | :------------------------------------------------------ |
+| [Algorithm Recipes](./examples/algorithms/)                  | RLOO, REINFORCE++, CISPO, and related policy optimizers |
+| [DeepEyes](./examples/deepeyes/)                             | Multi-modal vision-language RL with Qwen3-VL            |
+| [Search-R1](./examples/search_r1/)                           | Search-augmented single-agent and multi-agent RL        |
+| [Mini-SWE-Agent](./examples/mini_swe_agent/)                 | Agentic RL for software-engineering tasks               |
+| [NeMo Gym Agentic](./examples/nemo_gym_agentic/)             | Agentic environment integrations and runnable recipes   |
+| [On-Policy Distillation](./examples/on_policy_distillation/) | Teacher-student knowledge distillation via KL penalty   |
 
 ______________________________________________________________________
 
@@ -264,6 +276,7 @@ ______________________________________________________________________
 | Project                                                  | Description                                                                                                                                                             |
 | :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [HyperEyes](https://github.com/DeepExperience/HyperEyes) | A parallel multimodal search agent that uses Relax for efficient RL training, combining visual grounding and retrieval to search across multiple entities concurrently. |
+| [Iris](https://github.com/AllSpark-Research/Iris)        | An open-weight search agent family post-trained with Relax from Qwen3.5/3.6, designed for long-horizon search, iterative evidence gathering, and context management.    |
 
 ______________________________________________________________________
 

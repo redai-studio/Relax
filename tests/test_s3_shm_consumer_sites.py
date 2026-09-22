@@ -1,11 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Regression tests for the two s3://-model-path consumer sites fixed in
-``fix(agentic/sft): resolve s3 model path ...``.
+"""Regression tests for S3 model paths in agentic compiler and SFT consumers.
 
-Each site must, when S3 selects its ``hf_checkpoint``, resolve the
-checkpoint to a shm path *before* handing it to the tokenizer /
-processor loaders, and must NOT mutate the shared args/config object.
+Each site must resolve an S3-selected ``hf_checkpoint`` to a shm path before
+handing it to tokenizer and processor loaders.
 """
 
 import importlib
@@ -35,6 +33,16 @@ def processor_pool_module(monkeypatch):
 
 
 @pytest.fixture()
+def processing_utils_module(monkeypatch):
+    module = ModuleType("relax.utils.data.processing_utils")
+    module.configure_encode_executor = MagicMock(return_value="EXECUTOR")
+    module.load_processor = MagicMock(return_value="PROCESSOR")
+    module.load_tokenizer = MagicMock(return_value="TOKENIZER")
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processing_utils", module)
+    return module
+
+
+@pytest.fixture()
 def sft_module(monkeypatch, processor_pool_module):
     module_name = "relax.components.sft"
     original_module = sys.modules.get(module_name)
@@ -60,7 +68,7 @@ def sft_module(monkeypatch, processor_pool_module):
                 delattr(components_module, "sft")
 
 
-def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch, processor_pool_module):
+def test_load_agentic_compiler_resources_resolves_s3_path(monkeypatch, processing_utils_module, processor_pool_module):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -77,19 +85,24 @@ def test_bootstrap_processor_pool_resolves_s3_path(monkeypatch, processor_pool_m
 
     args = SimpleNamespace(
         mm_processor_pool_size=2,
+        encode_max_workers=4,
         hf_checkpoint="s3://bkt/model/",
         model_source=_model_source("s3://bkt/model/"),
     )
-    result = runtime._bootstrap_processor_pool(args)
+    resources = runtime.load_agentic_compiler_resources(args)
 
-    assert result == "POOL"
+    assert resources.processor_pool == "POOL"
     assert captured["resolve_args"] is args
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
+    processing_utils_module.load_tokenizer.assert_called_once_with("/dev/shm/resolved_model", trust_remote_code=True)
+    processing_utils_module.load_processor.assert_called_once_with("/dev/shm/resolved_model", trust_remote_code=True)
     assert captured["pool_kwargs"]["model_path"] == "/dev/shm/resolved_model"
     assert args.hf_checkpoint == "/dev/shm/resolved_model"
 
 
-def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch, processor_pool_module):
+def test_load_agentic_compiler_resources_noop_when_S3_disabled(
+    monkeypatch, processing_utils_module, processor_pool_module
+):
     captured = {}
 
     def fake_update(obj, **kwargs):
@@ -105,23 +118,17 @@ def test_bootstrap_processor_pool_noop_when_S3_disabled(monkeypatch, processor_p
 
     args = SimpleNamespace(
         mm_processor_pool_size=1,
+        encode_max_workers=4,
         hf_checkpoint="s3://bkt/model/",
         model_source=None,
     )
-    runtime._bootstrap_processor_pool(args)
+    runtime.load_agentic_compiler_resources(args)
 
     assert captured["resolve_args"] is args
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
+    processing_utils_module.load_tokenizer.assert_called_once_with("s3://bkt/model/", trust_remote_code=True)
+    processing_utils_module.load_processor.assert_called_once_with("s3://bkt/model/", trust_remote_code=True)
     assert captured["pool_kwargs"]["model_path"] == "s3://bkt/model/"
-
-
-def test_bootstrap_processor_pool_skips_when_pool_disabled():
-    args = SimpleNamespace(
-        mm_processor_pool_size=0,
-        hf_checkpoint="s3://x/",
-        model_source=_model_source("s3://x/"),
-    )
-    assert runtime._bootstrap_processor_pool(args) is None
 
 
 class _FakeDataset:
@@ -186,7 +193,12 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
     assert captured["resolve_args"] is config
     assert captured["resolve_kwargs"] == {"completeness": "metadata"}
     sft_module.AutoTokenizer.from_pretrained.assert_called_once_with(resolved, trust_remote_code=True)
-    sft_module.ProcessorPool.assert_called_once_with(resolved, pool_size=None, trust_remote_code=True)
+    sft_module.ProcessorPool.assert_called_once_with(
+        resolved,
+        pool_size=None,
+        trust_remote_code=True,
+        multimodal_config=sft_module.MultimodalConfig.from_args(config),
+    )
     sft_module._resolve_pad_token_ids_from_config.assert_called_once_with(resolved)
     assert config.hf_checkpoint == resolved
 

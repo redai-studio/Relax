@@ -5,13 +5,23 @@
 # Multi-Teacher OPD (MOPD), 2-node 16 GPU colocate:
 #   student : Qwen3.5-35B-A3B,  actor(16) + rollout(8) colocate, TP=4 PP=2 EP=8
 #   teacher : one per data_source, shares the actor GPU pool (colocate)
-#     dapo-math-17k       -> Qwen3.6-27B  (text, 4 GPU TP=4)
-#     multimodal-open-r1  -> Qwen3.5-27B  (VL,   4 GPU TP=4)
+#     dapo-math-17k       -> Qwen3.6-27B  (text, 4 GPU = 2 replicas TP=2)
+#     multimodal-open-r1  -> Qwen3.5-27B  (VL,   4 GPU = 2 replicas TP=2)
 #
 # Colocate GPU layout (2 nodes × 8 GPU, one shared placement group):
 #   training : student actor uses ALL 16 GPUs (TP=4 PP=2 EP=8, DP=2)
-#   rollout  : GPU 0-7 student rollout (TP=8) | GPU 8-15 teachers
-#   teachers : GPU 8-11 text Qwen3.6-27B (TP=4) | GPU 12-15 VL Qwen3.5-27B (TP=4)
+#   rollout  : GPU 0-7 student rollout (2 engines TP=4) | GPU 8-15 teachers
+#   teachers : GPU 8-9 + 10-11 text Qwen3.6-27B | GPU 12-13 + 14-15 VL Qwen3.5-27B
+#
+# Why replicas instead of one wide engine per role: each engine has a single
+# scheduler with a bounded per-iteration prefill budget (chunked-prefill-size),
+# so a step's requests queue up behind it; splitting the same GPUs into more
+# engines gives independent schedulers and divides per-engine concurrency.
+# Requests round-robin across a teacher's replicas (_pick_teacher_url).
+# chunked-prefill-size is raised to 16384 (sglang's max_prefill_tokens ceiling)
+# for student and teachers alike: long multi-image prompts overflow the default
+# budget, which pins prefill at one sequence per iteration and needs many more
+# passes per request.
 # Constraint (enforced): rollout_gpus(8) + teacher_gpus(8) == actor_gpus(16).
 # Teachers live inside the actor placement group and offload/onload in lock-step
 # with training. Training the student on all 16 GPUs (TP=4 PP=2) is what fixes
@@ -28,7 +38,9 @@ set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH"
+export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
+export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -54,7 +66,7 @@ EVAL_SET="${EVAL_SET:-${PROMPT_SET%/*}/test_small.parquet}"
 ACTOR_GPUS="${ACTOR_GPUS:-16}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 TEACHER_GPUS="${TEACHER_GPUS:-8}"
-TEACHER_NUM_GPUS_PER_ENGINE="${TEACHER_NUM_GPUS_PER_ENGINE:-4}"
+TEACHER_NUM_GPUS_PER_ENGINE="${TEACHER_NUM_GPUS_PER_ENGINE:-2}"
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}/${STUDENT_MODEL_NAME}/"
@@ -96,12 +108,12 @@ OPD_ARGS=(
    --opd-teacher-key data_source
    --opd-teacher-routes "${TEACHER_ROUTES}"
    --teacher-num-gpus-per-engine "${TEACHER_NUM_GPUS_PER_ENGINE}"
-   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.65}"
-   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-4096}"
+   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.5}"
+   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-16384}"
    --teacher-sglang-max-running-requests "${TEACHER_MAX_RUNNING_REQUESTS:-128}"
    --teacher-sglang-disable-cuda-graph
    --opd-log-prob-min-clamp -10.0
-   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-600}"
+   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-1200}"
    --opd-teacher-image-key images
    --use-rollout-logprobs
 )
@@ -172,8 +184,9 @@ PERF_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
+   --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.6
+   --sglang-chunked-prefill-size 16384
    --sglang-max-running-requests 128
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup

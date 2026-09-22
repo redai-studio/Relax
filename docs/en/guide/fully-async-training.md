@@ -156,7 +156,7 @@ In Fully Async mode, Actor uses `StreamingDataLoader` for **streaming data consu
 #### StreamingDataset
 
 ```python
-# TransferQueue (installed from https://github.com/redai-infra/TransferQueue)
+# TransferQueue (installed from https://github.com/redai-studio/TransferQueue)
 class StreamingDataset(IterableDataset):
     """Streaming dataset that dynamically fetches data from TransferQueue"""
 

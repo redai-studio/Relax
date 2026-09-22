@@ -11,6 +11,7 @@ from relax.utils.multimodal.image_utils import (
     get_resize_height_width,
     image_smart_resize,
     load_image,
+    resize_qwen_vl_extreme_aspect_ratio,
     to_rgb,
 )
 
@@ -70,6 +71,25 @@ def test_image_smart_resize_preserves_mode_and_patch_alignment():
     assert resized.size == (56, 28)
     assert resized.size[0] % 28 == 0 and resized.size[1] % 28 == 0
     assert 28 * 28 <= resized.width * resized.height <= 4 * 28 * 28
+
+
+@pytest.mark.parametrize("size", [(750, 1), (1, 750), (201, 1), (1, 201)])
+def test_resize_qwen_vl_extreme_aspect_ratio_makes_image_safe(size):
+    image = Image.new("RGB", size, (12, 34, 56))
+
+    resized = resize_qwen_vl_extreme_aspect_ratio(image)
+
+    assert max(resized.size) / min(resized.size) < 200
+    assert resized.mode == image.mode
+    assert resized.width >= resized.height if image.width >= image.height else resized.height >= resized.width
+    assert resize_qwen_vl_extreme_aspect_ratio(resized) is resized
+
+
+@pytest.mark.parametrize("size", [(200, 1), (1, 200), (100, 100)])
+def test_resize_qwen_vl_extreme_aspect_ratio_leaves_valid_image_unchanged(size):
+    image = Image.new("RGB", size, (12, 34, 56))
+
+    assert resize_qwen_vl_extreme_aspect_ratio(image) is image
 
 
 def test_to_rgb_composites_rgba_over_white():
@@ -142,6 +162,16 @@ def test_load_image_supports_local_path_and_file_uri(tmp_path):
 
     assert from_path.size == (2, 2)
     assert from_uri.getpixel((1, 1)) == (9, 8, 7)
+
+
+def test_load_image_supports_truncated_jpeg():
+    source = Image.new("RGB", (8, 8), (1, 2, 3))
+    buffer = BytesIO()
+    source.save(buffer, format="JPEG")
+
+    loaded = load_image(buffer.getvalue()[:-4])
+
+    assert loaded.size == (8, 8)
 
 
 def test_load_image_rejects_unsupported_type():

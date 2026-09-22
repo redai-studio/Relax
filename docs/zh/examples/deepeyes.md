@@ -13,7 +13,7 @@ DeepEyes 示例演示了使用 Relax 进行 **Agent 式多轮视觉语言强化�
 
 ## 数据准备
 
-DeepEyes 使用 HuggingFace 上的 [Visual-Agent/DeepEyes](https://huggingface.co/datasets/Visual-Agent/DeepEyes) 数据集。数据集包含视觉问答样本，图像以 HF Image 格式内嵌存储。
+DeepEyes 使用 HuggingFace 上的 [ChenShawn/DeepEyes-Datasets-47k](https://huggingface.co/datasets/ChenShawn/DeepEyes-Datasets-47k) 数据集。数据集包含视觉问答样本，图像以 HF Image 格式内嵌存储。
 
 ### 下载数据集
 

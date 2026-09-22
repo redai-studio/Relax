@@ -55,7 +55,7 @@ def test_tracked_run_timeout_reports_partial_output() -> None:
             stderr=subprocess.STDOUT,
             timeout=0.3,
         )
-    assert "partial" in (excinfo.value.output or "")
+    assert b"partial" in (excinfo.value.output or b"")
 
 
 def test_tracked_run_exit_codes_not_swallowed_by_reaper() -> None:

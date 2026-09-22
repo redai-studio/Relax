@@ -80,11 +80,28 @@ def get_current_node_ip():
     return address
 
 
-def get_free_port(start_port=10000, consecutive=1):
+def get_free_port(start_port=10000, consecutive=1, max_port=None):
     # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
+    #
+    # max_port (optional, additive): when set, the highest port in the returned
+    # block (port + consecutive - 1) must be <= max_port; otherwise a RuntimeError
+    # is raised instead of scanning unboundedly into the OS ephemeral range
+    # (typically 32768-60999). Default None preserves the original unbounded
+    # behaviour for all existing callers.
     port = start_port
+    if max_port is not None and port + consecutive - 1 > max_port:
+        raise RuntimeError(
+            f"start_port {start_port} + {consecutive} exceeds max_port {max_port}; "
+            "widen the window via the RELAX_WEIGHT_SYNC_PORT_BASE/MAX (weight sync) or "
+            "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE/MAX (scale precheck) env vars"
+        )
     while not all(is_port_available(port + i) for i in range(consecutive)):
         port += 1
+        if max_port is not None and port + consecutive - 1 > max_port:
+            raise RuntimeError(
+                f"No free block of {consecutive} consecutive port(s) in "
+                f"[{start_port}, {max_port}] (exhausted the bounded window); widen the window via the RELAX_WEIGHT_SYNC_PORT_BASE/MAX (weight sync) or RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE/MAX (scale precheck) env vars"
+            )
     return port
 
 

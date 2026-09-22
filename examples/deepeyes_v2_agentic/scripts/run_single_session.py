@@ -166,26 +166,10 @@ def print_transcript(messages: list[dict[str, Any]]) -> None:
         print(_abbrev_content(msg.get("content")))
 
 
-def ensure_jupyter_client() -> None:
-    # Mirror of the guard in run_agent_app.sh: apptainer_jupyter_backend
-    # lazily imports jupyter_client at session-create time, so a missing
-    # host-side install only surfaces after the agent has launched and
-    # eaten one chat turn. Check up-front and install on miss.
-    try:
-        import jupyter_client  # noqa: F401
-
-        return
-    except ImportError:
-        pass
-    print("[harness] jupyter_client missing — installing into the current Python env", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--no-input", "jupyter_client>=8"])
-
-
 def check_env() -> None:
     missing = [k for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if not os.environ.get(k)]
     if missing:
         sys.exit(f"missing required env: {', '.join(missing)}")
-    ensure_jupyter_client()
     # Auto-derive APPTAINER_IMAGE_PATH from DATA_DIR if not explicitly set.
     if not os.environ.get("APPTAINER_IMAGE_PATH"):
         data_dir = os.environ.get("DATA_DIR")

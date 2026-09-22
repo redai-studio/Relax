@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from openai import APIStatusError, AsyncOpenAI
 
 from app.env_alfworld import AlfworldEnv
@@ -27,6 +26,10 @@ from app.env_alfworld import AlfworldEnv
 
 MAX_TURNS = int(os.environ.get("ALFWORLD_MAX_TURNS", "40"))
 HISTORY_LENGTH = int(os.environ.get("ALFWORLD_HISTORY_LENGTH", "2"))
+# Mirrors --rollout-max-response-len, purely so the two budgets that both end a
+# turn with finish_reason == "length" can be told apart (see run_alfworld).
+# 0 or unset keeps the old undifferentiated behaviour.
+MAX_RESPONSE_LEN = int(os.environ.get("ALFWORLD_MAX_RESPONSE_LEN", "0"))
 CONFIG_PATH = str(Path(__file__).with_name("config_tw.yaml"))
 
 
@@ -55,7 +58,7 @@ async def run_alfworld(metadata: dict[str, Any]) -> dict[str, Any]:
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"],
-        timeout=httpx.Timeout(timeout=900.0, connect=30.0),
+        timeout=9999,
     )
 
     won = False
@@ -68,14 +71,27 @@ async def run_alfworld(metadata: dict[str, Any]) -> dict[str, Any]:
         except APIStatusError as exc:
             error = exc.response.json().get("error")
             if isinstance(error, dict) and error.get("code") == "context_length_exceeded":
-                stop_reason = "finish_length"
+                # Distinct from a per-turn length stop: here the accumulated
+                # multi-turn context ran out, which points at
+                # --rollout-max-context-len rather than --rollout-max-response-len.
+                stop_reason = "context_exhausted"
                 break
             raise
 
         response_text = response.choices[0].message.content or ""
         messages.append({"role": "assistant", "content": response_text})
         if response.choices[0].finish_reason == "length":
-            stop_reason = "finish_length"
+            # Two different budgets stop a turn with finish_reason == "length".
+            # Hitting the per-turn cap generates exactly MAX_RESPONSE_LEN
+            # tokens; a shorter completion means the session service clamped
+            # max_new_tokens down to what was left of --rollout-max-context-len
+            # (a silent clamp, so this is the only place it is observable).
+            # Attributing both to "finish_length" would blame the per-turn cap
+            # for episodes the context ceiling actually killed.
+            usage = response.usage
+            completion_tokens = usage.completion_tokens if usage is not None else None
+            clamped = MAX_RESPONSE_LEN > 0 and completion_tokens is not None and completion_tokens < MAX_RESPONSE_LEN
+            stop_reason = "context_exhausted" if clamped else "finish_length"
             break
 
         next_prompt, done, info = env.step(response_text)

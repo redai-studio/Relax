@@ -24,6 +24,8 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
     ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim
     fix.
     """
+    name = name.replace(".to_wrap.", ".")
+
     if "expert_bias" in name:
         return param
 
@@ -139,8 +141,10 @@ def all_gather_params_async(
     handles = []
 
     for info, param in param_infos_and_params:
-        # Prepare async all_gather
-        if "expert_bias" in info.name:
+        # Prepare async all_gather. Strip the LoRA ``.to_wrap.`` infix so name-based
+        # dispatch matches the plain non-LoRA name (see all_gather_param). No-op otherwise.
+        name = info.name.replace(".to_wrap.", ".")
+        if "expert_bias" in name:
             gather_tasks.append((info, param, None, None, None))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
@@ -148,7 +152,7 @@ def all_gather_params_async(
             handles.append(None)
         else:
             # Start async all_gather
-            if ".experts." in info.name:
+            if ".experts." in name:
                 tp_size = mpu.get_expert_tensor_parallel_world_size()
                 tp_group = mpu.get_expert_tensor_parallel_group()
             else:
@@ -175,13 +179,14 @@ def all_gather_params_async(
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_dim must be set for TP-sharded params"
+            name = info.name.replace(".to_wrap.", ".")
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name and "vision_model" not in info.name:
+            if "linear_fc1.weight" in name and "vision_model" not in name:
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name and "vision_model" not in info.name:
+            if "linear_fc2.weight" in name and "vision_model" not in name:
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)

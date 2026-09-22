@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import importlib.util
-import sys
 import threading
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import transfer_queue
+
+from tests.core.controller_test_utils import load_controller_with_stubbed_dependencies
 
 
 if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
@@ -16,105 +16,54 @@ if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
         allow_module_level=True,
     )
 
-
-_MISSING = object()
-_REGISTRY_COMPONENTS = {
-    "relax.components.actor": "Actor",
-    "relax.components.actor_fwd": "ActorFwd",
-    "relax.components.advantages": "Advantages",
-    "relax.components.critic": "Critic",
-    "relax.components.rollout": "Rollout",
-    "relax.components.sft": "SFT",
-}
-_DCS_SERVICE_MODULES = (
-    "relax.distributed.checkpoint_service",
-    "relax.distributed.checkpoint_service.coordinator",
-    "relax.distributed.checkpoint_service.coordinator.service",
-)
-
-
-def _load_controller_with_stubbed_registry_components():
-    saved_modules = {
-        name: sys.modules.get(name, _MISSING)
-        for name in [*_REGISTRY_COMPONENTS, *_DCS_SERVICE_MODULES, "relax.core.registry"]
-    }
-    core_module = sys.modules.get("relax.core")
-    registry_attr_was_set = core_module is not None and hasattr(core_module, "registry")
-    original_registry_attr = getattr(core_module, "registry", None) if registry_attr_was_set else None
-    distributed_module = sys.modules.get("relax.distributed")
-    checkpoint_service_attr_was_set = distributed_module is not None and hasattr(
-        distributed_module, "checkpoint_service"
-    )
-    original_checkpoint_service_attr = (
-        getattr(distributed_module, "checkpoint_service", None) if checkpoint_service_attr_was_set else None
-    )
-    components_module = sys.modules.get("relax.components")
-    saved_component_attrs = {}
-    if components_module is not None:
-        for module_name in _REGISTRY_COMPONENTS:
-            attr_name = module_name.rsplit(".", 1)[1]
-            saved_component_attrs[attr_name] = (
-                hasattr(components_module, attr_name),
-                getattr(components_module, attr_name, None),
-            )
-
-    module_name = "_test_controller_s3_model_cleanup_controller"
-    try:
-        for component_module_name, class_name in _REGISTRY_COMPONENTS.items():
-            module = ModuleType(component_module_name)
-            setattr(module, class_name, type(class_name, (), {}))
-            sys.modules[component_module_name] = module
-        checkpoint_service_module = ModuleType("relax.distributed.checkpoint_service")
-        checkpoint_service_module.__path__ = []
-        coordinator_module = ModuleType("relax.distributed.checkpoint_service.coordinator")
-        coordinator_module.__path__ = []
-        dcs_service_module = ModuleType("relax.distributed.checkpoint_service.coordinator.service")
-        dcs_service_module.create_dcs_deployment = lambda *_args, **_kwargs: None
-        checkpoint_service_module.coordinator = coordinator_module
-        coordinator_module.service = dcs_service_module
-        sys.modules["relax.distributed.checkpoint_service"] = checkpoint_service_module
-        sys.modules["relax.distributed.checkpoint_service.coordinator"] = coordinator_module
-        sys.modules["relax.distributed.checkpoint_service.coordinator.service"] = dcs_service_module
-        if distributed_module is not None:
-            distributed_module.checkpoint_service = checkpoint_service_module
-        sys.modules.pop("relax.core.registry", None)
-        if core_module is not None and registry_attr_was_set:
-            delattr(core_module, "registry")
-
-        controller_path = Path(__file__).resolve().parents[2] / "relax" / "core" / "controller.py"
-        spec = importlib.util.spec_from_file_location(module_name, controller_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.modules.pop(module_name, None)
-        for name, original_module in saved_modules.items():
-            if original_module is _MISSING:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = original_module
-        if core_module is not None:
-            if registry_attr_was_set:
-                setattr(core_module, "registry", original_registry_attr)
-            elif hasattr(core_module, "registry"):
-                delattr(core_module, "registry")
-        if distributed_module is not None:
-            if checkpoint_service_attr_was_set:
-                setattr(distributed_module, "checkpoint_service", original_checkpoint_service_attr)
-            elif hasattr(distributed_module, "checkpoint_service"):
-                delattr(distributed_module, "checkpoint_service")
-        if components_module is not None:
-            for attr_name, (attr_was_set, original_attr) in saved_component_attrs.items():
-                if attr_was_set:
-                    setattr(components_module, attr_name, original_attr)
-                elif hasattr(components_module, attr_name):
-                    delattr(components_module, attr_name)
-
-
-controller = _load_controller_with_stubbed_registry_components()
+controller = load_controller_with_stubbed_dependencies("_test_controller_s3_model_cleanup_controller")
 ROLES = controller.ROLES
+
+
+def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"))
+    model_config = {"model_type": "qwen3", "hidden_size": 4096}
+    monkeypatch.setattr(controller, "read_s3_model_config", lambda args: model_config)
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert start_config._model_source_config is model_config
+    assert not hasattr(config, "_model_source_config")
+
+
+def test_train_start_config_fails_open_when_remote_config_is_unavailable(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"))
+    warnings = []
+    monkeypatch.setattr(
+        controller,
+        "read_s3_model_config",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("not found")),
+    )
+    monkeypatch.setattr(controller.logger, "warning", warnings.append)
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert not hasattr(start_config, "_model_source_config")
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0]
+    assert "not found" not in warnings[0]
+    assert "s3://" not in warnings[0]
+
+
+def test_train_start_config_does_not_read_local_model(monkeypatch):
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="/models/qwen3"))
+    monkeypatch.setattr(
+        controller,
+        "read_s3_model_config",
+        lambda _args: pytest.fail("local model must not use the S3 client"),
+    )
+
+    start_config = controller._build_train_start_config(config)
+
+    assert start_config is not config
+    assert not hasattr(start_config, "_model_source_config")
 
 
 class _FakeCleanupTask:
@@ -131,7 +80,7 @@ class _FakeCleanupTask:
 
 def test_controller_s3_cleanup_runs_once_on_each_alive_node(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", "17.5")
-    config = SimpleNamespace(model_source=SimpleNamespace(), disable_s3_model_cleanup=False)
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -229,7 +178,7 @@ def test_controller_s3_cleanup_requires_model_source():
 
 def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_CANCEL_TIMEOUT_S", "2.5")
-    config = SimpleNamespace(model_source=SimpleNamespace(), disable_s3_model_cleanup=False)
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -261,7 +210,7 @@ def test_controller_s3_cleanup_timeout_cancels_pending_tasks(monkeypatch):
 
 
 def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkeypatch):
-    config = SimpleNamespace(model_source=SimpleNamespace(), disable_s3_model_cleanup=False)
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -282,7 +231,7 @@ def test_controller_s3_cleanup_timeout_raises_when_cancel_remains_pending(monkey
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_controller_s3_cleanup_rejects_non_positive_task_timeout(monkeypatch, value):
     monkeypatch.setenv("RELAX_S3_MODEL_CLEANUP_TASK_TIMEOUT_S", value)
-    config = SimpleNamespace(model_source=SimpleNamespace(), disable_s3_model_cleanup=False)
+    config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/model/"), disable_s3_model_cleanup=False)
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = config
     instance.serve_dict = {}
@@ -302,6 +251,170 @@ def test_controller_s3_cleanup_disable_skips_node_discovery(monkeypatch):
     monkeypatch.setattr(controller.ray, "nodes", lambda: (_ for _ in ()).throw(AssertionError("must not run")))
 
     instance._cleanup_s3_model_weights_after_init()
+
+
+def test_controller_local_model_source_skips_node_discovery(monkeypatch):
+    config = SimpleNamespace(
+        model_source=SimpleNamespace(uri="/models/local"),
+        disable_s3_model_cleanup=False,
+    )
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = config
+    monkeypatch.setattr(controller.ray, "nodes", lambda: (_ for _ in ()).throw(AssertionError("must not run")))
+
+    instance._cleanup_s3_model_weights_after_init()
+
+
+@pytest.mark.parametrize(
+    ("role", "load_format", "shares_actor_pg", "expected"),
+    [
+        ("actor", "runai_streamer", False, controller.ModelCompleteness.FULL),
+        ("rollout", "dummy", False, controller.ModelCompleteness.METADATA),
+        ("rollout", "runai_streamer", True, controller.ModelCompleteness.NONE),
+        ("rollout", "auto", False, controller.ModelCompleteness.NONE),
+        ("rollout", "auto", True, controller.ModelCompleteness.FULL),
+        ("genrm", "auto", True, controller.ModelCompleteness.NONE),
+    ],
+)
+def test_policy_model_completeness(role, load_format, shares_actor_pg, expected):
+    config = SimpleNamespace(
+        sglang_load_format=load_format,
+        rollout_external=False,
+        sglang_config=None,
+    )
+
+    assert (
+        controller.Controller._policy_model_completeness(
+            config,
+            role,
+            shares_actor_pg=shares_actor_pg,
+        )
+        == expected
+    )
+
+
+def test_controller_prepares_then_deploys_service(monkeypatch):
+    events = []
+
+    class FakeService:
+        def __init__(self, _cls, **kwargs):
+            events.append(("prepare", kwargs["defer_deploy"]))
+            self.pgs = ("pg", [0], [0])
+
+        def deploy(self):
+            events.append(("deploy", self.pgs))
+
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace()
+    instance.runtime_env = None
+    instance._health_manager = SimpleNamespace(status=object())
+    monkeypatch.setattr(controller, "Service", FakeService)
+
+    role, service, error = instance._create_service_task(
+        "actor",
+        object(),
+        1,
+        None,
+        None,
+        defer_deploy=True,
+    )
+    assert (role, error) == ("actor", None)
+    assert events == [("prepare", True)]
+
+    role, deployed, error = instance._deploy_service_task(role, service)
+    assert (role, deployed, error) == ("actor", service, None)
+    assert events == [("prepare", True), ("deploy", service.pgs)]
+
+
+def test_controller_service_phase_preserves_fully_async_concurrency():
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(fully_async=True)
+    barrier = threading.Barrier(2)
+
+    def task(role):
+        barrier.wait(timeout=2)
+        return (role, f"service-{role}", None)
+
+    assert instance._run_service_phase(
+        controller.ServiceStartupPhase.ALLOCATE_RESOURCES,
+        task,
+        [("actor",), ("rollout",)],
+    ) == {
+        "actor": "service-actor",
+        "rollout": "service-rollout",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_source", "expected"),
+    [
+        (None, False),
+        (SimpleNamespace(uri="/models/qwen"), False),
+        (SimpleNamespace(uri="s3://bucket/qwen"), True),
+    ],
+)
+def test_controller_uses_staged_startup_only_for_s3(model_source, expected):
+    assert controller._uses_s3_model_prefetch(SimpleNamespace(model_source=model_source)) is expected
+
+
+def test_controller_local_model_uses_constructor_immediate_deploy(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="/models/qwen"))
+    instance.serve_dict = {}
+    service = object()
+    service_args = [("actor", object(), 1, None, None, ["actor"])]
+    phases = []
+
+    def fake_run(phase, task, task_args):
+        phases.append((phase, task, task_args))
+        return {"actor": service}
+
+    monkeypatch.setattr(instance, "_run_service_phase", fake_run)
+    monkeypatch.setattr(
+        instance,
+        "_start_model_prefetch",
+        lambda _pgs: (_ for _ in ()).throw(AssertionError("local models must not prefetch")),
+    )
+
+    assert instance._start_services(service_args) == []
+    assert instance.serve_dict == {"actor": service}
+    assert phases == [(controller.ServiceStartupPhase.DEPLOY, instance._create_service_task, service_args)]
+
+
+def test_controller_s3_model_allocates_prefetches_then_deploys(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(model_source=SimpleNamespace(uri="s3://bucket/qwen"))
+    instance.serve_dict = {}
+    prepared = SimpleNamespace(pgs=("pg", [0], [0]))
+    deployed = object()
+    service_args = [("actor", object(), 1, None, None, ["actor"])]
+    events = []
+
+    def fake_run(phase, task, task_args):
+        if phase == controller.ServiceStartupPhase.ALLOCATE_RESOURCES:
+            assert isinstance(task, partial)
+            assert task.func == instance._create_service_task
+            assert task.keywords == {"defer_deploy": True}
+            assert task_args == service_args
+            events.append("allocate")
+            return {"actor": prepared}
+        assert phase == controller.ServiceStartupPhase.DEPLOY
+        assert task == instance._deploy_service_task
+        assert task_args == [("actor", prepared)]
+        events.append("deploy")
+        return {"actor": deployed}
+
+    def fake_prefetch(service_pgs):
+        assert service_pgs == {"actor": prepared.pgs}
+        events.append("prefetch")
+        return ["prefetch-ref"]
+
+    monkeypatch.setattr(instance, "_run_service_phase", fake_run)
+    monkeypatch.setattr(instance, "_start_model_prefetch", fake_prefetch)
+
+    assert instance._start_services(service_args) == ["prefetch-ref"]
+    assert events == ["allocate", "prefetch", "deploy"]
+    assert instance.serve_dict == {"actor": deployed}
 
 
 def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkeypatch):

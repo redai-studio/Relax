@@ -1,0 +1,21 @@
+# 4-GPU OPD student rollout: 1 P x TP2 + 1 D x TP2; all engines EP1.
+# The other 4 GPUs host the regular TP4 teacher; actor reuses all 8 for training.
+# Context length, max-running-requests and decode CUDA Graph max batch inherit
+# the launch script values; one D engine serves all resident student sessions.
+# Memory saver, weight backup and disabled prefill CUDA Graph inherit from Relax.
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+    - worker_type: prefill
+      num_gpus: 2
+      overrides:
+        mamba_radix_cache_strategy: extra_buffer
+        chunked_prefill_size: 8192
+        mem_fraction_static: 0.80
+    - worker_type: decode
+      num_gpus: 2
+      overrides:
+        mamba_radix_cache_strategy: extra_buffer
+        chunked_prefill_size: 8192
+        mem_fraction_static: 0.70

@@ -156,7 +156,7 @@ TransferQueue 必须能同时缓存 `max_staleness + 1` 个 rollout batch 的数
 #### StreamingDataset
 
 ```python
-# TransferQueue (installed from https://github.com/redai-infra/TransferQueue)
+# TransferQueue (installed from https://github.com/redai-studio/TransferQueue)
 class StreamingDataset(IterableDataset):
     """流式数据集，从 TransferQueue 动态获取数据"""
 

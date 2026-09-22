@@ -24,13 +24,67 @@ import torch
 
 from relax.utils.megatron_peft_utils import (
     MEGATRON_TO_HF_MODULES,
+    build_lora_peft,
     convert_megatron_to_hf_target_modules,
     count_adapter_parameters,
+    exclude_frozen_lora_target_modules,
     is_lora_adapter_param,
     is_lora_enabled,
     is_lora_merge_mode,
     write_hf_peft_adapter,
 )
+
+
+def test_exclude_frozen_lora_target_modules_keeps_vision_merger() -> None:
+    class ToyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoder = torch.nn.Module()
+            self.decoder.linear_fc1 = torch.nn.Linear(2, 2)
+            self.vision_model = torch.nn.Module()
+            self.vision_model.decoder = torch.nn.Module()
+            self.vision_model.decoder.linear_fc1 = torch.nn.Linear(2, 2)
+            self.vision_model.merger = torch.nn.Module()
+            self.vision_model.merger.linear_fc1 = torch.nn.Linear(2, 2)
+
+    targets = exclude_frozen_lora_target_modules(ToyModel(), ["linear_fc1"], [r"^(vision_model|visual)\.(?!merger\.)"])
+
+    assert targets == ["decoder.linear_fc1", "vision_model.merger.linear_fc1"]
+
+
+class TestBuildLoraPeft:
+    @staticmethod
+    def _install_create_peft_stub(monkeypatch):
+        module = types.ModuleType("megatron.bridge.peft.utils")
+        module.create_peft = lambda config: config
+        monkeypatch.setitem(sys.modules, "megatron", types.ModuleType("megatron"))
+        monkeypatch.setitem(sys.modules, "megatron.bridge", types.ModuleType("megatron.bridge"))
+        monkeypatch.setitem(sys.modules, "megatron.bridge.peft", types.ModuleType("megatron.bridge.peft"))
+        monkeypatch.setitem(sys.modules, "megatron.bridge.peft.utils", module)
+
+    def test_external_baseline_overrides_are_opt_in(self, monkeypatch):
+        self._install_create_peft_stub(monkeypatch)
+        monkeypatch.setenv("RELAX_LORA_A_INIT_METHOD", "kaiming")
+        monkeypatch.setenv("RELAX_LORA_SHARE_EXPERT_ADAPTERS", "false")
+        args = Namespace(
+            lora_rank=32,
+            lora_alpha=64,
+            lora_target_modules=["linear_qkv", "linear_fc1"],
+            lora_dropout=0.05,
+        )
+
+        config = build_lora_peft(args)
+
+        assert config["lora_A_init_method"] == "kaiming"
+        assert config["share_expert_adapters"] is False
+
+    def test_invalid_expert_adapter_override_fails_fast(self, monkeypatch):
+        self._install_create_peft_stub(monkeypatch)
+        monkeypatch.setenv("RELAX_LORA_SHARE_EXPERT_ADAPTERS", "sometimes")
+        args = Namespace(lora_rank=8, lora_alpha=16, lora_target_modules=["linear_qkv"], lora_dropout=0.0)
+
+        with pytest.raises(ValueError, match="RELAX_LORA_SHARE_EXPERT_ADAPTERS"):
+            build_lora_peft(args)
 
 
 class TestConvertMegatronToHfTargetModules:

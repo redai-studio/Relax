@@ -13,7 +13,6 @@ cd "${EXAMPLE_DIR}"
 : "${RELAX_SESSION_IO_DIR:?RELAX_SESSION_IO_DIR must be set by Relax}"
 : "${RELAX_BASE_URL:?RELAX_BASE_URL must be set by Relax}"
 : "${NEMO_GYM_URL:?NEMO_GYM_URL must point to the shared NeMo Gym gateway}"
-: "${NEMO_GYM_ENVIRONMENT:?NEMO_GYM_ENVIRONMENT must name a registered environment}"
 
 exec python -m app.client \
     --input-json "${RELAX_INPUT_JSON}" \

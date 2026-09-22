@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -155,6 +156,40 @@ async def test_completed_create_uses_single_versioned_endpoint():
     assert seen[0].method == "POST"
     assert seen[0].url.path == "/v1/trials"
     assert json.loads(seen[0].content)["protocol_version"] == PROTOCOL_VERSION
+
+
+def test_client_exits_with_failure_without_exporting_unscored_deadline(tmp_path, monkeypatch):
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    input_path.write_text(json.dumps({"messages": [], "metadata": {}}), encoding="utf-8")
+    for key, value in _environ(NEMO_GYM_URL="http://gym.example").items():
+        monkeypatch.setenv(key, value)
+
+    def handler(http_request):
+        request_id = json.loads(http_request.content)["request_id"]
+        return httpx.Response(
+            200,
+            json=_result_payload(
+                request_id,
+                "truncated",
+                error={"code": "deadline_exceeded", "message": "token=session-secret"},
+            ),
+        )
+
+    monkeypatch.setattr(
+        client_mod, "GatewayClient", lambda config: GatewayClient(config, transport=httpx.MockTransport(handler))
+    )
+    monkeypatch.setattr(
+        client_mod, "parse_args", lambda: SimpleNamespace(input_json=str(input_path), output_json=str(output_path))
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        client_mod.main()
+
+    assert "NeMo Gym thin client failed: NeMo Gym trial has no reward" in str(caught.value.code)
+    assert "deadline_exceeded" in str(caught.value.code)
+    assert "session-secret" not in str(caught.value.code)
+    assert not output_path.exists()
 
 
 async def test_running_trial_is_polled_to_completion(py310_sleep_or_stop):

@@ -2,7 +2,48 @@
 
 """Tests for converting NeMo Gym datasets into Relax rollout rows."""
 
-from relax_nemo_gym_example.scripts.convert_dataset import convert_row
+import json
+from pathlib import Path
+
+import pytest
+from relax_nemo_gym_example.scripts.convert_dataset import convert_file, convert_row
+
+
+@pytest.mark.parametrize("alias", ["same", "relative", "symlink", "hardlink"])
+def test_convert_file_rejects_same_file_without_truncating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str
+) -> None:
+    source = tmp_path / "source.jsonl"
+    original = b'{"responses_create_params":{"input":[{"role":"user","content":"question"}]}}\n'
+    source.write_bytes(original)
+    destination = source
+    if alias == "relative":
+        monkeypatch.chdir(tmp_path)
+        destination = Path("source.jsonl")
+    elif alias == "symlink":
+        destination = tmp_path / "alias.jsonl"
+        destination.symlink_to(source)
+    elif alias == "hardlink":
+        destination = tmp_path / "alias.jsonl"
+        destination.hardlink_to(source)
+
+    with pytest.raises(ValueError, match="Input and output must refer to different files"):
+        convert_file(source, destination)
+
+    assert source.read_bytes() == original
+    assert destination.read_bytes() == original
+
+
+def test_convert_file_writes_separate_output_without_changing_source(tmp_path: Path) -> None:
+    source = tmp_path / "source.jsonl"
+    row = {"responses_create_params": {"input": [{"role": "user", "content": "question"}]}, "id": 7}
+    original = json.dumps(row) + "\n"
+    source.write_text(original, encoding="utf-8")
+    destination = tmp_path / "converted" / "output.jsonl"
+
+    assert convert_file(source, destination) == 1
+    assert source.read_text(encoding="utf-8") == original
+    assert json.loads(destination.read_text(encoding="utf-8")) == convert_row(row)
 
 
 def test_convert_row_preserves_task_fields_in_metadata() -> None:

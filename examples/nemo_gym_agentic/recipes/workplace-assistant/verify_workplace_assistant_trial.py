@@ -29,16 +29,18 @@ class CallbackState:
     def next_response(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload.get("tools"), list) or not payload["tools"]:
             raise ValueError("Callback request did not preserve Workplace Assistant tools")
-        messages = payload.get("messages")
-        if not isinstance(messages, list):
-            raise ValueError("Callback request did not contain messages")
-        tool_results = sum(1 for message in messages if isinstance(message, dict) and message.get("role") == "tool")
+        input_items = payload.get("input")
+        if not isinstance(input_items, list):
+            raise ValueError("Callback request did not contain Responses input items")
+        tool_results = sum(
+            1 for item in input_items if isinstance(item, dict) and item.get("type") == "function_call_output"
+        )
         with self.lock:
             self.tool_result_counts.append(tool_results)
             call_index = len(self.tool_result_counts) - 1
 
         if call_index == 0:
-            return _completion(
+            return _response(
                 tool_name="email_search_emails",
                 arguments={"query": "Carlos Task Update"},
                 call_id="call_search",
@@ -46,7 +48,7 @@ class CallbackState:
         if call_index == 1:
             if tool_results < 1:
                 raise ValueError("Second callback did not contain the first tool result")
-            return _completion(
+            return _response(
                 tool_name="email_reply_email",
                 arguments={
                     "email_id": "00000057",
@@ -57,7 +59,7 @@ class CallbackState:
         if call_index == 2:
             if tool_results < 2:
                 raise ValueError("Third callback did not contain both tool results")
-            return _completion(content="Done.")
+            return _response(content="Done.")
         raise ValueError(f"Unexpected callback number: {call_index + 1}")
 
 
@@ -66,7 +68,7 @@ class CallbackHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path != "/v1/chat/completions":
+            if self.path != "/v1/responses":
                 self.send_error(404)
                 return
             if self.headers.get("Authorization") != f"Bearer {self.server.state.api_key}":
@@ -99,34 +101,53 @@ class CallbackServer(ThreadingHTTPServer):
         self.state = state
 
 
-def _completion(
+def _response(
     *,
     content: str | None = None,
     tool_name: str | None = None,
     arguments: dict[str, Any] | None = None,
     call_id: str | None = None,
 ) -> dict[str, Any]:
-    message: dict[str, Any] = {"role": "assistant", "content": content}
-    finish_reason = "stop"
+    response_id = f"resp_{uuid.uuid4().hex}"
+    output: list[dict[str, Any]] = []
     if tool_name is not None:
-        message["tool_calls"] = [
+        output.append(
             {
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(arguments, separators=(",", ":")),
-                },
+                "id": f"fc_{uuid.uuid4().hex}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": tool_name,
+                "arguments": json.dumps(arguments, separators=(",", ":")),
             }
-        ]
-        finish_reason = "tool_calls"
+        )
+    elif content is not None:
+        output.append(
+            {
+                "id": f"msg_{uuid.uuid4().hex}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content, "annotations": []}],
+            }
+        )
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
         "model": "workplace-contract-model",
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        "output": output,
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 1,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 2,
+        },
     }
 
 
@@ -205,7 +226,7 @@ def main() -> None:
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     gateway_url = args.gateway_url.rstrip("/")
-    callback_url = f"http://{args.callback_host}:{args.callback_port}/v1"
+    callback_url = f"http://{args.callback_host}:{server.server_port}/v1"
 
     try:
         task = _read_task(args.task_jsonl)

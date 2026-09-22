@@ -25,7 +25,12 @@ wandb
 debugpy==1.8.0
 math_verify==0.8.0
 librosa
+diffusers>=0.37.0
 imageio[ffmpeg]
+# Upper-bounded on purpose: relax/backends/fsdp/lora.py imports
+# `peft.tuners.lora.LoraLayer`, a PEFT internal with no stability guarantee.
+peft>=0.20.0,<0.21.0
+soundfile
 colorlog
 loguru
 av==17.0.0
@@ -38,6 +43,5 @@ pystack
 py-spy
 ipdb
 mathruler==0.1.0
-jupyter_client>=8  # host-side ZMQ client for examples/deepeyes_v2_agentic apptainer_jupyter sandbox
 pyarrow==14.0.2
 boto3  # s3:// -> /dev/shm model downloader (relax/utils/s3_model_loader.py)

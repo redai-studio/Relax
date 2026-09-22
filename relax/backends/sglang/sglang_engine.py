@@ -2,9 +2,13 @@
 
 import dataclasses
 import ipaddress
+import json
 import multiprocessing
 import os
 import signal
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import Optional
@@ -19,20 +23,21 @@ from sglang.srt.utils import kill_process_tree
 
 
 try:
-    from sglang.srt.server_args import LOAD_FORMAT_CHOICES
+    from sglang.srt.server_args import LOAD_FORMAT_CHOICES as _SGLANG_LOAD_FORMAT_CHOICES
 except ImportError:
-    # Older SGLang releases expose the legacy remote loader but not the shared
-    # choices constant. Keep module import compatible with those releases.
-    LOAD_FORMAT_CHOICES = ("remote",)
+    # Older SGLang releases do not expose the supported load formats. Keep
+    # imports working, but fail closed if S3 streaming is requested.
+    _SGLANG_LOAD_FORMAT_CHOICES = None
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
+from relax.utils import scale_utils
 from relax.utils.async_utils import run
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info, router_worker_base_url
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, is_lora_enabled
+from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules, is_lora_enabled
 from relax.utils.model_source import ModelSource, SGLangLoadPlan
 from relax.utils.s3_model_loader import (
     get_s3_model_cached_path,
@@ -40,6 +45,7 @@ from relax.utils.s3_model_loader import (
     maybe_resolve_s3_model_to_shm,
     resolve_s3_model_metadata_to_shm,
 )
+from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
@@ -56,23 +62,21 @@ _MIN_HTTP_TIMEOUT_S = 1.0
 
 
 def _preferred_s3_stream_load_format() -> str:
-    if "runai_streamer" in LOAD_FORMAT_CHOICES:
+    if _SGLANG_LOAD_FORMAT_CHOICES is None:
+        raise RuntimeError("The installed SGLang cannot report whether runai_streamer is supported")
+    if "runai_streamer" in _SGLANG_LOAD_FORMAT_CHOICES:
         return "runai_streamer"
-    if "remote" in LOAD_FORMAT_CHOICES:
-        logger.warning("SGLang does not expose runai_streamer; falling back to the legacy remote loader")
-        return "remote"
-    raise RuntimeError("The installed SGLang does not support runai_streamer or the legacy remote loader")
+    raise RuntimeError("The installed SGLang does not support runai_streamer")
 
 
 def _configure_runai_streamer_env(args) -> None:
     model_source = args.model_source
-    if model_source.endpoint:
-        os.environ["AWS_ENDPOINT_URL"] = model_source.endpoint
-        os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = model_source.endpoint
-    if model_source.addressing_style == "path":
+    if "RUNAI_STREAMER_S3_ENDPOINT" not in os.environ:
+        endpoint = model_source.endpoint or os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+        if endpoint:
+            os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = endpoint
+    if "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" not in os.environ and model_source.addressing_style == "path":
         os.environ["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
-    else:
-        os.environ.pop("RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING", None)
     if model_source.credential_mode == "placeholder":
         os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
         os.environ["AWS_ACCESS_KEY_ID"] = "mock"
@@ -94,9 +98,11 @@ def build_sglang_load_plan(server_args: dict, args) -> SGLangLoadPlan:
     if model_path != model_source.uri or not is_s3_uri(model_source.uri):
         return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
 
-    if load_format in {"runai_streamer", "remote"}:
+    if load_format == "runai_streamer":
         _configure_runai_streamer_env(args)
         return SGLangLoadPlan(model_path=model_path, load_format=load_format, source=model_source)
+    if load_format == "remote":
+        raise ValueError("SGLang load_format='remote' is not an S3 model loader; use 'runai_streamer' instead")
 
     cached_path = get_s3_model_cached_path(model_source.uri, args)
     if load_format == "dummy":
@@ -123,6 +129,14 @@ def _apply_sglang_policy_load_plan(server_args: dict, args) -> dict:
     resolved = dict(server_args)
     resolved["model_path"] = plan.model_path
     resolved["load_format"] = plan.load_format
+    if (
+        getattr(args, "model_source", None) is not None
+        and plan.model_path == plan.source.uri
+        and is_s3_uri(plan.source.uri)
+        and plan.load_format == "runai_streamer"
+        and not resolved.get("tokenizer_path")
+    ):
+        resolved["tokenizer_path"] = resolve_s3_model_metadata_to_shm(plan.source.uri, args)
     return resolved
 
 
@@ -232,7 +246,6 @@ def _resolve_external_model_arch(package_name):
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
 
     # Each SGLang patch is controlled by its own env flag and applied
     # independently (see ``_launch_server_with_patches`` and
@@ -340,72 +353,22 @@ class SGLangEngine(RayActor):
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
         self._evicted = threading.Event()
-        self._is_weight_updating: bool = False
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
-    def set_weight_updating(self, is_updating: bool) -> None:
-        """Set whether a weight update is currently in progress.
-
-        Called by RolloutManager before and after each weight sync so that the
-        SIGTERM handler can wait for the update to finish before unregistering
-        from the router.
-        """
-        self._is_weight_updating = is_updating
-
     def _register_sigterm_handler(self):
         """Register SIGTERM handler for platform-initiated pod eviction.
 
-        When the platform needs to evict or replace a pod, it sends SIGTERM to the
-        user process. We catch this signal and perform lightweight cleanup so the
-        RolloutManager can detect the eviction and treat it as a scale-in event.
-
-        If a weight update is in progress (``_is_weight_updating``), the handler
-        blocks until the update finishes before unregistering from the router, to
-        avoid disrupting NCCL communication groups. The k8s PreStop timeout
-        (default 30s) serves as the hard deadline.
+        The signal handler only publishes an intent. RolloutManager owns the
+        weight-update fence and the live-actor removal sequence; doing I/O or
+        waiting here could block the actor RPC that releases an active update.
         """
         self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
-        def _handle_sigterm(signum, frame):
-            actor_id = ""
-            try:
-                actor_id = ray.get_runtime_context().get_actor_id()
-            except Exception:
-                pass
-            logger.warning(
-                f"[SGLangEngine] Received SIGTERM (rank={self.rank}, actor_id={actor_id}), "
-                f"marking as evicted for graceful scale-in"
-            )
+        def _handle_sigterm(_signum, _frame):
             self._evicted.set()
-
-            # Wait for any in-progress weight update to finish before cleaning up,
-            # so we don't disrupt NCCL communication groups during weight sync.
-            # k8s PreStop hard deadline is typically 30s; leave a safety margin.
-            weight_update_timeout = 20
-            wait_start = time.time()
-            while self._is_weight_updating:
-                if time.time() - wait_start > weight_update_timeout:
-                    logger.warning(
-                        f"[SGLangEngine] Weight update did not finish within {weight_update_timeout}s, "
-                        f"proceeding with eviction cleanup (rank={self.rank})"
-                    )
-                    break
-                logger.warning(
-                    f"[SGLangEngine] SIGTERM received but weight update in progress "
-                    f"(rank={self.rank}, actor_id={actor_id}), waiting..."
-                )
-                time.sleep(1)
-
-            # Best-effort: unregister from router so new requests are not routed here.
-            # This is a quick HTTP call; if it fails the router will detect the engine
-            # as unhealthy anyway.
-            try:
-                self.unregister_from_router()
-            except Exception as e:
-                logger.warning(f"[SGLangEngine] Failed to unregister from router during SIGTERM handling: {e}")
 
         signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -575,6 +538,7 @@ class SGLangEngine(RayActor):
 
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
+        server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         bootstrap_port = (
@@ -668,9 +632,9 @@ class SGLangEngine(RayActor):
         """Load/refresh a LoRA adapter directly from serialized tensors — no
         disk IO.
 
-        In-memory counterpart to :meth:`load_lora_adapter` (SGLang's ``/load_lora_adapter_from_tensors``,
-        available since 0.5.12). ``config_dict`` is the HF-PEFT adapter config (the same content
-        the disk path writes to ``adapter_config.json``); ``serialized_tensors`` carries the full
+        Wraps SGLang's ``/load_lora_adapter_from_tensors`` (available since 0.5.12), the transport
+        the colocate backend uses. ``config_dict`` is the adapter config (the same content that
+        would go into ``adapter_config.json``); ``serialized_tensors`` carries the full
         (TP-gathered, PP-merged) adapter tensors serialized with SGLang's ``MultiprocessingSerializer``.
 
         Unlike ``update_weights_from_tensor`` (which fans out one shard per TP worker), SGLang
@@ -698,6 +662,56 @@ class SGLangEngine(RayActor):
                 "config_dict": config_dict,
                 "serialized_tensors": serialized_tensors,
                 "load_format": load_format,
+                "pinned": pinned,
+            },
+        )
+
+    def update_lora_from_distributed(
+        self,
+        lora_name: str,
+        names: list[str],
+        dtypes: list,
+        shapes: list,
+        config_dict: dict,
+        group_name: str,
+        pinned: bool = False,
+    ) -> dict | None:
+        """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group.
+
+        — no disk IO.
+
+        NCCL counterpart to :meth:`load_lora_adapter_from_tensors`. The HTTP call
+        only carries metadata (``names``/``dtypes``/``shapes``/``config_dict``); the
+        actual adapter tensors are broadcast ``src=0`` on ``group_name`` (the same
+        weight-update group base weights use) and received on the SGLang side by
+        ``/update_lora_from_distributed``. Fully-async uses this instead of a shared-
+        directory handoff, so no adapter ever touches the network FS.
+
+        Same-name replacement is handled server-side, so no separate
+        ``/unload_lora_adapter`` call is needed. Requires ``--enable-lora`` and
+        ``dp_size == 1``.
+
+        Args:
+            lora_name: Adapter name; rollout requests pass ``lora_path=lora_name``.
+            names: Adapter tensor names (HF-PEFT layout), defining the broadcast order.
+            dtypes: Per-tensor dtypes (``torch.dtype`` or str), serialized as bare names.
+            shapes: Per-tensor shapes.
+            config_dict: HF-PEFT config dict (see ``build_hf_peft_config_dict``).
+            group_name: NCCL group to receive the tensors on.
+            pinned: Pin the adapter against LRU eviction (kept False; one self-managed adapter).
+
+        Returns:
+            Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
+        """
+        return self._make_request(
+            "update_lora_from_distributed",
+            {
+                "lora_name": lora_name,
+                "config_dict": config_dict,
+                "names": names,
+                "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+                "shapes": shapes,
+                "group_name": group_name,
                 "pinned": pinned,
             },
         )
@@ -1080,6 +1094,259 @@ class SGLangEngine(RayActor):
             },
         )
 
+    def get_scale_weight_sync_transport_fingerprint(self) -> dict:
+        """The engine's NCCL transport env — a cheap fingerprint (no NCCL, no
+        subprocess) for the Stage-1 seed-vs-new compatibility gate before the
+        real probe."""
+        return {
+            "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
+            "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
+            "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+            "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
+        }
+
+    def run_scale_weight_sync_precheck(
+        self,
+        master_address: str,
+        ports: str,
+        group_rank: int,
+        run_token: str,
+        tp_size: int,
+        timeout_secs: float,
+    ) -> dict:
+        """Run an independent NCCL probe without touching ModelRunner groups.
+
+        The probe reuses this actor's node, GPU mapping, Python environment,
+        and NCCL environment. It launches local subprocesses only; no new Ray
+        actor or GPU allocation is created. Transport variables are inherited
+        verbatim, so socket-only mode is accepted only when both engine actors
+        already received the same job-start environment.
+        """
+        if self.node_rank != 0:
+            return {"success": False, "category": PrecheckProbeCategory.UNSUPPORTED_NODE_RANK.value, "results": []}
+        local_gpu_count = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        if tp_size != local_gpu_count:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.UNSUPPORTED_TOPOLOGY.value,
+                "message": f"precheck requires one local process per TP rank: {tp_size=} {local_gpu_count=}",
+                "results": [],
+            }
+
+        port_list = ports.split(",")
+        if len(port_list) != tp_size:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.INVALID_PORTS.value,
+                "message": f"expected {tp_size} ports, got {len(port_list)}",
+                "results": [],
+            }
+
+        env = os.environ.copy()
+        visible_env = device_utils.get_visible_devices_env_var()
+        inherited_visible = [item.strip() for item in env.get(visible_env, "").split(",") if item.strip()]
+        physical_gpu_ids = [self.base_gpu_id + local_rank for local_rank in range(tp_size)]
+        if inherited_visible:
+            physical_tokens = [str(gpu_id) for gpu_id in physical_gpu_ids]
+            if all(token in inherited_visible for token in physical_tokens):
+                selected_visible = physical_tokens
+                parent_device_ids = [inherited_visible.index(token) for token in physical_tokens]
+            elif all(0 <= gpu_id < len(inherited_visible) for gpu_id in physical_gpu_ids):
+                selected_visible = [inherited_visible[gpu_id] for gpu_id in physical_gpu_ids]
+                parent_device_ids = physical_gpu_ids
+            else:
+                return {
+                    "success": False,
+                    "category": PrecheckProbeCategory.GPU_MAPPING_MISMATCH.value,
+                    "message": f"cannot map {physical_gpu_ids=} under {visible_env}={inherited_visible}",
+                    "results": [],
+                }
+        else:
+            selected_visible = [str(gpu_id) for gpu_id in physical_gpu_ids]
+            parent_device_ids = physical_gpu_ids
+        # Ray intentionally does not isolate this actor's CVD. Restrict each
+        # probe process tree to exactly the GPUs already assigned to the engine.
+        env[visible_env] = ",".join(selected_visible)
+        # Diagnostic verbosity is local to the probe subprocess and does not
+        # alter the seed ModelRunner environment or transport selection.
+        env["NCCL_DEBUG"] = "INFO"
+        env["NCCL_DEBUG_SUBSYS"] = "INIT,NET"
+        env.pop("NCCL_DEBUG_FILE", None)
+
+        # Each probe creates a CUDA context next to the live ModelRunner. Check
+        # every assigned device before launching any child so low headroom
+        # fails closed without partially starting a probe. SGLang reserves
+        # ~85-90% VRAM via mem-fraction-static, so a healthy engine often has
+        # <2 GiB free even though a probe only needs a CUDA context + tiny NCCL
+        # buffers (~few hundred MB); default to a realistic 512 MiB floor.
+        min_free_bytes = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES
+        memory_results = []
+        try:
+            import torch
+
+            for local_rank, (physical_gpu_id, parent_device_id) in enumerate(zip(physical_gpu_ids, parent_device_ids)):
+                free_bytes, total_bytes = torch.cuda.mem_get_info(parent_device_id)
+                memory_results.append(
+                    {
+                        "local_rank": local_rank,
+                        "physical_gpu_id": physical_gpu_id,
+                        "parent_device_id": parent_device_id,
+                        "free_bytes": free_bytes,
+                        "total_bytes": total_bytes,
+                        "required_free_bytes": min_free_bytes,
+                    }
+                )
+        except Exception as exc:
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.MEMORY_CHECK_FAILED.value,
+                "message": f"failed to query GPU memory: {type(exc).__name__}: {exc}",
+                "memory": memory_results,
+                "results": [],
+            }
+        if any(item["free_bytes"] < min_free_bytes for item in memory_results):
+            return {
+                "success": False,
+                "category": PrecheckProbeCategory.INSUFFICIENT_GPU_MEMORY.value,
+                "memory": memory_results,
+                "results": [],
+            }
+
+        processes = []
+        log_directory = tempfile.TemporaryDirectory(prefix=f"relax-nccl-precheck-{run_token}-")
+        started_at = time.monotonic()
+        for local_rank, port in enumerate(port_list):
+            command = [
+                sys.executable,
+                "-m",
+                "relax.backends.sglang._scale_weight_sync_precheck",
+                "--master-address",
+                master_address,
+                "--master-port",
+                port,
+                "--rank",
+                str(group_rank),
+                "--device-id",
+                str(local_rank),
+                "--timeout-secs",
+                str(timeout_secs),
+                "--run-token",
+                f"{run_token}-{local_rank}",
+            ]
+            try:
+                log_path = os.path.join(log_directory.name, f"rank-{local_rank}.log")
+                log_file = open(log_path, "w", encoding="utf-8")
+                process = subprocess.Popen(
+                    command,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    start_new_session=True,
+                )
+                processes.append((local_rank, process, log_file, log_path))
+            except Exception as exc:
+                if "log_file" in locals() and not log_file.closed:
+                    log_file.close()
+                for _, process, process_log, _ in processes:
+                    scale_utils._terminate_probe_process(process)
+                    process_log.close()
+                log_directory.cleanup()
+                return {
+                    "success": False,
+                    "category": PrecheckProbeCategory.LAUNCH_TRANSIENT.value,
+                    "message": f"failed to launch rank {local_rank}: {type(exc).__name__}: {exc}",
+                    "results": [],
+                }
+
+        deadline = started_at + timeout_secs
+        # Wrap the entire post-launch body so an unexpected exception (e.g.
+        # ``open`` failing during result collection) cannot leak running child
+        # processes (CUDA context + NCCL group on the LIVE gpu) or the tempdir.
+        # The finally is idempotent: terminating an already-dead process is a
+        # no-op (poll() guards it) and closing a closed file is harmless.
+        try:
+            while any(process.poll() is None for _, process, _, _ in processes) and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+            timed_out = {local_rank for local_rank, process, _, _ in processes if process.poll() is None}
+            for local_rank, process, _, _ in processes:
+                if local_rank in timed_out:
+                    scale_utils._terminate_probe_process(process)
+
+            results = []
+            for local_rank, process, log_file, log_path in processes:
+                # A probe wedged in an uninterruptible (D) state can survive SIGKILL,
+                # so bound the join instead of blocking this actor thread forever.
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"NCCL precheck rank {local_rank} (pid {process.pid}) unresponsive after "
+                        "SIGKILL; abandoning join to avoid blocking the actor"
+                    )
+                log_file.close()
+                with open(log_path, encoding="utf-8", errors="replace") as probe_log:
+                    combined_output = probe_log.read()
+                parsed = None
+                for line in reversed(combined_output.splitlines()):
+                    try:
+                        parsed = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                # Category is derived from structured signals only: the manager
+                # deadline, the subprocess exit code, and its JSON — never by
+                # scanning the NCCL log text.
+                if local_rank in timed_out:
+                    category, success = PrecheckProbeCategory.TIMEOUT.value, False
+                elif process.returncode == 0 and bool(parsed and parsed.get("success")):
+                    category, success = None, True
+                elif parsed is None:
+                    # No structured output → the subprocess never really ran.
+                    category, success = PrecheckProbeCategory.LAUNCH_TRANSIENT.value, False
+                else:
+                    # Ran but NCCL init/collective raised; carry the raw exception.
+                    category, success = PrecheckProbeCategory.PROBE_FAILED.value, False
+                parsed = parsed or {}
+                results.append(
+                    {
+                        "local_rank": local_rank,
+                        "success": success,
+                        "category": category,
+                        "returncode": process.returncode,
+                        "error_type": parsed.get("error_type"),
+                        "error": parsed.get("error"),
+                        "result": parsed or None,
+                        "log_tail": combined_output[-4000:],  # surfaced in the coordinator's failure log
+                    }
+                )
+
+            failed = [result for result in results if not result["success"]]
+            return {
+                "success": not failed,
+                "category": failed[0]["category"] if failed else None,
+                "error_type": failed[0].get("error_type") if failed else None,
+                "error": failed[0].get("error") if failed else None,
+                "run_token": run_token,
+                "memory": memory_results,
+                "fingerprint": {
+                    "nccl_ib_disable": os.environ.get("NCCL_IB_DISABLE"),
+                    "nccl_socket_ifname": os.environ.get("NCCL_SOCKET_IFNAME"),
+                    "nccl_ib_hca": os.environ.get("NCCL_IB_HCA"),
+                    "nccl_ib_gid_index": os.environ.get("NCCL_IB_GID_INDEX"),
+                    "visible_devices": selected_visible,
+                },
+                "results": results,
+            }
+        finally:
+            for _, process, log_file, _ in processes:
+                scale_utils._terminate_probe_process(process)
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+            log_directory.cleanup()
+
     def pause_generation(self, timeout: float | None = None):
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/pause_generation", json={}, timeout=timeout
@@ -1266,6 +1533,16 @@ class GenRMEngine(SGLangEngine):
             logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
+def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
+    if getattr(args, "enable_mtp_training", False):
+        return False
+
+    speculative_algorithm = getattr(args, "sglang_speculative_algorithm", None)
+    if sglang_overrides and "speculative_algorithm" in sglang_overrides:
+        speculative_algorithm = sglang_overrides["speculative_algorithm"]
+    return speculative_algorithm is not None
+
+
 def _compute_genrm_server_args(
     args,
     rank,
@@ -1322,8 +1599,7 @@ def _compute_genrm_server_args(
         # "max_total_tokens": args.genrm_engine_config['max_total_tokens'],
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": False,
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
+        "enable_draft_weights_cpu_backup": _enable_draft_weights_cpu_backup(args, args.genrm_engine_config),
         # GenRM Only
         "enable_weights_cpu_backup": True,
         # The global load format belongs to policy rollout engines. GenRM must
@@ -1428,8 +1704,9 @@ def _compute_server_args(
         "ep_size": args.sglang_ep_size,
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
+        # MTP training syncs draft weights from the actor; otherwise only speculative
+        # rollout needs draft weights backup for checkpoints without MTP weights.
+        "enable_draft_weights_cpu_backup": _enable_draft_weights_cpu_backup(args, sglang_overrides),
         "enable_metrics": True,
     }
 
@@ -1439,8 +1716,10 @@ def _compute_server_args(
     if is_lora_enabled(args) and getattr(args, "lora_adapter_mode", False):
         kwargs["enable_lora"] = True
         kwargs["max_lora_rank"] = args.lora_rank
-        # SGLang expects HF-style module names; CLI holds canonical Megatron names.
-        kwargs["lora_target_modules"] = convert_megatron_to_hf_target_modules(args.lora_target_modules)
+        # SGLang matches modules by leaf name; CLI holds canonical Megatron names. Fused
+        # projections that SGLang groups differently from HF (GDN in_proj -> in_proj_qkvz)
+        # must use the engine flavor, otherwise the module is never wrapped.
+        kwargs["lora_target_modules"] = convert_megatron_to_sglang_target_modules(args.lora_target_modules)
         # We serve exactly one policy adapter. max_loaded_loras >= max_loras_per_batch is a
         # SGLang startup requirement; 2 leaves room for the unload->reload overlap.
         kwargs["max_loras_per_batch"] = 1

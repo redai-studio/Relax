@@ -4,9 +4,11 @@
 import argparse
 import inspect
 import json
+import logging
 import os
 import pickle
 import re
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Literal
 
@@ -23,16 +25,47 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from relax.utils.device import is_npu_available
+from relax.utils.device import is_npu_available, make_current_torch_device
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
-from relax.utils.megatron_peft_utils import build_lora_peft, count_adapter_parameters, is_lora_enabled
+from relax.utils.megatron_peft_utils import (
+    _lora_module_key,
+    build_lora_peft,
+    count_adapter_parameters,
+    exclude_frozen_lora_target_modules,
+    install_gdn_gate_mask_hooks,
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+    scope_target_modules_to_region,
+    summarize_lora_modules,
+)
 from relax.utils.misc import load_function
-from relax.utils.training.ppo_utils import install_critic_value_head_in_provider
+from relax.utils.training.ppo_utils import (
+    ensure_sequence_classification_head_trainable,
+    install_critic_value_head_in_provider,
+    install_sequence_classification_head_in_provider,
+)
 
 from .conditional_branch_sync import install_conditional_branch_sync
 
 
 logger = get_logger(__name__)
+
+
+def configure_mtp_detach_paths(args: argparse.Namespace, model: torch.nn.Module) -> None:
+    """Propagate MTP detach-path settings to every Megatron model config."""
+    detach_paths = frozenset(getattr(args, "mtp_detach_paths", ("embedding", "backbone", "lm-head")))
+    seen_configs: set[int] = set()
+    for module in model.modules():
+        config = getattr(module, "config", None)
+        if config is None or id(config) in seen_configs:
+            continue
+        setattr(config, "mtp_detach_embedding", "embedding" in detach_paths)
+        setattr(config, "mtp_detach_backbone", "backbone" in detach_paths)
+        setattr(config, "mtp_detach_lm_head", "lm-head" in detach_paths)
+        seen_configs.add(id(config))
 
 
 def _make_json_safe(value: Any, seen: set[int] | None = None) -> Any:
@@ -83,6 +116,41 @@ def _dump_provider_config(provider: Any, save_path: str) -> None:
 # context parallelism actually splits the sequence dimension at the attention input.
 # Compare seq_len across CP=1 vs CP=2 runs — it must halve.  Remove after verifying.
 _CP_PROBE_INSTALLED = False
+
+
+def _patch_bridge_vision_cp_all_gather(bridge_model_module: Any, all_gather_vision_embeddings: Any) -> bool:
+    """Make Bridge's Qwen3-VL CP vision all-gather accept keyword arguments.
+
+    The Bridge Qwen3-VL forward currently calls ``autograd.Function.apply``
+    with ``cp_group=...``.  PyTorch only accepts positional arguments for
+    ``apply``, so the vision CP path fails before the first forward.  Keep the
+    autograd function unchanged and adapt only its call surface in the Bridge
+    model module.
+    """
+    if getattr(bridge_model_module, "AllGatherVisionEmbeddings", None) is not all_gather_vision_embeddings:
+        return False
+
+    class _AllGatherVisionEmbeddingsCompat:
+        @staticmethod
+        def apply(input, seqlens_on_cp_ranks, cp_group=None):
+            return all_gather_vision_embeddings.apply(input, seqlens_on_cp_ranks, cp_group)
+
+    bridge_model_module.AllGatherVisionEmbeddings = _AllGatherVisionEmbeddingsCompat
+    return True
+
+
+def _install_bridge_vision_cp_all_gather_compat() -> None:
+    """Install the Qwen3-VL Bridge compatibility patch when that model is
+    present."""
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import model as bridge_qwen3_vl_model
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import AllGatherVisionEmbeddings
+    except ImportError:
+        return
+
+    if _patch_bridge_vision_cp_all_gather(bridge_qwen3_vl_model, AllGatherVisionEmbeddings):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info("Patched Bridge Qwen3-VL vision CP all-gather for PyTorch autograd.apply compatibility.")
 
 
 def _maybe_mark_unsplit_forward(args: argparse.Namespace, model: torch.nn.Module) -> None:
@@ -195,13 +263,17 @@ def get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             else:
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
             return model
 
+        if is_lora_enabled(args) and getattr(args, "task_type", "causal_lm") == "seq_cls":
+            wrapped_model_provider = wrap_model_provider_with_lora(wrapped_model_provider, args)
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
@@ -229,6 +301,7 @@ def get_model_provider_func(
             "recompute_granularity",
             "recompute_method",
             "recompute_num_layers",
+            "recompute_modules",
             "distribute_saved_activations",
             "moe_router_load_balancing_type",
             "moe_router_dtype",
@@ -243,7 +316,7 @@ def get_model_provider_func(
             "freeze_vision_projection",
             "freeze_audio_model",
             "freeze_audio_projection",
-            # https://github.com/redai-infra/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
+            # https://github.com/redai-studio/Megatron-Bridge/commit/960bb5f18800d3e1fb9815e95daa185ab06c09ea
             "vision_dp_when_tp",
             "vision_dp_when_cp",
             "calculate_per_token_loss",
@@ -251,6 +324,11 @@ def get_model_provider_func(
             "cross_entropy_fusion_impl",
             "mtp_num_layers",
             "mtp_loss_scaling_factor",
+            # Reuse one physical MTP layer across all mtp_num_layers depths. Must
+            # be copied onto the bridge provider or it stays at the default (False)
+            # even when --mtp-use-repeated-layer is passed, so the model builds N
+            # physical layers (layers.1/2 unloaded/random).
+            "mtp_use_repeated_layer",
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Allow CLI to override layer count / MoE frequency for layer-reduced training
             "num_layers",
@@ -267,6 +345,7 @@ def get_model_provider_func(
             "rotary_base",
             "moe_router_pre_softmax",
             "moe_router_enable_expert_bias",
+            "moe_router_bias_update_rate",
             "moe_permute_fusion",
             "moe_grouped_gemm",
             "moe_shared_expert_intermediate_size",
@@ -292,6 +371,21 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
+        # the vision encoder input before its CP all-gather.  Relax's public
+        # CLI predates that Bridge rename and exposes ``vision_dp_when_tp``.
+        # Without this compatibility mapping the parsed flag is silently
+        # ignored, so every CP rank repeats the full vision forward.
+        if getattr(args, "vision_dp_when_tp", False) and hasattr(provider, "vision_dp_when_cp"):
+            if not provider.vision_dp_when_cp:
+                logger.info(
+                    "Mapping --vision-dp-when-tp to provider.vision_dp_when_cp for Qwen3.5-VL vision sharding."
+                )
+            provider.vision_dp_when_cp = True
+
+        if getattr(provider, "vision_dp_when_cp", False):
+            _install_bridge_vision_cp_all_gather_compat()
 
         # Handle name-mismatched attributes that require explicit mapping
         if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
@@ -325,8 +419,16 @@ def get_model_provider_func(
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
             model = original_provide(*p_args, **p_kwargs)
+            configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_sequence_classification_head_in_provider(
+                model,
+                args,
+                role,
+                post_process,
+                stash_lm_head=True,
+            )
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
             _install_cp_probe(model)
@@ -439,7 +541,9 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
         install_conditional_branch_sync(args, model)
@@ -450,6 +554,31 @@ def get_model_provider_func(
         model_provider = wrap_model_provider_with_lora(model_provider, args)
 
     return model_provider
+
+
+def _global_vision_lora_count(local_count: int, args) -> int:
+    """Max vision-region LoRA module count across all ranks (adapter mode
+    only).
+
+    The vision tower lives on a single PP stage, so only some ranks can observe it.
+    A rank-local check would raise on those ranks while the rest marched on into the
+    next collective and hung, so the count is all-reduced first and every rank then
+    reaches the same verdict.
+
+    Gated on adapter mode, which is uniform across ranks — no rank can skip the
+    collective while another enters it. Returns ``local_count`` unchanged when
+    ``torch.distributed`` is not initialized (single-process tests).
+    """
+    if not is_lora_adapter_mode(args):
+        return 0
+    if not dist.is_initialized():
+        return local_count
+    group = dist.group.WORLD
+    # NCCL/HCCL cannot reduce a CPU tensor; gloo cannot reduce an accelerator one.
+    on_cpu = dist.get_backend(group) == "gloo"
+    count = torch.tensor([local_count], dtype=torch.int32, device="cpu" if on_cpu else make_current_torch_device())
+    dist.all_reduce(count, op=dist.ReduceOp.MAX, group=group)
+    return int(count.item())
 
 
 def wrap_model_provider_with_lora(original_provider, args):
@@ -473,21 +602,60 @@ def wrap_model_provider_with_lora(original_provider, args):
 
         try:
             peft = build_lora_peft(args)
+            # Restrict adapter injection to the requested model region (e.g. language-only
+            # for VL models). Overriding target_modules post-construction is supported:
+            # PEFT.__call__ rebuilds its matcher state from the current target_modules.
+            scope = getattr(args, "lora_scope", "all")
+            if scope != "all":
+                peft.target_modules = scope_target_modules_to_region(model, list(args.lora_target_modules), scope)
+            if Envs.RELAX_LORA_EXCLUDE_FROZEN_MODULES and getattr(args, "freeze_params_name_list", None):
+                peft.target_modules = exclude_frozen_lora_target_modules(
+                    model, list(peft.target_modules), args.freeze_params_name_list
+                )
             model = peft(model, training=True)
+            ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
+            gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
+            adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]
+            by_role = summarize_lora_modules(adapter_names)
+            vision_wrapped = _global_vision_lora_count(by_role.get("vision", 0), args)
             if dist.is_initialized() and dist.get_rank() == 0:
                 adapter_params, total_params, percentage = count_adapter_parameters(model)
+                mode = "adapter" if is_lora_adapter_mode(args) else ("merge" if is_lora_merge_mode(args) else "plain")
                 logger.info(
-                    f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}, "
-                    f"adapter_params={adapter_params:,} ({percentage:.2f}% of {total_params:,} total)"
+                    "LoRA enabled: mode=%s scope=%s rank=%d alpha=%d dropout=%s targets=%s | "
+                    "wrapped modules by role (rank0-local): %s | adapter_params=%s (%.2f%% of %s total)",
+                    mode,
+                    scope,
+                    args.lora_rank,
+                    args.lora_alpha,
+                    args.lora_dropout,
+                    list(args.lora_target_modules),
+                    by_role,
+                    f"{adapter_params:,}",
+                    percentage,
+                    f"{total_params:,}",
+                )
+                if gdn_gate_masked:
+                    logger.info(
+                        "LoRA: pinned the GDN in_proj adapter's b/a (gate) rows to zero on %d "
+                        "module(s); SGLang hosts the delta on the fused in_proj_qkvz slices only.",
+                        gdn_gate_masked,
+                    )
+                if logger.isEnabledFor(logging.DEBUG):
+                    for module_name in sorted({_lora_module_key(n) for n in adapter_names}):
+                        logger.debug("LoRA wrapped module: %s", module_name)
+            if vision_wrapped:
+                raise ValueError(
+                    f"LoRA adapter mode wrapped {vision_wrapped} vision-region module(s) (scope={scope}). "
+                    "SGLang hosts LoRA on language-model layers only, so this adapter would be trained "
+                    "but silently dropped before rollout, breaking the on-policy assumption. Pass "
+                    "--lora-scope language, or use --lora-merge-mode (which folds the vision adapter "
+                    "into the synced base weights)."
                 )
         except RuntimeError:
             # build_lora_peft already raises a clear upgrade-hint message when the
             # Megatron-Bridge image lacks PEFT support; don't shadow it.
             raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to create LoRA (PEFT) wrapper. Ensure Megatron-Bridge PEFT utilities are available: {e}"
-            ) from e
 
         return model
 
@@ -509,6 +677,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
             model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
+        ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
 
         return model
 
@@ -530,3 +699,41 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+
+def validate_mtp_only_trainable_params(args: argparse.Namespace, model: Sequence[torch.nn.Module]) -> None:
+    """Fail fast when MTP-only mode exposes any non-MTP trainable parameter."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    trainable = [
+        (name, param) for model_chunk in model for name, param in model_chunk.named_parameters() if param.requires_grad
+    ]
+    unexpected = [name for name, _ in trainable if re.search(r"(^|\.)mtp(\.|$)", name) is None]
+    local_param_count = len(trainable)
+    global_param_count = local_param_count
+    global_unexpected_count = len(unexpected)
+    if dist.is_available() and dist.is_initialized():
+        first_param = next(param for model_chunk in model for param in model_chunk.parameters())
+        counts = torch.tensor(
+            [local_param_count, len(unexpected)],
+            dtype=torch.long,
+            device=first_param.device,
+        )
+        dist.all_reduce(counts, group=dist.group.WORLD)
+        global_param_count, global_unexpected_count = (int(value) for value in counts.tolist())
+
+    if global_unexpected_count:
+        details = ", ".join(unexpected[:10]) if unexpected else "reported by another distributed rank"
+        raise RuntimeError(f"--mtp-only-training left non-MTP parameters trainable: {details}")
+
+    if global_param_count == 0:
+        raise RuntimeError("--mtp-only-training found no trainable MTP parameters in the distributed model.")
+
+    local_numel = sum(param.numel() for _, param in trainable)
+    logger.info(
+        "MTP-only trainable parameters on this rank: tensors=%d, elements=%d; distributed tensors=%d",
+        local_param_count,
+        local_numel,
+        global_param_count,
+    )

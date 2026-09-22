@@ -23,7 +23,11 @@ pytest.importorskip("safetensors")
 import safetensors  # noqa: E402
 import safetensors.torch  # noqa: E402
 
-from relax.utils.hf_export import reconcile_hf_export_index, reference_expects_mtp  # noqa: E402
+from relax.utils.hf_export import (  # noqa: E402
+    reconcile_hf_export_index,
+    reference_expects_mtp,
+    reference_expects_vision,
+)
 
 
 _INDEX = "model.safetensors.index.json"
@@ -191,3 +195,46 @@ def test_supplement_mtp_single_file(tmp_path):
     assert index["model.embed_tokens.weight"] == "model.safetensors"
     with safetensors.safe_open(str(out / index["mtp.fc.weight"]), framework="pt", device="cpu") as f:
         assert torch.equal(f.get_tensor("mtp.fc.weight"), torch.arange(8, dtype=torch.float32).reshape(2, 4))
+
+
+def test_reference_expects_vision(tmp_path):
+    # Sharded reference carrying a vision tower -> True.
+    vl = tmp_path / "vl"
+    vl.mkdir()
+    _write_shard(
+        vl / "model-00001-of-00001.safetensors",
+        {
+            "model.language_model.embed_tokens.weight": torch.zeros(2, 2),
+            "model.vision_tower.patch_embedder.input_proj.weight": torch.zeros(2, 2),
+            "model.embed_vision.embedding_projection.weight": torch.zeros(2, 2),
+        },
+    )
+    _write_index(
+        vl / _INDEX,
+        {
+            "model.language_model.embed_tokens.weight": "model-00001-of-00001.safetensors",
+            "model.vision_tower.patch_embedder.input_proj.weight": "model-00001-of-00001.safetensors",
+            "model.embed_vision.embedding_projection.weight": "model-00001-of-00001.safetensors",
+        },
+    )
+    assert reference_expects_vision(str(vl)) is True
+
+    # Text-only reference -> False.
+    text = tmp_path / "text"
+    text.mkdir()
+    _write_shard(text / "model-00001-of-00001.safetensors", {"model.embed_tokens.weight": torch.zeros(2, 2)})
+    _write_index(text / _INDEX, {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"})
+    assert reference_expects_vision(str(text)) is False
+
+    # Single-file reference (no index) carrying vision -> True.
+    single = tmp_path / "single"
+    single.mkdir()
+    _write_shard(
+        single / "model.safetensors",
+        {"model.embed_tokens.weight": torch.zeros(2, 2), "model.vision_tower.std_scale": torch.zeros(2)},
+    )
+    assert reference_expects_vision(str(single)) is True
+
+    # Unreadable/missing reference must not raise -- save_hf_model relies on this to
+    # short-circuit before it ever inspects the model.
+    assert reference_expects_vision(str(tmp_path / "does-not-exist")) is False

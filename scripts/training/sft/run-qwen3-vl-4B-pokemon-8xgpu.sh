@@ -60,6 +60,7 @@ SFT_ARGS=(
    --max-tokens-per-gpu 20480
    --balance-data
    --per-rank-fetch
+   --sft-async-prepack
    --sft-prefetch-num-workers 16
    --sft-prefetch-buffer-size 512
 )

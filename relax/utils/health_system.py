@@ -5,10 +5,11 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import ray
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.async_utils import run
 from relax.utils.logging_utils import get_logger
 
@@ -343,13 +344,13 @@ class HealthManager:
         check_interval: Seconds between health checks (default: 1.0)
     """
 
-    def __init__(self, check_interval: float = 1.0):
+    def __init__(self, check_interval: float = 1.0, config: Optional[Any] = None):
         """Initialize health manager.
 
         Args:
             check_interval: Interval for periodic health checks.
         """
-        self.status = HealthStatus.remote()
+        self.status = HealthStatus.options(**with_control_plane_affinity(config)).remote()
         self._checker: Optional[HealthChecker] = None
         self._check_interval = check_interval
         logger.info("HealthManager initialized")

@@ -299,7 +299,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline`, `ppo`, `sapo`, `cispo` | Advantage estimator. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
+| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -404,7 +404,7 @@ These flags only apply under `--loss-type sft`. The SFT pipeline runs an `SFTStr
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → last 5%); a value ≥1 is treated as an absolute sample count. The reserved tail is removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
+| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
 | `--sft-predict-interval` | int | None | Every N rollout steps run a generative predict pass over the eval set and write completions to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Setting this flag implicitly spins up the Rollout role under SFT (SGLang must be online). Controls the generative complement to the always-on PPL eval (`--eval-interval`). **Requires** `--save` (writes under `<save>/predict/`) and at least one eval source (`--eval-prompt-data` / `--eval-config` / `--eval-size`). |
 
 ### Streaming Dataset Prefetch
@@ -416,6 +416,39 @@ The SFT producer uses its own `PrefetchBuffer` independent from the rollout data
 | `--sft-prefetch-buffer-size` | int | 256 | Max pre-loaded samples held by the SFT streaming dataset's PrefetchBuffer. Set to 0 to disable prefetching; the producer then falls back to an `asyncio.gather` path over the ProcessorPool for batch-level parallelism. |
 | `--sft-prefetch-chunk-size` | int | 32 | Chunk size dispatched to the SFT prefetch thread-pool per round. |
 | `--sft-prefetch-num-workers` | int | 4 | Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding (video/image). |
+
+### Sharded TransferQueue Producers
+
+`RELAX_SFT_TQ_SHARDS` controls how many TransferQueue partitions are produced for each async-prepacked SFT train step. This is an experimental environment variable so shard counts can be A/B tested without adding a public CLI flag.
+
+| Environment variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `RELAX_SFT_TQ_SHARDS` | int | 1 | Number of SFT TransferQueue shards. Values less than or equal to 0 are treated as 1. |
+
+::: warning Activation requirement
+This variable does not enable prepacking. It is effective only with `--loss-type sft --sft-async-prepack`; otherwise Relax uses one partition. Async prepacking also requires `--per-rank-fetch`, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, VPP=1, and THD QKV format.
+:::
+
+With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; the existing `sft_K` name is used only when `N == 1`. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.
+
+When eligible, Relax starts `N` remote `_SFTBatchProducerActor` instances for train batches. The configured `--sft-prefetch-num-workers` is distributed as `ceil(workers / N)` per shard, with at least one worker per shard. Eval is still coordinated locally: `--eval-size` uses the same deterministic train/eval split inside every remote producer, while the coordinator renders the held-out samples (or `--eval-prompt-data`) and pushes `sft_eval_<step>_n<N>_<i>` partitions at eval intervals.
+
+Remote train producers fall back to the local coordinator path in any of these cases:
+
+- Ray is not initialized.
+- `--task-type seq_cls` is used.
+- `--custom-dataset-class` / `--custom-dataset-class-path` is set.
+- `--sft-oversize-strategy` is `skip` or `custom`, or `--sft-invalid-multimodal-strategy` is `skip`.
+
+The local fallback still splits the batch into `N` TransferQueue partitions, but it does not create `N` remote producer actors. Look for `SFT remote shard producer enabled: ... shards=N ...` to confirm that remote producer parallelism is active; fallback paths log `SFT remote shard producer disabled: ...` with the reason.
+
+Configure the value in the Ray runtime environment so the producer and consumer derive identical partition names:
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
 
 ### Oversize Sample Handling
 
@@ -519,7 +552,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 |-----------|------|---------|-------------|
 | `--autoscaler-config` | str | None | Path to autoscaler YAML configuration file. Enables autoscaling when set, disabled when not set. Example: `--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
+For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-studio/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
 
 ### Scale-Out Operation Parameters
 
@@ -527,6 +560,21 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|---------|-------------|
 | `--scale-out-timeout` | float | 300.0 | - | Timeout for all scale-out operations (engine startup, connect, health check, weight sync) in seconds |
 | `--scale-out-partial-success-policy` | str | rollback_all | `rollback_all`, `keep_partial` | Policy for partial success during scale-out. `rollback_all` reverts all engines on any failure; `keep_partial` keeps successfully scaled engines |
+| `--scale-weight-sync-precheck` | bool | True | - | Run an independent NCCL precheck before scale-out weight sync; fail-closed on incompatible transport. On by default; disable with `--no-scale-weight-sync-precheck` (disabling drops the fail-closed protection). See [Elastic Rollout · Weight Sync Precheck](./elastic-rollout.md#weight-sync-precheck) |
+
+### Precheck Env Vars
+
+These environment variables are for tuning and troubleshooting; all are optional (defaults shown). Read at runtime by `relax/utils/env.py`.
+
+| Env var | Type | Default | Description |
+|----------|------|--------|------|
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` | int | 536870912 (512 MiB) | Minimum free GPU memory (bytes) for the Stage 2 probe; below it the probe returns `INSUFFICIENT_GPU_MEMORY` and fails closed. SGLang reserves 85–90% of VRAM; lowering this risks probe OOM. |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE` | int | 18000 | Lower bound of the Stage 2 probe subprocess rendezvous port range |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX` | int | 20000 | Upper bound of the Stage 2 probe subprocess rendezvous port range. **Cluster network policy must allow `[PORT_BASE, PORT_MAX]`**, otherwise the probe cannot connect → `PROBE_FAILED` |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS` | int | 2 | Max attempts for the Stage 2 probe |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEMS` | int | 3 | Max number of scale-out failure reasons surfaced in the TUI / stable log |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN` | int | 120 | Truncation length per failure reason |
+| `RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN` | int | 512 | Total truncation length for failure reasons (prevents excessively long raw-error output) |
 
 ### Scale-In Operation Parameters
 
@@ -566,7 +614,6 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|-------------|
 | `--log-passrate` | flag | False | Enable pass@n pass rate logging |
 | `--log-multi-turn` | flag | False | Enable multi-turn Rollout information logging |
-| `--log-correct-samples` | flag | False | Log correct samples |
 | `--log-reward-category` | str | None | Log reward category statistics. Specify key in reward dict |
 
 ### Notifications

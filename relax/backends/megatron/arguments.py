@@ -2,6 +2,7 @@
 
 import ast
 import math
+from typing import Optional
 
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.arguments import parse_args as _megatron_parse_args
@@ -17,6 +18,7 @@ from transformers import AutoConfig
 
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import ModelSource
 
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
@@ -349,9 +351,19 @@ def _derive_cluster_args_from_resource(args):
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 
 
-def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
+def megatron_parse_args(
+    extra_args_provider,
+    skip_hf_validate: bool = False,
+    model_source: Optional[ModelSource] = None,
+):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
+
+    if model_source is not None:
+        # Keep the CLI path so node-local materialization can remap other
+        # arguments that explicitly referenced the same model.
+        args._model_source_original_hf_checkpoint = args.hf_checkpoint
+        args.hf_checkpoint = model_source.uri
 
     if args.hf_checkpoint and not skip_hf_validate:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)

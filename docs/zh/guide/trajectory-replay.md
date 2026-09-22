@@ -186,4 +186,4 @@ writer.finalize(ranks=[0])
 - 生产捕获拆成两类 bundle：rollout 级（reward/advantage，身份 `rollout_id`，在 `train_actor` 打点）与 step 级（loss，身份 `(rollout_id, step_id)`，在 `train_one_step` 打点）；两者尚未在同一 bundle 中打通「首个分歧阶段」的跨 bundle 传播。通过 `RELAX_REPLAY_CAPTURE=1` 与 `RELAX_REPLAY_CAPTURE_DIR` 打开。
 - 远端 RM/GenRM 结果按 `recorded-only` 处理，不在离线侧重算。
 
-相关设计讨论见 [Task 34 RFC #171](https://github.com/redai-infra/Relax/issues/171)。
+相关设计讨论见 [Task 34 RFC #171](https://github.com/redai-studio/Relax/issues/171)。

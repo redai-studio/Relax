@@ -1,12 +1,12 @@
 # SFT 训练
 
-本指南展示 Relax 中监督微调（SFT）的完整流程，并以当前 [`scripts/training/sft/`](../../../scripts/training/sft/) 下的启动脚本为准，覆盖 math 和 Pokemon 数据准备、模型与路径配置、启动命令以及常用调参方法。
+本指南展示 Relax 中监督微调（SFT）的完整流程，覆盖 [`scripts/training/sft/`](../../../scripts/training/sft/) 下的生成式 SFT、[`examples/seq_cls_sft/`](../../../examples/seq_cls_sft/) 下的原生序列分类 SFT、模型与数据准备、启动命令以及常用调参方法。
 
 开始之前，请先完成[安装](./installation.md)。
 
 ## 概述
 
-SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT producer，从 `--prompt-data` 读取数据，用模型的 chat template 渲染样本，将 packed 样本写入 TransferQueue，然后由 Megatron Actor 训练。如果设置了 `--eval-interval`，还会在评估集上运行 PPL 评估。如果设置了 `--sft-predict-interval`，Relax 会额外使用 Rollout 角色和 SGLang 周期性做生成式 predict。
+SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT producer，从 `--prompt-data` 读取数据，用模型的 chat template 渲染样本，将 packed 样本写入 TransferQueue，然后由 Megatron Actor 训练。默认的 `--task-type causal_lm` 训练语言模型头；设置 `--eval-interval` 时运行 PPL 评估，并可通过 `--sft-predict-interval` 使用 Rollout 角色周期性做生成式 predict。原生分类使用 `--task-type seq_cls`，将词表输出头替换为分类头，并在不启动 Rollout 的情况下计算分类 loss 和指标。
 
 当前启动脚本使用 `ray job submit`，并且在没有外部 entrypoint 预先准备 Ray 环境时自动 source [`scripts/entrypoint/local.sh`](../../../scripts/entrypoint/local.sh)。
 
@@ -19,6 +19,8 @@ SFT 通过 `--loss-type sft` 启用。该模式下，Relax 会启动一个 SFT p
 | [`run-qwen3-vl-4B-pokemon-8xgpu.sh`](../../../scripts/training/sft/run-qwen3-vl-4B-pokemon-8xgpu.sh) | `pokemon-gpt4o-captions` | `Qwen3-VL-4B-Instruct` | 8 GPU Actor，加 SFT producer 和 Rollout | 图像多模态 SFT，使用两个 parquet 文件，并开启预取。 |
 | [`run-qwen3-vl-4B-pokemon-1xgpu.sh`](../../../scripts/training/sft/run-qwen3-vl-4B-pokemon-1xgpu.sh) | `pokemon-gpt4o-captions` | `Qwen3-VL-4B-Instruct` | 1 GPU Actor，加 SFT producer | 低资源 Pokemon SFT，开启 CPU optimizer offload。 |
 | [`run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh) | `OpenMathReasoning-mini` | `Qwen3.5-35B-A3B` | 16 GPU Actor，加 SFT producer | 进阶 MTP SFT。多个参数已暴露为环境变量。 |
+| [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-9B` | 8 GPU Actor，加 SFT producer | 全参数二分类、多分类或多标签序列分类 SFT。 |
+| [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2、AG News 或 GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU Actor，加 SFT producer | LoRA 序列分类 SFT，默认使用 GoEmotions。 |
 
 ## 数据准备
 
@@ -165,6 +167,88 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 
 对于 MTP 脚本，默认约定是 `EXP_DIR=/root`，然后 `MODEL_DIR=${EXP_DIR}`、`DATA_DIR=${EXP_DIR}`，除非你单独覆盖它们。
 
+## 序列分类 SFT
+
+序列分类 SFT 训练原生的 `K`-logit 分类头，而不是生成标签文本。示例支持三种任务形式：
+
+| 任务 | 输入标签 | 输出与 loss |
+| --- | --- | --- |
+| 单标签二分类 | 整数 `0` 或 `1` | 2 logits，使用 CrossEntropy |
+| 单标签多分类 | `[0, K)` 范围内的整数 | `K` logits，使用 CrossEntropy |
+| 多标签分类 | 类别索引列表，例如 `[0, 2, 5]` | `K` logits，使用 BCEWithLogits |
+
+分类阈值只用于把多标签概率转换成离散的 eval 或推理结果，不参与训练或 eval loss 的计算。
+
+### 1. 配置路径
+
+从 Relax 仓库根目录运行以下命令。脚本期望 Qwen3.5 模型目录直接位于 `MODEL_DIR` 下，并将准备好的数据写入 `${DATA_DIR}/sft/seq_cls`。
+
+```bash
+export DATA_DIR=/path/to/relax-workspace
+export EXP_DIR=/path/to/relax-workspace/exp
+export MODEL_DIR=/path/to/relax-workspace/models
+```
+
+9B 脚本使用 `${MODEL_DIR}/Qwen3.5-9B` 下的原始 Hugging Face 模型；35B-A3B LoRA 脚本使用 `${MODEL_DIR}/Qwen3.5-35B-A3B`。
+
+### 2. 准备数据集
+
+数据准备工具会将固定 revision 的 SST-2、AG News 和 GoEmotions simplified 转换成训练脚本使用的 JSONL 格式：
+
+```bash
+python examples/seq_cls_sft/tools/prepare_classification_sft_data.py \
+  --dataset all \
+  --subset full \
+  --global-batch-size 64 \
+  --output-dir "${DATA_DIR}/sft/seq_cls"
+```
+
+使用 `--dataset sst2`、`--dataset ag_news` 或 `--dataset go_emotions` 可以只准备一个任务。启动脚本默认读取 `full` 子集；`DATA_SUBSET=smoke` 和 `DATA_SUBSET=extended` 会选择同一工具生成的较小确定性子集。
+
+自定义单标签数据的 `label` 是整数：
+
+```json
+{"messages": [{"role": "user", "content": "This movie is excellent."}], "label": 1}
+```
+
+自定义多标签数据的 `label` 是类别索引列表：
+
+```json
+{"messages": [{"role": "user", "content": "I feel relieved and excited."}], "label": [4, 17]}
+```
+
+设置 `TRAIN_DATA` 和 `EVAL_DATA` 可使用自定义 JSONL 文件。自定义标签空间时，还需设置 `NUM_LABELS`，并将 `PROBLEM_TYPE` 设为 `single_label_classification` 或 `multi_label_classification`。
+
+### 3. 启动训练
+
+Qwen3.5-9B 全参数脚本默认使用 SST-2。通过 `CLASSIFICATION_DATASET` 可切换到 AG News 或 GoEmotions：
+
+```bash
+bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+
+CLASSIFICATION_DATASET=ag_news \
+  bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+
+CLASSIFICATION_DATASET=go_emotions \
+  bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+```
+
+Qwen3.5-35B-A3B LoRA 脚本默认使用 GoEmotions：
+
+```bash
+bash examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh
+```
+
+两个脚本均启用 dynamic batching，使用 8 张训练 GPU，默认训练 10 个 epoch，并每 100 step 保存一次 Megatron native checkpoint。单标签 eval 输出 loss 和 accuracy；多标签 eval 输出 loss、micro precision、micro recall、micro F1 和 subset accuracy。
+
+::: warning 当前范围
+序列分类 SFT 当前只支持纯文本同步 SFT，不支持 fully async、hybrid、SFT 生成式 predict、MTP、SFT chunked logits 或在线 `--save-hf`。部署前需要离线导出 native checkpoint。提供的 SGLang adapter 仅支持 tensor parallel，不支持 pipeline parallel。
+:::
+
+::: tip 完整导出与部署流程
+完整的环境变量覆盖、Megatron 到 Hugging Face 离线导出、SGLang 启动以及单标签和多标签请求示例，请参阅 [`examples/seq_cls_sft` README](../../../examples/seq_cls_sft/README.md)。
+:::
+
 ## 配置详解
 
 启动脚本按参数块组织。调参时可以直接修改选中的脚本；如果脚本已经暴露了环境变量，也可以通过环境变量覆盖。
@@ -195,6 +279,8 @@ export DATA_DIR=/root
 ### MTP 参数
 
 MTP SFT 脚本开启 `--mtp-num-layers ${MTP_NUM_LAYERS:-1}`、`--enable-mtp-training` 和 `--mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.2}`。只有模型和 checkpoint 确实包含对应 MTP 层时才调大 `MTP_NUM_LAYERS`；`MTP_LOSS_SCALING_FACTOR` 是辅助 loss 权重，建议从 `0.2` 起调。
+
+联合训练、MTP-only 两阶段训练及 Pokémon 实测结果见 [MTP 训练](./mtp-rl-training.md)。
 
 ### SFT 数据参数
 
@@ -278,7 +364,7 @@ PPL 评估由以下参数控制：
 --eval-interval 10
 ```
 
-`--eval-size` 会从 `--prompt-data` 末尾切出 eval 集，并从训练池移除。小于 1 的值表示比例；10 或更大的值可视为绝对样本数。也可以使用 `--eval-prompt-data name path` 提供独立评估集，但 SFT 模式下不要使用 `--eval-config`。
+`--eval-size` 会使用 `--seed` 对 `--prompt-data` 的行做一次随机切分，固定 eval 子集，并将其从每个 shuffle 后的训练 epoch 中移除。小于 1 的值表示比例；大于等于 1 的值表示绝对样本数。这是 row-level 切分；同一图片的多语言 caption 等关联行不会自动分组。也可以使用 `--eval-prompt-data name path` 提供独立评估集，但 SFT 模式下不要使用 `--eval-config`。
 
 生成式 predict 由以下参数控制：
 
@@ -332,6 +418,36 @@ Pokemon 1 GPU 脚本：
 ```
 
 `"sft": [1, 0]` 表示 SFT producer 是 CPU-only。Actor 使用训练 GPU。开启周期性 predict 时，Rollout 也需要 GPU 资源。
+
+### SFT 分片 Producer
+
+`RELAX_SFT_TQ_SHARDS` 是 SFT async prepack 的实验性吞吐调优开关，用于把每个全局 SFT batch 拆到多个 TransferQueue 分区。推荐在 Ray 运行时环境中配置：
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
+
+同时在训练参数中开启 async prepack：
+
+```bash
+--per-rank-fetch
+--sft-async-prepack
+--sft-max-in-flight-steps 4
+```
+
+`--sft-max-in-flight-steps 4` 只是示例；async prepack 要求该值至少为 2，或者等价地设置 `--max-staleness >= 1`。这个环境变量本身不会开启 prepack；未使用 `--loss-type sft --sft-async-prepack` 时会被忽略。
+
+使用 `N` 个 shard 时，`--global-batch-size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。例如 global batch size 为 32、DP size 为 8 时，本地 batch 为 4，因此可以设置 2 或 4 个 shard，不能设置 3 个。
+
+满足 remote 路径条件时，`N` 个 shard 会为 train batch 启动 `N` 个 Ray producer actor。Eval 可以同时开启：train shard 由远端 producer 生产，coordinator 负责渲染 eval split 或 eval prompt data，并在 eval interval 推送原有的 `sft_eval_<step>_n<N>_<i>` 分区。部分配置（包括序列分类、自定义数据集（`--custom-dataset-class` / `--custom-dataset-class-path`）和允许跳过样本的过滤策略）会使用单个本地 producer，但仍然写入 `N` 个分区。因此，`RELAX_SFT_TQ_SHARDS=2` 并不一定表示有两个 producer actor。可以通过下面的日志确认 remote 路径是否真正启用：
+
+```text
+SFT remote shard producer enabled: ... shards=2 ...
+```
+
+使用 `--eval-size` 时，每个远端 train producer 都会应用同一份基于 `--seed` 的 holdout split，保证 train 和 eval 行不重叠。直接启动 Python 时也可以使用 `export RELAX_SFT_TQ_SHARDS=2`。通过 Ray Job 启动时，将它写入 `configs/env.yaml` 可以确保 producer 和 consumer 收到相同的值。分区命名、fallback 条件和 worker 分配方式见 [TransferQueue 分片 Producer](./configuration.md#transferqueue-分片-producer)。
 
 ## 启动
 
@@ -417,6 +533,7 @@ bash scripts/entrypoint/spmd-multinode.sh \
 | `--sft-prefetch-chunk-size` | 调大 | 一次派发更多预取样本，但会增加内存压力。 |
 | `--per-rank-fetch` | 多 GPU 时开启 | 让 TP/PP rank 直接从 TransferQueue 拉数据，需配足 `--num-data-storage-units`。 |
 | `--max-staleness` | I/O 重时调大 | 允许 producer 提前生产。Pokemon 8 GPU 脚本使用 `--max-staleness 4`。 |
+| `RELAX_SFT_TQ_SHARDS` | 从 2 开始 | 并行化满足条件的 async-prepack producer。仅当数据准备是瓶颈且 batch 满足整除约束时再增加。 |
 
 纯文本 math 任务通常更受序列长度和模型并行影响；Pokemon 任务更容易被图片读取和 processor 工作拖慢。
 
@@ -546,6 +663,7 @@ _CHAT_TEMPLATE_PATCHERS = (
 
 ## 下一步
 
+- 按照完整的[序列分类 SFT 示例](../../../examples/seq_cls_sft/README.md)完成 checkpoint 导出和 SGLang 部署。
 - 阅读[配置参考手册](./configuration.md)，查看完整 SFT 参数表。
 - 阅读[性能调优](./performance-tuning.md)，了解更完整的吞吐优化方法。
 - 如果任务在模型加载或训练中 OOM，阅读[OOM 排查](./oom-troubleshooting.md)。

@@ -17,7 +17,7 @@ from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
-from relax.utils.timer import timer
+from relax.utils.timer import Timer, timer
 
 
 logger = logging.getLogger(__name__)
@@ -631,6 +631,49 @@ def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
     return dense.tolist()
 
 
+def fetch_data_from_transfer_queue(
+    tq_client,
+    data_fields,
+    batch_size,
+    partition_id,
+    task_name,
+    sampling_config,
+    batch_index,
+    token_budget: int | None = None,
+    allow_underfill: bool = True,
+) -> tuple[list, float]:
+    """Fetch one raw TransferQueue batch without collectives or GPU work.
+
+    The result must be finalized by :func:`get_data_from_transfer_queue` on the
+    main training thread, where model-parallel ranks agree on availability.
+    """
+    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
+    if token_budget is not None:
+        config["allow_underfill"] = allow_underfill
+
+    start = time.perf_counter()
+    if token_budget is not None:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            token_budget=token_budget,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+    else:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+
+    if batch_meta.size == 0:
+        return [None, batch_meta], time.perf_counter() - start
+    return [tq_client.get_data(batch_meta), batch_meta], time.perf_counter() - start
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -644,6 +687,10 @@ def get_data_from_transfer_queue(
     per_rank_fetch: bool = False,
     token_budget: int | None = None,
     allow_underfill: bool = True,
+    post_process: bool = True,
+    synchronize_per_rank_fetch: bool = True,
+    prefetched_rollout_data: list | None = None,
+    prefetched_fetch_time_s: float | None = None,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -681,19 +728,25 @@ def get_data_from_transfer_queue(
             dominates ``tgd_bcast_tp_time``.  Caller must ensure
             ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
             path is incompatible) — actor.py guards this.
+        post_process: Move and reshape rollout fields for Megatron. Set to
+            False only for CPU-only background prefetch; the training thread
+            must materialize each micro-batch before use.
+        synchronize_per_rank_fetch: When True, per-rank fetches agree on
+            empty-vs-data state across the model-parallel replica before
+            returning. Set to False only when the caller has its own foreground
+            synchronization point and must keep this call collective-free.
+        prefetched_rollout_data: Raw ``[data, meta]`` result from
+            :func:`fetch_data_from_transfer_queue`. It is finalized on this
+            main thread, preserving collective and GPU-work ordering.
+        prefetched_fetch_time_s: Wall-clock TQ RPC time associated with
+            ``prefetched_rollout_data`` for the fetch metric.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
         If no data is available, both elements are None.
     """
-    # Compose request configuration and ask the queue for metadata.
-    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
-    if token_budget is not None:
-        # Token-budget fetch mode: the streaming sampler needs dp_size and
-        # allow_underfill in sampling_config to decide bucket assignment and
-        # end-of-stream behaviour.  dp_rank is already in sampling_config.
-        config["allow_underfill"] = allow_underfill
-
+    if not synchronize_per_rank_fetch and not per_rank_fetch:
+        raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
     # Determine which rank should fetch data
     #
     # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
@@ -733,39 +786,33 @@ def get_data_from_transfer_queue(
 
     def _fetch_once() -> list:
         """One get_meta (+ get_data) round-trip on this rank."""
-        if token_budget is not None:
-            batch_meta = tq_client.get_meta(
-                data_fields=data_fields,
-                token_budget=token_budget,
-                partition_id=partition_id,
-                sampling_config=config,
-                task_name=task_name,
-            )  # type: ignore
-        else:
-            batch_meta = tq_client.get_meta(
-                data_fields=data_fields,
-                batch_size=batch_size,
-                partition_id=partition_id,
-                sampling_config=config,
-                task_name=task_name,
-            )  # type: ignore
+        rollout_data, _ = fetch_data_from_transfer_queue(
+            tq_client=tq_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+            token_budget=token_budget,
+            allow_underfill=allow_underfill,
+        )
+        return rollout_data
 
-        if batch_meta.size == 0:
-            # Keep the (empty) meta so its extra_info (e.g. dummy_round) rides
-            # the broadcast to every consumer rank — the consumer decides
-            # real vs dummy vs end from what it fetched, no extra RPC.
-            return [None, batch_meta]
-        return [tq_client.get_data(batch_meta), batch_meta]
+    if prefetched_rollout_data is not None:
+        rollout_data = prefetched_rollout_data
+        if prefetched_fetch_time_s is not None:
+            Timer().add(fetch_timer_name, prefetched_fetch_time_s)
+    else:
+        with timer(fetch_timer_name):
+            if should_fetch:
+                rollout_data = _fetch_once()
+            else:
+                # Non-fetching ranks start with an empty placeholder and
+                # will receive the real data via broadcast.
+                rollout_data = [None, None]
 
-    with timer(fetch_timer_name):
-        if should_fetch:
-            rollout_data = _fetch_once()
-        else:
-            # Non-fetching ranks start with an empty placeholder and
-            # will receive the real data via broadcast.
-            rollout_data = [None, None]
-
-    if per_rank_fetch:
+    if per_rank_fetch and synchronize_per_rank_fetch:
         # No broadcast follows, so a producer race can split this logical DP
         # rank into "got data" and "empty meta" model-parallel subsets.
         rollout_data = _agree_on_fetch(
@@ -777,7 +824,7 @@ def get_data_from_transfer_queue(
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.
-    cuda_dev = device_utils.make_current_torch_device()
+    cuda_dev = None if per_rank_fetch else device_utils.make_current_torch_device()
 
     # --- Extract rollout_routed_experts BEFORE broadcast_object_list ---
     # broadcast_object_list uses pickle for the entire payload. When
@@ -903,8 +950,9 @@ def get_data_from_transfer_queue(
     if isinstance(rollout_data, TensorDict):
         new_rollout_data: Dict[str, Any] = {}
         for k, v in rollout_data.items():
-            # Convert length/reward-style fields to Python lists.
-            if "lengths" in k or "reward" in k:
+            # Keep scalar metadata as Python values across the TensorDict boundary,
+            # including NestedTensor values reconstructed by TransferQueue.
+            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
                 new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path
@@ -958,7 +1006,8 @@ def get_data_from_transfer_queue(
     if has_multimodal and mm_inputs is not None:
         rollout_data["multimodal_train_inputs"] = mm_inputs
 
-    post_process_rollout_data(args, rollout_data)
+    if post_process:
+        post_process_rollout_data(args, rollout_data)
 
     return rollout_data, batch_meta
 
@@ -973,6 +1022,20 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "classification_labels" in rollout_data:
+        label_dtype = (
+            torch.long
+            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
+            else torch.float32
+        )
+        rollout_data["classification_labels"] = [
+            torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
+            for label in rollout_data["classification_labels"]
+        ]
+    if "sample_weights" in rollout_data:
+        rollout_data["sample_weights"] = [
+            torch.as_tensor(weight, dtype=torch.float32, device=cuda_dev) for weight in rollout_data["sample_weights"]
+        ]
     # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
     # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":
@@ -993,7 +1056,7 @@ def post_process_rollout_data(args, rollout_data):
         or getattr(args, "uses_unsplit_forward", False),
     )
 
-    for key in [
+    response_float_fields = [
         "log_probs",
         "ref_log_probs",
         "rollout_log_probs",
@@ -1001,7 +1064,16 @@ def post_process_rollout_data(args, rollout_data):
         "returns",
         "values",
         *iter_opd_cp_float_fields(),
-    ]:
+    ]
+    rewards = rollout_data.get("rewards", [])
+    if rewards and isinstance(rewards[0], list):
+        rollout_data["rewards"] = [
+            row * response_length if len(row) == 1 else row
+            for row, response_length in zip(rewards, rollout_data["response_lengths"], strict=True)
+        ]
+        response_float_fields.append("rewards")
+
+    for key in response_float_fields:
         if key not in rollout_data:
             continue
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
@@ -1418,10 +1490,9 @@ class StreamingTQIterator:
             )
             return self._make_dummy_batch()
 
-        partition_id = f"train_{self.rollout_id}"
-
         t0 = time.monotonic()
         empty_streak = 0
+        partition_id = f"train_{self.rollout_id}"
 
         while True:
             sampling_config = self._sampling_config(self._batch_index)

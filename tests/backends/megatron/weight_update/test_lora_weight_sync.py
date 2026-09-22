@@ -9,8 +9,7 @@ Consolidates three previously separate suites:
   the mode predicates that gate adapter vs merge paths, and the checkpoint save
   that writes an HF-PEFT dir + adapter-mode metadata.
 - **Colocate sync** — the transport-independent ``LoraAdapterSync`` helper:
-  ``config_dict`` (HF-PEFT shape + Megatron->HF target-module conversion) and
-  ``live_dir`` (shared-dir resolution + ``RELAX_LORA_LIVE_DIR`` override).
+  ``config_dict`` (HF-PEFT shape + Megatron->SGLang target-module conversion).
 - **Fully-async** — the pure/logic pieces gating the DeviceDirectBackend path:
   the adapter-param skip predicate, the delta-skip early-return contract, the
   Megatron->HF target-module expansion, the tp_size=1 merge formula, and the
@@ -183,10 +182,15 @@ class TestCheckpointModeDetection:
                 if object_gather_list is not None:
                     object_gather_list[0] = obj
 
+            def fake_all_gather(output, obj, group=None):
+                output[0] = obj
+
             with (
                 patch("torch.distributed.get_rank", return_value=0),
                 patch("torch.distributed.get_world_size", return_value=1),
+                patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
                 patch("torch.distributed.gather_object", side_effect=fake_gather),
+                patch("torch.distributed.broadcast_object_list"),
                 patch("relax.backends.megatron.checkpoint.get_gloo_group", return_value=None),
                 patch("relax.backends.megatron.checkpoint.megatron_bridge_utils.patch_megatron_model"),
             ):
@@ -199,6 +203,41 @@ class TestCheckpointModeDetection:
             meta = json.loads((adapter_dir / "relax_lora_meta.json").read_text())
             assert meta["lora_adapter_mode"] is True
             assert meta["lora_merge_mode"] is False
+
+    def test_empty_adapter_export_is_a_hard_error(self):
+        pytest.importorskip("megatron")
+
+        from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
+
+        args = MagicMock(
+            lora_rank=32,
+            lora_alpha=32,
+            lora_target_modules=["linear_qkv"],
+            lora_dropout=0.0,
+            lora_merge_mode=False,
+            lora_adapter_mode=False,
+        )
+        bridge = MagicMock()
+        bridge.export_adapter_weights.return_value = []
+
+        def fake_all_gather(output, obj, group=None):
+            output[0] = obj
+
+        def fake_gather(obj, object_gather_list=None, dst=0, group=None):
+            object_gather_list[0] = obj
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
+            patch("torch.distributed.gather_object", side_effect=fake_gather),
+            patch("torch.distributed.broadcast_object_list"),
+            patch("relax.backends.megatron.checkpoint.get_gloo_group", return_value=None),
+            patch("relax.backends.megatron.checkpoint.megatron_bridge_utils.patch_megatron_model"),
+            pytest.raises(RuntimeError, match="no adapter parameters"),
+        ):
+            _save_lora_to_checkpoint(MagicMock(), tmpdir, args, bridge=bridge)
 
 
 # ---------------------------------------------------------------------------
@@ -230,24 +269,11 @@ class TestConfigDict:
         assert cd["task_type"] == "CAUSAL_LM"
         assert cd["bias"] == "none"
 
-    def test_config_dict_converts_target_modules_to_hf(self):
-        # Canonical Megatron names must be expanded to HF-style names for SGLang's PEFT loader.
+    def test_config_dict_converts_target_modules_to_engine_flavor(self):
+        # Canonical Megatron names must be expanded to the leaf names SGLang matches by.
         cd = _make_sync().config_dict()
         assert "linear_qkv" not in cd["target_modules"]
         assert {"q_proj", "k_proj", "v_proj", "o_proj"}.issubset(set(cd["target_modules"]))
-
-
-class TestLiveDir:
-    def test_live_dir_defaults_to_save(self):
-        assert _make_sync(save="/data/run").live_dir() == "/data/run/relax_lora_live/adapter"
-
-    def test_live_dir_env_override(self, monkeypatch):
-        monkeypatch.setenv("RELAX_LORA_LIVE_DIR", "/dev/shm/x")
-        assert _make_sync().live_dir() == "/dev/shm/x/relax_lora_live/adapter"
-
-    def test_live_dir_falls_back_to_tmp(self, monkeypatch):
-        monkeypatch.delenv("RELAX_LORA_LIVE_DIR", raising=False)
-        assert _make_sync(save=None).live_dir() == "/tmp/relax_lora_live/adapter"
 
 
 class TestInitialState:
@@ -333,10 +359,12 @@ class TestMergeContract:
         assert expected.shape == base.shape
 
     def test_tp1_matches_real_loramerge(self):
-        pytest.importorskip("megatron.bridge.peft.lora")
         from inspect import signature
 
-        from megatron.bridge.peft.lora import LoRAMerge
+        lora = pytest.importorskip("megatron.bridge.peft.lora")
+        if not hasattr(lora, "LoRAMerge"):
+            pytest.skip("this Megatron-Bridge build does not expose LoRAMerge")
+        LoRAMerge = lora.LoRAMerge
 
         if "tp_size" not in signature(LoRAMerge().merge).parameters:
             pytest.skip("installed megatron bridge LoRAMerge.merge lacks tp_size support")

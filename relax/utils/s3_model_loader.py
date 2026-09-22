@@ -20,9 +20,11 @@ import os
 import re
 import shutil
 import time
+from argparse import Namespace
+from collections.abc import Mapping
 
 from relax.utils.logging_utils import get_logger
-from relax.utils.model_source import LocalModel, ModelSource
+from relax.utils.model_source import LocalModel, ModelSource, model_source_path_aliases, normalize_model_path
 
 
 logger = get_logger(__name__)
@@ -47,12 +49,63 @@ _MODEL_WEIGHT_FILENAME_PATTERNS = (
     re.compile(r"(?:rng|scheduler|training|trainer)[_-]state(?:_\d+)?\.(?:bin|ckpt|distcp|json|pt|pth)"),
 )
 _MANIFEST_VERSION = 1
+_CACHE_DIR_PATTERN = re.compile(rf"{_MARKER_PREFIX}_[0-9a-f]{{16}}")
 _CLEANUP_LOCK_TIMEOUT_SECONDS = 300.0
 _CLEANUP_LOCK_POLL_INTERVAL_SECONDS = 0.1
+_TELEMETRY_S3_CONNECT_TIMEOUT_SECONDS = 2.0
+_TELEMETRY_S3_READ_TIMEOUT_SECONDS = 3.0
+_TELEMETRY_S3_TOTAL_MAX_ATTEMPTS = 1
 
 
 def is_s3_uri(uri) -> bool:
     return isinstance(uri, str) and uri.lower().startswith("s3://")
+
+
+def build_runai_streamer_env_for_load(
+    model_source: ModelSource | None,
+    model_path: str | None,
+    load_format: str | None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the child env required before importing a streaming SGLang."""
+    if (
+        model_source is None
+        or model_path != model_source.uri
+        or not is_s3_uri(model_source.uri)
+        or load_format not in {"auto", "runai_streamer"}
+    ):
+        return {}
+
+    current = os.environ if environ is None else environ
+    endpoint = (
+        current.get("RUNAI_STREAMER_S3_ENDPOINT")
+        or model_source.endpoint
+        or current.get("AWS_ENDPOINT_URL_S3")
+        or current.get("AWS_ENDPOINT_URL")
+    )
+    overlay: dict[str, str] = {}
+    if endpoint:
+        overlay.update(
+            {
+                "RUNAI_STREAMER_S3_ENDPOINT": endpoint,
+                "AWS_ENDPOINT_URL": endpoint,
+                "AWS_ENDPOINT_URL_S3": endpoint,
+            }
+        )
+    if "RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING" in current:
+        overlay["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = current["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"]
+    elif model_source.addressing_style == "path":
+        overlay["RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING"] = "0"
+    if model_source.credential_mode == "placeholder":
+        overlay.update(
+            {
+                "AWS_EC2_METADATA_DISABLED": "true",
+                "AWS_ACCESS_KEY_ID": "mock",
+                "AWS_SECRET_ACCESS_KEY": "mock",
+                "AWS_SESSION_TOKEN": "",
+            }
+        )
+    return overlay
 
 
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
@@ -88,7 +141,15 @@ def _safe_join(root: str, rel: str) -> str:
     return dest
 
 
-def _make_s3_client(*, endpoint, use_placeholder_credentials=False, use_path_style=False):
+def _make_s3_client(
+    *,
+    endpoint,
+    use_placeholder_credentials=False,
+    use_path_style=False,
+    connect_timeout=None,
+    read_timeout=None,
+    total_max_attempts=None,
+):
     import boto3
     from botocore.config import Config
 
@@ -97,6 +158,12 @@ def _make_s3_client(*, endpoint, use_placeholder_credentials=False, use_path_sty
         max_pool_connections=64,
         proxies={},  # Disable proxies for this client without mutating os.environ.
     )
+    if connect_timeout is not None:
+        config_kwargs["connect_timeout"] = connect_timeout
+    if read_timeout is not None:
+        config_kwargs["read_timeout"] = read_timeout
+    if total_max_attempts is not None:
+        config_kwargs["retries"] = {"total_max_attempts": total_max_attempts, "mode": "standard"}
     if use_path_style:
         config_kwargs["s3"] = {"addressing_style": "path"}
     client_kwargs = dict(endpoint_url=endpoint, config=Config(**config_kwargs))
@@ -234,10 +301,16 @@ def _fsync_parent(path: str) -> None:
         os.close(directory_fd)
 
 
-def _manifest_files_complete(dest: str, manifest: dict) -> bool:
+def _manifest_files_complete(dest: str, manifest: dict, *, kind: str | None = None) -> bool:
+    matched = False
     for entry in manifest["files"]:
         if not isinstance(entry, dict):
             return False
+        if entry.get("kind") not in {"metadata", "weight"}:
+            return False
+        if kind is not None and entry.get("kind") != kind:
+            continue
+        matched = True
         try:
             path = _safe_join(dest, entry["path"])
             expected_size = entry["size"]
@@ -247,7 +320,7 @@ def _manifest_files_complete(dest: str, manifest: dict) -> bool:
             return False
         if not os.path.isfile(path) or os.path.getsize(path) != expected_size:
             return False
-    return True
+    return matched
 
 
 def _acquire_cleanup_lock(lock_file) -> None:
@@ -261,6 +334,26 @@ def _acquire_cleanup_lock(lock_file) -> None:
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for the S3 model SHM cache lock") from exc
             time.sleep(min(_CLEANUP_LOCK_POLL_INTERVAL_SECONDS, remaining))
+
+
+def _discard_cache_payload(dest: str) -> None:
+    """Discard an unpublished or invalid cache while preserving its lock."""
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.rmtree(dest + ".tmp", ignore_errors=True)
+    for suffix in (
+        ".done",
+        ".done.tmp",
+        ".metadata.done",
+        ".metadata.done.tmp",
+        ".manifest.json",
+        ".manifest.json.tmp",
+        ".tmp.manifest.json",
+        ".tmp.manifest.json.tmp",
+    ):
+        try:
+            os.remove(dest + suffix)
+        except FileNotFoundError:
+            pass
 
 
 def _download_one(cli, bucket, key, prefix, dest, buffer_size=8 * 1024 * 1024):
@@ -355,56 +448,82 @@ def _download_model_metadata_to_shm_once(
     os.makedirs(os.path.dirname(dest) or "/", exist_ok=True)
     with open(lock, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        for ready_marker in (full_marker, marker):
-            if os.path.isdir(dest) and os.path.isfile(ready_marker):
-                with open(ready_marker) as marker_file:
-                    if marker_file.read().strip() == _cache_identity(uri, endpoint):
-                        return
+        identity = _cache_identity(uri, endpoint)
+        if os.path.isdir(dest) and os.path.isfile(full_marker):
+            with open(full_marker) as marker_file:
+                marker_matches = marker_file.read().strip() == identity
+            manifest = _read_model_manifest(dest, identity) if marker_matches else None
+            if manifest is not None and _manifest_files_complete(dest, manifest):
+                return
+        if os.path.isdir(dest) and os.path.isfile(marker):
+            with open(marker) as marker_file:
+                marker_matches = marker_file.read().strip() == identity
+            manifest = _read_model_manifest(dest, identity) if marker_matches else None
+            if manifest is not None and _manifest_files_complete(dest, manifest, kind="metadata"):
+                return
 
-        bucket, prefix = _parse_s3_uri(uri)
-        prefix = _normalize_prefix(prefix)
-        cli = _make_s3_client(
-            endpoint=endpoint,
-            use_placeholder_credentials=use_placeholder_credentials,
-            use_path_style=use_path_style,
-        )
-        objects = _list_objects_with_size(cli, bucket, prefix)
-        if not objects:
-            raise RuntimeError(f"no objects under s3://{bucket}/{prefix}")
-        index_objects = [(key, size) for key, size in objects if key.lower().endswith(".index.json")]
-        _download_selected_objects(
-            cli,
-            bucket,
-            [key for key, _size in index_objects],
-            prefix,
-            dest,
-            workers=workers,
-            retries=retries,
-            description="model index",
-        )
-        indexed_weights = _indexed_weight_paths(dest)
-        metadata_objects = [
-            (key, size) for key, size in objects if not _is_model_weight_path(key[len(prefix) :], indexed_weights)
-        ]
-        if not metadata_objects:
-            raise RuntimeError(f"no model metadata under s3://{bucket}/{prefix}")
-        metadata_bytes = _missing_bytes(metadata_objects, prefix, dest)
-        free = _free_bytes(os.path.dirname(dest) or "/")
-        if metadata_bytes > free * 0.95:
-            raise RuntimeError(f"shm capacity is insufficient for model metadata: need={metadata_bytes} free={free}")
+        _discard_cache_payload(dest)
 
-        keys = [key for key, _ in metadata_objects]
-        _download_selected_objects(
-            cli,
-            bucket,
-            keys,
-            prefix,
-            dest,
-            workers=workers,
-            retries=retries,
-            description="metadata",
-        )
-        _write_ready_marker(marker, _cache_identity(uri, endpoint))
+        staging = dest + ".tmp"
+        try:
+            os.makedirs(staging)
+
+            bucket, prefix = _parse_s3_uri(uri)
+            prefix = _normalize_prefix(prefix)
+            cli = _make_s3_client(
+                endpoint=endpoint,
+                use_placeholder_credentials=use_placeholder_credentials,
+                use_path_style=use_path_style,
+            )
+            objects = _list_objects_with_size(cli, bucket, prefix)
+            if not objects:
+                raise RuntimeError(f"no objects under s3://{bucket}/{prefix}")
+            index_objects = [(key, size) for key, size in objects if key.lower().endswith(".index.json")]
+            _download_selected_objects(
+                cli,
+                bucket,
+                [key for key, _size in index_objects],
+                prefix,
+                staging,
+                workers=workers,
+                retries=retries,
+                description="model index",
+            )
+            indexed_weights = _indexed_weight_paths(staging)
+            metadata_objects = [
+                (key, size) for key, size in objects if not _is_model_weight_path(key[len(prefix) :], indexed_weights)
+            ]
+            if not metadata_objects:
+                raise RuntimeError(f"no model metadata under s3://{bucket}/{prefix}")
+            metadata_bytes = sum(size for _key, size in metadata_objects)
+            free = _free_bytes(os.path.dirname(dest) or "/")
+            if metadata_bytes > free * 0.95:
+                raise RuntimeError(
+                    f"shm capacity is insufficient for model metadata: need={metadata_bytes} free={free}"
+                )
+
+            keys = [key for key, _ in metadata_objects]
+            _download_selected_objects(
+                cli,
+                bucket,
+                keys,
+                prefix,
+                staging,
+                workers=workers,
+                retries=retries,
+                description="metadata",
+            )
+            _write_model_manifest(staging, identity, metadata_objects, prefix)
+            manifest = _read_model_manifest(staging, identity)
+            if manifest is None or not _manifest_files_complete(staging, manifest, kind="metadata"):
+                raise RuntimeError(f"downloaded model metadata is incomplete: s3://{bucket}/{prefix}")
+            shutil.rmtree(dest, ignore_errors=True)
+            os.replace(staging, dest)
+            os.replace(staging + ".manifest.json", dest + ".manifest.json")
+            _write_ready_marker(marker, identity)
+        except BaseException:
+            _discard_cache_payload(dest)
+            raise
         logger.info(f"downloaded {len(keys)} model metadata objects -> {dest}")
 
 
@@ -425,7 +544,6 @@ def _download_model_to_shm_once(
     os.makedirs(os.path.dirname(dest) or "/", exist_ok=True)
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        marker_matches = False
         if os.path.exists(marker) and os.path.isdir(dest):
             with open(marker) as mf:
                 marker_matches = mf.read().strip() == identity
@@ -434,6 +552,7 @@ def _download_model_to_shm_once(
                 if manifest is not None and _manifest_files_complete(dest, manifest):
                     logger.info(f"shm cache hit: {dest}")
                     return
+        _discard_cache_payload(dest)
         bucket, prefix = _parse_s3_uri(uri)
         prefix = _normalize_prefix(prefix)
         cli = _make_s3_client(
@@ -444,12 +563,7 @@ def _download_model_to_shm_once(
         objs = _list_objects_with_size(cli, bucket, prefix)
         if not objs:
             raise RuntimeError(f"no objects under s3://{bucket}/{prefix}")
-        if marker_matches and _missing_bytes(objs, prefix, dest) == 0:
-            _write_model_manifest(dest, identity, objs, prefix)
-            logger.info(f"migrated legacy shm cache manifest: {dest}")
-            return
-        # Check resumable missing bytes under the model lock after marker validation.
-        need = _missing_bytes(objs, prefix, dest)
+        need = sum(size for _key, size in objs)
         free = _free_bytes(os.path.dirname(dest) or "/")
         if need > free * capacity_margin:
             raise RuntimeError(
@@ -457,26 +571,69 @@ def _download_model_to_shm_once(
                 f"free={free / 1e9:.1f}GB at {os.path.dirname(dest)}); "
                 "contact the Relax team for model-specific support for oversized checkpoints"
             )
-        _download_prefix(
-            bucket,
-            prefix,
-            dest,
-            endpoint=endpoint,
-            workers=workers,
-            retries=retries,
-            use_placeholder_credentials=use_placeholder_credentials,
-            use_path_style=use_path_style,
-        )
-        _write_model_manifest(dest, identity, objs, prefix)
-        _write_ready_marker(marker, identity)
+        staging = dest + ".tmp"
+        try:
+            os.makedirs(staging)
+            _download_prefix(
+                bucket,
+                prefix,
+                staging,
+                endpoint=endpoint,
+                workers=workers,
+                retries=retries,
+                use_placeholder_credentials=use_placeholder_credentials,
+                use_path_style=use_path_style,
+            )
+            _write_model_manifest(staging, identity, objs, prefix)
+            manifest = _read_model_manifest(staging, identity)
+            if manifest is None or not _manifest_files_complete(staging, manifest):
+                raise RuntimeError(f"downloaded model cache is incomplete: s3://{bucket}/{prefix}")
+            shutil.rmtree(dest, ignore_errors=True)
+            os.replace(staging, dest)
+            os.replace(staging + ".manifest.json", dest + ".manifest.json")
+            _write_ready_marker(marker, identity)
+        except BaseException:
+            _discard_cache_payload(dest)
+            raise
 
 
 def _free_bytes(path: str) -> int:
     return shutil.disk_usage(path).free
 
 
-def _resolve_endpoint(args):
-    return args.model_source.endpoint
+def _resolve_endpoint(args) -> str | None:
+    """Resolve a source-specific endpoint before the standard AWS endpoint
+    environment."""
+    endpoint = args.model_source.endpoint
+    if endpoint is not None:
+        return endpoint
+    return os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+
+
+def read_s3_model_config(args) -> dict:
+    """Read only ``config.json`` using the resolved model source policy."""
+    source = getattr(args, "model_source", None)
+    if source is None or not is_s3_uri(source.uri):
+        raise ValueError("an S3 model source is required to read config.json")
+
+    bucket, prefix = _parse_s3_uri(source.uri)
+    cli = _make_s3_client(
+        endpoint=_resolve_endpoint(args),
+        use_placeholder_credentials=source.credential_mode == "placeholder",
+        use_path_style=source.addressing_style == "path",
+        connect_timeout=_TELEMETRY_S3_CONNECT_TIMEOUT_SECONDS,
+        read_timeout=_TELEMETRY_S3_READ_TIMEOUT_SECONDS,
+        total_max_attempts=_TELEMETRY_S3_TOTAL_MAX_ATTEMPTS,
+    )
+    response = cli.get_object(Bucket=bucket, Key=_normalize_prefix(prefix) + "config.json")
+    body = response["Body"]
+    try:
+        model_config = json.loads(body.read())
+    finally:
+        body.close()
+    if not isinstance(model_config, Mapping):
+        raise ValueError(f"S3 model config.json must contain a JSON object, got {type(model_config).__name__}")
+    return dict(model_config)
 
 
 def _resolve_shm_root(args) -> str:
@@ -488,6 +645,83 @@ def _resolve_shm_root(args) -> str:
             "Create the memory-backed directory before launch; disk fallback is intentionally disabled."
         )
     return root
+
+
+def remove_stale_s3_model_caches(args) -> tuple[int, int]:
+    """Remove cache artifacts left by an earlier Relax job on this node.
+
+    Only names derived from Relax's fixed cache prefix and 16-hex digest are
+    eligible. The caller must run this before starting the current job's
+    prefetch, so no cross-job cache reuse or recovery is attempted.
+    """
+    root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
+    if not os.path.isdir(root):
+        return 0, 0
+    removed_entries = 0
+    removed_bytes = 0
+    sidecar_suffixes = (
+        ".state.json.tmp",
+        ".tmp.manifest.json.tmp",
+        ".tmp.manifest.json",
+        ".metadata.done.tmp",
+        ".manifest.json.tmp",
+        ".done.tmp",
+        ".state.json",
+        ".metadata.done",
+        ".manifest.json",
+        ".done",
+        ".tmp",
+    )
+
+    def cache_base_name(name: str) -> str | None:
+        base_name = name
+        for suffix in (".lock", *sidecar_suffixes):
+            if name.endswith(suffix):
+                base_name = name[: -len(suffix)]
+                break
+        if _CACHE_DIR_PATTERN.fullmatch(base_name) is None:
+            return None
+        return base_name
+
+    cache_bases = {base_name for name in os.listdir(root) if (base_name := cache_base_name(name)) is not None}
+
+    for base_name in cache_bases:
+        lock = os.path.join(root, base_name + ".lock")
+        with open(lock, "w") as lock_file:
+            _acquire_cleanup_lock(lock_file)
+            # Re-scan while holding the original lock: an older downloader may
+            # have published payload after the first namespace scan.
+            paths = [
+                os.path.join(root, name)
+                for name in os.listdir(root)
+                if name != base_name + ".lock" and cache_base_name(name) == base_name
+            ]
+            for path in paths:
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        for current_root, _dirs, files in os.walk(path):
+                            for filename in files:
+                                try:
+                                    removed_bytes += os.path.getsize(os.path.join(current_root, filename))
+                                except OSError:
+                                    pass
+                        shutil.rmtree(path)
+                    else:
+                        try:
+                            removed_bytes += os.path.getsize(path)
+                        except OSError:
+                            pass
+                        os.remove(path)
+                except FileNotFoundError:
+                    continue
+                removed_entries += 1
+
+    if removed_entries:
+        logger.info(
+            f"removed {removed_entries} stale Relax S3 model cache artifacts "
+            f"({removed_bytes / 1e9:.1f} GB) from SHM: {root}"
+        )
+    return removed_entries, removed_bytes
 
 
 def maybe_resolve_s3_model_to_shm(uri: str, args) -> str:
@@ -521,12 +755,13 @@ def resolve_s3_model_metadata_to_shm(uri: str, args) -> str:
     if config is None or uri != config.uri:
         return uri
     root = _resolve_shm_root(args)
-    dest = _shm_dest_dir(uri, root, config.endpoint)
+    endpoint = _resolve_endpoint(args)
+    dest = _shm_dest_dir(uri, root, endpoint)
     workers = getattr(args, "s3_model_download_workers", None) or 20
     _download_model_metadata_to_shm_once(
         uri,
         dest,
-        endpoint=_resolve_endpoint(args),
+        endpoint=endpoint,
         workers=workers,
         retries=3,
         use_placeholder_credentials=config.credential_mode == "placeholder",
@@ -546,13 +781,17 @@ def get_s3_model_cached_path(uri: str, args) -> str | None:
     root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
     if not os.path.isdir(root):
         return None
-    dest = _shm_dest_dir(uri, root, config.endpoint)
+    endpoint = _resolve_endpoint(args)
+    dest = _shm_dest_dir(uri, root, endpoint)
     marker = dest + ".done"
     if not os.path.isdir(dest) or not os.path.isfile(marker):
         return None
     try:
         with open(marker) as marker_file:
-            return dest if marker_file.read().strip() == _cache_identity(uri, config.endpoint) else None
+            if marker_file.read().strip() != _cache_identity(uri, endpoint):
+                return None
+        manifest = _read_model_manifest(dest, _cache_identity(uri, endpoint))
+        return dest if manifest is not None and _manifest_files_complete(dest, manifest) else None
     except OSError:
         return None
 
@@ -576,11 +815,12 @@ def cleanup_s3_model_weights_from_shm(args) -> tuple[int, int]:
     root = getattr(args, "s3_model_shm_root", None) or "/dev/shm"
     if not os.path.isdir(root):
         return 0, 0
-    dest = _shm_dest_dir(config.uri, root, config.endpoint)
+    endpoint = _resolve_endpoint(args)
+    dest = _shm_dest_dir(config.uri, root, endpoint)
     if not os.path.isdir(dest):
         return 0, 0
 
-    identity = _cache_identity(config.uri, config.endpoint)
+    identity = _cache_identity(config.uri, endpoint)
     full_marker = dest + ".done"
     metadata_marker = dest + ".metadata.done"
     lock = dest + ".lock"
@@ -664,6 +904,19 @@ def prepare_local_model(args, *, completeness: str = "full") -> LocalModel:
     return LocalModel(source=source, path=path, completeness=completeness)
 
 
+def _remap_matching_model_paths(
+    args: Namespace,
+    names: tuple[str, ...],
+    aliases: set[str],
+    local_path: str,
+) -> None:
+    """Remap optional model paths that refer to the selected source."""
+    for name in names:
+        path = getattr(args, name, None)
+        if path and normalize_model_path(path) in aliases:
+            setattr(args, name, local_path)
+
+
 def prepare_model_maybe_update_args(args, *, completeness: str = "full") -> LocalModel:
     """Prepare the model and update process-private model arguments in
     place."""
@@ -673,10 +926,12 @@ def prepare_model_maybe_update_args(args, *, completeness: str = "full") -> Loca
     if local_path == source_uri:
         return local_model
 
+    source_aliases = model_source_path_aliases(args, source_uri)
+
     args.hf_checkpoint = local_path
-    for name in ("tokenizer_model",):
-        if getattr(args, name, None) == source_uri:
-            setattr(args, name, local_path)
-    if completeness == "full" and getattr(args, "load", None) == source_uri:
-        args.load = local_path
+    _remap_matching_model_paths(args, ("tokenizer_model",), source_aliases, local_path)
+    if completeness == "full":
+        # ``load`` stays untouched until the checkpoint dispatcher has had a
+        # chance to recognize a real Megatron resume checkpoint.
+        _remap_matching_model_paths(args, ("ref_load",), source_aliases, local_path)
     return local_model

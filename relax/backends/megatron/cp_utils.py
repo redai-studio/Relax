@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
@@ -87,6 +89,41 @@ def get_logits_and_tokens_offset_with_cp(
     return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 
 
+def _slice_loss_mask_with_cp(
+    loss_mask: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    qkv_format: str,
+    max_seq_len: int | None,
+    padded_total_length: int | None,
+    dynamic_cp_size: int | None,
+    dynamic_cp_rank: int | None,
+) -> torch.Tensor:
+    """Slice a response mask in the coordinate system used by CP log-probs.
+
+    RL masks are target-token aligned, while SFT masks have already been
+    shifted to predictor coordinates by ``align_loss_mask_for_sft``. CP log-
+    probs are ordered by target token in both the zigzag and allgather-
+    redistributed paths, so SFT must slice its mask with the matching
+    predictor/logit offsets.
+    """
+    prompt_length = total_length - response_length
+    _, _, logits_offsets, token_offsets = get_logits_and_tokens_offset_with_cp(
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+        padded_total_length,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+    if response_length == total_length:
+        mask_offsets = logits_offsets
+    else:
+        mask_offsets = tuple((start - prompt_length, end - prompt_length) for start, end in token_offsets)
+    return torch.cat([loss_mask[start:end] for start, end in mask_offsets], dim=0)
+
+
 def get_sum_of_sample_mean(
     total_lengths: list[int],
     response_lengths: list[int],
@@ -97,16 +134,24 @@ def get_sum_of_sample_mean(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
+    sample_denoms: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
+    if not calculate_per_token_loss:
+        if sample_denoms is None:
+            sample_denoms = torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+        else:
+            sample_denoms = torch.as_tensor(sample_denoms, device=loss_masks[0].device)
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
+                    for x_i, loss_mask_i, denom in zip(
+                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False
+                    )
                 ]
             )
 
@@ -127,27 +172,25 @@ def get_sum_of_sample_mean(
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-            prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            chunked_loss_mask = _slice_loss_mask_with_cp(
+                loss_mask,
                 total_length,
                 response_length,
                 qkv_format,
                 max_seq_len,
                 padded_total_length,
-                dynamic_cp_size=dynamic_cp_size,
-                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_size,
+                dynamic_cp_rank,
             )
-            loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-            loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-            chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
+            chunked_loss_masks.append(chunked_loss_mask)
             cp_chunk_lengths.append(chunked_loss_masks[i].size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-                    for x_i, chunked_loss_mask, loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
+                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
+                    for x_i, chunked_loss_mask, denom in zip(
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False
                     )
                 ]
             )
@@ -163,6 +206,42 @@ def get_sum_of_sample_mean(
             )
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
+
+
+def get_cp_local_mask_sums(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Return each row's loss-contributing token count on this CP rank."""
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+
+    local_mask_sums: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        chunked_loss_mask = _slice_loss_mask_with_cp(
+            loss_mask,
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size,
+            dynamic_cp_rank,
+        )
+        local_mask_sums.append(chunked_loss_mask.sum())
+
+    return torch.stack(local_mask_sums)
 
 
 def get_cp_local_num_tokens(
@@ -192,37 +271,20 @@ def get_cp_local_num_tokens(
     For ``cp_size == 1`` this reduces to the total number of unmasked tokens
     (preserving the historical per-sample ``clamp_min(., 1)``).
     """
+    local_mask_sums = get_cp_local_mask_sums(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size,
+        dynamic_cp_rank,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
-        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks]).to(torch.int)
-
-    # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
-    # counted tokens exactly match the ones sum_of_token contributes on this rank.
-    total: torch.Tensor | None = None
-    for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
-    ):
-        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
-        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-        prompt_length = total_length - response_length
-        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-            total_length,
-            response_length,
-            qkv_format,
-            max_seq_len,
-            padded_total_length,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-        )
-        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-        chunk_count = loss_mask_0.sum() + loss_mask_1.sum()
-        total = chunk_count if total is None else total + chunk_count
-
-    if total is None:
-        # No samples on this rank: mirror the empty-sum behaviour of cp_size == 1.
-        return sum([loss_mask.sum() for loss_mask in loss_masks]).to(torch.int)
-    return total.to(torch.int)
+        local_mask_sums = torch.clamp_min(local_mask_sums, 1)
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(

@@ -21,18 +21,20 @@ EXP_DIR="${EXP_DIR:-/root/exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-/root/webshop-relax}"
 
-CONDA_HOME="${CONDA_HOME:-/root/miniconda3}"          
-WEBSHOP_CONDA_ENV="${WEBSHOP_CONDA_ENV:-relax-opd-webshop}"
-WEBSHOP_HOME="${WEBSHOP_HOME:-/root/WebShop}"            
-WEBSHOP_PORT="${WEBSHOP_PORT:-36001}"          
-WEBSHOP_MAX_TURNS="${WEBSHOP_MAX_TURNS:-15}"     
+WEBSHOP_CONDA_ENV="${WEBSHOP_CONDA_ENV:-/root/miniconda3/envs/relax-opd-webshop}"
+WEBSHOP_HOME="${WEBSHOP_HOME:-/root/WebShop}"
+WEBSHOP_PORT="${WEBSHOP_PORT:-36001}"
+WEBSHOP_MAX_TURNS="${WEBSHOP_MAX_TURNS:-15}"
+WEBSHOP_HOST="${WEBSHOP_HOST:-0.0.0.0}"
+WEBSHOP_ADVERTISE_HOST="${WEBSHOP_ADVERTISE_HOST:-$(python3 -c 'import ray; print(ray.util.get_node_ip_address())')}"
+WEBSHOP_URL="http://${WEBSHOP_ADVERTISE_HOST}:${WEBSHOP_PORT}"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=150}"
 
-ROLLOUT_BATCH_SIZE=128          
-ROLLOUT_N_GROUPS=1   
-ROLLOUT_RESP_LENGTH=512        
-ROLLOUT_PROMPT_LENGTH=4096    
+ROLLOUT_BATCH_SIZE=128
+ROLLOUT_N_GROUPS=1
+ROLLOUT_RESP_LENGTH=512
+ROLLOUT_PROMPT_LENGTH=4096
 EVAL_ROLLOUT_RESP_LENGTH=512
 
 STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-35B-A3B}"
@@ -76,10 +78,8 @@ ROLLOUT_ARGS=(
    --agent-cwd "${SCRIPT_DIR}"
 
    --agent-env
-      "CONDA_HOME=${CONDA_HOME}"
-      "WEBSHOP_CONDA_ENV=${WEBSHOP_CONDA_ENV}"
-      "WEBSHOP_HOME=${WEBSHOP_HOME}"
       "WEBSHOP_PORT=${WEBSHOP_PORT}"
+      "WEBSHOP_URL=${WEBSHOP_URL}"
       "WEBSHOP_MAX_TURNS=${WEBSHOP_MAX_TURNS}"
 
    --num-rollout              ${NUM_ROLLOUT}
@@ -187,6 +187,52 @@ MISC_ARGS=(
 
 mkdir -p log
 
+WEBSHOP_HEALTH_URL="http://127.0.0.1:${WEBSHOP_PORT}"
+if curl --noproxy '*' -sS --max-time 2 -o /dev/null "${WEBSHOP_HEALTH_URL}/health"; then
+   echo "WebShop server port ${WEBSHOP_PORT} is already occupied." >&2
+   exit 1
+fi
+
+WEBSHOP_SERVER_LOG="log/${EXP_NAME}-webshop-server.log"
+WEBSHOP_CONDA_ENV="${WEBSHOP_CONDA_ENV}" \
+WEBSHOP_HOME="${WEBSHOP_HOME}" \
+WEBSHOP_HOST="${WEBSHOP_HOST}" \
+WEBSHOP_PORT="${WEBSHOP_PORT}" \
+bash "${SCRIPT_DIR}/run_webshop_server.sh" >"${WEBSHOP_SERVER_LOG}" 2>&1 &
+WEBSHOP_SERVER_PID=$!
+
+cleanup_webshop_server() {
+   if kill -0 "${WEBSHOP_SERVER_PID}" 2>/dev/null; then
+      kill "${WEBSHOP_SERVER_PID}" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+         kill -0 "${WEBSHOP_SERVER_PID}" 2>/dev/null || break
+         sleep 1
+      done
+      if kill -0 "${WEBSHOP_SERVER_PID}" 2>/dev/null; then
+         kill -9 "${WEBSHOP_SERVER_PID}" 2>/dev/null || true
+      fi
+   fi
+   wait "${WEBSHOP_SERVER_PID}" 2>/dev/null || true
+}
+trap cleanup_webshop_server EXIT
+
+WEBSHOP_SERVER_READY_TIMEOUT_S="${WEBSHOP_SERVER_READY_TIMEOUT_S:-600}"
+WEBSHOP_SERVER_READY_DEADLINE=$((SECONDS + WEBSHOP_SERVER_READY_TIMEOUT_S))
+while true; do
+   if ! kill -0 "${WEBSHOP_SERVER_PID}" 2>/dev/null; then
+      tail -n 100 "${WEBSHOP_SERVER_LOG}" >&2 || true
+      exit 1
+   fi
+   if curl --noproxy '*' -fsS "${WEBSHOP_HEALTH_URL}/health" 2>/dev/null | grep -q '"ready": *true'; then
+      break
+   fi
+   if [ "${SECONDS}" -ge "${WEBSHOP_SERVER_READY_DEADLINE}" ]; then
+      tail -n 100 "${WEBSHOP_SERVER_LOG}" >&2 || true
+      exit 1
+   fi
+   sleep 3
+done
+
 if [ -z "${RAY_DASHBOARD:-}" ]; then
     if [ -n "${RAY_ADDRESS:-}" ]; then
         RAY_DASHBOARD="http://${RAY_ADDRESS%%:*}:8265"
@@ -195,7 +241,7 @@ if [ -z "${RAY_DASHBOARD:-}" ]; then
     fi
 fi
 
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_DASHBOARD}" \
+ray job submit --address="${RAY_DASHBOARD}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 -m relax.entrypoints.train \

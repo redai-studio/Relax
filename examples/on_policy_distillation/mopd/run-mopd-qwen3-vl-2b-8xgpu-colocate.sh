@@ -26,7 +26,9 @@ set -o pipefail
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
 # Forward the patch flag into the Ray runtime env so remote-node teachers see it.
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,RELAX_OPD_PER_POS_TOKEN_IDS"
+export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
+export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,RELAX_OPD_PER_POS_TOKEN_IDS,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -93,13 +95,13 @@ OPD_ARGS=(
    --opd-teacher-key data_source
    --opd-teacher-routes "${TEACHER_ROUTES}"
    --teacher-num-gpus-per-engine "${TEACHER_NUM_GPUS_PER_ENGINE}"
-   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.85}"
-   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-4096}"
+   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.5}"
+   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-16384}"
    --teacher-sglang-max-running-requests "${TEACHER_MAX_RUNNING_REQUESTS:-256}"
    --teacher-sglang-disable-cuda-graph
    --opd-log-prob-top-k 64
    --opd-log-prob-min-clamp -10.0
-   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-120}"
+   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-1200}"
    --opd-teacher-image-key images
    --use-rollout-logprobs
    --rollout-stop-token-ids 128247

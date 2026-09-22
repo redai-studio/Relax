@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -36,6 +37,7 @@ from minisweagent.utils.serialize import recursive_merge
 
 INSTANCE_PREFIX = "mswe-"
 SETUP_AND_REWARD_TIMEOUT_SECONDS = 300
+CHILD_KILL_WAIT_TIMEOUT_SECONDS = 5
 
 
 # Reward (run_tests.sh = 4000+ pytest) is CPU-bound, unlike the IO-bound agent
@@ -85,6 +87,14 @@ def _unregister_child(pid: int) -> None:
         _owned_child_pids.discard(pid)
 
 
+def _kill_and_wait(proc: subprocess.Popen) -> None:
+    proc.kill()
+    try:
+        proc.wait(timeout=CHILD_KILL_WAIT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _tracked_run(
     cmd: list[str], *, check: bool = False, timeout: float | None = None, **kwargs: Any
 ) -> subprocess.CompletedProcess:
@@ -99,22 +109,10 @@ def _tracked_run(
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            proc.kill()
-            # Reap the killed child, but do NOT drain the pipe again: `apptainer
-            # exec` runs the command through a `starter` child, and anything the
-            # command spawned inside the sandbox survives killing that child
-            # while still holding the inherited stdout fd. A second, unbounded
-            # `communicate()` then waits for an EOF that never arrives and wedges
-            # this worker for good (observed: an agent-authored command that
-            # deadlocked pinned a session for 20+ minutes, stalling the whole
-            # rollout step until the sandbox-side survivor was killed by hand).
-            # POSIX `_communicate` already attached the partial output to `exc`,
-            # so nothing is lost -- this mirrors what `subprocess.run` does.
-            proc.wait()
-            raise subprocess.TimeoutExpired(cmd, timeout, output=exc.stdout, stderr=exc.stderr) from None
+            _kill_and_wait(proc)
+            raise subprocess.TimeoutExpired(cmd, timeout, output=exc.output, stderr=exc.stderr) from None
         except BaseException:
-            proc.kill()
-            proc.wait()
+            _kill_and_wait(proc)
             raise
         retcode = proc.returncode
     finally:
@@ -379,10 +377,6 @@ class ModeState:
     def get(self, sample_idx: int) -> dict[str, Any]:
         return self.dataset.take([sample_idx], columns=self.columns).to_pylist()[0]
 
-    def docker_images(self) -> set[str]:
-        rows = self.dataset.take(self.order, columns=["docker_image"]).to_pylist()
-        return {str(row["docker_image"]) for row in rows if row.get("docker_image")}
-
     def lease_sample(self, group_id: str) -> int:
         sample_idx, remaining = self.cache.get(group_id, (None, 0))
         if sample_idx is None:
@@ -576,16 +570,18 @@ class ApptainerInstanceEnvironment(SingularityEnvironment):
         last_error = ""
         for attempt in range(max_retries):
             try:
-                _tracked_run(
-                    cmd,
-                    env=self.apptainer_env,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                )
+                with tempfile.TemporaryFile() as start_output:
+                    result = _tracked_run(
+                        cmd,
+                        env=self.apptainer_env,
+                        stdout=start_output,
+                        stderr=subprocess.STDOUT,
+                    )
+                    output_size = os.fstat(start_output.fileno()).st_size
+                    start_output.seek(0)
+                    output = start_output.read(output_size)
+                if result.returncode:
+                    raise subprocess.CalledProcessError(result.returncode, cmd, output=output)
                 return f"instance://{self.instance_name}"
             except subprocess.CalledProcessError as exc:
                 last_error = _format_called_process_error(exc)
@@ -612,26 +608,29 @@ class ApptainerInstanceEnvironment(SingularityEnvironment):
         for key, value in self.config.env.items():
             cmd.extend(["--env", f"{key}={value}"])
         cmd.extend([str(self.sandbox_dir), "bash", "-c", command])
-        try:
-            result = _tracked_run(
-                cmd,
-                env=self.apptainer_env,
-                text=True,
-                timeout=timeout if timeout is not None else self.config.timeout,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-            output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
-        except Exception as exc:
-            raw_output = getattr(exc, "output", None)
-            raw_output = _decode_process_output(raw_output)
+        with tempfile.TemporaryFile() as command_output:
+            try:
+                result = _tracked_run(
+                    cmd,
+                    env=self.apptainer_env,
+                    timeout=timeout if timeout is not None else self.config.timeout,
+                    stdout=command_output,
+                    stderr=subprocess.STDOUT,
+                )
+                error = None
+            except Exception as exc:
+                error = exc
+            output_size = os.fstat(command_output.fileno()).st_size
+            command_output.seek(0)
+            stdout = command_output.read(output_size).decode("utf-8", errors="replace")
+        if error is None:
+            output = {"output": stdout, "returncode": result.returncode, "exception_info": ""}
+        else:
             output = {
-                "output": raw_output,
+                "output": stdout,
                 "returncode": -1,
-                "exception_info": f"An error occurred while executing the command: {exc}",
-                "extra": {"exception_type": type(exc).__name__, "exception": str(exc)},
+                "exception_info": f"An error occurred while executing the command: {error}",
+                "extra": {"exception_type": type(error).__name__, "exception": str(error)},
             }
         self._check_finished(output)
         return output
@@ -840,25 +839,6 @@ class AgentServer:
         self._record_ttl = float(os.environ.get("AGENT_SERVER_RECORD_TTL_SECONDS", SESSION_RECORD_TTL_SECONDS))
         threading.Thread(target=self._record_sweep_loop, name="record-sweeper", daemon=True).start()
 
-    def _check_sif_coverage(self) -> None:
-        missing: set[tuple[str, Path]] = set()
-        for mode_state in self.modes.values():
-            for docker_image in mode_state.docker_images():
-                key = _image_key(docker_image)
-                if key not in self.sifs:
-                    missing.add((docker_image, self.sif_dir / f"{key}.sif"))
-        if not missing:
-            return
-        preview = "\n".join(f"{image} -> {path}" for image, path in sorted(missing)[:20])
-        remaining = len(missing) - min(20, len(missing))
-        if remaining > 0:
-            preview += f"\n... {remaining} more missing SIFs"
-        raise FileNotFoundError(
-            f"Missing {len(missing)} R2E SIF images under {self.sif_dir}. "
-            "Run setup_r2e_data_and_sifs.sh with the same R2E_DATA_PATH/R2E_SIF_DIR.\n"
-            f"{preview}"
-        )
-
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         mode = str(payload["mode"])
         with self.lock:
@@ -979,7 +959,6 @@ class AgentServer:
         instance_name = _new_instance_name()
         info: dict[str, Any] = {}
         error = ""
-        forwarded_env: dict[str, Any] = {}
         tmp_dir.mkdir(parents=True, exist_ok=True)
         try:
             if record.cancel_event.is_set():
@@ -1003,7 +982,6 @@ class AgentServer:
             # host dir surfaced as "No such file or directory (os error 2)"
             # mid-setup. Forcing /tmp decouples uv from host scratch entirely.
             environment.setdefault("env", {}).update({"TMPDIR": "/tmp", "UV_CACHE_DIR": "/tmp/uv-cache"})
-            forwarded_env = dict(environment.get("env", {}))
             environment.setdefault("exec_args", []).extend(
                 ["--bind", f"{self.wheel_dir}:{self.r2e_config['wheel_mount']}:ro"]
             )
@@ -1035,23 +1013,6 @@ class AgentServer:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
-            # DIAG(agent): the os-error-2 setup race. On a recurrence, record
-            # whether the host session scratch still exists and what temp env the
-            # sandbox actually got, so we can pin uv's temp path (host scratch vs
-            # in-memory /tmp) instead of guessing. Runs before our own rmtree
-            # below, so tmp_dir_exists reflects the failure moment, not cleanup.
-            # Cheap: only fires on the specific failure.
-            if error and "os error 2" in error:
-                logging.warning(
-                    "SETUP-DIAG os-error-2 session=%s status_cancel=%s tmp_dir_exists=%s "
-                    "tmp_base_exists=%s tmp_root_exists=%s forwarded_temp_env=%s",
-                    server_session_id,
-                    record.cancel_event.is_set(),
-                    tmp_dir.exists(),
-                    self.tmp_base.exists(),
-                    self._tmp_root.exists(),
-                    {k: forwarded_env.get(k) for k in ("TMPDIR", "UV_CACHE_DIR")},
-                )
             cleanup_error = ""
             if env is not None:
                 try:

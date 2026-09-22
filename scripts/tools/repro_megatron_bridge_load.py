@@ -21,6 +21,7 @@ from relax.backends.megatron.model import initialize_model_and_optimizer
 from relax.utils import device as device_utils
 from relax.utils.arguments import parse_args
 from relax.utils.checkpoint_write_patch import patch_checkpoint_write
+from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_gloo_group
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
@@ -202,7 +203,7 @@ def _install_bridge_progress_profiler(args, role: str) -> None:
 
 def _init_distributed(args) -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    device_utils.set_device(f"{device_utils.get_device_name()}:{local_rank}")
+    device_module.set_device(f"{device_utils.get_device_name()}:{local_rank}")
 
     dist.init_process_group(
         backend=args.distributed_backend,

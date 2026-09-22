@@ -1,0 +1,2454 @@
+diff --git a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py b/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
+index 610267b..c592353 100644
+--- a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
++++ b/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
+@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
+ from sglang.multimodal_gen.configs.pipeline_configs.base import (
+     ImagePipelineConfig,
+     ModelTaskType,
++    TextConditioningOutput,
+     maybe_unpad_latents,
+     pad_text_embeddings_with_mask,
+     shard_rotary_emb_for_sp,
+@@ -28,6 +29,9 @@ from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+ from sglang.multimodal_gen.runtime.utils.vision import resize
+ from sglang.multimodal_gen.utils import calculate_dimensions
+
++_QWEN_PROMPT_TEMPLATE_START_IDX = 34
++_QWEN_MAX_SEQUENCE_LENGTH = 512
++
+
+ def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
+     bool_mask = mask.bool()
+@@ -47,7 +51,10 @@ def qwen_image_preprocess_text(prompt):
+
+
+ def qwen_image_postprocess_text(
+-    outputs, _text_inputs, drop_idx=34, return_attention_mask=False
++    outputs,
++    _text_inputs,
++    drop_idx=_QWEN_PROMPT_TEMPLATE_START_IDX,
++    return_attention_mask=False,
+ ):
+     """Postprocess Qwen text embeddings.
+
+@@ -61,6 +68,25 @@ def qwen_image_postprocess_text(
+     )
+     split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+     conditioning = pad_text_embeddings_with_mask(split_hidden_states)
++    prompt_embeds = conditioning.prompt_embeds[:, :_QWEN_MAX_SEQUENCE_LENGTH]
++    prompt_embeds_mask = (
++        conditioning.prompt_embeds_mask[:, :_QWEN_MAX_SEQUENCE_LENGTH]
++        if conditioning.prompt_embeds_mask is not None
++        else None
++    )
++    prompt_seq_lens = (
++        [
++            min(int(seq_len), _QWEN_MAX_SEQUENCE_LENGTH)
++            for seq_len in conditioning.prompt_seq_lens
++        ]
++        if conditioning.prompt_seq_lens is not None
++        else None
++    )
++    conditioning = TextConditioningOutput(
++        prompt_embeds,
++        prompt_embeds_mask,
++        prompt_seq_lens,
++    )
+     if return_attention_mask:
+         return conditioning
+     return conditioning.prompt_embeds
+@@ -179,6 +205,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
+             dict(
+                 padding=True,
+                 truncation=True,
++                max_length=_QWEN_MAX_SEQUENCE_LENGTH + _QWEN_PROMPT_TEMPLATE_START_IDX,
+             ),
+             None,
+         ]
+@@ -208,7 +235,10 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
+         if tok_kwargs.get("max_length") is not None:
+             tok_kwargs["padding"] = "max_length"
+         else:
+-            tok_kwargs.setdefault("max_length", 1024)
++            tok_kwargs.setdefault(
++                "max_length",
++                _QWEN_MAX_SEQUENCE_LENGTH + _QWEN_PROMPT_TEMPLATE_START_IDX,
++            )
+             tok_kwargs["padding"] = True
+         return tokenizer(prompts, **tok_kwargs)
+
+diff --git a/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py b/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
+index 9103832..15737cc 100644
+--- a/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
++++ b/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
+@@ -11,7 +11,7 @@ from typing import Any, Callable
+
+ from sglang.multimodal_gen.utils import StoreBoolean
+
+-_VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
++_VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode", "dance")
+
+
+ @dataclass
+diff --git a/python/sglang/multimodal_gen/configs/sample/sampling_params.py b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+index c5636c5..7ddbad7 100644
+--- a/python/sglang/multimodal_gen/configs/sample/sampling_params.py
++++ b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
+@@ -241,6 +241,16 @@ class SamplingParams:
+     # 0-indexed denoising-loop step filters; None = all steps.
+     rollout_sde_step_indices: list[int] | None = None
+     rollout_return_step_indices: list[int] | None = None
++    # Driver-supplied rollout reproducibility data. These fields are consumed by
++    # the diffusion post-training path; prepare_request copies them into Req so
++    # the scheduler, denoising and latent-preparation stages see the same recipe
++    # the trainer will replay.
++    initial_noise_group_ids: list[str] | None = None
++    initial_noise_latent_shape: list[int] | None = None
++    initial_noise_seed: int | None = None
++    denoise_seeds: list[str] | None = None
++    sigmas: list[float] | None = None
++    timesteps: list[float] | None = None
+     # if True, disallow user params to override subclass-defined protected fields
+     no_override_protected_fields: bool = field(
+         default=False, metadata={"batch_sig_exclude": True}
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
+index 45b3676..236e19b 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
+@@ -37,6 +37,17 @@ class UpdateWeightFromTensorCheckerReqInput:
+     expected_named_tensors_sha256: dict[str, str]
+
+
++@dataclass
++class SetLoraFromTensorReqInput:
++    """Request to install a LoRA adapter from an in-memory tensor payload."""
++
++    serialized_tensors: str | bytes
++    lora_name: str = "default"
++    target: str = "transformer"
++    strength: float = 1.0
++    merge_mode: str | None = None
++
++
+ @dataclass
+ class GetWeightsChecksumReqInput:
+     """Compute SHA-256 checksum of loaded module weights for verification."""
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
+index 554feea..251dde7 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
+@@ -6,6 +6,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+     GetWeightsChecksumReqInput,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
++    SetLoraFromTensorReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightFromTensorCheckerReqInput,
+     UpdateWeightFromTensorReqInput,
+@@ -138,6 +139,51 @@ async def update_weights_from_tensor_checker(request: Request):
+     )
+
+
++@router.post("/set_lora_from_tensor")
++async def set_lora_from_tensor(request: Request):
++    """Install a LoRA adapter from base64(torch.save(dict[str, Tensor]))."""
++    import base64
++
++    body = await request.json()
++    serialized = body.get("serialized_tensors")
++    if serialized is None:
++        return orjson_response(
++            {"success": False, "message": "serialized_tensors is required"},
++            status_code=400,
++        )
++
++    req = SetLoraFromTensorReqInput(
++        serialized_tensors=(
++            base64.b64decode(serialized) if isinstance(serialized, str) else serialized
++        ),
++        lora_name=body.get("lora_name", "default"),
++        target=body.get("target", "transformer"),
++        strength=float(body.get("strength", 1.0)),
++        merge_mode=body.get("merge_mode"),
++    )
++
++    try:
++        response = await async_scheduler_client.forward(req)
++    except Exception as e:
++        return orjson_response({"success": False, "message": str(e)}, status_code=500)
++
++    if response.error is not None:
++        return orjson_response(
++            {"success": False, "message": str(response.error)},
++            status_code=400,
++        )
++    result = response.output or {}
++    success = bool(result.get("success", False))
++    return orjson_response(
++        {
++            "success": success,
++            "message": result.get("message", "Unknown status"),
++            "adapted_layers": result.get("adapted_layers"),
++        },
++        status_code=200 if success else 400,
++    )
++
++
+ @router.post("/get_weights_checksum")
+ async def get_weights_checksum(request: Request):
+     """Return SHA-256 checksum of each requested module's weights."""
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/utils.py b/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
+index 1494f58..d3cb820 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
+@@ -759,6 +759,19 @@ def prepare_request(
+         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+     )
+     sampling_params.apply_request_extra(req)
++    for name in (
++        "initial_noise_group_ids",
++        "initial_noise_latent_shape",
++        "initial_noise_seed",
++        "denoise_seeds",
++        "sigmas",
++        "timesteps",
++    ):
++        value = getattr(sampling_params, name, None)
++        if value is not None:
++            if name == "timesteps":
++                value = torch.as_tensor(value, dtype=torch.float32)
++            setattr(req, name, value)
+     if getattr(sampling_params, "max_sequence_length", None) is not None:
+         req.max_sequence_length = sampling_params.max_sequence_length
+
+diff --git a/python/sglang/multimodal_gen/runtime/managers/scheduler.py b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+index cf64593..d0efdf3 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/scheduler.py
++++ b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
+@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+     GetWeightsChecksumReqInput,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
++    SetLoraFromTensorReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightFromTensorCheckerReqInput,
+     UpdateWeightFromTensorReqInput,
+@@ -135,6 +136,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
+             ShutdownReq: self._handle_shutdown,
+             ReleaseRealtimeSessionReq: self._handle_release_realtime_session,
+             GetDisaggStatsReq: self._handle_get_disagg_stats,
++            SetLoraFromTensorReqInput: self._handle_set_lora_from_tensor,
+             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+             UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+             UpdateWeightFromTensorCheckerReqInput: (
+diff --git a/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py b/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
+index 1f25398..2ecef7d 100644
+--- a/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
++++ b/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
+@@ -350,21 +350,23 @@ class FlowMatchEulerDiscreteScheduler(
+             sigmas_array = np.array(sigmas).astype(np.float32)
+             num_inference_steps = len(sigmas_array)
+
+-        # 2. Perform timestep shifting. Either no shifting is applied, or resolution-dependent shifting of
+-        #    "exponential" or "linear" type is applied
+-        if self.config.use_dynamic_shifting:
+-            assert mu is not None, "mu cannot be None when use_dynamic_shifting is True"
+-            sigmas_array = self.time_shift(mu, 1.0, sigmas_array)
+-        else:
+-            sigmas_array = (
+-                self.shift * sigmas_array / (1 + (self.shift - 1) * sigmas_array)
+-            )
++        # 2. Perform timestep shifting. Driver-supplied sigmas are already in the
++        #    exact sigma space the trainer will replay, so do not shift or
++        #    stretch them again.
++        if sigmas is None:
++            if self.config.use_dynamic_shifting:
++                assert mu is not None, "mu cannot be None when use_dynamic_shifting is True"
++                sigmas_array = self.time_shift(mu, 1.0, sigmas_array)
++            else:
++                sigmas_array = (
++                    self.shift * sigmas_array / (1 + (self.shift - 1) * sigmas_array)
++                )
+
+-        # 3. If required, stretch the sigmas schedule to terminate at the configured `shift_terminal` value
+-        if self.config.shift_terminal:
+-            sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
+-            sigmas_tensor = self.stretch_shift_to_terminal(sigmas_tensor)
+-            sigmas_array = sigmas_tensor.numpy()
++            # 3. If required, stretch the sigmas schedule to terminate at the configured `shift_terminal` value
++            if self.config.shift_terminal:
++                sigmas_tensor = torch.from_numpy(sigmas_array).to(dtype=torch.float32)
++                sigmas_tensor = self.stretch_shift_to_terminal(sigmas_tensor)
++                sigmas_array = sigmas_tensor.numpy()
+
+         # 4. If required, convert sigmas to one of karras, exponential, or beta sigma schedules
+         if self.config.use_karras_sigmas:
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/lora_pipeline.py b/python/sglang/multimodal_gen/runtime/pipelines_core/lora_pipeline.py
+index 8f3b26a..fbceed3 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/lora_pipeline.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/lora_pipeline.py
+@@ -722,6 +722,21 @@ class LoRAPipeline(ComposedPipelineBase):
+             if adapter_config.get("lora_alpha") is not None:
+                 adapter_lora_alpha = int(adapter_config["lora_alpha"])
+
++        self._ingest_lora_state_dict(
++            lora_state_dict,
++            lora_nickname,
++            adapter_lora_alpha=adapter_lora_alpha,
++        )
++        self.loaded_adapter_paths[lora_nickname] = lora_path
++        logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
++
++    def _ingest_lora_state_dict(
++        self,
++        lora_state_dict: dict[str, torch.Tensor],
++        lora_nickname: str,
++        adapter_lora_alpha: int | None = None,
++    ) -> None:
++        """Map adapter keys to SGLang DiT names and stage them on device."""
+         if lora_nickname in self.lora_adapters:
+             self.lora_adapters[lora_nickname].clear()
+
+@@ -764,9 +779,91 @@ class LoRAPipeline(ComposedPipelineBase):
+                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
+                 )
+             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+-        self.loaded_adapter_paths[lora_nickname] = lora_path
+         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
+-        logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
++
++    def set_lora_from_tensors(
++        self,
++        lora_nickname: str,
++        named_tensors: dict[str, torch.Tensor],
++        target: str = "transformer",
++        strength: float = 1.0,
++        merge_mode: str | None = None,
++    ) -> int:
++        """Apply a freshly supplied in-memory LoRA adapter."""
++        if target not in self.VALID_TARGETS:
++            raise ValueError(
++                f"Invalid target: {target}. Valid targets: {self.VALID_TARGETS}"
++            )
++
++        if not self.lora_initialized:
++            with self._temporarily_disable_offload(
++                target="all", use_module_names_only=True
++            ):
++                self.convert_to_lora_layers()
++
++        lora_state_dict = normalize_lora_state_dict(
++            dict(named_tensors), logger=logger
++        )
++        self._ingest_lora_state_dict(lora_state_dict, lora_nickname)
++        tensor_path = f"<tensors:{lora_nickname}>"
++        self.loaded_adapter_paths[lora_nickname] = tensor_path
++
++        target_modules, error = self._get_target_lora_layers(target)
++        if error:
++            raise ValueError(f"set_lora_from_tensors: {error}")
++
++        merge_mode = self._resolve_lora_merge_mode(None, merge_mode)
++        merge_weights_by_module = {
++            module_name: self._should_merge_lora_for_layers(
++                module_name, lora_layers_dict, merge_mode
++            )
++            for module_name, lora_layers_dict in target_modules
++        }
++
++        if self._needs_lora_weight_update_context(
++            target_modules, merge_weights_by_module
++        ):
++            weight_update_context = self._temporarily_disable_offload(
++                target_modules=target_modules
++            )
++        else:
++            weight_update_context = nullcontext()
++
++        adapted_count = 0
++        rank = dist.get_rank()
++        with weight_update_context:
++            for module_name, lora_layers_dict in target_modules:
++                effective_merge_weights = merge_weights_by_module[module_name]
++                count = self._apply_lora_to_layers(
++                    lora_layers_dict,
++                    [lora_nickname],
++                    [tensor_path],
++                    rank,
++                    [strength],
++                    clear_existing=True,
++                    merge_weights=effective_merge_weights,
++                )
++                adapted_count += count
++                self.cur_adapter_name[module_name] = lora_nickname
++                self.cur_adapter_path[module_name] = tensor_path
++                self.is_lora_merged[module_name] = effective_merge_weights
++                self.cur_adapter_strength[module_name] = strength
++                self.cur_adapter_config[module_name] = (
++                    [lora_nickname],
++                    [strength],
++                )
++
++        logger.info(
++            "Rank %d: in-memory LoRA adapter %s applied to %d layers "
++            "(target=%s, strength=%.2f, merge_mode=%s)",
++            rank,
++            lora_nickname,
++            adapted_count,
++            target,
++            strength,
++            merge_mode,
++        )
++        return adapted_count
+
+     def set_lora(
+         self,
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
+index bc1cb59..4a74aa7 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
+@@ -6,6 +6,7 @@ Denoising stage for diffusion pipelines.
+ """
+
+ import gc
++import hashlib
+ import inspect
+ import math
+ import time
+@@ -135,6 +136,30 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
+ from sglang.multimodal_gen.utils import dict_to_3d_list
+
+ logger = init_logger(__name__)
++_MAX_TORCH_SEED = (1 << 63) - 1
++
++
++def _resolve_base_seed(batch) -> int | None:
++    seed = getattr(batch, "seed", None)
++    if seed is None:
++        seed = getattr(getattr(batch, "sampling_params", None), "seed", None)
++    return int(seed) if seed is not None else None
++
++
++def _make_step_generators(
++    base_seed: int,
++    step_index: int,
++    denoise_seeds: list[str],
++) -> list[torch.Generator]:
++    generators = []
++    for seed_key in denoise_seeds:
++        payload = f"{int(base_seed)}::step::{int(step_index)}::sample::{str(seed_key)}".encode("utf-8")
++        digest = hashlib.blake2b(payload, digest_size=8).digest()
++        seed = int.from_bytes(digest, byteorder="big", signed=False) % _MAX_TORCH_SEED
++        generator = torch.Generator(device="cpu")
++        generator.manual_seed(seed)
++        generators.append(generator)
++    return generators
+
+
+ def _ensure_tensor_model_output(model_output):
+@@ -1229,6 +1254,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
+         below; mirror them in the override if those markers are needed.
+         """
+         use_nvtx = self.current_use_nvtx
++        denoise_seeds = getattr(batch, "denoise_seeds", None)
++        base_seed = _resolve_base_seed(batch)
++        if getattr(batch, "rollout", False) and denoise_seeds is not None and base_seed is not None:
++            ctx.extra_step_kwargs["generator"] = _make_step_generators(
++                base_seed,
++                int(step.step_index),
++                [str(seed) for seed in denoise_seeds],
++            )
++
+         # 1. Prepare latent inputs in the model's compute dtype.
+         latent_model_input = ctx.latents.to(ctx.target_dtype)
+         if batch.image_latent is not None:
+diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
+index f9a28a2..40c705f 100644
+--- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
++++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
+@@ -5,6 +5,7 @@
+ Latent preparation stage for diffusion pipelines.
+ """
+
++import hashlib
+ from dataclasses import dataclass
+ from typing import Any
+
+@@ -26,6 +27,48 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
+ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+ logger = init_logger(__name__)
++_MAX_TORCH_SEED = (1 << 63) - 1
++
++
++def _derive_group_seed(base_seed: int, group_id: str) -> int:
++    payload = f"{int(base_seed)}::{str(group_id)}".encode("utf-8")
++    digest = hashlib.blake2b(payload, digest_size=8).digest()
++    return int.from_bytes(digest, byteorder="big", signed=False) % (_MAX_TORCH_SEED + 1)
++
++
++def _regen_initial_noise(
++    noise_group_ids: list[str],
++    base_seed: int,
++    latent_shape: list[int] | tuple[int, ...],
++    device,
++    dtype,
++):
++    tensors = []
++    cache = {}
++    for raw_group_id in noise_group_ids:
++        group_id = str(raw_group_id)
++        noise = cache.get(group_id)
++        if noise is None:
++            generator = torch.Generator(device=torch.device("cpu"))
++            generator.manual_seed(_derive_group_seed(base_seed, group_id))
++            noise = torch.randn(
++                tuple(int(v) for v in latent_shape),
++                generator=generator,
++                device="cpu",
++                dtype=torch.float32,
++            )
++            cache[group_id] = noise
++        tensors.append(noise)
++    return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
++
++
++def _driver_xt_recipe(batch):
++    group_ids = getattr(batch, "initial_noise_group_ids", None)
++    latent_shape = getattr(batch, "initial_noise_latent_shape", None)
++    base_seed = getattr(batch, "initial_noise_seed", None)
++    if group_ids and latent_shape is not None and base_seed is not None:
++        return [str(v) for v in group_ids], [int(v) for v in latent_shape], int(base_seed)
++    return None
+
+
+ @dataclass(frozen=True)
+@@ -127,6 +170,7 @@ class LatentPreparationStage(PipelineStage):
+         latents = batch.latents
+         height = batch.height
+         width = batch.width
++        driver_xt_recipe = _driver_xt_recipe(batch)
+
+         # TODO(will): remove this once we add input/output validation for stages
+         if self.requires_batch_height_width(batch, server_args) and (
+@@ -142,7 +186,34 @@ class LatentPreparationStage(PipelineStage):
+             )
+
+         # Generate or use provided latents
+-        if latents is None:
++        if driver_xt_recipe is not None:
++            group_ids, latent_shape, base_seed = driver_xt_recipe
++            spec = self.get_latent_preparation_spec(
++                batch, server_args, len(group_ids), latent_num_frames, device
++            )
++            raw_latents = _regen_initial_noise(
++                group_ids,
++                base_seed,
++                latent_shape,
++                device=spec.device,
++                dtype=spec.dtype,
++            )
++
++            latent_ids = (
++                server_args.pipeline_config.maybe_prepare_latent_ids(raw_latents)
++                if spec.prepare_latent_ids
++                else None
++            )
++
++            if latent_ids is not None:
++                batch.latent_ids = latent_ids.to(device=device)
++
++            latents = raw_latents
++            if spec.pack_latents:
++                latents = server_args.pipeline_config.maybe_pack_latents(
++                    raw_latents, len(group_ids), batch
++                )
++        elif latents is None:
+             spec = self.get_latent_preparation_spec(
+                 batch, server_args, batch_size, latent_num_frames, device
+             )
+@@ -202,7 +273,8 @@ class LatentPreparationStage(PipelineStage):
+             indexed_batches = group
+             group_batches = [batch for _, batch in indexed_batches]
+             if len(group_batches) == 1 or any(
+-                batch.latents is not None for batch in group_batches
++                batch.latents is not None or _driver_xt_recipe(batch) is not None
++                for batch in group_batches
+             ):
+                 for index, batch in indexed_batches:
+                     results[index] = self(batch, server_args)
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
+index f652059..d2e6eb7 100644
+--- a/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
++++ b/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
+@@ -7,6 +7,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_ch
+ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+     iter_materialized_weights,
+ )
++from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+ from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
+     TensorUpdateChecker,
+ )
+@@ -19,12 +20,58 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+ if TYPE_CHECKING:
+     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
++        SetLoraFromTensorReqInput,
+         UpdateWeightFromTensorCheckerReqInput,
+         UpdateWeightFromTensorReqInput,
+     )
+
+
+ class GPUWorkerPostTrainingMixin:
++    def set_lora_from_tensors(
++        self,
++        req: SetLoraFromTensorReqInput,
++    ) -> OutputBatch:
++        """Install a LoRA adapter from a torch.save blob of tensor weights."""
++        import io
++
++        import torch
++
++        from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
++
++        if not isinstance(self.pipeline, LoRAPipeline):
++            return OutputBatch(error="Lora is not enabled")
++
++        try:
++            named_tensors = torch.load(
++                io.BytesIO(req.serialized_tensors),
++                map_location="cpu",
++                weights_only=True,
++            )
++            adapted = self.pipeline.set_lora_from_tensors(
++                req.lora_name,
++                named_tensors,
++                target=req.target,
++                strength=req.strength,
++                merge_mode=req.merge_mode,
++            )
++            if adapted <= 0:
++                return OutputBatch(
++                    error=f"LoRA adapter {req.lora_name} did not match any layer"
++                )
++        except Exception as e:
++            return OutputBatch(error=str(e))
++
++        return OutputBatch(
++            output={
++                "success": True,
++                "message": (
++                    f"Applied in-memory LoRA {req.lora_name} to "
++                    f"{adapted} layers of {req.target}"
++                ),
++                "adapted_layers": adapted,
++            }
++        )
++
+     def update_weights_from_disk(
+         self,
+         model_path: str,
+@@ -135,7 +182,7 @@ class GPUWorkerPostTrainingMixin:
+
+     def get_weights_checksum(
+         self, module_names: list[str] | None = None
+-    ) -> dict[str, str]:
++    ) -> dict[str, str | int]:
+         if not self.pipeline:
+             return {"error": "Pipeline is not initialized"}
+
+@@ -143,15 +190,16 @@ class GPUWorkerPostTrainingMixin:
+         names = module_names if module_names is not None else list(all_modules.keys())
+
+         checksums: dict[str, str] = {}
++        tensor_count = 0
+         for name in names:
+             module = all_modules.get(name)
+             if module is None:
+                 checksums[name] = "not_found"
+                 continue
+-            checksums[name] = compute_weights_checksum(
+-                iter_materialized_weights(module)
+-            )
+-        return checksums
++            materialized_weights = list(iter_materialized_weights(module))
++            tensor_count += len(materialized_weights)
++            checksums[name] = compute_weights_checksum(materialized_weights)
++        return {**checksums, "tensor_count": tensor_count}
+
+     def _select_rank_scoped_payload(
+         self,
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
+index 025643b..8dfe997 100644
+--- a/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
++++ b/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
+@@ -6,6 +6,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
+
+
+ class SchedulerPostTrainingMixin:
++    def _handle_set_lora_from_tensor(self, reqs: List[Any]) -> OutputBatch:
++        req = reqs[0]
++        return self.worker.set_lora_from_tensors(req)
++
+     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+         req = reqs[0]
+         success, message = self.worker.update_weights_from_disk(
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
+index 3777ad4..c4e91ea 100644
+--- a/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
++++ b/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """Flow-matching rollout step utilities for log-prob computation."""
+
++import hashlib
+ import math
++import os
+ from typing import Any, Union
+
+ import torch
+@@ -18,6 +20,25 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import
+ )
+
+ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
++_MAX_TORCH_SEED = (1 << 63) - 1
++
++
++def _resolve_base_seed(batch) -> int | None:
++    seed = getattr(batch, "seed", None)
++    if seed is None:
++        seed = getattr(getattr(batch, "sampling_params", None), "seed", None)
++    return int(seed) if seed is not None else None
++
++
++def _resolve_fallback_seed(batch) -> int:
++    base_seed = _resolve_base_seed(batch)
++    denoise_seeds = getattr(batch, "denoise_seeds", None)
++    sample_key = str(denoise_seeds[0]) if denoise_seeds else None
++    if base_seed is not None and sample_key is not None:
++        payload = f"{int(base_seed)}::fallback::sample::{sample_key}".encode("utf-8")
++        digest = hashlib.blake2b(payload, digest_size=8).digest()
++        return int.from_bytes(digest, byteorder="big", signed=False) % _MAX_TORCH_SEED
++    return int.from_bytes(os.urandom(8), byteorder="big") % _MAX_TORCH_SEED
+
+
+ class SchedulerRLMixin(SchedulerRLDebugMixin):
+@@ -86,7 +107,15 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
+         B = local_shape[0]
+         if isinstance(generator, torch.Generator):
+             assert B == 1, "Generator must be a list if batch size is not 1"
+-            generator = [generator]
++            per_request_generator = getattr(batch, "_relax_noise_gen", None)
++            if per_request_generator is None:
++                per_request_generator = torch.Generator(device=device)
++                per_request_generator.manual_seed(_resolve_fallback_seed(batch))
++                try:
++                    batch._relax_noise_gen = per_request_generator
++                except AttributeError:
++                    pass
++            generator = [per_request_generator]
+         else:
+             assert (
+                 len(generator) == B
+@@ -96,11 +125,14 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
+             rollout_session_data, rollout_session_data.latents_shape, device, dtype
+         )
+         for i in range(B):
+-            torch.randn(
+-                rollout_session_data.latents_shape,
+-                out=buffer[i : i + 1],
+-                generator=generator[i],
+-            )
++            gen = generator[i]
++            gen_device = getattr(gen, "device", None)
++            sample_shape = tuple(buffer[i].shape)
++            if gen is not None and gen_device is not None and gen_device.type != buffer.device.type:
++                tmp = torch.randn(sample_shape, generator=gen, dtype=dtype, device=gen_device)
++                buffer[i].copy_(tmp)
++            else:
++                torch.randn(sample_shape, out=buffer[i], generator=gen)
+
+         sharded_noise, _ = rollout_session_data.pipeline_config.shard_latents_for_sp(
+             batch=batch, latents=buffer
+@@ -128,6 +160,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
+         1. ``"sde"``: Standard stochastic differential equation transition (Gaussian).
+         2. ``"cps"``: Coupled Particle Sampling.
+         3. ``"ode"``: Deterministic ODE step (no diffusion noise).
++        4. ``"dance"``: FlowGRPO dance-style transition used by Relax diffusion RL.
+         """
+         rollout_session_data = self._get_rollout_session_data(batch)
+         sde_type = batch.rollout_sde_type
+@@ -234,6 +267,34 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
+                     log_prob_no_const
+                 ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+
++        elif effective_sde_type == "dance":
++            model_output = model_output.float()
++            sample = sample.float()
++            variance_noise = self._rollout_variance_noise(
++                batch, model_output, generator
++            )
++            full_variance_noise = rollout_session_data.noise_buffer
++            std_dev_t = current_sigma.new_tensor(noise_level)
++            noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
++            prev_sample_mean = (
++                sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
++                + model_output
++                * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma))
++                * dt
++            )
++            prev_sample = prev_sample_mean + variance_noise * noise_std_dev
++            if tuple(variance_noise.shape) != tuple(full_variance_noise.shape):
++                raise RuntimeError(
++                    "rollout_sde_type='dance' does not support sequence-parallel rollout: "
++                    f"the per-step log-prob is computed over the unsharded noise "
++                    f"{tuple(full_variance_noise.shape)} while this rank only owns "
++                    f"{tuple(variance_noise.shape)}, so the cross-rank reduction would "
++                    "over-count it by the SP degree. Run the diffusion engine with "
++                    "--rollout-num-gpus-per-engine 1 until the reduction convention "
++                    "is confirmed against the live engine."
++                )
++            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
++
+         else:
+             raise ValueError(f"Unsupported sde_type: {sde_type}")
+
+diff --git a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
+index 7c470d0..2b50e0e 100644
+--- a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
++++ b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
+@@ -493,6 +493,13 @@ class WeightsUpdater:
+                 lora_rank=lora_rank,
+             )
+
++        if getattr(self.pipeline, "lora_initialized", False):
++            return False, (
++                "Refusing update_weights_from_tensor: this pipeline has LoRA "
++                "layers installed. Use adapter-only sync (/set_lora_from_tensor) "
++                "for a LoRA run."
++            )
++
+         if target_modules is None:
+             target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
+         try:
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index 240e20de..eda3406c 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import time
+ from collections import deque
+ from dataclasses import dataclass
+@@ -680,6 +681,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+     def release_memory_occupation(self):
+         self.queue.clear()
+         self.retracted_queue.clear()
++        self.pending_reqs.clear()
+         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+             self.kv_manager.deregister_buffer_to_engine()
+ 
+@@ -769,6 +771,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+             )
+ 
++        bootstrap_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         for decode_req, poll in zip(self.queue, polls):
+             if poll is None:
+                 continue
+@@ -776,7 +783,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 continue
+ 
+             if poll == KVPoll.Bootstrapping:
+-                pass
++                entry_time = decode_req.req.time_stats.decode_prealloc_queue_entry_time
++                if entry_time > 0 and now - entry_time > bootstrap_timeout:
++                    error_message = (
++                        f"Decode prealloc timeout for request rank={self.tp_rank} "
++                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=} "
++                        f"after {bootstrap_timeout}s"
++                    )
++                    logger.error(error_message)
++                    prepare_abort(
++                        decode_req.req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    if self.scheduler.metrics_reporter.enable_metrics:
++                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+             elif poll == KVPoll.WaitingForInput:
+                 decode_req.waiting_for_input = True
+                 decode_req.req.time_stats.set_bootstrap_done_time()
+@@ -1995,6 +2016,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+         else:
+             polls = self._poll_with_metadata_gate()
+ 
++        transfer_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         transferred_reqs = []
+         indices_to_remove = set()
+         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+@@ -2071,7 +2097,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+                 KVPoll.WaitingForInput,
+                 KVPoll.Transferring,
+             ]:
+-                pass
++                entry_time = decode_req.req.time_stats.decode_transfer_queue_entry_time
++                if entry_time > 0 and now - entry_time > transfer_timeout:
++                    logger.error(
++                        "Decode transfer timeout for request rank=%s rid=%s room=%s "
++                        "after %ss",
++                        self.tp_rank,
++                        decode_req.req.rid,
++                        decode_req.req.bootstrap_room,
++                        transfer_timeout,
++                    )
++                    decode_req.kv_receiver.abort()
+             else:
+                 raise ValueError(f"Unexpected poll case: {poll}")
+ 
+@@ -2097,6 +2133,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+ 
+     def release_memory_occupation(self):
+         """Clean up in-flight transfers before releasing GPU memory."""
++        for decode_req in self.queue:
++            if decode_req.kv_receiver is not None:
++                decode_req.kv_receiver.abort()
+         self.queue.clear()
+ 
+     def resume_memory_occupation(self):
+@@ -2320,6 +2359,11 @@ class SchedulerDisaggregationDecodeMixin:
+         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+         self.waiting_queue.extend(resumed_reqs)
+         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
++            transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
++            if self.enable_hisparse:
++                for req in transferred_reqs:
++                    self.hisparse_coordinator.admit_request_direct(req)
++            self.waiting_queue.extend(transferred_reqs)
+             # if there are still retracted requests, we do not allocate new requests
+             return
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index 1907e0ee..14048ad0 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -1050,7 +1050,7 @@ class MooncakeKVManager(CommonKVManager):
+         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+             length = prefill_aux_item_lens[i]
+             src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
++            dst_addr = dst_aux_ptr + length * req.dst_aux_index
+             transfer_blocks.append((src_addr, dst_addr, length))
+ 
+         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+@@ -1714,12 +1714,6 @@ class MooncakeKVManager(CommonKVManager):
+                         if ret != 0:
+                             with self.session_lock:
+                                 self.session_failures[req.mooncake_session_id] += 1
+-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+-                                if self.session_failures[req.mooncake_session_id] >= 1:
+-                                    self.failed_sessions.add(req.mooncake_session_id)
+-                                    logger.error(
+-                                        f"Session {req.mooncake_session_id} failed."
+-                                    )
+                             self.record_failure(
+                                 kv_chunk.room,
+                                 f"Failed to send kv chunk of {kv_chunk.room} to "
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 5642c64e..599b9815 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -21,6 +21,8 @@ from __future__ import annotations
+ 
+ import hashlib
+ import logging
++import os
++import time
+ from array import array
+ from collections import deque
+ from http import HTTPStatus
+@@ -416,6 +418,11 @@ class PrefillBootstrapQueue:
+                 self.scheduler.attn_tp_cpu_group,
+             )
+ 
++        bootstrap_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+             if poll is None:
+                 continue
+@@ -425,6 +432,27 @@ class PrefillBootstrapQueue:
+                 indices_to_remove.add(i)
+                 failed_reqs.append(req)
+             elif poll == KVPoll.Bootstrapping:
++                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
++                if entry_time > 0 and now - entry_time > bootstrap_timeout:
++                    error_message = (
++                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
++                        f"for request rank={self.tp_rank} "
++                        f"{req.rid=} {req.bootstrap_room=}"
++                    )
++                    logger.error(error_message)
++                    prepare_abort(
++                        req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    self.scheduler.output_streamer.stream_output(
++                        [req], req.return_logprob
++                    )
++                    indices_to_remove.add(i)
++                    failed_reqs.append(req)
++                    if self.scheduler.metrics_reporter.enable_metrics:
++                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
++                    continue
+                 if (
+                     req.prefill_attempt_count
+                     < self.scheduler.server_args.optimistic_prefill_attempts
+@@ -832,6 +860,11 @@ class SchedulerDisaggregationPrefillMixin:
+             self.attn_tp_cpu_group,
+         )
+ 
++        transfer_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         undone_reqs: List[Req] = []
+         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
+         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+@@ -866,7 +899,26 @@ class SchedulerDisaggregationPrefillMixin:
+ 
+             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                 # todo: set Transferring correctly in backend
+-                undone_reqs.append(req)
++                entry_time = req.time_stats.prefill_transfer_queue_entry_time
++                if entry_time > 0 and now - entry_time > transfer_timeout:
++                    error_message = (
++                        f"Prefill transfer timed out after {now - entry_time:.1f}s "
++                        f"(state={poll}) for request rank={self.ps.tp_rank} "
++                        f"{req.rid=} {req.bootstrap_room=}"
++                    )
++                    logger.error(error_message)
++                    release_kv_cache(req, self.tree_cache)
++                    prepare_abort(
++                        req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    req.disagg_kv_sender.clear()
++                    done_reqs.append(req)
++                    if self.metrics_reporter.enable_metrics:
++                        self.metrics_collector.increment_transfer_failed_reqs()
++                else:
++                    undone_reqs.append(req)
+             elif poll == KVPoll.Success:  # transfer done
+                 if not isinstance(req.finished_reason, FINISH_ABORT):
+                     req.finished_reason = FINISH_LENGTH(length=0)
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index 6eb0ad1a..d27815f3 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqInput,
+     MultimodalDataInputFormat,
+     OpenSessionReqInput,
++    PostProcessWeightsReqInput,
+     ProfileReq,
+     ProfileReqType,
+     ReleaseMemoryOccupationReqInput,
+@@ -81,6 +82,7 @@ from sglang.srt.managers.io_struct import (
+     RpcReqInput,
+     RpcReqOutput,
+     UnloadLoRAAdapterReqInput,
++    UpdateLoRAFromDistributedReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -1429,6 +1431,20 @@ class Engine(EngineScoreMixin, EngineBase):
+             self.tokenizer_manager.update_weights_from_ipc(obj, None)
+         )
+ 
++    def post_process_weights(
++        self,
++        restore_weights_before_load: bool = False,
++        post_process_quantization: bool = False,
++    ):
++        """Optional post-processing for updated weights, e.g. quantization packing."""
++        obj = PostProcessWeightsReqInput(
++            restore_weights_before_load=restore_weights_before_load,
++            post_process_quantization=post_process_quantization,
++        )
++        return self.loop.run_until_complete(
++            self.tokenizer_manager.post_process_weights(obj, None)
++        )
++
+     def get_weights_by_name(self, name: str, truncate_size: int = 100):
+         """Get weights by parameter name."""
+         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
+@@ -1474,6 +1490,36 @@ class Engine(EngineScoreMixin, EngineBase):
+             self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+         )
+ 
++    def update_lora_from_distributed(
++        self,
++        lora_name: str,
++        names,
++        dtypes,
++        shapes,
++        config_dict: Dict,
++        group_name: str,
++        pinned: bool = False,
++    ):
++        """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group.
++
++        In-memory counterpart to ``load_lora_adapter`` (disk) and
++        ``load_lora_adapter_from_tensors`` (serialized blob): the tensors are
++        broadcast ``src=0`` on ``group_name`` (the weight-update group), so
++        only metadata travels through this HTTP call.
++        """
++        obj = UpdateLoRAFromDistributedReqInput(
++            lora_name=lora_name,
++            config_dict=config_dict,
++            names=names,
++            dtypes=dtypes,
++            shapes=shapes,
++            group_name=group_name,
++            pinned=pinned,
++        )
++        return self.loop.run_until_complete(
++            self.tokenizer_manager.update_lora_from_distributed(obj, None)
++        )
++
+     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
+         """Load a new LoRA adapter without re-launching the engine."""
+ 
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index ac38b466..ea54bac1 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -132,6 +132,7 @@ from sglang.srt.managers.io_struct import (
+     OpenSessionReqInput,
+     ParseFunctionCallReq,
+     PauseGenerationReqInput,
++    PostProcessWeightsReqInput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqInput,
+@@ -140,6 +141,7 @@ from sglang.srt.managers.io_struct import (
+     SetInternalStateReq,
+     SlowDownReqInput,
+     UnloadLoRAAdapterReqInput,
++    UpdateLoRAFromDistributedReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -762,10 +764,8 @@ async def model_info():
+ @app.get("/weight_version")
+ async def weight_version():
+     """Get the current weight version."""
+-    raise HTTPException(
+-        status_code=404,
+-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
+-    )
++    result = await model_info()
++    return {"weight_version": result.get("weight_version", None)}
+ 
+ 
+ @app.get("/get_server_info")
+@@ -782,9 +782,18 @@ async def get_server_info():
+ async def server_info():
+     """Get the server information."""
+     # Returns internal states per DP.
+-    internal_states: List[Dict[Any, Any]] = (
+-        await _global_state.tokenizer_manager.get_internal_state()
+-    )
++    server_info_timeout = float(os.environ.get("SGLANG_SERVER_INFO_TIMEOUT", "2"))
++    try:
++        internal_states: List[Dict[Any, Any]] = await asyncio.wait_for(
++            _global_state.tokenizer_manager.get_internal_state(),
++            timeout=server_info_timeout,
++        )
++    except asyncio.TimeoutError:
++        logger.warning(
++            "Timed out getting internal state for /server_info after %.1fs; returning empty internal_states",
++            server_info_timeout,
++        )
++        internal_states = []
+ 
+     server_args = _global_state.tokenizer_manager.server_args
+ 
+@@ -1409,6 +1418,22 @@ async def update_weights_from_ipc(
+         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+ 
+ 
++@app.post("/post_process_weights")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def post_process_weights(
++    obj: Annotated[PostProcessWeightsReqInput, Body()], request: Request
++):
++    """Optional post-processing for updated weights, e.g. quantization packing."""
++    success, message = await _global_state.tokenizer_manager.post_process_weights(
++        obj, request
++    )
++
++    content = {"success": success, "message": message}
++    return ORJSONResponse(
++        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
++    )
++
++
+ @app.post("/update_weight_version")
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def update_weight_version(
+@@ -1539,6 +1564,19 @@ async def load_lora_adapter_from_tensors(
+     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+ 
+ 
++@app.api_route("/update_lora_from_distributed", methods=["POST"])
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def update_lora_from_distributed(
++    obj: Annotated[UpdateLoRAFromDistributedReqInput, Body()], request: Request
++):
++    """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group."""
++    result = await _global_state.tokenizer_manager.update_lora_from_distributed(
++        obj, request
++    )
++    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
++
++
+ @app.api_route("/unload_lora_adapter", methods=["POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def unload_lora_adapter(
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+index 79136182..ef791247 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++import os
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -30,6 +31,7 @@ from sglang.srt.layers.attention.dsa.utils import (
+     is_dsa_enable_prefill_cp,
+     is_dsa_prefill_cp_in_seq_split,
+     is_graph_dsa_split_op_surface,
++    match_head_gate_q_scale,
+ )
+ from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+ from sglang.srt.layers.utils import MultiPlatformOp
+@@ -294,6 +296,17 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+             self.k_norm = LayerNorm(
+                 self.head_dim, dtype=torch.bfloat16 if _use_aiter else torch.float32
+             )
++        # NOTE: keep this override here, *after* `use_dsa_indexer_fusion` is computed
++        # above. Hoisting it earlier would let a forced `is_neox_style=False` flip that
++        # flag on and silently enable the fused indexer path.
++        env_neox_style = os.environ.get("INDEXER_ROPE_NEOX_STYLE")
++        if env_neox_style is not None:
++            if env_neox_style not in ("0", "1"):
++                raise ValueError(
++                    "INDEXER_ROPE_NEOX_STYLE must be either '0' or '1' when set."
++                )
++            is_neox_style = env_neox_style == "1"
++
+         self.rotary_emb = get_rope_wrapper(
+             rope_head_dim,
+             rotary_dim=rope_head_dim,
+@@ -365,6 +378,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+     ):
+         weights = self._weights_proj_bf16_in_fp32_out(x)
+         weights = weights * self.n_heads**-0.5
++        weights = match_head_gate_q_scale(weights, q_scale)
+         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+         return weights
+ 
+@@ -372,6 +386,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+     def _apply_q_scale_and_softmax_scale(
+         self, weights: torch.Tensor, q_scale: torch.Tensor
+     ):
++        weights = match_head_gate_q_scale(weights, q_scale)
+         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+ 
+     @torch.compile(dynamic=True)
+@@ -397,6 +412,12 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+             return max_kv_len <= self.index_topk
+         return False
+ 
++    def _maybe_repeat_query_heads(self, query: torch.Tensor) -> torch.Tensor:
++        if query.shape[1] < 32:
++            assert 32 % query.shape[1] == 0
++            query = query.repeat_interleave(32 // query.shape[1], dim=1)
++        return query
++
+     def _get_q_k_bf16(
+         self,
+         q_lora: torch.Tensor,
+@@ -1604,6 +1625,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+             query, key, weights_raw = self._get_q_k_bf16(
+                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+             )
++            query = self._maybe_repeat_query_heads(query)
+             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+             with torch.cuda.stream(self.alt_stream):
+                 self._store_index_k_cache(
+@@ -1625,6 +1647,7 @@ class Indexer(DSANPUIndexerMixin, MultiPlatformOp):
+                 enable_dual_stream,
+                 forward_batch=forward_batch,
+             )
++            query = self._maybe_repeat_query_heads(query)
+ 
+             if enable_dual_stream:
+                 current_stream = torch.cuda.current_stream()
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py b/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
+index f90e7ba9..407d88d7 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
+@@ -14,6 +14,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
+     get_tc_piecewise_forward_context,
+     is_in_tc_piecewise_cuda_graph,
+ )
++from sglang.srt.layers.attention.dsa.utils import match_head_gate_q_scale
+ from sglang.srt.utils import is_cuda
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+@@ -81,6 +82,7 @@ if _is_cuda:
+     ) -> torch.Tensor:
+         out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+         weights = out * n_heads_inv_sqrt
++        weights = match_head_gate_q_scale(weights, q_scale)
+         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+         return weights
+ 
+diff --git a/python/sglang/srt/layers/attention/dsa/utils.py b/python/sglang/srt/layers/attention/dsa/utils.py
+index 7df042c3..89054fe6 100644
+--- a/python/sglang/srt/layers/attention/dsa/utils.py
++++ b/python/sglang/srt/layers/attention/dsa/utils.py
+@@ -245,6 +245,21 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+     return cur_cp_seq_len != 0
+ 
+ 
++def match_head_gate_q_scale(
++    weights: torch.Tensor, q_scale: torch.Tensor
++) -> torch.Tensor:
++    """Broadcast head-gate weights up to ``q_scale``'s head count.
++
++    Models whose indexer has fewer heads than the query projection (e.g. GLM-5)
++    produce ``weights`` with fewer heads than ``q_scale``; the subsequent
++    ``weights.unsqueeze(-1) * q_scale`` would otherwise broadcast incorrectly.
++    """
++    if weights.shape[1] < q_scale.shape[1]:
++        assert q_scale.shape[1] % weights.shape[1] == 0
++        weights = weights.repeat_interleave(q_scale.shape[1] // weights.shape[1], dim=1)
++    return weights
++
++
+ from sglang.kernels.ops.attention.dsa.cp_split import (
+     dsa_cp_round_robin_split_q_seqs_kernel,
+ )
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+index 3490fc6a..b448595f 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -1021,6 +1021,10 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.scheme.process_weights_after_loading(layer)
+ 
++    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
++        if hasattr(layer.scheme, "restore_weights_before_loading"):
++            layer.scheme.restore_weights_before_loading(layer)
++
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+@@ -1075,6 +1079,10 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.scheme.process_weights_after_loading(layer)
+ 
++    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
++        if hasattr(layer.scheme, "restore_weights_before_loading"):
++            layer.scheme.restore_weights_before_loading(layer)
++
+     def create_weights(
+         self,
+         layer: torch.nn.Module,
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index 87b2a334..7c70342c 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -948,6 +948,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
+         # initializes FusedMoE with its own moe_runner for base path
+         super().__init__(base_layer, lora_backend)
+ 
++        # BaseLayerWithLoRA aliases `.weight`/`.bias` so a wrapped layer's base tensors stay
++        # reachable under their un-prefixed name. FusedMoE has neither -- it exposes
++        # `w13_weight`/`w2_weight` (plus quantization scales) -- so without an alias its base
++        # tensors are only reachable as `...experts.base_layer.w13_weight`. Model `load_weights`
++        # implementations resolve the un-prefixed `experts.w13_weight` produced by
++        # `FusedMoE.make_expert_params_mapping`, so reloading base weights into a LoRA-wrapped
++        # model (RL weight sync via /update_weights_from_*) would otherwise fail. Alias every
++        # directly-registered base parameter; this covers quantized MoE (w13_weight_scale,
++        # w13_weight_packed, ...) without a hardcoded name list. `named_parameters()` is called
++        # with remove_duplicate=False on the load path, so both names remain visible.
++        for param_name, param in base_layer.named_parameters(recurse=False):
++            if not hasattr(self, param_name):
++                setattr(self, param_name, param)
++
+         lora_backend.is_moe_lora = True
+ 
+         self.experts_shared_outer_loras: bool = False
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 928348eb..1c5bf177 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1862,6 +1862,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
+     pass
+ 
+ 
++class PostProcessWeightsReqInput(BaseReq, kw_only=True):
++    restore_weights_before_load: bool = False
++    post_process_quantization: bool = False
++
++
++class PostProcessWeightsReqOutput(BaseReq, kw_only=True):
++    success: bool
++    message: str
++
++
+ class CheckWeightsReqInput(BaseReq, kw_only=True):
+     action: str = "checksum"
+     allow_quant_error: bool = False
+@@ -2166,6 +2176,45 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+         )
+ 
+ 
++class UpdateLoRAFromDistributedReqInput(BaseReq, kw_only=True):
++    """Load/refresh a LoRA adapter whose tensors arrive over an NCCL process
++    group (the RLHF online-update transport), instead of via disk or a
++    serialized blob.
++
++    Mirrors ``UpdateWeightsFromDistributedReqInput`` (metadata only; the real
++    tensors are broadcast ``src=0`` on ``group_name``) but the payload lands in
++    the ``LoRAManager`` rather than ``model.load_weights``. ``config_dict`` is
++    the HF-PEFT adapter config (same content the disk path writes to
++    ``adapter_config.json``).
++    """
++
++    lora_name: str
++    config_dict: Dict[str, Any]
++    names: List[str]
++    dtypes: List[str]
++    shapes: List[List[int]]
++    # Number of tensors per broadcast bucket, in ``names`` order; sums to len(names).
++    # The sender picks the boundaries and the receiver must use the identical ones or the
++    # two desync on the broadcast. ``None`` means one bucket (pre-bucketing senders).
++    bucket_sizes: Optional[List[int]] = None
++    # The NCCL group name to receive the adapter tensors on (reuses the weight-update group).
++    group_name: str = "weight_update_group"
++    # Whether to pin the LoRA adapter in memory.
++    pinned: bool = False
++    added_tokens_config: Optional[Dict[str, Any]] = None
++    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
++    lora_id: Optional[str] = None
++    load_format: Optional[str] = None
++
++    def to_ref(self) -> LoRARef:
++        return LoRARef(
++            lora_id=self.lora_id,
++            lora_name=self.lora_name,
++            lora_path="__distributed__",
++            pinned=self.pinned,
++        )
++
++
+ class LoRAUpdateOutput(BaseReq, kw_only=True):
+     success: bool
+     error_message: Optional[str] = None
+@@ -2174,7 +2223,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
+ 
+ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
+     LoadLoRAAdapterFromTensorsReqOutput
+-) = LoRAUpdateOutput
++) = UpdateLoRAFromDistributedReqOutput = LoRAUpdateOutput
+ 
+ 
+ class BlockReqType(Enum):
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index a45d122f..0334e353 100755
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1103,6 +1103,7 @@ class Req(ReqDllmMixin):
+         self.metrics_collector = metrics_collector
+         if time_stats is not None:
+             self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
++            self.time_stats.disagg_mode = disagg_mode
+         else:
+             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
+         self.time_stats.set_metrics_collector(metrics_collector)
+@@ -2739,11 +2740,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+ 
+         retracted_reqs = []
+         first_iter = True
++        num_minimum_reqs = (
++            0 if server_args.disaggregation_mode == "decode" else 1
++        )
+         while first_iter or (
+             not self.check_decode_mem(selected_indices=sorted_indices)
+         ):
+-            if len(sorted_indices) == 1:
+-                # Always keep at least one request
++            if len(sorted_indices) <= num_minimum_reqs:
++                # Unified mode keeps one request; decode disaggregation may retract all.
+                 break
+ 
+             first_iter = False
+@@ -2754,7 +2758,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             self.release_req(idx, len(sorted_indices), server_args)
+ 
+         reqs_to_abort: List[Req] = []
+-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
++        if len(sorted_indices) <= num_minimum_reqs and not self.check_decode_mem(
+             selected_indices=sorted_indices
+         ):
+             # Even the last remaining request cannot fit in memory.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a9615a14..3fa13809 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     OpenSessionReqInput,
+     PauseGenerationReqInput,
++    PostProcessWeightsReqInput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
+     RemoveExternalCorpusReqInput,
+@@ -161,6 +162,8 @@ from sglang.srt.managers.io_struct import (
+     TokenizedGenerateReqInput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
++    UpdateLoRAFromDistributedReqInput,
++    UpdateLoRAFromDistributedReqOutput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -1539,6 +1542,10 @@ class Scheduler(
+                     UpdateWeightsFromIPCReqInput,
+                     self.weight_updater.update_weights_from_ipc,
+                 ),
++                (
++                    PostProcessWeightsReqInput,
++                    self.weight_updater.post_process_weights,
++                ),
+                 (
+                     GetWeightsByNameReqInput,
+                     self.weight_updater.get_weights_by_name,
+@@ -1571,6 +1578,10 @@ class Scheduler(
+                     LoadLoRAAdapterFromTensorsReqInput,
+                     self.load_lora_adapter_from_tensors,
+                 ),
++                (
++                    UpdateLoRAFromDistributedReqInput,
++                    self.update_lora_from_distributed,
++                ),
+                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                 (PauseGenerationReqInput, self.pause_generation),
+                 (ContinueGenerationReqInput, self.continue_generation),
+@@ -4457,6 +4468,12 @@ class Scheduler(
+                 # The request will still run one decode forward pass.
+                 # Then we reuse all existing code to clean up the KV cache allocation.
+                 logger.debug(f"Abort running request. {req.rid=}")
++                if self.disaggregation_mode == DisaggregationMode.PREFILL and hasattr(
++                    req, "disagg_kv_sender"
++                ):
++                    sender = getattr(req, "disagg_kv_sender", None)
++                    if sender is not None and hasattr(sender, "abort"):
++                        sender.abort()
+                 req.to_finish = FINISH_ABORT()
+ 
+     def _pause_engine(self) -> Tuple[List[Req], int]:
+@@ -4669,6 +4686,14 @@ class Scheduler(
+         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+         return result
+ 
++    def update_lora_from_distributed(
++        self, recv_req: UpdateLoRAFromDistributedReqInput
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        """In-place loading a new lora adapter whose tensors arrive over NCCL."""
++
++        result = self.tp_worker.update_lora_from_distributed(recv_req)
++        return result
++
+     def unload_lora_adapter(
+         self, recv_req: UnloadLoRAAdapterReqInput
+     ) -> UnloadLoRAAdapterReqOutput:
+diff --git a/python/sglang/srt/managers/scheduler_components/profiler_manager.py b/python/sglang/srt/managers/scheduler_components/profiler_manager.py
+index 39eeec2e..12ba5133 100644
+--- a/python/sglang/srt/managers/scheduler_components/profiler_manager.py
++++ b/python/sglang/srt/managers/scheduler_components/profiler_manager.py
+@@ -397,7 +397,7 @@ class SchedulerProfilerManager:
+                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
+                     if self.profile_in_progress:
+                         self._stop_profile(stage=ForwardMode.EXTEND)
+-            elif batch.forward_mode.is_decode():
++            elif batch.forward_mode.is_decode() or batch.forward_mode.is_prebuilt():
+                 if self.profiler_decode_ct == 0:
+                     if self.profile_in_progress:
+                         # force trace flush
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+index 653b28c4..d30ce9f9 100644
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -28,6 +28,8 @@ from sglang.srt.managers.io_struct import (
+     GetWeightsByNameReqOutput,
+     InitWeightsUpdateGroupReqInput,
+     InitWeightsUpdateGroupReqOutput,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
+     ResumeMemoryOccupationReqInput,
+@@ -183,6 +185,19 @@ class SchedulerWeightUpdaterManager:
+         parameter = self.tp_worker.get_weights_by_name(recv_req)
+         return GetWeightsByNameReqOutput(parameter=parameter)
+ 
++    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
++        success, message = self.tp_worker.post_process_weights(recv_req)
++        if (
++            success
++            and self.draft_worker is not None
++            and hasattr(self.draft_worker, "post_process_weights")
++        ):
++            success, message = self.draft_worker.post_process_weights(recv_req)
++        if not success:
++            logger.error(message)
++        torch.distributed.barrier(group=self.tp_cpu_group)
++        return PostProcessWeightsReqOutput(success=success, message=message)
++
+     def _assert_weight_cache_inactive(self, op: str) -> None:
+         """Reject freeing/restoring model weights while the CUDA IPC weight
+         cache is active: the weights are shared with the daemon via CUDA IPC, so
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index 7cfd98b8..03ac104c 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -48,6 +48,8 @@ from sglang.srt.managers.io_struct import (
+     LoadLoRAAdapterReqOutput,
+     LoRAUpdateOutput,
+     OpenSessionReqInput,
++    PostProcessWeightsReqInput,
++    PostProcessWeightsReqOutput,
+     ProfileReq,
+     ProfileReqOutput,
+     ProfileReqType,
+@@ -66,6 +68,8 @@ from sglang.srt.managers.io_struct import (
+     SlowDownReqOutput,
+     UnloadLoRAAdapterReqInput,
+     UnloadLoRAAdapterReqOutput,
++    UpdateLoRAFromDistributedReqInput,
++    UpdateLoRAFromDistributedReqOutput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromDistributedReqOutput,
+     UpdateWeightsFromIPCReqInput,
+@@ -101,6 +105,7 @@ _COMMUNICATOR_SPECS = [
+     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
+     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
++    ("post_process_weights", PostProcessWeightsReqOutput),
+     ("get_weights_by_name", GetWeightsByNameReqOutput),
+     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
+     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+@@ -738,6 +743,103 @@ class TokenizerControlMixin:
+                 error_message=str(e),
+             )
+ 
++    async def update_lora_from_distributed(
++        self: TokenizerManager,
++        obj: UpdateLoRAFromDistributedReqInput,
++        _: Optional[fastapi.Request] = None,
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        self.auto_create_handle_loop()
++
++        try:
++            if not self.server_args.enable_lora:
++                raise ValueError(
++                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
++                )
++
++            assert (
++                self.server_args.dp_size == 1
++            ), "dp_size must be 1 for dynamic lora loading"
++            logger.info(
++                "Start update Lora adapter from distributed. Lora name=%s",
++                obj.lora_name,
++            )
++
++            async with self.lora_update_lock:
++                # Self-contained same-name replacement: drop the prior version of
++                # this adapter first so repeated pushes under the fixed name do not
++                # accumulate (the NCCL caller does not send a separate unload).
++                #
++                # Ask the REGISTRY ("is a version live right now?"), never lora_ref_cache
++                # ("was one ever loaded?"). Upstream's cache is append-only -- unload only
++                # touches the registry -- so a push that dies between the unload above and
++                # the receive below leaves the name in the cache but not in the registry.
++                # Keying the unload off the cache would then make every retry call
++                # unregister() on a name that is gone, which raises before the receive is
++                # ever reached: one transient failure would wedge the engine permanently.
++                if obj.lora_name in self.lora_registry.get_all_adapters():
++                    unload_result = await self._unload_lora_adapter_locked(
++                        UnloadLoRAAdapterReqInput(lora_name=obj.lora_name)
++                    )
++                    if not unload_result.success:
++                        raise ValueError(
++                            f"Error while unloading prior LoRA adapter '{obj.lora_name}': "
++                            f"{unload_result.error_message}"
++                        )
++
++                new_adapter = LoRARef(
++                    lora_name=obj.lora_name,
++                    lora_path="__distributed__",
++                    pinned=obj.pinned,
++                )
++                obj.lora_id = new_adapter.lora_id
++                result = (await self.update_lora_adapter_communicator(obj))[0]
++
++                if result.success:
++                    await self.lora_registry.register(new_adapter)
++                    # Deliberately NOT recorded in lora_ref_cache. That cache exists so an
++                    # LRU-evicted adapter can be transparently re-read from its lora_path,
++                    # but these tensors arrived over NCCL and were never on disk --
++                    # "__distributed__" is a placeholder, not a real path. Caching it would
++                    # send the implicit-reload path in TokenizerManager off to load a
++                    # directory that does not exist; leaving it out makes an unregistered
++                    # adapter surface as "never been loaded", which is the truth.
++                if self.server_args.max_loaded_loras is not None:
++                    while (
++                        self.lora_registry.num_registered_loras
++                        > self.server_args.max_loaded_loras
++                    ):
++                        lru_lora_name = await self.lora_registry.lru_lora_name(
++                            exclude_pinned=True
++                        )
++                        if lru_lora_name is None:
++                            raise ValueError(
++                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
++                                f"LoRA registry is: {self.lora_registry._registry}"
++                            )
++
++                        logger.info(
++                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
++                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
++                            f"max allowed: {self.server_args.max_loaded_loras})"
++                        )
++
++                        unload_result = await self._unload_lora_adapter_locked(
++                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
++                        )
++                        if not unload_result.success:
++                            raise ValueError(
++                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
++                                f"{unload_result.error_message}"
++                            )
++                        del result.loaded_adapters[lru_lora_name]
++
++                return result
++        except ValueError as e:
++            return UpdateLoRAFromDistributedReqOutput(
++                success=False,
++                error_message=str(e),
++            )
++
+     async def unload_lora_adapter(
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+@@ -797,6 +899,16 @@ class TokenizerControlMixin:
+         self.auto_create_handle_loop()
+         await self.resume_memory_occupation_communicator(obj)
+ 
++    async def post_process_weights(
++        self: TokenizerManager,
++        obj: PostProcessWeightsReqInput,
++        request: Optional[fastapi.Request] = None,
++    ) -> Tuple[bool, str]:
++        self.auto_create_handle_loop()
++        async with self.model_update_lock.writer_lock:
++            results = await self.post_process_weights_communicator(obj)
++        return FanOutCommunicator.merge_results(results)
++
+     async def check_weights(
+         self: TokenizerManager,
+         obj: CheckWeightsReqInput,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 80351f33..99e4a1c2 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -2840,27 +2840,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             priority = getattr(state.obj, "priority", None)
+             if priority is not None:
+                 labels["priority"] = str(priority)
+-        if (
+-            not state.ttft_observed
+-            and self.disaggregation_mode != DisaggregationMode.PREFILL
+-        ):
++        if not state.ttft_observed:
+             state.ttft_observed = True
+             state.last_completion_tokens = completion_tokens
+-            self.metrics_collector.observe_time_to_first_token(
+-                labels,
+-                state.time_stats.get_first_token_latency(),
+-                stream=getattr(state.obj, "stream", False),
+-            )
++            if self.disaggregation_mode != DisaggregationMode.PREFILL:
++                self.metrics_collector.observe_time_to_first_token(
++                    labels,
++                    state.time_stats.get_first_token_latency(),
++                    stream=getattr(state.obj, "stream", False),
++                )
+         else:
+             num_new_tokens = completion_tokens - state.last_completion_tokens
+-            if num_new_tokens:
++            if num_new_tokens > 0:
+                 self.metrics_collector.observe_inter_token_latency(
+                     labels,
+                     state.time_stats.get_interval(),
+                     num_new_tokens,
+                 )
+                 state.time_stats.set_last_time()
+-                state.last_completion_tokens = completion_tokens
++            state.last_completion_tokens = completion_tokens
+ 
+         if state.finished:
+             # Get detailed cache breakdown if available
+@@ -3731,7 +3729,14 @@ def _get_processor_wrapper(server_args):
+ 
+ 
+ def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+-    is_cross_node = server_args.dist_init_addr
++    # NOTE(relax-fix): keying "cross node" off dist_init_addr false-positives for
++    # single-node multi-GPU TP, which MUST also set dist_init_addr to bootstrap the
++    # TP process group (see relax/backends/sglang/sglang_engine.py). The false
++    # positive forces the CPU "default" transport, which makes wrap_shm_features()
++    # a no-op, so multimodal pixel tensors (multi-GB for 5-image doc pages) get
++    # pickled + gloo-broadcast per request (observed 2.2-6.5 GB, 18-33s per
++    # recv_requests). Key off nnodes, which is what actually means multi-node.
++    is_cross_node = server_args.nnodes > 1
+ 
+     if is_cross_node:
+         # Fallback to default CPU transport for multi-node
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 0fdf5b96..2cda3ba5 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -30,8 +30,10 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsUpdateGroupReqInput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterReqInput,
++    PostProcessWeightsReqInput,
+     SendWeightsToRemoteInstanceReqInput,
+     UnloadLoRAAdapterReqInput,
++    UpdateLoRAFromDistributedReqInput,
+     UpdateWeightFromDiskReqInput,
+     UpdateWeightsFromDistributedReqInput,
+     UpdateWeightsFromIPCReqInput,
+@@ -195,6 +197,13 @@ class BaseTpWorker(ABC):
+         )
+         return success, message
+ 
++    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
++        success, message = self.model_runner.post_process_weights(
++            restore_weights_before_load=recv_req.restore_weights_before_load,
++            post_process_quantization=recv_req.post_process_quantization,
++        )
++        return success, message
++
+     def _deserialize_own_rank(self, serialized_named_tensors):
+         """Each rank deserializes only its own payload (index ps.tp_rank);
+         deserializing another rank's copy would break producer-side CUDA-IPC
+@@ -285,6 +294,23 @@ class BaseTpWorker(ABC):
+         )
+         return result
+ 
++    def update_lora_from_distributed(
++        self, recv_req: UpdateLoRAFromDistributedReqInput
++    ):
++        # Every TP worker joins the broadcast; the LoRA code slices its own shard
++        # internally (slice_lora_a_weights / slice_lora_b_weights).
++        result = self.model_runner.update_lora_from_distributed(
++            recv_req.to_ref(),
++            recv_req.names,
++            recv_req.dtypes,
++            recv_req.shapes,
++            recv_req.config_dict,
++            recv_req.group_name,
++            recv_req.added_tokens_config,
++            recv_req.bucket_sizes,
++        )
++        return result
++
+     def forward_batch_embedding(self, batch: ScheduleBatch):
+         forward_batch = ForwardBatch.init_new(
+             batch,
+diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
+index 5ebac56f..e9c2d85d 100644
+--- a/python/sglang/srt/mem_cache/hiradix_cache.py
++++ b/python/sglang/srt/mem_cache/hiradix_cache.py
+@@ -1137,9 +1137,7 @@ class HiRadixCache(RadixCache):
+             self._update_leaf_status(node)
+             self._update_host_leaf_status(node)
+             if node.parent is None:
+-                assert (
+-                    node is self.root_node
+-                ), f"This request holds the node from another tree"
++                break
+             node = node.parent
+         return DecLockRefResult(delta=delta)
+ 
+@@ -1245,6 +1243,7 @@ class HiRadixCache(RadixCache):
+         self._update_host_leaf_status(node)
+         # update leaf status for the parent because the node is evicted
+         self._update_leaf_status(node.parent)
++        self._update_host_leaf_status(node.parent)
+         return num_evicted
+ 
+     def _evict_backuped(self, node: TreeNode):
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index a9b2b8b9..27b1c48e 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -4391,9 +4391,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
+     def _create_index_buffers(self):
+         num_pages = (self.index_buf_size + self.page_size + 1) // self.page_size
+         with (
+-            torch.cuda.use_mem_pool(self.custom_mem_pool)
+-            if self.custom_mem_pool
+-            else nullcontext()
++            (
++                torch.cuda.use_mem_pool(self.custom_mem_pool)
++                if self.custom_mem_pool
++                else nullcontext()
++            ),
++            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
+         ):
+             self.index_k_with_scale_buffer = [
+                 torch.zeros(
+diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
+index 2916f8c6..32b81c49 100644
+--- a/python/sglang/srt/mem_cache/radix_cache.py
++++ b/python/sglang/srt/mem_cache/radix_cache.py
+@@ -491,6 +491,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
+             return
+ 
+         token_ids = req.get_fill_ids()
++        kv_committed_len = getattr(req, "kv_committed_len", None)
++        if kv_committed_len is not None and len(token_ids) > kv_committed_len:
++            token_ids = token_ids[:kv_committed_len]
+         kv_indices = self.req_to_token_pool.req_to_token[
+             req.req_pool_idx, : len(token_ids)
+         ]
+@@ -619,9 +622,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
+             node.lock_ref -= 1
+             self._update_leaf_status(node)
+             if node.parent is None:
+-                assert (
+-                    node is self.root_node
+-                ), "This request holds the node from another tree"
++                break
+             node = node.parent
+         return DecLockRefResult(delta=delta)
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 8e957f66..1bd46d38 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -376,9 +376,10 @@ class ModelRunner:
+         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
+ 
+         # CPU offload
+-        set_offloader(
+-            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
+-        )
++        if not is_draft_worker:
++            set_offloader(
++                create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
++            )
+ 
+         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
+ 
+@@ -1183,10 +1184,130 @@ class ModelRunner:
+             lora_ref, tensors, config_dict, added_tokens_config
+         )
+ 
++    def update_lora_from_distributed(
++        self,
++        lora_ref: LoRARef,
++        names,
++        dtypes,
++        shapes,
++        config_dict,
++        group_name,
++        added_tokens_config=None,
++        bucket_sizes=None,
++    ):
++        """Receive a LoRA adapter's tensors over an NCCL process group and load it.
++
++        Mirrors ``update_weights_from_distributed`` (each ``(name, dtype, shape)``
++        is broadcast ``src=0`` on the shared weight-update group), but the
++        gathered tensors are handed to the ``LoRAManager`` instead of
++        ``model.load_weights``. The full (TP-gathered, PP-merged) adapter is
++        broadcast to every worker, which slices its own shard internally.
++
++        ``bucket_sizes`` is the number of tensors per broadcast bucket, exactly as the
++        sender grouped them. Each bucket is staged on device, received, then moved to
++        host memory and released, so peak device memory is ONE bucket instead of the
++        whole adapter: a MoE adapter runs to several GB, and allocating that on top of
++        the KV cache OOMs mid-broadcast, which wedges every other participant until the
++        NCCL timeout. Host tensors are what ``LoRAAdapter`` keeps anyway
++        (``_process_weight`` calls ``.cpu()``). ``None`` means a single bucket.
++        """
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        model_update_group = self.weight_updater._model_update_group
++        assert group_name in model_update_group, (
++            f"Group {group_name} not in {list(model_update_group.keys())}. "
++            "Please call `init_weights_update_group` first."
++        )
++        if not bucket_sizes:
++            bucket_sizes = [len(names)]
++        assert sum(bucket_sizes) == len(names), (
++            f"bucket_sizes sum to {sum(bucket_sizes)} but {len(names)} tensors were "
++            "announced; sender and receiver would issue different broadcasts and hang."
++        )
++        logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
++        try:
++            tensors = {}
++            offset = 0
++            for count in bucket_sizes:
++                handles = []
++                staged = []
++                for name, dtype, shape in zip(
++                    names[offset : offset + count],
++                    dtypes[offset : offset + count],
++                    shapes[offset : offset + count],
++                ):
++                    target_dtype = (
++                        dtype
++                        if isinstance(dtype, torch.dtype)
++                        else getattr(torch, dtype)
++                    )
++                    weight = torch.empty(shape, dtype=target_dtype, device=self.device)
++                    handles.append(
++                        torch.distributed.broadcast(
++                            weight,
++                            src=0,
++                            group=model_update_group[group_name],
++                            async_op=True,
++                        )
++                    )
++                    staged.append((name, weight))
++                for handle in handles:
++                    handle.wait()
++                handles.clear()
++                # Move off-device and drop the staging buffers before the next bucket is
++                # allocated, so the device high-water mark stays at one bucket.
++                for name, weight in staged:
++                    tensors[name] = weight.to("cpu")
++                staged.clear()
++                offset += count
++        except Exception as e:
++            error_msg = f"Failed to receive LoRA adapter over distributed group: {e}."
++            logger.error(error_msg)
++            return LoRAUpdateOutput(success=False, error_message=error_msg)
++
++        result = self.lora_manager.load_lora_adapter_from_tensors(
++            lora_ref, tensors, config_dict, added_tokens_config
++        )
++        logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
++        return result
++
+     def unload_lora_adapter(self, lora_ref: LoRARef):
+         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+         return self.lora_manager.unload_lora_adapter(lora_ref)
+ 
++    def post_process_weights(
++        self,
++        restore_weights_before_load: bool = False,
++        post_process_quantization: bool = False,
++    ):
++        """Run optional post-loading hooks, such as quantization repacking."""
++        from sglang.srt.model_loader.loader import device_loading_context
++
++        if self.device == "cuda":
++            target_device = torch.device("cuda", torch.cuda.current_device())
++        else:
++            target_device = torch.device(self.device)
++
++        if restore_weights_before_load:
++            for _, module in self.model.named_modules():
++                quant_method = getattr(module, "quant_method", None)
++                if quant_method is not None and hasattr(
++                    quant_method, "restore_weights_before_loading"
++                ):
++                    with device_loading_context(module, target_device):
++                        quant_method.restore_weights_before_loading(module)
++
++        if post_process_quantization:
++            for _, module in self.model.named_modules():
++                quant_method = getattr(module, "quant_method", None)
++                if quant_method is not None and hasattr(
++                    quant_method, "process_weights_after_loading"
++                ):
++                    with device_loading_context(module, target_device):
++                        quant_method.process_weights_after_loading(module)
++
++        return True, "Success"
++
+     @property
+     def effective_max_total_num_tokens(self):
+         """Return the max token pool size considering hybrid swa settings."""
+@@ -1441,6 +1562,12 @@ class ModelRunner:
+         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+ 
+         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
++        cuda_graph_num_tokens = None
++        decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
++        if getattr(decode_graph_runner, "bs", None):
++            cuda_graph_num_tokens = decode_graph_runner.bs * getattr(
++                decode_graph_runner, "num_tokens_per_bs", 1
++            )
+         if (
+             not self.is_draft_worker
+             and (experts_capturer := get_global_experts_capturer()) is not None
+@@ -1448,7 +1575,7 @@ class ModelRunner:
+             output.routed_experts_output = experts_capturer.on_forward_end(
+                 forward_batch=forward_batch,
+                 can_run_graph=output.can_run_graph,
+-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
++                cuda_graph_batch=cuda_graph_num_tokens,
+                 no_copy_to_cpu=no_copy_to_cpu,
+             )
+ 
+@@ -1456,7 +1583,7 @@ class ModelRunner:
+             output.indexer_topk_output = indexer_capturer.on_forward_end(
+                 forward_batch=forward_batch,
+                 can_run_graph=output.can_run_graph,
+-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
++                cuda_graph_batch=cuda_graph_num_tokens,
+                 no_copy_to_cpu=no_copy_to_cpu,
+             )
+
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index 08c47b99..06a222fe 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1125,12 +1125,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+         forward_batch: ForwardBatch,
+     ) -> torch.Tensor:
+         """Full attention forward pass."""
+-        if _is_cuda and self.attn_output_gate:
++        if _is_cuda and self.attn_output_gate and positions.ndim == 1:
+             q, k, v, gate = self.forward_prepare_cuda_fused(
+                 positions=positions,
+                 hidden_states=hidden_states,
+             )
+-        elif (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
++        elif (_is_cuda or _is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+             q, k, v, gate = self.forward_prepare_fused_gate(
+                 positions=positions,
+                 hidden_states=hidden_states,
+diff --git a/python/sglang/srt/models/qwen3_vl.py b/python/sglang/srt/models/qwen3_vl.py
+index 83697f14..aae8b5c8 100644
+--- a/python/sglang/srt/models/qwen3_vl.py
++++ b/python/sglang/srt/models/qwen3_vl.py
+@@ -1171,9 +1171,14 @@ class Qwen3LLMModel(Qwen3Model):
+             # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+             # The order matters because addition with different tensors is not associative in practice.
+             # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+-            deepstack_embeds = self.get_deepstack_embeds(
+-                layer_idx - 1, input_deepstack_embeds
+-            )
++            deepstack_embeds = None
++            if input_deepstack_embeds is not None:
++                prev_layer_idx = layer_idx - 1
++                if prev_layer_idx in self.deepstack_embed_to_decoder_layer:
++                    sep = self.hidden_size * prev_layer_idx
++                    deepstack_embeds = input_deepstack_embeds[
++                        :, sep : sep + self.hidden_size
++                    ]
+             hidden_states, residual = layer(
+                 positions,
+                 hidden_states,
+diff --git a/python/sglang/srt/multimodal/processors/glm4v.py b/python/sglang/srt/multimodal/processors/glm4v.py
+index db684259..17d2cb69 100644
+--- a/python/sglang/srt/multimodal/processors/glm4v.py
++++ b/python/sglang/srt/multimodal/processors/glm4v.py
+@@ -1,7 +1,13 @@
+ from typing import List, Union
+ 
++import torch
++
+ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
++from sglang.srt.managers.schedule_batch import (
++    Modality,
++    MultimodalDataItem,
++    MultimodalProcessorOutput,
++)
+ from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
+ from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+ from sglang.srt.multimodal.processors.base_processor import (
+@@ -46,6 +52,8 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
+         self.IMAGE_END_TOKEN_ID = hf_config.image_end_token_id
+         self.VIDEO_START_TOKEN_ID = hf_config.video_start_token_id
+         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
++        self.IM_START_TOKEN_ID = self.IMAGE_START_TOKEN_ID
++        self.IM_END_TOKEN_ID = self.IMAGE_END_TOKEN_ID
+ 
+         # Vision config
+         self.IMAGE_FACTOR = 28
+@@ -60,6 +68,39 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
+             video_token_id=self.IM_TOKEN_ID,
+         ).build(_processor)
+ 
++    def get_mm_data(self, prompt, embeddings, img_grid_thw):
++        input_ids, offsets, _ = self.build_input_ids(prompt, img_grid_thw=img_grid_thw)
++        image_embeddings = (
++            embeddings.get(Modality.IMAGE, embeddings)
++            if isinstance(embeddings, dict)
++            else embeddings
++        )
++        mm_items = [
++            MultimodalDataItem(
++                modality=Modality.IMAGE,
++                offsets=offsets,
++                precomputed_embeddings=image_embeddings,
++            )
++        ]
++
++        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
++            input_ids=torch.tensor(input_ids, dtype=torch.long).unsqueeze(0),
++            hf_config=self.hf_config,
++            image_grid_thw=img_grid_thw,
++            video_grid_thw=None,
++            attention_mask=None,
++        )
++
++        return MultimodalProcessorOutput(
++            input_ids=input_ids,
++            mm_items=mm_items,
++            im_start_id=self.IM_START_TOKEN_ID,
++            im_end_id=self.IM_END_TOKEN_ID,
++            im_token_id=self.IM_TOKEN_ID,
++            mrope_positions=mrope_positions.squeeze(1),
++            mrope_position_delta=mrope_position_delta,
++        )
++
+     def compute_mrope_positions(self, input_ids, mm_items):
+         image_grid_thw = None
+         video_grid_thw = None
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index b4e37c7..eb14b7d 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -1066,6 +1066,20 @@ class BaseMultimodalProcessor(ABC):
+             len(audios),
+         )
+ 
++        # Decoded input_ids can contain image tokens already expanded by the
++        # client processor. Raw images are processed again below, so restore
++        # one placeholder per image, as in legacy_load_mm_data. Precomputed
++        # inputs must retain their expanded token layout.
++        if (
++            images
++            and all(not isinstance(image, dict) for image in images)
++            and isinstance(multimodal_tokens.image_token, str)
++            and multimodal_tokens.image_token_regex is not None
++        ):
++            prompt_str = multimodal_tokens.image_token_regex.sub(
++                lambda _: multimodal_tokens.image_token, prompt_str
++            )
++
+         return BaseMultiModalProcessorOutput(
+             images=images,
+             audios=audios,
+diff --git a/python/sglang/srt/multimodal/processors/executor.py b/python/sglang/srt/multimodal/processors/executor.py
+index 43da2ea..9fe011d 100644
+--- a/python/sglang/srt/multimodal/processors/executor.py
++++ b/python/sglang/srt/multimodal/processors/executor.py
+@@ -46,7 +46,12 @@ class MultimodalProcessorExecutor:
+                     else copy.deepcopy(self._processor)
+                 )
+             self._worker_state.processor = processor
+-        return function(*args, processor=processor, **kwargs)
++        try:
++            return function(*args, processor=processor, **kwargs)
++        except StopIteration as exc:
++            # asyncio cannot transfer StopIteration to its Future. Leaving it
++            # on the concurrent Future would keep the awaiting request pending.
++            raise ValueError("Multimodal processor exhausted an input iterator") from exc
+ 
+     def shutdown(self) -> None:
+         self._executor.shutdown()
+diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
+index 3bcb6b36..9b971098 100644
+--- a/python/sglang/srt/observability/req_time_stats.py
++++ b/python/sglang/srt/observability/req_time_stats.py
+@@ -346,7 +346,7 @@ class ReqTimeStatsBase:
+                 state["trace_ctx"] = TraceNullContext()
+ 
+         for key in state.keys():
+-            if key.endswith("time"):
++            if key.endswith("time") and state[key] > 0.0:
+                 state[key] = convert_time_cross_thread(
+                     state[key],
+                     state["diff_realtime_monotonic"],
+@@ -632,9 +632,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+ 
+         state = {
+             "has_timing_data": True,
++            "enable_metrics": self.enable_metrics,
++            "disagg_mode": self.disagg_mode,
+             "wait_queue_entry_time": self.wait_queue_entry_time,
+             "forward_entry_time": self.forward_entry_time,
+             "prefill_finished_time": self.prefill_finished_time,
++            "completion_time": self.completion_time,
++            "prefill_bootstrap_queue_entry_time": self.prefill_bootstrap_queue_entry_time,
++            "prefill_transfer_queue_entry_time": self.prefill_transfer_queue_entry_time,
++            "decode_prealloc_queue_entry_time": self.decode_prealloc_queue_entry_time,
++            "decode_transfer_queue_entry_time": self.decode_transfer_queue_entry_time,
++            "bootstrap_done_time": self.bootstrap_done_time,
++            "transfer_speed_gb_s": self.transfer_speed_gb_s,
++            "transfer_total_mb": self.transfer_total_mb,
+             "diff_realtime_monotonic": global_diff_realtime_monotonic,
+         }
+         return state
+@@ -1149,6 +1159,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+ 
+     def convert_to_output_meta_info(self):
+         meta_data = {}
++
++        def add_duration(key: str, start: float, end: float):
++            if start > 0.0 and end > 0.0:
++                duration = end - start
++                if duration >= 0.0:
++                    meta_data[key] = duration
++
+         if self.forward_entry_time > 0.0:
+             meta_data["forward_entry_time"] = convert_time_to_realtime(
+                 self.forward_entry_time
+@@ -1162,6 +1179,66 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
+                 "queue_time": self.get_queueing_time(),
+             }
+         )
++        if self.disagg_mode == DisaggregationMode.PREFILL:
++            add_duration(
++                "pd_prefill_bootstrap_queue_duration",
++                self.prefill_bootstrap_queue_entry_time,
++                self.wait_queue_entry_time,
++            )
++            add_duration(
++                "pd_prefill_bootstrap_duration",
++                self.prefill_bootstrap_queue_entry_time,
++                self.bootstrap_done_time,
++            )
++            add_duration(
++                "pd_prefill_alloc_wait_duration",
++                self.bootstrap_done_time,
++                self.wait_queue_entry_time,
++            )
++            add_duration(
++                "pd_prefill_forward_duration",
++                self.forward_entry_time,
++                self.completion_time,
++            )
++            add_duration(
++                "pd_prefill_transfer_queue_duration",
++                self.prefill_transfer_queue_entry_time,
++                self.completion_time,
++            )
++            if self.transfer_speed_gb_s > 0.0:
++                meta_data["pd_transfer_speed_gb_s"] = self.transfer_speed_gb_s
++            if self.transfer_total_mb > 0.0:
++                meta_data["pd_transfer_total_mb"] = self.transfer_total_mb
++        elif self.disagg_mode == DisaggregationMode.DECODE:
++            add_duration(
++                "pd_decode_prealloc_duration",
++                self.decode_prealloc_queue_entry_time,
++                self.decode_transfer_queue_entry_time,
++            )
++            add_duration(
++                "pd_decode_bootstrap_duration",
++                self.decode_prealloc_queue_entry_time,
++                self.bootstrap_done_time,
++            )
++            add_duration(
++                "pd_decode_alloc_wait_duration",
++                self.bootstrap_done_time,
++                self.decode_transfer_queue_entry_time,
++            )
++            add_duration(
++                "pd_decode_transfer_duration",
++                self.decode_transfer_queue_entry_time,
++                self.wait_queue_entry_time,
++            )
++            add_duration(
++                "pd_decode_forward_duration",
++                self.forward_entry_time,
++                self.completion_time,
++            )
++            if self.transfer_speed_gb_s > 0.0:
++                meta_data["pd_transfer_speed_gb_s"] = self.transfer_speed_gb_s
++            if self.transfer_total_mb > 0.0:
++                meta_data["pd_transfer_total_mb"] = self.transfer_total_mb
+         return meta_data
+ 
+     def format_duration(self, duration: float) -> str:
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index 13371f43..1bd91856 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -566,8 +566,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
+             forward_batch.seq_lens,
+             forward_batch.out_cache_loc,
+             forward_batch.positions,
+-            forward_batch.spec_info.topk_p,
+-            forward_batch.spec_info.topk_index,
++            forward_batch.spec_info.topk_p.clamp(0.0, 1.0),
++            forward_batch.spec_info.topk_index.clamp(
++                0, self.model_runner.model_config.vocab_size - 1
++            ),
+             forward_batch.req_pool_indices,
+         ]
+         if buffers.rids_int is not None and forward_batch.rids_int is not None:
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 6636d06a..53142e01 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -2834,6 +2834,9 @@ class SafeUnpickler(pickle.Unpickler):
+         "sglang.srt.utils.",
+         "sglang.srt.disaggregation.",
+         "sglang.srt.managers.",
++        "slime.",
++        # --- Relax ---
++        "Relax.",
+         "torch_npu.",
+     }
+ 

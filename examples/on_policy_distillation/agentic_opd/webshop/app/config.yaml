@@ -2,12 +2,11 @@
 
 server:
   host: "127.0.0.1"
-  # Port the per-node WebShop env server listens on; the agent connects to
-  # http://127.0.0.1:<port>. Overridable via $WEBSHOP_PORT (see run_agent_app.sh).
+  # WEBSHOP_HOST and WEBSHOP_PORT override the bind address for training.
   port: 36001
   # Max concurrent /step calls actually running WebShop CPU work at once (search
-  # is the hot path). A safety valve against saturating node CPU, NOT a throttle
-  # of active sessions (DESIGN Q5) — set generously.
+  # is the hot path). A safety valve against saturating node CPU, not a throttle
+  # of active sessions; set generously.
   step_concurrency: 64
   # Seconds the boot /health probe waits for the catalog to finish loading.
   ready_timeout_s: 600

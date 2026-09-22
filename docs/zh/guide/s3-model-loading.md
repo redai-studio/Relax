@@ -1,6 +1,6 @@
-# S3 模型加载
+# S3 模型加载加速
 
-Relax 支持直接从 S3 兼容对象存储加载 Hugging Face checkpoint。为 `--hf-checkpoint` 传入 `s3://` URI 后，各节点会在启动阶段将 checkpoint 下载到共享内存（`/dev/shm`），之后按普通本地路径读取。该能力不需要独立开关，传入本地路径即不走这条链路。
+Relax 支持直接从 S3 兼容对象存储加载 Hugging Face checkpoint。为 `--hf-checkpoint` 传入 `s3://` URI 后，实际消费策略模型的节点会在启动阶段将 checkpoint 下载到共享内存（`/dev/shm`），之后按普通本地路径读取。该能力不需要独立开关，传入本地路径即不走这条链路。
 
 ### 适用场景
 
@@ -12,7 +12,7 @@ S3 加载替换的是从原有文件系统读取 checkpoint 这一步，是否�
 | 各节点本地已有 checkpoint 且位于高速 NVMe | 使用本地路径，本地读通常快于网络下载 |
 | 对象存储带宽受限或距集群较远 | 建议先实测，每节点拉取数十 GB 的开销可能超过收益 |
 
-下载并发执行，每个节点只下载一次，与该节点上的 rank 数量无关。
+对于 S3 模型源，Relax 会先分配各 Service 的 Placement Group，再在实际消费策略 checkpoint 的每个 GPU 节点上启动一个预取任务。预取进行时 Ray Serve 会继续部署；如果 consumer 更早走到模型加载位置，它会等待同一个节点缓存锁。无论一个节点承载多少个 rank，每个节点都只下载一次，纯 CPU Ray head 不下载模型文件。本地模型路径继续使用原有的 Service 构造即部署流程，也不会执行 S3 缓存探测或清理。
 
 ### 前置条件
 
@@ -57,7 +57,17 @@ python3 -m relax.entrypoints.train \
     # ... 其他训练参数
 ```
 
-只有自建或 S3 兼容存储才需要额外指定 `--s3-model-endpoint`。
+使用自建或 S3 兼容存储时，通过标准 AWS 环境变量配置连接信息，不需要把 transport 参数写进训练命令：
+
+```bash
+export AWS_ENDPOINT_URL_S3=http://s3.example
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+```
+
+`AWS_ENDPOINT_URL_S3` 的优先级高于 `AWS_ENDPOINT_URL`。凭证使用标准 boto3 credential chain，因此 profile、session token 和 workload credential 均无需 Relax 私有参数即可生效。
+
+使用 `runai_streamer` 时，Relax 仅在用户没有设置 `RUNAI_STREAMER_S3_ENDPOINT` 时，将上述 AWS endpoint 桥接给 RunAI Streamer，因此用户显式设置的 RunAI endpoint 优先。网关要求 path-style addressing 时，可以直接设置 RunAI Streamer 原生变量 `RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0`。
 
 ### 为什么用 `dummy`
 
@@ -77,7 +87,7 @@ ______________________________________________________________________
 | **引擎启动顺序不确定** | `--sglang-load-format auto` | SHM 副本就绪时直接复用，否则从 S3 流式加载。SHM 会被占用到任务结束 |
 | **rollout 先于训练启动，或独立 SGLang** | `--sglang-load-format runai_streamer` | 权重直接从 S3 流式加载，rollout 完全不占 SHM，Actor 首次同步后释放 SHM |
 | **排障，需要保留权重文件** | 追加 `--disable-s3-model-cleanup` | 完整 checkpoint 全程保留在 `/dev/shm` |
-| **关闭该能力** | `--disable-s3-model-download` | 按普通方式加载 `--hf-checkpoint` |
+| **关闭该能力** | `--disable-s3-model-download` | 同时关闭 Relax 通用 S3 下载和已注册的模型来源 provider，之后由普通 loader 直接处理 `--hf-checkpoint` |
 
 ::: warning
 `dummy` 只适用于 policy rollout 引擎，因为 Actor 会在首次请求前覆盖它的权重。GenRM、teacher、evaluation 和独立推理服务始终加载真实权重，即使它们指向同一个模型。
@@ -91,15 +101,22 @@ ______________________________________________________________________
 
 ```
 提交任务
-  → 各节点并行下载 checkpoint 到 /dev/shm（每节点一次）
-  → SGLang rollout 引擎启动
+  → Placement Group 就绪
+  → 清除前一个串行任务遗留的、由 Relax 管理的模型缓存
+  → 策略模型 consumer 所在 GPU 节点开始预取 checkpoint 到 /dev/shm
+  → 预取进行时 Ray Serve 同步开始部署
+       consumer 需要文件但缓存未就绪时，等待节点本地缓存锁
+  → SGLang rollout 引擎初始化
        dummy           只读 metadata，最快就绪
        auto            直接复用 /dev/shm，不再重复下载
        runai_streamer  从 S3 流式加载，不占用 SHM
+  → Controller 确认所有已提交的预取任务完成
   → Actor 执行首次权重同步（dummy 引擎在此拿到真实权重）
   → 自动释放 /dev/shm 中的权重分片
   → 开始训练
 ```
+
+Relax 不会恢复、续传或复用前一个任务的完整或部分下载。新的 S3 预取开始前，会在逐缓存加锁后清除前一个串行任务遗留的 Relax 缓存。清理范围严格限制在 Relax 自己的哈希命名空间内，不会删除 `/dev/shm` 中的其他文件；因此长期存活的 Ray 集群串行运行多个 Relax 任务时，也不会持续堆积旧模型。
 
 ______________________________________________________________________
 
@@ -133,15 +150,12 @@ ______________________________________________________________________
 |---|---|---|
 | `--hf-checkpoint` | — | 传 `s3://` URI 启用 S3 加载；本地路径则不走该链路 |
 | `--sglang-load-format` | `auto` | rollout 引擎加载模式，见上表 |
-| `--s3-model-endpoint` | `None` | 自建或 S3 兼容存储的地址 |
-| `--s3-model-use-path-style` | 关闭 | 网关要求 path-style addressing 时开启 |
-| `--s3-model-use-placeholder-credentials` | 关闭 | 网关要求签名请求但不校验真实凭据时开启 |
 | `--s3-model-shm-root` | `/dev/shm` | 下载使用的共享内存目录 |
 | `--s3-model-download-workers` | `20` | 下载并发数 |
-| `--disable-s3-model-download` | 关闭 | 改为按普通方式加载 `--hf-checkpoint` |
+| `--disable-s3-model-download` | 关闭 | 同时关闭通用 S3 下载和已注册的模型来源 provider，再把 `--hf-checkpoint` 交给普通 loader |
 | `--disable-s3-model-cleanup` | 关闭 | 全程保留共享内存中的权重 |
 
-命令行不会传递真实凭据，Relax 使用运行环境的标准 credential chain。
+Relax 不再通过私有命令行参数传递 endpoint 和凭据。普通 S3 使用 `AWS_ENDPOINT_URL_S3`（其次为 `AWS_ENDPOINT_URL`）以及标准 boto3 credential chain。模型来源 provider 仍可携带只作用于该来源的 transport 配置，不会改变普通 S3 模型使用的环境。
 
 ______________________________________________________________________
 

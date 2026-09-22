@@ -1,4 +1,7 @@
+import taskLists from 'markdown-it-task-lists'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
+import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
@@ -209,9 +212,18 @@ export default defineConfig({
   // Ignore dead links for source code references and placeholder pages
   ignoreDeadLinks: true,
 
-  // Enable LaTeX math rendering
+  // Enable LaTeX math rendering and GitHub-style task lists
   markdown: {
-    math: true
+    math: true,
+    config(md) {
+      md.use(taskLists)
+      md.use(sourceLinks, {
+        repo: 'https://github.com/redai-studio/Relax',
+        branch: 'main',
+        repoRoot: fileURLToPath(new URL('../..', import.meta.url)),
+        docsRoot: 'docs'
+      })
+    }
   },
   
   // 多语言配置
@@ -229,7 +241,7 @@ export default defineConfig({
           {
             text: 'Resources',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: 'Paper', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -243,7 +255,9 @@ export default defineConfig({
                 { text: 'Installation', link: '/en/guide/installation' },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
+                { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
                 { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
@@ -265,20 +279,23 @@ export default defineConfig({
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
+                { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
-                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' }
+                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
+                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' }
               ]
             },
             {
               text: 'Best Practices',
               items: [
                 { text: 'Performance Tuning', link: '/en/guide/performance-tuning' },
-                { text: 'S3 Model Loading', link: '/en/guide/s3-model-loading' },
+                { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
+                { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
@@ -318,6 +335,7 @@ export default defineConfig({
                 { text: 'On-Policy Distillation', link: '/en/examples/on-policy-distillation' },
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
                 { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
+                { text: 'Elastic Rollout', link: '/en/examples/elastic-rollout' },
                 { text: 'Algorithms', link: '/en/examples/algorithms' }
               ]
             }
@@ -342,7 +360,7 @@ export default defineConfig({
           {
             text: '资源',
             items: [
-              { text: 'GitHub', link: 'https://github.com/redai-infra/Relax' },
+              { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
               { text: '论文', link: 'https://arxiv.org/abs/2604.11554' }
             ]
           }
@@ -356,7 +374,9 @@ export default defineConfig({
                 { text: '安装', link: '/zh/guide/installation' },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
+                { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
                 { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
@@ -378,20 +398,23 @@ export default defineConfig({
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
+                { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
-                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' }
+                { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
+                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' }
               ]
             },
             {
               text: '最佳实践',
               items: [
                 { text: '性能调优', link: '/zh/guide/performance-tuning' },
-                { text: 'S3 模型加载', link: '/zh/guide/s3-model-loading' },
+                { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
+                { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]
@@ -431,6 +454,7 @@ export default defineConfig({
                 { text: '在线策略蒸馏', link: '/zh/examples/on-policy-distillation' },
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
                 { text: '低精度训练', link: '/zh/examples/low-precision-training' },
+                { text: '弹性 Rollout', link: '/zh/examples/elastic-rollout' },
                 { text: '算法参考', link: '/zh/examples/algorithms' }
               ]
             }
@@ -468,7 +492,7 @@ export default defineConfig({
   themeConfig: {
     logo: '/rednote-logo.png',
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/redai-infra/Relax' }
+      { icon: 'github', link: 'https://github.com/redai-studio/Relax' }
     ],
     search: {
       provider: 'local'

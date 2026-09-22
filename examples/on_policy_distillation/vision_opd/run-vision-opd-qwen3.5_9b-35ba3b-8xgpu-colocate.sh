@@ -12,7 +12,7 @@ set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
-# export RELAX_OPD_PER_POS_TOKEN_IDS=1 
+# export RELAX_OPD_PER_POS_TOKEN_IDS=1
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -90,9 +90,9 @@ OPD_ARGS=(
    --opd-kl-coef "${OPD_KL_COEF:-1.0}"
    --opd-loss-coef "${OPD_LOSS_COEF:-0.0}"
    --opd-kl-type "${OPD_KL_TYPE:-reverse_kl}"
-   
+
    --opd-token-selection "${OPD_TOKEN_SELECTION:-student_sampled}" # student_sampled
-   
+
    --opd-teacher-image-key bbox_images
    --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-6000}"
    --opd-disable-rl-reward

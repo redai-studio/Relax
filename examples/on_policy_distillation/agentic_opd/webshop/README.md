@@ -29,10 +29,6 @@ pip install "spacy==3.7.2" "werkzeug==2.0.3"
 pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 pip install "spacy==3.7.2" "pydantic==1.10.13"
 
-# Relax 侧胶水依赖：agent 连 SGLang(openai) + 连本机 env server(httpx)，prepare_data 出 parquet。
-# openai 锁 1.x 以兼容上面的 pydantic 1.10.13；env server 用标准库 http.server，无需 fastapi/uvicorn。
-pip install "openai>=1,<2" httpx pyarrow pandas
-
 # 2. 数据（HF 替代 gdown，1000 子集只需 3 个文件）
 mkdir -p "$WEBSHOP_HOME/data"
 # 若 huggingface.co 不通： export HF_ENDPOINT=https://hf-mirror.com
@@ -64,11 +60,11 @@ print('reward', reward, 'done', done)
 > 全量（可选）：额外 `--include "items_shuffle.json" "items_ins_v2.json"`，并把
 > `web_agent_site/utils.py` 的 `DEFAULT_FILE_PATH`/`DEFAULT_ATTR_PATH` 指向全量文件后重建索引。
 
-## 进训练（自动起 server）
+## 进训练（训练脚本管理 server）
 
-架构：每节点一个共享 `SimServer`（几 GB 商品库常驻内存），每个 rollout session 起一个瘦客户端
-agent 进程连本机 `http://127.0.0.1:$WEBSHOP_PORT`。训练脚本无需手动起 server——`run_agent_app.sh`
-内的 flock 会懒启动每节点恰好一个。
+架构：每次实验启动一个 cluster-shared `SimServer`（几 GB 商品库常驻内存），每个 rollout session 起一个
+瘦客户端 agent 进程。训练脚本在提交 Ray Job 前启动 server，等待 `/health` 返回 ready，把集群可达的
+`WEBSHOP_URL` 传给所有节点，并在训练命令退出时回收 server。`run_agent_app.sh` 始终作为瘦客户端运行。
 
 先把 WebShop goal 下标枚举成 parquet（在上面这个 conda 环境里跑，需要 `$WEBSHOP_HOME`；
 `prepare_data.py` 是 Relax 仓库里的模块，须先 `cd` 到 Relax 根目录再跑，否则找不到 `examples` 包）：
@@ -82,21 +78,25 @@ python examples/on_policy_distillation/agentic_opd/webshop/prepare_data.py \
 # 已知 goal 总数可加 --num-goals N 跳过加载商品库（快）。
 ```
 
-再跑训练（`WEBSHOP_HOME` / `WEBSHOP_PORT` / `CONDA_HOME` 经 `--agent-env` 广播到各节点）：
+再跑训练。`WEBSHOP_HOME`、`WEBSHOP_PORT` 和 `WEBSHOP_CONDA_ENV` 用于训练脚本启动本机 server；
+`WEBSHOP_CONDA_ENV` 指向 conda 环境目录。Agent 进程使用 Relax 主环境中的 `openai` 和 `httpx`，并通过
+`WEBSHOP_URL` 访问 server；下面的 import 检查用于确认训练环境具备客户端依赖：
 
 > 训练前先 `conda deactivate` 退出 `relax-opd-webshop`。训练脚本用的是驱动进程自身的 Python
-> 环境（Relax 主环境），`relax-opd-webshop` 只给节点上的 `run_agent_app.sh` 子进程用，两者依赖
-> （如 pydantic 版本）会冲突，留在 webshop 环境里直接跑训练脚本可能拿错解释器/依赖。
+> 环境（Relax 主环境），`relax-opd-webshop` 供 WebShop server 使用。两者依赖（如 pydantic 版本）
+> 会冲突，留在 webshop 环境里直接跑训练脚本可能拿错解释器/依赖。
 
 ```bash
 conda deactivate
 cd Relax
+python -c "import openai, httpx"
 
-WEBSHOP_HOME="$WEBSHOP_HOME" EXP_DIR=/path/to/exp \
+WEBSHOP_HOME="$WEBSHOP_HOME" WEBSHOP_CONDA_ENV=/root/miniconda3/envs/relax-opd-webshop EXP_DIR=/path/to/exp \
 bash examples/on_policy_distillation/agentic_opd/webshop/run-webshop-grpo-qwen35-35B-A3B-8xgpu.sh
 # OPSD（loss 模式自蒸馏）版：run-webshop-opsd-qwen3-1_7B-8xgpu.sh
 ```
 
 - 端口：`WEBSHOP_PORT`（默认 36001）；交互轮数：`WEBSHOP_MAX_TURNS`（默认 15，对齐 SDAR）。
 - server 侧 num_products / 语料路径 / step 并发上限在 [`app/config.yaml`](app/config.yaml) 调。
-- 多机：源码/索引放共享盘（省得每台下），每节点各自 flock 起一个 server（内存不跨机）。
+- server 日志写入 `log/<experiment>-webshop-server.log`。
+- `WEBSHOP_HOST` 默认 `0.0.0.0`；`WEBSHOP_ADVERTISE_HOST` 默认取训练脚本所在 Ray 节点的 IP，也可以显式指定。

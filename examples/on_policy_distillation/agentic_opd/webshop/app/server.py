@@ -1,20 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Per-node WebShop environment server (shared SimServer + cheap per-session
-browsers).
+"""Cluster-shared WebShop environment server.
 
-Why a server at all (DESIGN.md §1-§3)
-------------------------------------
+Why a server at all
+-------------------
 WebShop's ``SimServer`` is a several-GB in-memory asset (product catalog + Lucene
 index) that must be loaded to run *any* session. ALFWorld's env is tiny, so the
 ALFWorld recipe spins up one env per session process; doing that for WebShop would
 cost ``N × several GB``. WebShop's ``WebAgentTextEnv(server=...)`` instead lets a
-single ``SimServer`` be shared by many cheap ``SimBrowser`` sessions. So we run
-**one server process per node** holding one ``SimServer``, and each per-session
-agent process talks to it over localhost HTTP.
+single ``SimServer`` be shared by many cheap ``SimBrowser`` sessions. One server
+process serves all nodes in the training run, and every per-session agent
+process talks to it over HTTP.
 
-Session isolation (DESIGN.md §3.1) — the important bit
-------------------------------------------------------
+Session isolation
+-----------------
 ``SimServer.user_sessions`` is keyed by a session id and stores the cart / current
 page for that session. WebShop's own ``env.reset(session=X)`` overloads ``X`` as
 BOTH the cart key AND (when it's an int) the goal selector. Under GRPO the same
@@ -242,19 +241,14 @@ def main() -> None:
     global STATE
     cfg = _load_config()
     server_cfg = cfg.get("server", {})
-    host = server_cfg.get("host", "127.0.0.1")
+    host = os.environ.get("WEBSHOP_HOST", server_cfg.get("host", "127.0.0.1"))
     port = int(os.environ.get("WEBSHOP_PORT", server_cfg.get("port", 36001)))
     step_concurrency = int(server_cfg.get("step_concurrency", 64))
 
-    # Bind the port BEFORE loading the multi-GB catalog. Loading first (which
-    # takes minutes) means (a) a port collision only surfaces at bind() long
-    # after the wasted load, and (b) a still-loading server is invisible to
-    # `lsof -ti tcp:PORT` (not yet bound), so run_agent_app.sh's port-reclaim
-    # cannot see it — two servers then load concurrently on a node and the loser
-    # crashes with EADDRINUSE. Binding first makes a collision fail fast and
-    # keeps the port visible to lsof for reclaim. Serving runs in a background
-    # thread so /health answers 503 (ready:false) during load, then flips to
-    # ready:true once STATE is set (do_GET already guards on STATE is None).
+    # Bind the port before loading the multi-GB catalog so duplicate launches
+    # fail fast instead of wasting minutes loading a second copy. Serving runs
+    # in a background thread so /health answers 503 (ready:false) during load,
+    # then flips to ready:true once STATE is set.
     httpd = _Server((host, port), _Handler)
     httpd.daemon_threads = True
     server_thread = threading.Thread(target=httpd.serve_forever, name="webshop-http", daemon=True)

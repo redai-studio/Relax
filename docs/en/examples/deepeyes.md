@@ -13,7 +13,7 @@ The DeepEyes example demonstrates **agentic multi-turn vision-language RL** usin
 
 ## Data Preparation
 
-DeepEyes uses the [Visual-Agent/DeepEyes](https://huggingface.co/datasets/Visual-Agent/DeepEyes) dataset from HuggingFace. The dataset contains visual QA samples with images stored inline (HF Image format).
+DeepEyes uses the [ChenShawn/DeepEyes-Datasets-47k](https://huggingface.co/datasets/ChenShawn/DeepEyes-Datasets-47k) dataset from HuggingFace. The dataset contains visual QA samples with images stored inline (HF Image format).
 
 ### Download the Dataset
 

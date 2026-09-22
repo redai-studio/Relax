@@ -72,10 +72,10 @@ correct_reward=1.0 incorrect_reward=0.0
 Gym 私有 Ray 使用 `:6381`，Relax Ray 通常使用 `:6379`。训练的 `RAY_ADDRESS` 永远指向 Relax
 Ray；`start_gsm8k_gym.sh` 会主动清除继承的 `RAY_ADDRESS` 并启动自己的 Ray。
 
-## 9. callback allowlist 必须是精确 host
+## 9. callback networks 必须覆盖实际 IP
 
-`NEMO_GYM_CALLBACK_ALLOWED_HOSTS` 接收逗号分隔的裸 host/IP，不接受 wildcard。值必须包含
-Relax callback URL 中真实出现的 host。代理环境还应把 Gym/Relax 内网 IP 加入 `NO_PROXY`。
+`NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 接收逗号分隔的严格 CIDR，不接受 wildcard 或 `/0`。网段必须覆盖
+Relax callback URL 中真实出现的 IP。代理环境还应把 Gym/Relax 内网 IP 加入 `NO_PROXY`。
 
 ## 10. 不要只看 Ray Job 状态
 

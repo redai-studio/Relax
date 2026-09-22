@@ -3,11 +3,14 @@
 """Tests for weight synchronization: seed engine selection, single engine sync,
 parallel sync with fallback, and validate_seed_engine."""
 
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import ScaleOutStatus  # noqa
+    from relax.distributed.ray.rollout import ScaleOutStatus, _WeightSyncTimeoutError  # noqa
 
     HAS_DEPS = True
 except ImportError:
@@ -231,6 +234,62 @@ class TestSyncSingleEngineWeights:
         )
         assert ok is False
 
+    @pytest.mark.asyncio
+    async def test_init_timeout_does_not_retry(self, patch_async_helpers):
+        seed = make_mock_engine()
+        new = make_mock_engine()
+
+        def hang(**kwargs):
+            return asyncio.get_running_loop().create_future()
+
+        seed.init_weights_send_group_for_remote_instance.remote.side_effect = hang
+        new.init_weights_send_group_for_remote_instance.remote.side_effect = hang
+        manager = create_test_manager()
+
+        with pytest.raises(TimeoutError):
+            await manager._sync_single_engine_weights(
+                seed_engine=seed,
+                new_engine=new,
+                engine_index=0,
+                total_engines=1,
+                master_address="10.0.0.1",
+                tp_size=1,
+                timeout=0.01,
+            )
+
+        seed.init_weights_send_group_for_remote_instance.remote.assert_called_once()
+        new.init_weights_send_group_for_remote_instance.remote.assert_called_once()
+        seed.send_weights_to_remote_instance.remote.assert_not_called()
+        new.send_weights_to_remote_instance.remote.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_timeout_does_not_retry(self, patch_async_helpers):
+        seed = make_mock_engine()
+        new = make_mock_engine()
+
+        def hang(**kwargs):
+            return asyncio.get_running_loop().create_future()
+
+        seed.send_weights_to_remote_instance.remote.side_effect = hang
+        new.send_weights_to_remote_instance.remote.side_effect = hang
+        manager = create_test_manager()
+
+        with pytest.raises(TimeoutError):
+            await manager._sync_single_engine_weights(
+                seed_engine=seed,
+                new_engine=new,
+                engine_index=0,
+                total_engines=1,
+                master_address="10.0.0.1",
+                tp_size=1,
+                timeout=0.01,
+            )
+
+        seed.init_weights_send_group_for_remote_instance.remote.assert_called_once()
+        new.init_weights_send_group_for_remote_instance.remote.assert_called_once()
+        seed.send_weights_to_remote_instance.remote.assert_called_once()
+        new.send_weights_to_remote_instance.remote.assert_called_once()
+
 
 # ================ _sync_weights_from_seed_engine ===========================
 
@@ -249,6 +308,27 @@ class TestSyncWeightsFromSeedEngine:
         new_engine = make_mock_engine()
         ok = await manager._sync_weights_from_seed_engine([new_engine], timeout=10)
         assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_fall_back_to_another_seed(self, patch_async_helpers):
+        seed1 = make_mock_engine(url="http://seed1:1", weight_version="v1")
+        seed2 = make_mock_engine(url="http://seed2:1", weight_version="v1")
+        new = make_mock_engine()
+        group = make_engine_group(engines=[seed1, seed2])
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+
+        with patch.object(
+            manager,
+            "_sync_single_engine_weights",
+            new_callable=AsyncMock,
+            side_effect=_WeightSyncTimeoutError("remote operation timed out"),
+        ) as sync:
+            ok = await manager._sync_weights_from_seed_engine([new], timeout=60)
+
+        assert ok is False
+        sync.assert_awaited_once()
+        manager._weight_sync_lock.release.remote.assert_called_once()
+        new.continue_generation.remote.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_successful_parallel_sync(self, patch_async_helpers):
@@ -361,22 +441,43 @@ class TestSyncWeightsFromSeedEngine:
         new_engine.continue_generation.remote.assert_called()
 
     @pytest.mark.asyncio
-    async def test_resume_called_even_on_failure(self, patch_async_helpers):
-        """Resume is called in the finally block, even when sync fails."""
-        manager = create_test_manager(servers={})  # No seed -> fail
-
+    async def test_failed_engine_remains_paused_for_rollback(self, patch_async_helpers):
+        """A failed engine must not resume before the caller rolls it back."""
+        seed = make_mock_engine(url="http://seed:1", weight_version="v1")
+        seed.init_weights_send_group_for_remote_instance.remote.return_value = AwaitableValue(
+            {"success": False, "message": "NCCL error"}
+        )
+        group = make_engine_group(engines=[seed])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
         new_engine = make_mock_engine()
         ok = await manager._sync_weights_from_seed_engine(
             [new_engine],
             timeout=60,
             model_name="default",
         )
+
         assert ok is False
-        # Even on failure, resume should NOT be called because we fail
-        # before acquiring the lock. Let me check the flow...
-        # Actually, with no seed candidates, we return False before
-        # acquiring the lock, so pause/resume are never called.
-        # This is correct behavior.
+        new_engine.pause_generation.remote.assert_called_once()
+        new_engine.continue_generation.remote.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pause_failure_prevents_weight_sync(self, patch_async_helpers):
+        seed = make_mock_engine(url="http://seed:1", weight_version="v1")
+        group = make_engine_group(engines=[seed])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        new_engine = make_mock_engine()
+        new_engine.pause_generation.remote.return_value = AwaitableValue(RuntimeError("pause failed"))
+
+        ok = await manager._sync_weights_from_seed_engine(
+            [new_engine],
+            timeout=60,
+            model_name="default",
+        )
+
+        assert ok is False
+        seed.init_weights_send_group_for_remote_instance.remote.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_lock_acquired_and_released(self, patch_async_helpers):
@@ -392,6 +493,58 @@ class TestSyncWeightsFromSeedEngine:
             model_name="default",
         )
         manager._weight_sync_lock.acquire.remote.assert_called()
+        manager._weight_sync_lock.release.remote.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_scale_out_claims_lifecycle_owner_before_weight_sync_lock(self, patch_async_helpers):
+        seed = make_mock_engine(url="http://seed:1", weight_version="v1")
+        group = make_engine_group(engines=[seed])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+
+        def acquire_lock():
+            assert manager._scale_out_weight_updating is True
+            return AwaitableValue(True)
+
+        manager._weight_sync_lock.acquire.remote.side_effect = acquire_lock
+
+        ok = await manager._sync_weights_from_seed_engine(
+            [make_mock_engine()],
+            timeout=60,
+            model_name="default",
+        )
+
+        assert ok is True
+        assert manager._scale_out_weight_updating is False
+        manager._weight_sync_lock.release.remote.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sync_failure_releases_weight_sync_lock(self, patch_async_helpers):
+        """A sync that fails on every attempt still ALWAYS releases the shared
+        weight-sync lock (P0 invariant).
+
+        The lock is the SAME distributed lock every training weight update
+        acquires; retaining it on failure would hang training forever. The
+        finally block must release it unconditionally regardless of why sync
+        failed.
+        """
+        seed = make_mock_engine(url="http://seed:1", weight_version="v1")
+        seed.init_weights_send_group_for_remote_instance.remote.return_value = AwaitableValue(
+            {"success": False, "message": "NCCL error"}
+        )
+        group = make_engine_group(engines=[seed])
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+
+        ok = await manager._sync_weights_from_seed_engine(
+            [make_mock_engine()],
+            timeout=60,
+            model_name="default",
+        )
+
+        assert ok is False
+        manager._weight_sync_lock.acquire.remote.assert_called()
+        # P0 invariant: the shared training lock is released even when sync fails.
         manager._weight_sync_lock.release.remote.assert_called()
 
 

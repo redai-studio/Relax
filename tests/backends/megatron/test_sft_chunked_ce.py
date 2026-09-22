@@ -26,10 +26,11 @@ from argparse import Namespace
 import pytest
 import torch
 
+from relax.engine.sft.runtime import should_use_sft_chunked
+
 
 try:
     from relax.backends.megatron import loss as _loss_mod
-    from relax.backends.megatron import model as _model_mod
     from relax.backends.megatron.loss import sft_loss_function_chunked
     from relax.backends.megatron.model import (
         _bypass_output_layer,
@@ -470,6 +471,30 @@ def test_bypass_sp_gather_passes_output_grad_false(monkeypatch):
     )
 
 
+def test_bypass_can_skip_sp_gather_for_mtp_only_anchor(monkeypatch):
+    head = _FakeLmHead(in_features=4, out_features=8)
+    head.sequence_parallel = True
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = head
+
+    def fail_gather(*_args, **_kwargs):
+        raise AssertionError("MTP-only passthrough must not gather sequence-parallel hidden states")
+
+    monkeypatch.setattr(
+        "megatron.core.tensor_parallel.mappings.gather_from_sequence_parallel_region",
+        fail_gather,
+    )
+
+    x = torch.randn(3, 4)
+    with _bypass_output_layer(M(), gather_passthrough=False):
+        hidden, _ = head(x)
+
+    assert torch.equal(hidden, x)
+
+
 def test_chunked_loss_delegates_to_get_log_probs_and_entropy(monkeypatch):
     """``sft_loss_function_chunked`` must call ``get_log_probs_and_entropy``
     passing ``lm_head_forward=``.
@@ -575,4 +600,4 @@ def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
         loss_type=loss_type,
         sft_chunked_logits=chunked_flag,
     )
-    assert _model_mod._should_use_sft_chunked(args) is expected
+    assert should_use_sft_chunked(args) is expected

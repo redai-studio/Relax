@@ -100,19 +100,26 @@ async def _score_all(samples):
 
 
 def _grpo_normalize(args, raw_rewards):
-    """Replicates the default GRPO group normalization in
-    relax.utils.utils.post_process_rewards."""
-    if (
-        args.advantage_estimator
-        not in [
-            "grpo",
-            "gspo",
-            "sapo",
-            "cispo",
-            "reinforce_plus_plus_baseline",
-        ]
-        or not args.rewards_normalization
-    ):
+    """Replicates the default group normalization in
+    relax.utils.utils.post_process_rewards.
+
+    Which algorithms normalize, and which of those also divide by the group
+    standard deviation, comes from the algorithm registry rather than from a
+    copy of the whitelist — a copy would silently go stale the next time an
+    algorithm is added.
+
+    The gate names the two normalizers this function actually reimplements
+    rather than asking ``spec.is_group_normalized``: that property would also be
+    true of a future normalizer computing something else entirely, and this
+    reimplementation would then silently diverge from it. Naming normalizers
+    keeps it registry-driven -- a new algorithm reusing either one is covered
+    for free, and a genuinely new normalizer is exactly the case where a human
+    needs to look at this function.
+    """
+    from relax.algorithms import get_algorithm
+
+    spec = get_algorithm(args.advantage_estimator)
+    if spec.reward_normalizer not in ("group_mean", "group_mean_std") or not args.rewards_normalization:
         return raw_rewards
     rewards = torch.tensor(raw_rewards, dtype=torch.float)
     if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
@@ -121,7 +128,7 @@ def _grpo_normalize(args, raw_rewards):
         rewards = rewards.view(-1, rewards.shape[-1])
     mean = rewards.mean(dim=-1, keepdim=True)
     rewards = rewards - mean
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"] and args.grpo_std_normalization:
+    if spec.reward_normalizer == "group_mean_std" and args.grpo_std_normalization:
         std = rewards.std(dim=-1, keepdim=True)
         rewards = rewards / (std + 1e-6)
     return rewards.flatten().tolist()
@@ -135,7 +142,7 @@ def custom_reward_post_process(args, samples):
       2. Onload GenRM (Ray handle — different actor).
       3. Batch-score every sample via GenRM HTTP.
       4. Offload GenRM.
-      5. Return (raw, normalized) — leave rollout offloaded (update_weights
+      5. Return normalized rewards — leave rollout offloaded (update_weights
          re-onloads it next iteration; skipping the redundant onload here
          saves one full weights+KV round trip).
     """
@@ -155,23 +162,8 @@ def custom_reward_post_process(args, samples):
     finally:
         ray.get(genrm.offload.remote())
 
-    # Stamp real scores back onto sample.reward and sample.metadata["raw_reward"]
-    # so downstream consumers see the real GenRM values instead of the dummy
-    # 0.0 placeholder written during inline reward:
-    #   - sample.reward (dict when --reward-key set, else scalar):
-    #       used by dump jsonl (train_dump_utils.py:206), log_rollout_data,
-    #       any TB metric keyed by sample.reward
-    #   - sample.metadata["raw_reward"] (scalar):
-    #       triggers the override at utils.py:133-137 so train_data["raw_reward"]
-    #       is a list of scalars matching what downstream `raw_reward == 1`
-    #       correctness accounting expects (backends/megatron/data.py:823).
-    # train_data["rewards"] (normalized) still comes from our return value.
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):
         sample.reward = {reward_key: score} if reward_key else score
-        if sample.metadata is None:
-            sample.metadata = {}
-        sample.metadata["raw_reward"] = score
 
-    normalized = _grpo_normalize(args, raw_rewards)
-    return raw_rewards, normalized
+    return _grpo_normalize(args, raw_rewards)

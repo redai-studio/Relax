@@ -3,17 +3,6 @@ code_timeout_s: 200
 ensure_sandbox_timeout_s: 240
 sandbox_backend: apptainer_jupyter  # only backend in Phase 1
 
-# Per chat-completion request read timeout (seconds). Generous margin over the
-# expected 20-45s per-turn; NOT the livelock guard. In colocate mode the rollout
-# engine sleeps for the whole actor training window, so requests in flight then
-# hit this timeout — the agent retries (see max_llm_call_timeout_retries) rather
-# than crashing, and Relax's sleep-aware session timeout is the real deadline.
-llm_call_timeout_s: 600
-# Max consecutive timeout/connection retries while polling for the offloaded
-# engine to wake. Backstop against a genuinely dead engine; each retry blocks up
-# to llm_call_timeout_s, so 60 covers hours of training windows.
-max_llm_call_timeout_retries: 60
-
 # Single-token stops bypass the detokenizer entirely — SGLang matches them
 # on the GPU side against generated token ids, no subprocess round-trip.
 # Token ids below are for the Qwen3-VL / Qwen3.5 / Qwen3.6 tokenizer family

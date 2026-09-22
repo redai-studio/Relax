@@ -55,14 +55,58 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 #      Each route value is a LIST of that teacher's replica URLs.
 #   2. Replica round-robin: spread requests across a teacher's replicas with a
 #      per-teacher in-process counter (single-threaded asyncio makes ``+= 1`` safe).
+#      The counter advances once per GRPO *group*, not once per sample, so that a
+#      group's shared prompt prefix is prefilled by one replica -- see
+#      ``_pick_replica``.
 # Single-teacher path falls back to ``args.opd_teacher_urls`` / ``opd_teacher_url``.
 _TEACHER_URL_RR: dict[str, int] = {}
+# (teacher key, group_index) -> replica ordinal. Bounded by clearing wholesale:
+# this is a pure cache-locality heuristic, so a dropped entry only costs prefix
+# reuse for a group still in flight, never correctness.
+_TEACHER_GROUP_REPLICA: dict[tuple[str, int], int] = {}
+_MAX_TEACHER_GROUP_REPLICA = 1 << 16
 
 
 def _round_robin(urls: list[str], key: str) -> str:
     i = _TEACHER_URL_RR.get(key, 0)
     _TEACHER_URL_RR[key] = i + 1
     return urls[i % len(urls)]
+
+
+def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
+    """Load-balance across ONE teacher's replicas at GRPO-group granularity.
+
+    ``rr_key`` already identifies the teacher — the caller resolved
+    ``data_source`` to a replica list first — so this only decides which copy of
+    that same model serves the request. Text/VL teacher routing is unaffected.
+
+    The ``n_samples_per_prompt`` samples of a prompt share ``group_index``
+    (assigned in ``engine/rollout/data_source.py``) and therefore share the whole
+    prompt prefix, which for multi-image data is tens of thousands of tokens.
+    Advancing the per-teacher cursor once per group instead of once per sample
+    keeps a group on one replica, so that replica's radix cache serves the prefix
+    once rather than every replica re-prefilling it.
+
+    Deliberately NOT ``group_index % len(replicas)``: ``group_index`` is a global
+    counter that does not restart per ``data_source``, so with an interleaved
+    multi-source dataset one teacher sees only every k-th index and the modulo
+    collapses onto a subset of its replicas (e.g. an alternating text/VL dataset
+    gives one teacher only even indices, which all map to replica 0).
+    """
+    if len(replicas) == 1:
+        return replicas[0]
+    group_index = getattr(sample, "group_index", None) if sample is not None else None
+    if group_index is None:
+        return _round_robin(replicas, rr_key)
+    key = (rr_key, int(group_index))
+    idx = _TEACHER_GROUP_REPLICA.get(key)
+    if idx is None:
+        if len(_TEACHER_GROUP_REPLICA) > _MAX_TEACHER_GROUP_REPLICA:
+            _TEACHER_GROUP_REPLICA.clear()
+        idx = _TEACHER_URL_RR.get(rr_key, 0)
+        _TEACHER_URL_RR[rr_key] = idx + 1
+        _TEACHER_GROUP_REPLICA[key] = idx
+    return replicas[idx % len(replicas)]
 
 
 def _pick_teacher_url(args, sample=None) -> str:
@@ -84,11 +128,11 @@ def _pick_teacher_url(args, sample=None) -> str:
                 f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
                 f"Available routes: {list(routes_map.keys())}."
             )
-        return _round_robin(replicas, routing_value)
+        return _pick_replica(replicas, sample, routing_value)
     # Single-teacher path: round-robin over replicas if configured.
     urls = getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
-        return _round_robin(urls, "__single__")
+        return _pick_replica(urls, sample, "__single__")
     return args.opd_teacher_url
 
 

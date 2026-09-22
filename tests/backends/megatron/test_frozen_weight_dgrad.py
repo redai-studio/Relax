@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Alarm for the frozen-weight DGRAD fold in the Megatron image patch.
+"""Alarm for the frozen-weight DGRAD fold in Megatron.
 
-``docker/patch/megatron/20260506-85bced0ae.patch`` backports the
-``LinearWithFrozenWeight.backward`` hunk from NVIDIA/Megatron-LM#5092; a
-Megatron bump could drop it silently, so the first test guards the patch text
-and runs in CI while the rest check the behaviour and need Megatron.
+NVIDIA/Megatron-LM#5092 made ``LinearWithFrozenWeight.backward`` reshape so
+that size-1 leading dims fold into a single ``mm``. mcore has carried it
+upstream since 0e6ac576f, so these tests check the behaviour directly and need
+Megatron on the path.
 """
 
 import inspect
@@ -23,8 +23,7 @@ except ImportError:  # CI installs no training dependencies
 
 needs_megatron = pytest.mark.skipif(LinearWithFrozenWeight is None, reason="requires Megatron")
 
-PATCH = Path(__file__).resolve().parents[3] / "docker" / "patch" / "latest" / "megatron.patch"
-HINT = f"the LinearWithFrozenWeight.backward hunk from NVIDIA/Megatron-LM#5092 is missing from {PATCH}"
+HINT = "the LinearWithFrozenWeight.backward fold from NVIDIA/Megatron-LM#5092 is missing from Megatron"
 FOLD = "grad_output.reshape(-1, grad_output.size(-1))"
 
 
@@ -44,17 +43,8 @@ def _megatron_lacks_dgrad_fold() -> bool:
 
 needs_fold = pytest.mark.skipif(
     _megatron_lacks_dgrad_fold(),
-    reason=f"the Megatron on the path predates the DGRAD fold; rebuild the image with {PATCH}",
+    reason="the Megatron on the path predates the DGRAD fold; rebuild the image with a newer mcore",
 )
-
-
-def test_megatron_patch_carries_dgrad_fold():
-    """Runs without Megatron installed, so CI covers it."""
-    assert PATCH.is_file(), HINT
-    patch = PATCH.read_text()
-    assert "megatron/core/tensor_parallel/layers.py" in patch, HINT
-    assert FOLD in patch, HINT
-    assert "grad_input.reshape(*grad_output.shape[:-1], weight.size(1))" in patch, HINT
 
 
 class _MatmulSpy(TorchDispatchMode):

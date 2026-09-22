@@ -13,6 +13,8 @@ MoE cold start can take minutes) and MUST NOT carry the configured probe
 timeout, otherwise a legitimate recovery would be interrupted.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 import requests
 
@@ -29,10 +31,13 @@ MegatronTrainRayActor = actor_mod.MegatronTrainRayActor
 
 
 class _Resp:
-    def __init__(self, payload=False):
+    def __init__(self, payload=False, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"status={self.status_code}")
         return None
 
     def json(self):
@@ -182,3 +187,51 @@ def test_check_services_health_swallows_timeout(monkeypatch):
     rollout_only, actor_fwd_only = shell._check_services_health()
     assert actor_fwd_only is True
     assert rollout_only is True
+
+
+def test_check_services_health_retries_scale_in_fence(monkeypatch):
+    from argparse import Namespace
+
+    calls = []
+    attempts = iter([_Resp(status_code=503), _Resp(payload=True)])
+
+    def _get(url, *args, **kwargs):
+        calls.append(url)
+        if url.endswith("/can_do_update_weight_for_async"):
+            return next(attempts)
+        return _Resp()
+
+    _patch_health_common(monkeypatch, _get)
+    shell = _shell()
+    shell.args = Namespace(true_on_policy_mode=True, hybrid=False, rollout_http_timeout=120.0)
+
+    assert shell._check_services_health() == (True, False)
+    assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 2
+
+
+def test_check_services_health_resets_fence_deadline_after_non_503(monkeypatch):
+    from argparse import Namespace
+
+    calls = []
+    attempts = iter(
+        [
+            _Resp(status_code=503),
+            _Resp(payload=False),
+            _Resp(payload=False),
+            _Resp(payload=True),
+        ]
+    )
+
+    def _get(url, *args, **kwargs):
+        calls.append(url)
+        if url.endswith("/can_do_update_weight_for_async"):
+            return next(attempts)
+        return _Resp()
+
+    _patch_health_common(monkeypatch, _get)
+    monkeypatch.setattr(actor_mod.time, "monotonic", MagicMock(side_effect=[0.0, 0.0, 1.0, 3.0]))
+    shell = _shell()
+    shell.args = Namespace(true_on_policy_mode=True, hybrid=False, rollout_http_timeout=2.0)
+
+    assert shell._check_services_health() == (True, False)
+    assert sum(url.endswith("/can_do_update_weight_for_async") for url in calls) == 4

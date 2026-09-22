@@ -17,7 +17,7 @@ export MODEL_DIR="${MODEL_DIR:-/workspace}"
 export DATA_DIR="${DATA_DIR:-/workspace}"
 export PROJECT_NAME=Relax-Qwen3.5-35B-A3B-VL-P800
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
- 
+
 export MEGATRON=${WORKDIR}/Megatron-LM
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7

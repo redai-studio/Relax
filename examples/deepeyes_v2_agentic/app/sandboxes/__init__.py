@@ -17,8 +17,6 @@ Public API:
 
 from typing import Any, Optional
 
-from relax.utils.misc import load_function
-
 from .backends import _REGISTRY, register_backend
 from .base import (
     RELAX_SANDBOX_DEFAULT_CODE_TIMEOUT_S,
@@ -75,6 +73,8 @@ def get_sandbox_backend(
     over ``--rm-type`` in :class:`relax.engine.rewards.RewardExecutor`.
     """
     if custom_path:
+        from relax.utils.misc import load_function
+
         cls: Any = load_function(custom_path)
     else:
         if name is None:

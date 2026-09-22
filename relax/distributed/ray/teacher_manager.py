@@ -2,11 +2,10 @@
 
 
 import ray
-from ray.util.placement_group import remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
+from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
@@ -23,7 +22,7 @@ def _resolve_teacher_gpu_index(
 ) -> int:
     if not shared_pg:
         # Dedicated (per-teacher own PG) path: each replica creates its OWN
-        # placement group of size gpus_per_replica (see _prepare_one), so the
+        # placement group of size gpus_per_replica (see _resolve_placement), so the
         # index is always 0 within that per-replica PG — a replica*gpus_per_replica
         # offset would overflow it (only valid when all replicas share one big PG).
         return 0
@@ -57,7 +56,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
 
 
 @ray.remote
-class TeacherManager:
+class TeacherManager(MultiEngineManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
     def __init__(
@@ -81,64 +80,60 @@ class TeacherManager:
                 f"bundle_offset={bundle_offset} + gpus_per_replica={gpus_per_replica} * num_replicas={num_replicas})."
             )
 
-        self.args = args
-        self.num_replicas = num_replicas
         self.gpus_per_replica = gpus_per_replica
-        self._pg = pg
         self._shared_pg = shared_pg
+        self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
-        self._engines: list[tuple] = []
-        self._urls = self._start()
 
-    def get_urls(self) -> list[str]:
-        return list(self._urls)
-
-    def _start(self) -> list[str]:
-        """Create the teacher PG(s) + engine actor(s), wait until healthy, and
-        return the list of teacher ``/generate`` URLs.
-
-        Multi-replica engines load in parallel: every replica's
-        ``engine.init.remote(...)`` is fired first (non-blocking), then all
-        handles are awaited in a single ``ray.get`` so a large teacher (e.g.
-        122B) doesn't pay N x cold-load latency.
-        """
-        overrides = build_teacher_overrides(self.args, colocate_sync=self._shared_pg)
-        teacher_args = build_teacher_engine_args(self.args, overrides)
+        overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
+        self._overrides = overrides
+        self._teacher_args = build_teacher_engine_args(args, overrides)
         logger.info(
-            f"[OPD teacher] launching {self.num_replicas} replica(s), "
-            f"TP={self.gpus_per_replica}, model={overrides['model_path']}, "
-            f"shared_pg={self._shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
+            f"[OPD teacher] launching {num_replicas} replica(s), "
+            f"TP={gpus_per_replica}, model={overrides['model_path']}, "
+            f"shared_pg={shared_pg}, mem_fraction_static={overrides.get('mem_fraction_static')}"
         )
 
-        # Phase 1: create actors + fire init.remote() for every replica without
-        # blocking. Each prep call returns the engine handle and the init future.
-        preps = [self._prepare_one(replica, teacher_args, overrides) for replica in range(self.num_replicas)]
+        super().__init__(
+            args,
+            num_slots=num_replicas,
+            nodes_per_engine=1,
+            engine_actor_cls=SGLangEngine,
+            log_prefix="[OPD teacher]",
+        )
 
-        # Phase 2: await every init in parallel (single ray.get on the full list).
-        init_handles = [p["init_handle"] for p in preps]
-        if init_handles:
-            ray.get(init_handles)
-
-        # Phase 3: finalize — pull URLs, register engines, log readiness.
-        urls: list[str] = []
-        for p in preps:
-            base_url = ray.get(p["engine"].get_url.remote())
-            url = f"{base_url}/generate"
-            self._engines.append((p["pg"], p["engine"], p["owns_pg"]))
-            logger.info(f"[OPD teacher] replica {p['replica']} ready at {url}")
-            urls.append(url)
+    def get_urls(self) -> list[str]:
+        urls = []
+        for engine in self.engines:
+            if engine is None:
+                continue
+            base_url = ray.get(engine.get_url.remote())
+            urls.append(f"{base_url}/generate")
         return urls
 
-    def _prepare_one(self, replica: int, teacher_args: object, overrides: dict[str, object]) -> dict:
-        """Build the engine actor for a single replica and fire its
-        ``init.remote()``, returning the handle + future so the caller can
-        await all replicas in parallel."""
+    def recover(self) -> set:
+        """Recover in place only when the teacher's endpoint can stay
+        stable."""
+        dead = [rank for rank, engine in enumerate(self.all_engines) if engine is None]
+        if dead and not self._shared_pg:
+            # A dedicated replacement PG may land on another node. OPD callers
+            # hold URLs captured at startup, so rebuilding here could advertise
+            # success while every caller keeps targeting the old host. Escalate
+            # to Controller restart, which rebuilds and re-injects the routes.
+            raise RuntimeError(
+                f"Dedicated OPD teacher engines died at ranks={dead}; global restart is required to refresh URLs."
+            )
+        return super().recover()
+
+    # ------------------------------------------------------------------
+    # MultiEngineManager hooks.
+    # ------------------------------------------------------------------
+
+    def _resolve_placement(self, rank: int):
+        replica = rank
         if self._shared_pg:
-            assert self._pg is not None
-            pg, reordered_bundle_indices, reordered_gpu_ids = self._pg
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
-            owns_pg = False
             gpu_index = _resolve_teacher_gpu_index(
                 args=self.args,
                 replica=replica,
@@ -146,113 +141,65 @@ class TeacherManager:
                 shared_pg=True,
                 bundle_offset=self._bundle_offset,
             )
-        else:
-            pg, reordered_bundle_indices, reordered_gpu_ids = create_placement_group(
-                num_gpus=self.gpus_per_replica,
-                node_group_affinity=getattr(self.args, "enable_affinity", True),
-            )
-            owns_pg = True
-            gpu_index = _resolve_teacher_gpu_index(
-                args=self.args,
-                replica=replica,
-                gpus_per_replica=self.gpus_per_replica,
-                shared_pg=False,
-            )
+            return self._shared_pg_tuple, False, gpu_index
 
-        base_gpu_id = int(reordered_gpu_ids[gpu_index])
-        scheduling_strategy = PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+        # Dedicated: this replica creates and owns its own placement group.
+        pg_tuple = create_placement_group(
+            num_gpus=self.gpus_per_replica,
+            node_group_affinity=getattr(self.args, "enable_affinity", True),
         )
-        logger.info(
-            f"[OPD teacher] replica={replica} gpu_index={gpu_index} "
-            f"bundle_index={reordered_bundle_indices[gpu_index]} base_gpu_id={base_gpu_id}"
+        gpu_index = _resolve_teacher_gpu_index(
+            args=self.args,
+            replica=replica,
+            gpus_per_replica=self.gpus_per_replica,
+            shared_pg=False,
         )
+        return pg_tuple, True, gpu_index
 
-        engine = (
-            ray.remote(SGLangEngine)
-            .options(
-                num_cpus=0.2,
-                num_gpus=0.2,
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={"env_vars": _build_teacher_engine_env(self.args)},
-            )
-            .remote(
-                teacher_args,
-                rank=0,
-                worker_type="regular",
-                base_gpu_id=base_gpu_id,
-                sglang_overrides=overrides,
-                num_gpus_per_engine=self.gpus_per_replica,
-                register_sigterm_handler=False,
-            )
-        )
+    def _ray_resource_kwargs(self, rank: int) -> dict:
+        return {"num_cpus": 0.2, "num_gpus": 0.2}
 
-        base_port = find_available_port(15000)
-        addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
-            args=teacher_args,
-            rollout_engines=[(0, engine)],
-            worker_type="regular",
-            num_gpus_per_engine=self.gpus_per_replica,
-            rank_offset=0,
-            base_port=base_port,
-        )
+    def _build_engine_env_vars(self) -> dict[str, str]:
+        return _build_teacher_engine_env(self.args)
 
-        # Fire init.remote() WITHOUT awaiting — the caller batches the ray.get
-        # across replicas. The teacher is standalone: do NOT register to the
-        # rollout router and do NOT register to DCS (it receives no weight sync).
-        init_handle = engine.init.remote(
-            **addr_and_ports[0],
-            router_ip=None,
-            router_port=None,
-            skip_dcs_registration=True,
-            skip_router_registration=True,
-        )
+    def _engine_ctor_args(self, rank: int):
+        return self._teacher_args
+
+    def _build_engine_ctor_kwargs(self, rank: int) -> dict:
         return {
-            "replica": replica,
-            "pg": pg,
-            "engine": engine,
-            "owns_pg": owns_pg,
-            "init_handle": init_handle,
+            "sglang_overrides": self._overrides,
+            "num_gpus_per_engine": self.gpus_per_replica,
+            "register_sigterm_handler": False,
         }
 
-    def shutdown(self) -> None:
-        for pg, engine, owns_pg in self._engines:
-            try:
-                ray.get(engine.shutdown.remote(), timeout=30)
-            except Exception as e:
-                logger.warning(f"[OPD teacher] engine shutdown failed: {e}")
-            try:
-                ray.kill(engine)
-            except Exception as e:
-                logger.warning(f"[OPD teacher] engine kill failed: {e}")
-            if owns_pg:
-                try:
-                    remove_placement_group(pg)
-                except Exception as e:
-                    logger.warning(f"[OPD teacher] remove placement group failed: {e}")
-        self._engines = []
-        logger.info("[OPD teacher] shutdown complete.")
+    def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
+        # The teacher is standalone: do NOT register to the rollout router and
+        # do NOT register to DCS (it receives no weight sync).
+        return {
+            **addr_and_ports,
+            "router_ip": None,
+            "router_port": None,
+            "skip_dcs_registration": True,
+            "skip_router_registration": True,
+        }
 
-    def offload(self) -> None:
-        if not self._engines:
-            return
-        logger.info("[OPD teacher] offload requested")
-        handles = [
-            engine.release_memory_occupation.remote() for _pg, engine, _owns_pg in self._engines if engine is not None
-        ]
-        if handles:
-            ray.get(handles)
-
-    def onload(self, tags: list[str] | None = None) -> None:
-        if not self._engines:
-            return
-        logger.info(f"[OPD teacher] onload requested with tags={tags}")
-        handles = [
-            engine.resume_memory_occupation.remote(tags=tags)
-            for _pg, engine, _owns_pg in self._engines
-            if engine is not None
-        ]
-        if handles:
-            ray.get(handles)
+    def _allocate_engine_addr_and_ports(self, *, new_engines: list[tuple]) -> dict[int, dict]:
+        addr_and_ports: dict[int, dict] = {}
+        for rank, engine in new_engines:
+            # OPD consumers receive teacher URLs once during startup. Preserve
+            # the original endpoint across recovery instead of silently moving
+            # a rebuilt engine to a port those consumers never learn about.
+            if self._shared_pg and rank in self._engine_addr_and_ports:
+                addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
+                continue
+            base_port = find_available_port(15000)
+            per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+                args=self._teacher_args,
+                rollout_engines=[(0, engine)],
+                worker_type="regular",
+                num_gpus_per_engine=self.gpus_per_replica,
+                rank_offset=0,
+                base_port=base_port,
+            )
+            addr_and_ports[rank] = per_engine_addr_and_ports[0]
+        return addr_and_ports

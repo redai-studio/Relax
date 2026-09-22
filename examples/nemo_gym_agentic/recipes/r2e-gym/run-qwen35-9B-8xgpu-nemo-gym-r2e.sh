@@ -8,11 +8,16 @@
 set -ex
 set -o pipefail
 
-export EXP_DIR="${EXP_DIR:-${PWD}/outputs/nemo-gym-r2e-qwen35-9B}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/nemo-gym}"
 EXP_NAME="${EXP_NAME:-r2e-gym-qwen35-9b-8xgpu-tp2-32k}"
+: "${SAVE_DIR:=${PWD}/outputs/${EXP_NAME}}"
 
 : "${NEMO_GYM_SOURCE_DATA:?Set NEMO_GYM_SOURCE_DATA to the prepared R2E-Gym JSONL}"
+NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-${GYM_PORT:-${R2E_GYM_PORT_BASE:-28100}}}"
+if ! [[ "${NEMO_GYM_GATEWAY_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || ((NEMO_GYM_GATEWAY_PORT > 65535)); then
+   echo "NEMO_GYM_GATEWAY_PORT must be an integer between 1 and 65535" >&2
+   exit 2
+fi
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -39,15 +44,15 @@ RUNTIME_ENV_JSON="$(
 )"
 export RUNTIME_ENV_JSON
 
-PROMPT_SET="${NEMO_GYM_PROMPT_DATA:-${EXP_DIR}/data/r2e_gym_train.jsonl}"
-GATEWAY_URL="http://${GYM_HOST}:28100"
+PROMPT_SET="${NEMO_GYM_PROMPT_DATA:-${NEMO_GYM_SOURCE_DATA%.jsonl}_relax.jsonl}"
+GATEWAY_URL="http://${GYM_HOST}:${NEMO_GYM_GATEWAY_PORT}"
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}/Qwen3.5-9B/"
    --ref-load "${MODEL_DIR}/Qwen3.5-9B/"
    --megatron-to-hf-mode bridge
    --warm-hf-checkpoint-page-cache
-   --save "${EXP_DIR}/Qwen3.5-9B_mcore_8xgpu_tp2_32k/"
+   --save "${SAVE_DIR}/nemo-gym/r2e-gym/Qwen3.5-9B/"
    --save-interval 100
 )
 
@@ -70,8 +75,6 @@ ROLLOUT_ARGS=(
      "NEMO_GYM_LEASE_S=120"
    --agent-timeout 1260
    --agentic-tool-call-parser qwen3_coder
-   --agentic-prepare-pool-size 4
-
    --num-rollout 32
    --rollout-batch-size 8
    --n-samples-per-prompt 8

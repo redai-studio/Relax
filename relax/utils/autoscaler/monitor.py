@@ -43,6 +43,10 @@ JsonDict = dict[str, object]
 
 MAX_HISTORY_POINTS = 60
 
+# History "Reason" cell: category leads (never truncated away), detail follows;
+# bounded, not wrapped — the column is wide + horizontally scrollable.
+_HISTORY_REASON_MAXLEN = 300
+
 
 def _as_dict(v: object) -> JsonDict:
     return v if isinstance(v, dict) else {}
@@ -230,7 +234,8 @@ def _render_chart(
     y_max: float | None = None,
     integer_yaxis: bool = False,
 ) -> str:
-    """使用 Half-block 半方块绘制连续折线图，包含坐标轴与边框。"""
+    """Draw a continuous line chart with Half-block glyphs, axes and
+    borders."""
     if not values:
         return f"[bold]{title}[/bold]\n[dim]No data[/dim]"
 
@@ -245,7 +250,7 @@ def _render_chart(
         display_max += 1.0
         display_min -= 1.0
 
-    # 重采样以适应网格宽度
+    # Resample to fit the grid width
     if len(values) > width:
         step = len(values) / width
         display = []
@@ -263,13 +268,13 @@ def _render_chart(
     vmax = display_max
     vrange = vmax - vmin if vmax > vmin else 1.0
 
-    # 值映射到虚拟行 (0 到 2*height - 1)
+    # Map value to virtual row (0 to 2*height - 1)
     def to_vr(v: float) -> float:
         return (v - vmin) / vrange * (2 * height - 1)
 
     grid = [[" " for _ in range(width)] for _ in range(height)]
 
-    # 1. 绘制 y=0 水平基准线
+    # 1. Draw the y=0 baseline
     y0_r = -1
     if vmin <= 0 <= vmax:
         y0_r = int(round(to_vr(0))) // 2
@@ -277,14 +282,14 @@ def _render_chart(
             for c in range(width):
                 grid[y0_r][c] = "-"
 
-    # 2. 绘制数据曲线 (使用 Half-blocks)
+    # 2. Draw the data curve (using Half-blocks)
     for c in range(width):
         if display[c] is None:
             continue
         v_curr = display[c]
         vr_curr = to_vr(v_curr)
 
-        # 计算该列的左右连接点高度，形成平滑走势
+        # Compute left/right join heights for a smooth trend
         v_left = v_curr
         if c > 0 and display[c - 1] is not None:
             v_left = display[c - 1]
@@ -298,7 +303,7 @@ def _render_chart(
         min_vri = int(round(min(vr_curr, vr_left, vr_right)))
         max_vri = int(round(max(vr_curr, vr_left, vr_right)))
 
-        # 填充当前列跨越的虚行
+        # Fill the virtual rows this column spans
         for r in range(height):
             bottom_active = min_vri <= 2 * r <= max_vri
             top_active = min_vri <= 2 * r + 1 <= max_vri
@@ -310,7 +315,7 @@ def _render_chart(
             elif bottom_active:
                 grid[r][c] = "▄"
 
-    # 生成优雅的 y 轴刻度
+    # Generate clean y-axis ticks
     def nice_ticks(ymin, ymax):
         rng = ymax - ymin
         if rng == 0:
@@ -342,14 +347,14 @@ def _render_chart(
 
     lines = []
 
-    # 居中 Title
+    # Center the title
     pad = max(0, (width - len(title)) // 2)
     lines.append(" " * pad + f"[bold]{title}[/bold]")
 
-    # 顶部边框
+    # Top border
     lines.append("┌" + "-" * width + "┐")
 
-    # 图表主体与右侧 Y 轴刻度
+    # Chart body with right-side Y-axis ticks
     for r in range(height - 1, -1, -1):
         row_str = "".join(grid[r])
         colored_row = f"[{color}]{row_str}[/{color}]"
@@ -359,10 +364,10 @@ def _render_chart(
         else:
             lines.append(f"¦{colored_row}¦")
 
-    # 底部边框
+    # Bottom border
     lines.append("└" + "-" * width + "┘")
 
-    # 底部 X 轴刻度
+    # Bottom X-axis ticks
     num_vals = len(values)
     if num_vals > 1:
         xt = nice_ticks(0, num_vals - 1)
@@ -634,24 +639,174 @@ def _render_scale_in_panel(snapshot: AutoscalerSnapshot) -> str:
     return "\n".join(lines)
 
 
-def _history_rows(snapshot: AutoscalerSnapshot) -> list[tuple[str, str, str, str]]:
+# Terminal scale statuses that represent a *successful* outcome (✓). Non-success
+# terminal states (FAILED/CANCELLED) and rejections map to ✗; NOOP is a neutral
+# no-op (nothing to scale) shown as ○; anything else (PENDING/CREATING/... —
+# still in flight) maps to "-".
+_STATUS_SUCCESS = frozenset({"ACTIVE", "COMPLETED", "PARTIAL", "SUCCESS"})
+_STATUS_FAILURE = frozenset({"FAILED", "CANCELLED", "REJECTED", "CONFLICT", "ERROR"})
+_STATUS_NEUTRAL = frozenset({"NOOP"})
+
+
+def _status_symbol(status: object) -> tuple[str, str]:
+    """Map a raw scale status string to a (symbol, rich-color) pair.
+
+    - ``✓`` (green): terminal success (scale_out ACTIVE/PARTIAL, scale_in
+      COMPLETED, or generic SUCCESS).
+    - ``✗`` (red): failure / rejection (FAILED, CANCELLED, REJECTED, CONFLICT,
+      ERROR).
+    - ``○`` (yellow): neutral no-op (NOOP — decision resolved to no action, e.g.
+      already at target); not a failure, but the reason is still surfaced.
+    - ``-`` (dim): still in progress (PENDING, CREATING, CONNECTING,
+      HEALTH_CHECKING, WEIGHT_SYNCING, READY, DRAINING, REMOVING, ...).
+    """
+    s = _as_str(status, default="").strip().upper()
+    if s in _STATUS_SUCCESS:
+        return "✓", "green"
+    if s in _STATUS_FAILURE:
+        return "✗", "red"
+    if s in _STATUS_NEUTRAL:
+        return "○", "yellow"
+    return "-", "dim"
+
+
+# Source-classified failure_categories map straight to a bucket. The map is
+# built from the source-of-truth enum so a newly added failure category is
+# bucketed by its label instead of silently falling into "other"; a few get a
+# friendlier TUI label than the raw enum value. Anything not source-classified
+# (scale-in, autoscaler no-op/conflict) still falls through to string matching.
+_CATEGORY_BUCKET_OVERRIDES = {
+    "NCCL_PRECHECK_FAIL": "precheck failed",
+    "PROVISION_TIMEOUT": "elastic node provision timeout",
+}
+try:
+    from relax.utils.scale_utils import ScaleOutFailureCategory as _ScaleOutFailureCategory
+
+    _CATEGORY_BUCKETS = {
+        member.name: _CATEGORY_BUCKET_OVERRIDES.get(member.name, member.value) for member in _ScaleOutFailureCategory
+    }
+    # Enum declaration order is most-specific first, so it doubles as the
+    # priority used when several categories are present on one request.
+    _CATEGORY_PRIORITY = tuple(member.name for member in _ScaleOutFailureCategory)
+except Exception:  # pragma: no cover - degraded standalone TUI without relax deps
+    _CATEGORY_BUCKETS = {
+        "NCCL_PRECHECK_TRANSPORT_MISMATCH": "NCCL transport mismatch",
+        "NCCL_PRECHECK_FAIL": "precheck failed",
+        "PROVISION_TIMEOUT": "elastic node provision timeout",
+    }
+    _CATEGORY_PRIORITY = ("NCCL_PRECHECK_TRANSPORT_MISMATCH", "NCCL_PRECHECK_FAIL", "PROVISION_TIMEOUT")
+
+
+def _categorize_scale_error(
+    error_message: object,
+    reason: object = "",
+    status: object = "",
+    categories: object = None,
+) -> str:
+    """Bucket a scale failure into a short, human-readable category.
+
+    Structured ``categories`` (source-classified) win for the disambiguated
+    buckets; otherwise fall back to matching ``error_message``/``reason``/
+    ``status`` most-specific-first.
+    """
+    if isinstance(categories, (list, tuple)):
+        names = {_as_str(c, default="") for c in categories}
+        for name in _CATEGORY_PRIORITY:
+            if name in names:
+                return _CATEGORY_BUCKETS[name]
+
+    # Scale-out failure categories (NCCL transport mismatch / precheck / provision
+    # timeout) are matched structurally above, so no NCCL/precheck/transport text
+    # guessing lives here. Only these buckets remain, for sources that carry no
+    # structured category (scale-in, autoscaler no-op/conflict decisions).
+    text = " ".join(_as_str(x, default="") for x in (error_message, reason, status)).lower()
+    if not text.strip():
+        return "-"
+
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+
+    # no-op: autoscaler decided no action is needed (already at target replicas /
+    # within cooldown). A neutral result, not a failure.
+    if "noop" in text:
+        return "no scaling needed (no-op)"
+
+    # conflict/rejected: concurrent scale requests conflict, or scale_in target
+    # below the initial replica count was rejected (HTTP 400).
+    if any(k in text for k in ("conflict", "reject")):
+        return "conflict/rejected"
+
+    # other: no known signature matched; show a truncated raw error as fallback.
+    raw = _as_str(error_message, default="") or _as_str(reason, default="") or _as_str(status, default="")
+    raw = raw.strip()
+    if not raw:
+        return "other"
+    if len(raw) > 60:
+        raw = raw[:57] + "..."
+    return f"other: {raw}"
+
+
+def _history_rows(snapshot: AutoscalerSnapshot) -> list[tuple[str, str, str, str, str]]:
+    """Build history rows for the TUI.
+
+    Merges completed records from ``/scale_history`` with the still in-flight
+    ``pending_requests`` exposed by ``/status`` so a scale decision is visible the
+    moment it is *accepted* (not only once it completes). Dedup is by
+    ``request_id`` (the terminal record from history wins); rows are ordered
+    newest-first by ``triggered_at``.
+
+    Each row is ``(time, status_markup, action, from_to, reason)`` where
+    ``status_markup`` carries the ✓ / ✗ / - symbol and, for failures, ``reason``
+    is the categorized error (with a short raw snippet).
+    """
     payload = _as_dict(snapshot.history)
     history = _as_list(payload.get("history"))
-    rows: list[tuple[str, str, str, str]] = []
-    for raw in history[:10]:
+    status_payload = _as_dict(snapshot.status)
+    pending = _as_list(status_payload.get("pending_requests"))
+
+    seen_ids: set[str] = set()
+    merged: list[JsonDict] = []
+    for raw in list(history) + list(pending):
         item = _as_dict(raw)
+        rid = _as_str(item.get("request_id"), default="")
+        if rid:
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+        merged.append(item)
+
+    merged.sort(key=lambda it: _as_float(it.get("triggered_at"), default=0.0), reverse=True)
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for item in merged[:10]:
         triggered_at = _fmt_ts(_as_float(item.get("triggered_at"), default=0.0))
         action = _as_str(item.get("action"), default="-")
+        raw_status = _as_str(item.get("status"), default="")
+        symbol, color = _status_symbol(raw_status)
+        status_cell = f"[{color}]{symbol}[/{color}]"
+
         from_e = item.get("from_engines")
         to_e = item.get("to_engines")
         if from_e is None or to_e is None:
             from_to = "-"
         else:
             from_to = f"{_as_int(from_e)}→{_as_int(to_e)}"
+
         reason = _as_str(item.get("reason"), default="")
-        if len(reason) > 80:
-            reason = reason[:77] + "..."
-        rows.append((triggered_at, action, from_to, reason))
+        if symbol == "✗":
+            error_message = item.get("error_message")
+            category = _categorize_scale_error(
+                error_message, reason, raw_status, categories=item.get("failure_categories")
+            )
+            detail = _as_str(error_message, default="") or reason
+            # Category leads (never lost to truncation); detail follows.
+            if detail and not category.startswith("other"):
+                reason = f"{category} · {detail}"
+            else:
+                reason = category
+        if len(reason) > _HISTORY_REASON_MAXLEN:
+            reason = reason[: _HISTORY_REASON_MAXLEN - 3] + "..."
+        rows.append((triggered_at, status_cell, action, from_to, reason))
     return rows
 
 
@@ -776,7 +931,10 @@ class AutoscalerMonitorApp:
                 metrics_table.cursor_type = "row"
 
                 history_table = self.query_one("#history_table", DataTable)
-                _ = history_table.add_columns("Time", "Action", "From→To", "Reason")
+                _ = history_table.add_columns("Time", "St", "Action", "From→To")
+                # Fixed-wide Reason column → table scrolls horizontally instead of
+                # squeezing the cell to an ellipsis.
+                _ = history_table.add_column("Reason", width=_HISTORY_REASON_MAXLEN)
                 history_table.cursor_type = "row"
 
                 self.query_one("#status_text", Static).update(f"[dim]Connecting to {base_url}...[/dim]")
@@ -860,26 +1018,27 @@ class AutoscalerMonitorApp:
 
                 history_table = self.query_one("#history_table", DataTable)
                 _ = history_table.clear(columns=False)
-                for t, action, from_to, reason in _history_rows(self.snapshot):
+                for t, status_cell, action, from_to, reason in _history_rows(self.snapshot):
                     if action == "scale_out":
                         action_cell = Text.from_markup("[green]scale_out[/green]")
                     elif action == "scale_in":
                         action_cell = Text.from_markup("[blue]scale_in[/blue]")
                     else:
                         action_cell = Text(action)
-                    _ = history_table.add_row(Text(t), action_cell, Text(from_to), Text(reason))
+                    status_text = Text.from_markup(status_cell) if "[" in status_cell else Text(status_cell)
+                    _ = history_table.add_row(Text(t), status_text, action_cell, Text(from_to), Text(reason))
 
-                # 获取面板的实际可用宽度，减去左右边框和Y轴标签的预估宽度(约8个字符)
+                # Available panel width minus borders and Y-axis labels (~8 chars)
                 try:
                     panel = self.query_one("#chart_throughput")
                     available_width = panel.content_size.width
-                    # 如果一开始没获取到尺寸，给个默认值 35
+                    # Fall back to a default of 35 if size is not available yet
                     chart_width = max(20, available_width - 8) if available_width > 0 else 35
                 except Exception:
                     chart_width = 35
                 # ==========================================
 
-                # 更新为较适宜的半方块画图尺寸并渲染
+                # Render at a suitable half-block chart size
                 self.query_one("#chart_throughput_text", Static).update(
                     _render_chart(
                         list(self._history.throughput),

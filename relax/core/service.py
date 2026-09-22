@@ -12,6 +12,7 @@ from ray import serve
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import InfoActor, sort_key
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
@@ -32,6 +33,8 @@ class Service:
         data_source: Optional[Any] = None,
         actor_rollout_pgs: Optional[Any] = None,
         runtime_env=None,
+        *,
+        defer_deploy: bool = False,
     ) -> None:
         """Service wrapper that deploys a Ray Serve deployment.
 
@@ -44,6 +47,7 @@ class Service:
             data_source: Optional data source actor or factory used by rollout.
             actor_rollout_pgs: Optional placement group for colocated actor-rollout.
             runtime_env: Optional Ray runtime environment dict for the service.
+            defer_deploy: Allocate resources without deploying until ``deploy`` is called.
         """
         logger.info(
             f"[{role}] Initializing service with num_gpus={num_gpus}, actor_rollout_pgs={actor_rollout_pgs is not None}"
@@ -56,6 +60,7 @@ class Service:
         self.data_source = data_source
         self.runtime_env = runtime_env
         self._is_shared_pgs = actor_rollout_pgs is not None
+        self._deployed = False
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
@@ -71,8 +76,16 @@ class Service:
         self.pgs = pgs
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
-        self._deploy(pgs)
-        logger.info(f"[{role}] Service deployed successfully")
+        if not defer_deploy:
+            self.deploy()
+
+    def deploy(self) -> None:
+        """Deploy a prepared service exactly once."""
+        if self._deployed:
+            raise RuntimeError(f"[{self.role}] Service has already been deployed")
+        self._deploy(self.pgs)
+        self._deployed = True
+        logger.info(f"[{self.role}] Service deployed successfully")
 
     def _deploy(self, pgs: Optional[Any] = None) -> None:
         """Bind and deploy the Ray Serve deployment with the given placement
@@ -81,12 +94,16 @@ class Service:
         Args:
             pgs: Placement group tuple or None.
         """
+        ray_actor_options = with_control_plane_affinity(
+            self.config,
+            {"runtime_env": self.runtime_env},
+        )
         if self.data_source is not None:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
             )
         else:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
@@ -171,8 +188,9 @@ class Service:
     async def set_genrm_manager(self, genrm_manager: Any) -> None:
         await self.handle.set_genrm_manager.remote(genrm_manager)
 
-    async def get_genrm_manager(self) -> Any:
-        return await self.handle.get_genrm_manager.remote()
+    async def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
+        """Get the GenRM manager selected by ``route_key``."""
+        return await self.handle.get_genrm_manager.remote(route_key)
 
     async def set_step(self, set_step: int) -> None:
         await self.handle.set_step.remote(set_step)

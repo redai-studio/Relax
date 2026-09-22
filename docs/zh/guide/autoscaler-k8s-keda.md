@@ -450,7 +450,7 @@ ______________________________________________________________________
 
 - 引擎会使用初始模型权重运行
 - 后续权重更新在 Actor 的 `update_weights_fully_async()` 完成后自动触发
-- 如果对权重一致性要求严格，参考 [弹性 Rollout 扩缩容文档](../zh/guide/elastic-rollout.md) 中的权重同步机制
+- 如果对权重一致性要求严格，参考 [弹性 Rollout 扩缩容文档](./elastic-rollout.md) 中的权重同步机制
 
 ______________________________________________________________________
 
@@ -549,7 +549,7 @@ ______________________________________________________________________
 
 ## 延伸阅读
 
-- [弹性 Rollout 扩缩容](../zh/guide/elastic-rollout.md) — Relax 弹性扩缩容完整文档
-- [全异步训练流水线](../zh/guide/fully-async-training.md) — 弹性扩缩容的基础运行模式
+- [弹性 Rollout 扩缩容](./elastic-rollout.md) — Relax 弹性扩缩容完整文档
+- [全异步训练流水线](./fully-async-training.md) — 弹性扩缩容的基础运行模式
 - [KEDA 官方文档](https://keda.sh/docs/) — KEDA ScaledObject 配置参考
 - [Prometheus Operator](https://prometheus-operator.dev/) — ServiceMonitor 配置参考

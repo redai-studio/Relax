@@ -1,12 +1,12 @@
 # SFT Training
 
-This guide shows the end-to-end supervised fine-tuning (SFT) workflow in Relax, using the current scripts under [`scripts/training/sft/`](../../../scripts/training/sft/). It covers data preparation for the math and Pokemon datasets, model and path configuration, launch commands, and practical tuning.
+This guide shows the end-to-end supervised fine-tuning (SFT) workflow in Relax. It covers generative SFT with the current scripts under [`scripts/training/sft/`](../../../scripts/training/sft/), native sequence-classification SFT under [`examples/seq_cls_sft/`](../../../examples/seq_cls_sft/), model and data preparation, launch commands, and practical tuning.
 
 Make sure you have completed [Installation](./installation.md) before running the commands below.
 
 ## Overview
 
-SFT is enabled with `--loss-type sft`. In this mode, Relax starts an SFT producer that reads `--prompt-data`, renders samples through the model chat template, writes packed samples into TransferQueue, and trains the Megatron actor. If `--eval-interval` is set, it also runs PPL evaluation on an eval split. If `--sft-predict-interval` is set, Relax additionally uses the Rollout role and SGLang for periodic generative prediction.
+SFT is enabled with `--loss-type sft`. In this mode, Relax starts an SFT producer that reads `--prompt-data`, renders samples through the model chat template, writes packed samples into TransferQueue, and trains the Megatron actor. The default `--task-type causal_lm` trains the language-model head, runs PPL evaluation when `--eval-interval` is set, and can use the Rollout role for periodic generative prediction through `--sft-predict-interval`. Native classification uses `--task-type seq_cls`, replaces the vocabulary head with a classification head, and evaluates classification loss and metrics without a Rollout role.
 
 The current launch scripts use `ray job submit` and auto-source [`scripts/entrypoint/local.sh`](../../../scripts/entrypoint/local.sh) when no external entrypoint has already prepared the Ray environment.
 
@@ -19,6 +19,8 @@ The current launch scripts use `ray job submit` and auto-source [`scripts/entryp
 | [`run-qwen3-vl-4B-pokemon-8xgpu.sh`](../../../scripts/training/sft/run-qwen3-vl-4B-pokemon-8xgpu.sh) | `pokemon-gpt4o-captions` | `Qwen3-VL-4B-Instruct` | 8 GPU actor plus SFT producer and Rollout | Multimodal image SFT with two parquet files and prefetch enabled. |
 | [`run-qwen3-vl-4B-pokemon-1xgpu.sh`](../../../scripts/training/sft/run-qwen3-vl-4B-pokemon-1xgpu.sh) | `pokemon-gpt4o-captions` | `Qwen3-VL-4B-Instruct` | 1 GPU actor plus SFT producer | Low-resource Pokemon SFT with CPU optimizer offload. |
 | [`run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh`](../../../scripts/training/sft/run-qwen3.5-35B-A3B-mtp-sft-16xgpu.sh) | `OpenMathReasoning-mini` | `Qwen3.5-35B-A3B` | 16 GPU actor plus SFT producer | Advanced MTP SFT. Many knobs are exposed as environment variables. |
+| [`run-qwen3.5-9B-classification-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-9B` | 8 GPU actor plus SFT producer | Full-parameter binary, multiclass, or multilabel sequence-classification SFT. |
+| [`run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh`](../../../examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh) | SST-2, AG News, or GoEmotions | `Qwen3.5-35B-A3B` | 8 GPU actor plus SFT producer | LoRA sequence-classification SFT; defaults to GoEmotions. |
 
 ## Data Preparation
 
@@ -165,6 +167,88 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 
 For the MTP script, the default convention is `EXP_DIR=/root`, then `MODEL_DIR=${EXP_DIR}` and `DATA_DIR=${EXP_DIR}` unless you override them.
 
+## Sequence Classification SFT
+
+Sequence-classification SFT trains a native `K`-logit classification head instead of generating label text. The example supports three objective shapes:
+
+| Task | Input label | Output and loss |
+| --- | --- | --- |
+| Single-label binary classification | Integer `0` or `1` | 2 logits with CrossEntropy |
+| Single-label multiclass classification | Integer in `[0, K)` | `K` logits with CrossEntropy |
+| Multilabel classification | List of class indices, such as `[0, 2, 5]` | `K` logits with BCEWithLogits |
+
+The classification threshold is used only to turn multilabel probabilities into discrete eval or inference predictions. It is not used to compute the training or eval loss.
+
+### 1. Configure Paths
+
+Run the following commands from the Relax repository root. The scripts expect the Qwen3.5 model directories directly under `MODEL_DIR` and write prepared datasets under `${DATA_DIR}/sft/seq_cls`.
+
+```bash
+export DATA_DIR=/path/to/relax-workspace
+export EXP_DIR=/path/to/relax-workspace/exp
+export MODEL_DIR=/path/to/relax-workspace/models
+```
+
+For the 9B script, place the original Hugging Face model at `${MODEL_DIR}/Qwen3.5-9B`. The 35B-A3B LoRA script uses `${MODEL_DIR}/Qwen3.5-35B-A3B`.
+
+### 2. Prepare Datasets
+
+The data preparation tool converts pinned revisions of SST-2, AG News, and the simplified GoEmotions dataset into the JSONL format consumed by the training scripts:
+
+```bash
+python examples/seq_cls_sft/tools/prepare_classification_sft_data.py \
+  --dataset all \
+  --subset full \
+  --global-batch-size 64 \
+  --output-dir "${DATA_DIR}/sft/seq_cls"
+```
+
+Use `--dataset sst2`, `--dataset ag_news`, or `--dataset go_emotions` to prepare only one task. The launch scripts default to the `full` subset; `DATA_SUBSET=smoke` and `DATA_SUBSET=extended` select the smaller deterministic subsets produced by the same tool.
+
+Custom single-label rows use an integer `label`:
+
+```json
+{"messages": [{"role": "user", "content": "This movie is excellent."}], "label": 1}
+```
+
+Custom multilabel rows use a list of class indices:
+
+```json
+{"messages": [{"role": "user", "content": "I feel relieved and excited."}], "label": [4, 17]}
+```
+
+Set `TRAIN_DATA` and `EVAL_DATA` to use custom JSONL files. For a custom label space, also set `NUM_LABELS` and `PROBLEM_TYPE` to `single_label_classification` or `multi_label_classification`.
+
+### 3. Launch Training
+
+The Qwen3.5-9B full-parameter script defaults to SST-2. Select AG News or GoEmotions with `CLASSIFICATION_DATASET`:
+
+```bash
+bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+
+CLASSIFICATION_DATASET=ag_news \
+  bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+
+CLASSIFICATION_DATASET=go_emotions \
+  bash examples/seq_cls_sft/run-qwen3.5-9B-classification-sft-8xgpu.sh
+```
+
+The Qwen3.5-35B-A3B LoRA script defaults to GoEmotions:
+
+```bash
+bash examples/seq_cls_sft/run-qwen3.5-35B-A3B-classification-lora-sft-8xgpu.sh
+```
+
+Both scripts use dynamic batching and eight training GPUs, train for 10 epochs by default, and save a Megatron native checkpoint every 100 steps. Single-label eval reports loss and accuracy. Multilabel eval reports loss, micro precision, micro recall, micro F1, and subset accuracy.
+
+::: warning Current Scope
+Sequence-classification SFT currently supports text-only synchronous SFT. It does not support fully async, hybrid, SFT generative prediction, MTP, chunked SFT logits, or online `--save-hf`. Export the native checkpoint offline before serving it. The provided SGLang adapter supports tensor parallelism, not pipeline parallelism.
+:::
+
+::: tip Complete Export and Serving Workflow
+See the [`examples/seq_cls_sft` README](../../../examples/seq_cls_sft/README.md) for every environment override, offline Megatron-to-Hugging-Face export, SGLang startup, and single-label or multilabel request example.
+:::
+
 ## Configuration Walkthrough
 
 The scripts are organized into argument blocks. Tune by editing the selected script, or by using environment variables where the script already exposes them.
@@ -195,6 +279,8 @@ For a fresh run, keep `--load` and `--save` pointing at the same experiment dire
 ### MTP Arguments
 
 The MTP SFT script enables `--mtp-num-layers ${MTP_NUM_LAYERS:-1}`, `--enable-mtp-training`, and `--mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.2}`. Increase `MTP_NUM_LAYERS` only for models/checkpoints with matching MTP layers; tune `MTP_LOSS_SCALING_FACTOR` as an auxiliary-loss weight, starting from `0.2`.
+
+See [MTP Training](./mtp-rl-training.md) for joint training, MTP-only two-stage training, and Pokémon measurements.
 
 ### SFT Data Arguments
 
@@ -278,7 +364,7 @@ PPL evaluation is controlled by:
 --eval-interval 10
 ```
 
-`--eval-size` reserves the tail of `--prompt-data` for eval and removes it from the train pool. A value below 1 is a fraction; a value of 10 or higher is an absolute sample count. You may use `--eval-prompt-data name path` instead, but in SFT mode do not use `--eval-config`.
+`--eval-size` randomly splits rows from `--prompt-data` once using `--seed`, keeps that eval subset fixed, and removes it from every shuffled training epoch. A value below 1 is a fraction; a value of 1 or higher is an absolute sample count. This is a row-level split; related rows such as multilingual captions for the same image are not grouped automatically. You may use `--eval-prompt-data name path` instead, but in SFT mode do not use `--eval-config`.
 
 Generative prediction is controlled by:
 
@@ -332,6 +418,36 @@ Pokemon 1 GPU script:
 ```
 
 `"sft": [1, 0]` means the SFT producer is CPU-only. The Actor owns training GPUs. Rollout GPUs are needed when periodic predict is enabled.
+
+### Sharded SFT Producers
+
+`RELAX_SFT_TQ_SHARDS` is an experimental throughput knob for SFT async prepacking. It splits each global SFT batch across multiple TransferQueue partitions. Configure it in the Ray runtime environment:
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
+
+Enable async prepacking in the training arguments as well:
+
+```bash
+--per-rank-fetch
+--sft-async-prepack
+--sft-max-in-flight-steps 4
+```
+
+`--sft-max-in-flight-steps 4` is an example; async prepacking requires at least 2, or equivalently `--max-staleness >= 1`. The environment variable does not enable prepacking by itself and is ignored without `--loss-type sft --sft-async-prepack`.
+
+For `N` shards, both `--global-batch-size` and the per-DP-rank local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`. For example, with global batch size 32 and DP size 8, the local batch is 4, so 2 or 4 shards are valid but 3 is not.
+
+When the remote path is eligible, `N` shards launch `N` Ray producer actors for train batches. Eval can be enabled at the same time: train shards are produced remotely, while the coordinator renders the eval split or eval prompt data and pushes the usual `sft_eval_<step>_n<N>_<i>` partitions at eval intervals. Some configurations, including sequence classification, custom datasets (`--custom-dataset-class` / `--custom-dataset-class-path`), and skip-capable sample filtering, use one local producer that still writes `N` partitions. Therefore, `RELAX_SFT_TQ_SHARDS=2` does not always mean two producer actors. Confirm the remote path from this log:
+
+```text
+SFT remote shard producer enabled: ... shards=2 ...
+```
+
+When using `--eval-size`, every remote train producer applies the same seed-based held-out split so train and eval rows do not overlap. When launching Python directly, `export RELAX_SFT_TQ_SHARDS=2` is also supported. For a Ray Job, putting the value in `configs/env.yaml` ensures that producers and consumers receive the same value. See [Sharded TransferQueue Producers](./configuration.md#sharded-transferqueue-producers) for partition naming, fallback conditions, and worker allocation.
 
 ## Launch
 
@@ -417,6 +533,7 @@ If GPUs wait on SFT data:
 | `--sft-prefetch-chunk-size` | Increase | Dispatches larger prefetch chunks, with higher memory pressure. |
 | `--per-rank-fetch` | Enable for multi-GPU | Lets TP/PP ranks pull from TransferQueue directly. Pair with enough `--num-data-storage-units`. |
 | `--max-staleness` | Increase for I/O-heavy SFT | Lets the producer run ahead. The Pokemon 8 GPU script uses `--max-staleness 4`. |
+| `RELAX_SFT_TQ_SHARDS` | Start from 2 | Parallelizes eligible async-prepack producers. Increase only when data preparation is the bottleneck and batch divisibility constraints are met. |
 
 For text-only math, prefetch usually matters less than sequence length and model parallelism. For Pokemon, image loading and processor work are common bottlenecks.
 
@@ -546,6 +663,7 @@ Follow [`test_qwen_chat_template_patch.py`](../../../tests/engine/sft/dataset/te
 
 ## Next Steps
 
+- Follow the complete [sequence-classification SFT example](../../../examples/seq_cls_sft/README.md) for checkpoint export and SGLang serving.
 - Read [Configuration Reference](./configuration.md) for the full SFT parameter table.
 - Read [Performance Tuning](./performance-tuning.md) for broader throughput tuning.
 - Read [OOM Troubleshooting](./oom-troubleshooting.md) if the job fails during model load or training.

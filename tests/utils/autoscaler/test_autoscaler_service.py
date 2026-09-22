@@ -197,6 +197,34 @@ def test_update_pending_requests_scale_in_completed_terminal():
     assert len(svc._state.scale_history) == 1
 
 
+def test_update_pending_requests_propagates_failure_categories():
+    """A failed scale-out's source-classified failure_categories must be copied
+    from the rollout status back into the tracked request and survive
+    serialization to /scale_history (ScaleHistoryItem), so the monitor can
+    bucket it without re-parsing error_message."""
+    from relax.utils.autoscaler.autoscaler_service import ScaleHistoryItem
+
+    session = _FakeSession(
+        get_payload={
+            "status": "FAILED",
+            "error_message": "scale-out failed: NCCL transport mismatch: wrong_type",
+            "failure_categories": ["NCCL_PRECHECK_TRANSPORT_MISMATCH"],
+        },
+        get_status=200,
+    )
+    svc = _service(session=session)
+    svc._state.pending_requests = [
+        {"request_id": "r1", "action": "scale_out", "status": "CREATING", "delta": 2, "triggered_at": 1.0}
+    ]
+    asyncio.run(svc._update_pending_requests())
+
+    assert len(svc._state.scale_history) == 1
+    record = svc._state.scale_history[0]
+    assert record["failure_categories"] == ["NCCL_PRECHECK_TRANSPORT_MISMATCH"]
+    # The /scale_history pydantic model must keep the field (not drop it).
+    assert ScaleHistoryItem(**record).failure_categories == ["NCCL_PRECHECK_TRANSPORT_MISMATCH"]
+
+
 class _FakePostSession:
     """aiohttp-like session that records POSTs and returns a preconfigured
     body.

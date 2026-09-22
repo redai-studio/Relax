@@ -12,13 +12,11 @@ import argparse
 import asyncio
 import base64
 import json
-import logging
 import os
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import httpx
 import yaml
 from app.env_deepeyes_v2 import (
     DeepEyesV2Env,
@@ -33,18 +31,14 @@ from PIL import Image
 
 CONFIG_PATH = Path(__file__).with_name("deepeyes_v2_config.yaml")
 
-logger = logging.getLogger(__name__)
-
 
 def read_session_input(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
-    # Defensive: if Relax already discarded the session (timeout) it will
-    # have deleted the tmpdir out from under us. Runtime SIGKILLs us in that
-    # case, but during the race window we may still reach here. Skip the
-    # write instead of dying with FileNotFoundError.
+    # The launcher may remove a discarded session's temporary directory while
+    # the agent is finishing its output write.
     try:
         Path(path).write_text(json.dumps(payload), encoding="utf-8")
     except FileNotFoundError:
@@ -54,8 +48,8 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
 def load_initial_image(messages: list[dict[str, Any]]) -> Image.Image | None:
     """Pull the first image attached to the last user message, if any.
 
-    Dataset prompts arrive with image data URLs in ``content[*].image_url.url``
-    (see ``relax/agentic/pipeline/runtime.py:1157``).
+    Dataset prompts arrive with image data URLs in
+    ``content[*].image_url.url``.
     """
     if not messages:
         return None
@@ -146,19 +140,13 @@ def _build_executor(backend_name: str, ensure_sandbox_timeout_s: int) -> Sandbox
 
 async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
     from openai import (  # type: ignore[import-not-found]
-        APIConnectionError,
         APIStatusError,
-        APITimeoutError,
         AsyncOpenAI,
     )
 
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     max_turns = int(config["max_turns"])
     ensure_sandbox_timeout_s = int(config["ensure_sandbox_timeout_s"])
-    # See the AsyncOpenAI construction and the per-turn request loop below for
-    # why these two exist (colocate engine-sleep survival).
-    llm_call_timeout_s = float(config.get("llm_call_timeout_s", 600.0))
-    max_llm_call_timeout_retries = int(config.get("max_llm_call_timeout_retries", 60))
 
     data_index = str(metadata.get("data_index") or metadata.get("index") or "?")
     executor = _build_executor(config["sandbox_backend"], ensure_sandbox_timeout_s)
@@ -173,19 +161,7 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"].rstrip("/"),
-        # llm_call_timeout_s (default 600s) is generous margin over the expected
-        # 20-45s per-turn even under SGLang backpressure. It is deliberately NOT
-        # the livelock guard: in colocate mode the rollout engine is offloaded
-        # (asleep) for the entire actor training window, which routinely exceeds
-        # any per-request budget, so an in-flight request would otherwise hit
-        # this timeout and crash the session with exit 1 -> the whole
-        # 256-sample batch is dropped -> Relax regenerates -> Ray/GCS task
-        # pileup -> GCS OOM. We instead retry on timeout in the loop below and
-        # let Relax's sleep-aware session timeout (SIGTERM) / 404
-        # session_discarded be the real deadline. max_retries=0 keeps the SDK
-        # from stacking its own hidden retry loop on top of ours.
-        timeout=httpx.Timeout(timeout=llm_call_timeout_s, connect=30.0),
-        max_retries=0,
+        timeout=9999,
     )
 
     stop_reason = "max_turns"
@@ -205,58 +181,27 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     try:
         for _turn in range(max_turns):
             try:
-                resp = None
-                timeout_retries = 0
-                while resp is None:
-                    try:
-                        resp = await client.chat.completions.create(
-                            model=os.environ.get("OPENAI_MODEL", "model"),
-                            messages=messages,
-                            extra_body=extra_body,
-                        )
-                    except (APITimeoutError, APIConnectionError) as exc:
-                        # In colocate mode the SGLang rollout engine is
-                        # offloaded (asleep) for the entire actor training
-                        # window, which routinely exceeds one request's timeout.
-                        # A hung request must NOT crash the session (exit 1 ->
-                        # whole 256-sample batch dropped -> Relax regenerates ->
-                        # Ray/GCS task pileup -> GCS OOM). Poll instead: on
-                        # engine wake the request succeeds. Relax's sleep-aware
-                        # session timeout (SIGTERM) and the 404
-                        # session_discarded path stay the real deadlines, so
-                        # this loop cannot livelock a genuinely dead engine.
-                        timeout_retries += 1
-                        if timeout_retries > max_llm_call_timeout_retries:
-                            raise
-                        logger.warning(
-                            "[agent] %s on chat turn %s (retry %s/%s); "
-                            "rollout engine likely offloaded for training, polling for wake...",
-                            type(exc).__name__,
-                            _turn,
-                            timeout_retries,
-                            max_llm_call_timeout_retries,
-                        )
-                        await asyncio.sleep(min(5.0 * timeout_retries, 30.0))
+                response = await client.chat.completions.create(
+                    model=os.environ.get("OPENAI_MODEL", "model"),
+                    messages=messages,
+                    extra_body=extra_body,
+                )
             except APIStatusError as exc:
                 err = (exc.response.json() or {}).get("error", {})
                 code = err.get("code") if isinstance(err, dict) else None
                 if code == "context_length_exceeded":
                     stop_reason = "finish_length"
                     break
-                # Sync-mode tail discard: Relax pipeline pops the session
-                # record at step close (relax/agentic/rollout.py:953 →
-                # drop_resident_results) when enough committed groups are
-                # in. The agent's next chat hits 404 session_discarded;
-                # the output JSON is no longer consumed, so just exit
-                # cleanly instead of crashing with a traceback.
+                # A session discarded after the rollout target closes returns
+                # 404 session_discarded. Its output JSON is no longer consumed.
                 if code == "session_discarded":
                     stop_reason = "discarded_by_pipeline"
                     break
                 raise
 
-            text = resp.choices[0].message.content or ""
+            text = response.choices[0].message.content or ""
             messages.append({"role": "assistant", "content": text})
-            if resp.choices[0].finish_reason == "length":
+            if response.choices[0].finish_reason == "length":
                 stop_reason = "finish_length"
                 break
 
@@ -287,9 +232,8 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     finally:
         await env.close()
 
-    # SessionOutput (relax/agentic/pipeline/runtime.py:160) only accepts
-    # "metadata" and "reward". The chat trajectory is already captured by
-    # Relax through the chat-completions endpoint, so don't ship messages.
+    # This app uses the implicit SessionOutput form from
+    # relax.agentic.runner.ipc. Relax already captured the chat trajectory.
     return {
         "metadata": {
             "stop_reason": stop_reason,

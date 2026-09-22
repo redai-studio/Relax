@@ -1,55 +1,42 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+"""Runtime control plane over group-affine Ray SessionShards."""
+
 from __future__ import annotations
 
 import asyncio
 import base64
-import copy
-import functools
 import json
-import os
-import signal
-import tempfile
-import threading
 import time
-from collections import deque
-from concurrent.futures import Executor, ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
-from enum import Enum
+import uuid
+import zlib
+from argparse import Namespace
+from concurrent.futures import Executor
+from dataclasses import dataclass, field
+from functools import partial
 from io import BytesIO
-from math import ceil
-from pathlib import Path
-from typing import Any, Callable
-from uuid import uuid4
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeVar, cast
 
 import httpx
 import numpy as np
 import ray
 import torch
 
-from relax.agentic import AGENTIC_CHAT_API_ROUTE_PREFIX, AGENTIC_CHAT_API_SERVICE_NAME
-from relax.agentic.pipeline import ExportMode, GroupKey, PendingExportUnit, sample_group_key
-from relax.agentic.pipeline.prepare import (
-    ExecutionBatchInput,
-    PrepareGroupSpec,
-    PrepareGroupState,
-    PrepareRequestHandle,
-)
-from relax.agentic.profile import (
-    TRACE_KEY,
-    mark_agentic_event,
-    mark_metadata_agentic_event,
-    merge_agentic_trace,
-)
-from relax.agentic.runner.ipc import LauncherClient, ensure_local_launcher_daemon
-from relax.agentic.session.state import (
-    FinalizedResultTransport,
+from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME, format_agentic_status
+from relax.agentic.pipeline import (
+    GroupExport,
+    GroupInput,
+    RuntimeGroupError,
+    SampleExport,
+    SessionExport,
+    SessionExportTransport,
+    SessionShardProgress,
+    SessionSpec,
     TrainingFieldArtifact,
-    check_messages,
-    normalize_template_kwargs,
-    normalize_tools,
 )
-from relax.utils.http_utils import post
+from relax.agentic.profile import mark_sample_agentic_event
+from relax.agentic.session.state import check_messages
+from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -58,3329 +45,86 @@ from relax.utils.types import Sample
 
 logger = get_logger(__name__)
 
-_AGENTIC_SERVICE_CLIENT: "_ServeHandleChatControlClient | None" = None
-_MANAGED_TERMINATION_WAIT_TIMEOUT_S = 5.0
-_MANAGED_FORCE_TERMINATION_WAIT_TIMEOUT_S = 5.0
 
-
-@dataclass
-class RequestDispatchContext:
-    rollout_id: int
-    group_key: GroupKey
-    expected_count: int
-    slot_idx: int
-    envelope: Any
-
-
-class RuntimeSlotState(str, Enum):
-    RUNNING_APP = "running_app"
-    MATERIALIZING = "materializing"
-    MATERIALIZED = "materialized"
-
-
-@dataclass
-class RuntimeSlot:
-    request_id: str
-    session_id: str
-    dispatch_context: RequestDispatchContext
-    seed_sample: Sample
-    managed_session_handle: Any
-    managed_session_submitted_at: float
-    state: RuntimeSlotState = RuntimeSlotState.RUNNING_APP
-    materialization_task: asyncio.Task | None = None
-    managed_session_handle_released: bool = False
-
-    @property
-    def group_key(self) -> GroupKey:
-        return self.dispatch_context.group_key
-
-    @property
-    def admission_rollout_id(self) -> int:
-        return self.dispatch_context.rollout_id
-
-
-@dataclass
-class RuntimeGroup:
-    group_key: GroupKey
-    expected_count: int
-    admission_rollout_id: int
-    request_ids: set[str] = field(default_factory=set)
-    materialized_slot_idxs: set[int] = field(default_factory=set)
-    materialized_units_by_slot: dict[int, list[PendingExportUnit]] = field(default_factory=dict)
-
-    def add_materialized_record(self, record: dict[str, Any], *, store_samples: bool) -> None:
-        slot_idx = int(record["slot_idx"])
-        self.materialized_slot_idxs.add(slot_idx)
-        if store_samples:
-            self.materialized_units_by_slot[slot_idx] = record["pending_units"]
-
-    def is_complete(self) -> bool:
-        return len(self.materialized_slot_idxs) >= self.expected_count
-
-    def slot_count(self) -> int:
-        return len(self.materialized_slot_idxs)
-
-    def materialized_group(self) -> list[Sample]:
-        completed_group: list[Sample] = []
-        for idx in range(self.expected_count):
-            units = self.materialized_units_by_slot.get(idx)
-            if units is None:
-                raise RuntimeError(
-                    f"RuntimeGroup cannot build a materialized group before all stored slots are ready: "
-                    f"group_key={self.group_key!r}, missing_slot={idx}."
-                )
-            completed_group.extend(unit.sample for unit in units)
-        return completed_group
-
-
-@dataclass(frozen=True)
-class _MaterializationDrop:
-    group_key: GroupKey
-    session_id: str
-    reason: str
-    info: dict[str, Any] = field(default_factory=dict)
-
-
-RewardValue = float | dict[str, Any] | None
-
-
-class AgentExecutionError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class SessionInput:
-    session_id: str
-    rollout_mode: str
-    group_id: str
-    input_payload: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_agent_payload(self) -> dict[str, Any]:
-        return copy.deepcopy(self.input_payload)
-
-
-@dataclass(frozen=True)
-class SessionOutput:
-    metadata: dict[str, Any] = field(default_factory=dict)
-    reward: RewardValue = None
-    records: list[dict[str, Any]] = field(default_factory=list)
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "SessionOutput":
-        if not isinstance(payload, dict):
-            raise TypeError(f"SessionOutput payload must be a JSON object, got {type(payload)}")
-        if "messages" in payload:
-            return cls.from_records([payload])
-        unknown_keys = set(payload) - {"metadata", "reward"}
-        if unknown_keys:
-            # Be lenient: example agents often want to dump debug fields
-            # (messages, branch_counts, trajectory…). Warn once per call
-            # instead of crashing the whole session.
-            logger.warning(
-                "SessionOutput ignoring unknown top-level keys: %s. "
-                "Only 'metadata' and 'reward' are consumed by Relax.",
-                sorted(unknown_keys),
-            )
-        metadata = payload.get("metadata", {})
-        reward = payload.get("reward")
-        if not isinstance(metadata, dict):
-            raise TypeError("SessionOutput 'metadata' must be a JSON object")
-        if reward is not None and not isinstance(reward, (int, float, dict)):
-            raise TypeError("SessionOutput 'reward' must be null, number, or JSON object")
-        return cls(metadata=metadata, reward=reward)
-
-    @classmethod
-    def from_records(cls, records: list[dict[str, Any]]) -> "SessionOutput":
-        normalized_records = [_normalize_session_output_record(record) for record in records]
-        seen_names: set[str] = set()
-        for record in normalized_records:
-            name = record["name"]
-            if name in seen_names:
-                raise TypeError(f"Session output record name must be unique within one explicit export: {name!r}")
-            seen_names.add(name)
-        return cls(records=normalized_records)
-
-
-def _normalize_session_output_record(record: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(record, dict):
-        raise TypeError(f"Session output record must be a JSON object, got {type(record)}")
-    unknown_keys = set(record) - {"name", "messages", "tools", "chat_template_kwargs", "metadata", "reward"}
-    if unknown_keys:
-        logger.warning(
-            "Session output record ignoring unknown keys: %s. Only 'name', 'messages', 'tools', "
-            "'chat_template_kwargs', 'metadata', and 'reward' are consumed by Relax.",
-            sorted(unknown_keys),
-        )
-    if "messages" not in record:
-        raise TypeError("Session output record must include 'messages'")
-    name = record.get("name")
-    if not isinstance(name, str) or not name:
-        raise TypeError("Session output record must include non-empty string 'name'")
-    metadata = record.get("metadata", {})
-    if not isinstance(metadata, dict):
-        raise TypeError("Session output record 'metadata' must be a JSON object")
-    reward = record.get("reward")
-    if reward is not None and not isinstance(reward, (int, float, dict)):
-        raise TypeError("Session output record 'reward' must be null, number, or JSON object")
-    normalized_record = {
-        "name": name,
-        "messages": check_messages(record["messages"]),
-        "metadata": copy.deepcopy(metadata),
-    }
-    if "reward" in record:
-        normalized_record["reward"] = copy.deepcopy(reward)
-    if "tools" in record:
-        normalized_record["tools"] = normalize_tools(record["tools"])
-    if "chat_template_kwargs" in record:
-        normalized_record["chat_template_kwargs"] = normalize_template_kwargs(record["chat_template_kwargs"])
-    return normalized_record
-
-
-def _session_output_from_text(raw_text: str) -> SessionOutput:
-    stripped = raw_text.strip()
-    if not stripped:
-        return SessionOutput()
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        records = [json.loads(line) for line in stripped.splitlines() if line.strip()]
-        return SessionOutput.from_records(records)
-    if isinstance(parsed, dict):
-        return SessionOutput.from_payload(parsed)
-    if isinstance(parsed, list):
-        raise TypeError("Session output explicit records must be written as JSONL, not a JSON array")
-    raise TypeError(f"Managed command output must be a JSON object or JSONL records, got {type(parsed)}")
-
-
-@dataclass(frozen=True)
-class ManagedCommandAppSpec:
-    command: str = ""
-    cwd: str | None = None
-    env: dict[str, str] = field(default_factory=dict)
-    timeout_s: float = 1800.0
-
-
-@dataclass(frozen=True)
-class ManagedSessionHandle:
-    runner_id: int
-    session_handle: str
-
-
-def _parse_agent_env_items(raw_items: Any) -> dict[str, str]:
-    parsed_env: dict[str, str] = {}
-    for item in raw_items:
-        key, value = item.split("=", 1)
-        parsed_env[key.strip()] = value
-    return parsed_env
-
-
-def load_agent_app_spec_from_args(args: Any) -> ManagedCommandAppSpec:
-    command = args.agent_command
-    cwd = args.agent_cwd
-    cwd_path = Path(cwd).expanduser()
-    agent_env = _parse_agent_env_items(args.agent_env)
-    return ManagedCommandAppSpec(
-        command=command.strip(),
-        cwd=str(cwd_path.resolve()),
-        env=agent_env,
-        timeout_s=float(args.agent_timeout),
-    )
-
-
-def _metadata_patch(base_metadata: dict[str, Any] | None, updated_metadata: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(base_metadata, dict):
-        return dict(updated_metadata)
-    patch: dict[str, Any] = {}
-    for key, value in updated_metadata.items():
-        if key not in base_metadata or base_metadata[key] != value:
-            patch[key] = value
-    return patch
-
-
-def _decode_output(encoded: str | None) -> str:
-    if not encoded:
-        return ""
-    return base64.b64decode(encoded.encode("ascii")).decode("utf-8", errors="ignore")
-
-
-async def execute_managed_session_input(
-    *,
-    spec: ManagedCommandAppSpec,
-    session_input: SessionInput,
-    launcher_client: LauncherClient | None = None,
-    before_process_launch: Callable[[], Any] | None = None,
-    on_process_started: Callable[[], None] | None = None,
-    on_process_launched: Callable[[str], None] | None = None,
-    on_process_finished: Callable[[str], None] | None = None,
-    is_process_timed_out: Callable[[], bool] | None = None,
-) -> dict[str, Any]:
-    prepare_started_at = time.time()
-
-    tmpdir_handle = tempfile.TemporaryDirectory(prefix="relax-agentic-command-")
-    launcher_handle: str | None = None
-    process_finished_reported = False
-
-    def _report_process_finished() -> None:
-        nonlocal process_finished_reported
-        if launcher_handle is None or process_finished_reported:
-            return
-        process_finished_reported = True
-        if on_process_finished is not None:
-            on_process_finished(launcher_handle)
-
-    try:
-        tmpdir_path = Path(tmpdir_handle.name)
-        input_path = tmpdir_path / "session_input.json"
-        output_path = tmpdir_path / "session_output.json"
-        log_path = tmpdir_path / "command.log"
-        env = {str(key): str(value) for key, value in spec.env.items()}
-        env.update(
-            {
-                "RELAX_SESSION_ID": session_input.session_id,
-                "RELAX_ROLLOUT_MODE": session_input.rollout_mode,
-                "RELAX_GROUP_ID": session_input.group_id,
-                "RELAX_SESSION_IO_DIR": str(tmpdir_path),
-                "RELAX_OUTPUT_JSON": str(output_path),
-            }
-        )
-        input_path.write_text(
-            json.dumps(
-                session_input.to_agent_payload(),
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        env["RELAX_INPUT_JSON"] = str(input_path)
-        prepare_finished_at = time.time()
-        if launcher_client is None:
-            launcher_client = LauncherClient(socket_path=ensure_local_launcher_daemon())
-        if before_process_launch is not None:
-            launch_hook_result = before_process_launch()
-            if asyncio.iscoroutine(launch_hook_result):
-                await launch_hook_result
-        launch_started_at = time.time()
-        request_id = session_input.metadata["request_id"]
-        launch_payload = await launcher_client.launch(
-            command=spec.command,
-            cwd=spec.cwd,
-            env=env,
-        )
-        launch_returned_at = time.time()
-        process_started_at = float(launch_payload["started_at"])
-        spawn_returned_at = float(launch_payload["spawn_returned_at"])
-        handle = str(launch_payload["handle"])
-        launcher_handle = handle
-        if on_process_launched is not None:
-            on_process_launched(handle)
-        logger.debug(
-            "Managed session launched session_id=%s request_id=%s handle=%s pid=%s",
-            session_input.session_id,
-            request_id,
-            handle,
-            launch_payload["pid"],
-        )
-        if on_process_started is not None:
-            on_process_started()
-        process_wait_finished = False
-
-        try:
-            wait_payload = await launcher_client.wait(handle=handle)
-            process_wait_finished = True
-        except asyncio.CancelledError:
-            raise
-        finally:
-            if process_wait_finished:
-                _report_process_finished()
-        process_exited_at = float(wait_payload["exited_at"])
-        return_code = int(wait_payload["exit_code"])
-        logger.debug(
-            "Managed session exited session_id=%s request_id=%s handle=%s exit_code=%s",
-            session_input.session_id,
-            request_id,
-            handle,
-            return_code,
-        )
-        stdout_text = _decode_output(wait_payload["stdout_b64"])
-        stderr_text = _decode_output(wait_payload["stderr_b64"])
-        combined_output = stdout_text + stderr_text
-        log_path.write_text(combined_output, encoding="utf-8")
-
-        process_timed_out = bool(is_process_timed_out is not None and is_process_timed_out())
-        if process_timed_out:
-            raise AgentExecutionError(
-                f"Managed command agent timed out after {spec.timeout_s} seconds.\n{combined_output}".rstrip()
-            )
-        if return_code != 0:
-            raise AgentExecutionError(
-                f"Managed command agent exited with code {return_code}.\n{combined_output}".rstrip()
-            )
-        output_read_at = time.time()
-        if output_path.exists():
-            try:
-                session_output = _session_output_from_text(output_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise AgentExecutionError(
-                    f"Managed command agent produced invalid output.\n{combined_output}".rstrip()
-                ) from exc
-        else:
-            session_output = SessionOutput()
-        payload_ready_at = time.time()
-        session_output_metadata = _metadata_patch(
-            session_input.input_payload.get("metadata"),
-            session_output.metadata,
-        )
-        payload = {
-            "reward": session_output.reward,
-            "_session_id": session_input.session_id,
-            "_session_output_metadata": session_output_metadata,
-            "_session_output_records": session_output.records,
-            "_agentic_trace_events": {},
-        }
-        profile = payload["_agentic_trace_events"]
-        mark_agentic_event(profile, "managed_prepare_start_at", prepare_started_at)
-        mark_agentic_event(profile, "managed_prepare_end_at", prepare_finished_at)
-        mark_agentic_event(profile, "managed_launch_start_at", launch_started_at)
-        mark_agentic_event(profile, "managed_process_start_at", process_started_at)
-        if spawn_returned_at is not None:
-            mark_agentic_event(profile, "managed_process_spawn_return_at", spawn_returned_at)
-        mark_agentic_event(profile, "managed_launch_return_at", launch_returned_at)
-        mark_agentic_event(profile, "managed_process_exit_at", process_exited_at)
-        mark_agentic_event(profile, "managed_output_read_at", output_read_at)
-        mark_agentic_event(profile, "managed_output_ready_at", payload_ready_at)
-        return payload
-    finally:
-        _report_process_finished()
-        tmpdir_handle.cleanup()
-
-
-def _managed_spec_to_payload(spec: ManagedCommandAppSpec) -> dict[str, Any]:
-    return {
-        "command": spec.command,
-        "cwd": spec.cwd,
-        "env": dict(spec.env),
-        "timeout_s": spec.timeout_s,
-    }
-
-
-def _managed_spec_from_payload(payload: dict[str, Any]) -> ManagedCommandAppSpec:
-    command = payload["command"]
-    cwd = payload["cwd"]
-    env = payload["env"]
-    timeout_s = payload["timeout_s"]
-    return ManagedCommandAppSpec(
-        command=command.strip(),
-        cwd=cwd,
-        env={str(key): str(value) for key, value in env.items()},
-        timeout_s=float(timeout_s),
-    )
-
-
-def _session_input_to_payload(session_input: SessionInput) -> dict[str, Any]:
-    return {
-        "session_id": session_input.session_id,
-        "group_id": session_input.group_id,
-        "rollout_mode": session_input.rollout_mode,
-        "input_payload": dict(session_input.input_payload),
-        "metadata": dict(session_input.metadata),
-    }
-
-
-def _session_input_from_payload(payload: dict[str, Any]) -> SessionInput:
-    session_id = payload["session_id"]
-    group_id = payload["group_id"]
-    rollout_mode = payload["rollout_mode"]
-    input_payload = payload["input_payload"]
-    metadata = payload["metadata"]
-    return SessionInput(
-        session_id=session_id,
-        group_id=group_id,
-        rollout_mode=rollout_mode,
-        input_payload=dict(input_payload),
-        metadata=dict(metadata),
-    )
-
-
-@ray.remote(max_restarts=3, max_task_retries=0, num_cpus=0, max_concurrency=256)
-class ManagedSessionRunner:
-    def __init__(self, *, runner_id: int, launch_capacity: int) -> None:
-        self._runner_id = runner_id
-        self._capacity = launch_capacity
-        self._inflight = 0
-        self._launch_permits_in_use = 0
-        self._shutdown_requested = False
-        self._semaphore = asyncio.BoundedSemaphore(self._capacity)
-        self._launcher_client = LauncherClient(socket_path=ensure_local_launcher_daemon())
-        self._active_session_ids: set[str] = set()
-        self._active_launcher_handles: set[str] = set()
-        self._waiting_launch_session_ids: set[str] = set()
-        self._recent_completed_session_ids: deque[str] = deque(maxlen=32)
-        self._tasks_by_handle: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._session_id_by_handle: dict[str, str] = {}
-        self._completed_session_handles: deque[str] = deque()
-        self._launcher_handle_by_session_handle: dict[str, str] = {}
-        self._timeout_remaining_s_by_handle: dict[str, float] = {}
-        self._timeout_active_started_at_by_handle: dict[str, float] = {}
-        self._timeout_tasks_by_handle: dict[str, asyncio.Task] = {}
-        self._timeout_active_handles: set[str] = set()
-        self._timed_out_session_handles: set[str] = set()
-
-    async def submit_sessions(
-        self,
-        spec_payload: dict[str, Any],
-        session_input_payloads: list[dict[str, Any]],
-    ) -> list[str]:
-        return [
-            self._submit_session_task(
-                spec_payload=spec_payload,
-                session_input_payload=session_input_payload,
-            )
-            for session_input_payload in session_input_payloads
-        ]
-
-    def _submit_session_task(
-        self,
-        *,
-        spec_payload: dict[str, Any],
-        session_input_payload: dict[str, Any],
-    ) -> str:
-        session_handle = uuid4().hex
-        session_id = session_input_payload["session_id"]
-        task = asyncio.create_task(
-            self._run_session(
-                session_handle=session_handle,
-                spec_payload=spec_payload,
-                session_input_payload=session_input_payload,
-            )
-        )
-        task.add_done_callback(lambda _task, handle=session_handle: self._completed_session_handles.append(handle))
-        self._tasks_by_handle[session_handle] = task
-        self._session_id_by_handle[session_handle] = str(session_id)
-        self._timeout_remaining_s_by_handle[session_handle] = float(spec_payload["timeout_s"])
-        return session_handle
-
-    def _start_session_timeout_clock(self, session_handle: str) -> None:
-        if session_handle not in self._timeout_active_handles:
-            return
-        if session_handle in self._timeout_active_started_at_by_handle:
-            return
-        if session_handle not in self._launcher_handle_by_session_handle:
-            return
-        remaining_s = self._timeout_remaining_s_by_handle.get(session_handle)
-        if remaining_s is None:
-            return
-        self._timeout_active_started_at_by_handle[session_handle] = time.monotonic()
-        task = self._timeout_tasks_by_handle.get(session_handle)
-        if task is not None and not task.done():
-            task.cancel()
-        self._timeout_tasks_by_handle[session_handle] = asyncio.create_task(
-            self._terminate_session_on_timeout(session_handle=session_handle, delay_s=max(0.0, remaining_s))
-        )
-
-    def _pause_session_timeout_clock(self, session_handle: str) -> None:
-        self._timeout_active_handles.discard(session_handle)
-        active_started_at = self._timeout_active_started_at_by_handle.pop(session_handle, None)
-        if active_started_at is not None and session_handle in self._timeout_remaining_s_by_handle:
-            elapsed_s = time.monotonic() - active_started_at
-            self._timeout_remaining_s_by_handle[session_handle] = max(
-                0.0,
-                self._timeout_remaining_s_by_handle[session_handle] - elapsed_s,
-            )
-        task = self._timeout_tasks_by_handle.pop(session_handle, None)
-        if task is not None and not task.done():
-            task.cancel()
-
-    def _clear_session_timeout_clock(self, session_handle: str) -> None:
-        self._pause_session_timeout_clock(session_handle)
-        self._timeout_remaining_s_by_handle.pop(session_handle, None)
-        self._launcher_handle_by_session_handle.pop(session_handle, None)
-        self._timed_out_session_handles.discard(session_handle)
-
-    async def _kill_launcher_handle(
-        self,
-        *,
-        launcher_handle: str,
-        signal_value: int,
-        reason: str,
-    ) -> dict[str, Any]:
-        try:
-            response = await self._launcher_client.kill(
-                handle=launcher_handle,
-                signal_value=signal_value,
-                forget=True,
-                wait=True,
-                force=True,
-                wait_timeout_s=_MANAGED_TERMINATION_WAIT_TIMEOUT_S,
-                force_signal_value=signal.SIGKILL,
-                force_wait_timeout_s=_MANAGED_FORCE_TERMINATION_WAIT_TIMEOUT_S,
-            )
-        except Exception as exc:
-            # An unknown handle means the process is already gone; releasing it is
-            # therefore already satisfied. Treat as idempotent success so a stale
-            # handle does not surface as a release failure and trigger a Global
-            # Restart. (Handles daemons that predate the daemon-side fix.)
-            if "Unknown launcher handle" in str(exc):
-                logger.warning(
-                    "Managed launcher handle already terminated; treating release as success: "
-                    "runner_id=%s handle=%s reason=%s",
-                    self._runner_id,
-                    launcher_handle,
-                    reason,
-                )
-                self._active_launcher_handles.discard(launcher_handle)
-                return {"handle": launcher_handle, "killed": False, "already_gone": True}
-            logger.error(
-                "Failed to confirm managed launcher process termination: runner_id=%s handle=%s reason=%s error=%s",
-                self._runner_id,
-                launcher_handle,
-                reason,
-                exc,
-            )
-            raise
-        self._active_launcher_handles.discard(launcher_handle)
-        return response
-
-    async def _terminate_session_on_timeout(self, *, session_handle: str, delay_s: float) -> None:
-        await asyncio.sleep(delay_s)
-        if session_handle not in self._timeout_active_started_at_by_handle:
-            return
-        launcher_handle = self._launcher_handle_by_session_handle.get(session_handle)
-        if not launcher_handle:
-            return
-        session_id = self._session_id_by_handle.get(session_handle, "")
-        logger.warning(
-            "Managed session active timeout reached; sending SIGTERM runner_id=%s session_id=%s "
-            "session_handle=%s launcher_handle=%s timeout_s=%s",
-            self._runner_id,
-            session_id,
-            session_handle,
-            launcher_handle,
-            self._timeout_remaining_s_by_handle.get(session_handle, 0.0),
-        )
-        self._timed_out_session_handles.add(session_handle)
-        try:
-            await self._kill_launcher_handle(
-                launcher_handle=launcher_handle,
-                signal_value=signal.SIGTERM,
-                reason="timeout",
-            )
-        finally:
-            task = self._tasks_by_handle.get(session_handle)
-            if task is not None and not task.done():
-                task.cancel()
-
-    async def set_session_timeouts_active(self, *, session_handles: list[str], active: bool) -> int:
-        changed_count = 0
-        for session_handle in dict.fromkeys(session_handles):
-            if session_handle not in self._tasks_by_handle:
-                if active:
-                    raise KeyError(f"Unknown managed session handle: {session_handle}")
-                continue
-            if active:
-                if session_handle not in self._timeout_active_handles:
-                    changed_count += 1
-                self._timeout_active_handles.add(session_handle)
-                self._start_session_timeout_clock(session_handle)
-            else:
-                if session_handle in self._timeout_active_handles:
-                    changed_count += 1
-                self._pause_session_timeout_clock(session_handle)
-        return changed_count
-
-    async def _run_session(
-        self,
-        *,
-        session_handle: str,
-        spec_payload: dict[str, Any],
-        session_input_payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        self._inflight += 1
-        released = False
-        permit_acquired = False
-        launch_permit_wait_started_at: float | None = None
-        session_id = session_input_payload["session_id"]
-        request_id = session_input_payload["metadata"]["request_id"]
-        self._active_session_ids.add(session_id)
-        logger.debug(
-            "ManagedSessionRunner runner_id=%s start session_id=%s request_id=%s inflight=%s",
-            self._runner_id,
-            session_id,
-            request_id,
-            self._inflight,
-        )
-
-        def _release_permit() -> None:
-            nonlocal released
-            if released:
-                return
-            released = True
-            if session_id:
-                self._waiting_launch_session_ids.discard(session_id)
-            if permit_acquired:
-                self._semaphore.release()
-                self._launch_permits_in_use -= 1
-                if self._launch_permits_in_use < 0:
-                    raise RuntimeError(
-                        "ManagedSessionRunner launch permit counter underflow: "
-                        f"runner_id={self._runner_id}, session_id={session_id}, request_id={request_id}."
-                    )
-
-        async def _acquire_permit() -> None:
-            nonlocal permit_acquired
-            nonlocal launch_permit_wait_started_at
-            launch_permit_wait_started_at = time.time()
-            if session_id:
-                self._waiting_launch_session_ids.add(session_id)
-            await self._semaphore.acquire()
-            permit_acquired = True
-            self._launch_permits_in_use += 1
-            if self._launch_permits_in_use > self._capacity:
-                raise RuntimeError(
-                    "ManagedSessionRunner launch permits exceed capacity: "
-                    f"runner_id={self._runner_id}, capacity={self._capacity}, "
-                    f"permits_in_use={self._launch_permits_in_use}."
-                )
-
-        def _record_launcher_handle(handle: str) -> None:
-            self._active_launcher_handles.add(handle)
-            self._launcher_handle_by_session_handle[session_handle] = handle
-            self._start_session_timeout_clock(session_handle)
-
-        try:
-            try:
-                result_payload = await execute_managed_session_input(
-                    spec=_managed_spec_from_payload(spec_payload),
-                    session_input=_session_input_from_payload(session_input_payload),
-                    launcher_client=self._launcher_client,
-                    before_process_launch=_acquire_permit,
-                    on_process_started=_release_permit,
-                    on_process_launched=_record_launcher_handle,
-                    on_process_finished=self._active_launcher_handles.discard,
-                    is_process_timed_out=lambda: session_handle in self._timed_out_session_handles,
-                )
-            except asyncio.CancelledError:
-                if session_handle in self._timed_out_session_handles:
-                    raise AgentExecutionError(
-                        f"Managed command agent timed out after {spec_payload['timeout_s']} seconds."
-                    ) from None
-                raise
-            except AgentExecutionError as exc:
-                message = str(exc)
-                shutdown_signal_exit = (
-                    "Managed command agent exited with code -9" in message
-                    or "Managed command agent exited with code -15" in message
-                )
-                if not self._shutdown_requested or not shutdown_signal_exit:
-                    raise
-                logger.info(
-                    "ManagedSessionRunner runner_id=%s suppressed managed agent exit during shutdown "
-                    "session_id=%s request_id=%s error=%s",
-                    self._runner_id,
-                    session_id,
-                    request_id,
-                    message.splitlines()[0] if message else type(exc).__name__,
-                )
-                return {
-                    "reward": None,
-                    "_session_id": session_id,
-                    "_session_output_metadata": {},
-                    "_agentic_trace_events": {
-                        "managed_terminated_by_shutdown": True,
-                        "managed_shutdown_exit_at": time.time(),
-                    },
-                }
-            profile = result_payload["_agentic_trace_events"]
-            if not isinstance(profile, dict):
-                raise TypeError("Managed result payload '_agentic_trace_events' must be a dict")
-            if launch_permit_wait_started_at is not None:
-                mark_agentic_event(profile, "managed_launch_queue_enter_at", launch_permit_wait_started_at)
-            return result_payload
-        finally:
-            self._clear_session_timeout_clock(session_handle)
-            if not released:
-                _release_permit()
-            if session_id:
-                self._active_session_ids.discard(session_id)
-                self._waiting_launch_session_ids.discard(session_id)
-                self._recent_completed_session_ids.append(session_id)
-            self._inflight -= 1
-            if self._inflight < 0:
-                raise RuntimeError(
-                    "ManagedSessionRunner inflight counter underflow: "
-                    f"runner_id={self._runner_id}, session_id={session_id}, request_id={request_id}."
-                )
-            logger.debug(
-                "ManagedSessionRunner runner_id=%s finish session_id=%s request_id=%s inflight=%s",
-                self._runner_id,
-                session_id,
-                request_id,
-                self._inflight,
-            )
-
-    async def drain_completed_sessions(self, *, session_handles: list[str] | None = None) -> list[str]:
-        requested_handles = set(session_handles) if session_handles is not None else None
-        ready: list[str] = []
-        retained: deque[str] = deque()
-        while self._completed_session_handles:
-            session_handle = self._completed_session_handles.popleft()
-            task = self._tasks_by_handle.get(session_handle)
-            if task is None or not task.done():
-                continue
-            if requested_handles is not None and session_handle not in requested_handles:
-                retained.append(session_handle)
-                continue
-            ready.append(session_handle)
-        if retained:
-            retained.extend(self._completed_session_handles)
-            self._completed_session_handles = retained
-        return ready
-
-    async def completed_sessions(self, *, session_handles: list[str]) -> list[str]:
-        return [
-            session_handle
-            for session_handle in session_handles
-            if (task := self._tasks_by_handle.get(session_handle)) is not None and task.done()
-        ]
-
-    async def completed_session_diagnostics(self, *, session_handles: list[str]) -> dict[str, dict[str, Any]]:
-        """Peek the result/exception of each completed task without consuming
-        it.
-
-        Returns a dict mapping session_handle -> diagnostic payload. The diagnostic
-        payload distinguishes:
-          - ``{"kind": "exception", "error_type": str, "message": str}`` — task
-            raised; for AgentExecutionError the ``message`` carries the agent
-            subprocess's exit code AND full stdout+stderr (see
-            ``execute_managed_session_input`` line ~346).
-          - ``{"kind": "cancelled"}`` — task was cancelled (e.g. shutdown).
-          - ``{"kind": "result", "session_id": str, "reward": Any}`` — task
-            returned a result payload but never produced a chat IR upstream
-            (the genuine "silent-success" case: agent exited 0 without doing work).
-
-        Tasks that are missing from tracking or not yet done are omitted so this
-        is safe to call with the full set of group handles. Does NOT consume the
-        task — other layers (materialization, release_sessions) can still process
-        it normally.
-        """
-        result: dict[str, dict[str, Any]] = {}
-        for handle in session_handles:
-            task = self._tasks_by_handle.get(handle)
-            if task is None or not task.done():
-                continue
-            if task.cancelled():
-                result[handle] = {"kind": "cancelled"}
-                continue
-            exc = task.exception()
-            if exc is not None:
-                result[handle] = {
-                    "kind": "exception",
-                    "error_type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                continue
-            payload = task.result()
-            reward = payload.get("reward") if isinstance(payload, dict) else None
-            result[handle] = {
-                "kind": "result",
-                "session_id": self._session_id_by_handle.get(handle, ""),
-                "reward": reward,
-            }
-        return result
-
-    async def collect_session(self, *, session_handle: str) -> dict[str, Any]:
-        task = self._tasks_by_handle.get(session_handle)
-        if task is None:
-            raise KeyError(f"Unknown managed session handle: {session_handle}")
-        try:
-            return await task
-        finally:
-            self._tasks_by_handle.pop(session_handle, None)
-            self._session_id_by_handle.pop(session_handle, None)
-
-    async def release_sessions(self, *, session_handles: list[str], signal_before_wait: int | None = None) -> int:
-        if not session_handles:
-            return 0
-        unique_handles: list[str] = []
-        seen_handles: set[str] = set()
-        for session_handle in session_handles:
-            if session_handle in seen_handles:
-                continue
-            if session_handle not in self._tasks_by_handle:
-                # Handle can legitimately be missing if the runner actor was
-                # respawned (e.g. after OOM kill) between session start and
-                # release; treat cleanup of a dead session as a no-op.
-                logger.warning("release_sessions: unknown managed session handle %s; skipping", session_handle)
-                continue
-            seen_handles.add(session_handle)
-            unique_handles.append(session_handle)
-        if not unique_handles:
-            return 0
-        tasks = [self._tasks_by_handle[session_handle] for session_handle in unique_handles]
-        launcher_handles_by_session_handle = {
-            session_handle: self._launcher_handle_by_session_handle.get(session_handle)
-            for session_handle in unique_handles
-        }
-        if signal_before_wait is not None:
-            kill_tasks = []
-            for session_handle in unique_handles:
-                task = self._tasks_by_handle[session_handle]
-                if task.done():
-                    continue
-                launcher_handle = launcher_handles_by_session_handle.get(session_handle)
-                if launcher_handle:
-                    kill_tasks.append(
-                        self._kill_launcher_handle(
-                            launcher_handle=launcher_handle,
-                            signal_value=signal_before_wait,
-                            reason="release_sessions",
-                        )
-                    )
-            if kill_tasks:
-                kill_results = await asyncio.gather(*kill_tasks, return_exceptions=True)
-                kill_failures = [result for result in kill_results if isinstance(result, BaseException)]
-                if kill_failures:
-                    # A launcher that cannot be confirmed-killed (e.g. a
-                    # descendant wedged in D-state on slow shared storage, so
-                    # even SIGKILL is only pending) must NOT fail the whole
-                    # release: raising here marks the rollout service unhealthy
-                    # and escalates to a Controller global restart that tears
-                    # down the actor + inference engine mid-step. Log and
-                    # continue best-effort -- the session tasks are cancelled
-                    # below regardless, and the doomed process is reaped once
-                    # its blocking syscall returns.
-                    logger.warning(
-                        "release_sessions: %d managed launcher process(es) not confirmed terminated; "
-                        "continuing best-effort (first error: %s)",
-                        len(kill_failures),
-                        kill_failures[0],
-                    )
-            for session_handle in unique_handles:
-                task = self._tasks_by_handle[session_handle]
-                if not task.done():
-                    task.cancel()
-        for session_handle in unique_handles:
-            self._clear_session_timeout_clock(session_handle)
-        await asyncio.gather(*tasks, return_exceptions=True)
-        for session_handle in unique_handles:
-            self._tasks_by_handle.pop(session_handle, None)
-            self._session_id_by_handle.pop(session_handle, None)
-        if self._completed_session_handles:
-            released_handles = set(unique_handles)
-            self._completed_session_handles = deque(
-                session_handle
-                for session_handle in self._completed_session_handles
-                if session_handle not in released_handles
-            )
-        return len(unique_handles)
-
-    async def debug_state(self, *, sample_limit: int = 16) -> dict[str, Any]:
-        active_samples = sorted(self._active_session_ids)[:sample_limit]
-        waiting_launch_samples = sorted(self._waiting_launch_session_ids)[:sample_limit]
-        completed_task_count = sum(1 for task in self._tasks_by_handle.values() if task.done())
-        available_launch_slots = self._capacity - self._launch_permits_in_use
-        return {
-            "runner_id": self._runner_id,
-            "launch_capacity": self._capacity,
-            "launch_permits_in_use": self._launch_permits_in_use,
-            "inflight": self._inflight,
-            "tracked_session_tasks": len(self._tasks_by_handle),
-            "completed_session_tasks": completed_task_count,
-            "completed_session_queue": len(self._completed_session_handles),
-            "active_launcher_handle_count": len(self._active_launcher_handles),
-            "available_launch_slots": available_launch_slots,
-            "active_session_count": len(self._active_session_ids),
-            "waiting_launch_count": len(self._waiting_launch_session_ids),
-            "timeout_active_session_count": len(self._timeout_active_handles),
-            "timeout_tracked_session_count": len(self._timeout_remaining_s_by_handle),
-            "timeout_triggered_session_count": len(self._timed_out_session_handles),
-            "active_session_samples": active_samples,
-            "waiting_launch_samples": waiting_launch_samples,
-            "recent_completed_session_samples": list(self._recent_completed_session_ids)[-sample_limit:],
-        }
-
-    async def shutdown(self) -> bool:
-        self._shutdown_requested = True
-        tasks = list(self._tasks_by_handle.values())
-        active_launcher_handles = list(self._active_launcher_handles)
-        kill_tasks = [
-            self._kill_launcher_handle(
-                launcher_handle=handle,
-                signal_value=signal.SIGTERM,
-                reason="shutdown",
-            )
-            for handle in active_launcher_handles
-        ]
-        if kill_tasks:
-            kill_results = await asyncio.gather(*kill_tasks, return_exceptions=True)
-            for result in kill_results:
-                if isinstance(result, BaseException):
-                    logger.warning("Managed launcher process termination failed during shutdown: %s", result)
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._active_launcher_handles.clear()
-        self._active_session_ids.clear()
-        self._waiting_launch_session_ids.clear()
-        self._recent_completed_session_ids.clear()
-        self._tasks_by_handle.clear()
-        self._session_id_by_handle.clear()
-        self._completed_session_handles.clear()
-        for task in self._timeout_tasks_by_handle.values():
-            if not task.done():
-                task.cancel()
-        self._launcher_handle_by_session_handle.clear()
-        self._timeout_remaining_s_by_handle.clear()
-        self._timeout_active_started_at_by_handle.clear()
-        self._timeout_tasks_by_handle.clear()
-        self._timeout_active_handles.clear()
-        self._timed_out_session_handles.clear()
-        return True
-
-
-class ManagedSessionRunnerPool:
-    def __init__(self, handles: list[Any], *, capacities: list[int]) -> None:
-        if not handles:
-            raise ValueError("Managed session session runner pool requires at least one session runner.")
-        self._handles = handles
-        self._total_capacity = sum(capacities)
-        self._active_session_count = 0
-        self._reserved_launch_slots = 0
-        self._next_index = 0
-
-    def drain_completed_session_handles(
-        self, *, session_handles: list[ManagedSessionHandle] | None = None
-    ) -> list[ManagedSessionHandle]:
-        handles_by_runner_id: dict[int, list[str]] | None = None
-        if session_handles is not None:
-            if not session_handles:
-                return []
-            handles_by_runner_id = {}
-            for handle in session_handles:
-                if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
-                    raise RuntimeError(
-                        "Managed session handle references an unknown runner: "
-                        f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
-                    )
-                handles_by_runner_id.setdefault(handle.runner_id, []).append(handle.session_handle)
-        refs = []
-        ref_to_runner_id: dict[Any, int] = {}
-        if handles_by_runner_id is None:
-            runner_items = list(enumerate(self._handles))
-        else:
-            runner_items = [(runner_id, self._handles[runner_id]) for runner_id in sorted(handles_by_runner_id)]
-        for runner_id, handle in runner_items:
-            requested_handles = None if handles_by_runner_id is None else handles_by_runner_id[runner_id]
-            ref = handle.drain_completed_sessions.remote(session_handles=requested_handles)
-            refs.append(ref)
-            ref_to_runner_id[ref] = runner_id
-        completed_handles: list[ManagedSessionHandle] = []
-        for ref, session_handles in zip(refs, ray.get(refs), strict=True):
-            runner_id = ref_to_runner_id[ref]
-            for session_handle in session_handles:
-                completed_handles.append(ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle)))
-        return completed_handles
-
-    def completed_session_handles(self, *, session_handles: list[ManagedSessionHandle]) -> list[ManagedSessionHandle]:
-        if not session_handles:
-            return []
-        handles_by_runner_id: dict[int, list[str]] = {}
-        for handle in session_handles:
-            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
-                raise RuntimeError(
-                    "Managed session handle references an unknown runner: "
-                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
-                )
-            handles_by_runner_id.setdefault(handle.runner_id, []).append(handle.session_handle)
-        refs = []
-        ref_to_runner_id: dict[Any, int] = {}
-        for runner_id in sorted(handles_by_runner_id):
-            ref = self._handles[runner_id].completed_sessions.remote(session_handles=handles_by_runner_id[runner_id])
-            refs.append(ref)
-            ref_to_runner_id[ref] = runner_id
-        completed_handles: list[ManagedSessionHandle] = []
-        for ref, completed_session_handles in zip(refs, ray.get(refs), strict=True):
-            runner_id = ref_to_runner_id[ref]
-            for session_handle in completed_session_handles:
-                completed_handles.append(ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle)))
-        return completed_handles
-
-    def completed_session_diagnostics(
-        self, *, session_handles: list[ManagedSessionHandle]
-    ) -> dict[ManagedSessionHandle, dict[str, Any]]:
-        """Fan out to each runner and collect diagnostic info for every handle
-        whose task has finished.
-
-        See ``ManagedSessionRunner.completed_session_diagnostics`` for the per-
-        handle payload schema. Used by RuntimeDomain when raising the
-        ``completed before producing a chat IR`` error so the driver log can
-        show the agent's actual exit reason (AgentExecutionError stdio for
-        subprocess crashes, ``kind=result`` for true silent-success bugs)
-        instead of only a list of session_ids.
-        """
-        if not session_handles:
-            return {}
-        handles_by_runner_id: dict[int, list[str]] = {}
-        for handle in session_handles:
-            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
-                raise RuntimeError(
-                    "Managed session handle references an unknown runner: "
-                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
-                )
-            handles_by_runner_id.setdefault(handle.runner_id, []).append(handle.session_handle)
-        refs = []
-        ref_to_runner_id: dict[Any, int] = {}
-        for runner_id in sorted(handles_by_runner_id):
-            ref = self._handles[runner_id].completed_session_diagnostics.remote(
-                session_handles=handles_by_runner_id[runner_id]
-            )
-            refs.append(ref)
-            ref_to_runner_id[ref] = runner_id
-        diagnostics: dict[ManagedSessionHandle, dict[str, Any]] = {}
-        for ref, partial in zip(refs, ray.get(refs), strict=True):
-            runner_id = ref_to_runner_id[ref]
-            if not isinstance(partial, dict):
-                continue
-            for session_handle_str, diag in partial.items():
-                key = ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle_str))
-                diagnostics[key] = diag
-        return diagnostics
-
-    def available_launch_slots(self) -> int:
-        available_launch_slots = self._total_capacity - self._active_session_count - self._reserved_launch_slots
-        if available_launch_slots < 0:
-            raise RuntimeError(
-                "ManagedSessionRunnerPool active task count and reserved launches exceed total launch capacity: "
-                f"capacity={self._total_capacity}, active={self._active_session_count}, "
-                f"reserved={self._reserved_launch_slots}."
-            )
-        return available_launch_slots
-
-    def reserve_launch_slots(self, session_count: int) -> None:
-        if session_count < 0:
-            raise RuntimeError(f"ManagedSessionRunnerPool cannot reserve negative launch slots: {session_count}.")
-        if session_count == 0:
-            return
-        available_launch_slots = self.available_launch_slots()
-        if session_count > available_launch_slots:
-            raise RuntimeError(
-                "ManagedSessionRunnerPool launch reservation exceeds available capacity: "
-                f"requested={session_count}, available={available_launch_slots}, "
-                f"capacity={self._total_capacity}, active={self._active_session_count}, "
-                f"reserved={self._reserved_launch_slots}."
-            )
-        self._reserved_launch_slots += session_count
-
-    def release_launch_slots(self, session_count: int) -> None:
-        if session_count < 0:
-            raise RuntimeError(f"ManagedSessionRunnerPool cannot release negative launch slots: {session_count}.")
-        if session_count == 0:
-            return
-        next_reserved_launch_slots = self._reserved_launch_slots - session_count
-        if next_reserved_launch_slots < 0:
-            raise RuntimeError(
-                "ManagedSessionRunnerPool launch reservation underflow: "
-                f"reserved={self._reserved_launch_slots}, release={session_count}."
-            )
-        self._reserved_launch_slots = next_reserved_launch_slots
-
-    def submit_sessions(self, *, spec: ManagedCommandAppSpec, session_inputs: list[SessionInput]) -> list[Any]:
-        if not session_inputs:
-            return []
-        spec_payload = _managed_spec_to_payload(spec)
-        grouped_inputs: dict[int, list[tuple[int, SessionInput]]] = {}
-        for item_index, session_input in enumerate(session_inputs):
-            runner_id = self._next_index % len(self._handles)
-            self._next_index += 1
-            grouped_inputs.setdefault(runner_id, []).append((item_index, session_input))
-
-        refs = []
-        ref_to_runner_id: dict[Any, int] = {}
-        for runner_id, items in grouped_inputs.items():
-            payloads = [_session_input_to_payload(session_input) for _, session_input in items]
-            ref = self._handles[runner_id].submit_sessions.remote(spec_payload, payloads)
-            refs.append(ref)
-            ref_to_runner_id[ref] = runner_id
-
-        submitted_handles: list[ManagedSessionHandle | None] = [None] * len(session_inputs)
-        for ref, session_handles in zip(refs, ray.get(refs), strict=True):
-            runner_id = ref_to_runner_id[ref]
-            indexed_inputs = grouped_inputs[runner_id]
-            if len(session_handles) != len(indexed_inputs):
-                raise RuntimeError(
-                    "ManagedSessionRunner returned a mismatched number of session handles: "
-                    f"runner_id={runner_id}, expected={len(indexed_inputs)}, got={len(session_handles)}."
-                )
-            for (item_index, _session_input), session_handle in zip(indexed_inputs, session_handles, strict=True):
-                managed_handle = ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle))
-                submitted_handles[item_index] = managed_handle
-
-        missing_handle_count = sum(handle is None for handle in submitted_handles)
-        if missing_handle_count:
-            raise RuntimeError(f"Managed session batch submission missed {missing_handle_count} handles.")
-        self._active_session_count += len(submitted_handles)
-        return submitted_handles
-
-    def collect_session_result_ref(self, handle: ManagedSessionHandle) -> Any:
-        return self._handles[handle.runner_id].collect_session.remote(session_handle=handle.session_handle)
-
-    def set_session_timeouts_active(self, handles: list[ManagedSessionHandle], *, active: bool) -> list[Any]:
-        unique_handles: list[ManagedSessionHandle] = []
-        seen_handles: set[tuple[int, str]] = set()
-        for handle in handles:
-            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
-                raise RuntimeError(
-                    "Managed session handle references an unknown runner: "
-                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
-                )
-            handle_key = (handle.runner_id, handle.session_handle)
-            if handle_key in seen_handles:
-                continue
-            seen_handles.add(handle_key)
-            unique_handles.append(handle)
-        grouped_handles: dict[int, list[str]] = {}
-        for handle in unique_handles:
-            grouped_handles.setdefault(handle.runner_id, []).append(handle.session_handle)
-        return [
-            self._handles[runner_id].set_session_timeouts_active.remote(
-                session_handles=session_handles,
-                active=active,
-            )
-            for runner_id, session_handles in grouped_handles.items()
-        ]
-
-    def release_session_handles(
-        self,
-        handles: list[ManagedSessionHandle],
-        *,
-        signal_before_wait: int | None = None,
-    ) -> list[Any]:
-        unique_handles: list[ManagedSessionHandle] = []
-        seen_handles: set[tuple[int, str]] = set()
-        for handle in handles:
-            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
-                raise RuntimeError(
-                    "Managed session handle references an unknown runner: "
-                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
-                )
-            handle_key = (handle.runner_id, handle.session_handle)
-            if handle_key in seen_handles:
-                continue
-            seen_handles.add(handle_key)
-            unique_handles.append(handle)
-        grouped_handles: dict[int, list[str]] = {}
-        for handle in unique_handles:
-            grouped_handles.setdefault(handle.runner_id, []).append(handle.session_handle)
-        refs = [
-            self._handles[runner_id].release_sessions.remote(
-                session_handles=session_handles,
-                signal_before_wait=signal_before_wait,
-            )
-            for runner_id, session_handles in grouped_handles.items()
-        ]
-        return refs
-
-    def mark_session_handles_released(self, released_count: int) -> None:
-        self._active_session_count -= released_count
-        if self._active_session_count < 0:
-            raise RuntimeError(
-                "ManagedSessionRunnerPool released more sessions than it submitted: "
-                f"released={released_count}, active={self._active_session_count}."
-            )
-
-    def shutdown(self) -> None:
-        shutdown_refs = []
-        for handle in self._handles:
-            try:
-                shutdown_refs.append(handle.shutdown.remote())
-            except Exception:
-                continue
-        if shutdown_refs:
-            ray.get(shutdown_refs)
-        self._handles.clear()
-        self._active_session_count = 0
-        self._reserved_launch_slots = 0
-        self._total_capacity = 0
-        self._next_index = 0
-
-    def debug_state(self, *, sample_limit: int = 8) -> list[dict[str, Any]]:
-        debug_refs = []
-        for handle in self._handles:
-            try:
-                debug_refs.append(handle.debug_state.remote(sample_limit=sample_limit))
-            except Exception:
-                continue
-        if not debug_refs:
-            return []
-        try:
-            snapshots = ray.get(debug_refs, timeout=10)
-        except Exception:
-            return []
-        return [dict(item) for item in snapshots if isinstance(item, dict)]
-
-
-def create_managed_session_runner_pool(args: Any, *, total_requests: int) -> ManagedSessionRunnerPool | None:
-    resources = get_agentic_runtime_resources(args)
-
-    def _factory(capacities: list[int]) -> ManagedSessionRunnerPool:
-        handles = []
-        for runner_id, launch_capacity in enumerate(capacities):
-            handle = ManagedSessionRunner.options(
-                # Require a *tiny* CPU reservation so runners cannot land on the head node
-                num_cpus=0.01,
-                scheduling_strategy="SPREAD",
-            ).remote(runner_id=runner_id, launch_capacity=launch_capacity)
-            handles.append(handle)
-        return ManagedSessionRunnerPool(handles, capacities=capacities)
-
-    return resources.build_session_runner_pool(total_requests=total_requests, factory=_factory)
-
-
-@dataclass
-class SampleSeedInfo:
-    group_index: int | None = None
-    index: int | None = None
-    label: str | None = None
-    train_metadata: dict[str, Any] | None = None
-
-
-@dataclass
-class RequestEnvelope:
-    metadata: dict[str, Any] = field(default_factory=dict)
-    input_payload: dict[str, Any] = field(default_factory=dict)
-    sampling_params: dict[str, Any] | None = None
-    session_id: str | None = None
-    request_id: str | None = None
-    rollout_id: int | None = None
-    seed: SampleSeedInfo = field(default_factory=SampleSeedInfo)
-
-
-def resolve_chat_api_base_url() -> str:
-    from relax.utils.utils import get_serve_url
-
-    return f"{get_serve_url(route_prefix=AGENTIC_CHAT_API_ROUTE_PREFIX)}/"
-
-
-def _sample_metadata(sample: Sample) -> dict[str, Any]:
-    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-    return metadata
-
-
-def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:
-    if prompt is None or (isinstance(prompt, (dict, list)) and not prompt):
-        return []
-    if isinstance(prompt, str):
-        if not prompt.strip():
-            return []
-        return check_messages([{"role": "user", "content": prompt}])
-    if isinstance(prompt, dict):
-        messages = [prompt]
-    elif isinstance(prompt, list):
-        messages = prompt
-    else:
-        raise TypeError(f"prompt must be a string, dict, list, or None, got {type(prompt)}")
-    if len(messages) == 1 and isinstance(messages[0], dict):
-        message = messages[0]
-        content = message.get("content")
-        if message.get("role") == "user" and (
-            content in (None, []) or (isinstance(content, str) and not content.strip())
-        ):
-            return []
-    return check_messages(messages)
-
-
-def _transport_image_payload(payload: Any) -> str:
-    if isinstance(payload, str) and payload.startswith(("data:image/", "http://", "https://")):
-        return payload
-
-    from PIL import Image
-
-    from relax.utils.multimodal.image_utils import load_image
-
-    if isinstance(payload, dict):
-        if isinstance(payload.get("bytes"), bytes):
-            payload = payload["bytes"]
-        elif isinstance(payload.get("path"), str) and payload["path"]:
-            payload = payload["path"]
-    image = payload if isinstance(payload, Image.Image) else load_image(payload)
-    buffer = BytesIO()
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded}"
-
-
-def _transport_dataset_message_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rendered_messages: list[dict[str, Any]] = []
-    for message in messages:
-        content = message["content"]
-        if isinstance(content, str):
-            rendered_messages.append(message)
-            continue
-        rendered_content: list[dict[str, Any]] = []
-        for item in content:
-            item_type = item.get("type")
-            if item_type == "image":
-                rendered_content.append(
-                    {"type": "image_url", "image_url": {"url": _transport_image_payload(item.get("image"))}}
-                )
-                continue
-            rendered_content.append(copy.deepcopy(item))
-        rendered_messages.append({"role": message["role"], "content": rendered_content})
-    return rendered_messages
-
-
-def _sample_messages(sample: Sample) -> list[dict[str, Any]]:
-    return _transport_dataset_message_media(_normalize_prompt(sample.prompt))
-
-
-def _request_envelope_from_sample(
-    sample: Sample,
-    *,
-    rollout_id: int | None = None,
-    sampling_params: dict[str, Any] | None = None,
-    shared_messages: list[dict[str, Any]] | None = None,
-    include_input_payload: bool = True,
-) -> RequestEnvelope:
-    metadata = _sample_metadata(sample)
-    if rollout_id is not None and sample.group_index is None:
-        raise ValueError("sample.group_index is required for rollout-managed request envelopes")
-    messages: list[dict[str, Any]] = []
-    input_payload: dict[str, Any] = {}
-    if include_input_payload:
-        messages = copy.copy(shared_messages) if shared_messages is not None else _sample_messages(sample)
-        input_payload["messages"] = messages
-        if metadata:
-            input_payload["metadata"] = metadata
-    if sampling_params is None:
-        sampling_params = getattr(sample, "sampling_params", None)
-    return RequestEnvelope(
-        metadata=metadata,
-        input_payload=input_payload,
-        sampling_params=copy.deepcopy(sampling_params) if sampling_params is not None else None,
-        session_id=sample.session_id,
-        rollout_id=rollout_id,
-        seed=SampleSeedInfo(
-            group_index=sample.group_index,
-            index=sample.index,
-            label=sample.label,
-            train_metadata=sample.train_metadata,
-        ),
-    )
-
-
-def _request_groups_from_sample_groups(
-    groups: list[list[Sample]], *, rollout_id: int | None = None, include_input_payload: bool = True
-) -> list[list[RequestEnvelope]]:
-    request_groups: list[list[RequestEnvelope]] = []
-    for group in groups:
-        if not group:
-            request_groups.append([])
-            continue
-        if include_input_payload:
-            shared_messages = _sample_messages(group[0])
-        else:
-            shared_messages = []
-        request_groups.append(
-            [
-                _request_envelope_from_sample(
-                    sample,
-                    rollout_id=rollout_id,
-                    shared_messages=shared_messages,
-                    include_input_payload=include_input_payload,
-                )
-                for sample in group
-            ]
-        )
-    return request_groups
-
-
-@dataclass(frozen=True)
-class _ManagedRequestResult:
-    # The managed agent task is complete, but the ChatAPI session is still alive.
-    # Finalize/discard belongs to materialization, so this object must never destroy session state by itself.
-    result_payload: dict[str, Any]
-    session_runner_started_at: float
-
-
-@dataclass(frozen=True)
-class ExecutionDispatch:
-    materialized_batches: list[list[dict[str, Any]]] = field(default_factory=list)
-    ready_groups: list[list[Sample]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class _MaterializationFailure:
-    request_id: str
-    session_id: str
-    group_key: GroupKey
-    error: Exception
-
-
-@dataclass(frozen=True)
-class _PrepareRequestPlan:
-    slot_idx: int
-    envelope: RequestEnvelope
-    session_id: str
-    request_sampling_params: dict[str, Any]
-
-
-class _ServeHandleChatControlClient:
-    def __init__(self, *, handle: Any):
-        self._handle = handle
-
-    async def aclose(self) -> None:
-        return None
-
-    async def finalize_and_discard(
-        self,
-        *,
-        session_id: str,
-        metadata: dict[str, Any] | None = None,
-        reward: float | dict[str, Any] | None = None,
-        output_records: list[dict[str, Any]] | None = None,
-    ) -> FinalizedResultTransport:
-        return await self._handle.finalize_and_discard.remote(
-            session_id=session_id,
-            metadata=metadata,
-            reward=reward,
-            output_records=output_records,
-        )
-
-    async def discard_session(self, *, session_id: str) -> bool:
-        return await self._handle.discard_session.remote(session_id=session_id)
-
-    async def register_sessions_batch(self, *, entries: list[dict[str, Any]]) -> int:
-        return int(await self._handle.register_sessions_batch.remote(entries=entries))
-
-    async def release_partial_resume_gate(self, *, rollout_id: int) -> int:
-        return int(await self._handle.release_partial_resume_gate.remote(rollout_id=rollout_id))
-
-    async def gate_rollout_irs_for_partial_resume(self, *, rollout_id: int) -> int:
-        return int(await self._handle.gate_rollout_irs_for_partial_resume.remote(rollout_id=rollout_id))
-
-    async def gate_rollout_irs_for_discard(self, *, rollout_id: int) -> int:
-        return int(await self._handle.gate_rollout_irs_for_discard.remote(rollout_id=rollout_id))
-
-    async def gate_all_irs_for_shutdown(self) -> int:
-        return int(await self._handle.gate_all_irs_for_shutdown.remote())
-
-    async def active_rollout_request_counts(self, *, rollout_id: int) -> dict[str, int]:
-        return dict(await self._handle.active_rollout_request_counts.remote(rollout_id=rollout_id))
-
-    async def abort_rollout_requests(self, *, rollout_id: int) -> dict[str, int]:
-        return dict(await self._handle.abort_rollout_requests.remote(rollout_id=rollout_id))
-
-    async def aborted_resume_session_ids(self, *, rollout_id: int) -> list[str]:
-        return list(await self._handle.aborted_resume_session_ids.remote(rollout_id=rollout_id))
-
-    async def enter_eval(self) -> int:
-        return int(await self._handle.enter_eval.remote())
-
-    async def exit_eval(self) -> int:
-        return int(await self._handle.exit_eval.remote())
-
-    async def trim_memory(self) -> dict[str, Any]:
-        return dict(await self._handle.trim_memory.remote())
-
-    async def debug_state(self, *, sample_limit: int = 0) -> dict[str, Any]:
-        return dict(await self._handle.debug_state.remote(sample_limit=int(sample_limit)))
-
-    async def prepare_group_status(self, *, scope_id: str) -> list[dict[str, Any]]:
-        return list(await self._handle.prepare_group_status.remote(scope_id=scope_id))
-
-    async def activate_group_sessions(
-        self,
-        *,
-        scope_id: str,
-        groups: list[dict[str, Any]],
-        rollout_id: int,
-    ) -> dict[str, int]:
-        return dict(
-            await self._handle.activate_group_sessions.remote(
-                scope_id=scope_id,
-                groups=groups,
-                rollout_id=rollout_id,
-            )
-        )
-
-
-def create_agentic_service_client() -> _ServeHandleChatControlClient:
-    global _AGENTIC_SERVICE_CLIENT
-    if _AGENTIC_SERVICE_CLIENT is not None:
-        return _AGENTIC_SERVICE_CLIENT
-    from ray import serve
-
-    if not ray.is_initialized():
-        raise RuntimeError("Agentic chat control requires a live Ray Serve handle for 'agentic_chat_api'.")
-    try:
-        handle = serve.get_app_handle(AGENTIC_CHAT_API_SERVICE_NAME)
-    except Exception as exc:
-        raise RuntimeError("Agentic chat control requires a live Ray Serve handle for 'agentic_chat_api'.") from exc
-    _AGENTIC_SERVICE_CLIENT = _ServeHandleChatControlClient(handle=handle)
-    return _AGENTIC_SERVICE_CLIENT
-
-
-async def _resolve_object_async(payload: Any, *, executor: Any = None) -> Any:
-    if not ray.is_initialized():
-        return payload
-    object_ref_type = getattr(ray, "ObjectRef", None)
-    if object_ref_type is None or not isinstance(payload, object_ref_type):
-        return payload
-    loop = asyncio.get_running_loop()
-    if executor is not None:
-        return await loop.run_in_executor(executor, ray.get, payload)
-    if hasattr(payload, "__await__"):
-        return await payload
-    return await loop.run_in_executor(executor, ray.get, payload)
-
-
-def _overlay_sample_metadata(
-    *,
-    base_metadata: dict[str, Any] | None,
-    overlay_metadata: dict[str, Any] | None,
-) -> dict[str, Any]:
-    base = base_metadata if isinstance(base_metadata, dict) else {}
-    if not isinstance(overlay_metadata, dict) or not overlay_metadata:
-        return base
-
-    overlay_trace = overlay_metadata.get(TRACE_KEY)
-    if overlay_trace is not None:
-        base[TRACE_KEY] = merge_agentic_trace(base.get(TRACE_KEY), overlay_trace)
-
-    for key, value in overlay_metadata.items():
-        if key == TRACE_KEY:
-            continue
-        base[key] = copy.deepcopy(value)
-    return base
-
-
-class RuntimeDomain:
-    def __init__(
-        self,
-        *,
-        args,
-        scope_id: str,
-    ) -> None:
-        if not isinstance(scope_id, str) or not scope_id:
-            raise RuntimeError("RuntimeDomain requires a non-empty scope_id.")
-        self.args = args
-        self.scope_id = scope_id
-        self.rollout_id: int | None = None
-        self.managed_chat_api_base_url: str | None = None
-        self.runtime_slots_by_request_id: dict[str, RuntimeSlot] = {}
-        self.runtime_groups_by_key: dict[GroupKey, RuntimeGroup] = {}
-        self._discarded_group_keys: set[GroupKey] = set()
-        self._aborted_resume_session_ids_by_rollout: dict[int, set[str]] = {}
-        self._interrupted_close_accounting_last_refresh_at = 0.0
-        self._interrupted_close_accounting_refresh_interval_s = 0.5
-        self.session_debug_state: dict[str, Any] | None = None
-        self._ready_materialized_batches: list[list[dict[str, Any]]] = []
-        self._ready_materialized_groups: list[tuple[GroupKey, list[Sample]]] = []
-        self._output_ready_event = asyncio.Event()
-        self._ready_materialized_session_count = 0
-        self._emitted_materialized_session_count_total = 0
-        self._drained_materialized_session_count_total = 0
-        self._managed_app_spec = load_agent_app_spec_from_args(args)
-        self._runtime_session_counter = 0
-        self._runtime_request_counter = 0
-        self._notified_session_rollouts: dict[str, int] = {}
-        self._rollout_mode = "train"
-        self._runtime_resources = get_agentic_runtime_resources(args)
-        self._session_runner_pool_lock = threading.Lock()
-        self._session_runner_pool_total_requests = self._runtime_resources.target_session_count
-
-        self._session_runner_pool: ManagedSessionRunnerPool | None = None
-        self._service_client = None
-
-        if ray.is_initialized():
-            try:
-                create_agentic_service_client()
-            except Exception:
-                logger.debug("Agentic service handles are not ready yet.", exc_info=True)
-            self._service_client = _AGENTIC_SERVICE_CLIENT
-            self.ensure_session_runner_pool(total_requests=self._session_runner_pool_total_requests)
-
-    def rebind_step(
-        self,
-        *,
-        args,
-        rollout_id: int,
-    ) -> None:
-        self.args = args
-        self.rollout_id = rollout_id
-        self._rollout_mode = "train"
-        self._managed_app_spec = load_agent_app_spec_from_args(args)
-        self._runtime_resources = get_agentic_runtime_resources(args)
-        self._session_runner_pool_total_requests = max(
-            self._session_runner_pool_total_requests,
-            self._runtime_resources.target_session_count,
-        )
-        self._interrupted_close_accounting_last_refresh_at = 0.0
-
-    def require_rollout_id(self) -> int:
-        if self.rollout_id is None:
-            raise RuntimeError("RuntimeDomain step is not bound.")
-        return self.rollout_id
-
-    async def drop_resident_results(self) -> int:
-        dropped_group_keys: set[GroupKey] = set(self._discarded_group_keys)
-        dropped_group_keys.update(self.runtime_groups_by_key)
-        for records in self._ready_materialized_batches:
-            for record in records:
-                dropped_group_keys.add(record["group_key"])
-        for group_key, _group in self._ready_materialized_groups:
-            dropped_group_keys.add(group_key)
-
-        for group_key in list(dropped_group_keys):
-            await self._drop_runtime_group_resources(group_key=group_key)
-        self.runtime_slots_by_request_id.clear()
-        self.runtime_groups_by_key.clear()
-        self._discarded_group_keys.clear()
-        self._aborted_resume_session_ids_by_rollout.clear()
-        self._interrupted_close_accounting_last_refresh_at = 0.0
-        self._ready_materialized_batches.clear()
-        self._ready_materialized_groups.clear()
-        self._ready_materialized_session_count = 0
-        self._output_ready_event.clear()
-        return len(dropped_group_keys)
-
-    def _register_runtime_slot(
-        self,
-        *,
-        request_id: str,
-        session_id: str,
-        dispatch_context: RequestDispatchContext,
-        seed_sample: Sample,
-        managed_session_handle: Any,
-        managed_session_submitted_at: float,
-    ) -> None:
-        if request_id in self.runtime_slots_by_request_id:
-            raise RuntimeError(f"RuntimeDomain received duplicate resident slot request_id={request_id!r}.")
-        slot = RuntimeSlot(
-            request_id=request_id,
-            session_id=session_id,
-            dispatch_context=dispatch_context,
-            seed_sample=seed_sample,
-            managed_session_handle=managed_session_handle,
-            managed_session_submitted_at=float(managed_session_submitted_at),
-        )
-        group = self.runtime_groups_by_key.get(dispatch_context.group_key)
-        if group is None:
-            group = RuntimeGroup(
-                group_key=dispatch_context.group_key,
-                expected_count=dispatch_context.expected_count,
-                admission_rollout_id=dispatch_context.rollout_id,
-            )
-            self.runtime_groups_by_key[dispatch_context.group_key] = group
-        if group.expected_count != dispatch_context.expected_count:
-            raise RuntimeError(
-                "RuntimeDomain resident group expected_count changed: "
-                f"group_key={dispatch_context.group_key!r}, existing={group.expected_count}, "
-                f"new={dispatch_context.expected_count}."
-            )
-        if group.admission_rollout_id != dispatch_context.rollout_id:
-            raise RuntimeError(
-                "RuntimeDomain resident group admission rollout changed: "
-                f"group_key={dispatch_context.group_key!r}, existing={group.admission_rollout_id}, "
-                f"new={dispatch_context.rollout_id}."
-            )
-        group.request_ids.add(request_id)
-        self.runtime_slots_by_request_id[request_id] = slot
-
-    def _drop_runtime_slot(self, request_id: str) -> RuntimeSlot | None:
-        slot = self.runtime_slots_by_request_id.pop(request_id, None)
-        if slot is None:
-            return None
-        if slot.materialization_task is not None and not slot.materialization_task.done():
-            slot.materialization_task.cancel()
-        group = self.runtime_groups_by_key.get(slot.group_key)
-        if group is not None:
-            group.request_ids.discard(request_id)
-            if not group.request_ids:
-                self.runtime_groups_by_key.pop(slot.group_key, None)
-        return slot
-
-    def _drop_runtime_group_slots(self, *, group_key: GroupKey) -> list[RuntimeSlot]:
-        group = self.runtime_groups_by_key.pop(group_key, None)
-        if group is None:
-            return []
-        dropped_slots: list[RuntimeSlot] = []
-        for request_id in list(group.request_ids):
-            slot = self.runtime_slots_by_request_id.pop(request_id, None)
-            if slot is None:
-                continue
-            dropped_slots.append(slot)
-        return dropped_slots
-
-    async def _discard_runtime_slots(self, slots: list[RuntimeSlot]) -> None:
-        if not slots:
-            return
-        release_slots = [
-            slot
-            for slot in slots
-            if slot.state != RuntimeSlotState.MATERIALIZING
-            if not slot.managed_session_handle_released
-            if isinstance(slot.managed_session_handle, ManagedSessionHandle)
-        ]
-        release_handles = [slot.managed_session_handle for slot in release_slots]
-        await self._set_managed_session_timeouts_active(release_handles, active=False)
-        finalize_client = self._ensure_service_client()
-        discard_tasks = [finalize_client.discard_session(session_id=slot.session_id) for slot in slots]
-        results = await asyncio.gather(*discard_tasks, return_exceptions=True)
-        failed_results: list[tuple[str, BaseException]] = []
-        for slot, result in zip(slots, results, strict=True):
-            if isinstance(result, BaseException):
-                failed_results.append((slot.session_id, result))
-                continue
-            if not isinstance(result, bool):
-                failed_results.append((slot.session_id, TypeError(f"Unexpected discard result: {result!r}")))
-                continue
-            self._clear_local_session_state(session_id=slot.session_id)
-        await self._release_managed_session_handles(release_handles, signal_before_wait=signal.SIGTERM)
-        for slot in release_slots:
-            slot.managed_session_handle_released = True
-        if failed_results:
-            failed_session_ids = ", ".join(session_id for session_id, _ in failed_results)
-            raise RuntimeError(f"Failed to discard runtime slots: failed={failed_session_ids}") from (
-                failed_results[0][1]
-            )
-
-    async def _resolve_ready_runtime_slot_ref(self, slot: RuntimeSlot) -> _ManagedRequestResult:
-        result_ready_at = time.time()
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot collect a managed session without a runner pool.")
-        try:
-            result_payload = await _resolve_object_async(
-                runner_pool.collect_session_result_ref(slot.managed_session_handle),
-                executor=self._runtime_resources.compiler.cpu_executor,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            if (
-                isinstance(slot.managed_session_handle, ManagedSessionHandle)
-                and not slot.managed_session_handle_released
-            ):
-                runner_pool.mark_session_handles_released(1)
-                slot.managed_session_handle_released = True
-            raise
-        if isinstance(slot.managed_session_handle, ManagedSessionHandle) and not slot.managed_session_handle_released:
-            runner_pool.mark_session_handles_released(1)
-            slot.managed_session_handle_released = True
-        if not isinstance(result_payload, dict):
-            raise TypeError(f"Managed result payload must be a dict, got {type(result_payload)}")
-        profile = result_payload["_agentic_trace_events"]
-        if not isinstance(profile, dict):
-            raise TypeError("Managed result payload '_agentic_trace_events' must be a dict")
-        mark_agentic_event(profile, "managed_result_ready_at", result_ready_at)
-        mark_agentic_event(profile, "managed_result_resolved_at")
-        return _ManagedRequestResult(
-            result_payload=result_payload,
-            session_runner_started_at=slot.managed_session_submitted_at,
-        )
-
-    async def _materialize_runtime_slot_task(
-        self,
-        *,
-        request_id: str,
-        slot: RuntimeSlot,
-    ) -> tuple[str, dict[str, Any] | _MaterializationDrop | _MaterializationFailure]:
-        try:
-            managed_result = await self._resolve_ready_runtime_slot_ref(slot)
-            materialized_record = await self._materialize_managed_result_record(
-                dispatch_context=slot.dispatch_context,
-                session_id=slot.session_id,
-                managed_result=managed_result,
-            )
-        except Exception as exc:
-            materialized_record = _MaterializationFailure(
-                request_id=request_id,
-                session_id=slot.session_id,
-                group_key=slot.group_key,
-                error=exc,
-            )
-        return request_id, materialized_record
-
-    def _start_runtime_slot_materialization(self, *, request_id: str, slot: RuntimeSlot) -> None:
-        if slot.state != RuntimeSlotState.RUNNING_APP:
-            return
-        slot.state = RuntimeSlotState.MATERIALIZING
-        slot.materialization_task = asyncio.create_task(
-            self._materialize_runtime_slot_task(request_id=request_id, slot=slot)
-        )
-        slot.materialization_task.add_done_callback(lambda _task: self._output_ready_event.set())
-
-    async def _drop_runtime_group_resources(self, *, group_key: GroupKey) -> None:
-        self._discarded_group_keys.add(group_key)
-        dropped_slots = self._drop_runtime_group_slots(group_key=group_key)
-        self._drop_materialized_group_state(group_key=group_key)
-        await self._discard_runtime_slots(dropped_slots)
-
-    async def _drain_finished_runtime_slot_materializations(self) -> str | None:
-        done_tasks = [
-            slot.materialization_task
-            for slot in self.runtime_slots_by_request_id.values()
-            if slot.state == RuntimeSlotState.MATERIALIZING
-            and slot.materialization_task is not None
-            and slot.materialization_task.done()
-        ]
-        if not done_tasks:
-            return None
-        materialized_records: list[dict[str, Any]] = []
-        materialized_request_ids: list[str] = []
-        discarded_group_keys: set[GroupKey] = set()
-        unexpected_errors: list[tuple[str, str, BaseException]] = []
-        for task in done_tasks:
-            request_id, materialized_record = task.result()
-            if isinstance(materialized_record, _MaterializationFailure):
-                session_local_failure = isinstance(materialized_record.error, AgentExecutionError)
-                session_local_failure_type = type(materialized_record.error).__name__
-                if isinstance(materialized_record.error, ray.exceptions.RayTaskError):
-                    try:
-                        cause = materialized_record.error.as_instanceof_cause()
-                    except Exception:
-                        cause = None
-                    session_local_failure = isinstance(cause, AgentExecutionError)
-                    if cause is not None:
-                        session_local_failure_type = type(cause).__name__
-                if session_local_failure:
-                    # ERROR-level + full message: AgentExecutionError carries the agent
-                    # subprocess's stdout+stderr (runtime.py:340-342), so dumping str(error)
-                    # surfaces the actual Python traceback from the agent in the training log,
-                    # instead of just a one-line "Dropping ..." that hides every retry's cause.
-                    logger.error(
-                        "Dropping failed resident agentic session session_id=%s request_id=%s error_type=%s\n%s",
-                        materialized_record.session_id,
-                        materialized_record.request_id,
-                        session_local_failure_type,
-                        str(materialized_record.error),
-                    )
-                    discarded_group_keys.add(materialized_record.group_key)
-                    await self._drop_runtime_group_resources(group_key=materialized_record.group_key)
-                    continue
-                if materialized_record.group_key not in self._discarded_group_keys:
-                    unexpected_errors.append(
-                        (materialized_record.request_id, materialized_record.session_id, materialized_record.error)
-                    )
-                    continue
-                discarded_group_keys.add(materialized_record.group_key)
-                continue
-            slot = self.runtime_slots_by_request_id.get(request_id)
-            if slot is None:
-                continue
-            if isinstance(materialized_record, _MaterializationDrop):
-                logger.info(
-                    "Dropping finalized resident agentic session session_id=%s request_id=%s reason=%s info=%s",
-                    slot.session_id,
-                    request_id,
-                    materialized_record.reason,
-                    materialized_record.info,
-                )
-                discarded_group_keys.add(slot.group_key)
-                await self._drop_runtime_group_resources(group_key=slot.group_key)
-                continue
-            materialized_records.append(materialized_record)
-            materialized_request_ids.append(request_id)
-        if materialized_records and discarded_group_keys:
-            retained_records: list[dict[str, Any]] = []
-            retained_request_ids: list[str] = []
-            for request_id, record in zip(materialized_request_ids, materialized_records, strict=True):
-                group_key = record["group_key"]
-                if group_key in discarded_group_keys or group_key in self._discarded_group_keys:
-                    continue
-                retained_records.append(record)
-                retained_request_ids.append(request_id)
-            materialized_records = retained_records
-            materialized_request_ids = retained_request_ids
-        if materialized_records:
-            self._emit_session_materialization_batch(materialized_records)
-        for request_id in materialized_request_ids:
-            slot = self.runtime_slots_by_request_id.get(request_id)
-            if slot is not None:
-                slot.state = RuntimeSlotState.MATERIALIZED
-            self._drop_runtime_slot(request_id)
-        if discarded_group_keys:
-            self._output_ready_event.set()
-        if unexpected_errors:
-            request_id, session_id, exc = unexpected_errors[0]
-            raise RuntimeError(
-                f"Resident runtime slot materialization failed request_id={request_id} session_id={session_id}."
-            ) from exc
-        return "slot_completed" if materialized_records or discarded_group_keys else None
-
-    def _clear_local_session_state(self, *, session_id: str) -> None:
-        self._notified_session_rollouts.pop(session_id, None)
-        for request_id, slot in list(self.runtime_slots_by_request_id.items()):
-            if slot.session_id == session_id:
-                self._drop_runtime_slot(request_id)
-
-    def drain_discarded_group_keys(self) -> set[GroupKey]:
-        discarded_group_keys = set(self._discarded_group_keys)
-        self._discarded_group_keys.clear()
-        return discarded_group_keys
-
-    def _drop_materialized_group_state(self, *, group_key: GroupKey) -> None:
-        self._drop_runtime_group_slots(group_key=group_key)
-        removed_ready_records = 0
-        retained_ready_batches: list[list[dict[str, Any]]] = []
-        for records in self._ready_materialized_batches:
-            retained_records = [record for record in records if record["group_key"] != group_key]
-            removed_ready_records += len(records) - len(retained_records)
-            if retained_records:
-                retained_ready_batches.append(retained_records)
-        self._ready_materialized_batches = retained_ready_batches
-        if removed_ready_records:
-            self._ready_materialized_session_count -= removed_ready_records
-            if self._ready_materialized_session_count < 0:
-                raise RuntimeError("RuntimeDomain ready materialized session count underflow after group discard.")
-        self._ready_materialized_groups = [
-            (ready_group_key, group)
-            for ready_group_key, group in self._ready_materialized_groups
-            if ready_group_key != group_key
-        ]
-
-    def debug_snapshot(self) -> dict[str, Any]:
-        def _summarize_runtime_groups(groups: dict[GroupKey, RuntimeGroup]) -> list[dict[str, Any]]:
-            details: list[dict[str, Any]] = []
-            for key, group in list(groups.items())[:8]:
-                details.append(
-                    {
-                        "group_key": key,
-                        "expected_count": group.expected_count,
-                        "slot_count": group.slot_count(),
-                        "running_slots": len(group.request_ids),
-                        "admission_rollout_id": group.admission_rollout_id,
-                    }
-                )
-            return details
-
-        runtime_slot_states = {
-            state.value: sum(1 for slot in self.runtime_slots_by_request_id.values() if slot.state == state)
-            for state in RuntimeSlotState
-        }
-        return {
-            "rollout_id": self.rollout_id,
-            "ready_materialized_batches": len(self._ready_materialized_batches),
-            "ready_materialized_records": sum(len(batch) for batch in self._ready_materialized_batches),
-            "ready_materialized_groups": len(self._ready_materialized_groups),
-            "runtime_slots": len(self.runtime_slots_by_request_id),
-            "runtime_slot_states": runtime_slot_states,
-            "runtime_groups": len(self.runtime_groups_by_key),
-            "runtime_materialized_records": sum(group.slot_count() for group in self.runtime_groups_by_key.values()),
-            "runtime_group_details": _summarize_runtime_groups(self.runtime_groups_by_key),
-            "interrupted_groups": self._interrupted_group_count_for_step(rollout_id=self.rollout_id)
-            if self.rollout_id is not None
-            else 0,
-            "prepare_gate_blocked_ir_count": self._cached_session_debug_total("prepare_gate_blocked_ir_count"),
-            "partial_resume_gate_blocked_ir_count": self._cached_session_debug_total(
-                "partial_resume_gate_blocked_ir_count"
-            ),
-            "emitted_materialized_session_count_total": self._emitted_materialized_session_count_total,
-            "drained_materialized_session_count_total": self._drained_materialized_session_count_total,
-            "notified_session_rollouts": len(self._notified_session_rollouts),
-            "output_ready_event_set": bool(self._output_ready_event.is_set()),
-            "session_debug_totals": self._cached_session_debug_totals(),
-        }
-
-    def resident_group_keys(self) -> set[GroupKey]:
-        ready_batch_group_keys = {
-            record["group_key"] for records in self._ready_materialized_batches for record in records
-        }
-        ready_group_keys = {group_key for group_key, _group in self._ready_materialized_groups}
-        return set(self.runtime_groups_by_key) | ready_batch_group_keys | ready_group_keys
-
-    def accounting_snapshot(self) -> dict[str, int]:
-        ready_batch_group_keys = {
-            record["group_key"] for records in self._ready_materialized_batches for record in records
-        }
-        ready_group_keys = {group_key for group_key, _group in self._ready_materialized_groups}
-        resident_group_keys = self.resident_group_keys()
-        interrupted_groups = self._interrupted_group_count_for_step(rollout_id=self.require_rollout_id())
-        return {
-            "resident_groups": len(resident_group_keys),
-            "runtime_groups": len(self.runtime_groups_by_key),
-            "ready_materialized_batch_groups": len(ready_batch_group_keys),
-            "ready_materialized_groups": len(ready_group_keys),
-            "runtime_slots": len(self.runtime_slots_by_request_id),
-            "interrupted_groups": interrupted_groups,
-        }
-
-    def _interrupted_close_accounting_snapshot(self, *, rollout_id: int) -> dict[str, int]:
-        return {
-            "interrupted_sessions": len(self._aborted_resume_session_ids_by_rollout.get(rollout_id, set())),
-            "interrupted_groups": self._interrupted_group_count_for_step(rollout_id=rollout_id),
-        }
-
-    async def refresh_interrupted_close_accounting(self) -> dict[str, int]:
-        rollout_id = self.require_rollout_id()
-        now = time.monotonic()
-        if (
-            self._interrupted_close_accounting_last_refresh_at > 0.0
-            and now - self._interrupted_close_accounting_last_refresh_at
-            < self._interrupted_close_accounting_refresh_interval_s
-        ):
-            return self._interrupted_close_accounting_snapshot(rollout_id=rollout_id)
-        client = self._ensure_service_client()
-        getter = getattr(client, "aborted_resume_session_ids", None)
-        if not callable(getter):
-            self._interrupted_close_accounting_last_refresh_at = now
-            return self._interrupted_close_accounting_snapshot(rollout_id=rollout_id)
-        session_ids = {str(session_id) for session_id in await getter(rollout_id=rollout_id)}
-        self._aborted_resume_session_ids_by_rollout = {rollout_id: session_ids}
-        self._interrupted_close_accounting_last_refresh_at = time.monotonic()
-        return self._interrupted_close_accounting_snapshot(rollout_id=rollout_id)
-
-    def _interrupted_group_count_for_step(self, *, rollout_id: int) -> int:
-        return len(self._interrupted_group_keys_for_step(rollout_id=rollout_id))
-
-    def _interrupted_group_keys_for_step(self, *, rollout_id: int) -> set[GroupKey]:
-        aborted_session_ids = self._aborted_resume_session_ids_by_rollout.get(rollout_id, set())
-        if not aborted_session_ids:
-            return set()
-        accounted_group_keys: set[GroupKey] = set()
-        for group_key, group in self.runtime_groups_by_key.items():
-            aborted_slot_count = 0
-            for request_id in group.request_ids:
-                slot = self.runtime_slots_by_request_id.get(request_id)
-                if slot is not None and slot.session_id in aborted_session_ids:
-                    aborted_slot_count += 1
-            if aborted_slot_count == 0:
-                continue
-            if group.slot_count() + aborted_slot_count >= group.expected_count:
-                accounted_group_keys.add(group_key)
-        return accounted_group_keys
-
-    def _cached_session_debug_total(self, key: str) -> int | None:
-        session_debug_state = self.session_debug_state
-        if not isinstance(session_debug_state, dict):
-            return None
-        if key in session_debug_state:
-            return int(session_debug_state.get(key) or 0)
-        totals = session_debug_state.get("totals")
-        if not isinstance(totals, dict):
-            return None
-        return int(totals.get(key) or 0)
-
-    def _cached_session_debug_totals(self) -> dict[str, int]:
-        session_debug_state = self.session_debug_state
-        if not isinstance(session_debug_state, dict):
-            return {}
-        by_state = session_debug_state.get("by_state")
-        if not isinstance(by_state, list):
-            return {}
-        totals = {
-            "active_sessions": int(session_debug_state.get("active_sessions") or 0),
-            "queued_irs": 0,
-            "protected_sessions": 0,
-            "active_irs": 0,
-            "total_irs": 0,
-            "pending_chat_waiters": 0,
-            "prepare_gate_sessions": 0,
-            "partial_resume_gate_sessions": 0,
-        }
-        breakdown = session_debug_state.get("session_breakdown")
-        if isinstance(breakdown, dict):
-            totals["sessions_with_active_irs"] = int(breakdown.get("with_active_irs") or 0)
-            totals["sessions_queued_no_active"] = int(breakdown.get("queued_no_active") or 0)
-            totals["sessions_waiters_no_active"] = int(breakdown.get("waiters_no_active") or 0)
-            totals["sessions_with_no_irs"] = int(breakdown.get("no_irs") or 0)
-        for row in by_state:
-            if not isinstance(row, dict):
-                continue
-            session_count = int(row.get("session_count") or 0)
-            totals["queued_irs"] += int(row.get("ir_queue") or 0)
-            totals["protected_sessions"] += int(row.get("protected_sessions") or 0)
-            totals["active_irs"] += int(row.get("active_irs") or 0)
-            totals["total_irs"] += int(row.get("irs_by_id") or 0)
-            totals["pending_chat_waiters"] += int(row.get("pending_chat_waiters") or 0)
-            gate_reason = row.get("gate_reason")
-            if gate_reason == "prepare":
-                totals["prepare_gate_sessions"] += session_count
-            elif gate_reason == "partial_resume":
-                totals["partial_resume_gate_sessions"] += session_count
-        return totals
-
-    def ensure_session_runner_pool(self, *, total_requests: int) -> ManagedSessionRunnerPool:
-        target_total_requests = max(total_requests, self._session_runner_pool_total_requests)
-        runner_pool = self._session_runner_pool
-        if runner_pool is not None and self._session_runner_pool_total_requests >= target_total_requests:
-            return runner_pool
-        with self._session_runner_pool_lock:
-            runner_pool = self._session_runner_pool
-            if runner_pool is None or self._session_runner_pool_total_requests < target_total_requests:
-                runner_pool = create_managed_session_runner_pool(self.args, total_requests=target_total_requests)
-                if runner_pool is None:
-                    raise RuntimeError("Managed session session runner pool could not be created.")
-                self._session_runner_pool = runner_pool
-                self._session_runner_pool_total_requests = target_total_requests
-        return runner_pool
-
-    def _ensure_service_client(self):
-        if self._service_client is None:
-            self._service_client = create_agentic_service_client()
-        return self._service_client
-
-    async def _refresh_session_debug_state(
-        self, *, client: Any | None = None, sample_limit: int = 0
-    ) -> dict[str, Any]:
-        client = self._ensure_service_client() if client is None else client
-        debug_state = getattr(client, "debug_state", None)
-        if not callable(debug_state):
-            return {}
-        try:
-            snapshot = dict(await debug_state(sample_limit=int(sample_limit)))
-        except Exception:
-            return {}
-        self.session_debug_state = copy.deepcopy(snapshot)
-        return snapshot
-
-    async def prepare_group_status(self) -> list[dict[str, Any]]:
-        client = self._ensure_service_client()
-        return await client.prepare_group_status(scope_id=self.scope_id)
-
-    def prepare_group_completed_before_ready(
-        self,
-        *,
-        group_state: PrepareGroupState,
-    ) -> list[dict[str, str]]:
-        """Return the session requests in a still-warming prepare group whose
-        managed session task has already completed without producing a chat IR.
-
-        This is a pure query (no raise on detection). Callers decide whether a
-        completed-before-ready group is a hard error (train) or a droppable
-        sample (eval).
-        """
-        if not group_state.request_handles:
-            return []
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
-        handle_to_request: dict[ManagedSessionHandle, tuple[str, str]] = {}
-        for request_handle in group_state.request_handles:
-            managed_handle = request_handle.managed_session_handle
-            if not isinstance(managed_handle, ManagedSessionHandle):
-                raise RuntimeError(
-                    "Prepare-owned request is missing a managed session handle; "
-                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
-                )
-            try:
-                envelope = group_state.request_group[request_handle.slot_idx]
-            except IndexError as exc:
-                raise RuntimeError(
-                    f"Prepare group {group_state.group_id} has inconsistent slot indexing "
-                    f"at slot={request_handle.slot_idx}."
-                ) from exc
-            handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
-        completed_handles = runner_pool.completed_session_handles(session_handles=list(handle_to_request))
-        if not completed_handles:
-            return []
-        return [
-            {
-                "session_id": handle_to_request[managed_handle][0],
-                "request_id": handle_to_request[managed_handle][1],
-            }
-            for managed_handle in completed_handles
-        ]
-
-    def raise_if_prepare_group_completed_before_ready(
-        self,
-        *,
-        group_state: PrepareGroupState,
-        total_sessions: int,
-        ready_sessions: int,
-    ) -> None:
-        if not group_state.request_handles:
-            return
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
-        # Build the (managed_handle -> session_id, request_id) mapping inline so
-        # we can both detect "task done" AND look up its actual result/exception
-        # in a single runner round-trip. Otherwise we'd race the materialization
-        # layer's AgentExecutionError logger (runtime.py:~1755), which never
-        # gets to run because this raise kills the rollout dataflow loop first.
-        handle_to_request: dict[ManagedSessionHandle, tuple[str, str]] = {}
-        for request_handle in group_state.request_handles:
-            managed_handle = request_handle.managed_session_handle
-            if not isinstance(managed_handle, ManagedSessionHandle):
-                raise RuntimeError(
-                    "Prepare-owned request is missing a managed session handle; "
-                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
-                )
-            try:
-                envelope = group_state.request_group[request_handle.slot_idx]
-            except IndexError as exc:
-                raise RuntimeError(
-                    f"Prepare group {group_state.group_id} has inconsistent slot indexing "
-                    f"at slot={request_handle.slot_idx}."
-                ) from exc
-            handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
-        diagnostics = runner_pool.completed_session_diagnostics(session_handles=list(handle_to_request))
-        if not diagnostics:
-            return
-        error_sections: list[str] = []
-        for managed_handle, diag in diagnostics.items():
-            session_id, request_id = handle_to_request[managed_handle]
-            kind = diag.get("kind") if isinstance(diag, dict) else None
-            if kind == "exception":
-                # AgentExecutionError.message already carries
-                # "Managed command agent exited with code N\n<combined stdout+stderr>"
-                # (see execute_managed_session_input). Dumping it here gives the
-                # actual agent failure (e.g. concurrent pip race, import error,
-                # SIF startup failure) in the driver log.
-                error_sections.append(
-                    f"\n--- session {session_id} (request {request_id}) failed: "
-                    f"{diag.get('error_type', 'Exception')} ---\n"
-                    f"{diag.get('message', '')}"
-                )
-            elif kind == "cancelled":
-                error_sections.append(f"\n--- session {session_id} (request {request_id}) cancelled ---")
-            else:
-                # Genuine silent-success: task returned a payload but never
-                # produced a chat IR upstream. Likely an agent bug that exited
-                # 0 before making any chat completion call.
-                reward = diag.get("reward") if isinstance(diag, dict) else None
-                error_sections.append(
-                    f"\n--- session {session_id} (request {request_id}) silent-success "
-                    f"(exit 0, no chat IR, reward={reward!r}) ---"
-                )
-        raise RuntimeError(
-            "Prepare-owned managed agent session completed before producing a chat IR: "
-            f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
-            f"expected_sessions={len(group_state.request_handles)}, total_sessions={total_sessions}, "
-            f"ready_sessions={ready_sessions}, completed_session_count={len(diagnostics)}." + "".join(error_sections)
-        )
-
-    async def activate_group_sessions(
-        self,
-        *,
-        groups: list[dict[str, Any]],
-        rollout_id: int,
-    ) -> dict[str, int]:
-        client = self._ensure_service_client()
-        return await client.activate_group_sessions(
-            scope_id=self.scope_id,
-            groups=groups,
-            rollout_id=rollout_id,
-        )
-
-    async def _release_managed_session_handles(
-        self,
-        handles: list[ManagedSessionHandle],
-        *,
-        signal_before_wait: int | None = None,
-    ) -> None:
-        if not handles:
-            return
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot release managed sessions without a runner pool.")
-        refs = runner_pool.release_session_handles(handles, signal_before_wait=signal_before_wait)
-        results = await asyncio.gather(
-            *(_resolve_object_async(ref, executor=self._runtime_resources.compiler.cpu_executor) for ref in refs),
-            return_exceptions=True,
-        )
-        released_count = 0
-        failures: list[BaseException] = []
-        for result in results:
-            if isinstance(result, BaseException):
-                failures.append(result)
-                continue
-            released_count += int(result)
-        runner_pool.mark_session_handles_released(released_count)
-        if failures:
-            raise RuntimeError(f"Failed to release {len(failures)} managed session handle(s).") from failures[0]
-
-    def _running_managed_session_handles(self) -> list[ManagedSessionHandle]:
-        return [
-            slot.managed_session_handle
-            for slot in self.runtime_slots_by_request_id.values()
-            if slot.state == RuntimeSlotState.RUNNING_APP
-            and isinstance(slot.managed_session_handle, ManagedSessionHandle)
-        ]
-
-    async def _set_managed_session_timeouts_active(
-        self,
-        handles: list[ManagedSessionHandle],
-        *,
-        active: bool,
-    ) -> None:
-        if not handles:
-            return
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain cannot update managed session timeout state without a runner pool.")
-        refs = runner_pool.set_session_timeouts_active(handles, active=active)
-        results = await asyncio.gather(
-            *(_resolve_object_async(ref, executor=self._runtime_resources.compiler.cpu_executor) for ref in refs),
-            return_exceptions=True,
-        )
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
-            raise RuntimeError("Failed to update managed session timeout state.") from failures[0]
-
-    async def discard_prepare_group(
-        self,
-        *,
-        group_state: PrepareGroupState,
-        released_session_handles: set[ManagedSessionHandle] | None = None,
-    ) -> int:
-        # Discarding a prepare group ends its prepare-owned managed session handles through the session API path.
-        session_ids = {
-            envelope.session_id
-            for envelope in group_state.request_group
-            if isinstance(envelope.session_id, str) and envelope.session_id
-        }
-        ordered_session_ids = sorted(session_ids)
-        if not ordered_session_ids:
-            return 0
-        finalize_client = self._ensure_service_client()
-        discard_tasks = [finalize_client.discard_session(session_id=session_id) for session_id in ordered_session_ids]
-        results = await asyncio.gather(*discard_tasks, return_exceptions=True)
-        cleaned_count = 0
-        cleaned_session_ids: set[str] = set()
-        failed_results: list[tuple[str, BaseException]] = []
-        for session_id, result in zip(ordered_session_ids, results):
-            if isinstance(result, BaseException):
-                failed_results.append((session_id, result))
-                continue
-            if not isinstance(result, bool):
-                failed_results.append((session_id, TypeError(f"Unexpected discard result: {result!r}")))
-                continue
-            cleaned_count += 1
-            cleaned_session_ids.add(session_id)
-            self._clear_local_session_state(session_id=session_id)
-        release_handles: list[ManagedSessionHandle] = []
-        released_session_handles = released_session_handles or set()
-        for request_handle in group_state.request_handles:
-            try:
-                envelope = group_state.request_group[request_handle.slot_idx]
-            except IndexError as exc:
-                raise RuntimeError(
-                    "Prepare-owned request handle has invalid slot index during discard: "
-                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
-                ) from exc
-            if envelope.session_id not in cleaned_session_ids:
-                continue
-            managed_session_handle = request_handle.managed_session_handle
-            if not isinstance(managed_session_handle, ManagedSessionHandle):
-                raise RuntimeError(
-                    "Prepare-owned request is missing a managed session handle during discard: "
-                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
-                )
-            if managed_session_handle in released_session_handles:
-                continue
-            release_handles.append(managed_session_handle)
-        await self._release_managed_session_handles(release_handles, signal_before_wait=signal.SIGTERM)
-        if failed_results:
-            failed_session_ids = ", ".join(session_id for session_id, _ in failed_results)
-            raise RuntimeError(f"Failed to discard prepare group sessions: failed={failed_session_ids}") from (
-                failed_results[0][1]
-            )
-        return cleaned_count
-
-    async def _finalize_managed_result_payload(
-        self,
-        *,
-        result_payload: dict[str, Any],
-        session_runner_started_at: float,
-    ) -> FinalizedResultTransport:
-        framework_events = result_payload["_agentic_trace_events"]
-        finalize_metadata = result_payload["_session_output_metadata"]
-        if not isinstance(finalize_metadata, dict):
-            raise TypeError("Managed result payload '_session_output_metadata' must be a dict")
-        output_records = result_payload["_session_output_records"]
-        if not isinstance(output_records, list):
-            raise TypeError("Managed result payload '_session_output_records' must be a list")
-        mark_agentic_event(framework_events, "managed_session_runner_start_at", session_runner_started_at)
-        mark_agentic_event(framework_events, "managed_session_runner_end_at")
-        finalize_client = self._ensure_service_client()
-        mark_agentic_event(framework_events, "managed_finalize_request_start_at")
-        transport = await finalize_client.finalize_and_discard(
-            session_id=result_payload["_session_id"],
-            metadata=copy.deepcopy(finalize_metadata),
-            reward=result_payload["reward"],
-            output_records=copy.deepcopy(output_records),
-        )
-        mark_agentic_event(framework_events, "managed_finalize_request_end_at")
-        transport_metadata = copy.deepcopy(transport.metadata) if isinstance(transport.metadata, dict) else {}
-        if framework_events:
-            transport_metadata[TRACE_KEY] = merge_agentic_trace(
-                transport_metadata.get(TRACE_KEY),
-                {"events": framework_events},
-            )
-        transport.metadata = transport_metadata
-        return transport
-
-    async def release_partial_resume_gate(self) -> int:
-        """Release partial-resume-gated sessions for the bound rollout step."""
-        client = self._ensure_service_client()
-        released = int(await client.release_partial_resume_gate(rollout_id=self.require_rollout_id()))
-        await self._set_managed_session_timeouts_active(self._running_managed_session_handles(), active=True)
-        return released
-
-    async def enter_eval(self) -> int:
-        client = self._ensure_service_client()
-        entered = int(await client.enter_eval())
-        self._rollout_mode = "eval"
-        return entered
-
-    async def exit_eval(self) -> int:
-        client = self._ensure_service_client()
-        exited = int(await client.exit_eval())
-        self._rollout_mode = "train"
-        return exited
-
-    def _managed_app_spec_for_launch(self) -> ManagedCommandAppSpec:
-        base_url = self.managed_chat_api_base_url
-        if not isinstance(base_url, str) or not base_url:
-            base_url = resolve_chat_api_base_url()
-            self.managed_chat_api_base_url = base_url
-        return replace(
-            self._managed_app_spec,
-            env={
-                **self._managed_app_spec.env,
-                "RELAX_BASE_URL": base_url,
-            },
-        )
-
-    def _build_managed_session_input(self, *, envelope: RequestEnvelope) -> SessionInput:
-        if not isinstance(envelope.session_id, str) or not envelope.session_id:
-            raise ValueError("Managed agentic request requires envelope.session_id")
-        if envelope.seed.group_index is None:
-            raise ValueError("Managed agentic request requires envelope.seed.group_index")
-        return SessionInput(
-            session_id=envelope.session_id,
-            group_id=str(envelope.seed.group_index),
-            rollout_mode=self._rollout_mode,
-            input_payload=copy.deepcopy(envelope.input_payload),
-            metadata={
-                "request_id": envelope.request_id,
-            },
-        )
-
-    def _session_id_for(self, *, envelope: RequestEnvelope, seed_sample: Sample, slot_idx: int) -> str:
-        session_id = envelope.session_id
-        if isinstance(session_id, str) and session_id:
-            return session_id
-        generated = f"agentic_session_{self._runtime_session_counter}_{seed_sample.group_index}_{slot_idx}"
-        self._runtime_session_counter += 1
-        return generated
-
-    def _request_id_for(self, *, envelope: RequestEnvelope, session_id: str) -> str:
-        if isinstance(envelope.request_id, str) and envelope.request_id:
-            return envelope.request_id
-        request_id = f"req_runtime_{session_id}_{self._runtime_request_counter}"
-        self._runtime_request_counter += 1
-        return request_id
-
-    def _session_sampling_params_for(self, *, envelope: RequestEnvelope, slot_idx: int) -> dict[str, Any]:
-        if isinstance(envelope.sampling_params, dict):
-            return copy.deepcopy(envelope.sampling_params)
-        sampling_params: dict[str, Any] = {
-            "temperature": self.args.rollout_temperature,
-            "top_p": self.args.rollout_top_p,
-            "top_k": self.args.rollout_top_k,
-            "max_new_tokens": self.args.rollout_max_response_len,
-            "stop": self.args.rollout_stop,
-            "stop_token_ids": self.args.rollout_stop_token_ids,
-            "skip_special_tokens": self.args.rollout_skip_special_tokens,
-            "no_stop_trim": True,
-            "spaces_between_special_tokens": False,
-        }
-        if self.args.sglang_enable_deterministic_inference:
-            sampling_params["sampling_seed"] = self.args.rollout_seed + slot_idx
-        return {key: value for key, value in sampling_params.items() if value is not None}
-
-    async def _register_managed_sessions_batch(self, entries: list[dict[str, Any]]) -> None:
-        pending_entries: list[dict[str, Any]] = []
-        for entry in entries:
-            session_id = entry["session_id"]
-            rollout_id = entry["rollout_id"]
-            if self._notified_session_rollouts.get(session_id) == rollout_id:
-                continue
-            pending_entries.append(entry)
-        if not pending_entries:
-            return
-        client = self._ensure_service_client()
-        registered = await client.register_sessions_batch(entries=pending_entries)
-        if registered != len(pending_entries):
-            raise RuntimeError(
-                f"Managed session registration mismatch: expected {len(pending_entries)}, got {registered}"
-            )
-        for entry in pending_entries:
-            self._notified_session_rollouts[entry["session_id"]] = entry["rollout_id"]
-        await self._refresh_session_debug_state(client=client)
-
-    def has_pending_runtime_work(self) -> bool:
-        return bool(self._ready_materialized_batches or self.runtime_slots_by_request_id)
-
-    def has_inflight_work(self) -> bool:
-        return bool(self.runtime_slots_by_request_id)
-
-    def has_ready_output(self) -> bool:
-        return bool(self._ready_materialized_batches)
-
-    def drain_ready_execution(self) -> ExecutionDispatch:
-        materialized_session_count = self._ready_materialized_session_count
-        self._ready_materialized_session_count = 0
-        self._drained_materialized_session_count_total += materialized_session_count
-        materialized_batches = list(self._ready_materialized_batches)
-        self._ready_materialized_batches.clear()
-        ready_groups = [group for _group_key, group in self._ready_materialized_groups]
-        self._ready_materialized_groups.clear()
-        return ExecutionDispatch(
-            materialized_batches=materialized_batches,
-            ready_groups=ready_groups,
-        )
-
-    async def gate_rollout_irs_for_partial_resume(self) -> int:
-        """Gate not-yet-backend-started IRs for partial resume; resident
-        managed tasks keep running."""
-        await self._set_managed_session_timeouts_active(self._running_managed_session_handles(), active=False)
-        client = self._ensure_service_client()
-        locked = await client.gate_rollout_irs_for_partial_resume(rollout_id=self.require_rollout_id())
-        await self._refresh_session_debug_state(client=client)
-        return locked
-
-    async def gate_rollout_irs_for_discard(self) -> int:
-        """Gate current-rollout IRs before non-partial resident tail
-        discard."""
-        await self._set_managed_session_timeouts_active(self._running_managed_session_handles(), active=False)
-        client = self._ensure_service_client()
-        locked = await client.gate_rollout_irs_for_discard(rollout_id=self.require_rollout_id())
-        await self._refresh_session_debug_state(client=client)
-        return locked
-
-    async def gate_all_irs_for_shutdown(self) -> int:
-        """Gate all train IRs before terminal shutdown or error cleanup."""
-        await self._set_managed_session_timeouts_active(self._running_managed_session_handles(), active=False)
-        client = self._ensure_service_client()
-        locked = await client.gate_all_irs_for_shutdown()
-        await self._refresh_session_debug_state(client=client)
-        return locked
-
-    async def active_rollout_request_counts(self) -> dict[str, int]:
-        client = self._ensure_service_client()
-        counts = dict(await client.active_rollout_request_counts(rollout_id=self.require_rollout_id()))
-        await self._refresh_session_debug_state(client=client)
-        return counts
-
-    async def abort_rollout_requests(self) -> dict[str, int]:
-        client = self._ensure_service_client()
-        result = dict(await client.abort_rollout_requests(rollout_id=self.require_rollout_id()))
-        await self._refresh_session_debug_state(client=client)
-        return result
-
-    async def trim_agentic_session_shards(self, *, reason: str = "manual") -> dict[str, Any]:
-        client = self._ensure_service_client()
-        result = dict(await client.trim_memory())
-        logger.info(
-            "Agentic session shard trim completed reason=%s ok=%s trimmed=%s active_sessions=%s active_requests=%s",
-            reason,
-            result.get("ok"),
-            result.get("trimmed_count"),
-            result.get("active_sessions"),
-            result.get("active_requests"),
-        )
-        await self._refresh_session_debug_state(client=client)
-        return result
-
-    async def _activate_leased_group_sessions(self, batch_input: ExecutionBatchInput) -> dict[str, int]:
-        leased_groups = list(batch_input.leased_groups)
-        if not leased_groups:
-            return {"activated_sessions": 0, "started_sessions": 0}
-        client = self._ensure_service_client()
-        activation = await client.activate_group_sessions(
-            scope_id=self.scope_id,
-            groups=[
-                {
-                    "group_id": str(group_id),
-                    "group_generation": group_generation,
-                }
-                for group_id, group_generation in leased_groups
-            ],
-            rollout_id=batch_input.rollout_id,
-        )
-        activated_sessions = activation.get("activated_sessions") or 0
-        started_sessions = activation.get("started_sessions") or 0
-        await self._refresh_session_debug_state(client=client)
-        return {
-            "activated_sessions": activated_sessions,
-            "started_sessions": started_sessions,
-        }
-
-    @classmethod
-    def _leased_request_views(
-        cls, batch_input: ExecutionBatchInput
-    ) -> list[tuple[PrepareGroupState, PrepareRequestHandle, RequestEnvelope, Sample]]:
-        views: list[tuple[PrepareGroupState, PrepareRequestHandle, RequestEnvelope, Sample]] = []
-        for group_state in batch_input.leased_group_states:
-            for handle in group_state.request_handles:
-                slot_idx = handle.slot_idx
-                try:
-                    envelope = group_state.request_group[slot_idx]
-                    seed_sample = group_state.sample_group[slot_idx]
-                except IndexError as exc:
-                    raise RuntimeError(
-                        f"Prepare group {group_state.group_id} has inconsistent slot indexing at slot={slot_idx}."
-                    ) from exc
-                views.append((group_state, handle, envelope, seed_sample))
-        return views
-
-    async def start_batch(
-        self,
-        *,
-        batch_input: ExecutionBatchInput,
-    ) -> int:
-        leased_group_count = len(batch_input.leased_group_states)
-        if leased_group_count <= 0:
-            raise RuntimeError("RuntimeDomain cannot start an empty execution batch.")
-        if leased_group_count != len(batch_input.leased_group_ids):
-            raise RuntimeError(
-                "RuntimeDomain execution batch has inconsistent leased group counts: "
-                f"states={leased_group_count}, ids={len(batch_input.leased_group_ids)}."
-            )
-        leased_request_count = len(self._leased_request_views(batch_input))
-        if leased_request_count <= 0:
-            raise RuntimeError(
-                f"RuntimeDomain execution batch has no leased requests for {leased_group_count} leased groups."
-            )
-        activation_counts = await self._activate_leased_group_sessions(batch_input)
-        activated_sessions = activation_counts.get("activated_sessions") or 0
-        started_sessions = activation_counts.get("started_sessions") or 0
-        if activated_sessions != leased_request_count or started_sessions != leased_request_count:
-            raise RuntimeError(
-                "RuntimeDomain activation did not take ownership of every leased request: "
-                f"leased_requests={leased_request_count}, activated_sessions={activated_sessions}, "
-                f"started_sessions={started_sessions}."
-            )
-        managed_session_handles = self._admit_runtime_slots(batch_input)
-        await self._set_managed_session_timeouts_active(managed_session_handles, active=True)
-        logger.info(
-            "Agentic step admission rollout=%s leased_groups=%s activated_sessions=%s started_sessions=%s resident_slots=%s",
-            batch_input.rollout_id,
-            leased_group_count,
-            activated_sessions,
-            started_sessions,
-            len(self.runtime_slots_by_request_id),
-        )
-        return leased_group_count
-
-    def _admit_runtime_slots(self, batch_input: ExecutionBatchInput) -> list[ManagedSessionHandle]:
-        managed_session_handles: list[ManagedSessionHandle] = []
-        for group_state, request_handle, envelope, seed_sample in self._leased_request_views(batch_input):
-            managed_session_handle = request_handle.managed_session_handle
-            if managed_session_handle is None:
-                raise RuntimeError(
-                    "Leased prepare request is missing managed_session_handle; runtime must not relaunch agent process."
-                )
-            if not isinstance(managed_session_handle, ManagedSessionHandle):
-                raise RuntimeError("Leased prepare request has an invalid managed_session_handle.")
-            session_id = envelope.session_id
-            request_id = envelope.request_id
-            if not isinstance(session_id, str) or not session_id:
-                raise RuntimeError("Leased prepare request is missing session_id.")
-            if not isinstance(request_id, str) or not request_id:
-                raise RuntimeError("Leased prepare request is missing request_id.")
-            self._register_runtime_slot(
-                request_id=request_id,
-                session_id=session_id,
-                dispatch_context=self._dispatch_context_for(
-                    rollout_id=batch_input.rollout_id,
-                    slot_idx=request_handle.slot_idx,
-                    sample_group=group_state.sample_group,
-                    envelope=envelope,
-                ),
-                seed_sample=seed_sample,
-                managed_session_handle=managed_session_handle,
-                managed_session_submitted_at=float(request_handle.managed_session_submitted_at),
-            )
-            managed_session_handles.append(managed_session_handle)
-        return managed_session_handles
-
-    @staticmethod
-    def _prepare_request_registration_entries(
-        request_plans: list[Any],
-        *,
-        scope_id: str,
-        group_id: str | None = None,
-        group_generation: int = 0,
-        gate_reason: str | None = None,
-    ) -> list[dict[str, Any]]:
-        entries: list[dict[str, Any]] = []
-        for request_plan in request_plans:
-            group_index = request_plan.envelope.seed.group_index
-            if group_index is None:
-                raise RuntimeError(
-                    "rollout-managed session registration requires envelope.seed.group_index to be populated"
-                )
-            entries.append(
-                {
-                    "session_id": request_plan.envelope.session_id,
-                    "scope_id": scope_id,
-                    "rollout_id": request_plan.envelope.rollout_id
-                    if request_plan.envelope.rollout_id is not None
-                    else -1,
-                    "sampling_params": copy.deepcopy(request_plan.request_sampling_params),
-                    "session_seed": {
-                        "group_index": group_index,
-                        "index": request_plan.envelope.seed.index,
-                        "label": request_plan.envelope.seed.label,
-                        "train_metadata": copy.deepcopy(request_plan.envelope.seed.train_metadata),
-                        "metadata": copy.deepcopy(request_plan.envelope.metadata)
-                        if isinstance(request_plan.envelope.metadata, dict)
-                        else {},
-                    },
-                    "group_id": group_id,
-                    "group_generation": group_generation,
-                    "gate_reason": gate_reason,
-                }
-            )
-        return entries
-
-    async def start_prepare_group_sessions(
-        self,
-        *,
-        prepare_groups: list[PrepareGroupSpec],
-        runner_pool,
-    ) -> list[PrepareGroupState]:
-        if not prepare_groups:
-            return []
-        loop = asyncio.get_running_loop()
-        sample_groups = [prepare_group.sample_group for prepare_group in prepare_groups]
-        request_groups = await loop.run_in_executor(
-            self._runtime_resources.compiler.cpu_executor,
-            functools.partial(
-                _request_groups_from_sample_groups,
-                sample_groups,
-                include_input_payload=self.args.rollout_global_dataset,
-            ),
-        )
-        group_records: list[dict[str, Any]] = []
-        all_request_plans: list[_PrepareRequestPlan] = []
-        registration_entries: list[dict[str, Any]] = []
-        for prepare_group, sample_group, request_group in zip(
-            prepare_groups, sample_groups, request_groups, strict=True
-        ):
-            group_id = prepare_group.group_id
-            group_generation = prepare_group.group_generation
-            request_plans: list[_PrepareRequestPlan] = []
-            for slot_idx, (envelope, seed_sample) in enumerate(zip(request_group, sample_group, strict=True)):
-                session_id = self._session_id_for(
-                    envelope=envelope,
-                    seed_sample=seed_sample,
-                    slot_idx=slot_idx,
-                )
-                envelope.session_id = session_id
-                seed_sample.session_id = session_id
-                request_sampling_params = (
-                    copy.deepcopy(envelope.sampling_params)
-                    if isinstance(envelope.sampling_params, dict)
-                    else self._session_sampling_params_for(
-                        envelope=envelope,
-                        slot_idx=slot_idx,
-                    )
-                )
-                request_plan = _PrepareRequestPlan(
-                    slot_idx=slot_idx,
-                    envelope=envelope,
-                    session_id=session_id,
-                    request_sampling_params=request_sampling_params,
-                )
-                request_plans.append(request_plan)
-                all_request_plans.append(request_plan)
-            registration_entries.extend(
-                self._prepare_request_registration_entries(
-                    request_plans,
-                    scope_id=self.scope_id,
-                    group_id=group_id,
-                    group_generation=group_generation,
-                    gate_reason="prepare",
-                )
-            )
-            group_records.append(
-                {
-                    "group_id": group_id,
-                    "group_generation": group_generation,
-                    "sample_group": sample_group,
-                    "request_group": request_group,
-                    "request_plans": request_plans,
-                }
-            )
-        managed_session_handles: list[ManagedSessionHandle] = []
-        try:
-            await self._register_managed_sessions_batch(entries=registration_entries)
-            session_inputs: list[SessionInput] = []
-            submission_records: list[tuple[int, _PrepareRequestPlan]] = []
-            for group_index, group_record in enumerate(group_records):
-                for request_plan in group_record["request_plans"]:
-                    if not isinstance(request_plan.envelope.request_id, str) or not request_plan.envelope.request_id:
-                        request_plan.envelope.request_id = self._request_id_for(
-                            envelope=request_plan.envelope,
-                            session_id=request_plan.session_id,
-                        )
-                    session_inputs.append(self._build_managed_session_input(envelope=request_plan.envelope))
-                    submission_records.append((group_index, request_plan))
-            session_submitted_at = time.time()
-            managed_session_handles = runner_pool.submit_sessions(
-                spec=self._managed_app_spec_for_launch(),
-                session_inputs=session_inputs,
-            )
-            if len(managed_session_handles) != len(submission_records):
-                raise RuntimeError(
-                    "Managed session batch submission returned a mismatched number of handles: "
-                    f"expected={len(submission_records)}, got={len(managed_session_handles)}."
-                )
-            request_handles_by_group: list[list[PrepareRequestHandle]] = [[] for _ in group_records]
-            for (group_index, request_plan), managed_session_handle in zip(
-                submission_records, managed_session_handles, strict=True
-            ):
-                if not isinstance(request_plan.envelope.request_id, str) or not request_plan.envelope.request_id:
-                    raise RuntimeError("Submitted prepare request is missing request_id.")
-                request_handles_by_group[group_index].append(
-                    PrepareRequestHandle(
-                        slot_idx=request_plan.slot_idx,
-                        managed_session_handle=managed_session_handle,
-                        managed_session_submitted_at=session_submitted_at,
-                    )
-                )
-            return [
-                PrepareGroupState(
-                    group_id=str(group_record["group_id"]),
-                    group_generation=int(group_record["group_generation"]),
-                    sample_group=group_record["sample_group"],
-                    request_group=group_record["request_group"],
-                    request_handles=request_handles,
-                    status="warming",
-                )
-                for group_record, request_handles in zip(group_records, request_handles_by_group, strict=True)
-            ]
-        except BaseException:
-            try:
-                finalize_client = self._ensure_service_client()
-            except Exception:
-                finalize_client = None
-            if finalize_client is not None:
-                discard_tasks = [
-                    finalize_client.discard_session(session_id=request_plan.session_id)
-                    for request_plan in all_request_plans
-                    if isinstance(request_plan.session_id, str) and request_plan.session_id
-                ]
-                if discard_tasks:
-                    await asyncio.gather(*discard_tasks, return_exceptions=True)
-            for request_plan in all_request_plans:
-                session_id = request_plan.session_id
-                if isinstance(session_id, str) and session_id:
-                    self._clear_local_session_state(session_id=session_id)
-            await self._release_managed_session_handles(managed_session_handles)
-            raise
-
-    @staticmethod
-    def _dispatch_context_for(
-        *,
-        rollout_id: int,
-        slot_idx: int,
-        sample_group: list[Sample],
-        envelope: RequestEnvelope,
-    ) -> RequestDispatchContext:
-        return RequestDispatchContext(
-            rollout_id=rollout_id,
-            group_key=sample_group_key(sample_group),
-            expected_count=len(sample_group),
-            slot_idx=slot_idx,
-            envelope=envelope,
-        )
-
-    async def _discard_registered_sessions(self) -> int:
-        session_ids: set[str] = set(self._notified_session_rollouts)
-        for slot in self.runtime_slots_by_request_id.values():
-            if isinstance(slot.session_id, str) and slot.session_id:
-                session_ids.add(slot.session_id)
-        if not session_ids:
-            return 0
-
-        try:
-            finalize_client = self._ensure_service_client()
-        except BaseException as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to create finalize client during runtime shutdown session cleanup: error=%s",
-                exc,
-            )
-            raise RuntimeError("Failed to create finalize client during runtime shutdown session cleanup") from exc
-        ordered_session_ids = sorted(session_ids)
-        results = await asyncio.gather(
-            *(finalize_client.discard_session(session_id=session_id) for session_id in ordered_session_ids),
-            return_exceptions=True,
-        )
-        cleaned_count = 0
-        cleaned_session_ids: set[str] = set()
-        failed_results: list[tuple[str, BaseException]] = []
-        for session_id, result in zip(ordered_session_ids, results):
-            if isinstance(result, BaseException):
-                failed_results.append((session_id, result))
-                continue
-            if not isinstance(result, bool):
-                failed_results.append((session_id, TypeError(f"Unexpected discard result: {result!r}")))
-                continue
-            cleaned_count += 1
-            cleaned_session_ids.add(session_id)
-            # Idempotent "already absent" cleanup is still considered terminal for runtime-local cleanup state.
-            self._clear_local_session_state(session_id=session_id)
-        if cleaned_count:
-            logger.debug(
-                "Discarded or confirmed missing registered agentic sessions count=%s session_ids=%s",
-                cleaned_count,
-                sorted(cleaned_session_ids)[:16],
-            )
-        if failed_results:
-            for session_id, result in failed_results:
-                logger.warning(
-                    "Failed to discard registered agentic session during runtime shutdown: session_id=%s error=%s",
-                    session_id,
-                    result,
-                )
-            failed_session_ids = ", ".join(session_id for session_id, _ in failed_results)
-            raise RuntimeError(
-                f"Failed to discard registered agentic sessions during runtime shutdown: failed={failed_session_ids}"
-            ) from failed_results[0][1]
-        return cleaned_count
-
-    async def shutdown(self) -> None:
-        await self.drop_resident_results()
-        discarded_sessions = await self._discard_registered_sessions()
-        if discarded_sessions:
-            logger.info(
-                "Discarded registered agentic sessions during runtime shutdown count=%s",
-                discarded_sessions,
-            )
-        if self._service_client is not None:
-            await self._service_client.aclose()
-            self._service_client = None
-        if self._session_runner_pool is not None:
-            self._session_runner_pool.shutdown()
-            self._session_runner_pool = None
-        self._emitted_materialized_session_count_total = 0
-        self._drained_materialized_session_count_total = 0
-        self.session_debug_state = None
-        self.managed_chat_api_base_url = None
-        self._notified_session_rollouts.clear()
-
-    async def wait_for_next_runtime_slot(self, *, timeout_s: float | None = None) -> str | None:
-        if self._ready_materialized_batches:
-            self._output_ready_event.clear()
-            return "output_ready"
-        materialization_progress = await self._drain_finished_runtime_slot_materializations()
-        if materialization_progress is not None:
-            return materialization_progress
-        running_slots = [
-            slot for slot in self.runtime_slots_by_request_id.values() if slot.state == RuntimeSlotState.RUNNING_APP
-        ]
-        if not running_slots:
-            return None
-        runner_pool = self._session_runner_pool
-        if runner_pool is None:
-            raise RuntimeError("RuntimeDomain has running managed sessions without a runner pool.")
-        handle_to_request_id = {slot.managed_session_handle: slot.request_id for slot in running_slots}
-        poll_sleep_s = 0.05 if timeout_s is None else max(0.0, float(timeout_s))
-        owned_handles = list(handle_to_request_id)
-        ready_handles = runner_pool.drain_completed_session_handles(session_handles=owned_handles)
-        if not ready_handles and poll_sleep_s > 0.0:
-            await asyncio.sleep(poll_sleep_s)
-            ready_handles = runner_pool.drain_completed_session_handles(session_handles=owned_handles)
-        if not ready_handles:
-            return None
-        for ready_handle in ready_handles:
-            request_id = handle_to_request_id[ready_handle]
-            slot = self.runtime_slots_by_request_id.get(request_id)
-            if slot is None:
-                continue
-            self._start_runtime_slot_materialization(request_id=request_id, slot=slot)
-        materialization_progress = await self._drain_finished_runtime_slot_materializations()
-        if materialization_progress is not None:
-            return materialization_progress
-        return "slot_materializing"
-
-    async def _materialize_managed_result_record(
-        self,
-        *,
-        dispatch_context: RequestDispatchContext,
-        session_id: str,
-        managed_result: _ManagedRequestResult,
-    ) -> dict[str, Any] | _MaterializationDrop:
-        # This is the only runtime path that turns an ended managed agent task into a finalized sample.
-        result_transport = await self._finalize_managed_result_payload(
-            result_payload=managed_result.result_payload,
-            session_runner_started_at=managed_result.session_runner_started_at,
-        )
-        if result_transport.status in {"discarded", "non_finalizable"}:
-            return _MaterializationDrop(
-                group_key=dispatch_context.group_key,
-                session_id=session_id,
-                reason=result_transport.status,
-                info=copy.deepcopy(result_transport.metadata) if isinstance(result_transport.metadata, dict) else {},
-            )
-        return await self._materialize_transport_record(
-            dispatch_context=dispatch_context,
-            session_id=session_id,
-            result_transport=result_transport,
-        )
-
-    async def _materialize_transport_record(
-        self,
-        *,
-        dispatch_context: RequestDispatchContext,
-        session_id: str,
-        result_transport: FinalizedResultTransport,
-    ) -> dict[str, Any]:
-        pending_units = await self._export_units_from_transport(
-            session_id=session_id,
-            envelope=dispatch_context.envelope,
-            result_transport=result_transport,
-        )
-        self._notified_session_rollouts.pop(session_id, None)
-        return {
-            "rollout_id": dispatch_context.rollout_id,
-            "group_key": dispatch_context.group_key,
-            "expected_count": dispatch_context.expected_count,
-            "slot_idx": dispatch_context.slot_idx,
-            "session_id": session_id,
-            "pending_units": pending_units,
-            "samples": [unit.sample for unit in pending_units],
-        }
-
-    def _emit_session_materialization_batch(self, records: list[dict[str, Any]]) -> None:
-        if not records:
-            return
-        ready_at = time.time()
-        self._ready_materialized_session_count += len(records)
-        self._emitted_materialized_session_count_total += len(records)
-        for record in records:
-            for unit in record["pending_units"]:
-                mark_metadata_agentic_event(unit.sample.metadata, "materialize_ready_at", ready_at)
-        for record in records:
-            group = self.runtime_groups_by_key.get(record["group_key"])
-            if group is None:
-                raise RuntimeError(f"RuntimeDomain cannot materialize unknown resident group: {record['group_key']!r}")
-            group.add_materialized_record(record, store_samples=bool(self.args.group_rm))
-            if group.is_complete() and self.args.group_rm:
-                completed_group = group.materialized_group()
-                self._ready_materialized_groups.append((record["group_key"], completed_group))
-        self._ready_materialized_batches.append(list(records))
-        self._output_ready_event.set()
-
-    async def _export_units_from_transport(
-        self,
-        *,
-        session_id: str,
-        envelope: RequestEnvelope,
-        result_transport: FinalizedResultTransport,
-    ) -> list[PendingExportUnit]:
-        if result_transport.status in {"discarded", "non_finalizable"}:
-            raise RuntimeError(f"Cannot export samples from {result_transport.status!r} transport.")
-        artifact_ref = result_transport.artifact_ref
-        if artifact_ref is None:
-            raise RuntimeError("Agentic export requires artifact_ref in FinalizedResultTransport")
-        artifact = await _resolve_object_async(artifact_ref, executor=self._runtime_resources.compiler.cpu_executor)
-        if not (isinstance(artifact, dict) and isinstance(artifact.get("units"), list)):
-            raise RuntimeError("Agentic export requires artifact_ref to resolve to a payload with a units list.")
-        unit_payloads = artifact["units"]
-        if len(unit_payloads) > 1:
-            if not getattr(self.args, "use_dynamic_batch_size", False):
-                raise RuntimeError("Agentic explicit export with multiple rows requires --use-dynamic-batch-size.")
-
-        units: list[PendingExportUnit] = []
-        for unit_payload in unit_payloads:
-            if not isinstance(unit_payload, dict):
-                raise RuntimeError("Agentic export unit payload must be a dict.")
-            sample_payload = unit_payload["sample_payload"]
-            if not isinstance(sample_payload, dict):
-                raise RuntimeError("Agentic export unit payload must include a sample_payload dict.")
-            sample = TrainingFieldArtifact(sample_payload=sample_payload).to_sample()
-            sample.group_index = envelope.seed.group_index
-            sample.index = envelope.seed.index
-            sample.label = envelope.seed.label
-            sample.train_metadata = envelope.seed.train_metadata
-            sample.metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-            sample.session_id = session_id
-            _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=envelope.metadata)
-            _overlay_sample_metadata(base_metadata=sample.metadata, overlay_metadata=result_transport.metadata)
-            mark_metadata_agentic_event(sample.metadata, "materialize_harvest_at")
-            spans = unit_payload["assistant_token_spans"]
-            unit_name = unit_payload["name"]
-            setattr(sample, "_agentic_export_name", unit_name)
-            units.append(
-                PendingExportUnit(
-                    name=unit_name,
-                    sample=sample,
-                    assistant_token_spans=[(int(start), int(end)) for start, end in spans],
-                    mode=ExportMode(str(unit_payload["mode"])),
-                )
-            )
-        return units
-
-
-# Runtime backend resources
-
-
+# Compiler calibration messages used to measure the chat-template prefix. Their
+# exact roles and text affect prefix subtraction, so changes require tokenizer
+# and template coverage rather than cosmetic editing.
 _DUMMY_MESSAGES = [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "I am a user."},
 ]
-_COMPILER_RESOURCE_CACHE_LOCK = threading.Lock()
-_COMPILER_RESOURCE_CACHE: dict[tuple[str, int], "AgenticCompilerResources"] = {}
-_MAX_COMPILER_RESOURCE_CACHE_ENTRIES = 4
 
 
-def _default_cpu_worker_count() -> int:
-    cpu_count = os.cpu_count() or 8
-    return max(16, min(64, cpu_count * 4))
+# OpenAI stores historical function.arguments as JSON text, while current
+# Hugging Face tool-use templates such as Qwen3.5 expect a mapping. Match
+# SGLang serving_chat by decoding arguments only in this rendering copy.
+def _messages_for_chat_template(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rendered_messages = list(messages)
+    for message_index, message in enumerate(messages):
+        tool_calls = message.get("tool_calls") or ()
+        rendered_tool_calls = list(tool_calls)
+        changed = False
+        for call_index, tool_call in enumerate(tool_calls):
+            function = tool_call["function"]
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("Assistant tool call function.arguments must be valid JSON.") from exc
+                if not isinstance(arguments, dict):
+                    raise ValueError("Assistant tool call function.arguments must be a JSON object.")
+                rendered_function = dict(function)
+                rendered_function["arguments"] = arguments
+                rendered_tool_call = dict(tool_call)
+                rendered_tool_call["function"] = rendered_function
+                rendered_tool_calls[call_index] = rendered_tool_call
+                changed = True
+        if changed:
+            rendered_message = dict(message)
+            rendered_message["tool_calls"] = rendered_tool_calls
+            rendered_messages[message_index] = rendered_message
+    return rendered_messages
 
 
 @dataclass(frozen=True)
 class AgenticCompilerResources:
+    """CPU resources shared by one message compiler."""
+
     tokenizer: Any
     processor: Any
     cpu_executor: Executor
     processor_pool: Any | None = None
 
     def shutdown(self) -> None:
-        try:
-            self.cpu_executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            self.cpu_executor.shutdown(wait=False)
-        except Exception as exc:
-            raise RuntimeError("Failed to shutdown compiler cpu executor") from exc
-
         if self.processor_pool is not None:
-            try:
-                self.processor_pool.shutdown(wait=False)
-            except Exception as exc:
-                raise RuntimeError("Failed to shutdown processor pool") from exc
+            self.processor_pool.shutdown(wait=False)
 
 
-@dataclass(frozen=True)
-class RuntimeDomainResources:
-    compiler: AgenticCompilerResources
-    target_session_count: int
+def load_agentic_compiler_resources(args: Namespace) -> AgenticCompilerResources:
+    """Load compiler resources used by one SessionShard."""
 
-    def session_runner_pool_size(self, *, total_requests: int) -> int:
-        launch_limit = max(self.target_session_count, total_requests)
-        if launch_limit <= 0 or total_requests <= 0:
-            return 0
-        desired_by_load = ceil(total_requests / 16)
-        node_count = 1
-        try:
-            import ray
-
-            if ray.is_initialized():
-                node_count = sum(1 for node in ray.nodes() if node.get("Alive"))
-        except Exception as exc:
-            raise RuntimeError("Failed to inspect Ray nodes for launch session runner pool sizing") from exc
-        return min(total_requests, launch_limit, max(node_count, desired_by_load))
-
-    def session_runner_capacities(self, *, total_requests: int) -> list[int]:
-        launch_limit = max(self.target_session_count, total_requests)
-        runner_count = self.session_runner_pool_size(total_requests=total_requests)
-        if launch_limit <= 0 or runner_count <= 0:
-            return []
-        base, remainder = divmod(launch_limit, runner_count)
-        capacities = [base + (1 if idx < remainder else 0) for idx in range(runner_count)]
-        return [capacity for capacity in capacities if capacity > 0]
-
-    def build_session_runner_pool(self, *, total_requests: int, factory: Callable[[list[int]], Any]) -> Any | None:
-        capacities = self.session_runner_capacities(total_requests=total_requests)
-        if not capacities:
-            return None
-        return factory(capacities)
-
-
-def _bootstrap_processor_pool(args: Any):
-    pool_size = args.mm_processor_pool_size
-    if pool_size <= 0:
-        return None
-    from relax.utils.data.processor_pool import ProcessorPool
+    from relax.utils.data.processing_utils import configure_encode_executor, load_processor, load_tokenizer
 
     prepare_model_maybe_update_args(args, completeness="metadata")
-    return ProcessorPool(
-        model_path=args.hf_checkpoint,
-        pool_size=pool_size,
-        trust_remote_code=True,
+    tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+    processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+    cpu_executor = configure_encode_executor(args.encode_max_workers)
+    processor_pool = None
+    if args.mm_processor_pool_size > 0:
+        from relax.utils.data.processor_pool import ProcessorPool
+
+        processor_pool = ProcessorPool(
+            model_path=args.hf_checkpoint,
+            pool_size=args.mm_processor_pool_size,
+            trust_remote_code=True,
+        )
+    return AgenticCompilerResources(
+        tokenizer=tokenizer,
+        processor=processor,
+        cpu_executor=cpu_executor,
+        processor_pool=processor_pool,
     )
-
-
-def _pop_oldest_cache_entry(cache: dict[Any, Any]) -> tuple[Any, Any] | None:
-    if not cache:
-        return None
-    oldest_key = next(iter(cache))
-    return oldest_key, cache.pop(oldest_key)
-
-
-def clear_agentic_runtime_caches() -> None:
-    global _AGENTIC_SERVICE_CLIENT
-    _AGENTIC_SERVICE_CLIENT = None
-
-    with _COMPILER_RESOURCE_CACHE_LOCK:
-        compiler_resources = list(_COMPILER_RESOURCE_CACHE.values())
-        _COMPILER_RESOURCE_CACHE.clear()
-    for resources in compiler_resources:
-        resources.shutdown()
-    logger.info("Agentic runtime caches cleared.")
-
-
-def agentic_target_session_count_from_args(args: Any) -> int:
-    oversample_group_count = args.over_sampling_batch_size
-    prepare_pool_target_groups = args.agentic_prepare_pool_size or oversample_group_count
-    tail_carry_group_count = args.rollout_batch_size if getattr(args, "fully_async", False) else 0
-    sessions_per_group = args.n_samples_per_prompt
-    return (tail_carry_group_count + oversample_group_count + prepare_pool_target_groups) * sessions_per_group
-
-
-def get_agentic_runtime_resources(args: Any) -> RuntimeDomainResources:
-    prepare_model_maybe_update_args(args, completeness="metadata")
-    hf_checkpoint = args.hf_checkpoint
-    pool_size = args.mm_processor_pool_size
-    cache_key = (hf_checkpoint, pool_size)
-    with _COMPILER_RESOURCE_CACHE_LOCK:
-        compiler_resources = _COMPILER_RESOURCE_CACHE.get(cache_key)
-        if compiler_resources is None:
-            evicted = None
-            if len(_COMPILER_RESOURCE_CACHE) >= _MAX_COMPILER_RESOURCE_CACHE_ENTRIES:
-                evicted = _pop_oldest_cache_entry(_COMPILER_RESOURCE_CACHE)
-            from relax.utils.data.processing_utils import load_processor, load_tokenizer
-
-            compiler_resources = AgenticCompilerResources(
-                tokenizer=load_tokenizer(hf_checkpoint, trust_remote_code=True),
-                processor=load_processor(hf_checkpoint, trust_remote_code=True),
-                cpu_executor=ThreadPoolExecutor(max_workers=_default_cpu_worker_count()),
-                processor_pool=_bootstrap_processor_pool(args),
-            )
-            _COMPILER_RESOURCE_CACHE[cache_key] = compiler_resources
-            logger.info(
-                "Created agentic compiler resources "
-                f"(hf_checkpoint={hf_checkpoint}, mm_processor_pool_size={pool_size})"
-            )
-        else:
-            _COMPILER_RESOURCE_CACHE.pop(cache_key)
-            _COMPILER_RESOURCE_CACHE[cache_key] = compiler_resources
-            evicted = None
-    if evicted is not None:
-        evicted[1].shutdown()
-    return RuntimeDomainResources(
-        compiler=compiler_resources,
-        target_session_count=agentic_target_session_count_from_args(args),
-    )
-
-
-def _processing_utils():
-    from relax.utils.data import processing_utils
-
-    return processing_utils
 
 
 def _normalize_multimodal_inputs_sync(
@@ -3415,6 +159,8 @@ def _normalize_multimodal_inputs_sync(
 
 @dataclass
 class EncodedMessages:
+    """Compiler output consumed by SessionForest and the generation backend."""
+
     train_prompt_ids: list[int]
     backend_prompt_ids: list[int]
     backend_image_data: list[str] = field(default_factory=list)
@@ -3426,6 +172,8 @@ class EncodedMessages:
 
 @dataclass
 class BackendGenerateResult:
+    """One SGLang-shaped generation attempt for a stable IR."""
+
     new_tokens: list[int]
     new_log_probs: list[float]
     finish_type: str
@@ -3434,10 +182,12 @@ class BackendGenerateResult:
 
 
 class BackendContextLengthExceededError(RuntimeError):
-    pass
+    """The generation backend rejected a request whose context is too long."""
 
 
 class SGLangMessageCompiler:
+    """Message compiler used by the Shard-owned SGLang adapter."""
+
     def __init__(
         self,
         *,
@@ -3447,8 +197,8 @@ class SGLangMessageCompiler:
         apply_chat_template_kwargs: dict[str, Any] | None = None,
         use_audio_in_video: bool = False,
         multimodal_config: Any | None = None,
-        cpu_executor: Any | None = None,
-    ):
+        cpu_executor: Executor,
+    ) -> None:
         self.tokenizer = tokenizer
         self.processor = processor
         self.processor_pool = processor_pool
@@ -3457,31 +207,6 @@ class SGLangMessageCompiler:
         self.multimodal_config = multimodal_config
         self.cpu_executor = cpu_executor
 
-    @staticmethod
-    def _merge_timing(*timings: dict[str, float]) -> dict[str, float]:
-        merged: dict[str, float] = {}
-        for timing in timings:
-            if not timing:
-                continue
-            merged.update({key: float(value) for key, value in timing.items()})
-        return merged
-
-    def _apply_chat_template(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]] | None,
-        chat_template_kwargs: dict[str, Any] | None,
-    ) -> str:
-        chat_template_kwargs = chat_template_kwargs or {}
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tools=tools,
-            tokenize=False,
-            add_generation_prompt=True,
-            **chat_template_kwargs,
-        )
-
     def _build_prompt_sync(
         self,
         messages: list[dict[str, Any]],
@@ -3489,10 +214,12 @@ class SGLangMessageCompiler:
         chat_template_kwargs: dict[str, Any] | None,
     ) -> tuple[str, list[int], int, dict[str, float]]:
         template_started_at = time.monotonic()
-        prompt_text = self._apply_chat_template(
-            messages,
+        prompt_text = self.tokenizer.apply_chat_template(
+            _messages_for_chat_template(messages),
             tools=tools,
-            chat_template_kwargs=chat_template_kwargs,
+            tokenize=False,
+            add_generation_prompt=True,
+            **(chat_template_kwargs or {}),
         )
         template_elapsed_s = time.monotonic() - template_started_at
 
@@ -3515,21 +242,22 @@ class SGLangMessageCompiler:
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
     ) -> tuple[str, list[int], int, dict[str, float]]:
-        chat_template_kwargs = chat_template_kwargs or {}
+        template_kwargs = chat_template_kwargs or {}
+        rendered_messages = _messages_for_chat_template(messages)
         template_started_at = time.monotonic()
         dummy_prompt = self.tokenizer.apply_chat_template(
             _DUMMY_MESSAGES,
             tools=tools,
             tokenize=False,
             add_generation_prompt=False,
-            **chat_template_kwargs,
+            **template_kwargs,
         ).rstrip("\n")
         formatted_prompt = self.tokenizer.apply_chat_template(
-            _DUMMY_MESSAGES + messages,
+            _DUMMY_MESSAGES + rendered_messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
-            **chat_template_kwargs,
+            **template_kwargs,
         )
         template_elapsed_s = time.monotonic() - template_started_at
 
@@ -3591,10 +319,7 @@ class SGLangMessageCompiler:
                         "return_mm_token_type_ids": False,
                     },
                 )
-                processor_output = self.processor(
-                    text=prompt_text,
-                    **processor_kwargs,
-                )
+                processor_output = self.processor(text=prompt_text, **processor_kwargs)
                 prompt_ids = list(processor_output["input_ids"][0])
                 train_inputs = {
                     key: (torch.from_numpy(value) if isinstance(value, np.ndarray) else value)
@@ -3625,20 +350,22 @@ class SGLangMessageCompiler:
         if not multimodal_inputs:
             return [], [], [], {}
         started_at = time.monotonic()
-        images = list(multimodal_inputs.get("images") or [])
-        videos = list(multimodal_inputs.get("videos") or [])
+        images = multimodal_inputs.get("images") or []
+        videos = multimodal_inputs.get("videos") or []
         audio_items = list(multimodal_inputs.get("audio") or [])
 
-        processing_utils = _processing_utils()
+        from relax.utils.data.processing_utils import (
+            encode_audio_for_rollout_engine,
+            encode_image_for_rollout_engine,
+            encode_video_tensor_for_rollout_engine,
+        )
+
         loop = asyncio.get_running_loop()
-        tasks = [
-            loop.run_in_executor(self.cpu_executor, processing_utils.encode_image_for_rollout_engine, image)
-            for image in images
-        ]
+        tasks = [loop.run_in_executor(self.cpu_executor, encode_image_for_rollout_engine, image) for image in images]
         tasks.extend(
             loop.run_in_executor(
                 self.cpu_executor,
-                processing_utils.encode_video_tensor_for_rollout_engine,
+                encode_video_tensor_for_rollout_engine,
                 video,
             )
             for video in videos
@@ -3649,7 +376,7 @@ class SGLangMessageCompiler:
                 tasks.append(
                     loop.run_in_executor(
                         self.cpu_executor,
-                        processing_utils.encode_audio_for_rollout_engine,
+                        encode_audio_for_rollout_engine,
                         waveform,
                         sample_rate,
                     )
@@ -3660,9 +387,9 @@ class SGLangMessageCompiler:
 
         results = await asyncio.gather(*tasks)
         offset = 0
-        image_data = list(results[offset : offset + len(images)])
+        image_data = results[offset : offset + len(images)]
         offset += len(images)
-        video_data = list(results[offset : offset + len(videos)])
+        video_data = results[offset : offset + len(videos)]
         offset += len(videos)
         audio_data = list(results[offset:])
         return image_data, audio_data, video_data, {"media_encode_elapsed_s": time.monotonic() - started_at}
@@ -3672,8 +399,8 @@ class SGLangMessageCompiler:
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
-        chat_template_kwargs: dict[str, Any] | None = None,
-        multimodal_inputs: dict[str, Any] | None = None,
+        chat_template_kwargs: dict[str, Any] | None,
+        multimodal_inputs: dict[str, Any] | None,
         prompt_builder: Callable[
             [list[dict[str, Any]], list[dict[str, Any]] | None, dict[str, Any] | None],
             tuple[str, list[int], int, dict[str, float]],
@@ -3681,7 +408,6 @@ class SGLangMessageCompiler:
     ) -> EncodedMessages:
         total_started_at = time.monotonic()
         loop = asyncio.get_running_loop()
-
         prompt_future = loop.run_in_executor(
             self.cpu_executor,
             prompt_builder,
@@ -3701,16 +427,19 @@ class SGLangMessageCompiler:
         else:
             multimodal_future = None
 
-        prompt_text, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
-        multimodal_inputs = None
+        normalized_multimodal_inputs = None
         multimodal_timing: dict[str, float] = {}
-        if multimodal_future is not None:
-            multimodal_inputs, multimodal_timing = await multimodal_future
-        has_media = multimodal_inputs is not None and any(
-            multimodal_inputs.get(key) for key in ("images", "videos", "audio")
+        if multimodal_future is None:
+            prompt_text, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
+        else:
+            prompt_result, multimodal_result = await asyncio.gather(prompt_future, multimodal_future)
+            prompt_text, backend_prompt_ids, trim_length, prompt_timing = prompt_result
+            normalized_multimodal_inputs, multimodal_timing = multimodal_result
+        has_media = normalized_multimodal_inputs is not None and any(
+            normalized_multimodal_inputs.get(key) for key in ("images", "videos", "audio")
         )
 
-        train_prompt_ids = list(backend_prompt_ids)
+        train_prompt_ids = backend_prompt_ids
         multimodal_train_inputs = None
         processor_timing: dict[str, float] = {}
         media_timing: dict[str, float] = {}
@@ -3718,21 +447,19 @@ class SGLangMessageCompiler:
         audio_data: list[str] = []
         video_data: list[str] = []
 
-        processor_task = None
-        media_task = None
         if has_media:
-            processor_task = asyncio.create_task(
-                self._run_processor_async(prompt_text, multimodal_inputs or {}, trim_length=trim_length)
+            processor_result, media_result = await asyncio.gather(
+                self._run_processor_async(prompt_text, normalized_multimodal_inputs, trim_length=trim_length),
+                self._encode_media_async(normalized_multimodal_inputs),
             )
-        if has_media:
-            media_task = asyncio.create_task(self._encode_media_async(multimodal_inputs))
+            train_prompt_ids, multimodal_train_inputs, processor_timing = processor_result
+            image_data, audio_data, video_data, media_timing = media_result
 
-        if processor_task is not None:
-            train_prompt_ids, multimodal_train_inputs, processor_timing = await processor_task
-        if media_task is not None:
-            image_data, audio_data, video_data, media_timing = await media_task
-
-        timing = self._merge_timing(prompt_timing, multimodal_timing, processor_timing, media_timing)
+        timing = {
+            key: value
+            for timings in (prompt_timing, multimodal_timing, processor_timing, media_timing)
+            for key, value in timings.items()
+        }
         timing["total_elapsed_s"] = time.monotonic() - total_started_at
         return EncodedMessages(
             train_prompt_ids=train_prompt_ids,
@@ -3777,99 +504,75 @@ class SGLangMessageCompiler:
         )
 
 
-def _extract_output_tokens_and_log_probs(
-    meta_info: dict[str, Any],
-    *,
-    output_ids: list[int],
-    tokenizer: Any,
-    processor: Any | None = None,
-) -> tuple[list[int], list[float]]:
-    output_token_logprobs = meta_info.get("output_token_logprobs")
-    if output_token_logprobs:
-        tokens = [item[1] for item in output_token_logprobs]
-        log_probs = [item[0] for item in output_token_logprobs]
-        return _sanitize_multimodal_output_tokens(tokens, tokenizer=tokenizer, processor=processor), log_probs
-    return _sanitize_multimodal_output_tokens(output_ids, tokenizer=tokenizer, processor=processor), []
+_Result = TypeVar("_Result")
 
 
-def _sanitize_multimodal_output_tokens(
-    tokens: list[int],
-    *,
-    tokenizer: Any | None,
-    processor: Any | None = None,
-) -> list[int]:
-    if tokenizer is None or not tokens:
-        return tokens
+async def finish_before_cancellation(work: Awaitable[_Result], task_name: str) -> _Result:
+    """Finish owned cleanup before forwarding caller cancellation."""
+
+    task = asyncio.ensure_future(work)
+    if isinstance(task, asyncio.Task):
+        task.set_name(task_name)
+    cancellation_received = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.done():
+                task.result()
+                raise
+            cancellation_received = True
+    if cancellation_received:
+        raise asyncio.CancelledError
+    return result
+
+
+def _sanitize_output_tokens(tokens: list[int], tokenizer: Any, processor: Any) -> list[int]:
     pad_token_id = getattr(tokenizer, "pad_token_id", None)
     if pad_token_id is None:
         return tokens
-    sanitized = list(tokens)
-    for token_name, warning_label in (
-        ("image_token_id", "Image"),
-        ("audio_token_id", "Audio"),
-        ("video_token_id", "Video"),
-    ):
+    sanitized = tokens
+    for token_name in ("image_token_id", "audio_token_id", "video_token_id"):
         special_token_id = getattr(tokenizer, token_name, None)
-        if special_token_id is None:
-            continue
-        while special_token_id in sanitized:
-            index = sanitized.index(special_token_id)
-            sanitized[index] = int(pad_token_id)
-            logger.warning(
-                "%s token found in output tokens, replaced with pad_token_id. Consider updating the model's stop "
-                "condition to stop at %s if you want to avoid this.",
-                warning_label,
-                token_name,
-            )
+        if special_token_id is not None:
+            sanitized = [pad_token_id if token == special_token_id else token for token in sanitized]
     if processor is not None:
         from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
 
-        kimi_sanitized = sanitize_kimi_k25_response_tokens(processor, sanitized)
-        if kimi_sanitized is not sanitized:
-            replaced = sum(1 for old, new in zip(sanitized, kimi_sanitized, strict=True) if old != new)
-            if replaced:
-                logger.warning(
-                    "K2.x: replaced %s stray <|media_pad|> token(s) in rollout response with pad_token_id.",
-                    replaced,
-                )
-            sanitized = kimi_sanitized
+        sanitized = sanitize_kimi_k25_response_tokens(processor, sanitized)
     return sanitized
 
 
-def _is_context_length_error(exc: httpx.HTTPStatusError) -> bool:
-    if exc.response.status_code != 400:
+def _is_context_length_error(error: httpx.HTTPStatusError) -> bool:
+    if error.response.status_code != 400:
         return False
-    response_text = exc.response.text or ""
-    if "maximum context length" in response_text or "Requested token count exceeds" in response_text:
-        return True
-    try:
-        payload = json.loads(response_text)
-    except Exception:
-        return False
-    error_message = (payload.get("error") or {}).get("message", "")
-    return "maximum context length" in error_message or "Requested token count exceeds" in error_message
+    response_text = error.response.text or ""
+    return "maximum context length" in response_text or "Requested token count exceeds" in response_text
 
 
 class SGLangBackendAdapter:
-    def __init__(self, args: Any, *, compiler_resources: AgenticCompilerResources | None = None):
-        router_port = args.sglang_router_port
-        self._resolved_router_ip = args.sglang_router_ip
-        self._resolved_router_port = None if router_port is None else int(router_port)
-        self._apply_chat_template_kwargs = args.apply_chat_template_kwargs
-        self._use_rollout_routing_replay = args.use_rollout_routing_replay
-        self._router_policy = args.sglang_router_policy
-        self._slime_router_sticky = getattr(args, "slime_router_sticky", False)
-        resources = compiler_resources or get_agentic_runtime_resources(args).compiler
-        self.tokenizer = resources.tokenizer
+    """Shard-owned SGLang compiler and HTTP capability."""
+
+    def __init__(self, args: Namespace) -> None:
+        init_http_client(args)
+        self._args = args
+        self._resources = load_agentic_compiler_resources(args)
+        self._session_lifecycle = args.agentic_session_lifecycle
+        self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
-            tokenizer=resources.tokenizer,
-            processor=resources.processor,
-            processor_pool=resources.processor_pool,
-            apply_chat_template_kwargs=self._apply_chat_template_kwargs,
+            tokenizer=self._resources.tokenizer,
+            processor=self._resources.processor,
+            processor_pool=self._resources.processor_pool,
+            apply_chat_template_kwargs=args.apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
             multimodal_config=MultimodalConfig.from_args(args),
-            cpu_executor=resources.cpu_executor,
+            cpu_executor=self._resources.cpu_executor,
         )
+
+    @property
+    def _router_url(self) -> str:
+        return f"http://{self._args.sglang_router_ip}:{self._args.sglang_router_port}"
 
     async def generate(
         self,
@@ -3877,56 +580,777 @@ class SGLangBackendAdapter:
         input_ids: list[int],
         sampling_params: dict[str, Any],
         session_id: str | None,
-        request_id: str | None = None,
+        request_id: str,
         image_data: list[str] | None = None,
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
     ) -> BackendGenerateResult:
-        router_ip, router_port = self._resolved_router_ip, self._resolved_router_port
-        if not router_ip or not router_port:
-            raise RuntimeError("SGLang router address is required for agentic chat generation.")
         payload = {
-            "input_ids": list(input_ids),
-            "sampling_params": dict(sampling_params),
-            "return_logprob": bool(return_logprob),
+            "input_ids": input_ids,
+            "sampling_params": sampling_params,
+            "rid": request_id,
+            "return_logprob": return_logprob,
         }
-        if request_id:
-            payload["request_id"] = request_id
-        if self._use_rollout_routing_replay:
+        if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
-            payload["image_data"] = list(image_data)
+            payload["image_data"] = image_data
         if audio_data:
             payload["audio_data"] = list(audio_data)
         if video_data:
-            payload["video_data"] = list(video_data)
+            payload["video_data"] = video_data
+        if session_id and self._session_lifecycle:
+            # The full input_ids remain authoritative; session_id only tags
+            # the resulting radix leaves for terminal cleanup.
+            payload["session_id"] = session_id
         headers = None
-        if session_id and (self._router_policy == "consistent_hashing" or self._slime_router_sticky):
-            # Pin every turn of a session to the same engine so the growing
-            # conversation prefix reuses that engine's KV cache across turns.
+        if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
-        url = f"http://{router_ip}:{router_port}/generate"
-        started = time.time()
+        started = time.monotonic()
         try:
-            output = await post(url, payload, headers=headers)
-        except httpx.HTTPStatusError as exc:
-            if _is_context_length_error(exc):
-                raise BackendContextLengthExceededError(exc.response.text) from exc
+            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+        except httpx.HTTPStatusError as error:
+            if _is_context_length_error(error):
+                raise BackendContextLengthExceededError(error.response.text) from error
             raise
-        elapsed = time.time() - started
-        meta_info = dict(output.get("meta_info", {}))
-        new_tokens, new_log_probs = _extract_output_tokens_and_log_probs(
-            meta_info,
-            output_ids=output["output_ids"],
-            tokenizer=self.tokenizer,
-            processor=self.compiler.processor,
-        )
-        finish_type = str(meta_info.get("finish_reason", {}).get("type", "stop"))
+        elapsed = time.monotonic() - started
+        meta_info = dict(output["meta_info"])
+        token_logprobs = list(meta_info.get("output_token_logprobs") or ())
+        tokens = [int(item[1]) for item in token_logprobs] if token_logprobs else list(output["output_ids"])
         return BackendGenerateResult(
-            new_tokens=new_tokens,
-            new_log_probs=new_log_probs,
-            finish_type=finish_type,
+            new_tokens=_sanitize_output_tokens(tokens, self.tokenizer, self.compiler.processor),
+            new_log_probs=[float(item[0]) for item in token_logprobs],
+            finish_type=str(meta_info["finish_reason"]["type"]),
             meta_info=meta_info,
             elapsed=elapsed,
         )
+
+    async def abort_request(self, request_id: str) -> None:
+        urls = await self._worker_urls()
+        await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
+
+    async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
+        """Release one terminal Session from every engine radix cache."""
+
+        if not self._session_lifecycle:
+            return True
+
+        async def close_all_workers() -> list[Any]:
+            urls = await self._worker_urls()
+            return await asyncio.gather(
+                *(post(f"{url}/close_session", {"session_id": session_id}) for url in urls),
+                return_exceptions=True,
+            )
+
+        try:
+            outcomes = await asyncio.wait_for(close_all_workers(), timeout=timeout_s)
+        except Exception:
+            return False
+        return all(not isinstance(outcome, BaseException) for outcome in outcomes)
+
+    async def _worker_urls(self) -> list[str]:
+        try:
+            response = await get(f"{self._router_url}/workers")
+            urls = [worker["url"] for worker in response["workers"] if worker["url"] and worker["is_healthy"]]
+            if urls:
+                return router_worker_base_urls(urls)
+        except Exception as workers_error:
+            try:
+                response = await get(f"{self._router_url}/list_workers")
+            except Exception as list_workers_error:
+                raise RuntimeError("Failed to query SGLang workers") from list_workers_error
+            urls = response["urls"]
+            if not urls:
+                raise RuntimeError("SGLang returned no workers") from workers_error
+            return router_worker_base_urls(urls)
+        response = await get(f"{self._router_url}/list_workers")
+        return router_worker_base_urls(response["urls"])
+
+    async def shutdown(self) -> None:
+        self._resources.shutdown()
+
+
+def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:
+    if prompt is None or (isinstance(prompt, (dict, list)) and not prompt):
+        return []
+    if isinstance(prompt, str):
+        if not prompt.strip():
+            return []
+        return check_messages([{"role": "user", "content": prompt}])
+    if isinstance(prompt, dict):
+        messages = [prompt]
+    elif isinstance(prompt, list):
+        messages = prompt
+    else:
+        raise TypeError(f"prompt must be a string, dict, list, or None, got {type(prompt)}")
+    if len(messages) == 1 and isinstance(messages[0], dict):
+        message = messages[0]
+        content = message.get("content")
+        if message.get("role") == "user" and (
+            content in (None, []) or (isinstance(content, str) and not content.strip())
+        ):
+            return []
+    return check_messages(messages)
+
+
+def _transport_image_payload(payload: Any) -> str:
+    if isinstance(payload, str) and payload.startswith(("data:image/", "http://", "https://")):
+        return payload
+
+    from PIL import Image
+
+    from relax.utils.multimodal.image_utils import load_image
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("bytes"), bytes):
+            payload = payload["bytes"]
+        elif isinstance(payload.get("path"), str) and payload["path"]:
+            payload = payload["path"]
+    image = payload if isinstance(payload, Image.Image) else load_image(payload)
+    buffer = BytesIO()
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _transport_dataset_message_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rendered_messages: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            rendered_messages.append(message)
+            continue
+        rendered_content: list[dict[str, Any]] = []
+        for item in content:
+            if item.get("type") == "image":
+                rendered_content.append(
+                    {"type": "image_url", "image_url": {"url": _transport_image_payload(item.get("image"))}}
+                )
+                continue
+            rendered_content.append(item)
+        rendered_message = dict(message)
+        rendered_message["content"] = rendered_content
+        rendered_messages.append(rendered_message)
+    return rendered_messages
+
+
+def _sample_messages(sample: Sample) -> list[dict[str, Any]]:
+    return _transport_dataset_message_media(_normalize_prompt(sample.prompt))
+
+
+def _build_session_specs(
+    samples: Sequence[Sample],
+    *,
+    session_ids: Sequence[str],
+    include_input_payload: bool,
+) -> Tuple[SessionSpec, ...]:
+    shared_messages = _sample_messages(samples[0]) if include_input_payload else []
+    session_specs = []
+    for sample, session_id in zip(samples, session_ids, strict=True):
+        metadata = sample.metadata
+        input_payload: dict[str, Any] = {}
+        if include_input_payload:
+            input_payload["messages"] = shared_messages
+            if metadata:
+                input_payload["metadata"] = metadata
+        sampling_params = getattr(sample, "sampling_params", None)
+        session_specs.append(
+            SessionSpec(
+                metadata=metadata,
+                input_payload=input_payload,
+                sampling_params=sampling_params,
+                session_id=session_id,
+                group_index=sample.group_index,
+                index=sample.index,
+                label=sample.label,
+                train_metadata=sample.train_metadata,
+            )
+        )
+    return tuple(session_specs)
+
+
+@dataclass(eq=False)
+class _SessionShardBinding:
+    """One borrowed SessionShard handle and its Runtime-local observer
+    state."""
+
+    actor_name: str
+    handle: Any
+    group_streams: Dict[str, "RuntimeGroupStream"] = field(default_factory=dict)
+    observed_revision: int = 0
+    revision_changed: asyncio.Event = field(default_factory=asyncio.Event)
+    observer_task: Optional["asyncio.Task[None]"] = None
+    state_change_ref: Optional[Any] = None
+
+
+@dataclass(eq=False)
+class _SessionResultRef:
+    """Driver-local completion ref addressed by the Session token."""
+
+    session_id: str
+    completion: "asyncio.Future[SessionExport | None]"
+    take_task: Optional["asyncio.Task[None]"] = None
+
+
+@dataclass(eq=False)
+class RuntimeGroupStream:
+    """Driver capability for one group owned wholly by one SessionShard.
+
+    It binds group identity, Shard ownership, the first-request barrier, and
+    terminal Session export refs.
+    """
+
+    group_id: str
+    shard: _SessionShardBinding
+    first_request_barrier: "asyncio.Future[bool]"
+    session_results: Tuple[_SessionResultRef, ...]
+    interrupted: bool = False
+    protected: bool = False
+
+
+def agentic_eval_concurrency_from_args(args: Namespace, eval_group_size: int) -> int:
+    """Resolve the resident Eval Group capacity for one dataset."""
+
+    if args.agentic_eval_concurrency is not None:
+        return args.agentic_eval_concurrency
+    train_session_capacity = args.agentic_concurrency * args.n_samples_per_prompt
+    return (train_session_capacity + eval_group_size - 1) // eval_group_size
+
+
+class RuntimeDomain:
+    """Sole adapter between pipeline group refs and their Session owner."""
+
+    def __init__(
+        self,
+        args: Namespace,
+        rollout_mode: Literal["train", "eval"],
+        shards: List[_SessionShardBinding],
+        concurrency: int,
+        admission_coordinator: Any | None = None,
+    ) -> None:
+        self.args = args
+        self.rollout_mode = rollout_mode
+        self._shards = shards
+        self.concurrency = concurrency
+        self._admission_coordinator = admission_coordinator
+        self._resident_group_permits = asyncio.Semaphore(concurrency)
+        self._progress_callback: Callable[[], None] = lambda: None
+        self._state_changed = asyncio.Event()
+
+    def set_progress_callback(self, callback: Callable[[], None]) -> None:
+        """Connect actor-local changes to the resident control loop."""
+
+        self._progress_callback = callback
+
+    @classmethod
+    async def connect(
+        cls,
+        args: Namespace,
+        rollout_mode: Literal["train", "eval"],
+        concurrency: int,
+    ) -> "RuntimeDomain":
+        """Borrow Shard handles from the named Ray Serve deployment.
+
+        Frequent control and terminal-data RPCs go directly to their Shard
+        owners.
+        """
+
+        from ray import serve
+
+        service = serve.get_app_handle(AGENTIC_CHAT_API_SERVICE_NAME)
+        shard_entries, admission_coordinator = await service.runtime_resources.remote()
+        return cls(
+            args,
+            rollout_mode,
+            [_SessionShardBinding(actor_name=actor_name, handle=handle) for actor_name, handle in shard_entries],
+            concurrency,
+            admission_coordinator,
+        )
+
+    @property
+    def resident_group_count(self) -> int:
+        """Derive Runtime residency from Shard group capabilities."""
+
+        return sum(len(shard.group_streams) for shard in self._shards)
+
+    @property
+    def interrupted_group_ids(self) -> Tuple[str, ...]:
+        """Derive close credit from current handles and Shard tokens."""
+
+        return tuple(
+            stream.group_id for shard in self._shards for stream in shard.group_streams.values() if stream.interrupted
+        )
+
+    async def prepare_group(
+        self,
+        group_input: GroupInput,
+        launch_decision: Optional[asyncio.Future[bool]] = None,
+    ) -> Optional[RuntimeGroupStream]:
+        """Start one group on a Shard and wait for its first-IR barrier.
+
+        Session launch and progress observation share one Shard event stream. A
+        controlled drop before the barrier resolves this operation without a
+        Runtime capability.
+        """
+
+        await self._resident_group_permits.acquire()
+        try:
+            self._start_shard_observers()
+            group_id = group_input.group_id
+            shard = self._shards[zlib.crc32(group_id.encode("utf-8")) % len(self._shards)]
+            session_ids = tuple(f"{shard.actor_name}.session-{uuid.uuid4().hex}" for _ in group_input.samples)
+            loop = asyncio.get_running_loop()
+            session_specs = await loop.run_in_executor(
+                None,
+                partial(
+                    _build_session_specs,
+                    group_input.samples,
+                    session_ids=session_ids,
+                    include_input_payload=self.args.rollout_global_dataset,
+                ),
+            )
+            if launch_decision is not None:
+                if not launch_decision.done():
+                    launch_decision.set_result(True)
+                if not launch_decision.result():
+                    self._resident_group_permits.release()
+                    return None
+            for sample_position, session_id in enumerate(session_ids):
+                group_input.samples[sample_position].session_id = session_id
+            stream = RuntimeGroupStream(
+                group_id=group_id,
+                shard=shard,
+                first_request_barrier=loop.create_future(),
+                session_results=tuple(
+                    _SessionResultRef(session_spec.session_id, loop.create_future()) for session_spec in session_specs
+                ),
+            )
+            # Register before the first await so concurrent Prepare calls observe
+            # one Shard binding for this stable Group token.
+            if group_id in shard.group_streams:
+                raise RuntimeGroupError(f"group token is already resident: {group_id}")
+        except BaseException:
+            self._resident_group_permits.release()
+            raise
+        shard.group_streams[group_id] = stream
+        try:
+            registration = asyncio.ensure_future(
+                shard.handle.start_group.remote(self.rollout_mode, group_id, session_specs)
+            )
+        except BaseException:
+            await finish_before_cancellation(
+                self._release_shard_group(stream),
+                f"start-group-submit-cleanup:{group_id}",
+            )
+            raise
+        try:
+            await finish_before_cancellation(
+                registration,
+                f"start-group:{group_id}",
+            )
+        except BaseException:
+            if registration.cancelled() or registration.exception() is not None:
+                await self._release_shard_group(stream)
+            else:
+                await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
+            raise
+
+        # Registration copied every launch field into the Shard. Drop the
+        # driver-side source and transport payloads before the first-IR wait.
+        del group_input, session_specs, registration, session_ids
+        try:
+            ready_for_lease = await asyncio.shield(stream.first_request_barrier)
+            if not ready_for_lease:
+                logger.warning("Dropping group %s because an agent exited before every first IR existed", group_id)
+                logger.info(format_agentic_status("Dropped 1 group"))
+                await self._drop_prepared_group(stream, f"prepare-group-drop:{group_id}")
+                return None
+        except BaseException:
+            await self._drop_prepared_group(stream, f"prepare-group-cleanup:{group_id}")
+            raise
+        return stream
+
+    async def lease_group(self, stream: RuntimeGroupStream, rollout_id: int) -> None:
+        """Move one prepared group into Runtime and release its IR gate."""
+
+        try:
+            await stream.shard.handle.lease_group.remote(stream.group_id, rollout_id)
+        except BaseException:
+            await finish_before_cancellation(
+                self.drop_group(stream),
+                f"lease-group-cleanup:{stream.group_id}",
+            )
+            raise
+
+    async def resume_generation(self, rollout_id: int) -> None:
+        """Release the partial-resume gate for the same requests."""
+
+        self._start_shard_observers()
+        revisions = await asyncio.gather(
+            *(shard.handle.resume_generation.remote(rollout_id) for shard in self._shards)
+        )
+        await self._wait_for_shard_revisions(revisions)
+
+    async def pause_generation(self) -> None:
+        """Seal train IR admission, abort active attempts, and join
+        protection."""
+
+        await self._wait_for_no_protected_groups()
+        revisions = await asyncio.gather(*(shard.handle.pause_generation.remote() for shard in self._shards))
+        await self._wait_for_shard_revisions(revisions)
+        await self._wait_for_no_protected_groups()
+
+    def _start_shard_observers(self) -> None:
+        """Start the sole progress observer for each Ray Shard."""
+
+        for shard in self._shards:
+            if shard.observer_task is None:
+                shard.observer_task = asyncio.create_task(
+                    self._watch_shard_progress(shard),
+                    name="session-shard-observer",
+                )
+            elif shard.observer_task.done():
+                # A failed observer is a failed Runtime transport. Re-raising
+                # preserves one owner instead of silently creating a new stream.
+                shard.observer_task.result()
+
+    async def _watch_shard_progress(self, shard: _SessionShardBinding) -> None:
+        """Bridge one Shard event stream into local group refs."""
+
+        def fail_group_stream(stream: RuntimeGroupStream, error: BaseException) -> None:
+            for local_ref in (
+                stream.first_request_barrier,
+                *(result.completion for result in stream.session_results),
+            ):
+                if not local_ref.done():
+                    local_ref.set_exception(error)
+
+        try:
+            while True:
+                state_change_ref = shard.handle.wait_for_state_change.remote(shard.observed_revision)
+                shard.state_change_ref = state_change_ref
+                try:
+                    progress = await state_change_ref
+                finally:
+                    if shard.state_change_ref is state_change_ref:
+                        shard.state_change_ref = None
+                self._apply_shard_progress(shard, progress)
+                self._progress_callback()
+        except asyncio.CancelledError:
+            pass
+        except BaseException as error:
+            for stream in tuple(shard.group_streams.values()):
+                fail_group_stream(stream, error)
+            shard.revision_changed.set()
+            self._state_changed.set()
+            self._progress_callback()
+            raise
+
+    def _apply_shard_progress(self, shard: _SessionShardBinding, progress: SessionShardProgress) -> None:
+        """Apply control progress and dispatch terminal-data takes."""
+
+        shard.observed_revision = progress.revision
+        for group_progress in progress.groups:
+            stream = shard.group_streams.get(group_progress.group_id)
+            if stream is None:
+                continue
+            # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
+            if group_progress.ready_for_lease and not stream.first_request_barrier.done():
+                stream.first_request_barrier.set_result(True)
+            # The step close predicate reads interrupted Group IDs as Fully-async credit.
+            stream.interrupted = group_progress.interrupted
+            stream.protected = group_progress.protected
+            # Group execution and ordinary RM await these terminal Session refs.
+            results = []
+            takeable_session_ids = set(group_progress.takeable_session_ids)
+            for result in stream.session_results:
+                if (
+                    result.session_id in takeable_session_ids
+                    and not result.completion.done()
+                    and result.take_task is None
+                ):
+                    results.append(result)
+            if results:
+                take_task = asyncio.create_task(
+                    _take_session_results(stream, tuple(results)),
+                    name=f"shard-take:{stream.group_id}",
+                )
+                for result in results:
+                    result.take_task = take_task
+        shard.revision_changed.set()
+        self._state_changed.set()
+
+    async def _wait_for_no_protected_groups(self) -> None:
+        """Join every protected Session around a train gate transition."""
+
+        self._start_shard_observers()
+        while any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
+            self._state_changed.clear()
+            if not any(stream.protected for shard in self._shards for stream in shard.group_streams.values()):
+                break
+            for shard in self._shards:
+                observer_task = cast("asyncio.Task[None]", shard.observer_task)
+                if observer_task.done():
+                    observer_task.result()
+            await self._state_changed.wait()
+
+    async def _wait_for_shard_revisions(self, target_revisions: List[int]) -> None:
+        """Join control RPCs with their event-stream observations."""
+
+        async def wait_for_revision(shard: _SessionShardBinding, target_revision: int) -> None:
+            while shard.observed_revision < target_revision:
+                shard.revision_changed.clear()
+                if shard.observed_revision >= target_revision:
+                    break
+                observer_task = cast("asyncio.Task[None]", shard.observer_task)
+                if observer_task.done():
+                    observer_task.result()
+                await shard.revision_changed.wait()
+
+        await asyncio.gather(
+            *(
+                wait_for_revision(shard, target_revision)
+                for shard, target_revision in zip(self._shards, target_revisions)
+            )
+        )
+
+    async def _stop_shard_observers(self) -> None:
+        """Stop Shard observers during Runtime shutdown."""
+
+        tasks = tuple(shard.observer_task for shard in self._shards if shard.observer_task is not None)
+        remote_waiters = tuple(
+            (shard, shard.state_change_ref)
+            for shard in self._shards
+            if isinstance(shard.state_change_ref, ray.ObjectRef)
+        )
+        for task in tasks:
+            task.cancel()
+        wake_outcomes = await asyncio.gather(
+            *(shard.handle.wake_state_change_waiters.remote() for shard, _ref in remote_waiters),
+            return_exceptions=True,
+        )
+        await asyncio.gather(*(ref for _shard, ref in remote_waiters), return_exceptions=True)
+        task_outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for shard in self._shards:
+            shard.observer_task = None
+            shard.state_change_ref = None
+        for outcome in (*wake_outcomes, *task_outcomes):
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+
+    async def collect_group(self, stream: RuntimeGroupStream) -> Optional[GroupExport]:
+        """Gather original Session exports into one complete Group export.
+
+        A controlled drop can complete the group early.
+        """
+
+        try:
+            session_export_refs = tuple(result.completion for result in stream.session_results)
+            pending = set(session_export_refs)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                # Read the whole completion batch so a controlled drop cannot hide a Runtime failure.
+                outcomes = [session_export_ref.result() for session_export_ref in done]
+                if any(outcome is None for outcome in outcomes):
+                    logger.info(format_agentic_status("Dropped 1 group"))
+                    return None
+
+            await stream.shard.handle.release_group.remote(stream.group_id)
+            group = GroupExport(
+                group_id=stream.group_id,
+                sessions=tuple(
+                    cast(SessionExport, session_export_ref.result()) for session_export_ref in session_export_refs
+                ),
+            )
+            await self._release_shard_group(stream)
+            return group
+        except BaseException:
+            await finish_before_cancellation(
+                self.drop_group(stream),
+                f"wait-group-cleanup:{stream.group_id}",
+            )
+            raise
+
+    async def drop_group(self, stream: RuntimeGroupStream) -> None:
+        """Release Prepare, Runtime, and runner state with one group RPC."""
+
+        if stream.shard.group_streams.get(stream.group_id) is not stream:
+            return
+        await stream.shard.handle.drop_group.remote(stream.group_id)
+        if not stream.first_request_barrier.done():
+            stream.first_request_barrier.set_result(False)
+        for result in stream.session_results:
+            if not result.completion.done():
+                result.completion.set_result(None)
+        await self._release_shard_group(stream)
+
+    async def trim_memory(self) -> None:
+        """Run allocator maintenance on every borrowed SessionShard."""
+
+        await asyncio.gather(
+            *(shard.handle.trim_memory.remote() for shard in self._shards),
+            return_exceptions=True,
+        )
+
+    async def debug_state(self) -> dict[str, Any]:
+        """Project Shard refs into one debug dictionary."""
+
+        shard_snapshots = tuple(
+            await asyncio.gather(*(shard.handle.debug_state.remote(sample_limit=8) for shard in self._shards))
+        )
+        return {
+            "shards": shard_snapshots,
+            "group_count": sum(snapshot["group_count"] for snapshot in shard_snapshots),
+            "session_count": sum(snapshot["session_count"] for snapshot in shard_snapshots),
+            "retained_request_count": sum(snapshot["retained_request_count"] for snapshot in shard_snapshots),
+            "backend_request_count": sum(snapshot["backend_request_count"] for snapshot in shard_snapshots),
+            "live_process_count": sum(snapshot["live_process_count"] for snapshot in shard_snapshots),
+        }
+
+    async def collect_agentic_kv_metrics(self) -> dict[str, float]:
+        if not getattr(self.args, "agentic_program_admission", False) and not getattr(
+            self.args, "agentic_session_lifecycle", False
+        ):
+            return {}
+        shard_metrics = await asyncio.gather(
+            *(shard.handle.agentic_kv_metrics.remote(reset=True) for shard in self._shards),
+            return_exceptions=True,
+        )
+        metrics: dict[str, float] = {}
+        for snapshot in shard_metrics:
+            if isinstance(snapshot, BaseException):
+                continue
+            for key, value in snapshot.items():
+                if key == "session/lifecycle_enabled":
+                    metrics[key] = max(metrics.get(key, 0.0), float(value))
+                else:
+                    metrics[key] = metrics.get(key, 0.0) + float(value)
+        if self._admission_coordinator is not None:
+            try:
+                metrics.update(await self._admission_coordinator.metrics.remote(True))
+            except Exception:
+                pass
+        return {f"agentic_kv/{key}": value for key, value in metrics.items()}
+
+    async def shutdown(self) -> None:
+        """Join every Ray owner and raise the first cleanup failure."""
+
+        first_error: Optional[BaseException] = None
+        try:
+            await self._stop_shard_observers()
+        except BaseException as error:
+            first_error = error
+
+        streams = tuple(stream for shard in self._shards for stream in shard.group_streams.values())
+        drop_outcomes = await asyncio.gather(
+            *(stream.shard.handle.drop_group.remote(stream.group_id) for stream in streams),
+            return_exceptions=True,
+        )
+        for outcome in drop_outcomes:
+            if first_error is None and isinstance(outcome, BaseException):
+                first_error = outcome
+        for stream in streams:
+            await self._release_shard_group(stream)
+
+        await self.trim_memory()
+
+        # Shards belong to the Serve deployment lifecycle. Runtime releases its
+        # borrowed handles after every owned Group has completed cleanup.
+        self._shards.clear()
+        if first_error is not None:
+            raise first_error
+
+    async def _release_shard_group(self, stream: RuntimeGroupStream) -> None:
+        """Release driver refs after Shard export/drop commits."""
+
+        take_tasks = {result.take_task for result in stream.session_results if result.take_task is not None}
+        for task in take_tasks:
+            if not task.done():
+                task.cancel()
+        if take_tasks:
+            await asyncio.gather(*take_tasks, return_exceptions=True)
+        local_refs = (
+            stream.first_request_barrier,
+            *(result.completion for result in stream.session_results),
+        )
+        for local_ref in local_refs:
+            if not local_ref.done():
+                local_ref.cancel()
+        await asyncio.gather(*local_refs, return_exceptions=True)
+        # Remote cleanup can commit before cancellation reaches this driver ref.
+        group_id = stream.group_id
+        if stream.shard.group_streams.get(group_id) is stream:
+            stream.shard.group_streams.pop(group_id)
+            self._resident_group_permits.release()
+
+    async def _drop_prepared_group(self, stream: RuntimeGroupStream, task_name: str) -> None:
+        """Drop a registered Prepare group and release its local stream."""
+
+        if stream.shard.group_streams.get(stream.group_id) is not stream:
+            return
+        try:
+            await finish_before_cancellation(
+                stream.shard.handle.drop_group.remote(stream.group_id),
+                task_name,
+            )
+        finally:
+            await self._release_shard_group(stream)
+
+
+async def _take_session_results(
+    stream: RuntimeGroupStream,
+    results: Tuple[_SessionResultRef, ...],
+) -> None:
+    """Take one Group's announced results into stable local refs."""
+
+    session_ids = tuple(result.session_id for result in results)
+    try:
+        session_results = await stream.shard.handle.take_session_results.remote(stream.group_id, session_ids)
+        for result, session_result in zip(results, session_results, strict=True):
+            _resolve_session_export(stream, result, session_result)
+    except Exception as error:
+        for result in results:
+            completion = result.completion
+            if not completion.done():
+                completion.set_exception(error)
+        if not stream.first_request_barrier.done():
+            stream.first_request_barrier.set_exception(error)
+
+
+def _resolve_session_export(
+    stream: RuntimeGroupStream,
+    result: _SessionResultRef,
+    session_result: SessionExportTransport | RuntimeGroupError | None,
+) -> None:
+    """Resolve one terminal result into its driver-owned ref."""
+
+    completion = result.completion
+    if completion.done():
+        return
+    if isinstance(session_result, RuntimeGroupError):
+        completion.set_exception(session_result)
+        if not stream.first_request_barrier.done():
+            stream.first_request_barrier.set_exception(session_result)
+        return
+    if session_result is None:
+        completion.set_result(None)
+        if not stream.first_request_barrier.done():
+            stream.first_request_barrier.set_result(False)
+        return
+    exports = []
+    for export_payload in session_result.exports:
+        sample = TrainingFieldArtifact(sample_payload=export_payload["sample_payload"]).to_sample()
+        mark_sample_agentic_event(sample, "sample_export_collected_at")
+        exports.append(
+            SampleExport(
+                name=export_payload["name"],
+                sample=sample,
+            )
+        )
+    completion.set_result(SessionExport(exports=tuple(exports)))
+
+
+__all__ = ["RuntimeDomain", "RuntimeGroupError", "RuntimeGroupStream"]

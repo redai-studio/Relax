@@ -214,14 +214,18 @@ class UpdateWeightFromTensor:
 
         if self.lora_enabled and self.lora_merge_mode:
             renamed = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
-            n_adapter_backup = sum(1 for k in renamed if is_lora_adapter_param(k))
+            adapter_keys = [k for k in renamed if is_lora_adapter_param(k)]
+            n_expert = sum(1 for k in adapter_keys if ".experts." in k)
             logger.info(
-                "[lora-merge] merge branch active (weight_version=%d): %d/%d backup tensors are "
-                "LoRA adapters available for splicing",
+                "[lora-merge] colocate sync v=%d: %d/%d backup tensors are LoRA adapters "
+                "(%d non-expert + %d expert) available for splicing",
                 self.weight_version,
-                n_adapter_backup,
+                len(adapter_keys),
                 len(renamed),
+                len(adapter_keys) - n_expert,
+                n_expert,
             )
+            n_adapter_backup = len(adapter_keys)
             if n_adapter_backup == 0:
                 logger.error(
                     "[lora-merge] NO adapter tensors in backup dict — merge would degrade to "
@@ -364,13 +368,17 @@ class UpdateWeightFromTensor:
         # 2) Register the LoRA adapter on the engines via SGLang's LoRA API. first_sync gates the
         #    unload-before-load; kept as `not self._lora_sync.adapter_loaded` (rather than hardcoded
         #    True) so a re-entry after engine restart still unloads stale state first.
-        self._push_lora_adapter(megatron_local_weights, first_sync=not self._lora_sync.adapter_loaded)
-        self._lora_sync.adapter_loaded = True
+        push_error: Exception | None = None
+        try:
+            self._push_lora_adapter(megatron_local_weights, first_sync=not self._lora_sync.adapter_loaded)
+        except Exception as e:  # noqa: BLE001 - re-raised by the resume helper, on every rank
+            logger.exception("LoRA adapter push failed; resuming generation before aborting")
+            push_error = e
+        else:
+            self._lora_sync.adapter_loaded = True
 
         dist.barrier(group=get_gloo_group())
-        if rank == 0:
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
+        self._resume_generation_after_adapter_push(push_error)
 
     def _sync_lora_delta_only(self) -> None:
         """Subsequent syncs: refresh ONLY the LoRA adapter on the rollout
@@ -402,14 +410,43 @@ class UpdateWeightFromTensor:
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
-        self._push_lora_adapter(all_params, first_sync=not self._lora_sync.adapter_loaded)
-        self._lora_sync.adapter_loaded = True
+        push_error: Exception | None = None
+        try:
+            self._push_lora_adapter(all_params, first_sync=not self._lora_sync.adapter_loaded)
+        except Exception as e:  # noqa: BLE001 - re-raised by the resume helper, on every rank
+            logger.exception("LoRA adapter push failed; resuming generation before aborting")
+            push_error = e
+        else:
+            self._lora_sync.adapter_loaded = True
 
         dist.barrier(group=get_gloo_group())
-        if rank == 0:
+        self._resume_generation_after_adapter_push(push_error)
+        self._lora_sync.prev_state = new_state
+
+    def _resume_generation_after_adapter_push(self, push_error: Exception | None) -> None:
+        """Resume rollout generation, then re-raise an adapter-push failure on
+        every rank.
+
+        Only the gather-src rank can fail inside ``_push_lora_adapter``, and generation is
+        paused at that point. Raising there directly would leave the engines paused forever
+        and every other rank blocked in the barrier below waiting for a rank that already
+        unwound, so the verdict is shared first (MAX all-reduce), generation is resumed, and
+        only then does everyone raise together.
+
+        The failure is never swallowed: in adapter mode the engine's base weights are frozen,
+        so a dropped adapter means the rollout policy silently stops tracking the trained one.
+        """
+        failed = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=get_gloo_group())
+        if dist.get_rank() == 0:
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-        self._lora_sync.prev_state = new_state
+        if failed.item():
+            raise RuntimeError(
+                "LoRA adapter push to the rollout engines failed; aborting the weight update "
+                "instead of generating with a stale or missing adapter. Generation has been "
+                "resumed so the engines are not left paused."
+            ) from push_error
 
     def _push_lora_adapter(self, all_params: Mapping[str, torch.Tensor], *, first_sync: bool) -> None:
         """Export the trained LoRA adapter and (re)register it in-memory on
@@ -453,7 +490,21 @@ class UpdateWeightFromTensor:
             serialized = MultiprocessingSerializer.serialize(tensors, output_str=True)
             t3 = monotonic()
             if not first_sync:
-                ray.get(self._ipc_engine.unload_lora_adapter.remote(LORA_ADAPTER_NAME))
+                # Tolerate "already gone". SGLang's unload raises when the name is not in its
+                # registry, and a previous push that died between this unload and the load
+                # below leaves exactly that state (the registry entry is dropped, nothing
+                # replaces it). Failing here would make every retry die before reloading, so
+                # one transient error would wedge the engine permanently. A genuine unload
+                # failure still surfaces: the load right after reports "already loaded".
+                try:
+                    ray.get(self._ipc_engine.unload_lora_adapter.remote(LORA_ADAPTER_NAME))
+                except Exception as e:  # noqa: BLE001 - see above; the load is the real gate
+                    logger.warning(
+                        "Unloading the previous LoRA adapter '%s' failed (%s); continuing to the "
+                        "load, which will report 'already loaded' if a stale copy is still there.",
+                        LORA_ADAPTER_NAME,
+                        e,
+                    )
             # Keep `tensors` alive across the synchronous load: file_system storages live only while
             # the producer holds them, and the server maps them during this call.
             ray.get(

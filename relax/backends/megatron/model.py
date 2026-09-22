@@ -2,6 +2,7 @@
 
 import dataclasses
 import gc
+import itertools
 import math
 import os
 import string
@@ -18,7 +19,13 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    ParamKey,
+    ParamWithNamePredicate,
+    get_megatron_optimizer,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -27,7 +34,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import is_sft_mode
+from relax.engine.sft.runtime import should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
@@ -42,13 +49,19 @@ from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
     release_critic_lm_heads,
+    release_sequence_classification_lm_heads,
     validate_critic_value_head_registration,
+    validate_sequence_classification_head_registration,
 )
 
 from .checkpoint import load_checkpoint, save_checkpoint
-from .data import DataIterator, get_batch
+from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function
-from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
+from .model_provider import (
+    get_model_provider_func,
+    validate_mtp_only_trainable_params,
+    wrap_model_provider_with_freeze,
+)
 
 
 logger = get_logger(__name__)
@@ -89,6 +102,7 @@ def _bypass_output_layer(
     model: torch.nn.Module,
     *,
     mtp_output_layer_calls: int = 0,
+    gather_passthrough: bool = True,
 ) -> Iterator[Callable | None]:
     """Defer the main output_layer so model() returns hidden_states.
 
@@ -103,7 +117,9 @@ def _bypass_output_layer(
     only the following main-head call becomes a passthrough. This preserves
     MTP loss computation while still deferring the main SFT logits.
 
-    No-op on PP stages with no output layer (the loss never runs there).
+    ``gather_passthrough=False`` keeps sequence-parallel hidden states local;
+    MTP-only needs only a zero-valued autograd anchor and does not consume the
+    gathered sequence. No-op on PP stages with no output layer.
     """
     assert mtp_output_layer_calls >= 0, f"{mtp_output_layer_calls=}"
     output_layer = _find_lm_output_layer(model)
@@ -118,7 +134,7 @@ def _bypass_output_layer(
     deferred_weight = None
     main_head_deferred = False
 
-    if sp_enabled:
+    if sp_enabled and gather_passthrough:
         from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
     def _passthrough(input_, weight=None, runtime_gather_output=None, **kwargs):
@@ -135,7 +151,7 @@ def _bypass_output_layer(
             raise RuntimeError("output_layer was called more than once after all MTP head calls")
         main_head_deferred = True
         deferred_weight = weight
-        if sp_enabled:
+        if sp_enabled and gather_passthrough:
             input_ = gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=False, group=tp_group)
         return input_, None
 
@@ -170,20 +186,6 @@ def _bypass_output_layer(
             del output_layer.forward
         except AttributeError:
             output_layer.forward = original_forward
-
-
-def _should_use_sft_chunked(args: Namespace) -> bool:
-    """Gate for the SFT chunked-logits path.
-
-    Two conditions all must hold:
-    - SFT mode (loss_type == "sft")
-    - User explicitly opted in via --sft-chunked-logits
-
-    Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
-    earlier as hard AssertionErrors in arguments.py.slime_validate_args, so
-    by the time we reach this gate sft_chunked_logits=True is guaranteed safe.
-    """
-    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
 def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dict) -> None:
@@ -284,6 +286,83 @@ def _build_optimizer_config_kwargs(args: Namespace) -> dict[str, object]:
     return kwargs
 
 
+_VIT_PARAMETER_REGIONS = frozenset({"image_encoder", "vision_model", "vision_tower", "visual", "vit"})
+_VISION_PROJECTION_REGIONS = frozenset({"merger", "multi_modal_projector", "projector", "projection"})
+_VISION_PROJECTION_DESCENDANTS = frozenset({"deepstack_merger_list"})
+
+
+def _is_vit_parameter_name(name: str) -> bool:
+    """Return whether ``name`` belongs to the vision encoder rather than its
+    projection head."""
+    regions = name.split(".")
+    if any(region in _VISION_PROJECTION_DESCENDANTS for region in regions):
+        return False
+    for index, region in enumerate(regions):
+        if region not in _VIT_PARAMETER_REGIONS:
+            continue
+        next_region = regions[index + 1] if index + 1 < len(regions) else None
+        return next_region not in _VISION_PROJECTION_REGIONS
+    return False
+
+
+def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig) -> dict:
+    """Build Megatron optimizer overrides, including the optional MS-Swift-
+    style ViT LR group."""
+    config_overrides = get_standard_config_overrides(config)
+    vit_lr = getattr(args, "vit_lr", None)
+    if vit_lr is None:
+        return config_overrides
+
+    if not math.isfinite(vit_lr) or vit_lr <= 0.0:
+        raise ValueError(f"--vit-lr must be a finite number greater than 0, got {vit_lr!r}.")
+    if config.lr is None or not math.isfinite(config.lr) or config.lr <= 0.0:
+        raise ValueError(f"--lr must be a finite number greater than 0 when --vit-lr is set, got {config.lr!r}.")
+    if config.min_lr is None or not math.isfinite(config.min_lr) or config.min_lr < 0.0:
+        raise ValueError(f"--min-lr must be a finite non-negative number when --vit-lr is set, got {config.min_lr!r}.")
+    lr_warmup_init = getattr(args, "lr_warmup_init", 0.0)
+    if lr_warmup_init != 0.0:
+        raise ValueError(
+            "--vit-lr currently requires --lr-warmup-init 0 so the ViT and main learning rates keep the same "
+            f"ratio throughout warmup, got {lr_warmup_init!r}."
+        )
+
+    lr_mult = vit_lr / config.lr
+    vit_parameter = ParamWithNamePredicate(
+        name="relax_vit_parameter",
+        fn=lambda _param, name: _is_vit_parameter_name(name),
+    )
+    config_overrides[ParamKey(with_name_predicate=vit_parameter)] = {
+        # Megatron also uses lr_mult as part of the stable parameter-group identity when
+        # saving and restoring optimizer state; max_lr/min_lr alone are not sufficient.
+        "lr_mult": lr_mult,
+        "max_lr": vit_lr,
+        "min_lr": config.min_lr * lr_mult,
+    }
+    return config_overrides
+
+
+def _validate_vit_lr_trainable_params(args: Namespace, model: list[DDP]) -> None:
+    """Fail fast when ``--vit-lr`` does not match a trainable parameter on any
+    rank."""
+    if getattr(args, "vit_lr", None) is None:
+        return
+
+    global_match_count = sum(
+        1
+        for model_chunk in model
+        for name, param in model_chunk.named_parameters()
+        if param.requires_grad and _is_vit_parameter_name(name)
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        first_param = next(param for model_chunk in model for param in model_chunk.parameters())
+        count = torch.tensor(global_match_count, dtype=torch.long, device=first_param.device)
+        torch.distributed.all_reduce(count, group=torch.distributed.group.WORLD)
+        global_match_count = int(count.item())
+
+    if global_match_count == 0:
+        raise RuntimeError("--vit-lr did not match any trainable vision-encoder parameters in the distributed model.")
+
+
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
@@ -321,6 +400,7 @@ def setup_model_and_optimizer(
         ModelType.encoder_or_decoder,
         wrap_with_ddp=role in ["actor", "critic"],
     )
+    validate_mtp_only_trainable_params(args, model)
 
     # Some model providers (e.g., Qwen3VLGPTModel) rebuild the decoder in __init__,
     # which causes duplicate RoutingReplay registrations. Rebuild the list from
@@ -348,10 +428,12 @@ def setup_model_and_optimizer(
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
     config.timers = None
+    _validate_vit_lr_trainable_params(args, model)
 
     optimizer = get_megatron_optimizer(
         config=config,
         model_chunks=model,
+        config_overrides=_build_optimizer_config_overrides(args, config),
         use_gloo_process_groups=args.use_gloo_process_groups,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
@@ -768,6 +850,8 @@ def forward_only(
                 "total_lengths",
                 "response_lengths",
                 "max_seq_lens",
+                "classification_labels",
+                "sample_weights",
             ],
             args.data_pad_size_multiplier,
             args.qkv_format,
@@ -849,6 +933,8 @@ def forward_only(
             loss_masks=batch.get("loss_masks", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            classification_labels=batch.get("classification_labels", None),
+            sample_weights=batch.get("sample_weights", None),
         )
 
         if getattr(args, "dynamic_context_parallel", False) and per_sample_output:
@@ -928,18 +1014,39 @@ def forward_only(
             if args.use_dynamic_batch_size and per_sample_output:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
-                origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                # Per-sample callbacks (log_probs/values) emit one tensor per
-                # sample, so values aligns with origin_indices and we can
-                # restore the pre-balance order. Per-microbatch callbacks
-                # (e.g. compute_sft_eval_step) emit one aggregate per
-                # microbatch — len(values) == num_microbatches, not
-                # num_samples — and have no per-sample order to restore.
-                if len(values) == len(origin_indices):
-                    origin_values = [None] * len(values)
-                    for value, origin_index in zip(values, origin_indices, strict=False):
-                        origin_values[origin_index] = value
-                    values = origin_values
+                iterator = data_iterator[0]
+                micro_batch_indices = getattr(iterator, "micro_batch_indices", None)
+                if micro_batch_indices is not None and len(forward_data_store) == len(micro_batch_indices):
+                    dummy_offsets = getattr(iterator, "dummy_micro_batch_offsets", set())
+                    origin_values = [None] * len(iterator.rollout_data["total_lengths"])
+                    can_restore_order = True
+                    for offset, value in enumerate(forward_data_store):
+                        if offset in dummy_offsets:
+                            continue
+                        micro_values = value[key]
+                        indices = micro_batch_indices[offset]
+                        if len(micro_values) != len(indices):
+                            can_restore_order = False
+                            break
+                        for micro_value, origin_index in zip(micro_values, indices, strict=False):
+                            origin_values[origin_index] = micro_value
+                    if can_restore_order:
+                        if any(value is None for value in origin_values):
+                            raise RuntimeError("Dynamic forward output did not cover every local row.")
+                        values = origin_values
+                else:
+                    origin_indices = sum(data_iterator[0].micro_batch_indices, [])
+                    # Per-sample callbacks (log_probs/values) emit one tensor per
+                    # sample, so values aligns with origin_indices and we can
+                    # restore the pre-balance order. Per-microbatch callbacks
+                    # (e.g. compute_sft_eval_step) emit one aggregate per
+                    # microbatch — len(values) == num_microbatches, not
+                    # num_samples — and have no per-sample order to restore.
+                    if len(values) == len(origin_indices):
+                        origin_values = [None] * len(values)
+                        for value, origin_index in zip(values, origin_indices, strict=False):
+                            origin_values[origin_index] = value
+                        values = origin_values
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 
@@ -953,6 +1060,7 @@ def train_one_step(
     optimizer: MegatronOptimizer,
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
+    step_global_batch_size: int,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -968,6 +1076,7 @@ def train_one_step(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
+        step_global_batch_size (int): Number of distinct sample indices in this optimizer step.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -1012,7 +1121,7 @@ def train_one_step(
 
         nonlocal main_loss_has_tokens
         is_vl_model = getattr(args, "is_vl_model", False)
-        sft_chunked = _should_use_sft_chunked(args)
+        mtp_only = getattr(args, "mtp_only_training", False)
         # Get the batch.
         with timer(f"get_data_batch_{uuid.uuid4().hex[:8]}", keep=False):
             _opd_keys: list[str] = []
@@ -1027,6 +1136,7 @@ def train_one_step(
                     "total_lengths",
                     "response_lengths",
                     "loss_masks",
+                    "classification_labels",
                     "log_probs",
                     "ref_log_probs",
                     "values",
@@ -1034,6 +1144,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "max_seq_lens",
+                    "sample_index_mask_sums",
                     *_opd_keys,
                 ],
                 args.data_pad_size_multiplier,
@@ -1056,7 +1167,7 @@ def train_one_step(
             # build_schedule_plan path doesn't go through model() so the
             # _bypass_output_layer wrapping can't apply. The combined-1f1b ×
             # chunked-logits incompatibility is enforced as a hard assert in
-            # arguments.py.slime_validate_args, so sft_chunked is guaranteed
+            # arguments.py.slime_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
             output_tensor = model.build_schedule_plan(
                 input_ids=batch["tokens"],
@@ -1108,15 +1219,22 @@ def train_one_step(
                     inner = inner.module
                 inner.pg_collection.cp = mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
 
-            # SFT: defer lm_head into the loss (sft_loss_function_chunked)
-            # so the full [B, S, V/TP] fp32 logits tensor never materializes.
-            if sft_chunked:
+            # SFT chunking defers the main lm_head into the loss. MTP-only
+            # bypasses that main head entirely while preserving the preceding
+            # MTP head calls that build the auxiliary-loss autograd graph.
+            if should_bypass_main_output_layer(args):
+                # The chunked-MTP patch runs the MTP heads via the class-level
+                # forward, bypassing _passthrough, so MTP consumes ZERO intercepted
+                # calls. This gate MUST match _chunked_mtp_enabled() in that patch.
+                mtp_enabled = getattr(args, "enable_mtp_training", False)
+                chunked_mtp_on = mtp_enabled and getattr(args, "sft_chunked_logits", False)
                 mtp_output_layer_calls = (
-                    int(getattr(args, "mtp_num_layers", 0) or 0) if getattr(args, "enable_mtp_training", False) else 0
+                    0 if chunked_mtp_on else (int(getattr(args, "mtp_num_layers", 0) or 0) if mtp_enabled else 0)
                 )
                 with _bypass_output_layer(
                     model,
                     mtp_output_layer_calls=mtp_output_layer_calls,
+                    gather_passthrough=not mtp_only,
                 ) as lm_head_forward:
                     output_tensor = model(**forward_kwargs)
             else:
@@ -1125,10 +1243,9 @@ def train_one_step(
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        # Always dispatch via loss_function. lm_head_forward is None unless the
-        # SFT chunked path entered the bypass above; loss_function's "sft" case
-        # routes to sft_loss_function_chunked when both --sft-chunked-logits
-        # and lm_head_forward are set.
+        # Always dispatch via loss_function. MTP-only consumes the bypassed
+        # hidden states directly; chunked SFT uses lm_head_forward to compute
+        # the regular language loss in bounded chunks.
         return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
 
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
@@ -1219,7 +1336,7 @@ def train_one_step(
     if valid_step:
         # Update learning rate.
         assert update_successful
-        opt_param_scheduler.step(increment=args.global_batch_size)
+        opt_param_scheduler.step(increment=step_global_batch_size)
     else:
         grad_norm = float("nan")
 
@@ -1253,13 +1370,32 @@ def train_one_step(
 
         loss_reduced = {}
         values = values.tolist()
-        num_samples_or_tokens = values[0]
+        is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+        num_samples_or_tokens = (
+            values[0] if args.calculate_per_token_loss or is_sequence_classification else step_global_batch_size
+        )
+        if num_samples_or_tokens == 0:
+            # Degenerate / zero-signal batch: every micro-batch across all DP ranks contributed
+            # zero loss-normalising units. This happens when the whole batch carries no learning
+            # signal — e.g. every GRPO group has identical reward (zero advantage), all tokens are
+            # masked out by TIS rejection sampling, or the batch is entirely dummy-padded. The
+            # optimizer step above already ran as a (near) no-op on the zero gradients, so this only
+            # affects the *reported* metrics: return zeros instead of dividing by zero and killing
+            # the run. This is a stopgap robustness guard; the proper upstream fix (drop zero-variance
+            # groups + oversample so such batches never form) is tracked in
+            # docs/draft/degenerate_batch_zerodivision.md.
+            logger.warning(
+                "train_one_step: num_samples_or_tokens == 0 (degenerate/zero-signal batch); "
+                "reporting zero loss for this step instead of dividing by zero. keys=%s",
+                keys,
+            )
+            for key in keys:
+                loss_reduced[key] = 0.0
+            capture_hooks.end_step_for()
+            return loss_reduced, grad_norm
         for key, value in zip(keys, values[1:], strict=False):
-            # No cp_size factor: num_samples_or_tokens is the all-reduced CP-local
-            # token count (per-token) or sample count, so each token/sample is
-            # already counted once. A `* cp_size` here would over-weight metrics by
-            # CP degree under dynamic CP (and is a no-op under static CP, where the
-            # count previously carried the cancelling cp factor).
+            # Per-token and sequence-classification metrics use the all-reduced
+            # effective count. RL sample-mean metrics use the step's logical GBS.
             loss_reduced[key] = value / num_samples_or_tokens
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
@@ -1386,6 +1522,24 @@ def train(
             f"streaming data_iterator length ({len(data_iterator)}) must match "
             f"num_steps_per_rollout ({num_steps_per_rollout})"
         )
+    first_iterator = data_iterator[0]
+    if is_data_iterator:
+        global_batch_sizes = first_iterator.rollout_data.get(ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, None)
+    elif use_step_iterators:
+        global_batch_sizes = [
+            iterator.window_quota if iterator.window_quota is not None else args.global_batch_size
+            for iterator in data_iterator
+        ]
+    else:
+        global_batch_sizes = None
+    if global_batch_sizes is None:
+        global_batch_sizes = [args.global_batch_size for _ in range(num_steps_per_rollout)]
+    global_batch_sizes = [int(size) for size in global_batch_sizes]
+    if len(global_batch_sizes) != num_steps_per_rollout:
+        raise RuntimeError(
+            f"global_batch_sizes length {len(global_batch_sizes)} does not match "
+            f"num_microbatches length {num_steps_per_rollout}."
+        )
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
@@ -1401,6 +1555,7 @@ def train(
                 optimizer,
                 opt_param_scheduler,
                 num_microbatches[step_id],
+                global_batch_sizes[step_id],
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)
@@ -1414,19 +1569,39 @@ def train(
                 config.param_sync_func = param_sync_func
                 pre_hook_enabled = True
 
+        mtp_losses = None
+        mtp_loss_per_depth: list[float] = []
         if args.enable_mtp_training:
             from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
-            if "values" in tracker:
+            # mcore >= 0.19 renamed the tracker payload: the per-microbatch
+            # accumulator is now "loss_sums" (plus "num_tokens" in per-token mode)
+            # instead of "values", and the cross-rank reduction moved into
+            # MTPLossLoggingHelper.reduce_loss_in_tracker(), which repopulates
+            # "values" and handles both normalization modes. Older mcore exposes
+            # "values" directly with no such helper, so reduce by hand there.
+            # Mirrors upstream MTPLossLoggingHelper.track_mtp_metrics.
+            mtp_losses = None
+            reduce_in_tracker = getattr(MTPLossLoggingHelper, "reduce_loss_in_tracker", None)
+            if reduce_in_tracker is not None:
+                reduce_in_tracker()
+            elif "values" in tracker:
                 values = tracker["values"]
                 if tracker.get("reduce_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-                # here we assume only one mtp layer
-                mtp_losses = (tracker["values"] * mtp_loss_scale).item()
+            # "values" is the reduced payload on both old and new mcore;
+            # "loss_values" is the compatibility slot used by older helpers.
+            mtp_values = tracker.get("values")
+            if mtp_values is None:
+                mtp_values = tracker.get("loss_values")
+            if mtp_values is not None:
+                scaled = mtp_values * mtp_loss_scale
+                mtp_loss_per_depth = scaled.flatten().tolist()
+                mtp_losses = sum(mtp_loss_per_depth)
                 MTPLossLoggingHelper.clean_loss_in_tracker()
 
                 # CI check: verify MTP loss is within expected bounds
@@ -1452,8 +1627,13 @@ def train(
             log_dict[f"train/{role_tag}grad_norm"] = (
                 grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             )
-            if args.enable_mtp_training:
+            if args.enable_mtp_training and mtp_losses is not None:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+                # Per-depth losses when >1 MTP depth.
+                if len(mtp_loss_per_depth) > 1:
+                    for _i, _v in enumerate(mtp_loss_per_depth, start=1):
+                        log_dict[f"train/{role_tag}mtp_{_i}_loss"] = _v
+            log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
@@ -1511,7 +1691,12 @@ def train(
 
 
 def save(
-    iteration: int, model: Sequence[DDP], optimizer: MegatronOptimizer, opt_param_scheduler: OptimizerParamScheduler
+    iteration: int,
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer,
+    opt_param_scheduler: OptimizerParamScheduler,
+    *,
+    lora_only: bool = False,
 ) -> None:
     """Persist a training checkpoint safely with forward hooks disabled.
 
@@ -1533,10 +1718,13 @@ def save(
         checkpointing_context=None,
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
+        lora_only=lora_only,
     )
-    if is_lora_enabled(args):
-        checkpoint_dir = Path(args.save) / f"iter_{iteration:07d}"
-        _save_lora_to_checkpoint(model, str(checkpoint_dir), args)
+    # The native Megatron checkpoint above already contains the LoRA parameters
+    # and is the resume artifact. Do not additionally gather a portable HF adapter
+    # here: for large MoE LoRA runs the world-size ``gather_object`` retains every
+    # rank's adapter copy on rank 0 (>1.4 TiB host RAM on the 128-rank Qwen3.5-397B
+    # run). Portable adapters are still written by ``save_hf_model`` under --save-hf.
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -1569,6 +1757,66 @@ def _install_streaming_fp8_writer(bridge, strategy, block_size):
         source.save_generator = original_save_generator
 
     return writer, restore
+
+
+def _reference_vision_tensors(reference_hf_dir, key_to_filename_map):
+    """Yield ``(key, tensor)`` for every vision weight the reference declares.
+
+    Rank-gated because only rank 0 writes; the rest just drain the generator.
+    """
+    if torch.distributed.is_initialized() and torch.distributed.get_rank(group=torch.distributed.group.WORLD) != 0:
+        return
+
+    import safetensors
+
+    by_file: dict[str, list[str]] = {}
+    for key in sorted(key_to_filename_map):
+        if "vision" in key.lower():
+            by_file.setdefault(key_to_filename_map[key], []).append(key)
+
+    count = 0
+    for filename, keys in sorted(by_file.items()):
+        with safetensors.safe_open(os.path.join(reference_hf_dir, filename), framework="pt", device="cpu") as handle:
+            for key in keys:
+                yield key, handle.get_tensor(key)
+                count += 1
+    logger.info(f"Supplemented {count} vision tensor(s) from {reference_hf_dir}")
+
+
+def _install_vision_supplement(bridge, reference_hf_dir):
+    """Chain the reference's vision weights onto the export generator.
+
+    Bridge shards from the source index, so completing the group there is what
+    makes the export come out shaped like the reference. Returns a restore
+    callable the caller MUST run in a finally block, or None if there is no
+    safetensors source to copy from.
+    """
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    state = getattr(hf_pretrained, "state", None)
+    source = getattr(state, "source", None)
+    if source is None or not hasattr(source, "key_to_filename_map"):
+        logger.warning(
+            "Cannot supplement vision weights: --hf-checkpoint is not a safetensors-backed HF directory. "
+            "The export will be missing them."
+        )
+        return None
+
+    original_save_generator = source.save_generator
+
+    def save_generator(generator, *args, **kwargs):
+        # *args/**kwargs so Bridge can add keyword arguments without breaking us.
+        return original_save_generator(
+            itertools.chain(generator, _reference_vision_tensors(reference_hf_dir, source.key_to_filename_map)),
+            *args,
+            **kwargs,
+        )
+
+    source.save_generator = save_generator
+
+    def restore() -> None:
+        source.save_generator = original_save_generator
+
+    return restore
 
 
 def _apply_fp8_quantization_config(config_path, strategy, block_size, modules_to_not_convert):
@@ -1663,32 +1911,45 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
 
         path.mkdir(parents=True, exist_ok=True)
 
-        # A base HF model can define MTP layers that a model trained without MTP
-        # never emits; those tensors share safetensors shards with real LM tensors
-        # (lm_head, final norm, last layers), and with strict=True the bridge
-        # refuses to write those shards and silently truncates the export. Decide
-        # strictness from the *reference* model (args.hf_checkpoint): for standard
-        # RL/SFT jobs args.mtp_num_layers is None, so keying off the training model
-        # (as before) never triggered and left the export truncated.
-        from relax.utils.hf_export import reconcile_hf_export_index, reference_expects_mtp
+        # strict=True fails whenever the reference declares weights this model structurally
+        # never emits: Bridge refuses every shard holding such a key, losing the real
+        # tensors that shared it (measured on gemma-4-26B text-mode SFT: 58 of 657
+        # language tensors written). Relax only where that is still true after the vision
+        # supplement below. It is the only export-time guard against a mapping bug
+        # silently truncating the checkpoint.
+        from relax.utils.hf_export import (
+            reconcile_hf_export_index,
+            reference_expects_mtp,
+            reference_expects_vision,
+        )
 
         model_has_mtp = bool(getattr(args, "mtp_num_layers", 0))
         allow_missing_mtp_keys = reference_expects_mtp(args.hf_checkpoint) and not model_has_mtp
-        strict = not allow_missing_mtp_keys
+        # Short-circuits: a reference without vision weights can never be missing them.
+        vision_absent_from_model = reference_expects_vision(args.hf_checkpoint) and not hasattr(
+            get_model_config(model[0]), "vision_config"
+        )
 
         save_fp8 = getattr(args, "save_hf_dtype", "bf16") == "fp8"
         fp8_writer = None
         restore_save_generator = None
+        supplementing_vision = False
         if save_fp8:
             fp8_writer, restore_save_generator = _install_streaming_fp8_writer(
                 bridge,
                 args.save_hf_fp8_quant_mode,
                 args.save_hf_fp8_block_size,
             )
-            # StreamingFP8Writer runs its own strict check against the source
-            # safetensors index and doesn't understand the "MTP is expected but
-            # missing" case; drop strict so Bridge yields whatever it has.
-            strict = strict and not allow_missing_mtp_keys
+        elif vision_absent_from_model:
+            # elif: the reference tower is BF16, so under FP8 it would be neither
+            # quantized nor listed in modules_to_not_convert, and a loader would
+            # decode it as FP8.
+            restore_save_generator = _install_vision_supplement(bridge, args.hf_checkpoint)
+            supplementing_vision = restore_save_generator is not None
+
+        # Relax only for a group that really will end up absent.
+        allow_missing_vision_keys = vision_absent_from_model and not supplementing_vision
+        strict = not (allow_missing_mtp_keys or allow_missing_vision_keys)
 
         try:
             with patch_megatron_model(model):
@@ -1701,21 +1962,21 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
             if restore_save_generator is not None:
                 restore_save_generator()
 
-        # When MTP keys are tolerated as missing (strict=False above), Megatron-Bridge's
-        # non-distributed save still lists those mtp.* keys in model.safetensors.index.json
-        # while omitting them from the shards ("ghost" keys), and the base MTP weights are
-        # absent. Reconcile: rebuild the index from the tensors actually written and
-        # supplement MTP from the base HF model, so the checkpoint loads cleanly (incl.
-        # EAGLE speculative decoding). The bridge writes on WORLD rank 0, so run the
-        # reconcile there too (the output lives on shared storage). The FP8 path uses a
-        # separate streaming writer with its own index and is skipped here (mirrors
-        # scripts/tools/convert_torch_dist_to_hf_bridge.py).
+        # A non-strict save can leave "ghost" index entries: keys Bridge listed but wrote
+        # to no shard (seen for mtp.*, not for vision -- but this is a no-op when there is
+        # nothing to fix, so gate on both relaxations). Rebuilds the index from what was
+        # written and supplements MTP from the base so the checkpoint stays deployable.
+        # Vision is not supplemented here -- it goes in through the generator above, or
+        # not at all. Bridge writes on WORLD rank 0, so reconcile there. FP8 has its own
+        # streaming index and is skipped.
         is_export_writer = (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         )
-        if allow_missing_mtp_keys and is_export_writer and not save_fp8:
-            reconcile_hf_export_index(str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=True)
+        if (allow_missing_mtp_keys or allow_missing_vision_keys) and is_export_writer and not save_fp8:
+            reconcile_hf_export_index(
+                str(path), reference_hf_dir=args.hf_checkpoint, supplement_mtp=allow_missing_mtp_keys
+            )
 
         if save_fp8 and is_export_writer and fp8_writer is not None:
             _apply_fp8_quantization_config(
@@ -1735,6 +1996,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP], *, force_sync: bo
     except Exception as e:
         if should_log:
             logger.error(f"Failed to save HuggingFace format: {e}")
+        raise
 
 
 def initialize_model_and_optimizer(
@@ -1762,8 +2024,11 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
+    classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
+    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1779,6 +2044,14 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
+    if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
+        release_sequence_classification_lm_heads(model)
+        loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
+            model, optimizer, args
+        )
+        assert loaded_classification_head_param_ids == classification_head_param_ids, (
+            "sequence classification head parameter identities changed during checkpoint loading"
+        )
     clear_memory()
 
     return model, optimizer, opt_param_scheduler, iteration

@@ -27,7 +27,7 @@ for _mod in filter(None, (m.strip() for m in Envs.RELAX_EXTRA_MODULES.split(",")
     except BaseException as e:
         print(f"failed to import RELAX_EXTRA_MODULES entry {_mod!r}, error={e}")
 
-from relax.utils import device as device_utils  # noqa
+from relax.utils.device import device_module  # noqa
 
 
 try:
@@ -40,7 +40,7 @@ try:
         if torch_memory_saver._impl is not None:
             torch_memory_saver._impl._binary_wrapper.cdll.tms_set_interesting_region(False)
         old_init(self, *args, **kwargs)
-        device_utils.synchronize()
+        device_module.synchronize()
         if torch_memory_saver._impl is not None:
             torch_memory_saver._impl._binary_wrapper.cdll.tms_set_interesting_region(True)
 

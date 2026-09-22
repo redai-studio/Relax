@@ -22,10 +22,11 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
-from relax.utils import tracking_utils
+from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
 from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
@@ -41,7 +42,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import (
     compute_pass_rate,
-    compute_rollout_explicit_reward_metrics,
+    compute_rollout_reward_metrics,
     compute_rollout_step,
     compute_statistics,
     dict_add_prefix,
@@ -51,7 +52,11 @@ from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
 from relax.utils.reload_utils import ReloadableMixin
-from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+from relax.utils.s3_model_loader import (
+    build_runai_streamer_env_for_load,
+    prepare_model_maybe_update_args,
+)
+from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -68,6 +73,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+
+
+def _resolve_rollout_engine_class(args):
+    """Return the rollout engine class for the configured run.
+
+    ``rollout_engine_class_path`` (a dotpath) selects a custom engine such as
+    the native-diffusion generation engine; when unset the default text
+    ``SGLangEngine`` is returned so existing runs are unaffected (design doc
+    8.3).
+    """
+    class_path = getattr(args, "rollout_engine_class_path", None)
+    if class_path:
+        return load_function(class_path)
+    return SGLangEngine
 
 
 @dataclasses.dataclass
@@ -284,6 +303,8 @@ class ScaleOutRequest:
     failed_engines: list[str] = dataclasses.field(default_factory=list)  # Failed engine IDs
     error_message: Optional[str] = None  # Error details if failed
     weight_version: Optional[str] = None  # Weight version after sync
+    # Deduped category names (e.g. "PROVISION_TIMEOUT") for the monitor to bucket.
+    failure_categories: list[str] = dataclasses.field(default_factory=list)
 
     def __post_init__(self):
         if not self.request_id:
@@ -334,6 +355,7 @@ class ScaleOutRequest:
             "updated_at": self.updated_at,
             "error_message": self.error_message,
             "weight_version": self.weight_version,
+            "failure_categories": self.failure_categories,
         }
 
 
@@ -398,6 +420,13 @@ class ScaleInRequest:
         }
 
 
+class EngineGroupLifecycle(str, enum.Enum):
+    ACTIVE = "ACTIVE"
+    DRAINING = "DRAINING"
+    REMOVING = "REMOVING"
+    REMOVED = "REMOVED"
+
+
 @dataclasses.dataclass
 class EngineGroup:
     """A group of homogeneous SGLang engines with the same configuration.
@@ -421,6 +450,8 @@ class EngineGroup:
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
+    lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
+    eviction_requested: bool = False
 
     @property
     def nodes_per_engine(self):
@@ -464,7 +495,7 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(SGLangEngine)
+        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -515,6 +546,17 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
+            effective_load_format = self.sglang_overrides.get(
+                "load_format", getattr(self.args, "sglang_load_format", "auto")
+            )
+            env_vars.update(
+                build_runai_streamer_env_for_load(
+                    getattr(self.args, "model_source", None),
+                    effective_model_path,
+                    effective_load_format,
+                )
+            )
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
 
@@ -634,6 +676,28 @@ class EngineGroup:
 
 
 @dataclasses.dataclass
+class EngineFinalizeResult:
+    """Outcome of finalizing a new engine group's registration."""
+
+    success: bool
+    group: "EngineGroup | None" = None
+    reason: "ScaleOutFailure | None" = None
+
+
+@dataclasses.dataclass
+class ScaleResult:
+    """Outcome of a scale-out sub-step: success flag + optional classified
+    failure."""
+
+    success: bool
+    reason: "ScaleOutFailure | None" = None
+
+
+class _WeightSyncTimeoutError(TimeoutError):
+    """A remote weight-sync operation timed out and must not be retried."""
+
+
+@dataclasses.dataclass
 class RolloutServer:
     """A model served behind a shared router, with one or more engine groups.
 
@@ -700,13 +764,21 @@ class RolloutServer:
 
     def recover(self):
         """Recover dead engines across all active groups, overlapping init."""
-        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in self.engine_groups]
+        groups = list(self.engine_groups)
+        dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
 
         all_handles = []
         port_cursors: dict[int, int] = {}
         groups_to_remove = []
 
-        for g_idx, g in enumerate(self.engine_groups):
+        for g_idx, g in enumerate(groups):
+            if g.is_scaled_out and g.pg is not None and g.lifecycle_status is not EngineGroupLifecycle.ACTIVE:
+                if any(engine is None for engine in g.all_engines):
+                    logger.warning(
+                        "Skipping recovery for non-active scaled engine group at rank offset %s",
+                        g.rank_offset,
+                    )
+                continue
             if g.pg is None:
                 failed_indices = g.healthcheck_engines()
                 if failed_indices:
@@ -723,7 +795,9 @@ class RolloutServer:
             all_handles.extend(handles)
 
         for g_idx in reversed(groups_to_remove):
-            self.engine_groups.pop(g_idx)
+            group = groups.pop(g_idx)
+            if group in self.engine_groups:
+                self.engine_groups.remove(group)
             dead_per_group.pop(g_idx)
             logger.info(f"Removed dead external engine group {g_idx}")
 
@@ -732,8 +806,8 @@ class RolloutServer:
 
         release_handles = []
         new_engines_all = []
-        for g, dead_indices in zip(self.engine_groups, dead_per_group, strict=True):
-            if g.pg is None:
+        for g, dead_indices in zip(groups, dead_per_group, strict=True):
+            if g.pg is None or (g.is_scaled_out and g.lifecycle_status is not EngineGroupLifecycle.ACTIVE):
                 continue
             logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
@@ -804,6 +878,14 @@ class RolloutManager(ReloadableMixin):
     - get_loaded_modules(): Retrieve information about loaded modules
     """
 
+    # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
+    _WEIGHT_SYNC_PORT_BASE = Envs.RELAX_WEIGHT_SYNC_PORT_BASE
+    _WEIGHT_SYNC_PORT_MAX = Envs.RELAX_WEIGHT_SYNC_PORT_MAX
+    _SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE
+    _SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX
+    _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
+    _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
+
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
@@ -839,10 +921,18 @@ class RolloutManager(ReloadableMixin):
         else:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg)
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        self.rollout_engine_lock = Lock.options(
+            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
+        ).remote()
         self.rollout_id = -1
         self._metric_checker = MetricChecker.maybe_create(args)
         self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
+        self._engine_lifecycle_lock = threading.RLock()
+        existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
+        self._next_engine_rank = max(
+            (group.rank_offset + len(group.all_engines) for group in existing_groups),
+            default=0,
+        )
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -873,12 +963,15 @@ class RolloutManager(ReloadableMixin):
 
         # Elastic scale-in tracking
         self._scale_in_requests: dict[str, ScaleInRequest] = {}
-        self._is_weight_updating: bool = False
+        self._training_weight_updating: bool = False
+        self._scale_out_weight_updating: bool = False
         # Distributed mutex shared with the Actor process to ensure DCS weight
         # sync (update_weights_fully_async) and sglang remote instance weight sync
         # (_sync_weights_from_seed_engine) never run concurrently.
         # Both paths use the seed engine's NCCL stack and cannot overlap.
-        self._weight_sync_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        self._weight_sync_lock = Lock.options(
+            **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
+        ).remote()
 
         # GC config: max terminal requests to keep per dict
         self._max_terminal_requests = 100
@@ -889,6 +982,19 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
+        """Allocate ranks monotonically so a removed elastic rank is not
+        reused."""
+        with self._engine_lifecycle_lock:
+            rank_offset = ((self._next_engine_rank + alignment - 1) // alignment) * alignment
+            self._next_engine_rank = rank_offset + count
+            return rank_offset
+
+    @property
+    def _is_weight_updating(self) -> bool:
+        with self._engine_lifecycle_lock:
+            return self._training_weight_updating or self._scale_out_weight_updating
 
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is
@@ -1032,7 +1138,9 @@ class RolloutManager(ReloadableMixin):
             evaluation=False,
         )
         if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-            self._dynamic_global_batch_size = len(output.samples) * self.args.n_samples_per_prompt
+            self._dynamic_global_batch_size = len(
+                {sample.index for sample_group in output.samples for sample in sample_group}
+            )
 
     async def eval(self, rollout_id):
         self.health_monitoring_resume()
@@ -1381,17 +1489,32 @@ class RolloutManager(ReloadableMixin):
 
     def _find_active_scale_request(self) -> Optional[dict]:
         """Return info about any active (non-terminal) scale-out or scale-in
-        request.
+        request or claimed graceful eviction.
 
         Returns None if no active request exists, otherwise a dict with
         ``type``, ``request_id``, and ``status`` of the blocking request.
         """
-        for r in self._scale_out_requests.values():
-            if not r.is_terminal():
-                return {"type": "scale_out", "request_id": r.request_id, "status": r.status.value}
-        for r in self._scale_in_requests.values():
-            if not r.is_terminal():
-                return {"type": "scale_in", "request_id": r.request_id, "status": r.status.value}
+        with self._engine_lifecycle_lock:
+            # Explicit requests take precedence because an active scale-in may
+            # itself have already moved a group into DRAINING.
+            for r in self._scale_out_requests.values():
+                if not r.is_terminal():
+                    return {"type": "scale_out", "request_id": r.request_id, "status": r.status.value}
+            for r in self._scale_in_requests.values():
+                if not r.is_terminal():
+                    return {"type": "scale_in", "request_id": r.request_id, "status": r.status.value}
+            for model_name, srv in self.servers.items():
+                for group in srv.engine_groups:
+                    if (
+                        group.is_scaled_out
+                        and group.eviction_requested
+                        and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                    ):
+                        return {
+                            "type": "graceful_eviction",
+                            "request_id": f"{model_name}:{group.rank_offset}",
+                            "status": group.lifecycle_status.value,
+                        }
         return None
 
     @ray.method(concurrency_group="scale_coordination")
@@ -1534,8 +1657,22 @@ class RolloutManager(ReloadableMixin):
                 timeout_secs=timeout_secs or self.args.scale_out_timeout,
             )
 
-        self._scale_out_requests[request.request_id] = request
-        self._gc_terminal_requests()
+        # Recheck and insert under the same lifecycle lock used by graceful
+        # eviction claims.  Validation above may be slow enough for eviction
+        # to win after the initial fast-path check.
+        with self._engine_lifecycle_lock:
+            active = self._find_active_scale_request()
+            if active is not None:
+                return {
+                    "request_id": str(uuid.uuid4()),
+                    "status": "CONFLICT",
+                    "message": (
+                        f"Another {active['type']} request is in progress: "
+                        f"request_id={active['request_id']}, status={active['status']}"
+                    ),
+                }
+            self._scale_out_requests[request.request_id] = request
+            self._gc_terminal_requests()
         return request.to_dict()
 
     @ray.method(concurrency_group="scale_out")
@@ -1630,6 +1767,7 @@ class RolloutManager(ReloadableMixin):
                 return
 
             gpus_per_engine = self.args.rollout_num_gpus_per_engine
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
@@ -1658,10 +1796,13 @@ class RolloutManager(ReloadableMixin):
             pending_indices = set(range(request.num_replicas))
             succeeded_engine_ids: list[str] = []
             failed_replica_ids: list[str] = []
+            # Aggregated per-replica root-cause reasons for failed replicas so the
+            # final error_message can surface the real cause (provision timeout /
+            # NCCL transport mismatch / weight sync / health) instead of a
+            # generic "All N replicas failed".
+            failure_reasons: list[ScaleOutFailure] = []
 
-            # Track the running engine offset (may change as replicas succeed)
-            base_engine_offset = sum(len(g.all_engines) for g in srv.engine_groups)
-            logger.info(f"[ScaleOut] Current total engines (base offset): {base_engine_offset}")
+            logger.info(f"[ScaleOut] Next monotonic engine rank: {self._next_engine_rank}")
 
             # Phase A: Wait for PGs to become ready, with incremental processing
             while pending_indices:
@@ -1703,6 +1844,7 @@ class RolloutManager(ReloadableMixin):
                             logger.warning(f"[ScaleOut] PG for replica {idx} failed: {e}")
                             pending_indices.discard(idx)
                             failed_replica_ids.append(f"replica_{idx}")
+                            failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[idx])
                             except Exception:
@@ -1715,25 +1857,27 @@ class RolloutManager(ReloadableMixin):
                 # Pre-allocate engine offsets so each coroutine gets a unique rank_offset
                 # without racing on srv.engine_groups mutations.
                 if newly_ready:
-                    current_offset = sum(len(g.all_engines) for g in srv.engine_groups)
-                    replica_offsets = {idx: current_offset + i for i, idx in enumerate(newly_ready)}
-
-                    async def _bring_up_one(idx: int) -> tuple[int, bool, int]:
-                        return (
-                            idx,
-                            await self._bring_up_single_replica(
-                                request=request,
-                                srv=srv,
-                                pg=per_replica_pgs[idx],
-                                replica_idx=idx,
-                                num_gpus=gpus_per_engine,
-                                gpus_per_engine=gpus_per_engine,
-                                engine_offset=replica_offsets[idx],
-                                sort_key=sort_key,
-                                InfoActor=InfoActor,
-                            ),
-                            replica_offsets[idx],
+                    replica_offsets = {
+                        idx: self._reserve_engine_ranks(
+                            actors_per_replica,
+                            alignment=actors_per_replica,
                         )
+                        for idx in newly_ready
+                    }
+
+                    async def _bring_up_one(idx: int) -> tuple[int, bool, "ScaleOutFailure | None", int]:
+                        r = await self._bring_up_single_replica(
+                            request=request,
+                            srv=srv,
+                            pg=per_replica_pgs[idx],
+                            replica_idx=idx,
+                            num_gpus=gpus_per_engine,
+                            gpus_per_engine=gpus_per_engine,
+                            engine_offset=replica_offsets[idx],
+                            sort_key=sort_key,
+                            InfoActor=InfoActor,
+                        )
+                        return (idx, r.success, r.reason, replica_offsets[idx])
 
                     results = await asyncio.gather(
                         *[_bring_up_one(idx) for idx in newly_ready],
@@ -1748,19 +1892,22 @@ class RolloutManager(ReloadableMixin):
                             # catches exceptions internally, but handle defensively.
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
                             failed_replica_ids.append(f"replica_{replica_idx_for_result}")
+                            failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
                             except Exception:
                                 pass
                             continue
-                        idx, success, engine_offset = result
+                        idx, success, reason, engine_offset = result
                         if success:
                             engine_id = f"engine_{engine_offset}"
                             succeeded_engine_ids.append(engine_id)
                             logger.info(f"[ScaleOut] ✅ Replica {idx} successfully brought up as {engine_id}")
                         else:
                             failed_replica_ids.append(f"replica_{idx}")
-                            logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up")
+                            if reason:
+                                failure_reasons.append(reason)
+                            logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up: {reason}")
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[idx])
                             except Exception:
@@ -1779,16 +1926,22 @@ class RolloutManager(ReloadableMixin):
             for idx in list(pending_indices):
                 logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
                 failed_replica_ids.append(f"replica_{idx}")
+                failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
                 try:
                     ray.util.remove_placement_group(per_replica_pgs[idx])
                 except Exception:
                     pass
 
             # Phase C: Determine final status
-            self._update_scale_out_final_status(request, srv, succeeded_engine_ids, failed_replica_ids)
+            self._update_scale_out_final_status(
+                request, srv, succeeded_engine_ids, failed_replica_ids, failure_reasons
+            )
 
         except Exception as e:
-            request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {e}")
+            # Surface only the exception type, never its args (may leak); full exc logged below.
+            failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
+            request.failure_categories = scale_utils._scale_out_failure_categories([failure])
+            request.update_status(ScaleOutStatus.FAILED, f"Scale-out failed: {failure.message()}")
             logger.exception(f"Scale-out failed for request {request.request_id}")
 
     async def _bring_up_single_replica(
@@ -1802,11 +1955,13 @@ class RolloutManager(ReloadableMixin):
         engine_offset: int,
         sort_key: Any,
         InfoActor: Any,
-    ) -> bool:
+    ) -> ScaleResult:
         """Bring up a single replica: probe topology, create engine, then
         finalize registration.
 
-        Returns True on success, False on failure. On failure, engines are rolled back
+        Returns ``ScaleResult(True)`` on success, or ``ScaleResult(False, reason)``
+        on failure where ``reason`` describes the specific failure (engine init /
+        provision timeout / finalize root cause). On failure, engines are rolled back
         but the placement group is NOT removed (caller is responsible for PG cleanup).
 
         Args:
@@ -1821,7 +1976,8 @@ class RolloutManager(ReloadableMixin):
             InfoActor: Ray actor class for GPU topology probing.
 
         Returns:
-            True if the replica was successfully brought up and registered.
+            ``ScaleResult(True)`` if the replica was successfully brought up and
+            registered, otherwise ``ScaleResult(False, reason)``.
         """
         info_actors = []
         new_group = None
@@ -1876,19 +2032,24 @@ class RolloutManager(ReloadableMixin):
             init_handles, self._port_cursors = new_group.start_engines(self._port_cursors)
             if not init_handles:
                 logger.error(f"[ScaleOut] Replica {replica_idx}: no init handles returned")
-                return False
+                return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_NO_HANDLES))
 
             # Step 4: Wait for engine init
             remaining_timeout = max(10.0, request.timeout_secs - (time.time() - request.created_at))
             try:
                 await asyncio.wait_for(asyncio.gather(*init_handles), timeout=remaining_timeout)
-            except (asyncio.TimeoutError, Exception) as e:
+            except asyncio.TimeoutError:
+                # Elastic node couldn't bring the engine up in time → provision timeout.
+                logger.error(f"[ScaleOut] Replica {replica_idx}: engine init timed out after {remaining_timeout:.0f}s")
+                await self._rollback_engines(new_group)
+                return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
+            except Exception as e:
                 logger.error(f"[ScaleOut] Replica {replica_idx}: engine init failed: {e}")
                 await self._rollback_engines(new_group)
-                return False
+                return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED, str(e)))
 
-            # Step 5: Finalize registration (health check → DCS → weight sync → router → server)
-            success, new_group = await self._finalize_engine_group_registration(
+            # Step 5: Finalize registration (health check → weight sync → DCS → router → server)
+            result = await self._finalize_engine_group_registration(
                 request=request,
                 srv=srv,
                 engines=new_group.engines,
@@ -1896,11 +2057,16 @@ class RolloutManager(ReloadableMixin):
                 replica_idx=replica_idx,
                 log_prefix="[ScaleOut]",
             )
-            if not success:
-                await self._rollback_engines(new_group or [])
-                return False
+            if not result.success:
+                # Keep the pre-created group: the finalizer returns None on
+                # failure, but these engine actors still require rollback.
+                await self._rollback_engines(new_group)
+                return ScaleResult(
+                    False, result.reason or ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "finalize failed")
+                )
+            new_group = result.group
 
-            return True
+            return ScaleResult(True)
 
         except Exception as e:
             logger.exception(f"[ScaleOut] Replica {replica_idx}: unexpected error: {e}")
@@ -1913,7 +2079,9 @@ class RolloutManager(ReloadableMixin):
                     ray.kill(actor)
                 except Exception:
                     pass
-            return False
+            return ScaleResult(
+                False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED, f"{type(e).__name__}: {e}")
+            )
 
     async def _scale_out_external(self, request: ScaleOutRequest) -> None:
         """Execute scale-out in external mode.
@@ -1931,6 +2099,7 @@ class RolloutManager(ReloadableMixin):
 
         new_engines = []
         failed_engine_actors = []
+        failure_reasons: list[ScaleOutFailure] = []
         try:
             request.update_status(ScaleOutStatus.CONNECTING)
 
@@ -1944,13 +2113,14 @@ class RolloutManager(ReloadableMixin):
                     host, port = self._parse_host_port(addr)
                 except ValueError as e:
                     request.failed_engines.append(f"engine_{i}")
+                    failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.INVALID_ENGINE_ADDRESS, str(e)))
                     logger.warning(f"Invalid address for external engine {addr}: {e}")
                     continue
 
                 # Create SGLangEngine actor (connecting mode).
                 # No GPU needed: this actor is an RPC proxy to the external engine;
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
-                RolloutRayActor = ray.remote(SGLangEngine)
+                RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
                     self.args,
@@ -1982,6 +2152,9 @@ class RolloutManager(ReloadableMixin):
                 except Exception as e:
                     request.failed_engines.append(f"engine_{i}")
                     failed_engine_actors.append(engine)
+                    failure_reasons.append(
+                        ScaleOutFailure(ScaleOutFailureCategory.EXTERNAL_ENGINE_CONNECT_FAILED, str(e))
+                    )
                     logger.warning(f"Failed to connect to external engine {addr}: {e}")
 
             # Step 2: Apply partial success policy
@@ -1993,11 +2166,17 @@ class RolloutManager(ReloadableMixin):
                         f"rolling back all per policy '{policy}'"
                     )
                     await self._rollback_engines(new_engines + failed_engine_actors)
-                    request.update_status(
-                        ScaleOutStatus.FAILED,
-                        f"Partial failure: {len(request.failed_engines)}/{len(request.engine_urls)} "
-                        f"engines failed (policy: {policy})",
+                    # rollback_all commits 0 engines, so treat it like a full
+                    # failure: surface the aggregated root cause, not just the policy.
+                    reason_str = scale_utils._aggregate_scale_out_reasons(failure_reasons)
+                    request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
+                    message = (
+                        f"Partial failure rolled back: {len(request.failed_engines)}/{len(request.engine_urls)} "
+                        f"engines failed (policy: {policy})"
                     )
+                    if reason_str:
+                        message += f". Reasons: {reason_str}"
+                    request.update_status(ScaleOutStatus.FAILED, message)
                     return
                 else:
                     logger.warning(
@@ -2008,11 +2187,18 @@ class RolloutManager(ReloadableMixin):
 
             if not new_engines:
                 await self._rollback_engines(failed_engine_actors)
-                request.update_status(ScaleOutStatus.FAILED, "Failed to connect to any external engines")
+                connect_reason = scale_utils._aggregate_scale_out_reasons(failure_reasons)
+                request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
+                request.update_status(
+                    ScaleOutStatus.FAILED,
+                    f"Failed to connect to any external engines: {connect_reason}"
+                    if connect_reason
+                    else "Failed to connect to any external engines",
+                )
                 return
 
             # Step 3: Finalize registration (health check → DCS → weight sync → router → server)
-            success, new_group = await self._finalize_engine_group_registration(
+            result = await self._finalize_engine_group_registration(
                 request=request,
                 srv=srv,
                 engines=new_engines,
@@ -2022,9 +2208,11 @@ class RolloutManager(ReloadableMixin):
                 log_prefix="[ScaleOut] External:",
             )
 
-            if success:
+            if result.success:
                 request.engine_ids = [f"engine_{total_engines + i}" for i in range(len(new_engines))]
-                self._update_scale_out_final_status(request, srv, request.engine_ids, request.failed_engines)
+                self._update_scale_out_final_status(
+                    request, srv, request.engine_ids, request.failed_engines, failure_reasons
+                )
                 # Override to ACTIVE since external mode handles partial success differently
                 if request.engine_ids:
                     request.update_status(ScaleOutStatus.ACTIVE)
@@ -2033,10 +2221,18 @@ class RolloutManager(ReloadableMixin):
                     )
             else:
                 await self._rollback_engines(new_engines)
-                request.update_status(ScaleOutStatus.FAILED, "Engine registration failed")
+                if result.reason is not None:
+                    request.failure_categories = scale_utils._scale_out_failure_categories([result.reason])
+                request.update_status(
+                    ScaleOutStatus.FAILED,
+                    f"Engine registration failed: {result.reason}" if result.reason else "Engine registration failed",
+                )
 
         except Exception as e:
-            request.update_status(ScaleOutStatus.FAILED, f"External scale-out failed: {e}")
+            # Surface only the exception type, never its args (may leak); full exc logged below.
+            failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
+            request.failure_categories = scale_utils._scale_out_failure_categories([failure])
+            request.update_status(ScaleOutStatus.FAILED, f"External scale-out failed: {failure.message()}")
             logger.exception(f"External scale-out failed for request {request.request_id}")
             # Clean up all engines
             all_actors = new_engines + failed_engine_actors
@@ -2057,9 +2253,9 @@ class RolloutManager(ReloadableMixin):
         router_port: int | None = None,
         replica_idx: int | None = None,
         log_prefix: str = "[ScaleOut]",
-    ) -> tuple[bool, EngineGroup | None]:
-        """Finalize engine group registration: health check → DCS → weight
-        sync.
+    ) -> EngineFinalizeResult:
+        """Finalize engine group registration: health check → weight sync →
+        DCS.
 
         → router → server → health monitor.
 
@@ -2077,7 +2273,10 @@ class RolloutManager(ReloadableMixin):
             log_prefix: Prefix for log messages.
 
         Returns:
-            Tuple of (success, engine_group). On failure, engine_group is None.
+            An ``EngineFinalizeResult``. On failure ``group`` is None and
+            ``reason`` describes the specific failure (health / weight sync /
+            precheck transport / DCS / router) so the caller can surface the
+            real root cause instead of a generic message.
         """
         replica_str = f"Replica {replica_idx}" if replica_idx is not None else "Engines"
         remaining_timeout = max(10.0, request.timeout_secs - (time.time() - request.created_at))
@@ -2086,9 +2285,34 @@ class RolloutManager(ReloadableMixin):
         healthy = await self._health_check_engines(engines, timeout=remaining_timeout)
         if not healthy:
             logger.error(f"{log_prefix} {replica_str}: health check failed")
-            return False, None
+            return EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.HEALTH_CHECK_FAILED))
 
-        # Step 2: Register to DCS coordinator
+        # Step 2: Sync weights from seed engine before publishing the engines
+        # to DCS. A failed scale-out engine must never enter the actor's normal
+        # DCS topology, otherwise the next full weight update can fail and
+        # escalate an isolated scale-out failure into a global restart.
+        request.update_status(ScaleOutStatus.WEIGHT_SYNCING)
+        logger.info(f"{log_prefix} {replica_str}: starting weight sync from seed engine...")
+        sync_timeout = max(30.0, request.timeout_secs - (time.time() - request.created_at))
+        sync_reasons: list[ScaleOutFailure] = []
+        sync_ok = await self._sync_weights_from_seed_engine(
+            engines,
+            timeout=sync_timeout,
+            model_name=request.model_name,
+            run_precheck=(engine_group is not None and getattr(self.args, "scale_weight_sync_precheck", True)),
+            reason_sink=sync_reasons,
+        )
+        if not sync_ok:
+            logger.error(f"{log_prefix} {replica_str}: weight sync failed")
+            return EngineFinalizeResult(
+                False,
+                reason=(
+                    sync_reasons[-1] if sync_reasons else ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED)
+                ),
+            )
+        logger.info(f"{log_prefix} {replica_str}: weight sync completed")
+
+        # Step 3: Register to DCS coordinator only after weight sync succeeds.
         logger.info(f"{log_prefix} {replica_str}: registering {len(engines)} engines to DCS...")
         try:
             register_handles = [engine.register_dcs.remote() for engine in engines if engine is not None]
@@ -2098,32 +2322,25 @@ class RolloutManager(ReloadableMixin):
             logger.info(f"{log_prefix} {replica_str}: DCS registration completed")
         except Exception as e:
             logger.error(f"{log_prefix} {replica_str}: DCS registration failed: {e}")
-            return False, None
+            return EngineFinalizeResult(
+                False, reason=ScaleOutFailure(ScaleOutFailureCategory.DCS_REGISTRATION_FAILED, str(e))
+            )
 
-        # Step 3: Sync weights from seed engine
-        request.update_status(ScaleOutStatus.WEIGHT_SYNCING)
-        logger.info(f"{log_prefix} {replica_str}: starting weight sync from seed engine...")
-        sync_timeout = max(30.0, request.timeout_secs - (time.time() - request.created_at))
-        sync_ok = await self._sync_weights_from_seed_engine(
-            engines,
-            timeout=sync_timeout,
-            model_name=request.model_name,
-        )
-        if not sync_ok:
-            logger.error(f"{log_prefix} {replica_str}: weight sync failed")
-            return False, None
-        logger.info(f"{log_prefix} {replica_str}: weight sync completed")
-
-        # Step 4: Register to router (AFTER weight sync)
+        # Step 4: Register to router (AFTER weight sync and DCS registration)
         logger.info(f"{log_prefix} {replica_str}: registering to router...")
         try:
             register_router_handles = [engine.register_to_router.remote() for engine in engines if engine is not None]
             if register_router_handles:
-                await asyncio.wait_for(asyncio.gather(*register_router_handles), timeout=30)
+                register_results = await asyncio.wait_for(asyncio.gather(*register_router_handles), timeout=30)
+                if not all(result is True for result in register_results):
+                    rejected_count = sum(result is not True for result in register_results)
+                    raise RuntimeError(f"Router rejected {rejected_count} engine(s)")
             logger.info(f"{log_prefix} {replica_str}: router registration completed")
         except Exception as e:
             logger.error(f"{log_prefix} {replica_str}: router registration failed: {e}")
-            return False, None
+            return EngineFinalizeResult(
+                False, reason=ScaleOutFailure(ScaleOutFailureCategory.ROUTER_REGISTRATION_FAILED, str(e))
+            )
 
         # Step 5: Create or use existing EngineGroup
         if engine_group is None:
@@ -2160,7 +2377,7 @@ class RolloutManager(ReloadableMixin):
             f"Total engine_groups: {len(srv.engine_groups)}, "
             f"total engines: {sum(len(g.all_engines) for g in srv.engine_groups)}"
         )
-        return True, engine_group
+        return EngineFinalizeResult(True, group=engine_group)
 
     def _update_scale_out_final_status(
         self,
@@ -2168,6 +2385,7 @@ class RolloutManager(ReloadableMixin):
         srv: RolloutServer,
         succeeded_engine_ids: list[str],
         failed_engine_ids: list[str],
+        failure_reasons: list[ScaleOutFailure] | None = None,
     ) -> None:
         """Update the final status of a scale-out request.
 
@@ -2176,17 +2394,28 @@ class RolloutManager(ReloadableMixin):
             srv: The target RolloutServer.
             succeeded_engine_ids: List of successfully added engine IDs.
             failed_engine_ids: List of failed engine/replica IDs.
+            failure_reasons: Per-replica root-cause reasons (deduped for the
+                error_message). Lets the TUI categorize the real cause
+                (provision timeout / NCCL transport mismatch / weight sync /
+                health) instead of a generic "All N replicas failed".
         """
         request.engine_ids = succeeded_engine_ids
         request.failed_engines = failed_engine_ids
 
         total_requested = request.num_replicas or len(request.engine_urls)
 
+        # Canonicalize, dedupe (by category), and bound reasons so the
+        # error_message never leaks raw exception text / addresses / tracebacks
+        # and stays length-bounded.
+        reason_str = scale_utils._aggregate_scale_out_reasons(failure_reasons)
+        request.failure_categories = scale_utils._scale_out_failure_categories(failure_reasons)
+
         if not succeeded_engine_ids:
-            request.update_status(
-                ScaleOutStatus.FAILED,
-                f"All {total_requested} replicas failed to scale out. Failed: {failed_engine_ids}",
-            )
+            if reason_str:
+                message = f"scale-out failed: {reason_str}. Failed engines: {failed_engine_ids}"
+            else:
+                message = f"All {total_requested} replicas failed to scale out. Failed: {failed_engine_ids}"
+            request.update_status(ScaleOutStatus.FAILED, message)
             logger.error(f"[ScaleOut] ❌ Scale-out completely failed: 0/{total_requested} replicas succeeded")
         elif len(succeeded_engine_ids) == total_requested:
             request.update_status(ScaleOutStatus.ACTIVE)
@@ -2196,11 +2425,13 @@ class RolloutManager(ReloadableMixin):
                 f"Total engines now: {sum(len(g.all_engines) for g in srv.engine_groups)}"
             )
         else:
-            request.update_status(
-                ScaleOutStatus.PARTIAL,
+            partial_message = (
                 f"Partial scale-out: {len(succeeded_engine_ids)}/{total_requested} replicas succeeded. "
-                f"Succeeded: {succeeded_engine_ids}. Failed: {failed_engine_ids}.",
+                f"Succeeded: {succeeded_engine_ids}. Failed: {failed_engine_ids}."
             )
+            if reason_str:
+                partial_message += f" Reasons: {reason_str}."
+            request.update_status(ScaleOutStatus.PARTIAL, partial_message)
             logger.warning(
                 f"[ScaleOut] ⚠️ Partial scale-out: {len(succeeded_engine_ids)}/{total_requested} "
                 f"replicas succeeded (IDs: {succeeded_engine_ids}). "
@@ -2262,76 +2493,388 @@ class RolloutManager(ReloadableMixin):
     ) -> bool:
         """Sync weights from seed engine to a single new engine via NCCL.
 
-        Returns True on success, False on failure.
+        Returns True on success and False on completed failures. Raises
+        ``_WeightSyncTimeoutError`` when remote work may still be running.
+
+        Robustness:
+        - Ports for the weight-send group's rank-0 bind are allocated on the
+          seed node within a bounded window below the OS ephemeral range to
+          avoid port collisions. TODO(agent): for "external" engines the actor
+          may be a proxy on a different node than the bind target, so the probe
+          could run on the wrong node; out of scope here.
+        - Completed init/send failures are retried with a fresh, rotated port
+          window. Timeouts fail immediately because the underlying remote work
+          may still be running and cannot be retried transactionally.
+        - Result validation is fail-closed: only ``success is True`` passes.
         """
-        ports = []
-        for _ in range(tp_size):
-            port = find_available_port(random.randint(20000, 50000))
-            ports.append(str(port))
-        ports_str = ",".join(ports)
-        group_name = f"direct_sync_{uuid.uuid4().hex[:8]}"
+        next_start_port = None
+        for attempt in range(1, self._WEIGHT_SYNC_MAX_INIT_ATTEMPTS + 1):
+            try:
+                ports = await self._allocate_weight_sync_ports(
+                    seed_engine,
+                    tp_size,
+                    start_port=next_start_port,
+                )
+                next_start_port = int(ports[-1]) + 1
+                if next_start_port + tp_size > self._WEIGHT_SYNC_PORT_MAX:
+                    next_start_port = self._WEIGHT_SYNC_PORT_BASE
+            except Exception as e:
+                logger.warning(
+                    f"[ScaleOut][WeightSync] Port allocation failed for engine "
+                    f"{engine_index + 1} (attempt {attempt}/{self._WEIGHT_SYNC_MAX_INIT_ATTEMPTS}): {e}"
+                )
+                continue
+            ports_str = ",".join(ports)
+            group_name = f"direct_sync_{uuid.uuid4().hex[:8]}"
 
-        logger.info(
-            f"[ScaleOut][WeightSync] Syncing engine {engine_index + 1}/{total_engines}: "
-            f"master={master_address}, ports={ports_str}, group={group_name}"
+            logger.info(
+                f"[ScaleOut][WeightSync] Syncing engine {engine_index + 1}/{total_engines} "
+                f"(attempt {attempt}/{self._WEIGHT_SYNC_MAX_INIT_ATTEMPTS}): "
+                f"master={master_address}, ports={ports_str}, group={group_name}"
+            )
+
+            try:
+                phase = "NCCL group init"
+                dist_backend = device_utils.get_dist_backend()
+                init_seed_ref = seed_engine.init_weights_send_group_for_remote_instance.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_rank=0,
+                    world_size=2,
+                    group_name=group_name,
+                    backend=dist_backend,
+                )
+                init_new_ref = new_engine.init_weights_send_group_for_remote_instance.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_rank=1,
+                    world_size=2,
+                    group_name=group_name,
+                    backend=dist_backend,
+                )
+                init_results = await asyncio.wait_for(
+                    asyncio.gather(init_seed_ref, init_new_ref, return_exceptions=True),
+                    timeout=min(timeout, 120),
+                )
+
+                for j, result in enumerate(init_results):
+                    side = "seed" if j == 0 else "new"
+                    if not (isinstance(result, dict) and result.get("success") is True):
+                        msg = result.get("message", "unknown") if isinstance(result, dict) else repr(result)
+                        raise RuntimeError(f"Failed to init NCCL group on {side}: {msg}")
+
+                logger.info(f"[ScaleOut][WeightSync] NCCL group initialized for engine {engine_index + 1}")
+
+                phase = "weight send"
+                send_seed_ref = seed_engine.send_weights_to_remote_instance.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_name=group_name,
+                )
+                send_new_ref = new_engine.send_weights_to_remote_instance.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_name=group_name,
+                )
+                send_results = await asyncio.wait_for(
+                    asyncio.gather(send_seed_ref, send_new_ref, return_exceptions=True),
+                    timeout=min(timeout, 300),
+                )
+
+                for j, result in enumerate(send_results):
+                    side = "seed" if j == 0 else "new"
+                    if not (isinstance(result, dict) and result.get("success") is True):
+                        msg = result.get("message", "unknown") if isinstance(result, dict) else repr(result)
+                        raise RuntimeError(f"Failed to send weights on {side}: {msg}")
+
+                logger.info(
+                    f"[ScaleOut][WeightSync] Weight sync completed for engine {engine_index + 1}/{total_engines}"
+                )
+                return True
+
+            except asyncio.TimeoutError as exc:
+                # wait_for cancellation does not guarantee cancellation of the
+                # underlying Ray/HTTP work. Retrying could overlap two NCCL
+                # operations on the same engines, so fail and let the caller
+                # roll back the new engine.
+                message = (
+                    f"[ScaleOut][WeightSync] {phase} timed out for engine {engine_index + 1}; "
+                    "not retrying because the remote operation may still be running"
+                )
+                logger.error(message)
+                raise _WeightSyncTimeoutError(message) from exc
+            except Exception as e:
+                logger.warning(
+                    f"[ScaleOut][WeightSync] Failed to sync engine {engine_index + 1} "
+                    f"(attempt {attempt}/{self._WEIGHT_SYNC_MAX_INIT_ATTEMPTS}): {e}"
+                )
+                # Retry with a fresh, rotated port window on the next attempt.
+                continue
+
+        logger.warning(
+            f"[ScaleOut][WeightSync] Giving up on engine {engine_index + 1} "
+            f"after {self._WEIGHT_SYNC_MAX_INIT_ATTEMPTS} attempt(s)"
         )
+        return False
 
+    def _next_weight_sync_start_port(self, tp_size: int) -> int:
+        """Return a rotating start port inside the bounded weight-sync window.
+
+        The cursor is advanced by ``tp_size`` on every call so concurrent syncs
+        (all driven on the same event loop, hence not truly parallel) and
+        successive retries request DISJOINT windows, minimising overlap without
+        a stateful cross-process lease. It wraps back to the base when the
+        window would be exceeded.
+        """
+        cursor = getattr(self, "_weight_sync_port_cursor", None)
+        if cursor is None or cursor + tp_size > self._WEIGHT_SYNC_PORT_MAX:
+            cursor = self._WEIGHT_SYNC_PORT_BASE
+        self._weight_sync_port_cursor = cursor + tp_size
+        return cursor
+
+    async def _allocate_weight_sync_ports(
+        self,
+        seed_engine,
+        tp_size: int,
+        start_port: int | None = None,
+    ) -> list[str]:
+        """Allocate ``tp_size`` consecutive ports ON THE SEED NODE (NCCL rank-0
+        bind node) within the bounded window, returned as strings.
+
+        Raises if the seed node has no free block inside the window (rather
+        than scanning into the ephemeral range).
+        """
+        allocation_lock = getattr(self, "_weight_sync_port_allocation_lock", None)
+        if allocation_lock is None:
+            allocation_lock = asyncio.Lock()
+            self._weight_sync_port_allocation_lock = allocation_lock
+
+        async with allocation_lock:
+            cursor = getattr(self, "_weight_sync_port_cursor", None)
+            if start_port is None:
+                start_port = self._next_weight_sync_start_port(tp_size)
+            elif cursor is not None:
+                start_port = max(start_port, cursor)
+
+            _, base_port = await asyncio.wait_for(
+                seed_engine._get_current_node_ip_and_free_port.remote(
+                    start_port=start_port,
+                    consecutive=tp_size,
+                    max_port=self._WEIGHT_SYNC_PORT_MAX - 1,
+                ),
+                timeout=30,
+            )
+            next_port = base_port + tp_size
+            if next_port + tp_size > self._WEIGHT_SYNC_PORT_MAX:
+                next_port = self._WEIGHT_SYNC_PORT_BASE
+            # Advance from the block actually resolved by the remote scan, not
+            # merely its requested start. This also keeps concurrent retries
+            # from converging on the same first-free block.
+            self._weight_sync_port_cursor = next_port
+        return [str(base_port + i) for i in range(tp_size)]
+
+    async def _allocate_scale_weight_sync_precheck_ports(self, seed_engine, tp_size: int) -> list[str]:
+        """Allocate an independent, bounded port block for NCCL precheck."""
+        allocation_lock = getattr(self, "_scale_weight_sync_precheck_port_allocation_lock", None)
+        if allocation_lock is None:
+            allocation_lock = asyncio.Lock()
+            self._scale_weight_sync_precheck_port_allocation_lock = allocation_lock
+
+        async with allocation_lock:
+            start_port = getattr(
+                self, "_scale_weight_sync_precheck_port_cursor", self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE
+            )
+            if start_port + tp_size > self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX:
+                start_port = self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE
+            _, base_port = await asyncio.wait_for(
+                seed_engine._get_current_node_ip_and_free_port.remote(
+                    start_port=start_port,
+                    consecutive=tp_size,
+                    max_port=self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX - 1,
+                ),
+                timeout=30,
+            )
+            next_port = base_port + tp_size
+            self._scale_weight_sync_precheck_port_cursor = (
+                next_port
+                if next_port + tp_size <= self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX
+                else self._SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE
+            )
+        return [str(base_port + offset) for offset in range(tp_size)]
+
+    async def _run_scale_weight_sync_precheck(
+        self,
+        seed_engine,
+        new_engines: list,
+        master_address: str,
+        tp_size: int,
+        timeout: float,
+    ) -> ScaleResult:
+        """Gate scale-out engines before touching the ModelRunner NCCL stack.
+
+        Stage 1 (cheap, no NCCL): reject if the seed/new NCCL transport env
+        fingerprints disagree — the common elastic-node misconfiguration. Stage
+        2 (NCCL probe): a real 2-rank collective for env-matched engines; only
+        launch transients retry, everything else fails closed and propagates
+        the raw NCCL error.
+        """
+        # Stage 1: cheap env-fingerprint gate (no NCCL, no subprocess).
         try:
-            dist_backend = device_utils.get_dist_backend()
-            init_seed_ref = seed_engine.init_weights_send_group_for_remote_instance.remote(
-                master_address=master_address,
-                ports=ports_str,
-                group_rank=0,
-                world_size=2,
-                group_name=group_name,
-                backend=dist_backend,
+            seed_fingerprint = await asyncio.wait_for(
+                seed_engine.get_scale_weight_sync_transport_fingerprint.remote(), timeout=15
             )
-            init_new_ref = new_engine.init_weights_send_group_for_remote_instance.remote(
-                master_address=master_address,
-                ports=ports_str,
-                group_rank=1,
-                world_size=2,
-                group_name=group_name,
-                backend=dist_backend,
+        except Exception as exc:
+            logger.error(f"[ScaleOut][Precheck] Seed transport fingerprint unavailable: {exc}")
+            return ScaleResult(
+                False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "seed fingerprint unavailable")
             )
-            init_results = await asyncio.wait_for(
-                asyncio.gather(init_seed_ref, init_new_ref),
-                timeout=min(timeout, 120),
+        for engine_index, new_engine in enumerate(new_engines):
+            if new_engine is None:
+                continue
+            try:
+                new_fingerprint = await asyncio.wait_for(
+                    new_engine.get_scale_weight_sync_transport_fingerprint.remote(), timeout=15
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[ScaleOut][Precheck] New engine {engine_index + 1} transport fingerprint unavailable: {exc}"
+                )
+                return ScaleResult(
+                    False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "new fingerprint unavailable")
+                )
+            match, mismatch_token = scale_utils._scale_weight_sync_precheck_fingerprints_match(
+                {"fingerprint": seed_fingerprint}, {"fingerprint": new_fingerprint}
             )
+            if not match:
+                logger.error(
+                    f"[ScaleOut][Precheck] env fingerprint mismatch ({mismatch_token}): "
+                    f"seed={seed_fingerprint}, new={new_fingerprint}"
+                )
+                return ScaleResult(
+                    False,
+                    ScaleOutFailure(
+                        ScaleOutFailureCategory.NCCL_PRECHECK_TRANSPORT_MISMATCH,
+                        mismatch_token or "transport_fingerprint_mismatch",
+                    ),
+                )
 
-            for j, result in enumerate(init_results):
-                side = "seed" if j == 0 else "new"
-                if result is not None and not result.get("success", True):
-                    raise RuntimeError(f"Failed to init NCCL group on {side}: {result.get('message', 'unknown')}")
+        # Stage 2: NCCL connectivity probe (env already validated above).
+        retryable = {PrecheckProbeCategory.LAUNCH_TRANSIENT}
+        for engine_index, new_engine in enumerate(new_engines):
+            if new_engine is None:
+                continue
+            for attempt in range(1, self._SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS + 1):
+                try:
+                    ports = await self._allocate_scale_weight_sync_precheck_ports(seed_engine, tp_size)
+                except Exception as exc:
+                    logger.error(f"[ScaleOut][Precheck] Port allocation failed for engine {engine_index + 1}: {exc}")
+                    return ScaleResult(
+                        False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "port allocation error")
+                    )
+                ports_str = ",".join(ports)
+                run_token = f"precheck-{uuid.uuid4().hex}"
+                per_actor_timeout = min(max(timeout, 10.0), 120.0)
+                logger.info(
+                    f"[ScaleOut][Precheck] Probing engine {engine_index + 1}/{len(new_engines)} "
+                    f"(attempt {attempt}/{self._SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS}): "
+                    f"master={master_address}, ports={ports_str}, token={run_token}"
+                )
+                seed_ref = seed_engine.run_scale_weight_sync_precheck.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_rank=0,
+                    run_token=run_token,
+                    tp_size=tp_size,
+                    timeout_secs=per_actor_timeout,
+                )
+                new_ref = new_engine.run_scale_weight_sync_precheck.remote(
+                    master_address=master_address,
+                    ports=ports_str,
+                    group_rank=1,
+                    run_token=run_token,
+                    tp_size=tp_size,
+                    timeout_secs=per_actor_timeout,
+                )
+                try:
+                    seed_result, new_result = await asyncio.wait_for(
+                        asyncio.gather(seed_ref, new_ref, return_exceptions=True),
+                        timeout=per_actor_timeout + 15,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"[ScaleOut][Precheck] Manager timeout for token {run_token}")
+                    return ScaleResult(
+                        False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "manager timeout")
+                    )
 
-            logger.info(f"[ScaleOut][WeightSync] NCCL group initialized for engine {engine_index + 1}")
+                if isinstance(seed_result, Exception):
+                    logger.error(f"[ScaleOut][Precheck] Seed actor failed for token {run_token}: {seed_result}")
+                    return ScaleResult(
+                        False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "seed actor error")
+                    )
+                if isinstance(new_result, Exception):
+                    logger.error(f"[ScaleOut][Precheck] New actor failed for token {run_token}: {new_result}")
+                    return ScaleResult(
+                        False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "new actor error")
+                    )
 
-            send_seed_ref = seed_engine.send_weights_to_remote_instance.remote(
-                master_address=master_address,
-                ports=ports_str,
-                group_name=group_name,
-            )
-            send_new_ref = new_engine.send_weights_to_remote_instance.remote(
-                master_address=master_address,
-                ports=ports_str,
-                group_name=group_name,
-            )
-            send_results = await asyncio.wait_for(
-                asyncio.gather(send_seed_ref, send_new_ref),
-                timeout=min(timeout, 300),
-            )
+                # A multi-node TP topology (tp_size spans >1 node) cannot be
+                # exercised by the single-node probe, but the real direct sync
+                # handles it. Skip the precheck instead of fail-closing the whole
+                # scale-out.
+                seed_probe = PrecheckProbeCategory.from_wire(seed_result.get("category"))
+                new_probe = PrecheckProbeCategory.from_wire(new_result.get("category"))
+                if seed_probe.is_skip or new_probe.is_skip:
+                    logger.info("[ScaleOut][Precheck] Skipped (unsupported topology); proceeding to real weight sync")
+                    return ScaleResult(True)
 
-            for j, result in enumerate(send_results):
-                side = "seed" if j == 0 else "new"
-                if result is not None and not result.get("success", True):
-                    raise RuntimeError(f"Failed to send weights on {side}: {result.get('message', 'unknown')}")
+                if seed_result.get("success") and new_result.get("success"):
+                    logger.info(f"[ScaleOut][Precheck] PASS engine {engine_index + 1}")
+                    break
 
-            logger.info(f"[ScaleOut][WeightSync] Weight sync completed for engine {engine_index + 1}/{total_engines}")
-            return True
-
-        except Exception as e:
-            logger.warning(f"[ScaleOut][WeightSync] Failed to sync engine {engine_index + 1}: {e}")
-            return False
+                probe_categories = {
+                    PrecheckProbeCategory.from_wire(result.get("category"))
+                    for result in (seed_result, new_result)
+                    if not result.get("success")
+                }
+                # Surface a clear reason from whichever side failed: the probe's
+                # raw exception (``error``) or a pre-launch check's ``message``
+                # (e.g. gpu-mapping / insufficient memory — also how a non-NCCL
+                # accelerator surfaces here: the GPU-memory query fails).
+                raw_error = next(
+                    (
+                        f"{result.get('error_type')}: {result.get('error')}"
+                        if result.get("error")
+                        else str(result.get("message") or "")
+                        for result in (seed_result, new_result)
+                        if not result.get("success") and (result.get("error") or result.get("message"))
+                    ),
+                    "",
+                )
+                sorted_values = sorted(category.value for category in probe_categories)
+                logger.warning(
+                    f"[ScaleOut][Precheck] FAIL engine {engine_index + 1}, categories={sorted_values}: {raw_error}"
+                )
+                if attempt >= self._SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS or not probe_categories.issubset(
+                    retryable
+                ):
+                    detail = raw_error or ",".join(sorted_values)
+                    # Full NCCL detail (fingerprints + per-rank log tails) goes to
+                    # this stable log, searchable by run_token; only the concise
+                    # ``detail`` reaches the TUI/error_message.
+                    seed_tails = " | ".join(r.get("log_tail", "") for r in seed_result.get("results", []))
+                    new_tails = " | ".join(r.get("log_tail", "") for r in new_result.get("results", []))
+                    logger.error(
+                        f"[ScaleOut][Precheck] FAILED token={run_token} engine={engine_index + 1} "
+                        f"categories={sorted_values} detail={detail!r}\n"
+                        f"  seed fingerprint={seed_result.get('fingerprint')} log_tail={seed_tails}\n"
+                        f"  new  fingerprint={new_result.get('fingerprint')} log_tail={new_tails}"
+                    )
+                    return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, detail))
+            else:
+                return ScaleResult(
+                    False, ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "exhausted retry attempts")
+                )
+        return ScaleResult(True)
 
     async def _validate_seed_engine(self, seed_engine, timeout: float = 10.0):
         """Validate a seed engine and return (weight_version, master_address)
@@ -2359,29 +2902,62 @@ class RolloutManager(ReloadableMixin):
         new_engines: list,
         timeout: float = 180.0,
         model_name: str = "default",
+        run_precheck: bool = False,
+        reason_sink: list[ScaleOutFailure] | None = None,
     ) -> bool:
         if not new_engines:
             logger.info("[ScaleOut][WeightSync] No new engines to sync")
             return True
+
+        def _record(failure: ScaleOutFailure) -> None:
+            if reason_sink is not None:
+                reason_sink.append(failure)
 
         logger.info(f"[ScaleOut][WeightSync] Starting weight sync for {len(new_engines)} engines")
 
         seed_candidates = self._get_healthy_seed_engines(model_name)
         if not seed_candidates:
             logger.warning("[ScaleOut][WeightSync] No healthy seed engines found, weight sync failed")
+            _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "no healthy seed engine"))
             return False
 
-        # Acquire the distributed lock to prevent concurrent DCS weight sync
-        # (update_weights_fully_async on the Actor side) from overlapping with
-        # this remote instance weight sync.  Both use the seed engine's NCCL stack.
-        acquired = False
-        while not acquired:
-            acquired = await asyncio.to_thread(ray.get, self._weight_sync_lock.acquire.remote())
-            if not acquired:
+        sync_succeeded = False
+        scale_out_owner_acquired = False
+        weight_sync_lock_acquired = False
+        try:
+            # Claim the lifecycle owner before taking the distributed lock.
+            # Otherwise scale-out can hold that lock while waiting for a
+            # DRAINING group whose eviction is waiting for a training update
+            # blocked on the same lock.
+            owner_deadline = time.monotonic() + timeout
+            while True:
+                with self._engine_lifecycle_lock:
+                    has_draining_elastic_group = any(
+                        group.is_scaled_out and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                        for srv in self.servers.values()
+                        for group in srv.engine_groups
+                    )
+                    if not has_draining_elastic_group:
+                        self._scale_out_weight_updating = True
+                        scale_out_owner_acquired = True
+                        break
+                if time.monotonic() >= owner_deadline:
+                    _record(
+                        ScaleOutFailure(
+                            ScaleOutFailureCategory.WEIGHT_SYNC_FAILED,
+                            "timed out waiting for elastic removal",
+                        )
+                    )
+                    return False
                 await asyncio.sleep(0.5)
 
-        self._is_weight_updating = True
-        try:
+            # Prevent Actor-side DCS weight sync from overlapping with this
+            # remote instance sync. Both use the seed engine's NCCL stack.
+            while not weight_sync_lock_acquired:
+                weight_sync_lock_acquired = await asyncio.to_thread(ray.get, self._weight_sync_lock.acquire.remote())
+                if not weight_sync_lock_acquired:
+                    await asyncio.sleep(0.5)
+
             # Pause generation on all new engines before weight sync
             # This ensures no pending requests during flush_cache
             logger.info("[ScaleOut][WeightSync] Pausing generation on new engines...")
@@ -2391,13 +2967,53 @@ class RolloutManager(ReloadableMixin):
                     pause_refs.append(engine.pause_generation.remote())
             if pause_refs:
                 try:
-                    await asyncio.wait_for(asyncio.gather(*pause_refs, return_exceptions=True), timeout=60)
+                    pause_results = await asyncio.wait_for(
+                        asyncio.gather(*pause_refs, return_exceptions=True),
+                        timeout=60,
+                    )
+                    pause_errors = [result for result in pause_results if isinstance(result, Exception)]
+                    if pause_errors:
+                        logger.warning(f"[ScaleOut][WeightSync] Failed to pause {len(pause_errors)} new engine(s)")
+                        _record(
+                            ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "could not pause new engines")
+                        )
+                        return False
                 except Exception as e:
-                    logger.warning(f"[ScaleOut][WeightSync] Some pause_generation calls failed: {e}")
+                    logger.warning(f"[ScaleOut][WeightSync] Failed to pause new engines: {e}")
+                    _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, f"pause error: {e}"))
+                    return False
 
             pp_size = max(getattr(self.args, "sglang_pp_size", 1), 1)
             rollout_gpus_per_engine = max(getattr(self.args, "rollout_num_gpus_per_engine", 1), 1)
             tp_size = max(rollout_gpus_per_engine // pp_size, 1)
+
+            if run_precheck:
+                precheck_seed = None
+                precheck_address = None
+                for candidate in seed_candidates:
+                    validated = await self._validate_seed_engine(candidate)
+                    if validated is not None:
+                        _, precheck_address = validated
+                        precheck_seed = candidate
+                        break
+                if precheck_seed is None or precheck_address is None:
+                    logger.error("[ScaleOut][Precheck] No valid seed available")
+                    _record(ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL, "no valid seed available"))
+                    return False
+                precheck_result = await self._run_scale_weight_sync_precheck(
+                    precheck_seed,
+                    new_engines,
+                    master_address=precheck_address,
+                    tp_size=tp_size,
+                    timeout=timeout,
+                )
+                if not precheck_result.success:
+                    logger.error("[ScaleOut][Precheck] Failed; real direct sync will not run")
+                    _record(precheck_result.reason or ScaleOutFailure(ScaleOutFailureCategory.NCCL_PRECHECK_FAIL))
+                    return False
+                # The real sync must use the exact seed whose node and runtime
+                # were admitted by precheck.
+                seed_candidates = [precheck_seed]
 
             start_time = time.time()
             pending_engines = [(i, e) for i, e in enumerate(new_engines) if e is not None]
@@ -2452,7 +3068,17 @@ class RolloutManager(ReloadableMixin):
                     )
                 except asyncio.TimeoutError:
                     logger.warning("[ScaleOut][WeightSync] Batch sync timed out")
-                    results = [False] * len(pending_engines)
+                    _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "batch sync timed out"))
+                    return False
+
+                timeout_error = next(
+                    (result for result in results if isinstance(result, _WeightSyncTimeoutError)),
+                    None,
+                )
+                if timeout_error is not None:
+                    logger.error(f"[ScaleOut][WeightSync] Aborting seed fallback after timeout: {timeout_error}")
+                    _record(ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "remote operation timed out"))
+                    return False
 
                 next_pending = []
                 for (i, e), result in zip(pending_engines, results):
@@ -2472,6 +3098,9 @@ class RolloutManager(ReloadableMixin):
 
             if success_count == 0 and total_live > 0:
                 logger.warning("[ScaleOut][WeightSync] Failed to sync any engines")
+                _record(
+                    ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, "NCCL sync failed for all engines")
+                )
                 return False
 
             logger.info("[ScaleOut][WeightSync] Flushing cache on new engines")
@@ -2486,23 +3115,38 @@ class RolloutManager(ReloadableMixin):
                     logger.warning("[ScaleOut][WeightSync] Some flush_cache calls timed out")
 
             logger.info(f"[ScaleOut][WeightSync] Weight sync completed: {success_count}/{total_live} engines synced")
-            return success_count == total_live
+            sync_succeeded = success_count == total_live
+            if not sync_succeeded:
+                _record(
+                    ScaleOutFailure(
+                        ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, f"only {success_count}/{total_live} engines synced"
+                    )
+                )
+            return sync_succeeded
 
         finally:
-            # Resume generation on all new engines after weight sync.
-            # This must happen even if sync failed, to unblock the engines.
-            logger.info("[ScaleOut][WeightSync] Resuming generation on new engines...")
-            resume_refs = []
-            for engine in new_engines:
-                if engine is not None:
-                    resume_refs.append(engine.continue_generation.remote())
-            if resume_refs:
-                try:
-                    await asyncio.wait_for(asyncio.gather(*resume_refs, return_exceptions=True), timeout=30)
-                except Exception as e:
-                    logger.warning(f"[ScaleOut][WeightSync] Some continue_generation calls failed: {e}")
-            self._is_weight_updating = False
-            ray.get(self._weight_sync_lock.release.remote())
+            # Failed engines remain paused until the caller rolls them back, so
+            # they cannot serve requests or participate in normal DCS updates.
+            if sync_succeeded:
+                logger.info("[ScaleOut][WeightSync] Resuming generation on new engines...")
+                resume_refs = []
+                for engine in new_engines:
+                    if engine is not None:
+                        resume_refs.append(engine.continue_generation.remote())
+                if resume_refs:
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*resume_refs, return_exceptions=True), timeout=30)
+                    except Exception as e:
+                        logger.warning(f"[ScaleOut][WeightSync] Some continue_generation calls failed: {e}")
+            else:
+                logger.warning("[ScaleOut][WeightSync] Keeping failed new engines paused for rollback")
+            if scale_out_owner_acquired:
+                with self._engine_lifecycle_lock:
+                    self._scale_out_weight_updating = False
+            if weight_sync_lock_acquired:
+                # This is the SAME lock every training weight update acquires;
+                # retaining it would spin the next training update forever.
+                ray.get(self._weight_sync_lock.release.remote())
 
     async def _health_check_engines(self, engines: list, timeout: float = 60.0) -> bool:
         """Check health of engines.
@@ -2691,36 +3335,34 @@ class RolloutManager(ReloadableMixin):
     ) -> list[dict]:
         """List all scale-out requests with optional filtering.
 
-        此方法用于查询系统中所有的 scale-out 请求，支持按模型名和状态过滤。
-
         Args:
-            model_name: 按目标模型名称过滤 (e.g., "actor", "reward")
-                       None 表示返回所有模型的请求
-            status_filter: 按状态过滤 (e.g., "PENDING", "ACTIVE", "FAILED")
-                          None 表示返回所有状态的请求
-                          必须是有效的 ScaleOutStatus 值
+            model_name: Filter by target model name (e.g., "actor", "reward").
+                       None returns requests for all models.
+            status_filter: Filter by status (e.g., "PENDING", "ACTIVE", "FAILED").
+                          None returns requests in all states.
+                          Must be a valid ScaleOutStatus value.
 
         Returns:
-            list[dict]: 请求列表（按 created_at 降序排列），每个元素是 ScaleOutRequest.to_dict()
-                       如果没有匹配的请求，返回空列表 []
+            list[dict]: Requests (sorted by created_at descending), each is a
+                       ScaleOutRequest.to_dict(). Empty list [] if none match.
 
         Raises:
-            ValueError: 如果 status_filter 不是有效的 ScaleOutStatus 值
+            ValueError: If status_filter is not a valid ScaleOutStatus value.
 
         Examples:
-            # 获取所有请求
+            # All requests
             requests = ray.get(
                 rollout_manager.list_all_scale_out_requests.remote()
             )
 
-            # 获取所有 PENDING 请求
+            # All PENDING requests
             pending = ray.get(
                 rollout_manager.list_all_scale_out_requests.remote(
                     status_filter="PENDING"
                 )
             )
 
-            # 获取 'actor' 模型的所有 ACTIVE 请求
+            # All ACTIVE requests for the 'actor' model
             actor_active = ray.get(
                 rollout_manager.list_all_scale_out_requests.remote(
                     model_name="actor",
@@ -2730,11 +3372,11 @@ class RolloutManager(ReloadableMixin):
         """
         requests = list(self._scale_out_requests.values())
 
-        # 按 model_name 过滤
+        # Filter by model_name
         if model_name is not None:
             requests = [r for r in requests if r.model_name == model_name]
 
-        # 按 status 过滤
+        # Filter by status
         if status_filter is not None:
             try:
                 status = ScaleOutStatus(status_filter)
@@ -2745,7 +3387,7 @@ class RolloutManager(ReloadableMixin):
                     f"Must be one of: {', '.join([s.value for s in ScaleOutStatus])}"
                 )
 
-        # 按 created_at 降序排列（最新优先）
+        # Sort by created_at descending (newest first)
         requests.sort(key=lambda r: r.created_at, reverse=True)
 
         logger.info(
@@ -2760,25 +3402,25 @@ class RolloutManager(ReloadableMixin):
     ) -> dict:
         """Cancel all scale-out requests matching criteria.
 
-        只有处于 PENDING 或 CREATING 状态的请求才能被取消。
-        其他状态的请求将被跳过并在返回结果中记录。
+        Only requests in PENDING or CREATING state can be cancelled.
+        Requests in other states are skipped and recorded in the result.
 
         Args:
-            model_name: 仅取消此模型的请求 (optional)
-            status_filter: 仅取消此状态的请求 (optional)
-            dry_run: 如果为 True，仅预览会被取消的请求，不实际取消
+            model_name: Only cancel requests for this model (optional).
+            status_filter: Only cancel requests in this status (optional).
+            dry_run: If True, only preview which requests would be cancelled.
 
         Returns:
-            dict: 包含以下字段：
-                - succeeded (List[str]): 成功取消的请求ID列表
-                - skipped (List[dict]): 无法取消的请求及其原因
-                  格式: [{"request_id": "...", "reason": "..."}, ...]
-                - total_count (int): 匹配过滤条件的请求总数
-                - dry_run (bool): 是否为试运行模式
-                - filters (dict): 应用的过滤条件
+            dict: With the following fields:
+                - succeeded (List[str]): IDs of successfully cancelled requests
+                - skipped (List[dict]): Requests that could not be cancelled and why
+                  Format: [{"request_id": "...", "reason": "..."}, ...]
+                - total_count (int): Total requests matching the filters
+                - dry_run (bool): Whether this was a dry run
+                - filters (dict): The filters that were applied
 
         Examples:
-            # 预览会取消哪些 PENDING 请求（不实际取消）
+            # Preview which PENDING requests would be cancelled (no changes)
             result = ray.get(
                 rollout_manager.cancel_all_scale_out_requests.remote(
                     status_filter="PENDING",
@@ -2788,7 +3430,7 @@ class RolloutManager(ReloadableMixin):
             print(f"Would cancel: {result['succeeded']}")
             print(f"Would skip: {result['skipped']}")
 
-            # 实际取消所有 PENDING 请求
+            # Actually cancel all PENDING requests
             result = ray.get(
                 rollout_manager.cancel_all_scale_out_requests.remote(
                     status_filter="PENDING",
@@ -2798,11 +3440,11 @@ class RolloutManager(ReloadableMixin):
         """
         requests = list(self._scale_out_requests.values())
 
-        # 应用 model_name 过滤
+        # Apply model_name filter
         if model_name is not None:
             requests = [r for r in requests if r.model_name == model_name]
 
-        # 应用 status 过滤
+        # Apply status filter
         if status_filter is not None:
             try:
                 status = ScaleOutStatus(status_filter)
@@ -2818,7 +3460,7 @@ class RolloutManager(ReloadableMixin):
 
         for request in requests:
             if dry_run:
-                # Dry-run 模式：只预览，不实际修改
+                # Dry-run mode: preview only, no changes
                 if request.can_cancel():
                     succeeded.append(request.request_id)
                     logger.info(f"[DryRun] Would cancel request {request.request_id}")
@@ -2832,7 +3474,7 @@ class RolloutManager(ReloadableMixin):
                     )
                     logger.debug(f"[DryRun] Would skip request {request.request_id}: {reason}")
             else:
-                # 实际执行模式：真正取消请求
+                # Live mode: actually cancel the request
                 if request.can_cancel():
                     request.update_status(ScaleOutStatus.CANCELLED)
                     succeeded.append(request.request_id)
@@ -2863,19 +3505,22 @@ class RolloutManager(ReloadableMixin):
         return result
 
     @ray.method(concurrency_group="scale_in")
-    def set_weight_updating(self, is_updating: bool) -> None:
-        self._is_weight_updating = is_updating
+    def set_weight_updating(self, is_updating: bool) -> bool:
+        """Acquire or release the fully-async topology lease.
 
-        # Mirror the flag to every live engine so their SIGTERM handlers can
-        # check it locally without an extra Ray RPC.
-        refs = []
-        for srv in self.servers.values():
-            for group in srv.engine_groups:
-                for engine in group.all_engines:
-                    if engine is not None:
-                        refs.append(engine.set_weight_updating.remote(is_updating))
-        if refs:
-            ray.get(refs)
+        A DRAINING group owns the scale-in fence, so a new update must retry.
+        An update admitted first may finish; scale-in waits for this owner to
+        release instead of mutating the live NCCL topology underneath it.
+        """
+        with self._engine_lifecycle_lock:
+            if is_updating and any(
+                group.is_scaled_out and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                for srv in self.servers.values()
+                for group in srv.engine_groups
+            ):
+                return False
+            self._training_weight_updating = is_updating
+            return True
 
     @ray.method(concurrency_group="scale_in")
     async def sync_weights_for_scaled_out_engines(
@@ -2931,10 +3576,12 @@ class RolloutManager(ReloadableMixin):
 
         # Sync from seed engine
         try:
+            sync_reasons: list[ScaleOutFailure] = []
             success = await self._sync_weights_from_seed_engine(
                 scaled_out_engines,
                 timeout=timeout,
                 model_name=model_name,
+                reason_sink=sync_reasons,
             )
 
             if success:
@@ -2951,7 +3598,9 @@ class RolloutManager(ReloadableMixin):
                     "success": False,
                     "synced_count": 0,
                     "failed_engines": [f"engine_{i}" for i in range(len(scaled_out_engines))],
-                    "error_message": "Weight sync failed for some engines",
+                    "error_message": (
+                        sync_reasons[-1].message() if sync_reasons else "Weight sync failed for some engines"
+                    ),
                 }
 
         except Exception as e:
@@ -3034,8 +3683,20 @@ class RolloutManager(ReloadableMixin):
             force=force,
             dry_run=dry_run,
         )
-        self._scale_in_requests[request.request_id] = request
-        self._gc_terminal_requests()
+        # Recheck and insert atomically against graceful eviction claims.
+        with self._engine_lifecycle_lock:
+            active = self._find_active_scale_request()
+            if active is not None:
+                return {
+                    "request_id": str(uuid.uuid4()),
+                    "status": "CONFLICT",
+                    "message": (
+                        f"Another {active['type']} request is in progress: "
+                        f"request_id={active['request_id']}, status={active['status']}"
+                    ),
+                }
+            self._scale_in_requests[request.request_id] = request
+            self._gc_terminal_requests()
         return request.to_dict()
 
     @ray.method(concurrency_group="scale_in")
@@ -3061,68 +3722,85 @@ class RolloutManager(ReloadableMixin):
             request.update_status(ScaleInStatus.FAILED, f"Model '{request.model_name}' not found (no rollout server)")
             return
 
-        # P1-3: Wait for any in-progress weight update to complete before draining.
-        # Draining engines during a weight update could break NCCL communication groups.
-        if self._is_weight_updating:
-            logger.info("[ScaleIn] Weight update in progress, waiting for it to complete...")
-            wait_start = time.time()
-            weight_update_timeout = request.timeout_secs
-            while self._is_weight_updating and (time.time() - wait_start) < weight_update_timeout:
-                await asyncio.sleep(1)
-            if self._is_weight_updating:
-                logger.warning(
-                    f"[ScaleIn] Weight update still in progress after {weight_update_timeout}s, proceeding anyway"
-                )
-            else:
-                logger.info(f"[ScaleIn] Weight update completed after {time.time() - wait_start:.1f}s, proceeding")
-
+        selected_groups: dict[int, EngineGroup] = {}
+        completed_eviction_groups: set[int] = set()
         try:
-            engine_infos = self._select_engines_for_removal(request, srv)
-            if not engine_infos:
-                if request.num_replicas > 0:
-                    request.update_status(ScaleInStatus.COMPLETED)
-                    logger.info(
-                        f"[ScaleIn] No-op: already at or below target replicas (target={request.num_replicas})"
-                    )
+            url_candidates = None
+            if request.engine_urls:
+                url_candidates = await self._resolve_scale_in_url_candidates(request, srv)
+
+            with self._engine_lifecycle_lock:
+                # Selection and lifecycle claim are one transaction with the
+                # SIGTERM handler. Whichever enters first determines whether
+                # a pending eviction is adopted into this target scale-in.
+                if request.selected_engines:
+                    logger.warning("[ScaleIn] Request %s already has claimed targets", request.request_id)
                     return
-                request.update_status(ScaleInStatus.FAILED, "No engines selected for removal")
-                return
+                engine_infos = self._select_engines_for_removal(request, srv, url_candidates=url_candidates)
+                if not engine_infos:
+                    if request.num_replicas > 0:
+                        request.update_status(ScaleInStatus.COMPLETED)
+                        logger.info(
+                            f"[ScaleIn] No-op: already at or below target replicas (target={request.num_replicas})"
+                        )
+                        return
+                    request.update_status(ScaleInStatus.FAILED, "No engines selected for removal")
+                    return
 
-            request.selected_engines = [f"group_{g.rank_offset}_engine_{node0_idx}" for g, node0_idx in engine_infos]
-            logger.info(f"[ScaleIn] Selected {len(engine_infos)} engines for removal: {request.selected_engines}")
+                request.selected_engines = [
+                    f"group_{group.rank_offset}_engine_{node0_idx}" for group, node0_idx in engine_infos
+                ]
+                logger.info(f"[ScaleIn] Selected {len(engine_infos)} engines for removal: {request.selected_engines}")
 
-            if request.dry_run:
-                request.update_status(ScaleInStatus.COMPLETED)
-                logger.info("[ScaleIn] Dry-run complete, no engines removed")
-                return
+                if request.dry_run:
+                    request.update_status(ScaleInStatus.COMPLETED)
+                    logger.info("[ScaleIn] Dry-run complete, no engines removed")
+                    return
+
+                selected_groups = {id(group): group for group, _ in engine_infos}
+                if any(
+                    group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    for group in selected_groups.values()
+                ):
+                    request.update_status(ScaleInStatus.FAILED, "Selected engine group is already being removed")
+                    return
+                for group in selected_groups.values():
+                    group.lifecycle_status = EngineGroupLifecycle.DRAINING
+
+            # Publish DRAINING before waiting. Existing transfers may finish,
+            # but a new fully-async lease cannot enter while removal is pending.
+            wait_start = time.monotonic()
+            while self._is_weight_updating:
+                elapsed = time.monotonic() - wait_start
+                if elapsed >= request.timeout_secs:
+                    request.update_status(
+                        ScaleInStatus.FAILED,
+                        f"Timed out waiting {request.timeout_secs}s for the weight-update fence",
+                    )
+                    logger.warning("[ScaleIn] Timed out waiting for weight update; aborting scale-in")
+                    return
+                await asyncio.sleep(min(1.0, request.timeout_secs - elapsed))
 
             drain_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0)
             shutdown_timeout = getattr(self.args, "scale_in_shutdown_timeout", 20.0)
 
             request.update_status(ScaleInStatus.DRAINING)
-            unregistered_engine_infos, router_failed = await self._drain_engines(
+            removed, failed = await self._remove_live_engines(
+                srv,
                 engine_infos,
-                timeout=drain_timeout,
+                drain_timeout=drain_timeout,
+                shutdown_timeout=shutdown_timeout,
                 force=request.force,
             )
 
             request.update_status(ScaleInStatus.REMOVING)
-            removed = []
-            failed = list(router_failed)
-            for group, node0_idx in unregistered_engine_infos:
-                engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
-                try:
-                    await self._remove_engine(group, node0_idx, shutdown_timeout=shutdown_timeout)
-                    removed.append(engine_id)
-                    logger.info(f"[ScaleIn] Removed engine {engine_id}")
-                except Exception as e:
-                    failed.append(engine_id)
-                    logger.warning(f"[ScaleIn] Failed to remove engine {engine_id}: {e}")
-
             request.removed_engines = removed
             request.failed_engines = failed
-
-            self._cleanup_engine_groups(srv)
+            completed_eviction_groups = {
+                id(group)
+                for group, node0_idx in engine_infos
+                if group.eviction_requested and f"group_{group.rank_offset}_engine_{node0_idx}" in removed
+            }
 
             if failed:
                 failure_prefix = "Scale-in partially failed" if removed else "Scale-in failed"
@@ -3140,8 +3818,40 @@ class RolloutManager(ReloadableMixin):
         except Exception as e:
             request.update_status(ScaleInStatus.FAILED, f"Scale-in failed: {e}")
             logger.exception(f"[ScaleIn] Unhandled error in scale-in for request {request.request_id}")
+        finally:
+            with self._engine_lifecycle_lock:
+                for group in selected_groups.values():
+                    if id(group) in completed_eviction_groups:
+                        group.eviction_requested = False
+                    if not group.eviction_requested and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                        group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
-    def _select_engines_for_removal(self, request: ScaleInRequest, srv) -> list:
+    async def _resolve_scale_in_url_candidates(self, request: ScaleInRequest, srv) -> list:
+        """Resolve URL targets without holding the lifecycle lock."""
+        target_urls = {self._normalize_engine_addr(url) for url in request.engine_urls}
+        with self._engine_lifecycle_lock:
+            snapshots = [
+                (group, node0_idx, engine)
+                for group in srv.engine_groups
+                if group.is_scaled_out
+                and group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                for node0_idx, engine in enumerate(group.engines)
+                if engine is not None
+            ]
+
+        async def _resolve(group, node0_idx, engine):
+            try:
+                url = await asyncio.wait_for(engine.get_url.remote(), timeout=5)
+                if url and self._normalize_engine_addr(url) in target_urls:
+                    return group, node0_idx, engine
+            except Exception as e:
+                logger.warning(f"Failed to get URL for engine group_{group.rank_offset}_engine_{node0_idx}: {e}")
+            return None
+
+        results = await asyncio.gather(*[_resolve(*snapshot) for snapshot in snapshots])
+        return [result for result in results if result is not None]
+
+    def _select_engines_for_removal(self, request: ScaleInRequest, srv, *, url_candidates: list | None = None) -> list:
         """Select engines eligible for removal during scale-in.
 
         Only engines belonging to groups that were added via scale-out
@@ -3149,40 +3859,99 @@ class RolloutManager(ReloadableMixin):
         touched, regardless of how ``num_replicas`` / ``engine_urls`` are
         specified.
         """
-        # Collect candidates: only from scale-out groups
-        engine_infos = []
-        for group in srv.engine_groups:
-            if not group.is_scaled_out:
-                continue
-            for node0_idx, engine in enumerate(group.engines):
-                if engine is not None:
-                    engine_infos.append((group, node0_idx))
+        # Collect one coherent snapshot.  A DRAINING group can be a SIGTERM
+        # intent claimed after this request was inserted; prefer it so a
+        # target-based scale-in does not remove a second elastic engine.
+        with self._engine_lifecycle_lock:
+            engine_snapshots = []
+            for group in srv.engine_groups:
+                if not group.is_scaled_out or group.lifecycle_status not in (
+                    EngineGroupLifecycle.ACTIVE,
+                    EngineGroupLifecycle.DRAINING,
+                ):
+                    continue
+                for node0_idx, engine in enumerate(group.engines):
+                    if engine is not None:
+                        engine_snapshots.append((group, node0_idx, engine))
+            current_total = sum(1 for group in srv.engine_groups for engine in group.engines if engine is not None)
 
         if request.num_replicas > 0:
             # Count ALL live engines (initial + scaled-out) to decide how many
             # to remove so the cluster reaches the target size.
-            current_total = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
             num_to_remove = current_total - request.num_replicas
             if num_to_remove <= 0:
                 return []
-            # Remove from the tail (most recently added) first; never exceed
-            # the number of eligible scale-out engines.
-            engine_infos = engine_infos[-num_to_remove:]
+            draining = [item for item in engine_snapshots if item[0].lifecycle_status is EngineGroupLifecycle.DRAINING]
+            active = [item for item in engine_snapshots if item[0].lifecycle_status is EngineGroupLifecycle.ACTIVE]
+            # Adopt SIGTERM intents first, then remove the most recently added
+            # ACTIVE engines only for the remaining target delta.
+            engine_snapshots = draining[:num_to_remove]
+            remaining = num_to_remove - len(engine_snapshots)
+            if remaining > 0:
+                engine_snapshots.extend(active[-remaining:])
         elif request.engine_urls:
-            # Match by engine URLs (normalize both sides so http:// prefix doesn't matter)
-            target_urls = {self._normalize_engine_addr(u) for u in request.engine_urls}
-            matched_infos = []
-            for g, idx in engine_infos:
-                engine = g.engines[idx]
-                try:
-                    url = ray.get(engine.get_url.remote(), timeout=5)
-                    if url and self._normalize_engine_addr(url) in target_urls:
-                        matched_infos.append((g, idx))
-                except Exception as e:
-                    logger.warning(f"Failed to get URL for engine group_{g.rank_offset}_engine_{idx}: {e}")
-            engine_infos = matched_infos
+            # URL probes happen outside the lifecycle lock. Revalidate actor
+            # identity against the current topology before claiming removal.
+            resolved_by_slot = {(id(group), node0_idx): engine for group, node0_idx, engine in (url_candidates or [])}
+            engine_snapshots = [
+                (group, node0_idx, engine)
+                for group, node0_idx, engine in engine_snapshots
+                if resolved_by_slot.get((id(group), node0_idx)) is engine
+            ]
 
-        return engine_infos
+        return [(group, node0_idx) for group, node0_idx, _ in engine_snapshots]
+
+    async def _remove_live_engines(
+        self,
+        srv,
+        engine_infos: list,
+        *,
+        drain_timeout: float,
+        shutdown_timeout: float,
+        force: bool,
+    ) -> tuple[list[str], list[str]]:
+        """Remove live actors in Router -> drain -> DCS -> shutdown -> PG
+        order."""
+        unregistered_engine_infos, router_failed = await self._drain_engines(
+            engine_infos,
+            timeout=drain_timeout,
+            force=force,
+        )
+
+        removal_targets = [
+            (
+                group,
+                node0_idx,
+                f"group_{group.rank_offset}_engine_{node0_idx}",
+                self._get_live_engine_actors(group, node0_idx),
+            )
+            for group, node0_idx in unregistered_engine_infos
+        ]
+        dcs_results = await asyncio.gather(
+            *[self._unregister_engine_dcs(engine_id, live_actors) for _, _, engine_id, live_actors in removal_targets],
+            return_exceptions=True,
+        )
+        removed = []
+        failed = list(router_failed)
+        shutdown_targets = []
+        for target, result in zip(removal_targets, dcs_results):
+            _, _, engine_id, _ = target
+            if isinstance(result, BaseException):
+                logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
+            shutdown_targets.append(target)
+
+        await asyncio.gather(
+            *[
+                self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
+                for group, _, engine_id, live_actors in shutdown_targets
+            ]
+        )
+        for _, _, engine_id, _ in shutdown_targets:
+            removed.append(engine_id)
+            logger.info(f"[ScaleIn] Removed engine {engine_id}")
+
+        self._cleanup_engine_groups(srv)
+        return removed, failed
 
     async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> tuple[list, list[str]]:
         """Remove all engines from the router, then wait once for the drain
@@ -3251,60 +4020,97 @@ class RolloutManager(ReloadableMixin):
 
         return unregistered_engine_infos, failed_engine_ids
 
-    async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
-        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+    @staticmethod
+    def _get_live_engine_actors(group, node0_idx: int) -> list[tuple[int, object]]:
         nodes_per_engine = group.nodes_per_engine
         indices = range(node0_idx * nodes_per_engine, (node0_idx + 1) * nodes_per_engine)
+        return [
+            (i, group.all_engines[i])
+            for i in indices
+            if i < len(group.all_engines) and group.all_engines[i] is not None
+        ]
 
-        for i in indices:
-            if i >= len(group.all_engines):
-                continue
-            engine = group.all_engines[i]
-            if engine is None:
-                continue
+    @staticmethod
+    async def _unregister_engine_dcs(engine_id: str, live_actors: list[tuple[int, object]]) -> None:
+        async def _unregister_dcs(engine):
+            return await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
 
-            try:
-                await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
-            except Exception as e:
-                logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}[{i}]: {e}")
+        dcs_results = await asyncio.gather(
+            *[_unregister_dcs(engine) for _, engine in live_actors],
+            return_exceptions=True,
+        )
+        dcs_failures = [
+            (i, result) for (i, _), result in zip(live_actors, dcs_results) if isinstance(result, BaseException)
+        ]
+        if dcs_failures:
+            failed_indices = ", ".join(str(i) for i, _ in dcs_failures)
+            raise RuntimeError(f"Failed to unregister DCS for engine {engine_id}[{failed_indices}]")
 
-            shutdown_ok = False
-            try:
-                await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
-                shutdown_ok = True
-            except Exception as e:
-                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {e}")
+    async def _shutdown_engine_actors(
+        self,
+        group,
+        engine_id: str,
+        live_actors: list[tuple[int, object]],
+        shutdown_timeout: float,
+    ) -> None:
+        async def _shutdown(engine):
+            return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
-            if not shutdown_ok:
+        shutdown_results = await asyncio.gather(
+            *[_shutdown(engine) for _, engine in live_actors],
+            return_exceptions=True,
+        )
+        for (i, engine), result in zip(live_actors, shutdown_results):
+            if isinstance(result, BaseException):
+                logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
                 try:
                     ray.kill(engine)
                 except Exception as e:
                     logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]: {e}")
 
-            group.all_engines[i] = None
+        with self._engine_lifecycle_lock:
+            for i, _ in live_actors:
+                group.all_engines[i] = None
+
+    async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
+        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+        live_actors = self._get_live_engine_actors(group, node0_idx)
+        try:
+            await self._unregister_engine_dcs(engine_id, live_actors)
+        except Exception as e:
+            logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {e}")
+        await self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
 
     def _cleanup_engine_groups(self, srv) -> None:
-        monitors_to_remove = []
-        groups_to_remove = []
-
-        for group in srv.engine_groups:
-            if all(e is None for e in group.all_engines):
-                groups_to_remove.append(group)
-                for monitor in self._health_monitors:
-                    if monitor._engine_group is group:
-                        monitors_to_remove.append(monitor)
+        with self._engine_lifecycle_lock:
+            groups_to_remove = [
+                group
+                for group in srv.engine_groups
+                if group.lifecycle_status in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                and all(engine is None for engine in group.all_engines)
+            ]
+            monitors_to_remove = [
+                monitor
+                for monitor in self._health_monitors
+                if any(monitor._engine_group is group for group in groups_to_remove)
+            ]
+            for group in groups_to_remove:
+                group.lifecycle_status = EngineGroupLifecycle.REMOVING
+                srv.engine_groups.remove(group)
+            for monitor in monitors_to_remove:
+                self._health_monitors.remove(monitor)
 
         for monitor in monitors_to_remove:
             monitor.stop()
-            self._health_monitors.remove(monitor)
 
         for group in groups_to_remove:
-            srv.engine_groups.remove(group)
             if group.pg is not None:
                 try:
                     ray.util.remove_placement_group(group.pg[0])
                 except Exception as e:
                     logger.warning(f"[ScaleIn] Failed to remove placement group: {e}")
+            with self._engine_lifecycle_lock:
+                group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
         if groups_to_remove:
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
@@ -3320,36 +4126,34 @@ class RolloutManager(ReloadableMixin):
     ) -> list[dict]:
         """List all scale-in requests with optional filtering.
 
-        此方法用于查询系统中所有的 scale-in 请求，支持按模型名和状态过滤。
-
         Args:
-            model_name: 按目标模型名称过滤 (e.g., "actor", "reward")
-                       None 表示返回所有模型的请求
-            status_filter: 按状态过滤 (e.g., "PENDING", "DRAINING", "REMOVING", "COMPLETED", "FAILED")
-                          None 表示返回所有状态的请求
-                          必须是有效的 ScaleInStatus 值
+            model_name: Filter by target model name (e.g., "actor", "reward").
+                       None returns requests for all models.
+            status_filter: Filter by status (e.g., "PENDING", "DRAINING", "REMOVING", "COMPLETED", "FAILED").
+                          None returns requests in all states.
+                          Must be a valid ScaleInStatus value.
 
         Returns:
-            list[dict]: 请求列表（按 created_at 降序排列），每个元素是 ScaleInRequest.to_dict()
-                       如果没有匹配的请求，返回空列表 []
+            list[dict]: Requests (sorted by created_at descending), each is a
+                       ScaleInRequest.to_dict(). Empty list [] if none match.
 
         Raises:
-            ValueError: 如果 status_filter 不是有效的 ScaleInStatus 值
+            ValueError: If status_filter is not a valid ScaleInStatus value.
 
         Examples:
-            # 获取所有请求
+            # All requests
             requests = ray.get(
                 rollout_manager.list_all_scale_in_requests.remote()
             )
 
-            # 获取所有 PENDING 请求
+            # All PENDING requests
             pending = ray.get(
                 rollout_manager.list_all_scale_in_requests.remote(
                     status_filter="PENDING"
                 )
             )
 
-            # 获取 'actor' 模型的所有 COMPLETED 请求
+            # All COMPLETED requests for the 'actor' model
             actor_completed = ray.get(
                 rollout_manager.list_all_scale_in_requests.remote(
                     model_name="actor",
@@ -3359,11 +4163,11 @@ class RolloutManager(ReloadableMixin):
         """
         requests = list(self._scale_in_requests.values())
 
-        # 按 model_name 过滤
+        # Filter by model_name
         if model_name is not None:
             requests = [r for r in requests if r.model_name == model_name]
 
-        # 按 status 过滤
+        # Filter by status
         if status_filter is not None:
             try:
                 status = ScaleInStatus(status_filter)
@@ -3373,7 +4177,7 @@ class RolloutManager(ReloadableMixin):
                     f"Invalid status: '{status_filter}'. Must be one of: {', '.join([s.value for s in ScaleInStatus])}"
                 )
 
-        # 按 created_at 降序排列（最新优先）
+        # Sort by created_at descending (newest first)
         requests.sort(key=lambda r: r.created_at, reverse=True)
 
         logger.info(
@@ -3422,120 +4226,160 @@ class RolloutManager(ReloadableMixin):
                 logger.exception("[Eviction] Unhandled error in eviction monitor loop")
 
     def _check_and_handle_evictions(self):
-        """Check all engines for SIGTERM eviction and handle evicted ones as
-        scale-in.
-
-        This method polls every live engine via ``is_evicted()`` in parallel.
-        Evicted engines are removed from the engine group and cleaned up,
-        similar to the existing scale-in flow but without requiring an external
-        API call.
-        """
-        # Collect all live engines with their (server_name, group, node0_idx)
-        engine_refs = []
-        engine_info_map = []
-        for srv_name, srv in self.servers.items():
-            for group in srv.engine_groups:
-                for node0_idx, engine in enumerate(group.engines):
-                    if engine is None:
+        """Poll live elastic actors independently for graceful SIGTERM
+        intent."""
+        pending = []
+        with self._engine_lifecycle_lock:
+            for server_name, srv in self.servers.items():
+                for group in srv.engine_groups:
+                    if (
+                        not group.is_scaled_out
+                        or group.pg is None
+                        or group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    ):
                         continue
-                    try:
-                        ref = engine.is_evicted.remote()
-                        engine_refs.append(ref)
-                        engine_info_map.append((srv_name, group, node0_idx, engine))
-                    except Exception:
-                        # Engine actor may already be dead
-                        pass
+                    for actor_idx, engine in enumerate(group.all_engines):
+                        if engine is None:
+                            continue
+                        try:
+                            pending.append(
+                                (
+                                    engine.is_evicted.remote(),
+                                    server_name,
+                                    group,
+                                    actor_idx // group.nodes_per_engine,
+                                )
+                            )
+                        except Exception as e:
+                            logger.debug("[Eviction] Failed to submit graceful probe: %s", e)
 
-        if not engine_refs:
+        if not pending:
             return
 
-        # Parallel poll with timeout — an engine that's already dead will
-        # raise; we treat that as "not evicted" (the health monitor handles dead actors).
+        refs = [item[0] for item in pending]
+        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=5)
+        ready_set = set(ready)
+        handled = set()
+        evicted_engine_infos = []
+        for ref, server_name, group, node0_idx in pending:
+            if ref not in ready_set or (id(group), node0_idx) in handled:
+                continue
+            try:
+                if ray.get(ref):
+                    handled.add((id(group), node0_idx))
+                    evicted_engine_infos.append((server_name, group, node0_idx))
+            except Exception as e:
+                # Hard actor failure belongs to the fault-recovery follow-up,
+                # not this graceful-eviction path.
+                logger.debug("[Eviction] Graceful probe failed: %s", e)
+
+        if evicted_engine_infos:
+            self._handle_evictions(evicted_engine_infos)
+
+    def _handle_evictions(self, eviction_infos: list[tuple[str, EngineGroup, int]]) -> None:
+        """Fence a ready eviction batch before performing one live removal."""
+        claimed = []
+        with self._engine_lifecycle_lock:
+            for srv_name, group, node0_idx in eviction_infos:
+                srv = self.servers.get(srv_name)
+                if (
+                    srv is None
+                    or group not in srv.engine_groups
+                    or group.lifecycle_status not in (EngineGroupLifecycle.ACTIVE, EngineGroupLifecycle.DRAINING)
+                    or not group.is_scaled_out
+                    or group.pg is None
+                    or node0_idx >= len(group.engines)
+                    or group.engines[node0_idx] is None
+                ):
+                    continue
+                group.eviction_requested = True
+                group.lifecycle_status = EngineGroupLifecycle.DRAINING
+                claimed.append((srv_name, srv, group, node0_idx))
+
+            if not claimed:
+                return
+
+            # Signal-first fence: every ready intent is DRAINING before any
+            # owner wait or cleanup.  An explicit scale-in remains the sole
+            # removal owner and adopts matching DRAINING engines.
+            active = self._find_active_scale_request()
+            if active is not None and active["type"] == "scale_in":
+                engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
+                logger.info(
+                    "[Eviction] Scale-in request %s will adopt pending evictions %s (%s)",
+                    active["request_id"],
+                    engine_ids,
+                    active["status"],
+                )
+                return
+            if active is not None and active["type"] not in ("scale_out", "graceful_eviction"):
+                return
+
+        engine_ids = [f"group_{group.rank_offset}_engine_{idx}" for _, _, group, idx in claimed]
+        logger.info("[Eviction] Gracefully removing engines %s", engine_ids)
         try:
-            results = ray.get(engine_refs, timeout=5)
-        except ray.exceptions.GetTimeoutError:
-            logger.warning("[Eviction] Timed out polling engines for eviction status")
+            wait_timeout = getattr(self.args, "scale_in_drain_timeout", 30.0) + 60.0
+            deadline = time.monotonic() + wait_timeout
+            while self._is_weight_updating:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("[Eviction] Timed out waiting for the weight-update fence for %s", engine_ids)
+                    return
+                time.sleep(min(1.0, remaining))
+
+            batches: dict[str, tuple[RolloutServer, list[tuple[EngineGroup, int]]]] = {}
+            for srv_name, srv, group, node0_idx in claimed:
+                if srv_name not in batches:
+                    batches[srv_name] = (srv, [])
+                batches[srv_name][1].append((group, node0_idx))
+
+            async def _remove_batches():
+                batch_items = list(batches.items())
+                results = await asyncio.gather(
+                    *[
+                        self._remove_live_engines(
+                            srv,
+                            infos,
+                            drain_timeout=getattr(self.args, "scale_in_drain_timeout", 30.0),
+                            shutdown_timeout=getattr(self.args, "scale_in_shutdown_timeout", 20.0),
+                            force=False,
+                        )
+                        for _, (srv, infos) in batch_items
+                    ],
+                    return_exceptions=True,
+                )
+                return [(srv_name, result) for (srv_name, _), result in zip(batch_items, results)]
+
+            batch_results = asyncio.run(_remove_batches())
+        except Exception:
+            logger.exception("[Eviction] Graceful removal failed for %s", engine_ids)
             return
-        except Exception as e:
-            logger.debug(f"[Eviction] Error polling engines: {e}")
-            return
 
-        evicted = [
-            (srv_name, group, node0_idx, engine)
-            for (srv_name, group, node0_idx, engine), is_evict in zip(engine_info_map, results)
-            if is_evict
-        ]
-        if not evicted:
-            return
+        removed_by_server = {}
+        for srv_name, result in batch_results:
+            if isinstance(result, BaseException):
+                logger.warning("[Eviction] Graceful removal batch failed for %s: %s", srv_name, result)
+                removed_by_server[srv_name] = set()
+            else:
+                removed, _ = result
+                removed_by_server[srv_name] = set(removed)
 
-        logger.info(
-            f"[Eviction] Detected {len(evicted)} evicted engine(s), "
-            f"processing as scale-in: "
-            f"{[(srv_name, f'group_{g.rank_offset}_engine_{idx}') for srv_name, g, idx, _ in evicted]}"
-        )
+        claimed_by_group: dict[int, tuple[EngineGroup, list[tuple[str, str]]]] = {}
+        for srv_name, _, group, node0_idx in claimed:
+            engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+            claimed_by_group.setdefault(id(group), (group, []))[1].append((srv_name, engine_id))
 
-        for srv_name, group, node0_idx, engine in evicted:
-            self._handle_single_eviction(srv_name, group, node0_idx)
-
-    def _handle_single_eviction(self, srv_name: str, group, node0_idx: int):
-        """Handle a single evicted engine: unregister DCS, kill actor, clean
-        up.
-
-        This mirrors the scale-in removal path but is triggered by eviction
-        rather than an API request.  The SIGTERM handler in SGLangEngine
-        already unregistered the engine from the router, so we skip the drain
-        step.
-        """
-        engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
-        logger.info(f"[Eviction] Handling evicted engine: {engine_id}")
-
-        # Mark as intentionally removed in health monitor so it doesn't
-        # try to recover the engine.
-        for monitor in self._health_monitors:
-            if monitor._engine_group is group:
-                monitor.mark_intentionally_removed(node0_idx)
-
-        nodes_per_engine = group.nodes_per_engine
-        indices = range(node0_idx * nodes_per_engine, (node0_idx + 1) * nodes_per_engine)
-
-        for i in indices:
-            if i >= len(group.all_engines):
-                continue
-            engine = group.all_engines[i]
-            if engine is None:
-                continue
-
-            # Best-effort DCS unregister
-            try:
-                ray.get(engine.unregister_dcs.remote(), timeout=5)
-            except Exception as e:
-                logger.warning(f"[Eviction] Failed to unregister DCS for {engine_id}[{i}]: {e}")
-
-            # Best-effort shutdown — the process may already be terminating
-            try:
-                ray.get(engine.shutdown.remote(), timeout=10)
-            except Exception as e:
-                logger.debug(f"[Eviction] Engine shutdown failed (expected if pod is terminating): {e}")
-
-            # Kill the Ray actor
-            try:
-                ray.kill(engine)
-            except Exception as e:
-                logger.debug(f"[Eviction] ray.kill failed for {engine_id}[{i}] (may already be dead): {e}")
-
-            group.all_engines[i] = None
-
-        logger.info(f"[Eviction] Engine {engine_id} removed from engine group")
-
-        # Clean up empty engine groups
-        srv = self.servers.get(srv_name)
-        if srv:
-            self._cleanup_engine_groups(srv)
-            remaining = sum(1 for g in srv.engine_groups for e in g.engines if e is not None)
-            logger.info(
-                f"[Eviction] Server '{srv_name}' now has {remaining} live engine(s) "
-                f"across {len(srv.engine_groups)} group(s)"
-            )
+        with self._engine_lifecycle_lock:
+            # Restore a surviving group only when every eviction claimed for
+            # that group completed. Any timeout/failure remains fail-closed.
+            for group, group_claims in claimed_by_group.values():
+                completed = all(
+                    engine_id in removed_by_server.get(srv_name, set()) for srv_name, engine_id in group_claims
+                )
+                if completed:
+                    group.eviction_requested = False
+                if completed and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                    group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
 
 def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
@@ -3969,16 +4813,36 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
         return
 
     log_dict = {**(rollout_extra_metrics or {})}
-    log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
-    log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
-    logger.info(f"perf {rollout_id}: {log_dict}")
+    if samples:
+        log_dict |= dict_add_prefix(
+            compute_metrics_from_samples(args, samples, rollout_id=rollout_id),
+            "rollout/",
+        )
+        log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
+    rollout_log_dict = {key: value for key, value in log_dict.items() if not key.startswith(("perf/", "perf_detail/"))}
+    perf_log_dict = {key: value for key, value in log_dict.items() if key.startswith(("perf/", "perf_detail/"))}
+    logger.info(f"rollout {rollout_id}: {rollout_log_dict}")
+    logger.info(f"perf {rollout_id}: {perf_log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
 
 
-def compute_metrics_from_samples(args, samples, *, include_rloo_diagnostics: bool = True):
+def compute_metrics_from_samples(
+    args,
+    samples,
+    *,
+    rollout_id: int | None = None,
+    include_rloo_diagnostics: bool = True,
+):
+    rewarded_samples = [sample for sample in samples if sample.reward is not None]
+    reward_cat_key = args.log_reward_category
+    reward_category_samples = (
+        [sample for sample in rewarded_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward]
+        if reward_cat_key is not None
+        else rewarded_samples
+    )
     response_lengths = [sample.effective_response_length for sample in samples]
     multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
 
@@ -3988,21 +4852,27 @@ def compute_metrics_from_samples(args, samples, *, include_rloo_diagnostics: boo
     log_dict |= _compute_min_mean_max_stats(
         [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
     )
-    log_dict |= compute_rollout_explicit_reward_metrics(
+    log_dict |= compute_rollout_reward_metrics(
         args,
-        samples,
+        rewarded_samples,
         include_rloo_diagnostics=include_rloo_diagnostics,
     )
-    log_dict |= _compute_zero_std_metrics(args, samples)
+    log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict |= compute_mopd_metrics(args, samples)
+    log_dict |= _compute_reward_cat_metrics(args, reward_category_samples)
+    log_dict |= compute_mopd_metrics(args, rewarded_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
     log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
+    if rollout_id is not None and args.partial_rollout and not args.fully_async:
+        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
+        log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
+        log_dict["staleness/max"] = np.max(staleness_gaps).item()
+        log_dict["staleness/min"] = np.min(staleness_gaps).item()
+        log_dict["global_batch_size"] = len({sample.index for sample in samples})
     return log_dict
 
 

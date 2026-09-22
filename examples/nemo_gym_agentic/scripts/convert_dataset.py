@@ -69,6 +69,11 @@ def convert_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def convert_file(input_path: Path, output_path: Path, *, limit: int | None = None) -> int:
+    if input_path.resolve() == output_path.resolve() or (output_path.exists() and input_path.samefile(output_path)):
+        raise ValueError(
+            f"Input and output must refer to different files: {input_path} -> {output_path}. "
+            "Set NEMO_GYM_PROMPT_DATA to a different path from NEMO_GYM_SOURCE_DATA."
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     converted = 0
     with input_path.open(encoding="utf-8") as source, output_path.open("w", encoding="utf-8") as destination:

@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="session_forest-title session_forest-desc">
+    <title id="session_forest-title">SessionForest multi-turn branches and export</title>
+    <desc id="session_forest-desc">Tree showing two independent initial contexts, alternating response and observation states across multiple turns, a branch from a committed response, longest-prefix matching to an intermediate state, and selected or omitted response leaves.</desc>
+    <defs>
+      <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Manrope:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
+
+        .zone { fill: rgba(31,31,35,.018); stroke: rgba(31,31,35,.12); stroke-width: .8; }
+        .zone-mask { fill: #f7f7f8; }
+        .zone-label { fill: #74757c; font: 600 8px "Inter", sans-serif; letter-spacing: .16em; }
+        .node-mask { fill: #f7f7f8; }
+        .root { fill: #f2f2f4; stroke: #8b8c93; stroke-width: 1.2; }
+        .state { fill: #f2f2f4; stroke: #8b8c93; stroke-width: 1; }
+        .observation { fill: #eef1f9; stroke: #7e96cf; stroke-width: 1; }
+        .response { fill: #fff; stroke: #55565e; stroke-width: 1.2; }
+        .selected { fill: #fff0f2; stroke: #e8384a; stroke-width: 1.6; }
+        .omitted { fill: rgba(31,31,35,.015); stroke: rgba(85,86,94,.45); stroke-width: 1; stroke-dasharray: 5 4; }
+        .request { fill: #eef1f9; stroke: #4f6fbf; stroke-width: 1.2; }
+        .tag { fill: none; stroke: rgba(85,86,94,.45); stroke-width: .8; }
+        .tag-accent { fill: #e8384a; stroke: #e8384a; stroke-width: .8; }
+        .tag-link { fill: #4f6fbf; stroke: #4f6fbf; stroke-width: .8; }
+        .tag-text { fill: #66676e; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .tag-text-white { fill: #fff; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .name { fill: #1f1f23; font: 600 16px "Manrope", sans-serif; }
+        .sub { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .edge { fill: none; stroke: #777880; stroke-width: 1.2; }
+        .prefix { fill: none; stroke: #4f6fbf; stroke-width: 1.4; stroke-dasharray: 5 4; marker-end: url(#arrow-link); }
+        .legend { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .note { fill: #55565e; font: 500 12px "Inter", sans-serif; }
+      </style>
+      <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f6fbf"/></marker>
+    </defs>
+
+    <rect width="1280" height="720" fill="#f7f7f8"/>
+
+    <rect class="zone" x="208" y="96" width="1032" height="312" rx="8"/>
+    <rect class="zone-mask" x="224" y="92" width="112" height="20"/>
+    <text class="zone-label" x="232" y="104">MAIN SUBTREE</text>
+
+    <rect class="zone" x="208" y="432" width="1032" height="144" rx="8"/>
+    <rect class="zone-mask" x="224" y="428" width="144" height="20"/>
+    <text class="zone-label" x="232" y="440">SEARCHER SUBTREE</text>
+
+    <!-- Tree connectors -->
+    <path class="edge" d="M184 336 H200 Q208 336 208 328 V200 Q208 192 216 192 H240"/>
+    <path class="edge" d="M184 336 H200 Q208 336 208 344 V496 Q208 504 216 504 H240"/>
+
+    <line class="edge" x1="384" y1="192" x2="464" y2="192"/>
+    <line class="edge" x1="608" y1="192" x2="664" y2="192"/>
+    <line class="edge" x1="792" y1="192" x2="864" y2="192"/>
+
+    <path class="edge" d="M536 232 V272 Q536 280 544 280 H720 Q728 280 728 288 V304"/>
+    <line class="edge" x1="792" y1="340" x2="864" y2="340"/>
+
+    <line class="edge" x1="384" y1="504" x2="464" y2="504"/>
+    <line class="edge" x1="608" y1="504" x2="664" y2="504"/>
+    <line class="edge" x1="792" y1="504" x2="864" y2="504"/>
+
+    <!-- A new full history matches the committed response before adding the next observation. -->
+    <line class="prefix" x1="536" y1="112" x2="536" y2="152"/>
+
+    <!-- Nodes -->
+    <rect class="node-mask" x="40" y="296" width="144" height="80" rx="8"/>
+    <rect class="root" x="40" y="296" width="144" height="80" rx="8"/>
+    <rect class="tag" x="52" y="308" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="76" y="320" text-anchor="middle">ROOT</text>
+    <text class="name" x="112" y="344" text-anchor="middle">Session Root</text>
+    <text class="sub" x="112" y="364" text-anchor="middle">technical state</text>
+
+    <rect class="node-mask" x="448" y="40" width="176" height="72" rx="8"/>
+    <rect class="request" x="448" y="40" width="176" height="72" rx="8"/>
+    <rect class="tag-link" x="460" y="52" width="64" height="16" rx="2"/>
+    <text class="tag-text-white" x="492" y="64" text-anchor="middle">REQUEST</text>
+    <text class="name" x="536" y="84" text-anchor="middle">New Full History</text>
+    <text class="sub" x="536" y="104" text-anchor="middle">longest committed prefix</text>
+
+    <rect class="node-mask" x="240" y="144" width="144" height="96" rx="8"/>
+    <rect class="state" x="240" y="144" width="144" height="96" rx="8"/>
+    <rect class="tag" x="252" y="156" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="280" y="168" text-anchor="middle">INITIAL</text>
+    <text class="name" x="312" y="192" text-anchor="middle">Context A</text>
+    <text class="sub" x="312" y="212" text-anchor="middle">messages · tools</text>
+    <text class="sub" x="312" y="232" text-anchor="middle">template kwargs</text>
+
+    <rect class="node-mask" x="464" y="152" width="144" height="80" rx="8"/>
+    <rect class="response" x="464" y="152" width="144" height="80" rx="8"/>
+    <rect class="tag" x="476" y="164" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="500" y="176" text-anchor="middle">RESP</text>
+    <text class="name" x="536" y="200" text-anchor="middle">Response 1</text>
+    <text class="sub" x="536" y="220" text-anchor="middle">tokens · logp · mask 1</text>
+
+    <rect class="node-mask" x="664" y="152" width="128" height="80" rx="8"/>
+    <rect class="observation" x="664" y="152" width="128" height="80" rx="8"/>
+    <rect class="tag" x="676" y="164" width="40" height="16" rx="2"/>
+    <text class="tag-text" x="696" y="176" text-anchor="middle">OBS</text>
+    <text class="name" x="728" y="200" text-anchor="middle">Observation 2</text>
+    <text class="sub" x="728" y="220" text-anchor="middle">messages · mask 0</text>
+
+    <rect class="node-mask" x="864" y="152" width="216" height="80" rx="8"/>
+    <rect class="selected" x="864" y="152" width="216" height="80" rx="8"/>
+    <rect class="tag-accent" x="876" y="164" width="88" height="16" rx="2"/>
+    <text class="tag-text-white" x="920" y="176" text-anchor="middle">EXPORT MAIN</text>
+    <text class="name" x="972" y="200" text-anchor="middle">Response 2</text>
+    <text class="sub" x="972" y="220" text-anchor="middle">selected training leaf · mask 1</text>
+
+    <rect class="node-mask" x="664" y="304" width="128" height="72" rx="8"/>
+    <rect class="observation" x="664" y="304" width="128" height="72" rx="8"/>
+    <rect class="tag" x="676" y="316" width="40" height="16" rx="2"/>
+    <text class="tag-text" x="696" y="328" text-anchor="middle">OBS</text>
+    <text class="name" x="728" y="348" text-anchor="middle">Alternative Obs</text>
+    <text class="sub" x="728" y="368" text-anchor="middle">from Response 1</text>
+
+    <rect class="node-mask" x="864" y="304" width="184" height="72" rx="8"/>
+    <rect class="omitted" x="864" y="304" width="184" height="72" rx="8"/>
+    <rect class="tag" x="876" y="316" width="40" height="16" rx="2"/>
+    <text class="tag-text" x="896" y="328" text-anchor="middle">OMIT</text>
+    <text class="name" x="956" y="348" text-anchor="middle">Alternative Response</text>
+    <text class="sub" x="956" y="368" text-anchor="middle">committed, not trained</text>
+
+    <rect class="node-mask" x="240" y="468" width="144" height="72" rx="8"/>
+    <rect class="state" x="240" y="468" width="144" height="72" rx="8"/>
+    <rect class="tag" x="252" y="480" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="280" y="492" text-anchor="middle">INITIAL</text>
+    <text class="name" x="312" y="512" text-anchor="middle">Context B</text>
+    <text class="sub" x="312" y="532" text-anchor="middle">independent history</text>
+
+    <rect class="node-mask" x="464" y="468" width="144" height="72" rx="8"/>
+    <rect class="response" x="464" y="468" width="144" height="72" rx="8"/>
+    <rect class="tag" x="476" y="480" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="500" y="492" text-anchor="middle">RESP</text>
+    <text class="name" x="536" y="512" text-anchor="middle">Response 1</text>
+    <text class="sub" x="536" y="532" text-anchor="middle">tokens · logp · mask 1</text>
+
+    <rect class="node-mask" x="664" y="468" width="128" height="72" rx="8"/>
+    <rect class="observation" x="664" y="468" width="128" height="72" rx="8"/>
+    <rect class="tag" x="676" y="480" width="40" height="16" rx="2"/>
+    <text class="tag-text" x="696" y="492" text-anchor="middle">OBS</text>
+    <text class="name" x="728" y="512" text-anchor="middle">Observation 2</text>
+    <text class="sub" x="728" y="532" text-anchor="middle">messages · mask 0</text>
+
+    <rect class="node-mask" x="864" y="468" width="216" height="72" rx="8"/>
+    <rect class="selected" x="864" y="468" width="216" height="72" rx="8"/>
+    <rect class="tag-accent" x="876" y="480" width="120" height="16" rx="2"/>
+    <text class="tag-text-white" x="936" y="492" text-anchor="middle">EXPORT SEARCHER</text>
+    <text class="name" x="972" y="512" text-anchor="middle">Response 2</text>
+    <text class="sub" x="972" y="532" text-anchor="middle">independent training leaf · mask 1</text>
+
+    <!-- Legend -->
+    <line x1="40" y1="624" x2="1240" y2="624" stroke="rgba(31,31,35,.12)" stroke-width=".8"/>
+    <text class="zone-label" x="48" y="656">LEGEND</text>
+    <rect class="observation" x="152" y="640" width="20" height="20" rx="4"/>
+    <text class="legend" x="188" y="656">observation · mask 0</text>
+    <rect class="response" x="376" y="640" width="20" height="20" rx="4"/>
+    <text class="legend" x="412" y="656">response · mask 1</text>
+    <rect class="selected" x="584" y="640" width="20" height="20" rx="4"/>
+    <text class="legend" x="620" y="656">selected leaf</text>
+    <rect class="omitted" x="752" y="640" width="20" height="20" rx="4"/>
+    <text class="legend" x="788" y="656">omitted leaf</text>
+    <line class="prefix" x1="912" y1="652" x2="968" y2="652"/>
+    <text class="legend" x="984" y="656">longest-prefix match</text>
+    <text class="note" x="1232" y="696" text-anchor="end">Every node is a committed state; highlighted leaves become training samples.</text>
+  </svg>

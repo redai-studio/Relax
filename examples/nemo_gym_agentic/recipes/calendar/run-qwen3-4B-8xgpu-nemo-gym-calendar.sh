@@ -44,7 +44,7 @@ RUNTIME_ENV_JSON="$(
 )"
 export RUNTIME_ENV_JSON
 
-NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-29100}"
+NEMO_GYM_GATEWAY_PORT="${NEMO_GYM_GATEWAY_PORT:-${GYM_PORT:-29100}}"
 PROMPT_SET="${EXP_DIR}/data/calendar_train.jsonl"
 GATEWAY_URL="http://${GYM_HOST}:${NEMO_GYM_GATEWAY_PORT}"
 SUBMISSION_ID="${RELAX_SUBMISSION_ID:-relax-nemo-gym-calendar-${now}-${BASHPID}-${RANDOM}}"
@@ -86,8 +86,6 @@ ROLLOUT_ARGS=(
    --agent-timeout 660
    --agentic-reasoning-parser qwen3
    --agentic-tool-call-parser qwen
-   --agentic-prepare-pool-size 1
-
    --num-rollout 200
    --rollout-batch-size 32
    --n-samples-per-prompt 8

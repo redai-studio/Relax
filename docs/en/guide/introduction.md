@@ -2,7 +2,7 @@
 
 ## What is Relax?
 
-**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-infra/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
+**Relax** (**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality) is a high-performance reinforcement learning post-training framework for multimodal large language models. Built on Ray Serve with a service-oriented architecture, Relax uses Megatron-LM as the training backend and SGLang as the inference engine. Through the [TransferQueue](https://github.com/redai-studio/TransferQueue) data transfer system, it achieves complete decoupling of training and inference, supporting end-to-end multimodal RL training from text to images, videos, and audio.
 
 ---
 
@@ -26,7 +26,7 @@ Relax adopts a service-oriented six-layer architecture where all components are 
 
 ### ⚡ Fully Asynchronous Training via TransferQueue
 
-Open source at [TransferQueue](https://github.com/redai-infra/TransferQueue). See [Fully Asynchronous Training](./fully-async-training.md) for details.
+Open source at [TransferQueue](https://github.com/redai-studio/TransferQueue). See [Fully Asynchronous Training](./fully-async-training.md) for details.
 
 In fully async mode, five roles—Rollout (inference), Actor (training), ActorFwd (forward pass), Reference (reference model), and Advantages (advantage computation)—run on **independent GPU clusters** and exchange data via TransferQueue, with weights synchronized asynchronously through DCS (Distributed Checkpoint Service).
 

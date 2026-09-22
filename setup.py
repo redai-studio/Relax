@@ -39,7 +39,7 @@ def main():
         long_description_content_type="text/markdown",
         keywords=["RL", "Agentic", "Multi-modality", "pytorch", "deep learning", "megatron", "vllm", "sglang"],
         license="Apache-2.0",
-        url="https://github.com/redai-infra/Relax",
+        url="https://github.com/redai-studio/Relax",
         package_dir={"": "."},
         package_data={"": ["*.yaml"]},
         packages=find_packages(),

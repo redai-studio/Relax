@@ -50,6 +50,7 @@ CKPT_ARGS=(
     --megatron-to-hf-mode bridge
     --save-interval 100
     --max-actor-ckpt-to-keep 1
+    --warm-hf-checkpoint-page-cache
 )
 
 ###############################################################################

@@ -2,7 +2,7 @@
 
 ## 什么是 Relax？
 
-**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是一个面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-infra/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
+**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是一个面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-studio/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
 
 ---
 
@@ -26,7 +26,7 @@ Relax 采用面向服务的六层架构设计，所有角色均部署为独立�
 
 ### ⚡ 基于 TransferQueue 的全异步训练（Fully Async）
 
-开源地址 [TransferQueue](https://github.com/redai-infra/TransferQueue)，详细介绍见 [全异步训练](./fully-async-training.md)。
+开源地址 [TransferQueue](https://github.com/redai-studio/TransferQueue)，详细介绍见 [全异步训练](./fully-async-training.md)。
 
 在全异步模式下，Rollout（推理）、Actor（训练）、ActorFwd（前向计算）、Reference（参考模型）和 Advantages（优势计算）五个角色运行在**独立的 GPU 集群**上，通过 TransferQueue 交换数据，通过 DCS（Distributed Checkpoint Service）异步同步权重。
 
