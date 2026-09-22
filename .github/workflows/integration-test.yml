@@ -18,7 +18,8 @@ jobs:
   integration:
     name: ${{ matrix.case }}
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 65
+    # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
+    timeout-minutes: 185
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +31,6 @@ jobs:
             script: scripts/training/multimodal/run-qwen3-vl-4B-2xgpu.sh
             gpus: 2
     env:
-      CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
       CI_CONTAINER_NAME: relax-integration-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       TRAINING_SCRIPT: ${{ matrix.script }}
       ARTIFACT_NAME: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -39,6 +39,14 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
 
       - name: Acquire test devices
         id: devices
@@ -51,6 +59,7 @@ jobs:
 
       - name: Create test container
         env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
           NUM_GPUS: ${{ matrix.gpus }}
           UV_CACHE_DIR: /uv-cache
@@ -63,7 +72,7 @@ jobs:
 
           # Each runner provisions the cases' model and dataset files in ~/model and ~/data.
           # Keep Ray processes, network, IPC and /tmp private to this container.
-          docker create --pull always --rm --init \
+          docker create --pull never --rm --init \
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \

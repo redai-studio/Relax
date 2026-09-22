@@ -1,0 +1,73 @@
+name: Prepare local image
+description: Reuse or build the Relax training image in the runner host's Docker cache
+
+inputs:
+  hash-key:
+    description: SHA-256 fingerprint of the image build inputs
+    required: true
+  build-args:
+    description: Optional Docker build arguments, one KEY=VALUE per line; included in the cache key
+    default: ''
+  lock-dir:
+    description: Shared directory for per-cache-key locks on the same Docker daemon
+    default: /tmp/relax-ci-image-build
+
+outputs:
+  image-id:
+    description: Local Docker image ID to run on this host
+    value: ${{ steps.image.outputs.image-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Reuse or build local image
+      id: image
+      shell: bash
+      env:
+        IMAGE_LOCK_DIR: ${{ inputs.lock-dir }}
+        IMAGE_KEY: ${{ inputs.hash-key }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+      run: |
+        set -euo pipefail
+        [[ "$IMAGE_KEY" =~ ^[0-9a-f]{64}$ ]]
+        build_args=(--build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY)
+        while IFS= read -r argument; do
+          [[ -z "$argument" ]] && continue
+          if [[ ! "$argument" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+            echo '::error::build-args must contain one KEY=VALUE per line'
+            exit 1
+          fi
+          build_args+=(--build-arg "$argument")
+        done <<< "$BUILD_ARGS"
+        cache_key="$(printf '%s\0' "$IMAGE_KEY" "${build_args[@]}" | sha256sum)"
+        cache_key="${cache_key%% *}"
+        tag="relaxrl:ci-$cache_key"
+        image_id="$(docker image ls --quiet --no-trunc --filter "reference=$tag")"
+
+        if [[ -z "$image_id" ]]; then
+          mkdir -p "$IMAGE_LOCK_DIR"
+          lock_file="$IMAGE_LOCK_DIR/$cache_key.lock"
+          echo "Waiting for local image build lock: $lock_file"
+          # Only identical images share a lock; the foreground build inherits fd 9.
+          # Keep the file so every waiter locks the same inode.
+          exec 9>>"$lock_file"
+          flock 9
+          # Another runner may have finished building while we waited.
+          image_id="$(docker image ls --quiet --no-trunc --filter "reference=$tag")"
+          if [[ -z "$image_id" ]]; then
+            export HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-}}"
+            export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
+            export NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
+            DOCKER_BUILDKIT=1 docker build \
+              --builder default --load --platform linux/amd64 \
+              --progress plain --target relax \
+              --file docker/Dockerfile --tag "$tag" \
+              "${build_args[@]}" \
+              .
+            image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
+          fi
+        fi
+
+        [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+        echo "Local test image: $tag ($image_id)"
+        echo "image-id=$image_id" >> "$GITHUB_OUTPUT"
