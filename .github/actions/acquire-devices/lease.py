@@ -54,6 +54,44 @@ def discover_nvidia(pool: str) -> tuple[dict[str, str], str]:
     return {device: indices[device] for device in devices}, "CUDA_VISIBLE_DEVICES"
 
 
+def discover_ascend(pool: str) -> tuple[dict[str, str], str]:
+    """Discover chip physical IDs accepted by Ascend Docker Runtime."""
+    if any(name in os.environ for name in ("ASCEND_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")) and not pool:
+        raise ValueError("Ascend visibility is already set; specify devices using chip physical IDs")
+    result = subprocess.run(
+        ["npu-smi", "info", "-m"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    devices: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields or not fields[0].isdigit():
+            continue
+        if len(fields) != 5:
+            raise ValueError(f"Unexpected npu-smi device: {line!r}")
+        board, chip, logical, physical, name = fields
+        if logical == physical == "-":
+            continue  # Management controllers have no compute device.
+        if not all(value.isdigit() for value in (board, chip, logical, physical)) or not name.startswith("Ascend"):
+            raise ValueError(f"Unexpected npu-smi device: {line!r}")
+        if physical in devices:
+            raise ValueError(f"Duplicate Ascend chip physical ID: {physical}")
+        devices[physical] = f"card {board}/chip {chip}"
+    if pool:
+        requested = [part.strip() for part in pool.split(",")]
+        if any(device not in devices for device in requested):
+            raise ValueError("devices must contain known Ascend chip physical IDs")
+        if len(requested) != len(set(requested)):
+            raise ValueError("Device pool must contain no duplicate physical devices")
+        devices = {device: devices[device] for device in requested}
+    if not devices:
+        raise ValueError("No Ascend compute devices found")
+    return devices, "ASCEND_VISIBLE_DEVICES"
+
+
 def format_devices(devices: list[str], indices: dict[str, str]) -> str:
     return ", ".join(f"{indices[device]} ({device})" for device in devices) or "none"
 
@@ -145,7 +183,8 @@ def main(directory: Path) -> None:
         signal.signal(signum, terminate)
     try:
         config = json.loads((directory / "config.json").read_text())
-        devices, visibility_env = discover_nvidia(config["devices"])
+        discover = {"nvidia": discover_nvidia, "ascend": discover_ascend}[config["backend"]]
+        devices, visibility_env = discover(config["devices"])
         if not 1 <= config["count"] <= len(devices):
             raise ValueError(f"count must be between 1 and the candidate pool size ({len(devices)})")
         deadline = time.monotonic() + config["timeout"]

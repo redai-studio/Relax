@@ -103,7 +103,20 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requirements.txt && pip install -e . && git checkout e4772499 && \
     cd /root/Megatron-LM && git checkout core_v0.16.1 && pip install -e . --no-build-isolation && \
     cd /root/Megatron-Bridge && git checkout v0.3.1 && \
-    cd /root/MindSpeed-Ops && git checkout 33ac80f7 && pip install -e . --no-build-isolation --no-deps && \
+    cd /root/MindSpeed-Ops && git checkout 33ac80f7 && \
+    # GitCode's release CDN may require a proxy even when gitcode.com is in NO_PROXY.
+    makeself_url=https://gitcode.com/cann-src-third-party/makeself/releases/download/release-2.5.0-patch1.0/makeself-release-2.5.0-patch1.tar.gz && \
+    makeself_redirect=$(curl -fsS -o /dev/null -w '%{redirect_url}' "$makeself_url") && \
+    curl -fSL --noproxy '' "${makeself_redirect:-$makeself_url}" -o /tmp/makeself.tar.gz && \
+    echo 'bfa730a5763cdb267904a130e02b2e48e464986909c0733ff1c96495f620369a  /tmp/makeself.tar.gz' | sha256sum -c - && \
+    mkdir -p mindspeed_ops/csrc/third_party/makeself && \
+    tar -xzf /tmp/makeself.tar.gz --strip-components=1 -C mindspeed_ops/csrc/third_party/makeself && \
+    rm /tmp/makeself.tar.gz && \
+    # This upstream archive is byte-identical to CANN's GitCode mirror.
+    curl -fSL https://github.com/nlohmann/json/releases/download/v3.11.3/include.zip -o /tmp/json.zip && \
+    echo 'a22461d13119ac5c78f205d3df1db13403e58ce1bb1794edc9313677313f4a9d  /tmp/json.zip' | sha256sum -c - && \
+    unzip -q /tmp/json.zip -d mindspeed_ops/csrc/third_party/json && rm /tmp/json.zip && \
+    pip install -e . --no-build-isolation --no-deps && \
     cd /root/MindSpeed-Bridge && git checkout v0.3.1 && pip install -r requirements.txt && pip install -e . --no-deps
 
 # Keep Relax code changes out of the dependency cache.
@@ -144,13 +157,27 @@ RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu
     cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
     git submodule update --init third_party/catlass third_party/pto-isa && \
     git am /root/Relax/docker/npu_patch/sgl-kernel-npu.patch && \
-    bash build.sh -a kernels ${SOC_VERSION_FOR_SGL_BUILD} && bash build.sh -a memory-saver && bash build.sh -a deepep && \
+    bash build.sh -a kernels ${SOC_VERSION_FOR_SGL_BUILD} && bash build.sh -a memory-saver && bash build.sh -a deepep ${SOC_VERSION_FOR_SGL_BUILD} && \
     pip install output/*.whl && \
     cd /root && rm -rf /root/sgl-kernel-npu
 
 # Install AscendC FLA
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu.git /root/flash-linear-attention-npu && \
     cd /root/flash-linear-attention-npu && git checkout v26.6.0 && \
+    # Reuse verified CANN dependencies and prefetch FLA's remaining pinned archives.
+    # Resolve GitCode redirects before using the proxy for its release CDN.
+    mkdir -p third_party/pkg && \
+    cp -a /root/MindSpeed-Ops/mindspeed_ops/csrc/third_party/{makeself,json} third_party/ && \
+    for dependency in \
+        'eigen/releases/download/5.0.0-h0.trunk/eigen-5.0.0.tar.gz 93f7f0462988b934e632a9fba58af55192ffceae38e8f46233f4f62cb1e79370' \
+        'protobuf/releases/download/v25.1/protobuf-25.1.tar.gz 9bd87b8280ef720d3240514f884e56a712f2218f0d693b48050c836028940a42' \
+        'abseil-cpp/releases/download/20230802.1/abseil-cpp-20230802.1.tar.gz 987ce98f02eefbaf930d6e38ab16aa05737234d7afbab2d5c4ea7adbe50c28ed'; do \
+        read -r path checksum <<< "$dependency"; \
+        url="https://gitcode.com/cann-src-third-party/$path"; filename="${path##*/}"; \
+        redirect=$(curl -fsS -o /dev/null -w '%{redirect_url}' "$url") && \
+        curl -fSL --noproxy '' "${redirect:-$url}" -o "third_party/pkg/$filename" && \
+        printf '%s  %s\n' "$checksum" "third_party/pkg/$filename" | sha256sum -c - || exit 1; \
+    done && \
     apt update && apt-get install -y --no-install-recommends gawk && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
