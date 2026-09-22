@@ -1164,8 +1164,18 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
     new_aborted, completed_protected = await abort(args, rollout_id)
-    aborted_samples.extend(new_aborted)
-    aborted_samples.extend(completed_protected)
+    for group in new_aborted + completed_protected:
+        # Groups completed during abort have not passed the main-loop filter.
+        if (
+            args.partial_rollout
+            and args.use_dynamic_global_batch_size
+            and all(s.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) for s in group)
+        ):
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+            if not dynamic_filter_output.keep:
+                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                continue
+        aborted_samples.append(group)
     if aborted_samples:
         logger.info(
             f"Rollout not completed for rollout_id: {rollout_id}, have {len(aborted_samples)} samples aborted."
@@ -1227,6 +1237,7 @@ async def generate_rollout_async(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = dict(timing_metrics)
+        rollout_metrics.update(metric_gatherer.collect())
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
