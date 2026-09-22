@@ -111,7 +111,7 @@ jobs:
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run integration test
-        timeout-minutes: 25
+        timeout-minutes: 10
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
