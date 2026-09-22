@@ -1,3 +1,23 @@
+diff --git a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index ee7a888..f0d360b 100644
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -561,7 +561,13 @@ class Qwen3VLModel(MegatronModule):
+         cp_rank = self.pg_collection.cp.rank()
+         cp_size = self.pg_collection.cp.size()
++        # A singleton BSHD row is shape-identical to THD. The legacy Qwen step
++        # supplies a keep mask and lets this model construct MRoPE, while THD
++        # producers supply explicit 3D MRoPE positions.
+         legacy_packed_bshd = (
+-            packed_seq_params is not None and input_ids is not None and input_ids.dim() == 2 and input_ids.size(0) > 1
++            packed_seq_params is not None
++            and input_ids is not None
++            and input_ids.dim() == 2
++            and (input_ids.size(0) > 1 or (attention_mask is not None and position_ids is None))
+         )
+         packed_input_pre_sharded = _is_packed_input_pre_sharded(
+             input_ids,
+
 diff --git a/megatron/bridge/models/gemma/gemma4_bridge.py b/megatron/bridge/models/gemma/gemma4_bridge.py
 index a62eb81..c858022 100644
 --- a/megatron/bridge/models/gemma/gemma4_bridge.py
