@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import httpx
 import pytest
@@ -198,21 +198,46 @@ def test_live_verification_rejects_unrelated_normalization(
     assert read_artifact(output)["passed"] is False
 
 
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [
+        ("private-user", "private-password"),
+        ("private user", "private:password+/"),
+        ("private-user", ""),
+        ("", "private-password"),
+    ],
+)
 def test_live_verification_redacts_values_and_preserves_json_structure(
     tmp_path: Path,
     configuration: Path,
     service: Mock,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    username: str,
+    password: str,
 ) -> None:
     monkeypatch.setenv("SEARCH_LIVE_TEST_TOKEN", "data")
-    markers = ["private-user", "private-password", "private-query", "private-header", "/private/search"]
+    values = yaml.safe_load(configuration.read_text(encoding="utf-8"))
+    values["endpoint"] = str(httpx.URL(values["endpoint"]).copy_with(username=username, password=password))
+    configuration.write_text(yaml.safe_dump(values), encoding="utf-8")
+    markers = [value for value in (username, password, "private-query", "private-header", "/private/search") if value]
     text = " ".join(markers + [quote(value, safe="") for value in markers] + ["data", "application/json"])
+    auth_values: set[str] = set()
     respond = service.side_effect
 
     def response(request: httpx.Request) -> httpx.Response:
         payload = respond(request).json()
-        payload["nested"] = [{"private-user": [text, True, 3, None]}]
+        authorization = request.headers["Authorization"]
+        encoded = authorization.removeprefix("Basic ")
+        auth_values.update((authorization, encoded))
+        auth_text = " ".join(
+            variant
+            for value in (authorization, encoded)
+            for variant in (value, quote(value, safe=""), quote_plus(value))
+        )
+        payload["data"]["items"][0]["text"] += f" {auth_text}"
+        payload["authorization_echo"] = {authorization: auth_text}
+        payload["nested"] = [{markers[0]: [text, True, 3, None]}]
         return httpx.Response(200, json=payload)
 
     service.side_effect = response
@@ -222,15 +247,19 @@ def test_live_verification_redacts_values_and_preserves_json_structure(
     assert live.main(args) == 0
     artifacts = "".join(path.read_text(encoding="utf-8") for path in output.iterdir())
     captured = capsys.readouterr()
-    for marker in markers:
+    for marker in (*markers, *auth_values):
         assert marker not in artifacts + captured.out + captured.err
         assert quote(marker, safe="") not in artifacts
+        assert quote_plus(marker) not in artifacts
     evidence = read_artifact(output, "query-001.json")
     assert set(evidence["normalized"]) == {"elapsed_time", "data"}
     assert set(evidence["normalized"]["data"][0]) == {"title", "link", "snippet", "date"}
     assert "data" not in evidence["query"]
     assert "application/json" in evidence["query"]
     assert evidence["attempts"][0]["raw_response"]["nested"][0]["[REDACTED]"][1:] == [True, 3, None]
+    redacted_auth = " ".join(["[REDACTED]"] * 6)
+    assert evidence["normalized"]["data"][0]["snippet"].endswith(redacted_auth)
+    assert evidence["attempts"][0]["raw_response"]["authorization_echo"] == {"[REDACTED]": redacted_auth}
     summary = read_artifact(output)
     assert summary["config_sha256"] == hashlib.sha256(configuration.read_bytes()).hexdigest()
     assert all((output / item["evidence"]).is_file() for item in summary["queries"])

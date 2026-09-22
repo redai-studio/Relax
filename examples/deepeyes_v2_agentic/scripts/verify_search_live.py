@@ -12,7 +12,7 @@ import re
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -108,11 +108,17 @@ def secret_values(
 ) -> set[str]:
     """收集认证值、endpoint 信息和指定敏感字段，返回原文及 URL 编码形式.
 
-    自定义 query 参数与 header 需显式列出；指定名称不存在时抛出 VerificationError.
+    URL 认证包含完整 Basic header 及其编码凭据；自定义 query 参数与 header 需显式列出. 指定名称不存在时抛出
+    VerificationError.
     """
 
     url = httpx.URL(str(config.endpoint))
     values = {url.username, url.password, str(url)}
+    if url.username or url.password:
+        auth = httpx.BasicAuth(url.username, url.password)
+        with closing(auth.auth_flow(httpx.Request("GET", url))) as flow:
+            authorization = next(flow).headers["Authorization"]
+        values.update((authorization, authorization.removeprefix("Basic ")))
     for name in sensitive_query_params:
         if name not in url.params:
             raise VerificationError("unknown_sensitive_query_param")

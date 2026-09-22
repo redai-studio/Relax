@@ -236,7 +236,7 @@ Exit status `0` requires nonempty results, exact correspondence between service 
 
 Source checks apply the configured optional-field rules, including empty strings for optional snippets. A valid empty search response is recorded as `empty_results` because live verification requires at least one result per query.
 
-URL authentication and the configured `auth.env` value are automatically redacted. Declare additional sensitive endpoint query parameters with repeated `--sensitive-query-param NAME` arguments and fixed sensitive headers with repeated `--sensitive-header NAME` arguments. For an endpoint parameter `access_token` and a fixed `X-Internal-Key` header, append:
+URL authentication and the configured `auth.env` value are automatically redacted. URL authentication includes the complete HTTPX Basic Authorization value, its Base64 credentials and their URL-encoded forms when echoed in responses. Declare additional sensitive endpoint query parameters with repeated `--sensitive-query-param NAME` arguments and fixed sensitive headers with repeated `--sensitive-header NAME` arguments. For an endpoint parameter `access_token` and a fixed `X-Internal-Key` header, append:
 
 ```text
 --sensitive-query-param access_token --sensitive-header X-Internal-Key

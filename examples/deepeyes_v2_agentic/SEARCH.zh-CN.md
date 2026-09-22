@@ -236,7 +236,7 @@ python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
 
 来源检查遵循配置中的可选字段规则，包括可选摘要对应的空字符串。合法空结果记录为 `empty_results`，因为真实服务验证要求每条查询取得至少一条结果。
 
-URL 认证信息及所选 `auth.env` 的值会自动脱敏。其他敏感 endpoint 查询参数通过可重复的 `--sensitive-query-param NAME` 声明，固定敏感 header 通过可重复的 `--sensitive-header NAME` 声明。对于 endpoint 参数 `access_token` 和固定 header `X-Internal-Key`，附加参数如下：
+URL 认证信息及所选 `auth.env` 的值会自动脱敏。URL 认证包含 HTTPX 生成的完整 Basic Authorization 值、其中的 Base64 凭据及其 URL 编码形式，服务响应回传这些内容时同样进行脱敏。其他敏感 endpoint 查询参数通过可重复的 `--sensitive-query-param NAME` 声明，固定敏感 header 通过可重复的 `--sensitive-header NAME` 声明。对于 endpoint 参数 `access_token` 和固定 header `X-Internal-Key`，附加参数如下：
 
 ```text
 --sensitive-query-param access_token --sensitive-header X-Internal-Key
