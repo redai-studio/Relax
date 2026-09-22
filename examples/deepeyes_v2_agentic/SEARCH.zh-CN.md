@@ -125,6 +125,9 @@ request:
   static_fields: {}
 response:
   items_path: [web, results]
+  optional_items_paths:
+    - [web]
+  snippet_optional: true
   fields:
     title: [title]
     link: [url]
@@ -137,6 +140,8 @@ response:
 - `endpoint`：完整的 HTTP/HTTPS URL。`method` 支持 `GET` 或 `POST`，`headers` 提供固定 header。`auth.env` 指定凭据环境变量，`auth.header` 指定发送 header，`auth.prefix` 可以设为 `"Bearer "`。无需认证的服务可以省略 `auth`。
 - `request`：`location` 支持 `query` 或 `json`，其中 `GET` 必须使用 `query`。`query_field` 与 `size_field` 指定请求最外层字段名称，`static_fields` 提供其他兼容 JSON 的字段，不能与这些名称冲突。查询参数支持标量或由标量组成的列表。`max_size` 可以限制请求数量。
 - `response.items_path`：使用对象键路径指定结果列表，`[]` 表示响应本身就是列表。`response.fields` 中的每条路径从单条结果对象读取内容。`title`、`link`、`snippet` 必须得到字符串。
+- `response.optional_items_paths`：默认为 `[]`。每项必须是 `items_path` 的非空前缀，可以等于完整路径。仅声明路径的节点缺失或为 `null` 时生成空结果列表；其他节点缺失或类型错误会导致验证失败。Brave 模板声明 `[web]`，因此 `web` 缺失或为 `null` 时生成 `data: []`，`web: {}` 和 `web.results: null` 会导致验证失败。
+- `response.snippet_optional`：默认为 `false`。启用后，摘要最终字段缺失或为 `null` 时生成 `snippet: ""` 并保留该条结果。中间节点必须存在且为对象，最终值的其他类型会导致验证失败。Brave 模板对 `description` 启用此规则。
 - `response.fields.date`：设为 `null` 时固定生成 `date: null`。配置路径时允许键缺失，或者最终值为字符串或 `null`。非法中间对象或其他最终值类型会导致验证失败。
 
 未知字段、非法类型、请求名称冲突，以及重复或冲突的认证 header，都会导致验证失败。搜索认证使用独立于模型和 agent 配置的变量，启动入口拒绝 `OPENAI_API_KEY`、`RELAX_*` 等保留名称。
@@ -228,6 +233,8 @@ python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
 ```
 
 退出状态 `0` 要求每条查询结果非空、服务字段与统一结果完全对应，并通过证据文件检查。失败时返回非零状态。`query-NNN.json` 记录请求尝试、原始响应、统一结果及来源检查；`summary.json` 记录服务说明、服务地址来源、搜索选项、配置与实现 SHA-256，以及证据文件名。验证程序重新读取全部文件并核查完整内容；摘要发布或完整性检查失败时移除 `summary.json`。
+
+来源检查遵循配置中的可选字段规则，包括可选摘要对应的空字符串。合法空结果记录为 `empty_results`，因为真实服务验证要求每条查询取得至少一条结果。
 
 URL 认证信息及所选 `auth.env` 的值会自动脱敏。其他敏感 endpoint 查询参数通过可重复的 `--sensitive-query-param NAME` 声明，固定敏感 header 通过可重复的 `--sensitive-header NAME` 声明。对于 endpoint 参数 `access_token` 和固定 header `X-Internal-Key`，附加参数如下：
 

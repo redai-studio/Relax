@@ -118,7 +118,7 @@ def test_live_verification_records_sources_and_version(
     assert os.environ["SEARCH_LIVE_TEST_TOKEN"] == "private-auth"
 
 
-@pytest.mark.parametrize("failure", ["http", "invalid_json", "empty"])
+@pytest.mark.parametrize("failure", ["http", "invalid_json", "empty", "missing_items", "null_items"])
 def test_live_verification_reports_failed_queries(
     tmp_path: Path, configuration: Path, service: Mock, failure: str
 ) -> None:
@@ -126,12 +126,49 @@ def test_live_verification_reports_failed_queries(
         "http": httpx.Response(401),
         "invalid_json": httpx.Response(200, text="invalid JSON"),
         "empty": httpx.Response(200, json={"data": {"items": []}}),
+        "missing_items": httpx.Response(200, json={}),
+        "null_items": httpx.Response(200, json={"data": None}),
     }
+    if failure in ("missing_items", "null_items"):
+        values = yaml.safe_load(configuration.read_text(encoding="utf-8"))
+        values["response"]["optional_items_paths"] = [["data"]]
+        configuration.write_text(yaml.safe_dump(values), encoding="utf-8")
     service.side_effect = lambda request: responses[failure]
     output = tmp_path / "evidence"
     assert live.main(arguments(configuration, output)) == 1
     assert read_artifact(output)["passed"] is False
     assert all(read_artifact(output, f"query-{index:03d}.json")["passed"] is False for index in (1, 2))
+    if failure in ("empty", "missing_items", "null_items"):
+        assert read_artifact(output, "query-001.json")["error"] == "empty_results"
+
+
+@pytest.mark.parametrize("snippet", [{}, {"text": None}])
+def test_live_verification_records_optional_snippet_sources(
+    tmp_path: Path, configuration: Path, service: Mock, snippet: dict[str, Any]
+) -> None:
+    values = yaml.safe_load(configuration.read_text(encoding="utf-8"))
+    values["response"]["snippet_optional"] = True
+    values["response"]["fields"]["snippet"] = ["summary", "text"]
+    configuration.write_text(yaml.safe_dump(values), encoding="utf-8")
+
+    def response(request: httpx.Request) -> httpx.Response:
+        rows = [
+            {"heading": "Title", "url": "", "summary": {"text": request.url.params["q"]}},
+            {"heading": "Optional", "url": "", "summary": snippet},
+        ]
+        return httpx.Response(200, json={"data": {"items": rows}})
+
+    service.side_effect = response
+    output = tmp_path / "evidence"
+    assert live.main(arguments(configuration, output)) == 0
+    for index, query in enumerate(("first query", "second query"), 1):
+        evidence = read_artifact(output, f"query-{index:03d}.json")
+        assert evidence["field_source_matches"] is True
+        assert evidence["normalized"]["data"] == [
+            {"title": "Title", "link": "", "snippet": query, "date": None},
+            {"title": "Optional", "link": "", "snippet": "", "date": None},
+        ]
+        assert evidence["attempts"][0]["raw_response"]["data"]["items"][1]["summary"] == snippet
 
 
 def test_live_verification_observes_retry(tmp_path: Path, configuration: Path, service: Mock) -> None:

@@ -117,13 +117,16 @@ def test_brave_template_and_auth_refresh(
 ) -> None:
     configure("external")
     row = {"title": "Brave title", "url": "https://source.test", "description": "Brave service text"}
-    http_handler.side_effect = lambda request: httpx.Response(200, json={"web": {"results": [row]}})
+    rows = [row, {**row, "description": None}, {"title": "Third", "url": ""}]
+    http_handler.side_effect = lambda request: httpx.Response(200, json={"web": {"results": rows}})
     for token in ("first-token", "second-token"):
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", token)
         response = search_utils.search("query", size=20)
         assert isinstance(response, dict)
         assert response["data"] == [
-            {"title": row["title"], "link": row["url"], "snippet": row["description"], "date": None}
+            {"title": row["title"], "link": row["url"], "snippet": row["description"], "date": None},
+            {"title": row["title"], "link": row["url"], "snippet": "", "date": None},
+            {"title": "Third", "link": "", "snippet": "", "date": None},
         ]
         request = http_handler.call_args.args[0]
         assert request.url.params["q"] == "query" and request.url.params["count"] == "20"
@@ -141,6 +144,70 @@ def test_external_root_results_without_auth(configure: Callable[..., None], http
     assert isinstance(response, dict)
     assert response["data"] == [{"title": "", "link": "", "snippet": "Root service text", "date": None}]
     assert "X-Subscription-Token" not in http_handler.call_args.args[0].headers
+
+
+@pytest.mark.parametrize(
+    ("optional_path", "payload", "valid"),
+    [
+        (["payload"], {}, True),
+        (["payload", "hits"], {"payload": {}}, True),
+        (["payload", "hits"], {"payload": {"hits": None}}, True),
+        (["payload", "hits"], {}, False),
+        (["payload", "hits"], {"payload": None}, False),
+        (["payload", "hits"], {"payload": []}, False),
+        (None, {}, False),
+        (None, {"payload": None}, False),
+    ],
+)
+def test_external_optional_items_paths(
+    configure: Callable[..., None], http_handler: Mock, optional_path: list[str] | None, payload: Any, valid: bool
+) -> None:
+    mapping: dict[str, Any] = {
+        "items_path": ["payload", "hits"],
+        "fields": {"title": ["title"], "link": ["url"], "snippet": ["text"]},
+    }
+    if optional_path is not None:
+        mapping["optional_items_paths"] = [optional_path]
+    configure("external", response=mapping)
+    http_handler.return_value = httpx.Response(200, json=payload)
+    response = search_utils.search("query")
+    if valid:
+        assert isinstance(response, dict) and response["data"] == []
+    else:
+        assert response == "Error"
+    http_handler.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("optional", "fields", "valid"),
+    [
+        (True, {"meta": {}}, True),
+        (True, {"meta": {"text": None}}, True),
+        (True, {}, False),
+        (True, {"meta": None}, False),
+        (True, {"meta": "text"}, False),
+        (False, {"meta": {}}, False),
+        (False, {"meta": {"text": None}}, False),
+    ],
+)
+def test_external_optional_snippet_preserves_intermediate_validation(
+    configure: Callable[..., None], http_handler: Mock, optional: bool, fields: dict[str, Any], valid: bool
+) -> None:
+    mapping: dict[str, Any] = {
+        "items_path": [],
+        "fields": {"title": ["title"], "link": ["url"], "snippet": ["meta", "text"]},
+    }
+    if optional:
+        mapping["snippet_optional"] = True
+    configure("external", response=mapping)
+    http_handler.return_value = httpx.Response(200, json=[{"title": "Title", "url": "", **fields}])
+    response = search_utils.search("query")
+    if valid:
+        assert isinstance(response, dict)
+        assert response["data"] == [{"title": "Title", "link": "", "snippet": "", "date": None}]
+    else:
+        assert response == "Error"
+    http_handler.assert_called_once()
 
 
 @pytest.mark.parametrize("failure", ["missing_auth", "size_limit", "nested_query"])
@@ -163,7 +230,13 @@ def test_external_rejects_invalid_request_before_http(
 
 
 @pytest.mark.parametrize(
-    ("backend", "payload"), [("retriever", {"result": [[]]}), ("external", {"web": {"results": []}})]
+    ("backend", "payload"),
+    [
+        ("retriever", {"result": [[]]}),
+        ("external", {"web": {"results": []}}),
+        ("external", {}),
+        ("external", {"web": None}),
+    ],
 )
 def test_remote_empty_response_is_success(
     configure: Callable[..., None], http_handler: Mock, backend: str, payload: Any
@@ -181,8 +254,12 @@ def test_remote_empty_response_is_success(
         ("retriever", {"result": [[], []]}),
         ("retriever", {"result": [[{"contents": ""}]]}),
         ("retriever", {"result": [[{"document": {"contents": "Text", "date": 7}}]]}),
+        ("external", []),
+        ("external", {"web": {}}),
+        ("external", {"web": []}),
         ("external", {"web": {"results": None}}),
-        ("external", {"web": {"results": [{"title": "Title", "url": ""}]}}),
+        ("external", {"web": {"results": [{"url": "", "description": "Text"}]}}),
+        ("external", {"web": {"results": [{"title": "Title", "description": "Text"}]}}),
         ("external", {"web": {"results": [{"title": "Title", "url": "", "description": {}}]}}),
     ],
 )

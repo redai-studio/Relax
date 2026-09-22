@@ -128,6 +128,16 @@ class ResponseMapping(StrictConfig):
 
     items_path: list[NonEmptyString]
     fields: ResponseFields
+    optional_items_paths: list[FieldPath] = Field(default_factory=list)
+    snippet_optional: bool = False
+
+    @model_validator(mode="after")
+    def validate_optional_paths(self) -> Self:
+        """仅允许将结果路径的非空前缀声明为可选节点."""
+
+        if any(path != self.items_path[: len(path)] for path in self.optional_items_paths):
+            raise ValueError("invalid_optional_items_path")
+        return self
 
 
 class ExternalSearchConfig(CommonSearchConfig):

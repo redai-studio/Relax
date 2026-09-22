@@ -117,6 +117,28 @@ def test_external_config_rejects_conflicting_mapping(
     assert search_utils.search("query") == "Error"
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"optional_items_paths": [[]]},
+        {"optional_items_paths": [["results"]]},
+        {"optional_items_paths": [["web", "results", "extra"]]},
+        {"optional_items_paths": "web"},
+        {"optional_items_paths": [[1]]},
+        {"items_path": [], "optional_items_paths": [["web"]]},
+        {"snippet_optional": "true"},
+    ],
+)
+def test_external_config_rejects_invalid_response_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, options: dict[str, Any]
+) -> None:
+    values = yaml.safe_load((EXAMPLE_DIR / "search_config.brave.yaml").read_text(encoding="utf-8"))
+    values["response"].update(options)
+    use_config(tmp_path, monkeypatch, values)
+    monkeypatch.setitem(search_utils._SEARCH_BACKENDS, "external", lambda *args: pytest.fail("非法配置进入后端"))
+    assert search_utils.search("query") == "Error"
+
+
 @pytest.mark.parametrize("response", ["Error", {"elapsed_time": 0.0, "data": []}])
 def test_search_preserves_backend_error_and_empty_success(monkeypatch: pytest.MonkeyPatch, response: Any) -> None:
     monkeypatch.setitem(search_utils._SEARCH_BACKENDS, "mock", lambda *args: response)

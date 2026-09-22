@@ -21,6 +21,9 @@ request:
   static_fields: {}
 response:
   items_path: [web, results]
+  optional_items_paths:
+    - [web]
+  snippet_optional: true
   fields:
     title: [title]
     link: [url]

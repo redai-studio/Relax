@@ -162,12 +162,20 @@ def redact(value: Any, secrets: set[str]) -> Any:
     return clean(value)
 
 
-def read_field(value: object, path: list[str], *, optional: bool = False) -> object:
-    """按对象键路径读取服务字段；允许可选字段缺失，拒绝中间结构错误."""
+def read_field(
+    value: object,
+    path: list[str],
+    *,
+    optional: bool = False,
+    empty_paths: list[list[str]] | None = None,
+) -> object:
+    """按路径读取服务字段；可选结果节点为空时生成空列表，拒绝非法中间结构."""
 
-    for key in path:
+    for index, key in enumerate(path):
         if not isinstance(value, dict):
             raise VerificationError("source_validation_failed")
+        if empty_paths and path[: index + 1] in empty_paths and value.get(key) is None:
+            return []
         if key not in value:
             if optional:
                 return None
@@ -217,14 +225,20 @@ def verify_source(payload: object, normalized: object, config: LiveConfig) -> bo
                 }
             )
     else:
-        rows = read_field(payload, config.response.items_path)
+        rows = read_field(payload, config.response.items_path, empty_paths=config.response.optional_items_paths)
         if not isinstance(rows, list):
             raise VerificationError("source_validation_failed")
         fields = config.response.fields
         for row in rows:
             if not isinstance(row, dict):
                 raise VerificationError("source_validation_failed")
-            converted = {name: read_field(row, getattr(fields, name)) for name in ("title", "link", "snippet")}
+            converted = {name: read_field(row, getattr(fields, name)) for name in ("title", "link")}
+            if config.response.snippet_optional:
+                parent = read_field(row, fields.snippet[:-1])
+                snippet = read_field(parent, fields.snippet[-1:], optional=True)
+                converted["snippet"] = "" if snippet is None else snippet
+            else:
+                converted["snippet"] = read_field(row, fields.snippet)
             if any(not isinstance(value, str) for value in converted.values()):
                 raise VerificationError("source_validation_failed")
             converted["date"] = None if fields.date is None else read_field(row, fields.date, optional=True)

@@ -125,6 +125,9 @@ request:
   static_fields: {}
 response:
   items_path: [web, results]
+  optional_items_paths:
+    - [web]
+  snippet_optional: true
   fields:
     title: [title]
     link: [url]
@@ -137,6 +140,8 @@ Other APIs use the same `external` backend with these fields:
 - `endpoint`: a complete HTTP/HTTPS URL. `method` accepts `GET` or `POST`; `headers` supplies fixed headers. `auth.env` names the credential environment variable, `auth.header` selects its header, and `auth.prefix` can be `"Bearer "`. Services without authentication can omit `auth`.
 - `request`: `location` accepts `query` or `json`; `GET` requires `query`. `query_field` and `size_field` name top-level request fields. `static_fields` adds JSON-compatible values without conflicting with those names. Query parameters accept scalars or lists of scalars. `max_size` optionally limits the requested count.
 - `response.items_path`: an object-key path to the result list; `[]` selects a response that is itself a list. Each path in `response.fields` reads from one result object. `title`, `link` and `snippet` must resolve to strings.
+- `response.optional_items_paths`: defaults to `[]`. Each entry must be a nonempty prefix of `items_path`, including the complete path. Only a missing or null node at a declared path produces an empty result list; other missing nodes and invalid types fail validation. The Brave template declares `[web]`, so missing/null `web` produces `data: []`, while `web: {}` and `web.results: null` fail validation.
+- `response.snippet_optional`: defaults to `false`. When enabled, a missing/null final snippet field produces `snippet: ""` and preserves the result. Intermediate nodes must exist and be objects; other final types fail validation. The Brave template enables this for `description`.
 - `response.fields.date`: `null` always produces `date: null`. A configured path permits a missing key or a string/null final value. An invalid intermediate object or another final type fails validation.
 
 Unknown fields, invalid types, conflicting request names and duplicate or conflicting authentication headers fail validation. Search authentication uses a separate variable from model and agent configuration: entry scripts reject reserved names such as `OPENAI_API_KEY` and `RELAX_*`.
@@ -228,6 +233,8 @@ python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
 ```
 
 Exit status `0` requires nonempty results, exact correspondence between service fields and normalized results, and successful artifact checks for every query. Failure returns a nonzero status. `query-NNN.json` records attempts, raw responses, normalized results and source checks; `summary.json` records the service description, endpoint origin, search options, configuration/implementation SHA-256 and evidence filenames. The verifier rereads every artifact to check its complete content; summary publication or integrity failure removes `summary.json`.
+
+Source checks apply the configured optional-field rules, including empty strings for optional snippets. A valid empty search response is recorded as `empty_results` because live verification requires at least one result per query.
 
 URL authentication and the configured `auth.env` value are automatically redacted. Declare additional sensitive endpoint query parameters with repeated `--sensitive-query-param NAME` arguments and fixed sensitive headers with repeated `--sensitive-header NAME` arguments. For an endpoint parameter `access_token` and a fixed `X-Internal-Key` header, append:
 

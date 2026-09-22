@@ -37,10 +37,13 @@ def _read_path(
     field: str,
     index: int | None = None,
     optional: bool = False,
+    empty_paths: list[list[str]] | None = None,
 ) -> object:
     for step, key in enumerate(path):
         if not isinstance(value, dict):
             _invalid_response(field, index, step)
+        if empty_paths and path[: step + 1] in empty_paths and value.get(key) is None:
+            return []
         if key not in value:
             if optional:
                 return None
@@ -52,10 +55,11 @@ def _read_path(
 def parse_external_results(payload: object, *, mapping: ResponseMapping) -> list[SearchResult]:
     """按 mapping 的对象键路径转换外部结果，必需字段均应为字符串.
 
-    date 未配置、键缺失或值为 None 时返回 None；路径中间结构及字段类型错误抛出 SearchError.
+    可选结果节点缺失或为 None 时生成空列表；可选摘要最终键缺失或为 None 时生成空字符串. date 未配置、键缺失或值为 None 时返回
+    None；其他路径结构及字段类型错误抛出 SearchError.
     """
 
-    items = _read_path(payload, mapping.items_path, field="items")
+    items = _read_path(payload, mapping.items_path, field="items", empty_paths=mapping.optional_items_paths)
     if not isinstance(items, list):
         _invalid_response("items")
     results: list[SearchResult] = []
@@ -64,7 +68,14 @@ def parse_external_results(payload: object, *, mapping: ResponseMapping) -> list
             _invalid_response("item", index)
         values: dict[str, str] = {}
         for field in ("title", "link", "snippet"):
-            value = _read_path(item, getattr(mapping.fields, field), field=field, index=index)
+            path = getattr(mapping.fields, field)
+            if field == "snippet" and mapping.snippet_optional:
+                parent = _read_path(item, path[:-1], field=field, index=index)
+                value = _read_path(parent, path[-1:], field=field, index=index, optional=True)
+                if value is None:
+                    value = ""
+            else:
+                value = _read_path(item, path, field=field, index=index)
             if not isinstance(value, str):
                 _invalid_response(field, index)
             values[field] = value
