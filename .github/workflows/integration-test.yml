@@ -15,14 +15,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  image:
-    uses: ./.github/workflows/prepare-image.yml
-
   integration:
     name: ${{ matrix.case }}
-    needs: image
-    runs-on: [self-hosted, linux, x64, h20, gpu, '${{ needs.image.outputs.runner-label }}']
-    timeout-minutes: 65
+    runs-on: [self-hosted, linux, x64, h20, gpu]
+    # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
+    timeout-minutes: 185
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +40,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
+
       - name: Acquire test devices
         id: devices
         uses: ./.github/actions/acquire-devices
@@ -54,7 +59,7 @@ jobs:
 
       - name: Create test container
         env:
-          CI_IMAGE: ${{ needs.image.outputs.image-id }}
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
           NUM_GPUS: ${{ matrix.gpus }}
           UV_CACHE_DIR: /uv-cache
