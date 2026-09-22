@@ -90,7 +90,7 @@ jobs:
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run unittest
-        timeout-minutes: 60
+        timeout-minutes: 10
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
