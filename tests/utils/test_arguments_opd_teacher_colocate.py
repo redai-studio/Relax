@@ -203,6 +203,28 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     assert args.rollout_num_gpus == 4
 
 
+def test_sequence_classification_accepts_multimodal_keys(arguments_module):
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.task_type = "seq_cls"
+    args.label_key = "label"
+    args.prompt_data = ["/train.jsonl"]
+    args.num_labels = 3
+    args.classification_threshold = 0.5
+    args.multimodal_keys = {"image": "images"}
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.sft_chunked_logits = False
+    args.allgather_cp = False
+    args.sft_oversize_strategy = "keep"
+    args.custom_dataset_class_path = None
+    args.save_hf = None
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.multimodal_keys == {"image": "images"}
+
+
 def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
     args = _opd_args()
     args.loss_type = "sft"

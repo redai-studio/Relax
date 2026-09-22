@@ -1,0 +1,19 @@
+# Reuse the pinned Claude Code installation baked into the Gym image instead
+# of reaching npm during every service startup.
+#
+# Applied to NVIDIA NeMo Gym commit a85670eb167ba9b48cc53a36a070eed815e6c40d.
+
+--- a/responses_api_agents/claude_code_agent/setup_claude_code.py
++++ b/responses_api_agents/claude_code_agent/setup_claude_code.py
+@@ -54,6 +54,11 @@
+     if shutil.which("claude"):
+         return
+
++    local_node_bin = _LOCAL_PREFIX / "bin"
++    if (local_node_bin / "claude").is_file():
++        os.environ["PATH"] = str(local_node_bin) + os.pathsep + os.environ.get("PATH", "")
++        return
++
+     # Check ~/.local/bin
+     local_bin = Path.home() / ".local" / "bin"
+     if (local_bin / "claude").is_file():

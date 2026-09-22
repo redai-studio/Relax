@@ -11,6 +11,8 @@ import pytest
 import torch
 
 from relax.engine.sft.dataset.multimodal import (
+    SFTMultimodalMediaLoadError,
+    _fetch_media,
     has_multimodal_content,
     preprocess_multimodal,
     preprocess_multimodal_async,
@@ -99,6 +101,20 @@ def test_preprocess_image_calls_processor_pool():
 def test_preprocess_without_pool_when_multimodal_raises():
     with pytest.raises(ValueError, match="processor_pool"):
         preprocess_multimodal(_image_sample(), processor_pool=None)
+
+
+def test_preprocess_wraps_media_loader_error(monkeypatch):
+    load_image = MagicMock(side_effect=AssertionError("missing"))
+    for kind in ("image", "video", "audio"):
+        module_name = f"relax.utils.multimodal.{kind}_utils"
+        loader_module = ModuleType(module_name)
+        setattr(loader_module, f"load_{kind}", load_image if kind == "image" else MagicMock())
+        monkeypatch.setitem(sys.modules, module_name, loader_module)
+
+    with pytest.raises(SFTMultimodalMediaLoadError, match=r"image position=0.*row_index=0") as exc_info:
+        _fetch_media(_image_sample(), "<image>")
+    load_image.assert_called_once_with("/tmp/cat.png")
+    assert isinstance(exc_info.value.__cause__, AssertionError)
 
 
 @pytest.mark.asyncio

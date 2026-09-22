@@ -19,6 +19,7 @@ import asyncio
 import logging
 
 import pytest
+from fastapi import HTTPException
 from ray.exceptions import RayActorError
 
 from relax.components.rollout import Rollout as RolloutDeployment
@@ -44,14 +45,18 @@ async def _ok(*_args, **_kwargs):
     return None
 
 
+async def _prepared(*_args, **_kwargs):
+    return True
+
+
 def _raise_dead(*_args, **_kwargs):
     raise RayActorError()
 
 
 class _ManagerStub:
-    def __init__(self, set_weight_updating_fn=None):
-        self.health_monitoring_pause = _RemoteStub(lambda *a, **k: _ok())
-        self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _ok()))
+    def __init__(self, set_weight_updating_fn=None, health_monitoring_pause_fn=None):
+        self.health_monitoring_pause = _RemoteStub(health_monitoring_pause_fn or (lambda *a, **k: _ok()))
+        self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _prepared()))
 
 
 def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
@@ -97,6 +102,60 @@ def test_can_do_update_weight_dead_engine_releases_gate_then_reraises():
 
     # The failure path must still release the handshake gate.
     assert shell._weight_update_ready.is_set()
+
+
+def test_can_do_update_weight_rejected_lease_rolls_back_before_pause():
+    calls = []
+
+    async def _set_weight_updating(value):
+        calls.append(value)
+        return not value
+
+    async def _pause():
+        calls.append("pause")
+
+    manager = _ManagerStub(
+        set_weight_updating_fn=_set_weight_updating,
+        health_monitoring_pause_fn=_pause,
+    )
+    shell = _make_rollout(can_update=True, manager=manager)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(shell.can_do_update_weight_for_async())
+
+    assert exc_info.value.status_code == 503
+    assert calls == [True, False]
+    assert shell.status == "running"
+    assert shell._weight_update_ready.is_set()
+
+
+def test_can_do_update_weight_closes_local_admission_while_lease_is_pending():
+    async def _scenario():
+        lease_started = asyncio.Event()
+        finish_lease = asyncio.Event()
+
+        async def _set_weight_updating(value):
+            if value:
+                lease_started.set()
+                await finish_lease.wait()
+                return False
+            return True
+
+        shell = _make_rollout(
+            can_update=True,
+            manager=_ManagerStub(set_weight_updating_fn=_set_weight_updating),
+        )
+        handshake = asyncio.create_task(shell.can_do_update_weight_for_async())
+        await asyncio.wait_for(lease_started.wait(), timeout=1)
+
+        assert shell.status == "paused"
+
+        finish_lease.set()
+        with pytest.raises(HTTPException):
+            await handshake
+        assert shell.status == "running"
+
+    asyncio.run(_scenario())
 
 
 def test_end_update_weight_does_not_block_after_failed_can_do():

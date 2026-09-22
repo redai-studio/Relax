@@ -8,9 +8,9 @@ that pinned goal, and writes back a session output whose ``metadata`` carries th
 environment outcome (``won`` / ``task_score`` / turn stats). Reward is computed
 downstream by ``reward_webshop.reward_func`` from this metadata.
 
-Two endpoints (DESIGN.md §3, §6.3):
+Two endpoints:
   * the policy — Relax OpenAI-compatible endpoint at ``$OPENAI_BASE_URL``.
-  * the env    — node-local WebShop server (``server.py``) at ``$WEBSHOP_URL``.
+  * the env    — cluster-shared WebShop server (``server.py``) at ``$WEBSHOP_URL``.
 The heavy WebShop catalog lives in that server; this process is a thin client.
 The session's cart is keyed by ``$RELAX_SESSION_ID`` (globally unique), so the
 same ``goal_idx`` rolled out ``group_size`` times never cross-contaminates.
@@ -25,7 +25,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 from openai import APIStatusError, AsyncOpenAI
 
 from app import prompt
@@ -59,7 +58,7 @@ async def run_webshop(metadata: dict[str, Any]) -> dict[str, Any]:
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"],
-        timeout=httpx.Timeout(timeout=900.0, connect=30.0),
+        timeout=9999,
     )
 
     won = False

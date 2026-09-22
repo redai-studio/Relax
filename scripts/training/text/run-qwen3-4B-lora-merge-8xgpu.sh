@@ -40,7 +40,8 @@ CKPT_ARGS=(
 LORA_ARGS=(
    --lora-rank 32
    --lora-alpha 64
-   --lora-target-modules linear_qkv linear_proj
+   --lora-scope language
+   --lora-target-modules linear_qkv linear_proj linear_fc1 linear_fc2
    --lora-dropout 0.0
    --lora-merge-mode
 )

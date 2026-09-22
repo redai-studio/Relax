@@ -79,10 +79,10 @@ test -z "$(git status --porcelain --untracked-files=no)"
 SOURCE_SHA=$(git rev-parse HEAD)
 VALIDATE_BRANCH=sync/validate-github-main-$(git rev-parse --short HEAD)
 git push github HEAD:refs/heads/$VALIDATE_BRANCH
-gh workflow run ci.yml -R redai-infra/Relax --ref $VALIDATE_BRANCH
-gh run list -R redai-infra/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
-gh run watch <run-id> -R redai-infra/Relax
-gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headSha,url
+gh workflow run ci.yml -R redai-studio/Relax --ref $VALIDATE_BRANCH
+gh run list -R redai-studio/Relax --workflow ci.yml --branch $VALIDATE_BRANCH --limit 5
+gh run watch <run-id> -R redai-studio/Relax
+gh run view <run-id> -R redai-studio/Relax --json status,conclusion,headSha,url
 ```
 
 门禁规则：
@@ -92,14 +92,14 @@ gh run view <run-id> -R redai-infra/Relax --json status,conclusion,headSha,url
 - 如果失败，先查看失败日志：
 
 ```bash
-gh run view <run-id> -R redai-infra/Relax --log-failed
+gh run view <run-id> -R redai-studio/Relax --log-failed
 ```
 
 - 如果需要改代码：本地修复、提交、push 到同一个验证分支或新验证分支后，重新 `gh workflow run ci.yml`。不要用旧 run 证明新代码。
 - 如果确认是瞬时失败且代码未变，可以只重跑失败 job：
 
 ```bash
-gh run rerun <run-id> -R redai-infra/Relax --failed
+gh run rerun <run-id> -R redai-studio/Relax --failed
 ```
 
 - 在 CI 全绿前禁止执行 `git push github HEAD:refs/heads/main`。

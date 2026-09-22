@@ -42,7 +42,7 @@ This project follows a standard code of conduct. Please be respectful, inclusive
 
 ```bash
 # Clone the repository
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 cd Relax
 
 # Create virtual environment (recommended)
@@ -155,7 +155,7 @@ feat(rollout): add streaming data consumption for async mode
 
 ## Reporting Bugs
 
-Use the [Bug Report template](https://github.com/redai-infra/Relax/issues/new?template=bug_report.md) and include:
+Use the [Bug Report template](https://github.com/redai-studio/Relax/issues/new?template=bug_report.md) and include:
 
 - **Environment** — OS, Python version, CUDA version, GPU type
 - **Steps to Reproduce** — Minimal commands to trigger the bug
@@ -165,7 +165,7 @@ Use the [Bug Report template](https://github.com/redai-infra/Relax/issues/new?te
 
 ## Requesting Features
 
-Use the [Feature Request template](https://github.com/redai-infra/Relax/issues/new?template=feature_request.md) and include:
+Use the [Feature Request template](https://github.com/redai-studio/Relax/issues/new?template=feature_request.md) and include:
 
 - **Problem Statement** — What problem does this solve?
 - **Proposed Solution** — How should it work?

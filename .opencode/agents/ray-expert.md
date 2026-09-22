@@ -31,7 +31,9 @@ Use this agent when:
 - Working with Ray cluster lifecycle (`ray start`, `ray stop`, `ray status`)
 - Debugging actor/task state via `ray list actors`, `ray list tasks`
 
-**Not for**: Megatron internals (use `megatron-expert`), FSDP internals (use `fsdp-expert`), RL algorithm logic (use `algorithm-expert`), or high-level orchestration design (use `launcher-expert`).
+**Not for**: Agentic rollout semantics (use `agentic-expert`), Megatron internals (use `megatron-expert`), FSDP
+internals (use `fsdp-expert`), RL algorithm logic (use `algorithm-expert`), or high-level orchestration design (use
+`launcher-expert`). Use this expert when an Agentic investigation has identified an underlying Ray mechanism.
 
 ## Ray in Relax: Overview
 

@@ -30,8 +30,7 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math-mtp}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
 MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
 DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
-NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
-
+NUM_ROLLOUT="${NUM_ROLLOUT:=200}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}/Qwen3.5-9B
@@ -71,7 +70,7 @@ EVAL_ARGS=(
    --eval-interval 20
    --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
    --n-samples-per-eval-prompt 8
-   --eval-max-response-len 8192
+   --eval-max-response-len 16384
    --eval-top-p 0.7
 )
 
@@ -121,7 +120,7 @@ MTP_ARGS=(
    --enable-mtp-training
    --mtp-loss-scaling-factor ${MTP_LOSS_SCALING_FACTOR:-0.1}
    --cross-entropy-loss-fusion
-   --cross-entropy-fusion-impl te
+   --cross-entropy-fusion-impl native
 )
 
 OPTIMIZER_ARGS=(
@@ -140,7 +139,13 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
-   --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
+
+   # enable sglang MTP
+   --sglang-speculative-algorithm EAGLE
+   --sglang-speculative-num-steps 2
+   --sglang-speculative-eagle-topk 1
+   --sglang-speculative-num-draft-tokens 3
+   --sglang-mamba-scheduler-strategy extra_buffer
 )
 
 WANDB_ARGS=(

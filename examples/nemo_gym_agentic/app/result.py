@@ -15,6 +15,13 @@ from .protocol import TrialResult, TrialStatus
 def to_relax_output(result: TrialResult) -> dict[str, Any]:
     if result.status not in {TrialStatus.COMPLETED, TrialStatus.TRUNCATED}:
         raise ValueError(f"Cannot materialize non-success terminal status: {result.status.value}")
+    if result.reward is None:
+        # A Gateway deadline can end the trial before its verifier runs. Exit
+        # as an agent failure so Relax drops the group instead of invoking RM.
+        raise ValueError(
+            f"NeMo Gym trial has no reward: request_id={result.request_id} "
+            f"status={result.status.value} error_code={result.error_code or 'missing_reward'}"
+        )
 
     reward = copy.deepcopy(result.reward)
     metadata: dict[str, Any] = {

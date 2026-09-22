@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Agent-side thin client for the per-node WebShop env server (``server.py``).
+"""Agent-side thin client for the cluster-shared WebShop env server.
 
 Mirrors the ``reset()/step()/close()`` surface the single-process
-``env_webshop.WebshopEnv`` used to expose, but each call is a localhost HTTP
-round-trip to the shared server instead of in-process work (DESIGN.md §6.2).
+``env_webshop.WebshopEnv`` used to expose, but each call is an HTTP round-trip
+to the shared server instead of in-process work.
 
 One agent process drives exactly one session, so a synchronous client is fine:
-there is no in-process concurrency to overlap, and localhost calls are cheap.
+there is no in-process concurrency to overlap.
 """
 
 from __future__ import annotations
@@ -18,8 +18,7 @@ import httpx
 
 
 class WebshopClient:
-    """HTTP client bound to a single ``instance_id`` on the node-local
-    server."""
+    """HTTP client bound to one ``instance_id`` on the shared server."""
 
     def __init__(self, base_url: str, instance_id: str, timeout: float = 120.0) -> None:
         self.base_url = base_url.rstrip("/")

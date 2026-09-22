@@ -2,7 +2,7 @@
 
 Relax supports multiple policy gradient algorithms, all selected via the `--advantage-estimator` flag. This document covers PPO and the primary GRPO-family algorithms (for On-Policy Distillation, see the [dedicated page](./on-policy-distillation.md)).
 
-GRPO, RLOO, CISPO, GSPO, and SAPO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
+GRPO, RLOO, CISPO, GSPO, SAPO, and M2PO share the same actor/rollout service topology, although RLOO is synchronous-only and enforces fixed batch invariants. PPO additionally requires a Critic model and an Advantages service; start from the [PPO training recipe](../guide/ppo-training.md) instead of only replacing `GRPO_ARGS`.
 
 REINFORCE++ and REINFORCE++-baseline also reuse the GRPO service topology, but
 their return, global normalization and KL contracts are algorithm-specific.
@@ -277,6 +277,93 @@ SAPO_ARGS=(
 
 ---
 
+## M2PO
+
+M2PO (Second-Moment Trust Policy Optimization) uses the **second moment** of the log importance ratio over harmful tokens as its trust-region constraint: it tightens clipping only when that second moment exceeds a budget, and keeps the token otherwise. Compared to fixed clipping, it retains more useful gradient and mitigates entropy collapse in off-policy (stale-data) regimes, making it purpose-built for mini-batch reuse and asynchronous training.
+
+Reference: [Prosperity before Collapse: How Far Can Off-Policy RL Reach with Reuse of Mini-Batch Data?](https://arxiv.org/abs/2510.01161) (NeurIPS 2025).
+
+### How It Works
+
+M2PO only constrains the "harmful" tokens that PPO would clip — those whose advantage sign aligns with the ratio's drift and would cause an over-update:
+
+$$\mathcal{H} = \{t : \hat{A}_t > 0,\ r_t > 1\} \cup \{t : \hat{A}_t < 0,\ r_t < 1\}$$
+
+where $r_t = \exp(-\text{KL}_t)$ and $\text{KL}_t = \log\pi_{\theta_\text{old}}(o_t) - \log\pi_\theta(o_t)$. The second moment of the log-ratio over these tokens is:
+
+$$M_2 = \frac{1}{|\mathcal{H}|} \sum_{t \in \mathcal{H}} (\log r_t)^2$$
+
+Relax solves this statistic independently on each Megatron microbatch's local
+tokens. Logging preserves the existing aggregation: with
+`--calculate-per-token-loss`, `train/ppo_kl_m2_before` and
+`train/ppo_kl_m2_after` are weighted by the microbatch's loss-token count;
+otherwise, each microbatch scalar is summed unchanged and the framework
+divides by the sample count. The latter is not a sample-weighted mean. Neither
+mode pools all harmful tokens in the global batch. These logged diagnostics
+do not feed back into the loss.
+
+- If $M_2 \le$ `kl2_budget`: no clipping, all tokens are kept;
+- Otherwise, use water-filling to select the previous observed breakpoint. This gives a conservative trust-region radius $\tau$ whose capped sum does not exceed $|\mathcal{H}| \cdot \text{kl2\_budget}$, yielding the clip band $[e^{-\tau},\ e^{\tau}]$.
+
+The final clipping margin is $\varepsilon = \max(\text{adaptive value},\ \text{miniclip})$, so it is never tighter than the configured floor. Choose the floors to match the GRPO margins when that is the desired lower bound. `ppo_kl_m2_after` is the legacy solver diagnostic for the selected breakpoint before that floor is applied; in the first-breakpoint edge case it retains the uncapped local mean. It is not a recomputation after the final policy clip. The policy loss reuses the PPO-Clip pessimistic form from the GRPO section, with only the clip bounds solved adaptively.
+
+### Key Parameters
+
+| Parameter | Default | Recommended | Description |
+|-----------|---------|-------------|-------------|
+| `--advantage-estimator m2po` | — | — | Enable M2PO |
+| `--m2po-kl2-budget` | `0.01` | `0.01`–`0.04` | Second-moment budget per harmful token. Smaller = tighter/more-frequent clipping, larger = more off-policy tolerance (the paper uses `0.04`) |
+| `--m2po-miniclip-low` | `0.3` | `0.2` | Lower-side clip-margin floor (the margin is at least `miniclip_low`) |
+| `--m2po-miniclip-high` | `0.5` | `0.28` | Upper clip-margin floor |
+| `--use-rollout-logprobs` | off | on for stale async data | Use the behavior-policy log probabilities that generated each token as M2PO's old policy |
+| `--use-tis` | off | off with rollout log probs | TIS is a post-loss correction and does not drive M2PO's adaptive threshold; it is mutually exclusive with `--use-rollout-logprobs` |
+
+> M2PO derives its clip bounds adaptively, so it does **not** use `--eps-clip` / `--eps-clip-high`.
+
+::: warning Existing implementation behavior
+The registry refactor preserves M2PO's existing computation: reward processing
+passes through raw sample rewards, and the threshold solver does not filter
+tokens by the loss mask or aggregate its statistic across CP ranks. Its
+breakpoint comparisons still use host scalars. Registration does not establish
+equivalence to the paper. Because the clipping statistics are local, M2PO
+declares `supports_context_parallel=False`: startup requires
+`--context-parallel-size 1` and dynamic context parallelism disabled. This
+validation leaves the algorithm's reward, solver and metric calculations
+unchanged.
+:::
+
+### When to Use
+
+M2PO's benefit grows with how off-policy the training data is, so reach for it **first** in these scenarios:
+
+- **Asynchronous training with large staleness**: in fully-async mode the rollout weights lag noticeably behind the actor (`--max-staleness` of 32, 256, or higher), and stale samples inflate the importance ratio. Fixed clipping then either zeroes out many tokens (losing gradient) or lets them through (causing over-updates); M2PO uses the second moment to adaptively tighten only the genuinely "harmful" fraction, suppressing collapse while preserving the learning signal.
+- **Mini-batch reuse / multi-step sampling**: when the same rollout batch is reused across several update steps, the later steps effectively train on off-policy data too, and M2PO extends the usable lifetime of that batch.
+- **Late-training entropy collapse or reward stagnation**: when fixed clipping narrows the policy too quickly and starves exploration, M2PO's looser adaptive bounds help sustain entropy and delay collapse.
+
+Conversely, under strictly on-policy synchronous training (`--max-staleness 0` with per-step weight sync), M2PO's gain over GRPO is limited — start from GRPO as a baseline there.
+
+M2PO is valid in true-on-policy mode, but then its importance ratio is exactly
+one and adaptive clipping does not engage. To evaluate its stale-data behavior,
+make sure the run supplies old-policy log probabilities rather than
+auto-enabling `--true-on-policy-mode`. For fully-async rollout staleness, pass
+`--use-rollout-logprobs`: `--use-tis` is applied only after M2PO has already
+chosen its clip bounds.
+
+### Quick Start
+
+Use any existing GRPO training script and replace `GRPO_ARGS` with `M2PO_ARGS`:
+
+```bash
+M2PO_ARGS=(
+   --advantage-estimator m2po
+   --m2po-kl2-budget 0.01
+   --m2po-miniclip-low 0.2
+   --m2po-miniclip-high 0.28
+)
+```
+
+---
+
 ## Algorithm Comparison
 
 | Algorithm | Advantage Computation | Policy Loss | KL Constraint |
@@ -288,6 +375,7 @@ SAPO_ARGS=(
 | **CISPO** | Group-relative reward | Stop-gradient coefficient | Recommended KL loss |
 | **GSPO** | Group-relative reward | PPO-Clip + sequence-level KL | Sequence-level ratio |
 | **SAPO** | Group-relative reward | Sigmoid gate | Temperature-controlled |
+| **M2PO** | Raw sample reward broadcast to tokens | Adaptive second-moment clip | Optional KL loss (favor for large-staleness / off-policy) |
 | **RLOO** | Leave-one-out baseline | Unclipped REINFORCE | Optional KL loss (same as GRPO) |
 
 ## Next Steps

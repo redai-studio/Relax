@@ -197,6 +197,45 @@ class BridgeConverter:
                         stack.append(attr_val)
         return result
 
+    def _lookup_task(self, global_name: str) -> tuple[str, Any]:
+        """Find the bridge's own ``WeightConversionTask`` for ``global_name``.
+
+        Prefers the bridge's task over a rebuilt one because it carries the real
+        ``megatron_module`` (and hence the parallelism actually detected for the module)
+        rather than a config-only donor.
+
+        Returns ``(resolved_name, task)``; ``task`` is ``None`` when neither spelling matched,
+        in which case ``resolved_name`` is returned unchanged.
+        """
+        task = self._bridge_task_map.get(global_name)
+        if task is not None:
+            return global_name, task
+
+        # Property 2 holds for params the bridge saw; a plain key can still exist for one it
+        # skipped (e.g. a PP rank that does not own the layer, where ``init_tasks`` drops the
+        # task via its ``param_weight is not None`` filter).
+        if ".to_wrap." in global_name:
+            plain_name = global_name.replace(".to_wrap.", ".")
+            task = self._bridge_task_map.get(plain_name)
+            if task is not None:
+                return plain_name, task
+
+        return global_name, None
+
+    def _lookup_mapping(self, global_name: str) -> tuple[str, Any]:
+        """Resolve ``global_name`` straight from the mapping registry.
+
+        Used only when :meth:`_lookup_task` came up empty. Per property 1 the registry speaks
+        no LoRA, so a wrapped name is retried plain.
+
+        Returns ``(resolved_name, mapping)``; ``mapping`` is ``None`` when nothing matched.
+        """
+        mapping = self._bridge_mapping_registry.megatron_to_hf_lookup(global_name)
+        if mapping is None and ".to_wrap." in global_name:
+            global_name = global_name.replace(".to_wrap.", ".")
+            mapping = self._bridge_mapping_registry.megatron_to_hf_lookup(global_name)
+        return global_name, mapping
+
     # ------------------------------------------------------------------
     # Per-parameter conversion
     # ------------------------------------------------------------------
@@ -220,13 +259,14 @@ class BridgeConverter:
             if len(parts) >= 3:
                 global_name = parts[2]
 
-        task = self._bridge_task_map.get(global_name)
+        global_name, task = self._lookup_task(global_name)
 
         if task is None:
             from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
             from megatron.bridge.models.conversion.param_mapping import AutoMapping
 
-            mapping = self._bridge_mapping_registry.megatron_to_hf_lookup(global_name)
+            global_name, mapping = self._lookup_mapping(global_name)
+
             assert mapping is not None, (
                 f"Bridge mapping registry has no entry for '{global_name}'. "
                 f"Available task map keys: {list(self._bridge_task_map.keys())[:10]}..."

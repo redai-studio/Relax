@@ -22,20 +22,20 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-infra/Relax'
+    if: github.repository == 'redai-studio/Relax'
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
@@ -48,24 +48,24 @@ jobs:
           npm install --no-audit --no-fund --no-save @rollup/rollup-linux-x64-gnu
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Build VitePress site
         run: npm run docs:build
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs/.vitepress/dist
 
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.repository == 'redai-infra/Relax'
+    if: github.repository == 'redai-studio/Relax'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

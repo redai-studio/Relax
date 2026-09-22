@@ -11,8 +11,6 @@
 set -ex
 set -o pipefail
 
-MODE=${1:-"async"}
-
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 
@@ -52,17 +50,18 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
-   # --rollout-shuffle
+   --rollout-shuffle
    --rm-type openr1mm
    --num-rollout ${NUM_ROLLOUT}
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 1024
+   --rollout-max-response-len 8192
    --rollout-max-prompt-len 2048
-   --rollout-temperature 0.8
+   --rollout-temperature 1
    --global-batch-size 256
    --multimodal-keys '{"image":"image"}'
    --system-prompt "${SYSTEM_PROMPT}"
+   --use-fault-tolerance
    --use-streaming-dataset
 )
 
@@ -70,22 +69,17 @@ PERF_ARGS=(
    --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 3
-   # --decoder-last-pipeline-num-layers 
+   # --decoder-last-pipeline-num-layers
    --decoder-first-pipeline-num-layers 8
-   
+
    --context-parallel-size 1
-   --expert-model-parallel-size 1
-   --expert-tensor-parallel-size 1
 
-   # --recompute-granularity full
-   # --recompute-method uniform
-   # --recompute-num-layers 1
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
    --calculate-per-token-loss
-   --micro-batch-size 2
-   # --qkv-format bshd
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 16384
-
+   --max-tokens-per-gpu 10240
    --no-rope-fusion
 )
 
@@ -94,10 +88,10 @@ GRPO_ARGS=(
    --advantage-estimator grpo
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
-   --kl-coef 0.00
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   --eps-clip-c 3
    --use-tis
 )
 
@@ -112,11 +106,11 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   --use-tensorboard
+   # --use-tensorboard
    --use-clearml
    --use-metrics-service
    --tb-project-name ${PROJECT_NAME}
-   --tb-experiment-name qwen35-9b-GRPO-gpu8-${MODE}-${now}
+   --tb-experiment-name qwen35-9b-GRPO-gpu8-async-${now}
 )
 
 SGLANG_ARGS=(
@@ -135,44 +129,27 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+RAY_RESOURCE_ARGS=(
+   --resource '{"actor": [1, 6], "rollout": [1, 2], "advantages": [1, 0]}'
+   --max-staleness 2
+   --num-data-storage-units 1
+   --num-iters-per-train-update 16
+   --fully-async
+   --use-health-check
+)
 
-mkdir -p log
-if [ ${MODE} = "async" ]; then
-     ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-        --runtime-env-json="${RUNTIME_ENV_JSON}" \
-        -- python3 -m relax.entrypoints.train \
-        --resource '{"actor": [1, 6], "rollout": [1, 2], "advantages": [1, 0]}'\
-        --max-staleness 2 \
-        --num-data-storage-units 1 \
-        --num-iters-per-train-update 16 \
-        --fully-async \
-        --use-health-check \
-        "${MODEL_ARGS[@]}" \
-        "${CKPT_ARGS[@]}" \
-        "${ROLLOUT_ARGS[@]}" \
-        "${OPTIMIZER_ARGS[@]}" \
-        "${GRPO_ARGS[@]}" \
-        "${WANDB_ARGS[@]}" \
-        "${PERF_ARGS[@]}" \
-        "${SGLANG_ARGS[@]}" \
-        "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-async-${now}.log
-else
-    ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
-         --runtime-env-json="${RUNTIME_ENV_JSON}" \
-         -- python3 -m relax.entrypoints.train \
-         --resource '{"actor": [1, 8], "rollout": [1, 8]}'\
-         --max-staleness 0 \
-         --num-data-storage-units 1 \
-         --colocate \
-         --use-health-check \
-         --balance-data \
-         "${MODEL_ARGS[@]}" \
-         "${CKPT_ARGS[@]}" \
-         "${ROLLOUT_ARGS[@]}" \
-         "${OPTIMIZER_ARGS[@]}" \
-         "${GRPO_ARGS[@]}" \
-         "${WANDB_ARGS[@]}" \
-         "${PERF_ARGS[@]}" \
-         "${SGLANG_ARGS[@]}" \
-         "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-9b-GRPO-gpu8-colocate-${now}.log
-fi
+mkdir -p logs
+
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   -- python3 -m relax.entrypoints.train \
+   "${RAY_RESOURCE_ARGS[@]}" \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee logs/qwen35-9b-GRPO-gpu8-async-${now}.log

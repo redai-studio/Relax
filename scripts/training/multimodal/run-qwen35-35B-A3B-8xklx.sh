@@ -17,9 +17,11 @@ export MODEL_DIR="${MODEL_DIR:-/workspace}"
 export DATA_DIR="${DATA_DIR:-/workspace}"
 export PROJECT_NAME=Relax-Qwen3.5-35B-A3B-VL-P800
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
- 
+
 export MEGATRON=${WORKDIR}/Megatron-LM
- 
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RL_MODEL_TYPE="Qwen35_35B_multimodal"
 export XMLIR_USE_HYDRA_LINEAR=${XMLIR_USE_HYDRA_LINEAR:-1}
 export XMLIR_ENABLE_FAST_FC=${XMLIR_ENABLE_FAST_FC:-1}
 export XMLIR_MEMCPY_RETRY_SYNC=${XMLIR_MEMCPY_RETRY_SYNC:-true}
@@ -181,6 +183,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --colocate \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+#
+# Qwen3-0.6B SFT on OpenMathReasoning-mini, 8xGPU single-node, ray-submit launch.
+#
+# Uses the SFT prepack pipeline: --sft-async-prepack offloads TQ fetch +
+# seqlen-balanced packing + pinned-memory H2D to a background worker,
+# keeping only fwd/bwd on the training thread. Data / batch / loss-scaling
+# semantics match dev exactly (K auto-aligns across DP by repartitioning real samples).
+#
+# --sft-max-in-flight-steps N: TQ buffer depth = N. Also maps to
+# max_staleness = N - 1, which controls how many rollouts ahead the
+# prefetch worker can look. Bigger N = better overlap between train step
+# and prefetch, at the cost of more pinned CPU memory. N=4 is a good
+# default; --sft-async-prepack rejects N=1 because it cannot overlap the
+# next window with the current training step.
+#
+# 0.6B fits on a single GPU so TP/PP/CP are all 1 and DP=8.
+#
+# Usage:
+#   bash scripts/training/sft/run-qwen3-0.6B-math-8xgpu.sh
+
+set -ex
+set -o pipefail
+
+now=$(date "+%Y-%m-%d-%H:%M:%S")
+echo "当前时间: $now"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+# Auto-source local environment when not launched via an external entrypoint
+if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
+    source "${SCRIPT_DIR}/../../entrypoint/local.sh"
+fi
+source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
+
+PROJECT_NAME="${PROJECT_NAME:=Relax/sft/math}"
+EXP_NAME=qwen3-0.6b-sft-math-gpu8
+EXP_DIR="${MODEL_DIR:=${SCRIPT_DIR}/../../../../exps}"
+DATA_DIR="${DATA_DIR:=${SCRIPT_DIR}/data}"
+PROMPT_DATA="${PROMPT_DATA:=${DATA_DIR}/sft/data/OpenMathReasoning-mini/data/cot-00000-of-00001.parquet}"
+SAVE_DIR="${SAVE_DIR:=${SCRIPT_DIR}/../../../checkpoints/qwen3-0.6B-math-sft}"
+
+CKPT_ARGS=(
+   --hf-checkpoint ${EXP_DIR}/Qwen3-0.6B
+   --ref-load ${EXP_DIR}/Qwen3-0.6B
+
+   --megatron-to-hf-mode bridge
+   --save ${SAVE_DIR}/sft/${EXP_NAME}
+   --load ${SAVE_DIR}/sft/${EXP_NAME}
+   --save-interval 1000
+   --num-epoch 10
+)
+
+SFT_ARGS=(
+   --loss-type sft
+   --prompt-data "${PROMPT_DATA}"
+   --input-key problem
+   --label-key generated_solution
+   --global-batch-size 32
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 20480
+   --sft-oversize-strategy skip
+   --balance-data
+   --per-rank-fetch
+   --sft-async-prepack
+   --sft-prefetch-num-workers 8
+   --sft-prefetch-buffer-size 256
+)
+
+EVAL_ARGS=(
+    --eval-size 0.01
+    --eval-interval 1000
+)
+
+PERF_ARGS=(
+   --tensor-model-parallel-size 1
+   --pipeline-model-parallel-size 1
+   --context-parallel-size 1
+   --expert-model-parallel-size 1
+   --expert-tensor-parallel-size 1
+
+   --no-rope-fusion
+
+   --colocate
+   --cross-entropy-loss-fusion
+)
+
+OPTIMIZER_ARGS=(
+   --optimizer adam
+   --lr 1e-5
+   --lr-decay-style cosine
+   --min-lr 1e-6
+   --weight-decay 0.1
+   --adam-beta1 0.9
+   --adam-beta2 0.98
+   --clip-grad 1.0
+)
+
+WANDB_ARGS=(
+   --use-clearml
+   --use-metrics-service
+   --tb-project-name ${PROJECT_NAME}
+   --tb-experiment-name ${EXP_NAME}-${now}
+)
+
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --attention-backend flash
+   --use-health-check
+)
+
+mkdir -p log
+
+ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
+   ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
+   -- python3 -m relax.entrypoints.train \
+   --resource '{"sft": [1, 0], "actor": [1, 8], "rollout": [1, 8]}' \
+   --sft-max-in-flight-steps 4 \
+   --num-data-storage-units 8 \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${SFT_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-0.6b-sft-math-gpu8-${now}.log

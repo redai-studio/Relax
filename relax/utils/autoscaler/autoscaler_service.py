@@ -53,6 +53,8 @@ class ScaleHistoryItem(BaseModel):
     triggered_conditions: List[str] = Field(default_factory=list)
     metrics_snapshot: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
+    # Carried through so the monitor buckets without re-parsing error_message.
+    failure_categories: List[str] = Field(default_factory=list)
 
 
 class ScaleHistoryResponse(BaseModel):
@@ -578,6 +580,7 @@ class AutoscalerService(Base):
                         new_status = data.get("status")
                         req["status"] = new_status
                         req["error_message"] = data.get("error_message")
+                        req["failure_categories"] = data.get("failure_categories") or []
 
                         if is_scale_request_terminal(action, new_status):
                             completed.append(req)

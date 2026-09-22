@@ -1,6 +1,6 @@
-# S3 Model Loading
+# Accelerated S3 Model Loading
 
-Relax can load a Hugging Face checkpoint directly from S3-compatible object storage. Passing an `s3://` URI to `--hf-checkpoint` makes each node download the checkpoint into shared memory (`/dev/shm`) at startup and then read it as an ordinary local path. No separate enable flag is needed; a local path bypasses this path entirely.
+Relax can load a Hugging Face checkpoint directly from S3-compatible object storage. Passing an `s3://` URI to `--hf-checkpoint` makes each policy consumer node download the checkpoint into shared memory (`/dev/shm`) at startup and then read it as an ordinary local path. No separate enable flag is needed; a local path bypasses this path entirely.
 
 ### When to use S3 loading
 
@@ -12,7 +12,7 @@ S3 loading replaces the step of reading the checkpoint from its existing filesys
 | Every node already has the checkpoint on fast local NVMe | Use the local path, since a local read usually beats a network download |
 | The object store is bandwidth-limited or far from the cluster | Measure first; pulling tens of GB per node can cost more than it saves |
 
-Downloads run in parallel, and each node downloads once regardless of how many ranks it hosts.
+For S3 sources, Relax allocates the service placement groups first and starts one prefetch task on each GPU node that will consume the policy checkpoint. Ray Serve deployment then proceeds while the downloads are running; consumers that reach the model first wait on the same node-local cache lock. Each node downloads once regardless of how many ranks it hosts, and a CPU-only Ray head does not download model files. Local model paths keep the normal constructor-immediate service deployment path and do not run S3 cache discovery or cleanup.
 
 ### Prerequisites
 
@@ -57,7 +57,17 @@ python3 -m relax.entrypoints.train \
     # ... other training arguments
 ```
 
-`--s3-model-endpoint` is only needed for a self-hosted or S3-compatible store.
+For a self-hosted or S3-compatible store, configure the standard AWS environment instead of putting transport settings in the training command:
+
+```bash
+export AWS_ENDPOINT_URL_S3=http://s3.example
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+```
+
+`AWS_ENDPOINT_URL_S3` takes precedence over `AWS_ENDPOINT_URL`. Credentials use the standard boto3 credential chain, so profiles, session tokens, and workload credentials continue to work without Relax-specific flags.
+
+For `runai_streamer`, Relax bridges that resolved AWS endpoint to `RUNAI_STREAMER_S3_ENDPOINT` only when the RunAI variable is not already set. An explicit `RUNAI_STREAMER_S3_ENDPOINT` therefore wins. Gateways that require path-style addressing can use RunAI Streamer's native `RUNAI_STREAMER_S3_USE_VIRTUAL_ADDRESSING=0` setting.
 
 ### Why `dummy`
 
@@ -77,7 +87,7 @@ ______________________________________________________________________
 | **Engine startup order varies** | `--sglang-load-format auto` | Reuses the `/dev/shm` copy when it is ready, otherwise streams from S3. SHM stays occupied for the whole job. |
 | **Rollout starts before training, or standalone SGLang** | `--sglang-load-format runai_streamer` | Streams weights straight from S3. Rollout never touches SHM, and SHM is freed after the Actor's first sync. |
 | **Debugging, need the files on disk** | add `--disable-s3-model-cleanup` | Full checkpoint stays in `/dev/shm` for the whole job. |
-| **Turn the feature off** | `--disable-s3-model-download` | Relax loads `--hf-checkpoint` the ordinary way. |
+| **Turn the feature off** | `--disable-s3-model-download` | Disable both generic Relax S3 downloading and any registered model-source provider. Relax then passes `--hf-checkpoint` through to the ordinary loaders. |
 
 ::: warning
 `dummy` applies to the policy rollout engine only, because the Actor overwrites its weights before the first request. GenRM, teacher, evaluation, and standalone inference services always load real weights, even when they point at the same model.
@@ -91,15 +101,22 @@ ______________________________________________________________________
 
 ```
 Job submitted
-  → every node downloads the checkpoint into /dev/shm (once per node)
-  → SGLang rollout engine starts
+  → placement groups become ready
+  → stale Relax-owned model caches from an earlier serial job are removed
+  → policy consumer GPU nodes start prefetching the checkpoint into /dev/shm
+  → Ray Serve deployment starts while those prefetch tasks are running
+       a consumer waits on the node-local cache lock if its files are not ready
+  → SGLang rollout engine initializes
        dummy           reads metadata only, fastest to become ready
        auto            reuses /dev/shm, no second download
        runai_streamer  streams from S3, does not use SHM
+  → controller confirms every submitted prefetch task has completed
   → Actor performs the first weight sync (a dummy engine receives real weights here)
   → weight shards in /dev/shm are released automatically
   → training starts
 ```
+
+Relax does not recover, resume, or reuse a previous job's partial or complete download. Before a new S3 prefetch starts, stale Relax-owned caches from an earlier serial job are removed under a per-cache lock. Cache names are restricted to Relax's own hashed namespace; unrelated files in `/dev/shm` are never removed. This also keeps a long-lived Ray cluster clean when it runs multiple Relax jobs sequentially.
 
 ______________________________________________________________________
 
@@ -133,15 +150,12 @@ ______________________________________________________________________
 |---|---|---|
 | `--hf-checkpoint` | — | An `s3://` URI enables S3 loading; a local path bypasses it |
 | `--sglang-load-format` | `auto` | Rollout engine load mode, see the table above |
-| `--s3-model-endpoint` | `None` | Endpoint of a self-hosted or S3-compatible store |
-| `--s3-model-use-path-style` | off | Enable when the gateway requires path-style addressing |
-| `--s3-model-use-placeholder-credentials` | off | Enable when the gateway requires signed requests but not real credentials |
 | `--s3-model-shm-root` | `/dev/shm` | Shared-memory directory used for the download |
 | `--s3-model-download-workers` | `20` | Download concurrency |
-| `--disable-s3-model-download` | off | Load `--hf-checkpoint` the ordinary way instead |
+| `--disable-s3-model-download` | off | Disable generic S3 downloading and registered model-source providers, then pass `--hf-checkpoint` to the ordinary loaders |
 | `--disable-s3-model-cleanup` | off | Keep the weights in shared memory for the whole job |
 
-Credentials are never passed on the command line; Relax uses the standard credential chain of the environment.
+Endpoints and credentials are not passed through Relax-specific command-line flags. Relax uses `AWS_ENDPOINT_URL_S3` (falling back to `AWS_ENDPOINT_URL`) and the standard boto3 credential chain. A model-source provider may supply source-specific transport settings without changing the environment used by ordinary S3 models.
 
 ______________________________________________________________________
 

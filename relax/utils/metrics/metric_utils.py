@@ -5,6 +5,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 
+from relax.algorithms.spec import get_algorithm
 from relax.utils.types import Sample
 
 
@@ -111,7 +112,13 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
 
 
 def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
-    """Compute RLOO-specific diagnostics from training rollout samples.
+    """Compute leave-one-out diagnostics from training rollout samples.
+
+    Gated on the algorithm registry's ``reward_normalizer`` rather than on the
+    estimator's name: what makes these numbers meaningful is that the reward
+    stage produced a leave-one-out baseline, so any algorithm declaring that
+    normalizer gets them. The ``rloo/`` key prefix stays as-is -- those metric
+    names are already published to dashboards.
 
     These keys are returned with an ``rloo/`` prefix. The training rollout
     logger adds the outer ``rollout/`` prefix before publishing them.
@@ -124,7 +131,8 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     length and therefore remains distinct from a sample whose response exists
     but is fully masked.
     """
-    if getattr(args, "advantage_estimator", None) != "rloo":
+    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    if spec.reward_normalizer != "group_leave_one_out":
         return {}
     if (
         getattr(args, "custom_reward_post_process_path", None) is not None
@@ -185,12 +193,14 @@ def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, fl
     }
 
 
-def compute_rollout_explicit_reward_metrics(
+def compute_rollout_reward_metrics(
     args,
     samples: list[Sample],
     *,
     include_rloo_diagnostics: bool = True,
 ) -> dict[str, float]:
+    reward_values = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
+    log_dict = {"raw_reward": np.mean(reward_values).item()} if reward_values else {}
     reward_metric_values: dict[str, list[float]] = {}
     primary_reward_key = getattr(args, "reward_key", None)
     for sample in samples:
@@ -207,19 +217,20 @@ def compute_rollout_explicit_reward_metrics(
             ):
                 continue
             append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
-    log_dict = finalize_rollout_explicit_metric_values(reward_metric_values)
-    if args.log_passrate:
-        rewards = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
-        if rewards:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(flat_rewards=rewards, group_size=args.n_samples_per_prompt),
-                "passrate/",
-            )
+    log_dict |= finalize_rollout_explicit_metric_values(reward_metric_values)
+    if args.log_passrate and reward_values:
+        log_dict |= dict_add_prefix(
+            compute_pass_rate(flat_rewards=reward_values, group_size=args.n_samples_per_prompt),
+            "passrate/",
+        )
 
     if include_rloo_diagnostics:
         log_dict |= _compute_rloo_group_diagnostics(args, samples)
 
     return log_dict
+
+
+compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
 
 
 def compression_ratio(

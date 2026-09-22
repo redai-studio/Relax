@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
 
-import numpy as np
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
@@ -17,6 +18,8 @@ from relax.utils.types import Sample
 
 
 MsgKind = Literal["obs", "resp"]
+# Roles accepted into the canonical Forest. Expanding this set requires the
+# compiler, OpenAI ingress, and export validator to agree on the new role.
 _ALLOWED_MESSAGE_ROLES = {"user", "assistant", "tool", "system"}
 
 
@@ -26,25 +29,78 @@ class RequestKind(str, Enum):
     PROTECTED = "protected"
 
 
+# Zero-valued SGLang accounting shape merged across interrupted IR attempts.
+# Keys are part of exported metadata and therefore must track backend schema.
 _EMPTY_SPEC_DELTA = {
     "spec_accept_token_num": 0,
     "spec_draft_token_num": 0,
     "spec_verify_ct": 0,
     "completion_token_num": 0,
 }
+# Zero-valued prefix-cache accounting shape accumulated across resumptions.
 _EMPTY_PREFIX_CACHE_DELTA = {
     "cached_tokens": 0,
     "total_prompt_tokens": 0,
 }
-_TRAINING_ARTIFACT_ARRAY_FIELDS: list[tuple[str, Any]] = [
-    ("tokens", np.int32),
-    ("rollout_tokens", np.int32),
-    ("loss_mask", np.uint8),
-    ("rollout_log_probs", np.float64),
-    ("teacher_log_probs", np.float64),
-    ("teacher_topk_token_ids", np.int32),
-    ("rollout_routed_experts", np.int32),
-]
+
+
+def _canonical_json_value(value: Any, *, field: str) -> Any:
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(f"{field} JSON object keys must be strings")
+        return {key: _canonical_json_value(item, field=field) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canonical_json_value(item, field=field) for item in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field} numbers must be finite")
+        # JavaScript JSON.stringify drops the decimal part of safe integral numbers.
+        # Match that representation so cross-language replays keep one state identity.
+        if value.is_integer() and abs(value) <= 2**53 - 1:
+            return int(value)
+        return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise TypeError(f"{field} must contain JSON-compatible values, got {type(value)}")
+
+
+def _canonical_tool_arguments(arguments: Any, *, field: str) -> str:
+    if isinstance(arguments, str):
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in parsed:
+                    raise ValueError(f"{field} contains duplicate key: {key}")
+                parsed[key] = value
+            return parsed
+
+        def reject_non_finite(value: str) -> None:
+            raise ValueError(f"{field} contains non-finite number: {value}")
+
+        try:
+            arguments = json.loads(
+                arguments,
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_non_finite,
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field} must be valid JSON") from exc
+    if not isinstance(arguments, dict):
+        raise TypeError(f"{field} must be a JSON object or a JSON string encoding an object, got {type(arguments)}")
+    canonical_arguments = _canonical_json_value(arguments, field=field)
+    canonical = json.dumps(
+        canonical_arguments,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    try:
+        canonical.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be valid UTF-8") from exc
+    return canonical
 
 
 def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> list[dict[str, Any]]:
@@ -63,24 +119,21 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
         if call_id is not None and (not isinstance(call_id, str) or not call_id):
             raise ValueError(f"messages[{message_index}].tool_calls[{call_index}].id must be a non-empty string")
         function = tool_call.get("function")
-        if function is not None:
-            if not isinstance(function, dict):
-                raise TypeError(
-                    f"messages[{message_index}].tool_calls[{call_index}].function must be a dict, got {type(function)}"
-                )
-            function_name = function.get("name")
-            if function_name is not None and not isinstance(function_name, str):
-                raise TypeError(
-                    f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
-                    f"got {type(function_name)}"
-                )
-            arguments = function.get("arguments")
-            if arguments is not None and not isinstance(arguments, str):
-                raise TypeError(
-                    f"messages[{message_index}].tool_calls[{call_index}].function.arguments must be a string, "
-                    f"got {type(arguments)}"
-                )
-        normalized.append(copy.deepcopy(tool_call))
+        if not isinstance(function, dict):
+            raise TypeError(
+                f"messages[{message_index}].tool_calls[{call_index}].function must be a dict, got {type(function)}"
+            )
+        function_name = function.get("name")
+        if function_name is not None and not isinstance(function_name, str):
+            raise TypeError(
+                f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
+                f"got {type(function_name)}"
+            )
+        arguments_field = f"messages[{message_index}].tool_calls[{call_index}].function.arguments"
+        arguments = function.get("arguments")
+        normalized_tool_call = copy.deepcopy(tool_call)
+        normalized_tool_call["function"]["arguments"] = _canonical_tool_arguments(arguments, field=arguments_field)
+        normalized.append(normalized_tool_call)
     return normalized
 
 
@@ -90,6 +143,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
     if not isinstance(messages, list):
         raise TypeError(f"messages must be a list, got {type(messages)}")
 
+    system_chunks: list[str] = []
     ensured: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
@@ -114,37 +168,33 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
                 raise ValueError(f"messages[{index}].tool_call_id must be a non-empty string")
         else:
             tool_call_id = None
-        if "content" not in message:
-            if assistant_allows_empty_content:
-                content = None
-            else:
-                raise ValueError(f"messages[{index}] must include content")
-        else:
-            content = message["content"]
+        if "content" not in message and not assistant_allows_empty_content:
+            raise ValueError(f"messages[{index}] must include content")
+        content = message.get("content")
         if content is None:
             if not assistant_allows_empty_content:
                 raise ValueError(f"messages[{index}].content must not be empty")
-        elif isinstance(content, str) and not content.strip():
-            if not assistant_allows_empty_content:
-                raise ValueError(f"messages[{index}].content must not be empty")
-        elif isinstance(content, list) and not content:
-            raise ValueError(f"messages[{index}].content must not be empty")
-        rendered_message = {"role": role}
-        if content is None:
-            rendered_message["content"] = None
+            content = ""
         elif isinstance(content, str):
-            rendered_message["content"] = content
+            if not content and role != "tool" and not assistant_allows_empty_content:
+                raise ValueError(f"messages[{index}].content must not be empty")
         elif isinstance(content, list):
-            rendered_content = []
+            if not content:
+                raise ValueError(f"messages[{index}].content must not be empty")
             for item_index, item in enumerate(content):
                 if not isinstance(item, dict):
                     raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
-                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"].strip():
+                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
                     raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
-                rendered_content.append(copy.deepcopy(item))
-            rendered_message["content"] = rendered_content
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
+        if role == "system":
+            if isinstance(content, str):
+                system_chunks.append(content)
+            else:
+                system_chunks.extend(part["text"] for part in content if isinstance(part.get("text"), str))
+            continue
+        rendered_message = {"role": role, "content": copy.deepcopy(content)}
         if has_reasoning_content:
             rendered_message["reasoning_content"] = reasoning_content
         if tool_calls:
@@ -152,16 +202,9 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
         if role == "tool" and tool_call_id is not None:
             rendered_message["tool_call_id"] = tool_call_id
         ensured.append(rendered_message)
+    if system_chunks:
+        return [{"role": "system", "content": "\n\n".join(system_chunks)}, *ensured]
     return ensured
-
-
-def iter_message_content_parts(message: dict[str, Any]):
-    content = message.get("content")
-    if isinstance(content, str):
-        yield {"type": "text", "text": content}
-        return
-    for item in content or []:
-        yield item
 
 
 def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -173,11 +216,25 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             raise TypeError(f"tools[{index}] must be a dict, got {type(tool)}")
-        normalized.append(tool)
+        function = tool.get("function")
+        if tool.get("type") != "function" or not isinstance(function, dict):
+            continue
+        normalized_function = {
+            "name": function.get("name"),
+            "parameters": function.get("parameters"),
+        }
+        if function.get("description") is not None:
+            normalized_function["description"] = function["description"]
+        normalized.append({"type": "function", "function": normalized_function})
     return normalized
 
 
 def normalize_template_kwargs(template_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    if template_kwargs is None:
+        return {}
+    if not isinstance(template_kwargs, dict):
+        raise TypeError(f"chat_template_kwargs must be a dict, got {type(template_kwargs)}")
+
     def _normalize(value: Any) -> Any:
         if isinstance(value, dict):
             return {str(key): _normalize(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
@@ -185,7 +242,7 @@ def normalize_template_kwargs(template_kwargs: dict[str, Any] | None) -> dict[st
             return [_normalize(item) for item in value]
         return value
 
-    return _normalize(template_kwargs or {})
+    return _normalize(template_kwargs)
 
 
 def _messages_tools_template_state_hash(
@@ -205,84 +262,6 @@ def _messages_tools_template_state_hash(
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-@dataclass
-class FinalizedResultTransport:
-    """Session finalization result.
-
-    Sample statuses (completed, truncated, aborted, failed) carry training data
-    in artifact_ref. discarded means the session was already cleaned by
-    rollout-side discard. non_finalizable means the session exited without an
-    exportable terminal response. Both are runtime-local drops.
-    """
-
-    status: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-    artifact_ref: Any = None
-
-
-@dataclass
-class TrainingFieldArtifact:
-    sample_payload: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_sample(cls, sample: Sample) -> "TrainingFieldArtifact":
-        return cls(sample_payload=_compact_sample_payload(sample.to_dict()))
-
-    def to_sample(self) -> Sample:
-        return Sample.from_dict(_expand_sample_payload(self.sample_payload))
-
-
-def _compact_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    compacted = copy.deepcopy(payload)
-
-    tokens = compacted.get("tokens")
-    rollout_tokens = compacted.get("rollout_tokens")
-    if isinstance(tokens, list) and isinstance(rollout_tokens, list) and rollout_tokens == tokens:
-        compacted["rollout_tokens"] = None
-        compacted["_rollout_tokens_shared"] = True
-
-    for field_name, dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
-        value = compacted.get(field_name)
-        if not isinstance(value, list) or not value:
-            continue
-        try:
-            compacted[field_name] = np.asarray(value, dtype=dtype)
-        except Exception:
-            compacted[field_name] = copy.deepcopy(value)
-    return compacted
-
-
-def _expand_sample_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    expanded = copy.deepcopy(payload)
-
-    def _tolist(value: Any) -> Any:
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        return value
-
-    tokens = _tolist(expanded.get("tokens"))
-    if isinstance(tokens, list):
-        expanded["tokens"] = tokens
-
-    rollout_tokens = _tolist(expanded.get("rollout_tokens"))
-    if expanded.pop("_rollout_tokens_shared", False):
-        expanded["rollout_tokens"] = list(tokens or [])
-    elif isinstance(rollout_tokens, list):
-        expanded["rollout_tokens"] = rollout_tokens
-
-    for field_name, _dtype in _TRAINING_ARTIFACT_ARRAY_FIELDS:
-        if field_name in {"tokens", "rollout_tokens"}:
-            continue
-        value = _tolist(expanded.get(field_name))
-        if isinstance(value, list):
-            expanded[field_name] = value
-    return expanded
-
-
-def _copy_dict_of_lists(data: dict[str, Any] | None) -> dict[str, Any] | None:
-    return copy.deepcopy(data) if data is not None else None
 
 
 def _merge_multimodal_train_inputs(deltas: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -306,18 +285,16 @@ def _merge_multimodal_train_inputs(deltas: list[dict[str, Any]]) -> dict[str, An
 
 def _extend_media_data(base: list[str], delta: list[str] | None) -> list[str]:
     if delta:
-        base.extend(list(delta))
+        base.extend(delta)
     return base
 
 
-def _merge_export_metadata(static_metadata: dict[str, Any], export_patch: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(static_metadata)
-    patch = copy.deepcopy(export_patch)
-    patch_trace = patch.pop(TRACE_KEY, None)
-    if patch_trace is not None:
-        merged[TRACE_KEY] = merge_agentic_trace(merged.get(TRACE_KEY), patch_trace)
-    merged.update(patch)
-    return merged
+def _merge_export_metadata(target: dict[str, Any], overlay: dict[str, Any]) -> None:
+    overlay = copy.deepcopy(overlay)
+    overlay_trace = overlay.pop(TRACE_KEY, None)
+    if overlay_trace is not None:
+        target[TRACE_KEY] = merge_agentic_trace(target.get(TRACE_KEY), overlay_trace)
+    target.update(overlay)
 
 
 def _sum_counter_dict(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
@@ -344,7 +321,10 @@ def _multimodal_inputs_from_messages(messages: list[dict[str, Any]]) -> dict[str
         # "audio": [],
     }
     for message in messages:
-        for item in iter_message_content_parts(message):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
             item_type = item.get("type")
             if item_type == "image_url" and item.get("image_url") is not None:
                 multimodal_inputs["images"].append(copy.deepcopy(item["image_url"]["url"]))
@@ -366,7 +346,6 @@ class MsgNode:
     messages_delta: list[dict[str, Any]] = field(default_factory=list)
     train_token_delta: list[int] = field(default_factory=list)
     rollout_token_delta: list[int] = field(default_factory=list)
-    loss_mask_delta: list[int] = field(default_factory=list)
     logprob_delta: list[float] = field(default_factory=list)
     multimodal_train_inputs_delta: dict[str, Any] | None = None
     backend_image_data_delta: list[str] = field(default_factory=list)
@@ -380,20 +359,21 @@ class MsgNode:
     wall_elapsed_s: float = 0.0
     generation_elapsed_s: float = 0.0
     status: str | None = None
-    reward: float | dict[str, Any] | None = None
-    remove_sample: bool = False
-    teacher_log_probs: list[float] | None = None
     rollout_routed_experts: Any = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(eq=False)
 class InflightRequest:
     request_id: str
     parent_state_hash: str
     rollout_id: int
     kind: RequestKind
     abort_count: int
+    waiter: asyncio.Future[dict[str, Any]] = field(repr=False)
+    wall_started_at: float
+    runner_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    backend_started: bool = False
     sampling_params: dict[str, Any] = field(default_factory=dict)
     logprobs: bool = False
     history_train_token_prefix: list[int] = field(default_factory=list)
@@ -401,21 +381,16 @@ class InflightRequest:
     history_backend_image_data: list[str] = field(default_factory=list)
     history_backend_audio_data: list[str] = field(default_factory=list)
     history_backend_video_data: list[str] = field(default_factory=list)
-    pending_train_token_delta: list[int] = field(default_factory=list)
-    pending_rollout_token_delta: list[int] = field(default_factory=list)
-    pending_loss_mask_delta: list[int] = field(default_factory=list)
+    pending_token_delta: list[int] = field(default_factory=list)
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
-    pending_wall_elapsed_s: float = 0.0
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
     pending_routed_experts: Any = None
     pending_export_metadata_patch: dict[str, Any] = field(default_factory=dict)
     latest_backend_meta: dict[str, Any] = field(default_factory=dict)
-    backend_started: bool = False
-    runner_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -438,7 +413,6 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
-    children_by_hash: dict[str, list[str]] = field(default_factory=dict)
 
     @classmethod
     def create_empty(
@@ -451,8 +425,6 @@ class SessionForest:
         train_metadata: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "SessionForest":
-        if not isinstance(session_id, str) or not session_id:
-            raise ValueError("session_id is required for SessionForest.create_empty")
         static_metadata = copy.deepcopy(metadata or {})
         forest = cls(
             session_id=session_id,
@@ -508,10 +480,10 @@ class SessionForest:
                 messages.extend(copy.deepcopy(node.messages_delta))
         return messages
 
-    def rollout_token_count(self, state_hash: str) -> int:
+    def train_token_count(self, state_hash: str) -> int:
         total = 0
         for node in self.lineage(state_hash):
-            total += len(node.rollout_token_delta)
+            total += len(node.train_token_delta)
         return total
 
     def build_execution_prefix(self, state_hash: str) -> ExecutionPrefix:
@@ -576,10 +548,7 @@ class SessionForest:
         self.nodes_by_hash[node.state_hash] = node
         if node.parent_state_hash is not None:
             self.leaf_state_hashes.add(node.state_hash)
-            children = self.children_by_hash.setdefault(node.parent_state_hash, [])
-            if node.state_hash not in children:
-                children.append(node.state_hash)
-                self.leaf_state_hashes.discard(node.parent_state_hash)
+            self.leaf_state_hashes.discard(node.parent_state_hash)
         return node
 
     def _next_state_hash(
@@ -632,18 +601,16 @@ class SessionForest:
                 rollout_id=rollout_id,
                 abort_count=abort_count,
                 messages_delta=messages_delta,
-                train_token_delta=list(train_token_delta),
-                rollout_token_delta=list(rollout_token_delta),
-                loss_mask_delta=[],
-                logprob_delta=[],
-                multimodal_train_inputs_delta=_copy_dict_of_lists(multimodal_train_inputs_delta),
-                backend_image_data_delta=list(backend_image_data_delta or []),
-                backend_audio_data_delta=list(backend_audio_data_delta or []),
-                backend_video_data_delta=list(backend_video_data_delta or []),
+                train_token_delta=train_token_delta,
+                rollout_token_delta=rollout_token_delta,
+                multimodal_train_inputs_delta=multimodal_train_inputs_delta,
+                backend_image_data_delta=backend_image_data_delta if backend_image_data_delta is not None else [],
+                backend_audio_data_delta=backend_audio_data_delta if backend_audio_data_delta is not None else [],
+                backend_video_data_delta=backend_video_data_delta if backend_video_data_delta is not None else [],
                 tools=tools,
                 chat_template_kwargs=chat_template_kwargs,
-                wall_elapsed_s=float(wall_elapsed_s),
-                generation_elapsed_s=float(generation_elapsed_s),
+                wall_elapsed_s=wall_elapsed_s,
+                generation_elapsed_s=generation_elapsed_s,
             )
         )
 
@@ -654,9 +621,7 @@ class SessionForest:
         rollout_id: int,
         abort_count: int,
         messages_delta: list[dict[str, Any]],
-        train_token_delta: list[int],
-        rollout_token_delta: list[int],
-        loss_mask_delta: list[int] | None = None,
+        token_delta: list[int],
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
         spec_delta: dict[str, int] | None = None,
@@ -664,9 +629,6 @@ class SessionForest:
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
         status: str = "completed",
-        reward: float | dict[str, Any] | None = None,
-        remove_sample: bool = False,
-        teacher_log_probs: list[float] | None = None,
         rollout_routed_experts: Any = None,
         export_metadata_patch: dict[str, Any] | None = None,
     ) -> MsgNode:
@@ -684,23 +646,19 @@ class SessionForest:
                 rollout_id=rollout_id,
                 abort_count=abort_count,
                 messages_delta=messages_delta,
-                train_token_delta=list(train_token_delta),
-                rollout_token_delta=list(rollout_token_delta),
-                loss_mask_delta=list(loss_mask_delta)
-                if loss_mask_delta is not None
-                else ([1] * len(train_token_delta)),
-                logprob_delta=list(logprob_delta),
-                weight_version_delta=[str(item) for item in (weight_version_delta or [])],
-                spec_delta=_sum_counter_dict(dict(_EMPTY_SPEC_DELTA), spec_delta or {}),
-                prefix_cache_delta=_sum_counter_dict(dict(_EMPTY_PREFIX_CACHE_DELTA), prefix_cache_delta or {}),
-                wall_elapsed_s=float(wall_elapsed_s),
-                generation_elapsed_s=float(generation_elapsed_s),
-                status=str(status),
-                reward=copy.deepcopy(reward),
-                remove_sample=remove_sample,
-                teacher_log_probs=copy.deepcopy(teacher_log_probs),
-                rollout_routed_experts=copy.deepcopy(rollout_routed_experts),
-                export_metadata_patch=copy.deepcopy(export_metadata_patch or {}),
+                train_token_delta=token_delta,
+                rollout_token_delta=token_delta,
+                logprob_delta=logprob_delta,
+                weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+                spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
+                prefix_cache_delta=prefix_cache_delta
+                if prefix_cache_delta is not None
+                else dict(_EMPTY_PREFIX_CACHE_DELTA),
+                wall_elapsed_s=wall_elapsed_s,
+                generation_elapsed_s=generation_elapsed_s,
+                status=status,
+                rollout_routed_experts=rollout_routed_experts,
+                export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
             )
         )
 
@@ -716,6 +674,7 @@ class SessionForest:
             "rollout_id": node.rollout_id,
             "request_id": patch.get("request_id"),
             "request_kind": patch.get("request_kind"),
+            "admission": patch.get("admission"),
             "base_state_hash": patch.get("base_state_hash"),
             "abort_count": node.abort_count,
             "status": str(node.status),
@@ -730,11 +689,8 @@ class SessionForest:
         *,
         leaf_state_hash: str,
         tokenizer: Any,
-        # mask_offpolicy_in_partial_rollout: bool = False,
     ) -> Sample:
         lineage = self.lineage(leaf_state_hash)
-        if not lineage:
-            raise ValueError(f"Unknown state hash: {leaf_state_hash}")
         leaf = lineage[-1]
 
         tokens: list[int] = []
@@ -744,6 +700,7 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
+        response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
@@ -751,7 +708,6 @@ class SessionForest:
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
         first_response_node: MsgNode | None = None
-        last_response_status: str | None = None
 
         for idx, node in enumerate(lineage):
             tokens.extend(node.train_token_delta)
@@ -764,14 +720,11 @@ class SessionForest:
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
-                if node.status is not None:
-                    last_response_status = node.status
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
+                response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
-                node_loss_mask = list(node.loss_mask_delta)
-                # if mask_offpolicy_in_partial_rollout and node.rollout_id < leaf.rollout_id:
-                #     node_loss_mask = [0] * len(node_loss_mask)
-                loss_mask.extend(node_loss_mask)
+                response_node_spans.append([response_start, len(continuation_train_tokens)])
+                loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
@@ -780,19 +733,15 @@ class SessionForest:
             if idx == 0 or first_response_node is None:
                 continue
             continuation_train_tokens.extend(node.train_token_delta)
-            loss_mask.extend(node.loss_mask_delta or ([0] * len(node.train_token_delta)))
+            loss_mask.extend([0] * len(node.train_token_delta))
             rollout_log_probs.extend(node.logprob_delta or ([0.0] * len(node.train_token_delta)))
 
         if first_response_node is None:
             raise ValueError("A sample export leaf must have at least one resp node in its lineage.")
         prompt_train_token_count = len(tokens) - len(continuation_train_tokens)
-        if prompt_train_token_count < 0:
-            raise RuntimeError(
-                "SessionForest export has more continuation train tokens than total train tokens: "
-                f"total={len(tokens)}, continuation={len(continuation_train_tokens)}."
-            )
         effective_prompt = _decode_tokens(tokenizer=tokenizer, token_ids=tokens[:prompt_train_token_count])
-        merged_metadata = _merge_export_metadata(self.static_metadata, leaf.export_metadata_patch)
+        merged_metadata = copy.deepcopy(self.static_metadata)
+        _merge_export_metadata(merged_metadata, leaf.export_metadata_patch)
         if "start_rollout_id" not in merged_metadata:
             merged_metadata["start_rollout_id"] = first_response_node.rollout_id
         subtree_root = lineage[1] if len(lineage) > 1 else None
@@ -800,12 +749,13 @@ class SessionForest:
         merged_metadata["chat_template_kwargs"] = (
             normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
         )
+        status = Sample.Status.TRUNCATED if leaf.kind == "obs" else Sample.Status(leaf.status)
         trace = merge_agentic_trace(merged_metadata.get(TRACE_KEY), None)
         trace.update(
             {
                 "session_id": self.session_id,
                 "leaf_state_hash": leaf_state_hash,
-                "terminal_status": str(leaf.status or ""),
+                "terminal_status": status.value,
                 "turn_count": len(turns),
                 "turns": turns,
             }
@@ -816,12 +766,6 @@ class SessionForest:
         # path) see a single source of truth without having to know about
         # ``agentic_trace``.
         merged_metadata["rollout_turns"] = len(turns)
-        if leaf.kind == "obs":
-            status = Sample.Status.TRUNCATED.value
-        else:
-            status = leaf.status
-        if status is None:
-            status = last_response_status or Sample.Status.COMPLETED.value
         sample = Sample(
             group_index=self.group_index,
             index=self.index,
@@ -833,15 +777,13 @@ class SessionForest:
             response=_decode_tokens(tokenizer=tokenizer, token_ids=continuation_train_tokens),
             response_length=len(continuation_train_tokens),
             label=self.label,
-            reward=copy.deepcopy(leaf.reward),
+            custom_advantage=response_node_spans,
             loss_mask=loss_mask,
             weight_versions=weight_versions,
             rollout_log_probs=rollout_log_probs,
             rollout_routed_experts=copy.deepcopy(leaf.rollout_routed_experts),
-            remove_sample=leaf.remove_sample,
             abort_count=leaf.abort_count,
-            teacher_log_probs=copy.deepcopy(leaf.teacher_log_probs),
-            status=Sample.Status(str(status)),
+            status=status,
             metadata=merged_metadata,
             train_metadata=copy.deepcopy(self.train_metadata),
             session_id=self.session_id,

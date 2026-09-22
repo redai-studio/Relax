@@ -36,7 +36,7 @@ def _install_fake_teacher_manager(monkeypatch, captured):
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.teacher_manager", teacher_manager_module)
 
 
-def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypatch):
+def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypatch, tmp_path):
     import ray
 
     from relax.utils.opd.opd_utils import create_managed_opd_teacher_manager
@@ -49,7 +49,13 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
         lambda ref: ["http://teacher/generate"] if ref == "get_urls-ref" else None,
     )
 
-    args = SimpleNamespace(offload_rollout=True)
+    autoscaler_config = tmp_path / "autoscaler.yaml"
+    autoscaler_config.write_text("enabled: true\n")
+    args = SimpleNamespace(
+        offload_rollout=True,
+        autoscaler_config=str(autoscaler_config),
+        enable_affinity=True,
+    )
     manager, urls = create_managed_opd_teacher_manager(
         args,
         num_replicas=1,
@@ -66,6 +72,7 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
         "num_cpus": 1,
         "num_gpus": 0,
         "runtime_env": {"env_vars": {"A": "B"}},
+        "resources": {"stable_cpu": 1},
     }
     assert captured["remote_args"] == (args, 1, 4)
     assert captured["remote_kwargs"] == {

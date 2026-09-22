@@ -8,6 +8,10 @@ from typing import Any
 from relax.utils.env import Envs
 
 
+def report_train_start(config: Any) -> None:
+    pass
+
+
 def try_import_telemetry_hook(logger: Any = None) -> None:
     """Import the optional telemetry hook without affecting training."""
     hook = Envs.RELAX_TELEMETRY_HOOK

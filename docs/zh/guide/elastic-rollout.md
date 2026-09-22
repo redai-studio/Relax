@@ -23,6 +23,9 @@
 弹性扩缩容仅在全异步模式下可用。在全异步模式中，Rollout 独占 GPU 资源并作为独立服务运行，天然适合弹性扩缩。关于全异步模式的更多信息，请参阅 [全异步训练流水线](./fully-async-training.md)。
 :::
 
+如需可直接运行的 Qwen3-4B 配置，以及基于 Autoscaler 的扩缩容和外部优雅抢占
+要求，请参阅[弹性 Rollout recipe](../examples/elastic-rollout.md)。
+
 ______________________________________________________________________
 
 ## 设计特色
@@ -269,6 +272,33 @@ Direct Sync 期间会设置 `_is_weight_updating = True`，阻止并发的权重
 ::: warning
 权重同步失败时，scaled-out 引擎将使用旧权重处理请求。如果对权重一致性要求严格，可以在 Router 中先标记为不健康，权重同步完成后再标记为健康。
 :::
+
+### 权重同步预检查（precheck）
+
+扩容权重同步前，Relax 会先跑一次独立的 NCCL 预检查，在不影响 seed engine 的前提下确认新引擎能与 seed 建立兼容的 NCCL 通信域。预检查失败即 **fail-closed**：扩容请求被拒、新引擎不接收权重、不进入业务——避免将有问题的引擎接入 Router 后，才在权重同步阶段导致整组 NCCL 通信域失败、引发全局重启回 step 0。
+
+#### 两阶段流程
+
+| 阶段 | 做什么 | 成本 | 失败类别 |
+| --- | --- | --- | --- |
+| Stage 1 · env 指纹 | 比较 seed 与新引擎的 NCCL 传输 env（一次 RPC，无 NCCL、无子进程） | 极低 | `NCCL_PRECHECK_TRANSPORT_MISMATCH` |
+| Stage 2 · NCCL 探针 | 在新引擎节点拉起独立子进程跑一次 all_reduce，复用该引擎的 GPU / Python / NCCL env | 几十秒 + 一个 CUDA context | `PROBE_FAILED` / `INSUFFICIENT_GPU_MEMORY` / `TIMEOUT` 等 |
+
+只有 Stage 1 通过才会跑 Stage 2；Stage 2 失败同样 fail-closed。探针走独立子进程，不碰 seed engine 的 ModelRunner 通信域，失败也不污染既有引擎。
+
+#### 主开关
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| `--scale-weight-sync-precheck` / `--no-scale-weight-sync-precheck` | **开（opt-out）** | 启/关整个预检查。默认开；仅在确信 seed 与新引擎环境完全一致、且想省掉 Stage 2 探针时间时关闭。关闭即放弃 fail-closed 保护，扩容将直接进入权重同步。 |
+
+#### 传输环境一致性要求
+
+Stage 1 会比较 seed 与新引擎的 NCCL 传输环境变量，因此**新引擎必须与 seed engine 保持一致的 NCCL 传输环境**，尤其是 `NCCL_IB_DISABLE`、`NCCL_SOCKET_IFNAME`、`NCCL_IB_HCA`、`NCCL_IB_GID_INDEX`。其中 `NCCL_IB_DISABLE` 一边启用 IB、一边禁用（未设置 / `"0"` / `"false"` 视为启用；`"1"` / `"true"` 视为禁用）会直接硬拒 `nccl_ib_disable_mismatch`，不进入 Stage 2 探针。
+
+#### GPU 显存门槛
+
+Stage 2 探针需要在新引擎 GPU 上建一个额外 CUDA context + 少量 NCCL buffer（几百 MB）。SGLang 默认预留 85–90% 显存，健康引擎空闲显存常不足 2 GiB。预检查设有一个现实下限（默认 512 MiB，可经 `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` 调整），低于该值返回 `INSUFFICIENT_GPU_MEMORY` 并 fail-closed，避免探针 OOM 干扰在跑的 ModelRunner。预检查相关 env 见 [配置参考 · Precheck 环境变量](./configuration.md#precheck-环境变量)。
 
 ______________________________________________________________________
 
@@ -674,8 +704,15 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### 基线节点组亲和性
 
 启用 autoscaler 配置后，Relax 会将 actor、critic、reference、rollout-seed 和 colocate 的基线 placement group
-固定到 `stable` worker group，弹性 rollout 引擎不受此约束。集群必须发布 `stable_gpu` 和 `stable_cpu` Ray
-自定义资源；资源不可用时 Relax 会快速失败。可通过 `--no-enable-affinity` 关闭该约束。
+固定到初始节点组，弹性 rollout 引擎不受此约束。节点组前缀由 `RELAX_INITIAL_NODE_GROUP` 设置，默认为
+`stable`；集群必须发布对应的 `<prefix>_gpu` 和 `<prefix>_cpu` Ray 自定义资源。例如设置
+`RELAX_INITIAL_NODE_GROUP=baseline` 时，需要提供 `baseline_gpu` 和 `baseline_cpu`。任一标记资源不可用时
+Relax 会快速失败；没有标记资源的集群可通过 `--no-enable-affinity` 关闭该约束。
+
+该 affinity 的作用是把固定训练基线放到平台定义的稳定、不可抢占 worker group。为弹性 Rollout Engine
+创建的 Placement Group 不申请节点组标记资源，因此可以使用任意满足条件的容量，也可能被调度到可抢占
+worker。这个环境变量只负责选择固定基线所在的节点组，并不会让该节点组自动具备不可抢占性；节点组的
+可用性、稳定性和抢占策略需要由 Ray 集群、Kubernetes 配置或外部资源平台保障。
 
 #### 配置文件格式
 

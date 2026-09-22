@@ -5,10 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-import megatron.bridge.training.model_load_save as _model_load_save_module
-import safetensors.torch as _safetensors_torch
 import torch
-from megatron.bridge import AutoBridge
 
 
 _RELAX_ROOT = str(Path(__file__).resolve().parents[2])
@@ -22,12 +19,190 @@ _pythonpath_entries = [
 os.environ["PYTHONPATH"] = os.pathsep.join([_RELAX_ROOT, *_pythonpath_entries])
 
 
+_model_load_save_module = None
+_original_load_model_config = None
+_original_save_file = None
+_provider_override = {}
+_lora_checkpoint_spec = None
+
+
+def _resolve_checkpoint_dir(input_dir):
+    checkpoint_dir = Path(input_dir)
+    latest_file = checkpoint_dir / "latest_checkpointed_iteration.txt"
+    if latest_file.is_file():
+        tag = latest_file.read_text().strip()
+        iteration_dir = checkpoint_dir / f"iter_{int(tag):07d}"
+        if iteration_dir.is_dir():
+            checkpoint_dir = iteration_dir
+    return checkpoint_dir
+
+
+def _read_checkpoint_metadata(input_dir):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    return FileSystemReader(_resolve_checkpoint_dir(input_dir)).read_metadata()
+
+
+def _build_lora_checkpoint_spec(metadata):
+    """Describe the LoRA structure stored in a torch-dist checkpoint.
+
+    Full module paths are recovered from the checkpoint instead of recomputing
+    scope/freeze rules from launcher-only environment variables. This makes the
+    converter recreate exactly the adapters that were actually saved, including
+    merger-only vision LoRA and per-expert grouped MoE adapters.
+    """
+    adapter_shapes = {}
+    for key, value in metadata.state_dict_metadata.items():
+        if ".adapter." not in key or not key.endswith(".weight"):
+            continue
+        size = getattr(value, "size", None)
+        if size is not None:
+            adapter_shapes[key] = tuple(size)
+
+    if not adapter_shapes:
+        return None
+
+    suffixes = (".adapter.linear_in.weight", ".adapter.linear_out.weight")
+    pairs = {}
+    unrecognized = []
+    for key in adapter_shapes:
+        for side, suffix in zip(("in", "out"), suffixes):
+            if key.endswith(suffix):
+                pairs.setdefault(key[: -len(suffix)], {})[side] = key
+                break
+        else:
+            unrecognized.append(key)
+
+    if unrecognized:
+        raise ValueError(
+            f"Checkpoint contains {len(unrecognized)} unsupported adapter weight key(s), "
+            f"e.g. {sorted(unrecognized)[:3]}"
+        )
+    incomplete = sorted(prefix for prefix, pair in pairs.items() if set(pair) != {"in", "out"})
+    if incomplete:
+        raise ValueError(f"Checkpoint contains {len(incomplete)} incomplete LoRA adapter pair(s): {incomplete[:3]}")
+
+    ranks = set()
+    for pair in pairs.values():
+        in_shape = adapter_shapes[pair["in"]]
+        out_shape = adapter_shapes[pair["out"]]
+        if len(in_shape) not in (2, 3) or len(out_shape) != len(in_shape):
+            raise ValueError(f"Unsupported LoRA adapter shapes: linear_in={in_shape}, linear_out={out_shape}")
+        ranks.add(in_shape[-2])
+        if out_shape[-1] != in_shape[-2]:
+            raise ValueError(f"LoRA rank mismatch: linear_in={in_shape}, linear_out={out_shape}")
+
+    if len(ranks) != 1:
+        raise ValueError(
+            f"Checkpoint contains multiple LoRA ranks {sorted(ranks)}; automatic reconstruction is unsafe"
+        )
+
+    model_targets = {_checkpoint_adapter_prefix_to_model_target(prefix) for prefix in pairs}
+    if len(model_targets) != len(pairs):
+        raise ValueError("Multiple checkpoint LoRA paths collapse to the same model module path")
+
+    return {
+        "rank": ranks.pop(),
+        "target_modules": sorted(model_targets),
+        "adapter_keys": set(adapter_shapes),
+        "share_expert_adapters": not any(len(shape) == 3 for shape in adapter_shapes.values()),
+    }
+
+
+def _checkpoint_adapter_prefix_to_model_target(prefix):
+    target = prefix.replace(".mlp.experts.experts.", ".mlp.experts.")
+    vision_layers_prefix = "vision_model.decoder.layers."
+    if target.startswith(vision_layers_prefix):
+        suffix = target[len(vision_layers_prefix) :]
+        first_component = suffix.split(".", 1)[0]
+        if not first_component.isdigit():
+            # Qwen3-VL's vision sharded_state_dict collapses the physical layer
+            # index into the ShardedTensor offsets. Recreate every concrete
+            # vision layer with a wildcard; adapter coverage below still checks
+            # the persistent DCP keys exactly before any weights are loaded.
+            target = f"{vision_layers_prefix}*.{suffix}"
+    return target
+
+
+def _assert_adapter_coverage(expected, actual):
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "LoRA checkpoint/model structure mismatch before torch-dist load: "
+            f"missing={len(missing)} {missing[:3]}, unexpected={len(unexpected)} {unexpected[:3]}"
+        )
+
+
+def _adapter_checkpoint_keys_from_model(model_chunks):
+    actual = set()
+    for chunk in model_chunks:
+        for dict_key, sharded_value in chunk.sharded_state_dict().items():
+            checkpoint_key = getattr(sharded_value, "key", dict_key)
+            if ".adapter." in checkpoint_key and checkpoint_key.endswith(".weight"):
+                actual.add(checkpoint_key)
+    return actual
+
+
+def _register_lora_hook(provider, checkpoint_args, spec):
+    if checkpoint_args is None:
+        raise ValueError(
+            "LoRA checkpoint detected, but its training args are unavailable; refusing a base-only export"
+        )
+
+    rank = getattr(checkpoint_args, "lora_rank", None)
+    alpha = getattr(checkpoint_args, "lora_alpha", None)
+    if rank != spec["rank"]:
+        raise ValueError(f"LoRA rank mismatch: checkpoint args={rank}, adapter tensors={spec['rank']}")
+    if alpha is None:
+        raise ValueError("LoRA checkpoint args do not contain lora_alpha; automatic merge is unsafe")
+
+    peft_config = {
+        "rank": rank,
+        "alpha": alpha,
+        "dropout": getattr(checkpoint_args, "lora_dropout", 0.0),
+        "bias": "none",
+        "target_modules": spec["target_modules"],
+        "share_expert_adapters": spec["share_expert_adapters"],
+        "normalize_moe_lora": getattr(checkpoint_args, "normalize_moe_lora", False),
+    }
+
+    def apply_checkpoint_lora(model_chunks):
+        try:
+            from megatron.bridge.peft.utils import create_peft
+        except ImportError:
+            # Older Bridge revisions expose LoRA directly but not the config
+            # factory. Keep this fallback strict: unsupported constructor fields
+            # (notably per-expert adapters) must raise instead of being dropped.
+            from megatron.bridge.peft.lora import LoRA
+
+            peft = LoRA(
+                target_modules=peft_config["target_modules"],
+                dim=peft_config["rank"],
+                alpha=peft_config["alpha"],
+                dropout=peft_config["dropout"],
+                share_expert_adapters=peft_config["share_expert_adapters"],
+                normalize_moe_lora=peft_config["normalize_moe_lora"],
+            )
+        else:
+            peft = create_peft(peft_config)
+        model_chunks = peft(model_chunks, training=False)
+        actual = _adapter_checkpoint_keys_from_model(model_chunks)
+        _assert_adapter_coverage(spec["adapter_keys"], actual)
+        print(
+            f"[convert] Reconstructed {len(actual) // 2} LoRA module(s): rank={rank}, alpha={alpha}, "
+            f"share_expert_adapters={spec['share_expert_adapters']}"
+        )
+        return model_chunks
+
+    provider.register_pre_wrap_hook(apply_checkpoint_lora)
+
+
 # Some megatron_to_hf mappings in Megatron Bridge yield non-contiguous tensors (e.g. after
 # transpose/narrow/chunk without a trailing .contiguous()). The shared-tensor dedup check in
 # safetensors.save_file runs `tensor.view(-1)[-1]`, which raises
 # "view size is not compatible with input tensor's size and stride" on such tensors.
 # Force .contiguous() at the save boundary as a safety net.
-_original_save_file = _safetensors_torch.save_file
 
 
 def _save_file_ensure_contiguous(tensors, filename, metadata=None):
@@ -42,39 +217,44 @@ def _save_file_ensure_contiguous(tensors, filename, metadata=None):
     return _original_save_file(fixed, filename, metadata=metadata)
 
 
-_safetensors_torch.save_file = _save_file_ensure_contiguous
-
-
 # Here we need to patch Megatron Bridge's `load_model_config`, since the checkpoint is saved
 # by Megatron and lack of provider information.
-_provider_override = {}
-_original_load_model_config = _model_load_save_module.load_model_config
-
-
 def _patched_load_model_config(checkpoint_path):
-    model_cfg, mlm_args = _original_load_model_config(checkpoint_path)
     provider = _provider_override.get("provider")
     if provider is not None:
-        from megatron.bridge.models.model_provider import ModelProviderMixin
+        # The HF Bridge provider replaces the MLM TransformerConfig. Load only the
+        # checkpoint Namespace here: converting old Relax args into the current
+        # TransformerConfig can fail on newly-added fields even though that config
+        # would immediately be discarded below.
+        from megatron.bridge.training.mlm_compat.arguments import _load_args_from_checkpoint
 
-        if not isinstance(model_cfg, ModelProviderMixin):
-            # A list-valued MoE pattern makes TransformerBlock use layer-indexed
-            # distributed-checkpoint keys. Preserve that representation from the
-            # checkpoint even when it is semantically equivalent to provider's
-            # integer value (for example, [1] * num_layers versus 1).
-            checkpoint_moe_layer_freq = getattr(model_cfg, "moe_layer_freq", None)
-            if isinstance(checkpoint_moe_layer_freq, list):
-                provider.moe_layer_freq = checkpoint_moe_layer_freq
-                print(
-                    "[convert] Preserving checkpoint moe_layer_freq list "
-                    f"({len(checkpoint_moe_layer_freq)} layers) for sharded key compatibility"
-                )
-            print(f"[convert] Overriding MLM TransformerConfig with Bridge provider: {type(provider).__name__}")
-            return provider, mlm_args
-    return model_cfg, mlm_args
+        mlm_args = _load_args_from_checkpoint(checkpoint_path)
+        checkpoint_moe_layer_freq = getattr(mlm_args, "moe_layer_freq", None)
+        if isinstance(checkpoint_moe_layer_freq, list):
+            provider.moe_layer_freq = checkpoint_moe_layer_freq
+            print(
+                "[convert] Preserving checkpoint moe_layer_freq list "
+                f"({len(checkpoint_moe_layer_freq)} layers) for sharded key compatibility"
+            )
+        if _lora_checkpoint_spec is not None and not getattr(provider, "_relax_lora_export_hook", False):
+            _register_lora_hook(provider, mlm_args, _lora_checkpoint_spec)
+            provider._relax_lora_export_hook = True
+        print(f"[convert] Overriding MLM TransformerConfig with Bridge provider: {type(provider).__name__}")
+        return provider, mlm_args
+    return _original_load_model_config(checkpoint_path)
 
 
-_model_load_save_module.load_model_config = _patched_load_model_config
+def _initialize_bridge_patches():
+    global _model_load_save_module, _original_load_model_config, _original_save_file
+
+    import megatron.bridge.training.model_load_save as model_load_save_module
+    import safetensors.torch as safetensors_torch
+
+    _model_load_save_module = model_load_save_module
+    _original_load_model_config = model_load_save_module.load_model_config
+    _original_save_file = safetensors_torch.save_file
+    model_load_save_module.load_model_config = _patched_load_model_config
+    safetensors_torch.save_file = _save_file_ensure_contiguous
 
 
 def _checkpoint_has_mtp(input_dir):
@@ -85,19 +265,23 @@ def _checkpoint_has_mtp(input_dir):
     checkpoint directory. Detection reads the torch DCP `.metadata` and looks
     for any `mtp` key.
     """
-    from torch.distributed.checkpoint import FileSystemReader
-
-    ckpt_dir = input_dir
-    latest_file = os.path.join(input_dir, "latest_checkpointed_iteration.txt")
-    if os.path.exists(latest_file):
-        with open(latest_file) as f:
-            tag = f.read().strip()
-        iter_dir = os.path.join(input_dir, f"iter_{int(tag):07d}")
-        if os.path.isdir(iter_dir):
-            ckpt_dir = iter_dir
-
-    metadata = FileSystemReader(ckpt_dir).read_metadata()
+    metadata = _read_checkpoint_metadata(input_dir)
     return any("mtp" in k.lower() for k in metadata.state_dict_metadata)
+
+
+def _export_checkpoint(bridge, input_dir, output_dir, strict):
+    """Load torch-dist weights and explicitly merge any reconstructed LoRA on
+    HF export."""
+    from megatron.bridge.training.model_load_save import temporary_distributed_context
+
+    with temporary_distributed_context(backend="gloo"):
+        megatron_model = bridge.load_megatron_model(input_dir, wrap_with_ddp=False)
+        bridge.save_hf_pretrained(
+            megatron_model,
+            output_dir,
+            strict=strict,
+            merge_adapter_weights=True,
+        )
 
 
 if __name__ == "__main__":
@@ -149,6 +333,19 @@ if __name__ == "__main__":
         help="Target FP8 safetensors shard size in MiB; one converted tensor group may exceed it (default: 4096).",
     )
     args = parser.parse_args()
+
+    _initialize_bridge_patches()
+    from megatron.bridge import AutoBridge
+
+    checkpoint_metadata = _read_checkpoint_metadata(args.input_dir)
+    _lora_checkpoint_spec = _build_lora_checkpoint_spec(checkpoint_metadata)
+    if _lora_checkpoint_spec is None:
+        print("[convert] No LoRA adapter weights detected; exporting the full checkpoint directly")
+    else:
+        print(
+            f"[convert] Detected {len(_lora_checkpoint_spec['adapter_keys']) // 2} LoRA module(s); "
+            "they will be reconstructed and merged into the exported HF weights"
+        )
 
     if args.fp8:
         try:
@@ -216,13 +413,18 @@ if __name__ == "__main__":
 
     print(f"Exporting checkpoint from {args.input_dir} to {args.output_dir}")
     try:
-        bridge.export_ckpt(args.input_dir, args.output_dir, strict=args.fp8 and not allow_missing_mtp_keys)
+        _export_checkpoint(
+            bridge,
+            args.input_dir,
+            args.output_dir,
+            strict=not allow_missing_mtp_keys,
+        )
     finally:
         if source is not None and original_save_generator is not None:
             source.save_generator = original_save_generator
 
-    # Work around a Megatron-Bridge bug: with strict=False, export_ckpt writes each
-    # incomplete shard without the tensors the checkpoint lacked (e.g. MTP), yet still
+    # Work around a Megatron-Bridge bug: when MTP is explicitly absent and strict=False,
+    # export_ckpt writes each incomplete shard without the missing MTP tensors, yet still
     # lists those keys in model.safetensors.index.json, producing "ghost" entries that
     # point at shards which do not contain them. Reconcile the index against the shards
     # and supplement missing MTP weights from the reference model so the export stays

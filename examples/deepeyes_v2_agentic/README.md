@@ -13,9 +13,13 @@ Reward = `0.8 * acc + 0.2 * format`, accuracy via LLM-judge, routed on
 
 ## One env var: `DATA_DIR`
 
-Everything keys off a single workspace dir. `scripts/prepare.sh` lays out:
+`scripts/prepare.sh` keeps the high-concurrency app environment on node-local
+storage and lays out shared data assets under `DATA_DIR`:
 
 ```
+${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/
+└── .venv/                           (host-side agent environment)
+
 ${DATA_DIR}/
 ├── sif/
 │   └── deepeyes_v2_kernel.sif       (~115 MiB, built locally)
@@ -45,13 +49,17 @@ bash examples/deepeyes_v2_agentic/scripts/prepare.sh
 
 What it does (all idempotent — skips done work on re-run):
 
-1. **SIF** — `apptainer build` from `apptainer_env/deepeyes_v2_kernel.def`, falls
+1. **App environment** — creates a reusable node-local `uv` virtual environment
+   with system site packages and installs the host-side `jupyter_client` used
+   to control the sandbox kernel. Its default location is
+   `/tmp/deepeyes-v2-app-env`; prepare the same path on every training node.
+2. **SIF** — `apptainer build` from `apptainer_env/deepeyes_v2_kernel.def`, falls
    back to `--fakeroot`, verifies kernel deps inside the SIF.
-2. **Train parquets** — downloads `honglyhly/DeepEyesV2_RL` (8 files, ~10 GiB)
-   via `HF_ENDPOINT=https://hf-mirror.com` (override if you have direct HF
-   access), then runs `convert_tool/rl_data_convert.py` to inject
+3. **Train parquets** — downloads `honglyhly/DeepEyesV2_RL` (8 files, ~10 GiB)
+   from the configured Hugging Face endpoint (default `https://huggingface.co`),
+   then runs `convert_tool/rl_data_convert.py` to inject
    `extra_info.data_source`.
-3. **Smoke parquet** — 4 synthetic rows covering all `data_source` values.
+4. **Smoke parquet** — 4 synthetic rows covering all `data_source` values.
 
 Skip individual steps with `SKIP_SIF=1 SKIP_TRAIN=1 SKIP_SMOKE=1`.
 
@@ -77,7 +85,8 @@ For ad-hoc debug with a synthetic input (no parquet needed):
 
 ```bash
 source examples/deepeyes_v2_agentic/env.sh
-python examples/deepeyes_v2_agentic/scripts/run_single_session.py
+${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python \
+    examples/deepeyes_v2_agentic/scripts/run_single_session.py
 ```
 
 ## Train (cluster)
@@ -85,7 +94,7 @@ python examples/deepeyes_v2_agentic/scripts/run_single_session.py
 `DATA_DIR` comes from `env.sh`. Also export `MODEL_DIR` + `SAVE_DIR`:
 
 ```bash
-export MODEL_DIR=...          # contains Qwen3-VL-30B-A3B-Thinking/
+export MODEL_DIR=...          # contains Qwen3.6-35B-A3B/ and Qwen2.5-1.5B-Instruct/
 export SAVE_DIR=...
 
 bash examples/deepeyes_v2_agentic/run_deepeyes_v2_agentic.sh
@@ -119,7 +128,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | Path                             | Role                                                                                     |
 | -------------------------------- | ---------------------------------------------------------------------------------------- |
 | `env.sh.example`                 | Template for the gitignored `env.sh` — set DATA_DIR + optional knobs                     |
-| `scripts/prepare.sh`             | Single prep entry point — SIF + train data + smoke parquet                               |
+| `scripts/prepare.sh`             | Single prep entry point — app environment + SIF + train data + smoke parquet             |
+| `scripts/prepare_app_env.sh`     | Reusable host-side agent environment                                                     |
 | `scripts/build_smoke_parquet.py` | Synthetic 4-row parquet generator (called by prepare.sh; also runnable standalone)       |
 | `scripts/run_single_session.py`  | Single-trajectory harness (parquet row or synthetic input)                               |
 | `app/agent.py`                   | Per-session agent driver                                                                 |
@@ -130,7 +140,7 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | `reward_deepeyes_v2.py`          | Post-trajectory scorer (data_source-routed, LLM-judge)                                   |
 | `convert_tool/`                  | `rl_data_convert.py` (data_source injection) + `cache_convert.py` (search cache rewrite) |
 | `apptainer_env/`                 | Apptainer image def + sandbox YAML config                                                |
-| `run_deepeyes_v2_agentic.sh`     | Full GRPO launch (Qwen3-VL-30B-A3B-Thinking, colocate)                                   |
+| `run_deepeyes_v2_agentic.sh`     | Full GRPO launch (Qwen3.6-35B-A3B, colocate)                                             |
 | `scripts/smoke.sh`               | Single-sample smoke wrapper (one trajectory through the full app, no Ray)                |
 | `run_agent_app.sh`               | Per-session wrapper invoked by Relax for each rollout                                    |
 | `sglang_judge_service.sh`        | Stands up the LLM-judge SGLang server                                                    |
@@ -138,8 +148,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 ## Pitfalls — read before debugging
 
 Adapting DeepEyes V2 on Relax's agentic stack has a set of recurring
-footguns (SGLang mamba IMA, agentic prepare-gate livelock, "step 1 keeps
-looping" caused by `--use-fault-tolerance` silently masking errors,
+footguns (SGLang mamba IMA, "step 1 keeps looping" caused by
+`--use-fault-tolerance` silently masking errors,
 reward tool-bonus divergence from upstream, …). Before opening py-spy,
 read [`PITFALLS.md`](./PITFALLS.md) — the top entry (don't enable
 `--use-fault-tolerance` during adaptation) alone will save hours.

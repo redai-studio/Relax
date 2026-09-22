@@ -23,6 +23,10 @@
 Elastic scaling is only available in Fully Async mode. In this mode, Rollout occupies dedicated GPU resources and runs as an independent service, making it naturally suited for elastic scaling. For more information about Fully Async mode, see [Fully Async Training Pipeline](./fully-async-training.md).
 :::
 
+For a runnable Qwen3-4B setup with Autoscaler-based scaling and external
+graceful-eviction requirements, see the
+[Elastic Rollout recipe](../examples/elastic-rollout.md).
+
 ______________________________________________________________________
 
 ## Design Highlights
@@ -290,6 +294,33 @@ During Direct Sync, `_is_weight_updating = True` is set to prevent concurrent we
 ::: warning
 When weight sync fails, scaled-out engines will serve requests with stale weights. If strict weight consistency is required, you can mark them as unhealthy in the Router first, then mark them healthy after sync completes.
 :::
+
+### Weight Sync Precheck
+
+Before scale-out weight sync, Relax runs an independent NCCL precheck that confirms a new engine can form a compatible NCCL communication domain with the seed engine, without touching the seed. A precheck failure is **fail-closed**: the scale-out request is rejected, the new engine receives no weights and is not admitted to business — avoiding placing a faulty engine in the router only to cause the whole NCCL group to fail during weight sync and force a global restart back to step 0.
+
+#### Two-Stage Flow
+
+| Stage | What it does | Cost | Failure category |
+| --- | --- | --- | --- |
+| Stage 1 · env fingerprint | Compares seed vs. new-engine NCCL transport env (one RPC, no NCCL, no subprocess) | Negligible | `NCCL_PRECHECK_TRANSPORT_MISMATCH` |
+| Stage 2 · NCCL probe | Launches an independent subprocess on the new engine's node to run one all_reduce, reusing that engine's GPU / Python / NCCL env | Tens of seconds + one CUDA context | `PROBE_FAILED` / `INSUFFICIENT_GPU_MEMORY` / `TIMEOUT`, etc. |
+
+Stage 2 only runs if Stage 1 passes; a Stage 2 failure is also fail-closed. The probe runs in an independent subprocess and never touches the seed engine's ModelRunner groups, so a failure does not pollute existing engines.
+
+#### Master Switch
+
+| Switch | Default | Description |
+| --- | --- | --- |
+| `--scale-weight-sync-precheck` / `--no-scale-weight-sync-precheck` | **On (opt-out)** | Enable/disable the whole precheck. On by default; disable only when you are certain seed and new-engine environments are identical and want to skip the Stage 2 probe time. Disabling drops the fail-closed protection — scale-out proceeds straight into weight sync. |
+
+#### Transport Env Consistency
+
+Stage 1 compares the seed and new-engine NCCL transport env, so a **new engine must keep its NCCL transport env consistent with the seed engine**, especially `NCCL_IB_DISABLE`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, and `NCCL_IB_GID_INDEX`. A mismatch on `NCCL_IB_DISABLE` — IB enabled on one side and disabled on the other (unset / `"0"` / `"false"` counts as enabled; `"1"` / `"true"` as disabled) — is hard-rejected as `nccl_ib_disable_mismatch` and Stage 2 is not run.
+
+#### GPU Memory Floor
+
+The Stage 2 probe needs an extra CUDA context plus small NCCL buffers (a few hundred MB) on the new engine's GPU. SGLang reserves 85–90% of VRAM by default, so a healthy engine often has less than 2 GiB free. The precheck enforces a realistic floor (default 512 MiB, tunable via `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES`); below it, the probe returns `INSUFFICIENT_GPU_MEMORY` and fails closed, avoiding probe OOM that would disturb the running ModelRunner. See [Configuration · Precheck env vars](./configuration.md#precheck-env-vars).
 
 ______________________________________________________________________
 
@@ -696,9 +727,17 @@ ray job submit -- python3 relax/entrypoints/train.py \
 #### Baseline Node-Group Affinity
 
 When the autoscaler configuration is enabled, Relax pins baseline actor, critic, reference, rollout-seed, and
-colocated placement groups to the `stable` worker group. Elastic rollout engines remain unpinned. The cluster must
-publish `stable_gpu` and `stable_cpu` Ray custom resources; Relax fails fast if they are unavailable. Use
-`--no-enable-affinity` to disable this constraint.
+colocated placement groups to the initial node group. Elastic rollout engines remain unpinned. The node-group prefix
+comes from `RELAX_INITIAL_NODE_GROUP` and defaults to `stable`; the cluster must publish matching `<prefix>_gpu` and
+`<prefix>_cpu` Ray custom resources. For example, `RELAX_INITIAL_NODE_GROUP=baseline` requires `baseline_gpu` and
+`baseline_cpu`. Relax fails fast if either marker is unavailable. Use `--no-enable-affinity` to disable this
+constraint on clusters without marker resources.
+
+The purpose of this affinity is to keep the fixed training baseline on a worker group that the platform treats as
+stable and non-preemptible. Placement groups created for elastic Rollout engines do not request the node-group
+markers, so they can use any eligible capacity and may be scheduled on preemptible workers. The environment variable
+only selects the baseline group; it does not make that group non-preemptible. The Ray cluster, Kubernetes setup, or
+external resource platform must enforce the group's availability and preemption policy.
 
 #### Configuration File Format
 

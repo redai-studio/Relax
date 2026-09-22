@@ -91,6 +91,128 @@ def test_streaming_tq_iterator_sampling_config_carries_window_quota(monkeypatch)
     assert "consumed_samples" not in config
 
 
+def test_get_data_from_transfer_queue_can_skip_per_rank_agreement(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    class _Meta:
+        size = 0
+
+    class _Client:
+        def get_meta(self, **kwargs):
+            return _Meta()
+
+    def fail_agreement(*args, **kwargs):
+        raise AssertionError("_agree_on_fetch should not run")
+
+    monkeypatch.setattr(stream_module, "_agree_on_fetch", fail_agreement)
+
+    data, meta = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=_Client(),
+        data_fields=["tokens"],
+        batch_size=1,
+        partition_id="partition",
+        task_name="task",
+        sampling_config={},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        synchronize_per_rank_fetch=False,
+    )
+
+    assert data is None
+    assert meta.size == 0
+
+
+def test_get_data_from_transfer_queue_rejects_disabled_agreement_without_per_rank_fetch(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    with pytest.raises(ValueError, match="requires per_rank_fetch=True"):
+        stream_module.get_data_from_transfer_queue(
+            args=Namespace(),
+            tq_client=object(),
+            data_fields=["tokens"],
+            batch_size=1,
+            partition_id="partition",
+            task_name="task",
+            sampling_config={},
+            batch_index=0,
+            per_rank_fetch=False,
+            synchronize_per_rank_fetch=False,
+        )
+
+
+def test_fetch_data_from_transfer_queue_returns_raw_cpu_payload(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    class _Meta:
+        size = 1
+
+    class _Client:
+        def __init__(self):
+            self.meta_kwargs = None
+
+        def get_meta(self, **kwargs):
+            self.meta_kwargs = kwargs
+            return _Meta()
+
+        def get_data(self, meta):
+            assert isinstance(meta, _Meta)
+            return {"tokens": [torch.tensor([1])]}
+
+    client = _Client()
+    raw_data, elapsed = stream_module.fetch_data_from_transfer_queue(
+        tq_client=client,
+        data_fields=["tokens"],
+        batch_size=2,
+        partition_id="sft_3",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 1},
+        batch_index=0,
+    )
+
+    assert raw_data[0]["tokens"][0].tolist() == [1]
+    assert raw_data[1].size == 1
+    assert elapsed >= 0
+    assert client.meta_kwargs["sampling_config"] == {"dp_rank": 1, "batch_index": 0, "partition_id": "sft_3"}
+
+
+def test_prefetched_raw_payload_skips_second_tq_rpc(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module.dist, "all_reduce", lambda tensor, op=None, group=None: None)
+    monkeypatch.setattr(stream_module.mpu, "get_tensor_and_context_parallel_group", lambda: object(), raising=False)
+
+    class _Meta:
+        size = 0
+
+    class _Client:
+        def get_meta(self, **kwargs):
+            raise AssertionError("prefetched payload must not fetch metadata again")
+
+        def get_data(self, meta):
+            raise AssertionError("prefetched payload must not fetch data again")
+
+    meta = _Meta()
+    rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=_Client(),
+        data_fields=["tokens"],
+        batch_size=2,
+        partition_id="sft_3",
+        task_name="sft_train",
+        sampling_config={"dp_rank": 1},
+        batch_index=0,
+        broadcast_pp=False,
+        per_rank_fetch=True,
+        prefetched_rollout_data=[None, meta],
+        prefetched_fetch_time_s=0.1,
+    )
+
+    assert rollout_data is None
+    assert batch_meta is meta
+
+
 def test_streaming_tq_iterator_finishes_on_window_drained_with_underfill(monkeypatch):
     """Regression for the fully-async DP-imbalance deadlock.
 
@@ -243,3 +365,135 @@ def test_streaming_tq_iterator_per_round_dummy_then_end(monkeypatch):
         next(iterator)
     assert iterator._mb_count == 4  # 2 real + 2 dummy → equal count with a busier DP
     assert iterator._sample_count == 2  # dummies don't count as samples
+
+
+def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(stream_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(stream_module.mpu, "get_context_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(stream_module, "_maybe_log_tgd_pickle_diag", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(stream_module, "post_process_rollout_data", lambda *_args, **_kwargs: None)
+
+    class _Meta:
+        size = 2
+
+    class _TQClient:
+        def get_meta(self, **kwargs):
+            return _Meta()
+
+        def get_data(self, batch_meta):
+            return {
+                "response_lengths": torch.nested.nested_tensor(
+                    [
+                        torch.tensor([512]),
+                        torch.tensor([135]),
+                    ],
+                    layout=torch.jagged,
+                ),
+                "total_lengths": torch.nested.nested_tensor(
+                    [
+                        torch.tensor([1309]),
+                        torch.tensor([842]),
+                    ],
+                    layout=torch.jagged,
+                ),
+                "raw_reward": torch.nested.nested_tensor(
+                    [
+                        torch.tensor([1.5]),
+                        torch.tensor([2.5]),
+                    ],
+                    layout=torch.jagged,
+                ),
+            }
+
+    rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
+        args=Namespace(),
+        tq_client=_TQClient(),
+        data_fields=["response_lengths", "total_lengths", "raw_reward"],
+        batch_size=2,
+        partition_id="train_0",
+        task_name="ref_log_probs",
+        sampling_config={},
+        batch_index=0,
+        broadcast_pp=False,
+    )
+
+    assert batch_meta.size == 2
+    assert rollout_data["response_lengths"] == [512, 135]
+    assert rollout_data["total_lengths"] == [1309, 842]
+    assert rollout_data["raw_reward"] == [1.5, 2.5]
+
+
+def test_tensor_to_python_values_dense_tensor(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.tensor([512, 135])
+
+    assert stream_module._tensor_to_python_values(value) == [512, 135]
+
+
+def test_tensor_to_python_values_jagged_tensor(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4, 5]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [
+        [1, 2],
+        [3, 4, 5],
+    ]
+
+
+def test_tensor_to_python_values_singleton_nested_rows(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([512]),
+            torch.tensor([135]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [512, 135]
+
+
+def test_tensor_to_python_values_uniform_nested_rows(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([1, 2]),
+            torch.tensor([3, 4]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [
+        [1, 2],
+        [3, 4],
+    ]
+
+
+def test_tensor_to_python_values_mixed_ragged_rows(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+
+    value = torch.nested.nested_tensor(
+        [
+            torch.tensor([1]),
+            torch.tensor([2, 3]),
+        ],
+        layout=torch.jagged,
+    )
+
+    assert stream_module._tensor_to_python_values(value) == [
+        [1],
+        [2, 3],
+    ]

@@ -183,18 +183,11 @@ Gateway 无法知道属于哪个 Relax session，会返回 404/410。正确路�
 opaque prefix 必须从 Gateway `/run` payload 进入 SWE agent，再进入 OpenHands config/container。
 如果首轮能回调、后续轮断链，检查 rollout-prefix patch 是否真的在运行镜像中。
 
-## 12. callback allowlist 必须匹配 Relax 实际 host
+## 12. callback networks 必须覆盖实际 IP
 
-`--callback-host` 只填裸 host/IP，必须与 Relax `RELAX_BASE_URL` 中的 hostname 完全一致。不要填：
-
-- Gym IP；
-- Ray GCS 地址带端口；
-- dashboard URL；
-- `0.0.0.0`；
-- wildcard。
-
-Golden 模式不调用 callback，所以 wrapper 默认用 Gym host 作为合法占位；train 模式必须显式传
-Relax host。
+只配置 `NEMO_GYM_CALLBACK_ALLOWED_NETWORKS` 或 `--callback-network`，使用逗号分隔的严格 CIDR。
+网段必须覆盖 Relax callback URL 中的 IP；单地址使用 `/32` 或 `/128`，禁止 `/0`。
+Golden 模式虽然不调用模型，协议仍校验 callback URL，因此也必须配置覆盖 verifier callback IP 的 CIDR。
 
 ## 13. `cleanup_unverified` 不是模型 reward=0
 
@@ -433,3 +426,18 @@ Event already has an ID:1
 
 当前修复在每次 attempt 前分别对 replay event 列表和 initial action 执行 `deepcopy`。不要通过清空
 单个 `_id` 或吞掉 retry 异常绕过；ReplayManager 还可能原地修改其他 Event 字段。
+
+## 24. 重复初始化测试目录会让 pytest 沿循环软链重复收集
+
+部分 SIF 已有 `/testbed/r2e_tests -> /root/r2e_tests`。旧 R2E-Gym 把 `r2e_tests` 当成
+普通 skip file 移动，然后再次 `ln -s`，会创建 `/root/r2e_tests/r2e_tests` 指回自身。
+实测 Pyramid 的 825 个测试因此重复 40 次，变成 33000 个，评测耗时超过外层 trial deadline。
+GPU 在等待奖励和整组补采期间空闲；这与 OpenHands 历史丢失导致的多叶导出错误是两个问题。
+
+`r2egym_test_layout.patch` 将测试目录从通用移动循环中排除，保留已有测试目录，仅移除经
+目标核对的自身软链，并用 `ln -sfnT` 重建入口。启动脚本对已有 setup volume 应用补丁，
+新 checkout 由 setup hook 应用；修改后重启 Gym 即可，不需要重建 SIF。
+
+真实 SIF 隔离验证：重复初始化三次、修复旧循环后，均收集 825 个测试；完整测试结果与原始
+SIF 一致（786 passed / 39 failed），修复后耗时 3.71 秒。该验证没有应用模型 patch，
+因此不能把基线的 39 个失败当成修复回归，也不能宣称任务 reward 验证通过。

@@ -120,6 +120,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
+   --sglang-load-format dummy
    --sglang-mem-fraction-static 0.75
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )

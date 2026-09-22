@@ -1,83 +1,708 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+"""Resident agentic rollout control flow.
+
+Prepare, Runtime, Reward, and Transfer own their domain state. The Pipeline
+owns lifecycle tasks and expresses one rollout step as collect -> close check
+-> lease -> wait.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import threading
 import time
+from argparse import Namespace
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Deque, List, Optional, Tuple, cast
 
-import numpy as np
 from tqdm import tqdm
 
 from relax.agentic import format_agentic_event
+from relax.agentic.pipeline import (
+    GroupExport,
+    GroupInput,
+)
+from relax.agentic.pipeline.prepare import PrepareDomain
+from relax.agentic.pipeline.reward import RewardDomain
 from relax.agentic.pipeline.runtime import (
     RuntimeDomain,
-    get_agentic_runtime_resources,
+    RuntimeGroupStream,
+    agentic_eval_concurrency_from_args,
+    finish_before_cancellation,
+    load_agentic_compiler_resources,
 )
+from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain, _transfer_batch_to_data_system
 from relax.agentic.profile import TRACE_KEY
-from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
+from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_utils import (
-    compute_rollout_explicit_reward_metrics,
-    compute_rollout_step,
-    compute_statistics,
-    finalize_rollout_explicit_metric_values,
-    has_repetition,
-)
-from relax.utils.misc import group_by
+from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
 from relax.utils.training.eval_config import EvalDatasetConfig
-from relax.utils.training.train_dump_utils import save_debug_rollout_data, save_rollout_result_jsonl
+from relax.utils.training.train_dump_utils import save_debug_rollout_data
 from relax.utils.types import Sample
-
-from .pipeline.prepare import PrepareDomain
-from .pipeline.reward import RewardDomain
-from .pipeline.transfer import TransferDomain
+from relax.utils.utils import compute_dp_size
 
 
-logger = get_logger(__name__)
-_AGENT_METADATA_INTERNAL_KEYS = {TRACE_KEY}
-_IDLE_HEARTBEAT_INTERVAL_S = 30.0
-_BACKGROUND_POLL_INTERVAL_S = 0.05
-
-
-_RESIDENT_PIPELINE: "AgenticResidentPipeline | None" = None
-_RESIDENT_PIPELINE_LOCK = threading.Lock()
-_RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID: int | None = None
+_RESIDENT_PIPELINE: Optional["AgenticResidentPipeline"] = None
+_RESIDENT_ENTRY_LOCK = threading.Lock()
+_RESIDENT_ASYNC_LOCK = threading.Lock()
 _RESIDENT_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 _RESIDENT_ASYNC_THREAD: threading.Thread | None = None
-_RESIDENT_ASYNC_LOCK = threading.Lock()
+_METADATA_METRIC_SKIP = {TRACE_KEY, "id", "index", "sample_index", "group_index", "start_rollout_id", "rollout_turns"}
+logger = get_logger(__name__)
+_IDLE_HEARTBEAT_INTERVAL_S = 30.0
 
 
-def _eval_scope_id(*, dataset_name: str, rollout_id: int) -> str:
-    return f"eval:{dataset_name}:{rollout_id}"
+@dataclass
+class _StepContext:
+    """References owned by one rollout step."""
+
+    rollout_id: int
+    final_backfill: bool
+    output_groups: List[List[Sample]] = field(default_factory=list)
+    tq_put_tasks: List[asyncio.Task[None]] = field(default_factory=list)
+    progress: Any = None
+    scored: int = 0
+    prepared: int = 0
 
 
-def _post_train_eval_expected(args, rollout_id: int, data_source) -> bool:
-    eval_interval = getattr(args, "eval_interval", None)
-    if eval_interval is None or getattr(args, "eval_prompt_data", None) is None:
+async def _run_group(
+    runtime_domain: RuntimeDomain,
+    reward_domain: RewardDomain,
+    stream: RuntimeGroupStream,
+    opd_manager: opd.OpdManager | None = None,
+) -> Optional[GroupExport]:
+    """Run one Group through Runtime and the configured Reward barrier."""
+
+    requires_complete_group = reward_domain.group_rm or reward_domain.custom_advantage_func is not None
+    try:
+        if requires_complete_group:
+            group = await runtime_domain.collect_group(stream)
+        else:
+            group, _ = await asyncio.gather(
+                runtime_domain.collect_group(stream),
+                reward_domain.score_sessions(stream),
+            )
+        if group is None:
+            reward_domain.discard_group_progress(stream)
+            await runtime_domain.drop_group(stream)
+            return None
+
+        if reward_domain.group_rm:
+            await reward_domain.score_group(group)
+        if reward_domain.custom_advantage_func is not None and not await reward_domain.apply_custom_advantage(group):
+            reward_domain.discard_group_progress(stream)
+            return None
+        if requires_complete_group:
+            reward_domain.note_scored_sessions(stream)
+
+        scored_group = reward_domain.finalize_group(group)
+        if scored_group is None:
+            reward_domain.discard_group_progress(stream)
+            return None
+        if opd_manager is None:
+            return scored_group
+        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+        await opd_manager.prefill(scored_group.samples, _encode_multimodal_inputs)
+        return scored_group
+    except BaseException:
+        reward_domain.discard_group_progress(stream)
+        await runtime_domain.drop_group(stream)
+        raise
+
+
+class AgenticResidentPipeline:
+    """Resident coordinator of Domains, Group tasks, and finalized Group
+    refs."""
+
+    def __init__(
+        self,
+        args: Namespace,
+        prepare_domain: PrepareDomain,
+        runtime_domain: RuntimeDomain,
+        reward_domain: RewardDomain,
+        transfer_domain: TransferDomain,
+        data_system_client: Any,
+    ) -> None:
+        self.args = args
+        self.prepare_domain = prepare_domain
+        self.runtime_domain = runtime_domain
+        self.reward_domain = reward_domain
+        self.transfer_domain = transfer_domain
+        self._data_system_client = data_system_client
+        self._opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+
+        self._changed = asyncio.Event()
+        self.prepare_domain.set_progress_callback(self._changed.set)
+        self.runtime_domain.set_progress_callback(self._changed.set)
+        self.reward_domain.set_progress_callback(self._changed.set)
+        self._active_group_tasks: List[asyncio.Task[Optional[GroupExport]]] = []
+        self._finalized_groups: Deque[GroupExport] = deque()
+        self._active_step: Optional[_StepContext] = None
+
+    def snapshot(self) -> dict[str, object]:
+        """Project debug state from owned refs without feeding it into
+        control."""
+
+        context = self._active_step
+        warming, ready = self.prepare_domain.counts
+        runtime_reward = len(self._active_group_tasks)
+        finalized = len(self._finalized_groups)
+        return {
+            "active_rollout_id": context.rollout_id if context is not None else None,
+            "warming_prepare_group_count": warming,
+            "ready_prepare_group_count": ready,
+            "prepare_group_count": warming + ready,
+            "runtime_reward_group_count": runtime_reward,
+            "finalized_group_count": finalized,
+            "resident_group_count": self.runtime_domain.resident_group_count,
+            "interrupted_runtime_group_count": len(self.runtime_domain.interrupted_group_ids),
+        }
+
+    async def run_step(self, rollout_id: int) -> RolloutFnTrainOutput:
+        """Generate one rollout step while resident Group refs may cross
+        steps."""
+
+        started_at = time.monotonic()
+        await start_sglang_profile(self.args, rollout_id)
+        profile_stopped = False
+        step_progress_finished = False
+        final_backfill = self.args.fully_async and rollout_id >= self.args.num_rollout
+        context = _StepContext(
+            rollout_id=rollout_id,
+            # Regular rollout IDs are [0, num_rollout). Fully async uses the
+            # following ID to drain physical debt without opening a partition.
+            final_backfill=final_backfill,
+        )
+        self._active_step = context
+        try:
+            self.prepare_domain.open_step(
+                prelaunch_next_step=self.args.agentic_prelaunch and rollout_id + 1 < self.args.num_rollout
+            )
+            output = await self._run_rollout_step(context)
+            self._finish_step_progress(context)
+            step_progress_finished = True
+
+            samples = [sample for group in output.samples for sample in group]
+            metrics = dict(output.metrics or {})
+            metrics.update(_aggregate_agentic_timing(samples))
+            metrics.update(self.reward_domain.collect_metrics())
+            if getattr(self.args, "agentic_program_admission", False) or getattr(
+                self.args, "agentic_session_lifecycle", False
+            ):
+                metrics.update(await self.runtime_domain.collect_agentic_kv_metrics())
+            for key, value in _collect_agentic_metadata_metrics(samples).items():
+                metrics.setdefault(key, value)
+
+            await stop_sglang_profile(self.args, rollout_id)
+            profile_stopped = True
+            rollout_time = time.monotonic() - started_at
+            if samples:
+                last_sample = samples[-1]
+                logger.info(
+                    "Finish rollout: %s, label: %s, reward: %s",
+                    [str(last_sample.prompt) + last_sample.response],
+                    str(last_sample.label)[:100],
+                    last_sample.reward,
+                )
+                _save_train_debug_rollout_data(self.args, rollout_id, samples)
+            _log_rollout_data(
+                rollout_id,
+                self.args,
+                samples,
+                metrics,
+                rollout_time,
+            )
+            if self.args.debug_rollout_only:
+                if self._data_system_client is None:
+                    raise RuntimeError("Agentic debug rollout cleanup requires a data system client.")
+                partition_rollout_id = rollout_id - 1 if final_backfill else rollout_id
+                await self._data_system_client.async_clear_partition(partition_id=f"train_{partition_rollout_id}")
+            output.metrics = metrics
+            logger.info(
+                format_agentic_event(
+                    "ROLLOUT",
+                    "accounting_end",
+                    rollout=rollout_id,
+                    groups=len(context.output_groups),
+                    rows=len(samples),
+                    debt=self.transfer_domain.total_debt,
+                    resident_groups=self.runtime_domain.resident_group_count,
+                    interrupted_groups=len(self.runtime_domain.interrupted_group_ids),
+                )
+            )
+        finally:
+            if not step_progress_finished:
+                self._finish_step_progress(context)
+            if not profile_stopped:
+                await stop_sglang_profile(self.args, rollout_id)
+        self._active_step = None
+        return output
+
+    def _finish_step_progress(self, context: _StepContext) -> None:
+        if context.progress is not None:
+            context.progress.close()
+            context.progress = None
+        self.reward_domain.finish_step_progress(sample for group in context.output_groups for sample in group)
+
+    async def shutdown(self) -> None:
+        """Permanently release all resident work and borrowed Runtime
+        resources."""
+
+        await finish_before_cancellation(self._shutdown(), "agentic-pipeline-shutdown")
+
+    async def _run_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
+        """Express rollout control as collect -> close -> lease -> fill ->
+        wait."""
+
+        if not context.final_backfill:
+            self.transfer_domain.open_partition(
+                context.rollout_id,
+                self.args.rollout_batch_size,
+                accepts_surplus=self.args.use_dynamic_global_batch_size,
+            )
+        target_groups = self.transfer_domain.total_debt
+        target_sessions = target_groups * self.args.n_samples_per_prompt
+        logger.info(
+            format_agentic_event(
+                "ROLLOUT",
+                "accounting_start",
+                rollout=context.rollout_id,
+                sessions=target_sessions,
+                groups=target_groups,
+                final_backfill=context.final_backfill,
+            )
+        )
+        context.progress = tqdm(
+            total=target_sessions,
+            desc=f"Rollout {context.rollout_id} generation",
+            unit="session",
+        )
+        context.scored = self.reward_domain.scored_session_count
+        postfix = f"scored={context.scored}"
+        if self.args.agentic_prelaunch:
+            context.prepared = self.prepare_domain.ready_group_count
+            postfix += f", prepared={context.prepared}"
+        context.progress.set_postfix_str(postfix, refresh=True)
+        await self.runtime_domain.resume_generation(context.rollout_id)
+
+        while True:
+            self._changed.clear()
+            self._collect_step_progress(context)
+            if self._step_can_close(context):
+                self._refresh_progress(context)
+                return await self._close_rollout_step(context)
+            await self._lease_prepared_groups(context)
+            self.prepare_domain.fill(self._runtime_group_gap(context))
+            self._refresh_progress(context)
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=_IDLE_HEARTBEAT_INTERVAL_S)
+            except asyncio.TimeoutError:
+                logger.info(
+                    format_agentic_event(
+                        "ROLLOUT",
+                        "idle_heartbeat",
+                        rollout=context.rollout_id,
+                        debt=self.transfer_domain.total_debt,
+                        state=self.snapshot(),
+                    )
+                )
+
+    def _collect_step_progress(self, context: _StepContext) -> None:
+        """Move completed Prepare, Group, and finalized refs forward."""
+
+        for task in tuple(context.tq_put_tasks):
+            if task.done():
+                context.tq_put_tasks.remove(task)
+                task.result()
+        self.prepare_domain.collect()
+
+        self._collect_finalized_groups()
+        while self._finalized_groups and self.transfer_domain.total_debt > 0:
+            group = self._finalized_groups.popleft()
+            if not context.output_groups:
+                sample = group.samples[0]
+                logger.info(
+                    "First rollout sample: %s, label: %s, reward: %s",
+                    [str(sample.prompt) + sample.response],
+                    str(sample.label)[:100],
+                    sample.reward,
+                )
+            context.output_groups.append(group.samples)
+            self.transfer_domain.accept(group)
+        for batch in self.transfer_domain.detach_ready_batches():
+            self._submit_tq_batch(context, batch)
+
+    def _refresh_progress(self, context: _StepContext) -> None:
+        progress = context.progress
+        if progress is None:
+            return
+        group_size = self.args.n_samples_per_prompt
+        completed_groups = len(context.output_groups) + len(self._finalized_groups)
+        completed_sessions = completed_groups * group_size
+        visible_sessions = min(completed_sessions, progress.total)
+        scored = self.reward_domain.scored_session_count
+        prepared = self.prepare_domain.ready_group_count if self.args.agentic_prelaunch else 0
+        if visible_sessions == progress.n and scored == context.scored and prepared == context.prepared:
+            return
+        progress_delta = visible_sessions - progress.n
+        context.scored = scored
+        context.prepared = prepared
+        postfix = f"scored={scored}"
+        if self.args.agentic_prelaunch:
+            postfix += f", prepared={prepared}"
+        progress.set_postfix_str(postfix, refresh=False)
+        if progress_delta > 0:
+            progress.update(progress_delta)
+        else:
+            progress.refresh()
+
+    def _submit_tq_batch(self, context: _StepContext, batch: TransferBatch) -> None:
+        """Create one TQ transfer call owned by the active step."""
+
+        rollout_id, groups, is_last = batch
+        task = asyncio.create_task(
+            _transfer_batch_to_data_system(
+                args=self.args,
+                batch_samples=[group.samples for group in groups],
+                rollout_id=rollout_id,
+                data_system_client=self._data_system_client,
+                is_last=is_last,
+            ),
+            name=f"agentic-transfer:train_{rollout_id}:{len(groups)}-groups",
+        )
+        task.add_done_callback(lambda _task: self._changed.set())
+        context.tq_put_tasks.append(task)
+
+    async def _await_tq_puts(self, context: _StepContext) -> None:
+        """Cross the TQ durability barrier for batches owned by this step."""
+
+        if context.tq_put_tasks:
+            await asyncio.gather(*context.tq_put_tasks)
+            context.tq_put_tasks.clear()
+
+    def _collect_finalized_groups(self) -> None:
+        """Move completed Group task results into the finalized FIFO."""
+
+        for task in tuple(self._active_group_tasks):
+            if not task.done():
+                continue
+            self._active_group_tasks.remove(task)
+            outcome = task.result()
+            if outcome is not None:
+                self._finalized_groups.append(outcome)
+
+    def _step_can_close(self, context: _StepContext) -> bool:
+        """Read close eligibility from physical debt and resident Group
+        refs."""
+
+        debt = self.transfer_domain.total_debt
+        if debt == 0:
+            return True
+
+        # Fully async may close with unfinished physical debt only when the
+        # same number of resident Groups is confirmed interrupted.
+        if self.args.fully_async and not context.final_backfill:
+            return debt <= len(self.runtime_domain.interrupted_group_ids)
         return False
-    step = rollout_id + 1
-    if step % eval_interval == 0:
-        return True
-    if not getattr(args, "rollout_global_dataset", False):
-        return False
 
-    import ray
+    async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
+        """Seal one step, await its TQ tasks, and apply resident-tail
+        policy."""
 
-    num_rollout_per_epoch = ray.get(data_source.lengths.remote()) // args.rollout_batch_size
-    return step % num_rollout_per_epoch == 0
+        self.prepare_domain.close_step()
+        dynamic_close = self.args.use_dynamic_global_batch_size
+        # Normal partitions are already sealed, so their partial batch can be
+        # flushed now. A dynamic current partition stays unsealed until its
+        # aligned surplus is known.
+        if not dynamic_close:
+            for batch in self.transfer_domain.flush_batches():
+                self._submit_tq_batch(context, batch)
+        # Dynamic close has two durability barriers: base writes, then pause,
+        # completed aligned surplus, seal, and the remaining writes.
+        await self._await_tq_puts(context)
+        self.transfer_domain.release_finished_partitions()
+
+        await finish_before_cancellation(
+            self.runtime_domain.pause_generation(),
+            "agentic-generation-pause",
+        )
+        retain_resident_tail = not context.final_backfill and (self.args.partial_rollout or self.args.fully_async)
+        if not retain_resident_tail:
+            self._finalized_groups.clear()
+            await self._cancel_active_group_tasks()
+        elif dynamic_close:
+            # Generation is now paused. Harvest Group tasks already complete,
+            # append their aligned FIFO prefix, seal the partition, and wait for
+            # its remaining TQ batches. Reward-inflight Groups stay resident.
+            await self._seal_dynamic_partition(context)
+
+        await self.runtime_domain.trim_memory()
+        return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
+
+    async def _seal_dynamic_partition(self, context: _StepContext) -> None:
+        """Seal with the DP-aligned FIFO prefix of completed Group tasks."""
+
+        self._collect_finalized_groups()
+
+        data_parallel_size = compute_dp_size(self.args)
+        target_groups = self.args.rollout_batch_size
+        candidate_count = target_groups + len(self._finalized_groups)
+        aligned_count = candidate_count - candidate_count % data_parallel_size
+        surplus = ()
+        if aligned_count > target_groups:
+            surplus = tuple(self._finalized_groups.popleft() for _ in range(aligned_count - target_groups))
+        if context.progress is not None:
+            context.progress.total += len(surplus) * self.args.n_samples_per_prompt
+        context.output_groups.extend(group.samples for group in surplus)
+        self._refresh_progress(context)
+        for batch in self.transfer_domain.finish_current_partition(surplus):
+            self._submit_tq_batch(context, batch)
+        await self._await_tq_puts(context)
+        self.transfer_domain.release_finished_partitions()
+
+    async def _lease_prepared_groups(self, context: _StepContext) -> None:
+        """Open generation for the ready FIFO prefix visible at this check.
+
+        Each ready task already owns a Shard-resident Group whose Sessions have
+        crossed the first-IR barrier. Leasing changes ownership to Runtime and
+        opens its generation gate.
+        """
+
+        for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
+            await self.runtime_domain.lease_group(stream, context.rollout_id)
+            group_task = asyncio.create_task(
+                _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager),
+                name=f"agentic-group:{stream.group_id}",
+            )
+            group_task.add_done_callback(lambda _task: self._changed.set())
+            self._active_group_tasks.append(group_task)
+
+    def _runtime_group_gap(self, context: _StepContext) -> int:
+        oversample_groups = 0
+        if not context.final_backfill:
+            oversample_groups = self.args.over_sampling_batch_size - self.args.rollout_batch_size
+        return (
+            self.transfer_domain.total_debt
+            + oversample_groups
+            - len(self._active_group_tasks)
+            - len(self._finalized_groups)
+        )
+
+    async def _shutdown(self) -> None:
+        """Cancel and join active-step TQ writes, then release every owner."""
+
+        self._finalized_groups.clear()
+        first_error: Optional[BaseException] = None
+        context = self._active_step
+        tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
+        if context is not None:
+            tq_put_tasks = tuple(context.tq_put_tasks)
+        for task in tq_put_tasks:
+            task.cancel()
+        for outcome in await asyncio.gather(*tq_put_tasks, return_exceptions=True):
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                first_error = outcome
+                break
+
+        self.transfer_domain.clear()
+        for cleanup in (
+            self.prepare_domain.shutdown,
+            self._cancel_active_group_tasks,
+            self.runtime_domain.shutdown,
+        ):
+            try:
+                await cleanup()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    async def _cancel_active_group_tasks(self) -> None:
+        """Drop resident Runtime/Reward tasks when the mode cannot retain
+        them."""
+
+        tasks = tuple(self._active_group_tasks)
+        self._active_group_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                raise outcome
 
 
-def _resident_async_loop_main(loop: asyncio.AbstractEventLoop) -> None:
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+async def _init_agentic_resident_pipeline_async(
+    args: Namespace,
+    data_source: Any,
+    data_system_client: Any,
+) -> None:
+    """Build the Pipeline owned by one RolloutManager.
+
+    RolloutManager calls this exactly once per resident lifecycle. Reward owns
+    RM/custom loading; the composition root binds the stable metrics-aware
+    filter.
+    """
+
+    global _RESIDENT_PIPELINE
+    filter_path = args.dynamic_sampling_filter_path
+    if filter_path is None:
+        group_filter = None
+    else:
+        from relax.utils.utils import load_function
+
+        filter_function = load_function(filter_path)
+
+        def group_filter(samples: list[Sample]) -> Any:
+            return filter_function(args, samples)
+
+    runtime_domain = None
+    try:
+        reward_domain = RewardDomain(args, "train", group_filter)
+        transfer_domain = TransferDomain(args=args)
+        concurrency = args.agentic_concurrency
+        runtime_domain = await RuntimeDomain.connect(args, "train", concurrency)
+        prepare_domain = PrepareDomain(
+            "train",
+            data_source,
+            runtime_domain,
+        )
+        pipeline = AgenticResidentPipeline(
+            args=args,
+            prepare_domain=prepare_domain,
+            runtime_domain=runtime_domain,
+            reward_domain=reward_domain,
+            transfer_domain=transfer_domain,
+            data_system_client=data_system_client,
+        )
+        _RESIDENT_PIPELINE = pipeline
+    except BaseException:
+        if runtime_domain is not None:
+            await runtime_domain.shutdown()
+        raise
+
+
+async def _shutdown_agentic_resident_pipeline_async() -> None:
+    """Release one initialized RolloutManager-local resident Pipeline."""
+
+    global _RESIDENT_PIPELINE
+    pipeline = _RESIDENT_PIPELINE
+    _RESIDENT_PIPELINE = None
+    if pipeline is not None:
+        await pipeline.shutdown()
+
+
+async def _eval_groups(
+    eval_id: int,
+    scope_id: str,
+    groups: Tuple[Tuple[Sample, ...], ...],
+    runtime_domain: RuntimeDomain,
+    reward_domain: RewardDomain,
+    progress: Any,
+) -> Tuple[GroupExport, ...]:
+    """Evaluate finite source Groups through the shared Runtime/Reward core."""
+
+    if not groups:
+        return ()
+
+    async def run_eval_group(group_input: GroupInput) -> Optional[GroupExport]:
+        stream = await runtime_domain.prepare_group(group_input)
+        if stream is None:
+            return None
+        await runtime_domain.lease_group(stream, eval_id)
+        return await _run_group(runtime_domain, reward_domain, stream)
+
+    sample_groups = groups if reward_domain.group_rm else tuple((sample,) for group in groups for sample in group)
+    group_inputs = tuple(
+        GroupInput(f"{scope_id}:prepare_group_{sequence}", list(sample_group))
+        for sequence, sample_group in enumerate(sample_groups)
+    )
+    group_tasks = tuple(
+        asyncio.create_task(
+            run_eval_group(group_input),
+            name=f"agentic-eval-group:{group_input.group_id}",
+        )
+        for group_input in group_inputs
+    )
+    first_sample_logged = False
+
+    async def shutdown_eval() -> None:
+        for task in group_tasks:
+            task.cancel()
+        await asyncio.gather(*group_tasks, return_exceptions=True)
+
+    def note_completed(task: asyncio.Task[Optional[GroupExport]], sample_count: int) -> None:
+        nonlocal first_sample_logged
+        if task.cancelled() or task.exception() is not None:
+            return
+        progress.update(sample_count)
+        group = task.result()
+        if not first_sample_logged and group is not None and group.samples:
+            sample = group.samples[0]
+            logger.info(
+                "eval_rollout_single_dataset example data: %s reward=%s",
+                [str(sample.prompt) + sample.response],
+                sample.reward,
+            )
+            first_sample_logged = True
+
+    for task, sample_group in zip(group_tasks, sample_groups, strict=True):
+        task.add_done_callback(lambda completed, count=len(sample_group): note_completed(completed, count))
+    try:
+        outcomes = await asyncio.gather(*group_tasks)
+        return tuple(outcome for outcome in outcomes if outcome is not None)
+    finally:
+        await finish_before_cancellation(
+            shutdown_eval(),
+            "agentic-eval-shutdown",
+        )
+
+
+def _agentic_eval_runtime_concurrency(args: Namespace, eval_group_size: int) -> int:
+    """Translate logical Eval Group concurrency into Runtime permits."""
+
+    eval_group_concurrency = agentic_eval_concurrency_from_args(args, eval_group_size)
+    return eval_group_concurrency if args.group_rm else eval_group_concurrency * eval_group_size
+
+
+def _run_on_resident_async_loop(coro):
+    """Synchronously submit work to the RolloutManager-local resident loop.
+
+    The rollout function is synchronous, while the Pipeline owns asyncio tasks
+    that may outlive one step. The dedicated thread keeps their event loop
+    alive between calls instead of recreating it with asyncio.run().
+    """
+
+    global _RESIDENT_ASYNC_LOOP, _RESIDENT_ASYNC_THREAD
+    with _RESIDENT_ASYNC_LOCK:
+        loop = _RESIDENT_ASYNC_LOOP
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            thread = threading.Thread(
+                target=run_loop,
+                name="agentic-resident-loop",
+                daemon=True,
+            )
+            thread.start()
+            _RESIDENT_ASYNC_LOOP = loop
+            _RESIDENT_ASYNC_THREAD = thread
+        elif threading.current_thread() is _RESIDENT_ASYNC_THREAD:
+            raise RuntimeError("Agentic resident loop cannot synchronously wait on itself.")
+    # Preserve the synchronous rollout contract while the coroutine runs on
+    # the long-lived Pipeline loop.
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 
 def _shutdown_resident_async_loop() -> None:
@@ -97,1344 +722,108 @@ def _shutdown_resident_async_loop() -> None:
         loop.close()
 
 
-def _run_on_resident_async_loop(coro):
-    global _RESIDENT_ASYNC_LOOP, _RESIDENT_ASYNC_THREAD
-    with _RESIDENT_ASYNC_LOCK:
-        loop = _RESIDENT_ASYNC_LOOP
-        if loop is None or loop.is_closed():
-            loop = asyncio.new_event_loop()
-            thread = threading.Thread(
-                target=_resident_async_loop_main, args=(loop,), name="agentic-resident-loop", daemon=True
-            )
-            thread.start()
-            _RESIDENT_ASYNC_LOOP = loop
-            _RESIDENT_ASYNC_THREAD = thread
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result()
-
-
-def _shutdown_resident_pipeline_after_deferred_eval(rollout_id: int) -> None:
-    global _RESIDENT_PIPELINE, _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID
-    with _RESIDENT_PIPELINE_LOCK:
-        if _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID != rollout_id:
-            return
-        _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = None
-        resident_pipeline = _RESIDENT_PIPELINE
-        _RESIDENT_PIPELINE = None
-    if resident_pipeline is not None:
-        _run_on_resident_async_loop(resident_pipeline.shutdown())
-    _shutdown_resident_async_loop()
-
-
-class RolloutProgress:
-    def __init__(self, *, total_sessions: int, rollout_id: int) -> None:
-        if total_sessions <= 0:
-            raise RuntimeError(f"RolloutProgress requires a positive total_sessions, got {total_sessions}.")
-        self.total_sessions = total_sessions
-        self._materialized_sessions = 0
-        self._committed_sessions = 0
-        self._scored_samples = 0
-        self._bar = tqdm(
-            total=self.total_sessions,
-            desc=f"Rollout {rollout_id} generation",
-            unit="session",
-            disable=False,
-            mininterval=0.0,
-            miniters=1,
-        )
-        self._set_bar_postfix(refresh=True)
-
-    def _set_bar_postfix(self, *, refresh: bool) -> None:
-        self._bar.set_postfix_str(f"scored={self._scored_samples}", refresh=refresh)
-
-    def update_counts(
-        self,
-        *,
-        materialized_sessions: int,
-        committed_sessions: int,
-        scored_samples: int,
-    ) -> None:
-        if materialized_sessions < self._materialized_sessions:
-            raise RuntimeError(
-                "RolloutProgress materialized session count regressed: "
-                f"{materialized_sessions} < {self._materialized_sessions}."
-            )
-        if committed_sessions < self._committed_sessions:
-            raise RuntimeError(
-                "RolloutProgress committed session count regressed: "
-                f"{committed_sessions} < {self._committed_sessions}."
-            )
-        if (
-            materialized_sessions == self._materialized_sessions
-            and committed_sessions == self._committed_sessions
-            and scored_samples == self._scored_samples
-        ):
-            return
-        old_bar_count = min(self._materialized_sessions, self.total_sessions)
-        new_bar_count = min(materialized_sessions, self.total_sessions)
-        if new_bar_count > old_bar_count:
-            self._bar.update(new_bar_count - old_bar_count)
-        self._materialized_sessions = materialized_sessions
-        self._committed_sessions = committed_sessions
-        self._scored_samples = scored_samples
-        self._set_bar_postfix(refresh=True)
-
-    def update_total_sessions(self, total_sessions: int) -> None:
-        if total_sessions == self.total_sessions:
-            return
-        self.total_sessions = total_sessions
-        self._bar.total = total_sessions
-        self._bar.refresh()
-
-    def close(self) -> None:
-        self._bar.close()
-
-    def snapshot(self) -> dict[str, int]:
-        return {
-            "materialized_sessions": self._materialized_sessions,
-            "committed_sessions": self._committed_sessions,
-            "scored_samples": self._scored_samples,
-        }
-
-
-class AgenticResidentPipeline:
-    def __init__(self) -> None:
-        self.prepare_domain: PrepareDomain | None = None
-        self.runtime_domain: RuntimeDomain | None = None
-        self.transfer_domain: TransferDomain | None = None
-        self.reward_domain: RewardDomain | None = None
-        self.opd_manager: opd.OpdManager | None = None
-        self.resident_dataflow_task: asyncio.Task | None = None
-        self.resident_dataflow_progress_event: asyncio.Event | None = None
-        self.resident_dataflow_lock: asyncio.Lock | None = None
-        self.resident_dataflow_error: BaseException | None = None
-        self.step_admission_closed = False
-        self.prepare_requires_open_step = False
-        self._step_get_samples_wait_started_at: float | None = None
-        self._step_get_samples_times: list[float] = []
-        self._active_step_handle: _AgenticStepHandle | None = None
-        # How many groups the most recent step left short of its transfer-queue target
-        # (rollout_batch_size - committed_current). The next step backfills exactly this
-        # many groups into its previous partition. 0 before the first step / when a step
-        # fully met its target. Only meaningful under fully_async.
-        self._last_step_current_deficit = 0
-
-    def _dataflow_lock(self) -> asyncio.Lock:
-        lock = self.resident_dataflow_lock
-        if lock is None:
-            lock = asyncio.Lock()
-            self.resident_dataflow_lock = lock
-        return lock
-
-    async def _pump_once(self) -> bool:
-        async with self._dataflow_lock():
-            progressed = False
-            while True:
-                tick_progressed = False
-                if await self._pump_prepare_once():
-                    tick_progressed = True
-                if await self._pump_admission_once():
-                    tick_progressed = True
-                if await self._pump_runtime_to_reward_once():
-                    tick_progressed = True
-                if await self._pump_reward_to_transfer_once():
-                    tick_progressed = True
-                if await self._pump_transfer_once():
-                    tick_progressed = True
-                if not tick_progressed:
-                    return progressed
-                progressed = True
-
-    @property
-    def resident_group_count(self) -> int:
-        if (
-            self.runtime_domain is None
-            or self.reward_domain is None
-            or self.transfer_domain is None
-            or not hasattr(self.runtime_domain, "runtime_groups_by_key")
-        ):
-            return 0
-        runtime_keys = set(self.runtime_domain.resident_group_keys())
-        reward_keys = set(self.reward_domain.resident_group_keys())
-        transfer_keys = set(self.transfer_domain.resident_group_keys())
-        return len(runtime_keys | reward_keys | transfer_keys)
-
-    async def _pump_prepare_once(self) -> bool:
-        prepare_domain = self.prepare_domain
-        runtime_domain = self.runtime_domain
-        if prepare_domain is None or runtime_domain is None:
-            raise RuntimeError("Agentic prepare pump requires initialized prepare and runtime domains.")
-        progressed = False
-        if prepare_domain.has_ready_output():
-            if await prepare_domain.accept_fetched_batch():
-                progressed = True
-        should_refresh_prepare = (
-            prepare_domain.has_pending_prepare()
-            or prepare_domain.has_inflight_work()
-            or prepare_domain.has_ready_output()
-            or prepare_domain.has_warming_groups()
-        )
-        if should_refresh_prepare:
-            # Drop (do not crash on) a prepare group whose managed session
-            # finished before producing a chat IR — e.g. an apptainer instance
-            # that failed to start. The over-sampling prepare pool + transfer
-            # quota gate refill the dropped group, so batch size is preserved;
-            # crashing here would instead trigger a full global restart.
-            if await prepare_domain.refresh_ready_groups(
-                status_fetcher=runtime_domain.prepare_group_status,
-                drop_completed_before_ready=True,
-            ):
-                progressed = True
-        if prepare_domain.has_pending_prepare():
-            if await prepare_domain.launch_pending():
-                progressed = True
-        if (not self.prepare_requires_open_step or not self.step_admission_closed) and prepare_domain.start_fetch():
-            progressed = True
-        return progressed
-
-    async def _pump_admission_once(self) -> bool:
-        prepare_domain = self.prepare_domain
-        runtime_domain = self.runtime_domain
-        transfer_domain = self.transfer_domain
-        reward_domain = self.reward_domain
-        if prepare_domain is None or runtime_domain is None:
-            raise RuntimeError("Agentic admission pump requires initialized prepare and runtime domains.")
-        if self.step_admission_closed:
-            return False
-        if transfer_domain is None or reward_domain is None:
-            raise RuntimeError("Agentic admission pump requires initialized transfer and reward domains.")
-
-        progressed = False
-        transfer_snapshot = dict(transfer_domain.accounting_snapshot())
-        _, _, _, current_window_slack = self._current_window_admission_counts(
-            resident_group_count=self.resident_group_count,
-            transfer_snapshot=transfer_snapshot,
-        )
-        if current_window_slack == 0:
-            self._step_get_samples_wait_started_at = None
-            return progressed
-        if self._step_get_samples_wait_started_at is None:
-            self._step_get_samples_wait_started_at = time.monotonic()
-        if prepare_domain.has_warming_groups():
-            # See _pump_prepare_once: drop groups that completed before ready
-            # instead of crashing; the over-sampling pool refills them.
-            await prepare_domain.refresh_ready_groups(
-                status_fetcher=runtime_domain.prepare_group_status,
-                drop_completed_before_ready=True,
-            )
-        if not prepare_domain.has_ready_groups():
-            return progressed
-        batch_input = await prepare_domain.lease_ready_groups(
-            quota_group_count=min(transfer_domain.over_sampling_batch_size, current_window_slack),
-            rollout_id=runtime_domain.require_rollout_id(),
-        )
-        if batch_input is None:
-            return progressed
-        prepare_domain.start_fetch()
-        if self._step_get_samples_wait_started_at is not None:
-            self._step_get_samples_times.append(time.monotonic() - self._step_get_samples_wait_started_at)
-            self._step_get_samples_wait_started_at = None
-        admitted_batch_groups = await runtime_domain.start_batch(batch_input=batch_input)
-        if admitted_batch_groups <= 0:
-            raise RuntimeError("RuntimeDomain accepted an admission batch without owning any groups.")
-        return True
-
-    async def _pump_runtime_to_reward_once(self) -> bool:
-        runtime_domain = self.runtime_domain
-        reward_domain = self.reward_domain
-        if runtime_domain is None or reward_domain is None:
-            raise RuntimeError("Agentic runtime-to-reward pump requires initialized runtime and reward domains.")
-        progressed = False
-        if runtime_domain.has_pending_runtime_work():
-            batch_progress = await runtime_domain.wait_for_next_runtime_slot(timeout_s=0.0)
-            if batch_progress is not None:
-                progressed = True
-        discarded_group_keys = runtime_domain.drain_discarded_group_keys()
-        if discarded_group_keys:
-            await reward_domain.drop_waiting_groups_by_key(discarded_group_keys)
-            progressed = True
-        runtime_dispatch = runtime_domain.drain_ready_execution()
-        if runtime_dispatch.materialized_batches:
-            if not reward_domain.group_rm or reward_domain.custom_advantage_func is not None:
-                reward_domain.accept_session_materializations(runtime_dispatch.materialized_batches)
-            progressed = True
-        if reward_domain.custom_advantage_func is None:
-            for group in runtime_dispatch.ready_groups:
-                await reward_domain.ingest_groups([group])
-                progressed = True
-        return progressed
-
-    async def _pump_reward_to_transfer_once(self) -> bool:
-        reward_domain = self.reward_domain
-        transfer_domain = self.transfer_domain
-        if reward_domain is None:
-            raise RuntimeError("Agentic reward-to-transfer pump requires initialized reward domain.")
-        progressed = await reward_domain.step_once()
-        if transfer_domain is None:
-            return progressed
-
-        ready_reward_groups = reward_domain.drain_ready_dispatch(max_groups=transfer_domain.remaining_ready_capacity())
-        if ready_reward_groups:
-            if self.opd_manager is not None:
-                await self._opd_prefill_groups(ready_reward_groups)
-            for group in ready_reward_groups:
-                transfer_domain.enqueue_ready_groups([group])
-            progressed = True
-        return progressed
-
-    async def _opd_prefill_groups(self, groups: list[list[Sample]]) -> None:
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
-
-        for group in groups:
-            await self.opd_manager.prefill(group, _encode_multimodal_inputs)
-
-    async def _pump_transfer_once(self) -> bool:
-        transfer_domain = self.transfer_domain
-        if transfer_domain is None:
-            raise RuntimeError("Agentic transfer pump requires initialized transfer domain.")
-        released_groups, committed_group_count = await transfer_domain.drain_ready_group_payloads()
-        if committed_group_count <= 0:
-            return False
-        self._log_first_rollout_sample_for_active_step(released_groups)
-        return True
-
-    def _log_first_rollout_sample_for_active_step(self, released_groups: list[list]) -> None:
-        step_handle = self._active_step_handle
-        if step_handle is None or step_handle.first_rollout_sample_logged or not released_groups:
-            return
-        sample = released_groups[0][0][0] if isinstance(released_groups[0][0], list) else released_groups[0][0]
-        logger.info(
-            "First rollout sample: %s, label: %s, reward: %s",
-            [str(sample.prompt) + sample.response],
-            str(sample.label)[:100],
-            sample.reward,
-        )
-        step_handle.first_rollout_sample_logged = True
-
-    def _raise_resident_dataflow_error(self) -> None:
-        error = self.resident_dataflow_error
-        if error is None:
-            return
-        self.resident_dataflow_error = None
-        raise RuntimeError("agentic resident dataflow loop failed") from error
-
-    async def _wait_for_resident_dataflow_progress(self) -> bool:
-        self._raise_resident_dataflow_error()
-        progress_event = self.resident_dataflow_progress_event
-        if progress_event is None:
-            await asyncio.sleep(_BACKGROUND_POLL_INTERVAL_S)
-            self._raise_resident_dataflow_error()
-            return False
-        if progress_event.is_set():
-            self._raise_resident_dataflow_error()
-            progress_event.clear()
-            return True
-        try:
-            await asyncio.wait_for(progress_event.wait(), timeout=_BACKGROUND_POLL_INTERVAL_S)
-        except asyncio.TimeoutError:
-            self._raise_resident_dataflow_error()
-            return False
-        self._raise_resident_dataflow_error()
-        if not progress_event.is_set():
-            return False
-        progress_event.clear()
-        return True
-
-    async def _wait_for_step_event(self) -> bool:
-        task = self.resident_dataflow_task
-        if task is not None and not task.done():
-            return await self._wait_for_resident_dataflow_progress()
-        await asyncio.sleep(_BACKGROUND_POLL_INTERVAL_S)
-        return False
-
-    async def _resident_dataflow_loop(self) -> None:
-        while True:
-            try:
-                progressed = await self._pump_once()
-                if progressed:
-                    if self.resident_dataflow_progress_event is not None:
-                        self.resident_dataflow_progress_event.set()
-                    continue
-                await asyncio.sleep(_BACKGROUND_POLL_INTERVAL_S)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.resident_dataflow_error = exc
-                if self.resident_dataflow_progress_event is not None:
-                    self.resident_dataflow_progress_event.set()
-                logger.exception("Agentic resident pipeline dataflow loop failed")
-                return
-
-    async def start_resident_dataflow(self) -> None:
-        if self.resident_dataflow_task is not None and not self.resident_dataflow_task.done():
-            return
-        self.resident_dataflow_error = None
-        self.resident_dataflow_progress_event = asyncio.Event()
-        self.resident_dataflow_task = asyncio.create_task(self._resident_dataflow_loop())
-
-    async def stop_resident_dataflow(self) -> None:
-        task = self.resident_dataflow_task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        self.resident_dataflow_task = None
-        self.resident_dataflow_progress_event = None
-        self.resident_dataflow_error = None
-
-    async def shutdown(self) -> None:
-        await self.stop_resident_dataflow()
-        domains = (
-            ("prepare_domain", self.prepare_domain),
-            ("runtime_domain", self.runtime_domain),
-            ("transfer_domain", self.transfer_domain),
-            ("reward_domain", self.reward_domain),
-        )
-        for attr_name, domain in domains:
-            if domain is None:
-                continue
-            await domain.shutdown()
-            setattr(self, attr_name, None)
-        self.step_admission_closed = False
-
-    async def init_pipeline(
-        self,
-        *,
-        args,
-        data_source,
-        data_system_client,
-    ) -> None:
-        pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
-        async with self._dataflow_lock():
-            prepare_domain = self.prepare_domain
-            if prepare_domain is None:
-                prepare_domain = PrepareDomain(
-                    scope_id="train",
-                    data_source=data_source,
-                    prefetch_concurrency=1,
-                    pool_target_group_count=pool_target_group_count,
-                )
-                self.prepare_domain = prepare_domain
-            elif prepare_domain.pool_target_group_count != pool_target_group_count:
-                raise RuntimeError(
-                    "PrepareDomain configuration changed after initialization: "
-                    f"pool_target_group_count {prepare_domain.pool_target_group_count} "
-                    f"-> {pool_target_group_count}."
-                )
-            runtime_domain = self.runtime_domain
-            if runtime_domain is None:
-                runtime_domain = RuntimeDomain(args=args, scope_id="train")
-                self.runtime_domain = runtime_domain
-            if self.reward_domain is None:
-                self.reward_domain = RewardDomain(
-                    args=args,
-                    group_filter=None,
-                )
-            if self.transfer_domain is None:
-                self.transfer_domain = TransferDomain(
-                    args=args,
-                    data_system_client=data_system_client,
-                )
-            if self.opd_manager is None and opd.is_opd_enabled(args):
-                self.opd_manager = opd.OpdManager(args)
-            prepare_domain.configure(
-                runtime_driver=runtime_domain,
-                pool_target_group_count=pool_target_group_count,
-            )
-            self.prepare_requires_open_step = args.agentic_prepare_pool_size == 0
-            self.step_admission_closed = True
-            if not self.prepare_requires_open_step:
-                prepare_domain.start_fetch()
-        await self.start_resident_dataflow()
-
-    async def open_step(
-        self,
-        *,
-        args,
-        rollout_id: int,
-        group_filter,
-        defer_terminal_shutdown_for_eval: bool = False,
-    ) -> "_AgenticStepHandle":
-        fully_async = args.fully_async
-        num_rollout = getattr(args, "num_rollout", None)
-        final_backfill_step = fully_async and num_rollout is not None and rollout_id >= num_rollout
-        current_partition_quota = 0 if final_backfill_step else args.rollout_batch_size
-        terminal_step = num_rollout is not None and rollout_id + 1 >= num_rollout
-        async with self._dataflow_lock():
-            prepare_domain = self.prepare_domain
-            runtime_domain = self.runtime_domain
-            reward_domain = self.reward_domain
-            transfer_domain = self.transfer_domain
-            if None in (prepare_domain, runtime_domain, reward_domain, transfer_domain):
-                raise RuntimeError("Agentic resident pipeline must be initialized before opening a rollout step.")
-            runtime_domain.rebind_step(
-                args=args,
-                rollout_id=rollout_id,
-            )
-            reward_domain.rebind_step(
-                group_filter=group_filter,
-            )
-            transfer_domain.rebind_step(
-                rollout_id=rollout_id,
-            )
-            self._step_get_samples_wait_started_at = None
-            self._step_get_samples_times = []
-            # Previous-partition backfill debt is exactly how many groups the previous
-            # step left short of its transfer-queue target (rollout_batch_size). With
-            # over-sampling (over_sampling_batch_size > rollout_batch_size) the previous
-            # step may finish completely (deficit 0) yet still hold surplus completed
-            # groups in the transfer ready buffer; those surplus groups are NOT debt —
-            # they re-commit toward this step's current_partition_quota on their own.
-            # Sizing the debt from the recorded current-partition deficit (set at the
-            # previous close_step) keeps the ledger self-consistent and lets over-sampling
-            # actually run. See _last_step_current_deficit.
-            previous_partition_quota = self._last_step_current_deficit if fully_async else 0
-            transfer_domain.configure_transfer_quota(
-                previous_partition_quota=previous_partition_quota,
-                current_partition_quota=current_partition_quota,
-            )
-            self.step_admission_closed = False
-            await runtime_domain.release_partial_resume_gate()
-            transfer_start_snapshot = transfer_domain.accounting_snapshot()
-        progress = RolloutProgress(
-            total_sessions=transfer_domain.target_group_count() * transfer_start_snapshot["group_size"],
-            rollout_id=rollout_id,
-        )
-        step_handle = _AgenticStepHandle(
-            rollout_id=rollout_id,
-            required_group_count=current_partition_quota,
-            terminal_step=terminal_step,
-            final_backfill_step=final_backfill_step,
-            defer_terminal_shutdown_for_eval=defer_terminal_shutdown_for_eval,
-            progress=progress,
-        )
-        self._active_step_handle = step_handle
-        await self.start_resident_dataflow()
-        return step_handle
-
-    def _committed_target_count(self) -> int:
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
-        return transfer_snapshot["committed_current_groups"]
-
-    @property
-    def _final_backfill_pending(self) -> bool:
-        return self._last_step_current_deficit > 0
-
-    def _interrupted_close_accounting_enabled(self) -> bool:
-        return bool(self.runtime_domain.args.fully_async)
-
-    async def _refresh_close_accounting(self) -> None:
-        refresher = getattr(self.runtime_domain, "refresh_interrupted_close_accounting", None)
-        if callable(refresher):
-            await refresher()
-
-    def _remaining_previous_debt(self, transfer_snapshot: dict[str, int]) -> int:
-        committed_previous_groups = transfer_snapshot["committed_previous_groups"]
-        previous_partition_quota = transfer_snapshot["previous_partition_quota"]
-        remaining_previous_debt = previous_partition_quota - committed_previous_groups
-        if remaining_previous_debt < 0:
-            raise RuntimeError(
-                "Agentic previous partition accounting is inconsistent: "
-                f"quota={previous_partition_quota}, committed={committed_previous_groups}."
-            )
-        return remaining_previous_debt
-
-    def _current_window_admission_counts(
-        self,
-        *,
-        resident_group_count: int,
-        transfer_snapshot: dict[str, int],
-    ) -> tuple[int, int, int, int]:
-        current_admission_quota = self._current_window_admission_quota(transfer_snapshot)
-        remaining_previous_debt = self._remaining_previous_debt(transfer_snapshot)
-        if resident_group_count < remaining_previous_debt:
-            raise RuntimeError(
-                "Agentic resident accounting cannot cover remaining previous partition debt: "
-                f"resident={resident_group_count}, remaining_previous_debt={remaining_previous_debt}."
-            )
-        resident_current_window_groups = resident_group_count - remaining_previous_debt
-        current_window_admitted_groups = transfer_snapshot["committed_current_groups"] + resident_current_window_groups
-        current_window_slack = current_admission_quota - current_window_admitted_groups
-        if current_window_slack < 0:
-            raise RuntimeError(
-                "Agentic current window admission exceeded current admission quota: "
-                f"admission_accounted={current_window_admitted_groups}, "
-                f"current_admission_quota={current_admission_quota}, "
-                f"current_partition_quota={transfer_snapshot['current_partition_quota']}."
-            )
-        return (
-            remaining_previous_debt,
-            resident_current_window_groups,
-            current_window_admitted_groups,
-            current_window_slack,
-        )
-
-    def _current_window_admission_quota(self, transfer_snapshot: dict[str, int]) -> int:
-        if self.transfer_domain is None:
-            return transfer_snapshot["current_partition_quota"]
-        return int(
-            getattr(self.transfer_domain, "over_sampling_batch_size", transfer_snapshot["current_partition_quota"])
-        )
-
-    def _close_status(self, step_handle: "_AgenticStepHandle") -> str | None:
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
-        committed_previous = transfer_snapshot["committed_previous_groups"]
-        previous_quota = transfer_snapshot["previous_partition_quota"]
-        if step_handle.final_backfill_step:
-            # There is no later step to carry another deficit, so final backfill
-            # closes only after the previous TQ partition is actually complete.
-            return None if committed_previous >= previous_quota else "previous_partition_debt"
-        committed_current = transfer_snapshot["committed_current_groups"]
-        if self._interrupted_close_accounting_enabled():
-            # Match the original fully-async rollout's combined FIFO window:
-            # completed and interrupted groups are fungible for soft close.
-            interrupted_groups = int(self.runtime_domain.accounting_snapshot()["interrupted_groups"])
-            accounted_groups = committed_previous + committed_current + interrupted_groups
-            target_groups = previous_quota + step_handle.required_group_count
-            return None if accounted_groups >= target_groups else "committed_target"
-        if committed_previous < previous_quota:
-            return "previous_partition_debt"
-        if committed_current < step_handle.required_group_count:
-            return "committed_target"
-        return None
-
-    def _refresh_progress(self, step_handle: "_AgenticStepHandle") -> None:
-        progress = step_handle.progress
-        if progress is None:
-            return
-        reward_snapshot = dict(self.reward_domain.accounting_snapshot())
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
-        group_size = transfer_snapshot["group_size"]
-        previous_partition_quota = transfer_snapshot["previous_partition_quota"]
-        progress.update_total_sessions((step_handle.required_group_count + previous_partition_quota) * group_size)
-        complete_groups = (
-            transfer_snapshot["committed_previous_groups"]
-            + transfer_snapshot["committed_current_groups"]
-            + transfer_snapshot["ready_groups"]
-            + reward_snapshot["ready_groups"]
-        )
-        complete_group_sessions = min(
-            progress.total_sessions,
-            complete_groups * group_size,
-        )
-        progress_snapshot = progress.snapshot()
-        committed_sessions = (
-            transfer_snapshot["committed_previous_groups"] + transfer_snapshot["committed_current_groups"]
-        ) * group_size
-        progress.update_counts(
-            materialized_sessions=max(progress_snapshot["materialized_sessions"], complete_group_sessions),
-            committed_sessions=max(progress_snapshot["committed_sessions"], committed_sessions),
-            scored_samples=reward_snapshot["scored_samples_ready"],
-        )
-
-    def _compact_accounting_snapshot(self, step_handle: "_AgenticStepHandle", *, phase: str) -> dict[str, object]:
-        transfer_snapshot = dict(self.transfer_domain.accounting_snapshot())
-        runtime_snapshot = dict(self.runtime_domain.accounting_snapshot())
-        prepare_snapshot = dict(self.prepare_domain.accounting_snapshot())
-        reward_snapshot = dict(self.reward_domain.accounting_snapshot())
-        resident_group_count = self.resident_group_count
-        interrupted_close_accounting = self._interrupted_close_accounting_enabled()
-        previous_partition_quota = transfer_snapshot["previous_partition_quota"]
-        (
-            remaining_previous_debt,
-            resident_current_window_groups,
-            admission_current_window_groups,
-            admission_current_slack,
-        ) = self._current_window_admission_counts(
-            resident_group_count=resident_group_count,
-            transfer_snapshot=transfer_snapshot,
-        )
-        target_data_size = previous_partition_quota + transfer_snapshot["current_partition_quota"]
-        admission_current_quota = self._current_window_admission_quota(transfer_snapshot)
-        interrupted_groups = runtime_snapshot["interrupted_groups"]
-        close_accounted_interrupted_groups = (
-            interrupted_groups if interrupted_close_accounting and not step_handle.final_backfill_step else 0
-        )
-        return {
-            "phase": phase,
-            "rollout_id": step_handle.rollout_id,
-            "final_backfill_step": step_handle.final_backfill_step,
-            "train_target_groups": step_handle.required_group_count,
-            "target_data_size": target_data_size,
-            "resident_group_count": resident_group_count,
-            "previous_partition_quota": previous_partition_quota,
-            "remaining_previous_debt": remaining_previous_debt,
-            "resident_current_window_groups": resident_current_window_groups,
-            "admission_current_window_groups": admission_current_window_groups,
-            "admission_current_slack": admission_current_slack,
-            "admission_current_quota": admission_current_quota,
-            "interrupted_groups": interrupted_groups,
-            "close_accounted_groups": transfer_snapshot["committed_previous_groups"]
-            + transfer_snapshot["committed_current_groups"]
-            + close_accounted_interrupted_groups,
-            "finish_eligible_mode": (
-                "committed_previous"
-                if step_handle.final_backfill_step
-                else "committed_plus_interrupted"
-                if interrupted_close_accounting
-                else "committed_current"
-            ),
-            "prepare_pool_groups": prepare_snapshot["pool_groups"],
-            "prepare_pool_target_groups": prepare_snapshot["pool_target_groups"],
-            "prepare_pending_groups": prepare_snapshot["pending_prepare_groups"],
-            "prepare_ready_groups": prepare_snapshot["ready_groups"],
-            "prepare_warming_groups": prepare_snapshot["warming_groups"],
-            "reward_waiting_groups": reward_snapshot["waiting_groups"],
-            "reward_waiting_records": reward_snapshot["waiting_records"],
-            "reward_ready_groups": reward_snapshot["ready_groups"],
-            "transfer_committed_current_groups": transfer_snapshot["committed_current_groups"],
-            "transfer_committed_previous_groups": transfer_snapshot["committed_previous_groups"],
-            "transfer_current_quota": transfer_snapshot["current_partition_quota"],
-            "transfer_previous_quota": transfer_snapshot["previous_partition_quota"],
-            "finish_eligible_blocked_by": self._close_status(step_handle),
-            "transfer_ready_groups": transfer_snapshot["ready_groups"],
-            "previous_step_current_deficit": self._last_step_current_deficit,
-        }
-
-    async def _wait_step_target(self, step_handle: "_AgenticStepHandle") -> None:
-        while True:
-            self._raise_resident_dataflow_error()
-            if self._interrupted_close_accounting_enabled():
-                await self._refresh_close_accounting()
-            self._refresh_progress(step_handle)
-            async with self._dataflow_lock():
-                if self._close_status(step_handle) is None:
-                    self.step_admission_closed = True
-                    self._refresh_progress(step_handle)
-                    return
-            progressed = await self._wait_for_step_event()
-            now = time.time()
-            if progressed:
-                self._refresh_progress(step_handle)
-                step_handle.last_progress_at = now
-                continue
-            if (
-                now - step_handle.last_progress_at >= _IDLE_HEARTBEAT_INTERVAL_S
-                and now - step_handle.last_idle_heartbeat_at >= _IDLE_HEARTBEAT_INTERVAL_S
-            ):
-                step_handle.last_idle_heartbeat_at = now
-                runtime_snapshot = self.runtime_domain.debug_snapshot()
-                logger.info(
-                    "Agentic rollout=%s idle_heartbeat idle_for=%.1fs committed_target=%s required=%s "
-                    "step_accounting_snapshot=%s runtime=%s",
-                    step_handle.rollout_id,
-                    now - step_handle.last_progress_at,
-                    self._committed_target_count(),
-                    step_handle.required_group_count,
-                    self._compact_accounting_snapshot(step_handle, phase="idle_heartbeat"),
-                    runtime_snapshot,
-                )
-
-    async def _gate_step_irs_once(
-        self,
-        step_handle: "_AgenticStepHandle",
-        *,
-        shutdown_all_irs: bool = False,
-    ) -> int:
-        """Apply the step-close IR gate once.
-
-        Partial close uses a partial-resume gate. Non-partial close gates the
-        current rollout for discard. Terminal/error cleanup gates all train
-        IRs.
-        """
-        if step_handle.rollout_irs_gated and not shutdown_all_irs:
-            return 0
-        if shutdown_all_irs:
-            locked = await self.runtime_domain.gate_all_irs_for_shutdown()
-        elif self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async:
-            locked = await self.runtime_domain.gate_rollout_irs_for_partial_resume()
-        else:
-            locked = await self.runtime_domain.gate_rollout_irs_for_discard()
-        step_handle.rollout_irs_gated = True
-        return locked
-
-    async def _wait_for_active_request_counts(
-        self,
-        *,
-        require_no_protected: bool,
-        require_no_abortable: bool,
-    ) -> dict[str, int]:
-        while True:
-            self._raise_resident_dataflow_error()
-            counts = await self.runtime_domain.active_rollout_request_counts()
-            protected_active = counts.get("protected_active", 0) or 0
-            abortable_active = counts.get("abortable_active", 0) or 0
-            evaluating = counts.get("evaluating", 0) or 0
-            if evaluating == 0:
-                protected_done = (not require_no_protected) or protected_active == 0
-                abortable_done = (not require_no_abortable) or abortable_active == 0
-                if protected_done and abortable_done:
-                    return counts
-            await self._wait_for_step_event()
-
-    async def _seal_step(
-        self,
-        step_handle: "_AgenticStepHandle",
-        *,
-        shutdown_all_irs: bool = False,
-    ) -> None:
-        if step_handle.active_backend_requests_sealed:
-            return
-        tail_carry_enabled = bool(
-            (self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async) and not shutdown_all_irs
-        )
-        if tail_carry_enabled:
-            await self._wait_for_active_request_counts(
-                require_no_protected=True,
-                require_no_abortable=False,
-            )
-        await self._gate_step_irs_once(step_handle, shutdown_all_irs=shutdown_all_irs)
-        abort_result = await self.runtime_domain.abort_rollout_requests()
-        logger.info(
-            "Agentic rollout=%s abort_all requested_workers=%s failed_workers=%s abortable_active=%s",
-            step_handle.rollout_id,
-            abort_result.get("abort_requested_workers", 0) or 0,
-            abort_result.get("abort_failed_workers", 0) or 0,
-            abort_result.get("abortable_active", 0) or 0,
-        )
-        await self._wait_for_active_request_counts(
-            require_no_protected=tail_carry_enabled,
-            require_no_abortable=True,
-        )
-        step_handle.active_backend_requests_sealed = True
-
-    async def _discard_resident_tail(self) -> None:
-        async with self._dataflow_lock():
-            await self.runtime_domain.drop_resident_results()
-            await self.reward_domain.drop_resident_groups()
-            dropped_ready_groups = self.transfer_domain.drop_ready_groups()
-            dropped_transfer_groups, cancelled_transfer_tasks = await self.transfer_domain.discard_pending_transfers()
-            if dropped_ready_groups or dropped_transfer_groups or cancelled_transfer_tasks:
-                logger.info(
-                    "Agentic discarded resident transfer tail: ready_groups=%s transfer_groups=%s transfer_tasks=%s",
-                    dropped_ready_groups,
-                    dropped_transfer_groups,
-                    cancelled_transfer_tasks,
-                )
-
-    async def close_step(
-        self,
-        *,
-        step_handle: "_AgenticStepHandle",
-        cleanup_only: bool = False,
-    ) -> "_AgenticClosedStep | None":
-        terminal_step = step_handle.terminal_step
-        if cleanup_only:
-            async with self._dataflow_lock():
-                self.step_admission_closed = True
-            await self._seal_step(step_handle, shutdown_all_irs=True)
-            await self.stop_resident_dataflow()
-            await self._discard_resident_tail()
-            await self.runtime_domain.trim_agentic_session_shards(reason="cleanup")
-            if step_handle.progress is not None:
-                step_handle.progress.close()
-                step_handle.progress = None
-            return None
-        await self._wait_step_target(step_handle)
-        async with self._dataflow_lock():
-            self.transfer_domain.close_output_window()
-            output = await self.transfer_domain.build_output()
-            end_snapshot = self.transfer_domain.accounting_snapshot()
-            # Record how many groups this step fell short of its current-partition target
-            # (rollout_batch_size). The next step backfills exactly this many into its
-            # previous partition. required_group_count == current_partition_quota.
-            self._last_step_current_deficit = max(
-                step_handle.required_group_count - end_snapshot["committed_current_groups"], 0
-            )
-            committed_groups = self.transfer_domain.committed_transfer_groups_snapshot()
-            progress_snapshot = step_handle.progress.snapshot() if step_handle.progress is not None else {}
-            get_samples_times = list(self._step_get_samples_times)
-            self.reward_domain.drop_completed_groups()
-            self.transfer_domain.release_step_output_payloads()
-            if step_handle.progress is not None:
-                step_handle.progress.close()
-                step_handle.progress = None
-        await self.transfer_domain.wait_for_pending_transfers()
-        lifecycle_terminal = terminal_step and not self._final_backfill_pending
-        shutdown_all_irs = lifecycle_terminal and not step_handle.defer_terminal_shutdown_for_eval
-        await self._seal_step(step_handle, shutdown_all_irs=shutdown_all_irs)
-        if lifecycle_terminal or not (
-            self.runtime_domain.args.partial_rollout or self.runtime_domain.args.fully_async
-        ):
-            await self._discard_resident_tail()
-        await self.runtime_domain.trim_agentic_session_shards(reason=f"close_step_{step_handle.rollout_id}")
-        async with self._dataflow_lock():
-            accounting_end_snapshot = self._compact_accounting_snapshot(step_handle, phase="accounting_end")
-        runtime_snapshot = self.runtime_domain.debug_snapshot()
-        return _AgenticClosedStep(
-            output=output,
-            end_snapshot=end_snapshot,
-            runtime_snapshot=runtime_snapshot,
-            committed_groups=committed_groups,
-            progress_snapshot=progress_snapshot,
-            get_samples_times=get_samples_times,
-            accounting_end_snapshot=accounting_end_snapshot,
-        )
-
-    async def run_step(
-        self,
-        *,
-        args,
-        rollout_id,
-        defer_terminal_shutdown_for_eval: bool = False,
-    ) -> RolloutFnTrainOutput:
-        rollout_started_at = time.monotonic()
-        await start_sglang_profile(args, rollout_id)
-        sglang_profile_stopped = False
-        metric_gatherer = MetricGatherer()
-        filter_path = args.dynamic_sampling_filter_path
-        if filter_path:
-            from relax.utils.utils import load_function
-
-            filter_fn = load_function(filter_path)
-
-            def group_filter(group) -> bool:
-                output = call_dynamic_filter(filter_fn, args, group)
-                keep = output.keep
-                if not keep:
-                    metric_gatherer.on_dynamic_filter_drop(reason=getattr(output, "reason", None))
-                return keep
-
-        else:
-            group_filter = None
-        step_handle = await self.open_step(
-            args=args,
-            rollout_id=rollout_id,
-            group_filter=group_filter,
-            defer_terminal_shutdown_for_eval=defer_terminal_shutdown_for_eval,
-        )
-        terminal_step = step_handle.terminal_step
-        transfer_start_snapshot = self.transfer_domain.accounting_snapshot()
-        accounting_start_snapshot = self._compact_accounting_snapshot(step_handle, phase="accounting_start")
-        logger.info(
-            format_agentic_event(
-                "ROLLOUT",
-                "accounting_start",
-                rollout=rollout_id,
-                group_size=transfer_start_snapshot["group_size"],
-                target_groups=self.transfer_domain.target_group_count(),
-                terminal_step=terminal_step,
-                final_backfill_step=step_handle.final_backfill_step,
-                ready_groups=transfer_start_snapshot["ready_groups"],
-            )
-        )
-        logger.info(
-            format_agentic_event(
-                "ROLLOUT",
-                "accounting_snapshot",
-                **accounting_start_snapshot,
-            )
-        )
-        step_sealed = False
-        try:
-            # Resident flow: keep moving data until previous/current transfer slots are filled.
-            # Protected sessions finish before the IR release gate catches the remaining abortable request tail.
-            closed_step = await self.close_step(step_handle=step_handle)
-            if closed_step is None:
-                raise RuntimeError("Agentic pipeline close_step returned no output outside cleanup mode.")
-            step_sealed = True
-            output = closed_step.output
-            end_snapshot = closed_step.end_snapshot
-            runtime_snapshot = closed_step.runtime_snapshot
-            committed_groups = closed_step.committed_groups
-            progress_snapshot = closed_step.progress_snapshot
-            logger.info(
-                format_agentic_event(
-                    "ROLLOUT",
-                    "accounting_end",
-                    rollout=rollout_id,
-                    group_size=end_snapshot["group_size"],
-                    committed_previous_groups=end_snapshot["committed_previous_groups"],
-                    committed_current_groups=end_snapshot["committed_current_groups"],
-                    materialized_sessions=progress_snapshot["materialized_sessions"],
-                    scored_samples=progress_snapshot["scored_samples"],
-                    accounting_snapshot=closed_step.accounting_end_snapshot,
-                )
-            )
-            resident_groups = int(closed_step.accounting_end_snapshot.get("resident_group_count", 0) or 0)
-            if resident_groups:
-                logger.info(
-                    f"Rollout not completed for rollout_id: {rollout_id}, have {resident_groups} samples aborted."
-                )
-            else:
-                logger.info(f"Rollout fully completed for rollout_id: {rollout_id}.")
-            logger.info(
-                "Agentic runtime volatile resource snapshot rollout=%s emitted=%s drained=%s "
-                "waiting_materialized_records=%s prepare_gate_blocked_irs=%s "
-                "partial_resume_gate_blocked_irs=%s session_debug_totals=%s",
-                rollout_id,
-                runtime_snapshot.get("emitted_materialized_session_count_total"),
-                runtime_snapshot.get("drained_materialized_session_count_total"),
-                runtime_snapshot.get("waiting_materialized_records"),
-                runtime_snapshot.get("prepare_gate_blocked_ir_count"),
-                runtime_snapshot.get("partial_resume_gate_blocked_ir_count"),
-                runtime_snapshot.get("session_debug_totals"),
-            )
-            committed_samples = (
-                _assert_and_flatten_agentic_export_samples(committed_groups) if committed_groups else []
-            )
-            agentic_metrics = dict(output.metrics or {})
-            agentic_metrics.update(
-                _aggregate_rollout_timing_from_agentic_trace(
-                    samples=committed_samples,
-                    get_samples_times=closed_step.get_samples_times,
-                )
-            )
-            agentic_metrics.update(metric_gatherer.collect())
-            _merge_non_conflicting_metrics(
-                agentic_metrics, compute_rollout_explicit_reward_metrics(args, committed_samples)
-            )
-            _merge_non_conflicting_metrics(agentic_metrics, collect_agentic_metadata_metrics(committed_samples))
-            await stop_sglang_profile(args, rollout_id)
-            sglang_profile_stopped = True
-            if committed_samples:
-                last_sample = committed_samples[-1]
-                logger.info(
-                    "Finish rollout: %s, label: %s, reward: %s",
-                    [str(last_sample.prompt) + last_sample.response],
-                    str(last_sample.label)[:100],
-                    last_sample.reward,
-                )
-                rollout_time = time.monotonic() - rollout_started_at
-                if args.save_debug_rollout_data is not None:
-                    save_debug_rollout_data(
-                        args,
-                        committed_samples,
-                        rollout_id=rollout_id,
-                        evaluation=False,
-                        tokenizer=get_agentic_runtime_resources(args).compiler.tokenizer,
-                    )
-                _log_rollout_data(
-                    rollout_id,
-                    args,
-                    committed_samples,
-                    agentic_metrics,
-                    rollout_time,
-                )
-                if args.debug_rollout_only:
-                    if self.transfer_domain is None or self.transfer_domain.data_system_client is None:
-                        raise RuntimeError("Agentic debug rollout cleanup requires an initialized TransferDomain.")
-                    logger.info("Debug rollout only mode - data system cleanup")
-                    partition_rollout_id = rollout_id - 1 if step_handle.final_backfill_step else rollout_id
-                    await self.transfer_domain.data_system_client.async_clear_partition(
-                        partition_id=f"train_{partition_rollout_id}"
-                    )
-            output.metrics = agentic_metrics
-            flat_samples = _assert_and_flatten_agentic_export_samples(output.samples)
-            output.samples = flat_samples
-            return output
-        finally:
-            if not sglang_profile_stopped:
-                await stop_sglang_profile(args, rollout_id)
-            if not step_sealed:
-                await self.close_step(step_handle=step_handle, cleanup_only=True)
-            lifecycle_terminal = terminal_step and (not step_sealed or not self._final_backfill_pending)
-            if lifecycle_terminal and not step_handle.defer_terminal_shutdown_for_eval:
-                await self.shutdown()
-            if self._active_step_handle is step_handle:
-                self._active_step_handle = None
-
-
 def get_agentic_resident_pipeline() -> AgenticResidentPipeline:
-    with _RESIDENT_PIPELINE_LOCK:
-        if _RESIDENT_PIPELINE is None:
-            raise RuntimeError(
-                "Agentic resident pipeline has not been initialized. "
-                "Call init_agentic_resident_pipeline before generate_rollout."
-            )
-        return _RESIDENT_PIPELINE
+    pipeline = _RESIDENT_PIPELINE
+    if pipeline is None:
+        raise RuntimeError(
+            "Agentic resident pipeline has not been initialized. "
+            "Call init_agentic_resident_pipeline before generate_rollout."
+        )
+    return pipeline
 
 
 def init_agentic_resident_pipeline(args, data_source, data_system_client) -> None:
-    global _RESIDENT_PIPELINE
-    with _RESIDENT_PIPELINE_LOCK:
-        if _RESIDENT_PIPELINE is None:
-            _RESIDENT_PIPELINE = AgenticResidentPipeline()
-        resident_pipeline = _RESIDENT_PIPELINE
-    _run_on_resident_async_loop(
-        resident_pipeline.init_pipeline(
-            args=args,
-            data_source=data_source,
-            data_system_client=data_system_client,
-        )
-    )
+    """Preserve the synchronous RolloutManager composition boundary."""
+
+    with _RESIDENT_ENTRY_LOCK:
+        if _RESIDENT_PIPELINE is not None:
+            return
+        try:
+            _run_on_resident_async_loop(
+                _init_agentic_resident_pipeline_async(
+                    args=args,
+                    data_source=data_source,
+                    data_system_client=data_system_client,
+                )
+            )
+        except BaseException:
+            _shutdown_resident_async_loop()
+            raise
 
 
-def _assert_and_flatten_agentic_export_samples(groups: list[list[Sample]]) -> list[Sample]:
-    flat_samples: list[Sample] = []
-    for group in groups:
-        if not isinstance(group, list):
-            raise TypeError(f"Agentic export expected list[list[Sample]], got group type {type(group)}")
-        for sample in group:
-            session_id = sample.session_id
-            if not isinstance(session_id, str) or not session_id:
-                raise RuntimeError("Agentic export expects every sample to carry a non-empty session_id.")
-            flat_samples.append(sample)
-    return flat_samples
+def shutdown_agentic_resident_pipeline() -> None:
+    """Idempotently release the resident Pipeline and its event loop."""
+
+    with _RESIDENT_ENTRY_LOCK:
+        try:
+            _run_on_resident_async_loop(_shutdown_agentic_resident_pipeline_async())
+        finally:
+            _shutdown_resident_async_loop()
 
 
-@dataclass(frozen=True)
-class _AgenticClosedStep:
-    output: RolloutFnTrainOutput
-    end_snapshot: dict[str, Any]
-    runtime_snapshot: dict[str, Any]
-    committed_groups: list[list[Sample]]
-    progress_snapshot: dict[str, int]
-    get_samples_times: list[float]
-    accounting_end_snapshot: dict[str, object]
+def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:
+    turns_by_sample = [sample.metadata[TRACE_KEY]["turns"] for sample in samples]
+    if not turns_by_sample:
+        return {}
 
+    phase_values = {"generate": [sum(turn["generation_elapsed_s"] for turn in turns) for turns in turns_by_sample]}
+    for event_key, phase in (
+        ("process_vision_info_elapsed_s", "process_vision_info"),
+        ("processor_elapsed_s", "image_processor"),
+        ("media_encode_elapsed_s", "mm_encode"),
+    ):
+        sample_totals = []
+        for turns in turns_by_sample:
+            observed = [turn["events"][event_key] for turn in turns if event_key in turn["events"]]
+            if observed:
+                sample_totals.append(sum(observed))
+        if sample_totals:
+            phase_values[phase] = sample_totals
 
-@dataclass
-class _AgenticStepHandle:
-    """Step boundary handle for a resident agentic pipeline.
-
-    Dataflow and lifecycle control stay in AgenticResidentPipeline; this object
-    carries step-scoped domains, progress, and accounting state.
-    """
-
-    rollout_id: int
-    required_group_count: int
-    terminal_step: bool = False
-    final_backfill_step: bool = False
-    defer_terminal_shutdown_for_eval: bool = False
-    progress: RolloutProgress | None = None
-    rollout_irs_gated: bool = False
-    active_backend_requests_sealed: bool = False
-    first_rollout_sample_logged: bool = False
-    last_progress_at: float = field(default_factory=time.time)
-    last_idle_heartbeat_at: float = 0.0
-
-
-def _aggregate_rollout_timing_from_agentic_trace(
-    *,
-    samples: list[Sample],
-    get_samples_times: list[float],
-) -> dict[str, float]:
-    generate_values: list[float] = []
-    post_generate_values: list[float] = []
-    phase_values: dict[str, list[float]] = {
-        "process_vision_info": [],
-        "image_processor": [],
-        "mm_encode": [],
+    return {
+        f"perf_detail/rollout/{phase}_time/{statistic}": value
+        for phase, values in phase_values.items()
+        for statistic, value in (("mean", sum(values) / len(values)), ("max", max(values)))
     }
-    for sample in samples:
-        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        agentic_trace = metadata.get(TRACE_KEY)
-        if not isinstance(agentic_trace, dict):
-            continue
-        turns = agentic_trace.get("turns")
-        if not isinstance(turns, list):
-            continue
-        for turn in turns:
-            if not isinstance(turn, dict):
-                continue
-            generation_elapsed_s = turn.get("generation_elapsed_s")
-            wall_elapsed_s = turn.get("wall_elapsed_s")
-            events = turn.get("events")
-            if isinstance(generation_elapsed_s, (int, float)):
-                generate_values.append(float(generation_elapsed_s))
-            if (
-                isinstance(wall_elapsed_s, (int, float))
-                and isinstance(generation_elapsed_s, (int, float))
-                and wall_elapsed_s >= generation_elapsed_s
-            ):
-                post_generate_values.append(float(wall_elapsed_s) - float(generation_elapsed_s))
-            if not isinstance(events, dict):
-                continue
-            for event_key, phase in (
-                ("process_vision_info_elapsed_s", "process_vision_info"),
-                ("processor_elapsed_s", "image_processor"),
-                ("media_encode_elapsed_s", "mm_encode"),
-            ):
-                value = events.get(event_key)
-                if isinstance(value, (int, float)):
-                    phase_values[phase].append(float(value))
-
-    metrics: dict[str, float] = {}
-    for phase, values in phase_values.items():
-        if values:
-            metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
-            metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
-    if generate_values:
-        metrics["perf_detail/rollout/generate_time/mean"] = sum(generate_values) / len(generate_values)
-        metrics["perf_detail/rollout/generate_time/max"] = max(generate_values)
-    if post_generate_values:
-        metrics["perf_detail/rollout/post_generate_time/mean"] = sum(post_generate_values) / len(post_generate_values)
-        metrics["perf_detail/rollout/post_generate_time/max"] = max(post_generate_values)
-    if get_samples_times:
-        metrics["perf_detail/rollout/get_samples_time/total"] = sum(get_samples_times)
-        metrics["perf_detail/rollout/get_samples_time/mean"] = sum(get_samples_times) / len(get_samples_times)
-    return metrics
 
 
-def _merge_non_conflicting_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
-    for key, value in source.items():
-        if key not in target:
-            target[key] = value
-
-
-def collect_agentic_metadata_metrics(samples: list[Sample]) -> dict[str, float]:
+def _collect_agentic_metadata_metrics(samples: list[Sample]) -> dict[str, float]:
     metric_values: dict[str, list[float]] = {}
     for sample in samples:
-        metadata = sample.metadata if isinstance(sample.metadata, dict) else None
-        if not metadata:
-            continue
-        for key, value in metadata.items():
-            if not isinstance(key, str) or not key or key.startswith("_") or key in _AGENT_METADATA_INTERNAL_KEYS:
-                continue
-            if not isinstance(value, (int, float)):
-                continue
-            metric_values.setdefault(key, []).append(float(value))
+        for key, value in sample.metadata.items():
+            if (
+                isinstance(key, str)
+                and key
+                and not key.startswith("_")
+                and key not in _METADATA_METRIC_SKIP
+                and isinstance(value, (int, float))
+            ):
+                metric_values.setdefault(key, []).append(float(value))
     return finalize_rollout_explicit_metric_values(metric_values)
 
 
-def _dict_add_prefix(d, prefix):
-    return {f"{prefix}{k}": v for k, v in d.items()}
-
-
-def _compute_zero_std_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
-    if args.advantage_estimator == "ppo":
-        return {}
-
-    all_sample_groups = group_by(all_samples, lambda sample: sample.group_index)
-    reward_groups = [
-        [sample.get_reward_value(args) for sample in group if sample.reward is not None]
-        for group in all_sample_groups.values()
-    ]
-    interesting_rewards = [
-        str(round(rewards[0], 1))
-        for rewards in reward_groups
-        if rewards and all(rewards[0] == reward for reward in rewards)
-    ]
-    return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
-
-
-def _compute_reward_cat_metrics(args, all_samples: list[Sample]) -> dict[str, float]:
-    reward_cat_key = args.log_reward_category
-    if reward_cat_key is None:
-        return {}
-    rewarded_samples = [
-        sample for sample in all_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward
-    ]
-    if not rewarded_samples:
-        return {}
-    samples_of_reward_cat = group_by(rewarded_samples, lambda sample: sample.reward[reward_cat_key])
-    return {
-        f"error_cat/{reward_cat}": len(samples) / len(rewarded_samples)
-        for reward_cat, samples in samples_of_reward_cat.items()
-    }
-
-
-def _compute_prefix_cache_metrics(args, samples: list[Sample]) -> dict[str, float]:
-    num_samples = len(samples)
-    if num_samples == 0:
-        return {}
-    total_cached_tokens = sum(sample.prefix_cache_info.cached_tokens for sample in samples)
-    total_prompt_tokens = sum(sample.prefix_cache_info.total_prompt_tokens for sample in samples)
-    return {
-        "prefix_cache_hit_rate": (total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0),
-        "avg_cached_tokens_per_sample": total_cached_tokens / num_samples,
-    }
-
-
-def _compute_rollout_metrics_from_samples(args, samples: list[Sample]) -> dict[str, float]:
-    response_lengths = [sample.effective_response_length for sample in samples]
-    log_dict: dict[str, float] = {}
-    log_dict |= _dict_add_prefix(compute_statistics(response_lengths), "response_len/")
-    log_dict |= _compute_zero_std_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict |= _compute_prefix_cache_metrics(args, samples)
-    log_dict["repetition_frac"] = np.mean([has_repetition(sample.response) for sample in samples]).item()
-    log_dict["truncated_ratio"] = np.mean([sample.status == Sample.Status.TRUNCATED for sample in samples]).item()
-    turns = [s.metadata.get("agentic_trace", {}).get("turn_count", 1) for s in samples]
-    log_dict["num_turn/mean"] = float(np.mean(turns))
-    log_dict["num_turn/max"] = float(np.max(turns))
-    log_dict["num_turn/min"] = float(np.min(turns))
-    return log_dict
-
-
-def _compute_rollout_perf_metrics_from_samples(args, samples: list[Sample], rollout_time: float) -> dict[str, float]:
-    non_generation_time = [sample.non_generation_time for sample in samples]
-    log_dict: dict[str, float] = {"rollout_time": rollout_time}
-    if max(non_generation_time) > 0:
-        log_dict |= _dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
-
-    def token_perf(response_lengths: list[int], non_generation_time_values: list[float], key: str = "") -> None:
-        max_response_length = max(response_lengths)
-        if args.rollout_num_gpus:
-            log_dict[f"{key}tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
-        log_dict[f"longest_{key}sample_tokens_per_sec"] = max_response_length / rollout_time
-
-        if max(non_generation_time_values) == 0:
-            return
-
-        aligned_non_generation_time = [
-            value
-            for value, length in zip(non_generation_time_values, response_lengths, strict=True)
-            if length == max_response_length
-        ]
-        mean_non_generation_time = sum(aligned_non_generation_time) / len(aligned_non_generation_time)
-        log_dict[f"longest_{key}sample_non_generation_time"] = mean_non_generation_time
-        log_dict[f"longest_{key}sample_tokens_per_sec_without_non_generation"] = max_response_length / (
-            rollout_time - mean_non_generation_time
-        )
-
-    token_perf([sample.response_length for sample in samples], non_generation_time, key="")
-    token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
-    return log_dict
-
-
-def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> None:
-    from relax.utils import tracking_utils
-
-    save_rollout_result_jsonl(args, rollout_id, samples)
-
-    if args.custom_rollout_log_function_path is not None:
-        from relax.utils.misc import load_function
-
-        custom_log_func = load_function(args.custom_rollout_log_function_path)
-        if custom_log_func(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
-            return
-
-    if args.load_debug_rollout_data:
+def _save_train_debug_rollout_data(
+    args,
+    rollout_id: int,
+    samples: list[Sample],
+) -> None:
+    if args.save_debug_rollout_data is None:
         return
-
-    log_dict = {**(rollout_extra_metrics or {})}
-    log_dict |= _dict_add_prefix(_compute_rollout_metrics_from_samples(args, samples), "rollout/")
-    log_dict |= _dict_add_prefix(_compute_rollout_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
-    logger.info(f"perf {rollout_id}: {log_dict}")
-    step = compute_rollout_step(args, rollout_id)
-    log_dict["rollout/step"] = step
-    tracking_utils.log(args, log_dict, step_key="rollout/step")
-
-
-def _load_eval_dataset(args, dataset_cfg: EvalDatasetConfig):
-    from relax.utils.data.data import Dataset
-    from relax.utils.misc import load_function
-
-    resources = get_agentic_runtime_resources(args).compiler
-    custom_prompt_path = getattr(args, "custom_prompt_path", None)
-    custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
-    return Dataset(
-        path=dataset_cfg.path,
-        tokenizer=resources.tokenizer,
-        processor=resources.processor,
-        max_length=args.eval_max_prompt_len,
-        prompt_key=dataset_cfg.input_key,
-        label_key=dataset_cfg.label_key,
-        multimodal_keys=args.multimodal_keys,
-        metadata_key=dataset_cfg.metadata_key,
-        tool_key=dataset_cfg.tool_key,
-        apply_chat_template=args.apply_chat_template,
-        apply_chat_template_kwargs=args.apply_chat_template_kwargs,
-        use_audio_in_video=args.use_audio_in_video,
-        system_prompt=args.system_prompt,
-        custom_prompt_func=custom_prompt_func,
-    )
+    resources = load_agentic_compiler_resources(args)
+    try:
+        save_debug_rollout_data(
+            args,
+            samples,
+            rollout_id=rollout_id,
+            evaluation=False,
+            tokenizer=resources.tokenizer,
+        )
+    finally:
+        resources.shutdown()
 
 
-def _eval_sampling_params(args, dataset_cfg: EvalDatasetConfig, *, sample_slot_idx: int) -> dict[str, Any]:
-    sampling_params = {
+def _eval_sampling_params(args, dataset_cfg: EvalDatasetConfig, *, sample_idx: int) -> dict[str, Any]:
+    params = {
         "temperature": dataset_cfg.temperature,
         "top_p": dataset_cfg.top_p,
         "top_k": dataset_cfg.top_k,
@@ -1446,361 +835,123 @@ def _eval_sampling_params(args, dataset_cfg: EvalDatasetConfig, *, sample_slot_i
         "spaces_between_special_tokens": False,
     }
     if args.sglang_enable_deterministic_inference:
-        sampling_params["sampling_seed"] = args.rollout_seed + sample_slot_idx
-    return sampling_params
+        params["sampling_seed"] = args.rollout_seed + sample_idx
+    return params
 
 
-def _build_eval_samples(args, dataset_cfg: EvalDatasetConfig) -> list[Sample]:
-    dataset = _load_eval_dataset(args, dataset_cfg)
-    samples: list[Sample] = []
-    sample_index = 0
-    group_index = 0
-    for prompt_sample in dataset.samples:
-        for sample_slot_idx in range(dataset_cfg.n_samples_per_eval_prompt):
-            sample = copy.deepcopy(prompt_sample)
-            sample.index = sample_index
-            sample.group_index = group_index
-            sample_index += 1
-            sample.metadata = dataset_cfg.inject_metadata(sample.metadata)
-            samples.append(sample)
-        group_index += 1
-    return samples
-
-
-async def _advance_eval_outputs(
-    *,
-    runtime_domain,
-    reward_domain,
-    completed_samples: list[Sample],
-    pbar,
-    do_print: bool,
-) -> tuple[bool, bool, int, int]:
-    progressed = False
-    runtime_materialized_group_count = 0
-    runtime_dropped_group_count = 0
-    discarded_group_keys = runtime_domain.drain_discarded_group_keys()
-    if discarded_group_keys:
-        runtime_dropped_group_count = len(discarded_group_keys)
-        await reward_domain.drop_waiting_groups_by_key(discarded_group_keys)
-        progressed = True
-    runtime_dispatch = runtime_domain.drain_ready_execution()
-    if runtime_dispatch.materialized_batches or runtime_dispatch.ready_groups:
-        if runtime_dispatch.materialized_batches and not reward_domain.group_rm:
-            reward_domain.accept_session_materializations(runtime_dispatch.materialized_batches)
-            runtime_materialized_group_count += len(
-                {record["group_key"] for batch in runtime_dispatch.materialized_batches for record in batch}
-            )
-        for group in runtime_dispatch.ready_groups:
-            await reward_domain.ingest_groups([group])
-        if reward_domain.group_rm:
-            runtime_materialized_group_count += len(runtime_dispatch.ready_groups)
-        progressed = True
-
-    reward_progressed = await reward_domain.step_once()
-    if reward_progressed:
-        ready_reward_groups = reward_domain.drain_ready_dispatch()
-        for group in ready_reward_groups:
-            if do_print and group:
-                sample = group[0]
-                logger.info(
-                    "eval_rollout_single_dataset example data: "
-                    f"{[str(sample.prompt) + sample.response]} "
-                    f"reward={sample.reward}"
-                )
-                do_print = False
-            completed_samples.extend(group)
-            pbar.update(len(group))
-        progressed = True
-    return progressed, do_print, runtime_materialized_group_count, runtime_dropped_group_count
-
-
-async def _run_eval_samples(
-    args, rollout_id: int, dataset_cfg: EvalDatasetConfig, eval_samples: list[Sample]
+def _build_eval_samples(
+    args,
+    dataset_cfg: EvalDatasetConfig,
 ) -> list[Sample]:
-    if not eval_samples:
-        return []
+    from relax.utils.data.data import Dataset
+    from relax.utils.misc import load_function
 
-    completed_samples: list[Sample] = []
-    do_print = True
-    eval_sample_count = len(eval_samples)
-    if args.group_rm:
-        eval_prepare_groups: list[list[Sample]] = []
-        current_group_index = object()
-        for sample in eval_samples:
-            if sample.group_index != current_group_index:
-                eval_prepare_groups.append([])
-                current_group_index = sample.group_index
-            eval_prepare_groups[-1].append(sample)
-    else:
-        eval_prepare_groups = [[sample] for sample in eval_samples]
-    total_group_count = len(eval_prepare_groups)
-    eval_group_size = dataset_cfg.n_samples_per_eval_prompt if args.group_rm else 1
-    train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
-    train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
-    eval_prepare_pool_target_group_count = args.agentic_eval_prepare_pool_size
-    if eval_prepare_pool_target_group_count is None:
-        eval_prepare_pool_target_group_count = (
-            train_prepare_pool_target_session_count + eval_group_size - 1
-        ) // eval_group_size
-    eval_prepare_pool_target_group_count = min(total_group_count, eval_prepare_pool_target_group_count)
-    # Cap runtime residency to training's steady-state in-flight session budget.
-    # Leaving it at total_group_count lets the whole eval set queue in runtime and
-    # can OOM the raylet on large eval datasets; training never hits this because
-    # `over_sampling_batch_size` bounds admission per step.
-    eval_runtime_admission_group_count = min(
-        total_group_count,
-        max(
-            eval_prepare_pool_target_group_count,
-            (train_prepare_pool_target_session_count + eval_group_size - 1) // eval_group_size,
-        ),
-    )
-    pbar = tqdm(total=eval_sample_count, desc=f"Eval {dataset_cfg.name}", unit="sample")
-    logger.info(
-        "Agentic eval dataset=%s total_samples=%s total_group_count=%s "
-        "prepare_pool_target_group_count=%s runtime_admission_group_count=%s",
-        dataset_cfg.name,
-        eval_sample_count,
-        total_group_count,
-        eval_prepare_pool_target_group_count,
-        eval_runtime_admission_group_count,
-    )
-    eval_namespace = str(dataset_cfg.name).replace("/", "_").replace(" ", "_")
-    for sample in eval_samples:
-        if not isinstance(sample.metadata, dict):
-            sample.metadata = {}
-        sample.metadata["eval_dataset"] = dataset_cfg.name
-        sample.session_id = f"eval_session_{eval_namespace}_{rollout_id}_{sample.index}"
-
-    prepare_domain = PrepareDomain(
-        scope_id=_eval_scope_id(dataset_name=str(dataset_cfg.name), rollout_id=rollout_id),
-        data_source=None,
-        pool_target_group_count=eval_prepare_pool_target_group_count,
-    )
-    runtime_domain = RuntimeDomain(
-        args=args,
-        scope_id=prepare_domain.scope_id,
-    )
-    runtime_domain.rebind_step(
-        args=args,
-        rollout_id=rollout_id,
-    )
-    reward_domain = RewardDomain(
-        args=args,
-        group_filter=None,
-        use_custom_advantage=False,
-    )
-    prepare_domain.configure(
-        runtime_driver=runtime_domain,
-        pool_target_group_count=eval_prepare_pool_target_group_count,
-    )
-
+    resources = load_agentic_compiler_resources(args)
     try:
-        await runtime_domain.enter_eval()
-        runtime_domain.ensure_session_runner_pool(total_requests=eval_sample_count)
-        next_eval_group_idx = 0
-        started_group_count = 0
-        runtime_materialized_group_count = 0
-        runtime_dropped_group_count = 0
-
-        def runtime_resident_group_count() -> int:
-            return started_group_count - runtime_materialized_group_count - runtime_dropped_group_count
-
-        async def refresh_eval_ready_groups(*, wait_for_progress: bool) -> int:
-            if not prepare_domain.has_warming_groups():
-                return 0
-            if wait_for_progress:
-                await asyncio.sleep(0.05)
-            return await prepare_domain.refresh_ready_groups(
-                status_fetcher=runtime_domain.prepare_group_status,
-                drop_completed_before_ready=True,
-            )
-
-        async def fill_prepare_pool() -> int:
-            nonlocal next_eval_group_idx
-            if next_eval_group_idx >= len(eval_prepare_groups):
-                return 0
-            snapshot = prepare_domain.accounting_snapshot()
-            prepare_capacity = int(snapshot["pool_target_groups"]) - int(snapshot["pool_groups"])
-            if prepare_capacity <= 0:
-                return 0
-            select_count = min(prepare_capacity, len(eval_prepare_groups) - next_eval_group_idx)
-            selected_groups = eval_prepare_groups[next_eval_group_idx : next_eval_group_idx + select_count]
-            for group in selected_groups:
-                for sample_slot_idx, sample in enumerate(group):
-                    eval_sample_slot_idx = (
-                        sample_slot_idx if args.group_rm else sample.index % dataset_cfg.n_samples_per_eval_prompt
-                    )
-                    sample.sampling_params = _eval_sampling_params(
-                        args,
-                        dataset_cfg,
-                        sample_slot_idx=eval_sample_slot_idx,
-                    )
-            next_eval_group_idx += len(selected_groups)
-            await prepare_domain.accept_prepare(selected_groups)
-            return len(selected_groups)
-
-        await fill_prepare_pool()
-        while True:
-            launched_count = await prepare_domain.launch_pending()
-            runtime_capacity = eval_runtime_admission_group_count - runtime_resident_group_count()
-            if runtime_capacity > 0:
-                if not prepare_domain.has_ready_groups():
-                    if prepare_domain.has_pending_prepare():
-                        await prepare_domain.launch_pending()
-                    if prepare_domain.has_warming_groups() or prepare_domain.has_inflight_work():
-                        await refresh_eval_ready_groups(wait_for_progress=True)
-                elif prepare_domain.has_warming_groups():
-                    await refresh_eval_ready_groups(wait_for_progress=False)
-                batch_input = await prepare_domain.lease_ready_groups(
-                    quota_group_count=runtime_capacity,
-                    rollout_id=rollout_id,
+        custom_prompt_path = getattr(args, "custom_prompt_path", None)
+        custom_prompt_func = load_function(custom_prompt_path) if custom_prompt_path else None
+        dataset = Dataset(
+            path=dataset_cfg.path,
+            tokenizer=resources.tokenizer,
+            processor=resources.processor,
+            max_length=args.eval_max_prompt_len,
+            prompt_key=dataset_cfg.input_key,
+            label_key=dataset_cfg.label_key,
+            multimodal_keys=args.multimodal_keys,
+            metadata_key=dataset_cfg.metadata_key,
+            tool_key=dataset_cfg.tool_key,
+            apply_chat_template=args.apply_chat_template,
+            apply_chat_template_kwargs=args.apply_chat_template_kwargs,
+            use_audio_in_video=args.use_audio_in_video,
+            system_prompt=args.system_prompt,
+            custom_prompt_func=custom_prompt_func,
+        )
+        samples = []
+        sample_index = 0
+        for group_index, prompt_sample in enumerate(dataset.samples):
+            for sample_idx in range(dataset_cfg.n_samples_per_eval_prompt):
+                sample = copy.deepcopy(prompt_sample)
+                sample.index = sample_index
+                sample.group_index = group_index
+                sample.metadata = dataset_cfg.inject_metadata(sample.metadata)
+                sample.sampling_params = _eval_sampling_params(
+                    args,
+                    dataset_cfg,
+                    sample_idx=sample_idx,
                 )
-                if batch_input is not None:
-                    started_group_count += await runtime_domain.start_batch(batch_input=batch_input)
-                    await fill_prepare_pool()
-                    (
-                        _progressed_after_start,
-                        do_print,
-                        materialized_groups,
-                        dropped_groups,
-                    ) = await _advance_eval_outputs(
-                        runtime_domain=runtime_domain,
-                        reward_domain=reward_domain,
-                        completed_samples=completed_samples,
-                        pbar=pbar,
-                        do_print=do_print,
-                    )
-                    runtime_materialized_group_count += materialized_groups
-                    runtime_dropped_group_count += dropped_groups
-                    if _progressed_after_start:
-                        await fill_prepare_pool()
-                    continue
+                samples.append(sample)
+                sample_index += 1
+        return samples
+    finally:
+        resources.shutdown()
 
-            progressed, do_print, materialized_groups, dropped_groups = await _advance_eval_outputs(
+
+async def eval_rollout(args, rollout_id: int) -> RolloutFnEvalOutput:
+    results = {}
+    eval_metrics = {}
+    reward_key = args.eval_reward_key or args.reward_key
+    for dataset_index, dataset_cfg in enumerate(args.eval_datasets):
+        samples = _build_eval_samples(args, dataset_cfg)
+        progress = tqdm(total=len(samples), desc=f"Eval {dataset_cfg.name}", unit="sample")
+        grouped_samples: dict[int, list[Sample]] = {}
+        for sample in samples:
+            grouped_samples.setdefault(cast(int, sample.group_index), []).append(sample)
+        eval_group_size = dataset_cfg.n_samples_per_eval_prompt
+        eval_concurrency = _agentic_eval_runtime_concurrency(args, eval_group_size)
+        runtime_domain = await RuntimeDomain.connect(args, "eval", eval_concurrency)
+        try:
+            scored_groups = await _eval_groups(
+                eval_id=rollout_id,
+                scope_id=f"eval:{dataset_cfg.name}:{rollout_id}",
+                groups=tuple(tuple(group) for group in grouped_samples.values()),
                 runtime_domain=runtime_domain,
-                reward_domain=reward_domain,
-                completed_samples=completed_samples,
-                pbar=pbar,
-                do_print=do_print,
+                reward_domain=RewardDomain(args, "eval", None),
+                progress=progress,
             )
-            runtime_materialized_group_count += materialized_groups
-            runtime_dropped_group_count += dropped_groups
-            if progressed:
-                await fill_prepare_pool()
-                continue
-            if runtime_domain.has_pending_runtime_work():
-                runtime_progress = await runtime_domain.wait_for_next_runtime_slot()
-                if runtime_progress is not None:
-                    (
-                        _progressed_after_wait,
-                        do_print,
-                        materialized_groups,
-                        dropped_groups,
-                    ) = await _advance_eval_outputs(
-                        runtime_domain=runtime_domain,
-                        reward_domain=reward_domain,
-                        completed_samples=completed_samples,
-                        pbar=pbar,
-                        do_print=do_print,
-                    )
-                    runtime_materialized_group_count += materialized_groups
-                    runtime_dropped_group_count += dropped_groups
-                    await fill_prepare_pool()
-                    continue
-            elif reward_domain.has_inflight_work():
-                reward_completed = await reward_domain.wait_for_next_completion()
-                if reward_completed:
-                    await fill_prepare_pool()
-                    continue
-
-            has_prepare_work = (
-                prepare_domain.has_pending_prepare()
-                or prepare_domain.has_inflight_work()
-                or prepare_domain.has_warming_groups()
-                or prepare_domain.has_ready_groups()
-            )
-            if (
-                next_eval_group_idx >= len(eval_prepare_groups)
-                and not has_prepare_work
-                and not runtime_domain.has_inflight_work()
-                and not runtime_domain.has_ready_output()
-                and not reward_domain.has_inflight_work()
-                and not reward_domain.has_pending_submission_work()
-                and not reward_domain.has_ready_output()
-            ):
-                break
-            if (
-                prepare_domain.has_pending_prepare()
-                and launched_count == 0
-                and not prepare_domain.has_warming_groups()
-                and not prepare_domain.has_ready_groups()
-            ):
-                raise RuntimeError(
-                    "Agentic eval prepare queue is stuck with pending groups but no runtime driver launch."
+            if dataset_index + 1 == len(args.eval_datasets):
+                eval_metrics = {
+                    f"eval/{key}": value for key, value in (await runtime_domain.collect_agentic_kv_metrics()).items()
+                }
+        finally:
+            try:
+                await finish_before_cancellation(
+                    runtime_domain.shutdown(),
+                    f"agentic-eval-runtime-shutdown:{dataset_cfg.name}:{rollout_id}",
                 )
-            await asyncio.sleep(_BACKGROUND_POLL_INTERVAL_S)
-    finally:
-        pbar.close()
-        await reward_domain.shutdown()
-        await prepare_domain.shutdown()
-        await runtime_domain.exit_eval()
-        await runtime_domain.shutdown()
-
-    completed_samples.sort(key=lambda sample: sample.index)
-    return completed_samples
-
-
-async def eval_rollout(args, rollout_id) -> RolloutFnEvalOutput:
-    try:
-        results = {}
-        reward_key = args.eval_reward_key or args.reward_key
-        for dataset_cfg in args.eval_datasets:
-            data = await _run_eval_samples(args, rollout_id, dataset_cfg, _build_eval_samples(args, dataset_cfg))
-            results[dataset_cfg.name] = {
-                "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
-                "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
-                "samples": data,
-            }
-        return RolloutFnEvalOutput(data=results)
-    finally:
-        await asyncio.to_thread(_shutdown_resident_pipeline_after_deferred_eval, rollout_id)
+            finally:
+                progress.close()
+        completed_samples = [sample for group in scored_groups for sample in group.samples]
+        completed_samples.sort(key=lambda sample: sample.index)
+        results[dataset_cfg.name] = {
+            "rewards": [
+                sample.reward if not reward_key else sample.reward[reward_key] for sample in completed_samples
+            ],
+            "truncated": [sample.status == Sample.Status.TRUNCATED for sample in completed_samples],
+            "samples": completed_samples,
+        }
+    return RolloutFnEvalOutput(data=results, metrics=eval_metrics)
 
 
 def generate_rollout(args, rollout_id, data_source, data_system_client=None, evaluation=False):
-    global _RESIDENT_PIPELINE, _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID
-    if evaluation:
-        return asyncio.run(eval_rollout(args=args, rollout_id=rollout_id))
-    resident_pipeline = get_agentic_resident_pipeline()
-    num_rollout = args.num_rollout
-    terminal_step = num_rollout is not None and rollout_id + 1 >= num_rollout
-    final_train_rollout_id = min(rollout_id, num_rollout - 1) if terminal_step else rollout_id
-    defer_terminal_shutdown_for_eval = terminal_step and _post_train_eval_expected(
-        args, final_train_rollout_id, data_source
-    )
-    completed = False
-    final_backfill_pending = False
-    try:
-        output = _run_on_resident_async_loop(
-            resident_pipeline.run_step(
-                args=args,
-                rollout_id=rollout_id,
-                defer_terminal_shutdown_for_eval=defer_terminal_shutdown_for_eval,
+    """Run one rollout through the synchronous rollout function contract."""
+
+    with _RESIDENT_ENTRY_LOCK:
+        if evaluation:
+            return asyncio.run(eval_rollout(args, rollout_id))
+        pipeline = get_agentic_resident_pipeline()
+        finalize_pipeline = False
+        try:
+            output = _run_on_resident_async_loop(pipeline.run_step(rollout_id))
+            finalize_pipeline = (args.fully_async and rollout_id >= args.num_rollout) or (
+                rollout_id + 1 >= args.num_rollout and pipeline.transfer_domain.total_debt == 0
             )
-        )
-        completed = True
-        final_backfill_pending = resident_pipeline._final_backfill_pending
-        if defer_terminal_shutdown_for_eval and not final_backfill_pending:
-            with _RESIDENT_PIPELINE_LOCK:
-                _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = final_train_rollout_id
-        return output
-    finally:
-        finalize_pipeline = terminal_step and (not completed or not final_backfill_pending)
-        if finalize_pipeline and (not defer_terminal_shutdown_for_eval or not completed):
-            with _RESIDENT_PIPELINE_LOCK:
-                _RESIDENT_PIPELINE_DEFERRED_EVAL_ROLLOUT_ID = None
-                if _RESIDENT_PIPELINE is resident_pipeline:
-                    _RESIDENT_PIPELINE = None
-            try:
-                _run_on_resident_async_loop(resident_pipeline.shutdown())
-            finally:
-                _shutdown_resident_async_loop()
+            return output
+        except BaseException:
+            finalize_pipeline = True
+            raise
+        finally:
+            if finalize_pipeline:
+                try:
+                    _run_on_resident_async_loop(_shutdown_agentic_resident_pipeline_async())
+                finally:
+                    _shutdown_resident_async_loop()

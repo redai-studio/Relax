@@ -3,13 +3,13 @@
 """WebShop prompt templates, observation formatting, and action parsing.
 
 This module is the single source of truth for the WebShop rollout protocol and
-is imported by BOTH sides of the shared-server design (DESIGN.md §5):
+is imported by both sides of the shared-server design:
 
 * ``server.py`` uses :func:`flatten_actions` to turn WebShop's
   ``get_available_actions()`` dict into the admissible-action list returned over
   HTTP.
 * ``agent.py`` uses :func:`extract_task`, :func:`format_obs`,
-  :func:`build_prompt` (multi-turn history lives agent-side, DESIGN Q4) and
+  :func:`build_prompt` (multi-turn history lives agent-side) and
   :func:`extract_action` (parse the model's ``<action>``).
 
 The templates, the >13000-char history fallback, and the validity rule are kept

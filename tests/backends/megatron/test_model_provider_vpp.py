@@ -13,7 +13,7 @@ class _FakeProvider:
     def __init__(self, model=None):
         self.calls = []
         self.finalized = False
-        self.model = model or SimpleNamespace(named_modules=lambda: [])
+        self.model = model or torch.nn.Module()
         self.attention_backend = None
         self.tensor_model_parallel_size = 1
         self.sequence_parallel = False
@@ -192,6 +192,33 @@ def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     assert provider.vision_dp_when_cp is True
 
 
+def test_bridge_provider_maps_legacy_vision_dp_when_tp_to_cp(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(vision_dp_when_tp=True), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.vision_dp_when_cp is True
+
+
+def test_bridge_vision_cp_all_gather_compat_forwards_cp_group_positionally(monkeypatch):
+    class _OriginalAllGatherVisionEmbeddings:
+        calls = []
+
+        @staticmethod
+        def apply(*args):
+            _OriginalAllGatherVisionEmbeddings.calls.append(args)
+            return "gathered"
+
+    bridge_model_module = SimpleNamespace(AllGatherVisionEmbeddings=_OriginalAllGatherVisionEmbeddings)
+    module, _ = _load_model_provider(monkeypatch)
+
+    assert module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+    assert bridge_model_module.AllGatherVisionEmbeddings.apply("input", "seqlens", cp_group="cp") == "gathered"
+    assert _OriginalAllGatherVisionEmbeddings.calls == [("input", "seqlens", "cp")]
+    assert not module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+
+
 def test_bridge_critic_provider_registers_value_head_before_ddp(monkeypatch):
     class _FakeBridgeModel(torch.nn.Module):
         def __init__(self):
@@ -249,6 +276,50 @@ def test_hf_load_context_restores_value_head_on_error(monkeypatch):
 
     assert model.output_layer is value_head
     assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+
+def test_bridge_actor_provider_registers_sequence_classification_head(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(
+        _bridge_args(task_type="seq_cls", num_labels=3),
+        role="actor",
+    )(post_process=True)
+
+    assert isinstance(model.output_layer, ppo_utils.LinearForLastLayer)
+    assert model.output_layer.weight.shape == (3, 4)
+    assert model.output_layer.bias is None
+    assert ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR not in model._modules
+    assert all("relax_seq_cls_hf_output_layer" not in name for name, _ in model.named_parameters())
+
+
+def test_hf_load_context_restores_same_sequence_classification_head(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(
+        _bridge_args(task_type="seq_cls", num_labels=3),
+        role="actor",
+    )(post_process=True)
+    classification_head = model.output_layer
+    classification_param_ids = tuple(id(param) for param in classification_head.parameters())
+    lm_head = getattr(model, ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+
+    with ppo_utils.use_sequence_classification_lm_head_for_hf_load([model]):
+        assert model.output_layer is lm_head
+
+    assert model.output_layer is classification_head
+    assert tuple(id(param) for param in model.output_layer.parameters()) == classification_param_ids
+    assert not hasattr(model, ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
 
 
 def test_critic_value_head_validation_accepts_ddp_and_optimizer_ownership(monkeypatch):
@@ -389,6 +460,24 @@ def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
     wrapped_provider(pre_process=True, post_process=False)
 
     assert calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch):
+    module, _ = _load_model_provider(monkeypatch)
+    post_process_values = []
+    monkeypatch.setattr(
+        module,
+        "ensure_sequence_classification_head_trainable",
+        lambda model, args, role, post_process: post_process_values.append(post_process),
+    )
+
+    wrapped_provider = module.wrap_model_provider_with_freeze(
+        lambda **kwargs: SimpleNamespace(named_parameters=lambda: []),
+        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+    )
+    wrapped_provider(post_process=False)
+
+    assert post_process_values == [False]
 
 
 def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):

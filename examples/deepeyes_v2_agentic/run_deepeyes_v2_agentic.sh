@@ -57,6 +57,12 @@ if [ ! -f "${APPTAINER_IMAGE_PATH}" ]; then
     echo "Run: DATA_DIR=${DATA_DIR} bash ${SCRIPT_DIR}/scripts/prepare.sh"
     exit 1
 fi
+DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
+if [ ! -x "${DEEPEYES_V2_APP_PYTHON}" ]; then
+    echo "ERROR: DeepEyes V2 app environment not found at ${DEEPEYES_V2_APP_PYTHON}."
+    echo "Run: bash ${SCRIPT_DIR}/scripts/prepare_app_env.sh"
+    exit 1
+fi
 
 ###############################################################################
 #                              JUDGE MODEL API                                #
@@ -111,7 +117,8 @@ RUNTIME_ENV_JSON=$(cat <<EOF
     "DEEPEYES_JUDGE_BASE_URL": "${DEEPEYES_JUDGE_BASE_URL:-}",
     "DEEPEYES_JUDGE_MODELS": "${DEEPEYES_JUDGE_MODELS:-}",
     "DEEPEYES_JUDGE_API_KEY": "${DEEPEYES_JUDGE_API_KEY:-}",
-    "APPTAINER_IMAGE_PATH": "${APPTAINER_IMAGE_PATH:-}"
+    "APPTAINER_IMAGE_PATH": "${APPTAINER_IMAGE_PATH:-}",
+    "DEEPEYES_V2_APP_PYTHON": "${DEEPEYES_V2_APP_PYTHON}"
   }
 }
 EOF
@@ -133,10 +140,6 @@ ROLLOUT_ARGS=(
     # sessions are both kept, which is what makes hang/timeout diagnosis
     # possible — Relax's own tmpdir-based capture drops both.
     --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
-    # 30-min default is too generous: normal sessions take 1-3 min, a
-    # zombie session still burning chat completions after 10 min is
-    # ~always doomed. Faster session-level SIGKILL clears prepare-gate
-    # IR backlog quicker so new groups actually get served.
     --num-rollout ${NUM_ROLLOUT}
     --rollout-batch-size ${ROLLOUT_BATCH_SIZE:-32}
     --micro-batch-size 1
@@ -148,7 +151,6 @@ ROLLOUT_ARGS=(
     --global-batch-size 256
     --rollout-shuffle
     --use-streaming-dataset
-    --agentic-prepare-pool-size 0
 )
 
 ###############################################################################
@@ -162,7 +164,7 @@ EVAL_ARGS=(
     --n-samples-per-eval-prompt 8
     --eval-max-response-len 4096
     --eval-top-p 0.7
-    --agentic-eval-prepare-pool-size 32
+    --agentic-eval-concurrency ${AGENTIC_EVAL_CONCURRENCY:-128}
 )
 
 ###############################################################################

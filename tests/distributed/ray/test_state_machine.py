@@ -159,6 +159,7 @@ class TestScaleOutRequest:
             "updated_at",
             "error_message",
             "weight_version",
+            "failure_categories",
         }
         assert set(d.keys()) == expected_keys
 

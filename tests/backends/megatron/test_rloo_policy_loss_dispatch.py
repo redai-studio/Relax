@@ -303,3 +303,32 @@ def test_zero_token_metrics_are_reported_as_zero_without_division():
 def test_zero_token_metrics_reject_nonzero_numerator():
     with pytest.raises(RuntimeError, match="nonzero numerator.*pg_loss"):
         loss_module.normalize_reduced_loss_metrics(["loss", "pg_loss"], [0.0, 0.0, 1.0])
+
+
+@pytest.mark.parametrize("is_dummy", [False, True])
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_loss_function_exports_effective_tokens_independent_of_metric_denominator(
+    monkeypatch, is_dummy, calculate_per_token_loss
+):
+    monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
+    args = SimpleNamespace(
+        mtp_only_training=True,
+        calculate_per_token_loss=calculate_per_token_loss,
+        qkv_format="thd",
+        recompute_loss_function=False,
+        allgather_cp=False,
+        global_batch_size=1,
+    )
+    batch = {
+        "total_lengths": [4],
+        "response_lengths": [3],
+        "loss_masks": [torch.tensor([1.0, 0.0, 1.0])],
+        "dynamic_cp_size": 1,
+        "dynamic_cp_rank": 0,
+        "__is_dummy__": is_dummy,
+    }
+
+    _, _, logging = loss_module.loss_function(args, batch, 1, torch.ones(1, requires_grad=True))
+
+    assert logging["num_tokens"].item() == (0 if is_dummy else 2)
+    assert logging["values"][0].item() == (2 if calculate_per_token_loss and not is_dummy else 0)

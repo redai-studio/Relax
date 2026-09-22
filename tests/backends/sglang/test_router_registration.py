@@ -48,7 +48,11 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
 
     env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace()
+    env.Envs = SimpleNamespace(
+        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
+        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
+        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
+    )
     monkeypatch.setitem(sys.modules, "relax.utils.env", env)
 
     http_utils = ModuleType("relax.utils.http_utils")
@@ -61,14 +65,22 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
 
     megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
-    megatron_peft_utils.convert_megatron_to_hf_target_modules = lambda value: value
+    megatron_peft_utils.convert_megatron_to_sglang_target_modules = lambda value: value
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
-    sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    # Force a fresh import so the module binds to the stubbed dependencies above,
+    # but restore the original module object on teardown. Leaving the key popped
+    # corrupts sys.modules for any later test that patches this module: their
+    # patch() re-imports a *new* module object distinct from the one already
+    # bound in other test files' top-level imports, so the patch silently misses.
+    original_module = sys.modules.pop("relax.backends.sglang.sglang_engine", None)
     module = importlib.import_module("relax.backends.sglang.sglang_engine")
     yield module
-    sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    if original_module is not None:
+        sys.modules["relax.backends.sglang.sglang_engine"] = original_module
+    else:
+        sys.modules.pop("relax.backends.sglang.sglang_engine", None)
 
 
 class _Response:
@@ -148,8 +160,9 @@ def _make_engine(sglang_engine_module):
     return engine
 
 
-def test_missing_load_format_choices_uses_legacy_remote(sglang_engine_module):
-    assert sglang_engine_module._preferred_s3_stream_load_format() == "remote"
+def test_missing_load_format_choices_fails_closed(sglang_engine_module):
+    with pytest.raises(RuntimeError, match="cannot report whether runai_streamer is supported"):
+        sglang_engine_module._preferred_s3_stream_load_format()
 
 
 def test_unregister_uses_registration_worker_id_once(monkeypatch, sglang_engine_module):

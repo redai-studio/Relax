@@ -1,6 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Model-source descriptors and optional provider registration."""
 
+import os
+import re
+from argparse import Namespace
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -46,6 +49,31 @@ ModelSourceProvider = Callable[[Sequence[str]], ModelSource | None]
 
 _PROVIDERS: dict[str, ModelSourceProvider] = {}
 _FROZEN = False
+_MODEL_URI_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def is_model_uri(path: str) -> bool:
+    """Return whether a model path has a hierarchical URI-shaped prefix."""
+    return _MODEL_URI_PREFIX.match(path) is not None
+
+
+def normalize_model_path(path: str) -> str:
+    """Normalize local path spelling without rewriting model URIs."""
+    return path if is_model_uri(path) else os.path.normpath(path)
+
+
+def model_source_path_aliases(args: Namespace, source_uri: str) -> set[str]:
+    """Return non-empty paths that identified a model before localization."""
+    original_hf_checkpoint = getattr(args, "_model_source_original_hf_checkpoint", None)
+    return {normalize_model_path(path) for path in (source_uri, original_hf_checkpoint) if path}
+
+
+def is_model_source_alias(args: Namespace, path: str | None) -> bool:
+    """Check whether a path identified the model before localization."""
+    source = getattr(args, "model_source", None)
+    return bool(
+        path and source is not None and normalize_model_path(path) in model_source_path_aliases(args, source.uri)
+    )
 
 
 def register_model_source_provider(name: str, provider: ModelSourceProvider) -> None:
@@ -94,24 +122,3 @@ def resolve_model_source(argv: Sequence[str]) -> ModelSource | None:
             provider_name=name,
         )
     return source
-
-
-def apply_model_source_to_argv(argv: Sequence[str], source: ModelSource) -> list[str]:
-    """Return a copied argv with one canonical ``--hf-checkpoint`` value."""
-    updated: list[str] = []
-    prefix = "--hf-checkpoint="
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if item.startswith(prefix):
-            index += 1
-            continue
-        if item == "--hf-checkpoint":
-            if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
-                raise ValueError("--hf-checkpoint requires a value")
-            index += 2
-            continue
-        updated.append(item)
-        index += 1
-    updated.extend(("--hf-checkpoint", source.uri))
-    return updated

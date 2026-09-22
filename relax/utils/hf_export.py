@@ -110,6 +110,16 @@ def reference_expects_mtp(reference_hf_dir: str) -> bool:
     return any("mtp" in key.lower() for key in _weight_map_of(reference_hf_dir))
 
 
+def reference_expects_vision(reference_hf_dir: str) -> bool:
+    """Return True if the reference HF model contains any vision-tower weight.
+
+    A VL base trained text-only builds no vision tower, so the reference
+    declares weights the export can never produce -- as
+    ``reference_expects_mtp`` above.
+    """
+    return any("vision" in key.lower() for key in _weight_map_of(reference_hf_dir))
+
+
 def reconcile_hf_export_index(
     output_dir: str,
     reference_hf_dir: Optional[str] = None,

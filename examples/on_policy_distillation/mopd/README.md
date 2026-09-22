@@ -148,4 +148,4 @@ rollout 阶段按每条样本的 `data_source` 找到对应教师，请求 token
 ## 参考
 
 - [On-Policy Distillation - Relax Docs](../README.md)
-- [OPD 参数说明](../README.md#关键参数说明)
+- [OPD 参数配置示例](../README.md#common-combinations)

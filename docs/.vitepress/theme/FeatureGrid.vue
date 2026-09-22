@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useData } from 'vitepress'
+import { useData, withBase } from 'vitepress'
 
 const { lang } = useData()
 const isZh = computed(() => lang.value === 'zh-CN')
@@ -12,16 +12,20 @@ interface Feature {
   description: string
   descriptionZh: string
   colorClass: 'primary' | 'tertiary'
+  link?: string
+  linkZh?: string
 }
 
 const features: Feature[] = [
   {
     icon: 'bot',
-    title: 'Agentic RL',
-    titleZh: '智能体强化学习',
-    description: 'Multi-turn interaction capabilities for games, multi-turn dialogues, tool use, and complex decision-making scenarios',
-    descriptionZh: '支持游戏、多轮对话、工具使用等复杂决策场景的多轮交互能力',
+    title: 'Agentic Rollout',
+    titleZh: 'Agentic Rollout',
+    description: 'Connect your existing agent app to Relax training',
+    descriptionZh: '将已有 Agent 接入 Relax 训练',
     colorClass: 'primary',
+    link: '/en/guide/agentic-rollout',
+    linkZh: '/zh/guide/agentic-rollout',
   },
   {
     icon: 'zap',
@@ -64,15 +68,22 @@ const features: Feature[] = [
     colorClass: 'tertiary',
   },
 ]
+
+function featureHref(feature: Feature): string | undefined {
+  const link = isZh.value ? feature.linkZh : feature.link
+  return link ? withBase(link) : undefined
+}
 </script>
 
 <template>
   <section class="feature-grid-section">
     <div class="feature-grid">
-      <div
+      <component
+        :is="feature.link ? 'a' : 'div'"
         v-for="(feature, index) in features"
         :key="index"
         class="feature-card"
+        :href="featureHref(feature)"
       >
         <div :class="['feature-icon', `feature-icon--${feature.colorClass}`]">
           <!-- Bot icon -->
@@ -107,7 +118,7 @@ const features: Feature[] = [
         </div>
         <h3 class="feature-title">{{ isZh ? feature.titleZh : feature.title }}</h3>
         <p class="feature-desc">{{ isZh ? feature.descriptionZh : feature.description }}</p>
-      </div>
+      </component>
     </div>
   </section>
 </template>
@@ -149,6 +160,13 @@ const features: Feature[] = [
   display: flex;
   flex-direction: column;
   transition: all 0.3s ease;
+  color: inherit;
+  text-decoration: none;
+}
+
+.feature-card[href]:focus-visible {
+  outline: 2px solid #e8384a;
+  outline-offset: 4px;
 }
 
 .feature-card:hover {

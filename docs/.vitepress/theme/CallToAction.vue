@@ -26,8 +26,8 @@ const subtitle = computed(() =>
 const primaryLabel = computed(() => isZh.value ? '参与贡献' : 'Contribute Now')
 const secondaryLabel = computed(() => isZh.value ? '讨论区' : 'Discussion')
 
-const primaryLink = 'https://github.com/redai-infra/Relax/blob/main/CONTRIBUTING.md'
-const secondaryLink = 'https://github.com/redai-infra/Relax/discussions'
+const primaryLink = 'https://github.com/redai-studio/Relax/blob/main/CONTRIBUTING.md'
+const secondaryLink = 'https://github.com/redai-studio/Relax/discussions'
 </script>
 
 <template>

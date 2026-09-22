@@ -4,6 +4,7 @@
 
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -104,6 +105,26 @@ def make_mock_engine(
     engine.get_pid_and_node_id.remote.return_value = AwaitableValue({"pid": 123, "node_id": "node1"})
     engine.init_weights_send_group_for_remote_instance.remote.return_value = AwaitableValue({"success": True})
     engine.send_weights_to_remote_instance.remote.return_value = AwaitableValue({"success": True})
+    _transport_fingerprint = {
+        "nccl_ib_disable": "1",
+        "nccl_socket_ifname": "eth0",
+        "nccl_ib_hca": None,
+        "nccl_ib_gid_index": None,
+    }
+    # Stage-1 cheap env gate: seed and new default to the same fingerprint (match).
+    engine.get_scale_weight_sync_transport_fingerprint.remote.return_value = AwaitableValue(
+        dict(_transport_fingerprint)
+    )
+    engine.run_scale_weight_sync_precheck.remote.return_value = AwaitableValue(
+        {
+            "success": True,
+            "category": None,
+            "error_type": None,
+            "error": None,
+            "fingerprint": dict(_transport_fingerprint),
+            "results": [],
+        }
+    )
     engine._get_current_node_ip_and_free_port.remote.return_value = AwaitableValue(("127.0.0.1", 15000))
     return engine
 
@@ -207,7 +228,17 @@ def create_test_manager(args=None, servers=None):
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}
-    manager._is_weight_updating = False
+    manager._engine_lifecycle_lock = threading.RLock()
+    manager._training_weight_updating = False
+    manager._scale_out_weight_updating = False
+    manager._next_engine_rank = max(
+        (
+            group.rank_offset + len(group.all_engines)
+            for srv in manager.servers.values()
+            for group in srv.engine_groups
+        ),
+        default=0,
+    )
 
     # Mock the distributed lock
     lock = MagicMock()

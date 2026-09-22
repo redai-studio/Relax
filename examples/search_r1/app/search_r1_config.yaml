@@ -1,0 +1,7 @@
+retriever_topk: 3
+retriever_timeout_s: 30
+max_observation_chars: 3000
+max_search_turns: 4
+searcher_max_search_turns: 1
+structure_weight: 0.0
+final_weight: 0.0

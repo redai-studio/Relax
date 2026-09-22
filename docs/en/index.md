@@ -9,12 +9,14 @@ hero:
       link: /en/guide/introduction
     - theme: alt
       text: View on GitHub
-      link: https://github.com/redai-infra/Relax
+      link: https://github.com/redai-studio/Relax
 
 features:
   - icon: '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="icon-teal"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2" fill="currentColor" fill-opacity="0.2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>'
-    title: Agentic RL
-    details: Multi-turn interaction capabilities for games, multi-turn dialogues, tool use, and complex decision-making scenarios
+    title: Agentic Rollout
+    details: Connect your existing agent app to Relax training
+    link: /en/guide/agentic-rollout
+    linkText: Learn more
   - icon: '<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="icon-amber"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" fill="currentColor" fill-opacity="0.25"/></svg>'
     title: High Performance
     details: Support Megatron for training and SGLang for inference engine with optimized distributed computing

@@ -67,6 +67,7 @@ def chunk_param(
     Returns:
         The shard tensor for the current tensor-parallel rank.
     """
+    name = name.replace(".to_wrap.", ".")
     # 1. expert_bias is not sharded
     if "expert_bias" in name:
         return full_param

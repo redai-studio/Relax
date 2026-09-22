@@ -1,56 +1,4308 @@
+From 28aef8685f471c589d2d85ec954e6c2a786a30c7 Mon Sep 17 00:00:00 2001
+From: liyongwen <1310439159@qq.com>
+Date: Sat, 29 Aug 2026 03:49:49 +0000
+Subject: [PATCH] sglang optimize for qwen3.5 9B&35B
+
+---
+ python/sglang/srt/entrypoints/http_server.py  |   2 +-
+ python/sglang/srt/environ.py                  |  42 ++
+ .../npu/attention/ascend_gdn_backend.py       | 190 +++++--
+ .../ascend_hybrid_linear_attn_backend.py      |  61 +-
+ .../attention/full_attention_fusion_npu.py    | 468 ++++++++++++++++
+ .../npu/graph_runner/npu_cudagraph_backend.py |  18 +-
+ .../srt/hardware_backend/npu/moe/topk.py      |  53 +-
+ .../npu/moe_weight_prefetch.py                | 363 ++++++++++++
+ .../npu/tp_ascendc_fusion_npu.py              | 347 ++++++++++++
+ .../sglang/srt/layers/attention/fla/cumsum.py |   7 +-
+ .../attention/linear/kernels/gdn_triton.py    |  26 +-
+ .../srt/layers/exp_race_fused_triton.py       | 239 ++++++++
+ python/sglang/srt/layers/layernorm.py         |  21 +-
+ .../srt/layers/moe/token_dispatcher/deepep.py |   6 +
+ .../sglang/srt/layers/quantization/unquant.py | 100 +++-
+ .../srt/layers/radix_linear_attention.py      |  21 +
+ python/sglang/srt/layers/sampler.py           | 354 +++++++++++-
+ python/sglang/srt/managers/scheduler.py       |   2 +-
+ python/sglang/srt/managers/tp_worker.py       |  30 +
+ .../sglang/srt/mem_cache/mamba_radix_cache.py |   9 +
+ .../srt/model_executor/forward_batch_info.py  |  25 +-
+ .../sglang/srt/model_executor/model_runner.py |  26 +
+ python/sglang/srt/models/qwen2_moe.py         |  48 +-
+ python/sglang/srt/models/qwen3_5.py           | 521 +++++++++++++++---
+ .../srt/sampling/sampling_batch_info.py       |  10 +
+ python/sglang/srt/speculative/eagle_utils.py  |  98 ++--
+ .../srt/speculative/triton_ops/cache_locs.py  |   9 +
+ python/sglang/srt/utils/common.py             |   4 +-
+ .../srt/utils/torch_memory_saver_adapter.py   |   9 +-
+ .../layers/test_conv_weight_cache_refresh.py  | 109 ++++
+ .../layers/test_sampler_attach_logprobs.py    | 156 ++++++
+ 31 files changed, 3134 insertions(+), 240 deletions(-)
+ create mode 100644 python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
+ create mode 100644 python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
+ create mode 100644 python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
+ create mode 100644 python/sglang/srt/layers/exp_race_fused_triton.py
+ create mode 100644 test/registered/unit/layers/test_conv_weight_cache_refresh.py
+ create mode 100644 test/registered/unit/layers/test_sampler_attach_logprobs.py
+
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index bd9d7eafa1..1740283de2 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -598,7 +598,7 @@ async def health_generate(request: Request) -> Response:
+     ):
+         return Response(status_code=200)
+ 
+-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
++    sampling_params = {"max_new_tokens": 1, "temperature": 1.0,"top_k":-1,"top_p":1.0}
+     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+     # collide and crash the shared DetokenizerManager decode_status).
+     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 790acce902..b97ee18eeb 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -526,7 +526,49 @@ class Envs:
+     # NPU
+     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
++    # MoE expert weight L2 prefetch (decode aclgraph; see
++    # hardware_backend/npu/moe_weight_prefetch.py)
++    SGLANG_NPU_MOE_PREFETCH = EnvBool(False)
++    # Comma-separated op list: gmm1 (w13, default) / gmm2 (w2)
++    SGLANG_NPU_MOE_PREFETCH_OPS = EnvStr("gmm1")
++    # auto / full / active; auto == full, active falls back to full with warning
++    SGLANG_NPU_MOE_PREFETCH_MODE = EnvStr("auto")
++    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
++    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
++    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
++    # full_attention decode fusion master switch (A1b split+KV scatter /
++    # A2 sigmoid_mul / A3a add_gemma_rms_norm, hardware_backend/npu/attention/
++    # full_attention_fusion_npu.py); DEBUG=1 logs per-layer guard misses
++    SGLANG_NPU_FULL_ATTN_FUSION = EnvBool(True)
++    SGLANG_NPU_FULL_ATTN_FUSION_DEBUG = EnvBool(False)
++    # TP-line AscendC fusion master switch (only op1 fused_qkvzba_conv1d
++    # follows it); QKVZBA is op1's own switch (unset = follow master, explicit
++    # 0 disables op1 alone); GDN_RECURRENT_ASCENDC is op2 recurrent's switch
++    # (off by default, resolved at import time — set before graph capture /
++    # server start); DEBUG=1 logs guard misses
++    SGLANG_NPU_TP_ASCENDC_FUSION = EnvBool(False)
++    SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA = EnvBool(False)
++    SGLANG_NPU_GDN_RECURRENT_ASCENDC = EnvBool(False)
++    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG = EnvBool(False)
++    # GDN decode recurrent PR#740 Triton variant switch
++    SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
++    # GDN input-projection qkvz+ba weight pack into a single GEMM; MAX_M gates
++    # small M — M above the threshold falls back to two GEMMs
++    SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
++    SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M = EnvInt(256)
++    # post_sample: async exponential-race sampling (910C only);
++    # EXP_RACE_TRITON enables its fused Triton consumer kernel
++    SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
++    SGLANG_NPU_EXP_RACE_TRITON = EnvBool(True)
+     SGLANG_NPU_USE_MLAPO = EnvBool(False)
++    # MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
++    # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias
++    # 的 BF16 路径。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
++    SGLANG_MOE_FRONT_FUSION = EnvBool(False)
++    # GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton
++    # persistent kernel（默认 stock npu_grouped_matmul）。仅作用于 BF16 无量化
++    # 无 bias 路径，开启：SGLANG_GMM2_TRITON=1。
++    SGLANG_GMM2_TRITON = EnvBool(False)
+     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
+     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
+     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+index 7f506e7f1a..dad52ee943 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
+@@ -5,12 +5,16 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
+     fused_gdn_gating_kernel_without_sigmoid,
+     fused_gdn_gating_npu,
+ )
+-from sgl_kernel_npu.mamba.causal_conv1d import (
+-    causal_conv1d_fn_npu,
+-    causal_conv1d_update_npu,
+-    causal_conv1d_update_v2,
++from sgl_kernel_npu.fla.utils import (
++    fused_qkvzba_split_reshape_cat_contiguous,
+ )
+ 
++from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
++    tp_debug_log,
++    tp_fused_qkvzba_conv1d_inputs_ok,
++    tp_fusion_qkvzba_enabled,
++    tp_op_available,
++)
+ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+     AscendMambaAttnBackendBase,
+ )
+@@ -26,8 +30,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ 
+ fused_gdn_gating = fused_gdn_gating_npu
+-causal_conv1d_fn = causal_conv1d_fn_npu
+-causal_conv1d_update = causal_conv1d_update_npu
+ 
+ 
+ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -100,6 +102,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         if forward_batch.forward_mode.is_draft_extend_v2():
+             return
++        # In eager (non-graph) forward the base class builds int32 metadata, so
++        # no cast is needed for recurrent — drop any graph-flow int32 shadow to
++        # avoid reusing a stale buffer.
++        self._decode_recurrent_shadow_i32 = None
+         super().init_forward_metadata(forward_batch)
+         self.prepare_gdn_inputs(
+             forward_batch.batch_size,
+@@ -109,6 +115,15 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         self._prepare_mamba_track_metadata(forward_batch)
+         self.graph_mode = False
+ 
++    def _get_conv_weights_t(self, layer: RadixLinearAttention) -> torch.Tensor:
++        # The cached copy is refreshed in place by wrap_conv1d_weight_loader
++        # on every (re)load of conv1d.weight; it stays valid until then.
++        w = getattr(layer, "_conv_weights_t", None)
++        if w is None:
++            w = layer.conv_weights.transpose(0, 1).contiguous()
++            layer._conv_weights_t = w
++        return w
++
+     def forward_decode(
+         self,
+         layer: RadixLinearAttention,
+@@ -123,18 +138,94 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         ssm_states = layer_cache.temporal
+         query_start_loc = self.forward_metadata.query_start_loc
+         cache_indices = self.forward_metadata.mamba_cache_indices
++        # Recurrent side uses int32 shadow buffers (synced outside the decode
++        # graph by _capture/_replay_metadata, identical in content to the int64
++        # primary buffers); when the shadow is None (eager/verify) the original
++        # metadata is used. The conv side keeps the int64 primary buffers.
++        recurrent_query_start_loc = query_start_loc
++        recurrent_cache_indices = cache_indices
++        if self._decode_recurrent_shadow_i32 is not None:
++            recurrent_query_start_loc, recurrent_cache_indices = (
++                self._decode_recurrent_shadow_i32
++            )
+ 
+-        assert isinstance(mixed_qkv, torch.Tensor)
+-        conv_states_tmp = conv_states.transpose(1, 2).clone()
+-        mixed_qkv = causal_conv1d_update(
+-            mixed_qkv,
+-            conv_states_tmp,
+-            layer.conv_weights,
+-            layer.bias,
+-            layer.activation,
+-            conv_state_indices=cache_indices,
+-        )
+-        conv_states[:] = conv_states_tmp.transpose(1, 2)
++        # When the qwen3_5.py guard hits, the raw projections arrive as a tuple
++        # (projected_states_qkvz, projected_states_ba) before split — split +
++        # causal_conv1d(run_mode=1) are done by the single kernel
++        # torch.ops.npu.fused_qkvzba_conv1d (conv_states in-place semantics
++        # unchanged), and z flows back to the model side as (core_attn_out, z).
++        # If the runtime check fails (op unregistered / tensor attrs mismatch),
++        # fall back to the local split kernel + stock conv, still returning a
++        # tuple so the caller is unaffected (silent fallback; the branch is
++        # baked into the graph at capture time).
++        fused_z = None
++        if isinstance(mixed_qkv, tuple):
++            qkvz, mixed_ba = mixed_qkv
++            if tp_fusion_qkvzba_enabled() and tp_op_available(
++                "fused_qkvzba_conv1d"
++            ) and tp_fused_qkvzba_conv1d_inputs_ok(
++                qkvz,
++                mixed_ba,
++                layer.num_k_heads,
++                layer.num_v_heads,
++                layer.head_k_dim,
++                layer.head_v_dim,
++            ):
++                mixed_qkv, fused_z, b, a = torch.ops.npu.fused_qkvzba_conv1d(
++                    qkvz,
++                    self._get_conv_weights_t(layer),
++                    conv_states,
++                    mixed_ba,
++                    layer.num_k_heads,
++                    layer.num_v_heads,
++                    layer.head_k_dim,
++                    layer.head_v_dim,
++                    bias=layer.bias,
++                    query_start_loc=query_start_loc,
++                    cache_indices=cache_indices,
++                    activation_mode=1,
++                    pad_slot_id=-1,
++                )
++            else:
++                tp_debug_log(
++                    ("qkvzba_rt", layer.layer_id),
++                    f"layer {layer.layer_id}: fused_qkvzba_conv1d runtime check "
++                    f"missed (enabled={tp_fusion_qkvzba_enabled()} "
++                    f"op={tp_op_available('fused_qkvzba_conv1d')}), "
++                    "falling back to local split + stock conv",
++                )
++                mixed_qkv, fused_z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
++                    qkvz,
++                    mixed_ba,
++                    layer.num_k_heads,
++                    layer.num_v_heads,
++                    layer.head_k_dim,
++                    layer.head_v_dim,
++                )
++                mixed_qkv = torch.ops.npu.causal_conv1d(
++                    mixed_qkv,
++                    self._get_conv_weights_t(layer),
++                    conv_states=conv_states,
++                    bias=layer.bias,
++                    query_start_loc=query_start_loc,
++                    cache_indices=cache_indices,
++                    activation_mode=1,
++                    pad_slot_id=-1,
++                    run_mode=1,
++                )
++        else:
++            assert isinstance(mixed_qkv, torch.Tensor)
++            mixed_qkv = torch.ops.npu.causal_conv1d(
++                mixed_qkv,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states,
++                bias=layer.bias,
++                query_start_loc=query_start_loc,
++                cache_indices=cache_indices,
++                activation_mode=1,
++                pad_slot_id=-1,
++                run_mode=1,
++            )
+ 
+         query, key, value = torch.split(
+             mixed_qkv,
+@@ -155,13 +246,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+             A_log=layer.A_log,
+             dt_bias=layer.dt_bias,
+             ssm_states=ssm_states,
+-            cache_indices=cache_indices,
+-            query_start_loc=query_start_loc,
++            cache_indices=recurrent_cache_indices,
++            query_start_loc=recurrent_query_start_loc,
+         )
+ 
+         self._track_mamba_state_decode(
+             forward_batch, conv_states, ssm_states, cache_indices
+         )
++        # Tuple-input path returns (core_attn_out, z) to match the qwen3_5.py
++        # unpacking convention; the tensor path return matches stock exactly.
++        if fused_z is not None:
++            return core_attn_out, fused_z
+         return core_attn_out
+ 
+     def forward_extend(
+@@ -219,44 +314,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+                 dtype=torch.int32,
+                 device=mixed_qkv.device,
+             )
+-            mixed_qkv = causal_conv1d_update_v2(
+-                x=mixed_qkv.view(batch_size, draft_token_num, -1).contiguous(),
+-                conv_state=conv_states.contiguous(),
+-                weight=layer.conv_weights.transpose(0, 1).contiguous(),
++            mixed_qkv = torch.ops.npu.causal_conv1d(
++                mixed_qkv,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states,
+                 bias=layer.bias,
+-                activation=layer.activation,
+-                conv_state_indices=cache_indices,
++                query_start_loc=query_start_loc,
++                cache_indices=cache_indices,
+                 num_accepted_tokens=num_accepted_tokens,
++                activation_mode=1,
+                 pad_slot_id=-1,
+-                validate_data=False,
+-            ).view(seq_len, -1)
++                run_mode=1,
++            )
+         else:
+-            mixed_qkv = mixed_qkv.transpose(0, 1)
+             if forward_metadata.has_mamba_track_mask:
+-                mixed_qkv_to_track = mixed_qkv[
+-                    :, forward_metadata.track_conv_indices
+-                ].transpose(0, 1)
+-                conv_states.transpose(1, 2)[
+-                    forward_metadata.conv_states_mask_indices
+-                ] = mixed_qkv_to_track
++                mixed_qkv_to_track = mixed_qkv[forward_metadata.track_conv_indices]
++                conv_states[forward_metadata.conv_states_mask_indices] = (
++                    mixed_qkv_to_track
++                )
+             kernel_size = layer.conv_weights.shape[-1]
+-            conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
+-            conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()
+-
+-            mixed_qkv = causal_conv1d_fn(
++            conv_states_for_prefill = conv_states[
++                :, -(kernel_size - 1) :, :
++            ].contiguous()
++            mixed_qkv = torch.ops.npu.causal_conv1d(
+                 mixed_qkv,
+-                layer.conv_weights,
+-                layer.bias,
+-                activation=layer.activation,
+-                conv_states=conv_states_tmp,
+-                has_initial_state=has_initial_states,
+-                cache_indices=cache_indices,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states_for_prefill,
++                bias=layer.bias,
+                 query_start_loc=query_start_loc,
+-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+-            ).transpose(0, 1)[:seq_len]
+-            conv_states[:, -(kernel_size - 1) :, :] = conv_states_tmp.transpose(
+-                1, 2
+-            ).contiguous()
++                cache_indices=cache_indices,
++                has_initial_state=has_initial_states,
++                activation_mode=1,
++                pad_slot_id=-1,
++                run_mode=0,
++            )
++            conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
+         if is_target_verify:
+             g, beta = fused_gdn_gating_kernel_without_sigmoid(
+                 layer.A_log, a, b, layer.dt_bias
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+index 2a628c286d..cc3a655ad9 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+@@ -27,16 +27,30 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+     def __init__(self, model_runner: ModelRunner):
+         super().__init__(model_runner)
+         self.state_indices_list_gdn = []
++        # decode int32 shadow buffers: the AscendC recurrent host reads
++        # cache_indices/cu_seqlens as int32_t*; synced once per step outside
++        # the decode graph (zero cast inside the graph); always None on the
++        # eager/verify paths.
++        self.decode_state_indices_i32_list = []
++        self.decode_query_start_loc_i32_list = []
++        self.cached_cuda_graph_decode_query_start_loc_i32 = None
++        self._decode_recurrent_shadow_i32 = None
+ 
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         assert (
+             max_num_tokens % max_bs == 0
+         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+         draft_token_num = max_num_tokens // max_bs
++        # state_indices / query_start_loc primary buffers use int64: the conv
++        # AscendC ops (causal_conv1d / fused_qkvzba_conv1d) read them as
++        # int64_t* on host, so feeding directly avoids an in-graph cast.
++        # Exception: state_indices_list_gdn stays int32 (recurrent_gated_delta_rule
++        # reads it as int32_t* without validation — changing it silently
++        # corrupts results).
+         for i in range(max_bs):
+             self.state_indices_list.append(
+                 torch.full(
+-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++                    (i + 1,), self.pad_slot_id, dtype=torch.int64, device=self.device
+                 )
+             )
+             self.state_indices_list_gdn.append(
+@@ -48,7 +62,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 )
+             )
+             self.query_start_loc_list.append(
+-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
++                torch.zeros((i + 2,), dtype=torch.int64, device=self.device)
+             )
+             self.retrieve_next_token_list.append(
+                 torch.zeros(
+@@ -65,17 +79,54 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                 )
+             )
++            # decode shadow buffers (recurrent side), synced outside the graph
++            # by _capture/_replay_metadata each step; not used in verify.
++            self.decode_state_indices_i32_list.append(
++                torch.full(
++                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++                )
++            )
++            self.decode_query_start_loc_i32_list.append(
++                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
++            )
+         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
++            0, max_bs + 1, dtype=torch.int64, device=self.device
++        )
++        # decode query_start_loc is a static arange — the int32 copy is built
++        # once at init, so shadow sync is just a same-dtype copy.
++        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
+             0, max_bs + 1, dtype=torch.int32, device=self.device
+         )
+         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+             0,
+             max_bs * draft_token_num + 1,
+             step=draft_token_num,
+-            dtype=torch.int32,
++            dtype=torch.int64,
+             device=self.device,
+         )
+ 
++    def _update_decode_recurrent_shadow_i32(
++        self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
++    ):
++        """Sync the decode int32 shadow buffers (outside the graph, once per step).
++
++        Content is identical to the int64 primary buffers, for direct reads by
++        the AscendC recurrent (host reads cache_indices/cu_seqlens as int32_t*).
++        Called only for decode/idle; on the verify/eager paths the caller sets
++        _decode_recurrent_shadow_i32 to None.
++        """
++        idx_i32 = self.decode_state_indices_i32_list[bs - 1]
++        qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]
++        idx_i32[: len(mamba_indices)].copy_(mamba_indices)
++        if num_padding == 0:
++            qsl_i32.copy_(self.cached_cuda_graph_decode_query_start_loc_i32[: bs + 1])
++        else:
++            qsl_i32[: bs - num_padding].copy_(
++                self.cached_cuda_graph_decode_query_start_loc_i32[: bs - num_padding]
++            )
++            qsl_i32[bs - num_padding :].fill_(bs - num_padding)
++        self._decode_recurrent_shadow_i32 = (qsl_i32, idx_i32)
++
+     def _capture_metadata(
+         self,
+         bs: int,
+@@ -89,7 +140,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+             self.query_start_loc_list[bs - 1].copy_(
+                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+             )
++            self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
+         elif forward_mode.is_target_verify():
++            self._decode_recurrent_shadow_i32 = None
+             self.query_start_loc_list[bs - 1].copy_(
+                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+             )
+@@ -163,7 +216,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
+                     bs - num_padding
+                 )
++            self._update_decode_recurrent_shadow_i32(bs, mamba_indices, num_padding)
+         elif forward_mode.is_target_verify():
++            self._decode_recurrent_shadow_i32 = None
+             ssm_state_indices = torch.arange(
+                 bs * spec_info.draft_token_num,
+                 dtype=torch.int32,
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
+new file mode 100644
+index 0000000000..4751217a5e
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/attention/full_attention_fusion_npu.py
+@@ -0,0 +1,468 @@
++# Qwen3.5-35B-A3B NPU decode 全注意力段融合 kernel（full_attention 优化点 A1b/A2/A3a）。
++#
++#   A1b split_qkvgate_v4_scatter：split q/gate/k/v + q/k gemma rmsnorm + rope
++#       single kernel, and k/v are scattered by loc directly into the KV
++#       cache; returned k/v are None (cache already written — the caller must
++#       skip set_kv_buffer).
++#   A2  fa_sigmoid_mul：sigmoid(gate)*attn 融合单 kernel（替代 sigmoid+mul_ 两
++#       kernel）；round to bf16 before the multiply, bitwise-identical to
++#       stock's two-op rounding path.
++#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) row-parallel; math identical
++#       to stock add_gemma_rms_norm.
++#
++# 数值约定与 sgl_kernel_npu stock 逐字一致：fp32 中间精度、gemma (w+1)、
++# neox rotate_half rope（cat=[-x2,x1]; out=cat*sin+rot*cos）。
++#
++# 安全网：每个调用点先过守卫（精确命中已验证形状才走自研 kernel，否则回退
++# stock）；环境变量 SGLANG_NPU_FULL_ATTN_FUSION=0 可整体关停（图模式下守卫
++# 判定在 capture 时烘进图，需在建图前设置）。
++#
++# 定位日志：SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 时，A1b 守卫按层一次性打印
++# "guard miss reason" or "activated" confirmation.
++#
++# ⚠️ triton-ascend constraints: no runtime dispatch on program_id, no
++# scalar-conditional mask store, no 2D masked store (miscompiles). All kernels
++# in this file use only:
++# 纯线性索引 + 每 program 固定职责 + 1D 无掩码 store + constexpr if。
++
++import logging
++import os
++
++import torch
++import triton
++import triton.language as tl
++import triton.language.extra.cann.extension as al
++
++logger = logging.getLogger(__name__)
++
++_FA_FUSION_ENV = "SGLANG_NPU_FULL_ATTN_FUSION"
++_FA_DEBUG_ENV = "SGLANG_NPU_FULL_ATTN_FUSION_DEBUG"
++_fa_debug_logged = set()
++
++
++def fa_fusion_enabled() -> bool:
++    """full_attention 融合总开关（默认开；=0 时全部回退 stock）。"""
++    return os.environ.get(_FA_FUSION_ENV, "1") == "1"
++
++
++def _fa_debug_log(key, msg):
++    """debug 开关打开时按 key 一次性打日志（定位守卫未命中环节用）。"""
++    if os.environ.get(_FA_DEBUG_ENV, "0") != "1":
++        return
++    if key in _fa_debug_logged:
++        return
++    _fa_debug_logged.add(key)
++    logger.warning("[full_attention_fusion] %s", msg)
++
++
++# ---------------------------------------------------------------------------
++# A3a：add_gemma_rms_norm 行并行版（grid=(batch,)，每 program 一整行）
++# 数学与 stock add_gemma_rms_norm 完全一致（bf16 加残差→fp32 归约→fp32 (w+1)）。
++# ---------------------------------------------------------------------------
++@triton.jit
++def add_gemma_rms_norm_v2_kernel(
++    x_ptr,
++    res_ptr,
++    w_ptr,
++    add_out_ptr,
++    norm_out_ptr,
++    eps,
++    DIM: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.arange(0, DIM)
++    x = tl.load(x_ptr + row * DIM + cols)
++    r = tl.load(res_ptr + row * DIM + cols)
++    add = x + r
++    tl.store(add_out_ptr + row * DIM + cols, add)
++    xf = add.to(tl.float32)
++    w = tl.load(w_ptr + cols).to(tl.float32) + 1.0
++    var = tl.sum(xf * xf) / DIM
++    out = xf * tl.rsqrt(var + eps) * w
++    tl.store(norm_out_ptr + row * DIM + cols, out.to(x_ptr.dtype.element_ty))
++
++
++def fa_add_gemma_rms_norm_v2_supported(x, residual) -> bool:
++    """A3a shape guard: 2D, bf16, contiguous, hidden a power of 2
++    (tl.arange is invalid for non-power-of-2 hidden)."""
++    if not fa_fusion_enabled():
++        return False
++    if residual is None or x.dim() != 2:
++        return False
++    if x.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
++        return False
++    if not (x.is_contiguous() and residual.is_contiguous()):
++        return False
++    dim = x.shape[-1]
++    return dim > 0 and (dim & (dim - 1)) == 0
++
++
++def fa_add_gemma_rms_norm_v2(x, weight, residual, eps):
++    """返回 (norm_out, add_out)，语义同 sgl_kernel_npu add_gemma_rms_norm。
++    调用前须过 fa_add_gemma_rms_norm_v2_supported。"""
++    add_out = torch.empty_like(x)
++    norm_out = torch.empty_like(x)
++    B, D = x.shape
++    add_gemma_rms_norm_v2_kernel[(B,)](
++        x, residual, weight, add_out, norm_out, eps, DIM=D
++    )
++    return norm_out, add_out
++
++
++# ---------------------------------------------------------------------------
++# A2：sigmoid(gate) * attn 融合（替代 torch.sigmoid + mul_ 两个 kernel）
++# ---------------------------------------------------------------------------
++@triton.jit
++def sigmoid_mul_kernel(
++    attn_ptr,
++    gate_ptr,
++    out_ptr,
++    numel,
++    BLOCK: tl.constexpr,
++    BITWISE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < numel
++    a = tl.load(attn_ptr + offs, mask=mask).to(tl.float32)
++    g = tl.load(gate_ptr + offs, mask=mask).to(tl.float32)
++    s = tl.sigmoid(g)
++    if BITWISE:
++        # 模拟 stock 两个 op 之间的 bf16 中间舍入：sigmoid 先舍到 bf16 再乘，
++        # bitwise-identical to the attn.mul_(torch.sigmoid(gate)) target.
++        s = s.to(tl.bfloat16).to(tl.float32)
++    out = (a * s).to(tl.bfloat16)
++    tl.store(out_ptr + offs, out, mask=mask)
++
++
++def fa_sigmoid_mul_supported(attn_output, gate) -> bool:
++    """A2 形状守卫：等形、bf16、连续（elementwise 融合，无形状特化）。"""
++    if not fa_fusion_enabled():
++        return False
++    if attn_output.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16:
++        return False
++    if attn_output.shape != gate.shape:
++        return False
++    return attn_output.is_contiguous() and gate.is_contiguous()
++
++
++def fa_sigmoid_mul(attn, gate):
++    """out = attn * sigmoid(gate)，与 stock 双 op 舍入路径逐位一致。
++    调用前须过 fa_sigmoid_mul_supported。"""
++    out = torch.empty_like(attn)
++    numel = attn.numel()
++    BLOCK = 512
++    sigmoid_mul_kernel[(triton.cdiv(numel, BLOCK),)](
++        attn, gate, out, numel, BLOCK=BLOCK, BITWISE=True
++    )
++    return out
++
++
++# ---------------------------------------------------------------------------
++# A1b (row-parallel straight-line version): split q/kv/gate + q/k gemma
++# rmsnorm + rope,
++# 且 k/v 按 loc 直接 scatter 进 KV cache（免中间张量与两次 scatter_nd_update）。
++# grid=(batch,)：一 program 一行，q+gate / k / v 三段在一条直线里顺序做完。
++# Design constraints (triton-ascend): pid is used only for linear indexing
++# (no div/mod), no inter-segment runtime
++# 选择、store 不带标量条件 mask；SCATTER_KV 为 constexpr 分支，本文件生产
++# wrapper 恒 =1，k/v 中间张量写出整段编译期消除。
++# TP4/TP8/TP16 shape specialization: NUM_Q_HEADS ∈ {1,2,4} (TP16=1, TP8=2,
++# 9B-TP4=4, passed per runtime shape), NUM_KV_HEADS=1.
++# ---------------------------------------------------------------------------
++@triton.jit
++def split_qkvgate_v4_kernel(
++    input_ptr,
++    sin_ptr,
++    cos_ptr,
++    q_ptr,
++    gate_ptr,
++    k_ptr,
++    v_ptr,
++    kbuf_ptr,
++    vbuf_ptr,
++    loc_ptr,
++    q_weight_ptr,
++    k_weight_ptr,
++    q_hidden_size: tl.constexpr,
++    kv_hidden_size: tl.constexpr,
++    total_hidden_size: tl.constexpr,
++    eps: tl.constexpr,
++    NUM_Q_HEADS: tl.constexpr,  # ∈{1,2,4}
++    HEAD_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++    HALF_ROPE_DIM: tl.constexpr,
++    SCATTER_KV: tl.constexpr,
++):
++    row = tl.program_id(0)
++    base = input_ptr + row * total_hidden_size
++    d = tl.arange(0, HEAD_DIM)
++
++    # ---- q+gate：qkv 行前 2*q_hidden_size 连续读入，reshape 成 (头数, 512) 后
++    # 逐头切出 [q(256) | gate(256)]（与 stock 的 extract_slice 切法完全一致）
++    qg_cols = tl.arange(0, 2 * NUM_Q_HEADS * HEAD_DIM)
++    qg = tl.load(base + qg_cols).to(tl.float32).reshape(
++        NUM_Q_HEADS, 2 * HEAD_DIM
++    )
++    q = al.extract_slice(
++        qg, offsets=(0, 0), sizes=(NUM_Q_HEADS, HEAD_DIM), strides=(1, 1)
++    )
++    gate = al.extract_slice(
++        qg, offsets=(0, HEAD_DIM), sizes=(NUM_Q_HEADS, HEAD_DIM), strides=(1, 1)
++    )
++
++    # q norm（fp32 中间、gemma w+1；运算顺序与 stock 逐字一致）
++    qw = tl.load(q_weight_ptr + d).to(tl.float32) + 1.0
++    qvar = tl.sum(q * q, axis=1) / HEAD_DIM
++    qn = q * tl.rsqrt(qvar + eps)[:, None] * qw[None, :]
++
++    # rope (neox rotate_half, first ROPE_DIM dims only; op order matches stock
++    # exactly)
++    sc = row * ROPE_DIM + tl.arange(0, ROPE_DIM)
++    sin = tl.load(sin_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
++    cos = tl.load(cos_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
++    rot = al.extract_slice(
++        qn, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
++    )
++    x1 = al.extract_slice(
++        rot, offsets=(0, 0), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    x2 = al.extract_slice(
++        rot, offsets=(0, HALF_ROPE_DIM), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    cat = tl.zeros((NUM_Q_HEADS, ROPE_DIM), dtype=tl.float32)
++    cat = al.insert_slice(
++        cat, -x2, offsets=(0, 0), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    cat = al.insert_slice(
++        cat, x1, offsets=(0, HALF_ROPE_DIM), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    roped = cat * sin + rot * cos
++    qn = al.insert_slice(
++        qn, roped, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
++    )
++
++    # q/gate store: 1D unmasked store (same as stock reshape(Q_BLOCK); avoids
++    # 2D masked store — see the triton-ascend constraints at the top)
++    qg_out = row * q_hidden_size + tl.arange(0, NUM_Q_HEADS * HEAD_DIM)
++    tl.store(
++        q_ptr + qg_out,
++        qn.reshape(NUM_Q_HEADS * HEAD_DIM).to(input_ptr.dtype.element_ty),
++    )
++    tl.store(
++        gate_ptr + qg_out,
++        gate.reshape(NUM_Q_HEADS * HEAD_DIM).to(input_ptr.dtype.element_ty),
++    )
++
++    # ---- k（1 头）：norm + rope，与 stock k 段的 (1, HEAD_DIM) 形态一致
++    kt = tl.load(base + 2 * q_hidden_size + d).to(tl.float32).reshape(1, HEAD_DIM)
++    kw = tl.load(k_weight_ptr + d).to(tl.float32) + 1.0
++    kvar = tl.sum(kt * kt, axis=1) / HEAD_DIM
++    kn = kt * tl.rsqrt(kvar + eps)[:, None] * kw[None, :]
++    krot = al.extract_slice(kn, offsets=(0, 0), sizes=(1, ROPE_DIM), strides=(1, 1))
++    kx1 = al.extract_slice(
++        krot, offsets=(0, 0), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kx2 = al.extract_slice(
++        krot, offsets=(0, HALF_ROPE_DIM), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kcat = tl.zeros((1, ROPE_DIM), dtype=tl.float32)
++    kcat = al.insert_slice(
++        kcat, -kx2, offsets=(0, 0), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kcat = al.insert_slice(
++        kcat, kx1, offsets=(0, HALF_ROPE_DIM), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kroped = kcat * sin + krot * cos
++    kn = al.insert_slice(kn, kroped, offsets=(0, 0), sizes=(1, ROPE_DIM), strides=(1, 1))
++
++    # ---- v：bf16 原样拷贝（stock v 段不过 fp32）
++    vt = tl.load(base + 2 * q_hidden_size + kv_hidden_size + d)
++
++    # constexpr branch: with SCATTER_KV=1 the k/v intermediate-tensor stores
++    # are eliminated at compile time, and the k_ptr/v_ptr placeholder pointers
++    # are never dereferenced
++    if SCATTER_KV:
++        slot = tl.load(loc_ptr + row).to(tl.int64)
++        tl.store(
++            kbuf_ptr + slot * kv_hidden_size + d,
++            kn.reshape(HEAD_DIM).to(input_ptr.dtype.element_ty),
++        )
++        tl.store(vbuf_ptr + slot * kv_hidden_size + d, vt)
++    else:
++        tl.store(
++            k_ptr + row * kv_hidden_size + d,
++            kn.reshape(HEAD_DIM).to(input_ptr.dtype.element_ty),
++        )
++        tl.store(v_ptr + row * kv_hidden_size + d, vt)
++
++
++def fa_split_qkvgate_scatter_supported(
++    num_heads, num_kv_heads, head_dim, rope_dim, attn_output_gate
++) -> bool:
++    """A1b shape guard (TP layout specialization): per-rank q ∈ {1,2,4} heads
++    (TP16=1/TP8=2/9B-TP4=4), kv=1 head, head_dim=256, rope=64, with
++    attn_output_gate. All other TP/model configs fall back to stock.
++    Note: after enabling q=4 (9B TP4 form), run the in-graph UT
++    bench_fa_graph.py --num-q 4 on the server before production use."""
++    ok = (
++        fa_fusion_enabled()
++        and num_heads in (1, 2, 4)
++        and num_kv_heads == 1
++        and head_dim == 256
++        and rope_dim == 64
++        and attn_output_gate
++    )
++    if not ok:
++        _fa_debug_log(
++            ("shape_guard",),
++            "A1b 形状守卫未命中（回退 stock）："
++            f"num_heads={num_heads}(need 1/2/4) num_kv_heads={num_kv_heads}(need 1) "
++            f"head_dim={head_dim}(需256) rope_dim={rope_dim}(需64) "
++            f"gate={attn_output_gate}(需True) "
++            f"{_FA_FUSION_ENV}={os.environ.get(_FA_FUSION_ENV, '1')!r}",
++        )
++    return ok
++
++
++def fa_kv_pool_buffers(layer_id):
++    """从当前 NPU attention backend 的 KV pool 取该层 k/v buffer。
++    仅在 use_fia 布局（[pages*page_size, 1, head_num, head_dim]，与 token 级
++    slot=loc 直写口径一致）且非 hybrid SWA 时返回 (kbuf, vbuf)，否则返回 None。
++
++    GDN 混合模型的 pool 是 HybridLinearKVPool 包装：use_fia 判定要读内层
++    full_kv_pool（NPUMHATokenToKVPool，外层无此属性）；取 buffer 走外层
++    get_key/value_buffer——外层按 full_attention_layer_id_mapping 把全局
++    layer_id 翻译成全注意力局部序号后再 delegate（内层 pool 只有全注意力层，
++    直接用全局 id 会取错层）。
++    """
++    from sglang.srt.model_executor.forward_context import get_attn_backend
++
++    backend = get_attn_backend()
++    if getattr(backend, "is_hybrid_swa", False):
++        _fa_debug_log(
++            ("pool_swa", layer_id),
++            f"layer {layer_id}: backend is_hybrid_swa=True，A1b 回退 stock",
++        )
++        return None
++    pool = getattr(backend, "token_to_kv_pool", None)
++    if pool is None:
++        _fa_debug_log(
++            ("pool_none", layer_id),
++            f"layer {layer_id}: backend {type(backend).__name__} 无 "
++            "token_to_kv_pool，A1b 回退 stock",
++        )
++        return None
++    inner = getattr(pool, "full_kv_pool", pool)
++    if not getattr(inner, "use_fia", False):
++        _fa_debug_log(
++            ("pool_fia", layer_id),
++            f"layer {layer_id}: pool {type(pool).__name__} 内层 "
++            f"{type(inner).__name__}.use_fia=False（ASCEND_USE_FIA 未开？），"
++            "A1b 回退 stock",
++        )
++        return None
++    return pool.get_key_buffer(layer_id), pool.get_value_buffer(layer_id)
++
++
++def fa_v4_scatter_context(layer, forward_batch, qkv):
++    """A1b 运行时守卫总入口：全部条件命中返回 (kbuf, vbuf, loc)，任一未命中
++    返回 None（调用方回退 stock split + stock set_kv_buffer，行为与 origin
++    完全一致）。DEBUG=1 时按层一次性打印未命中原因/激活确认。"""
++    layer_id = layer.attn.layer_id
++    if not getattr(layer, "_fa_v4_shape_ok", False):
++        _fa_debug_log(
++            ("shape", layer_id),
++            f"layer {layer_id}: _fa_v4_shape_ok=False（见 init 时形状守卫日志），"
++            "A1b 回退 stock",
++        )
++        return None
++    if not forward_batch.forward_mode.is_decode():
++        _fa_debug_log(
++            ("mode", layer_id),
++            f"layer {layer_id}: forward_mode={forward_batch.forward_mode} 非 "
++            "DECODE（MTP verify / mixed / prefill 均不走 A1b），回退 stock",
++        )
++        return None
++    if not torch.is_tensor(qkv) or qkv.dtype != torch.bfloat16 or not qkv.is_contiguous():
++        _fa_debug_log(
++            ("qkv", layer_id),
++            f"layer {layer_id}: qkv 不满足（tensor={torch.is_tensor(qkv)} "
++            f"dtype={getattr(qkv, 'dtype', None)} "
++            f"contiguous={qkv.is_contiguous() if torch.is_tensor(qkv) else None}），"
++            "A1b 回退 stock",
++        )
++        return None
++    kv_bufs = fa_kv_pool_buffers(layer_id)
++    if kv_bufs is None:
++        return None  # 具体原因已在 fa_kv_pool_buffers 内打日志
++    kbuf, vbuf = kv_bufs
++    if kbuf.dtype != qkv.dtype:
++        _fa_debug_log(
++            ("kvdtype", layer_id),
++            f"layer {layer_id}: KV cache dtype={kbuf.dtype} != qkv "
++            f"dtype={qkv.dtype}（如 fp8 KV cache），A1b 回退 stock",
++        )
++        return None
++    _fa_debug_log(
++        ("active", layer_id),
++        f"layer {layer_id}: A1b 融合 split+KV scatter 已激活",
++    )
++    return kbuf, vbuf, forward_batch.out_cache_loc
++
++
++def fa_split_qkvgate_scatter(
++    input,
++    sin,
++    cos,
++    q_hidden_size,
++    kv_hidden_size,
++    head_dim,
++    rope_dim,
++    eps,
++    q_weight,
++    k_weight,
++    kbuf,
++    vbuf,
++    loc,
++):
++    """stock split_qkvgate_gemma_rmsnorm_rope 的行并行直线版（grid=(batch,)），
++    k/v 不写中间张量、按 loc 直接 scatter 进 KV cache。
++    返回 (q, None, None, gate)：k/v 为 None 表示 cache 已写，
++    调用方须以 save_kv_cache=False 走 attention backend。
++    Only q ∈ {1,2,4} heads and kv=1 head are supported (TP16=1, TP8=2,
++    9B-TP4=4 head specialization); the fa_v4_scatter_context guard must pass
++    before calling.
++    fa_v4_scatter_context 守卫。"""
++    batch = input.shape[0]
++    num_q = q_hidden_size // head_dim
++    num_kv = kv_hidden_size // head_dim
++    assert num_q in (1, 2, 4) and num_kv == 1, "TP4/TP8/TP16 shape specialization (q ∈ {1,2,4} heads, kv=1 head)"
++    assert kbuf.dtype == input.dtype and vbuf.dtype == input.dtype
++    q_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
++    gate_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
++    # SCATTER_KV=1：k_ptr/v_ptr 为占位指针（q_out/gate_out），编译期消除不会被写
++    split_qkvgate_v4_kernel[(batch,)](
++        input,
++        sin,
++        cos,
++        q_out,
++        gate_out,
++        q_out,
++        gate_out,
++        kbuf,
++        vbuf,
++        loc,
++        q_weight,
++        k_weight,
++        q_hidden_size,
++        kv_hidden_size,
++        q_hidden_size * 2 + kv_hidden_size * 2,
++        eps,
++        NUM_Q_HEADS=num_q,
++        HEAD_DIM=head_dim,
++        ROPE_DIM=rope_dim,
++        HALF_ROPE_DIM=rope_dim // 2,
++        SCATTER_KV=True,
++    )
++    return q_out, None, None, gate_out
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+index 919f46619a..c8a185388a 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+@@ -37,6 +37,21 @@ if TYPE_CHECKING:
+         BaseCudaGraphRunner,
+     )
+ 
++@contextmanager
++def _disable_tms_during_graph_capture():
++    try:
++        from torch_memory_saver import torch_memory_saver
++        _impl = torch_memory_saver._impl
++    except Exception:
++        _impl = None
++
++    if _impl is not None:
++        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
++    try:
++        yield
++    finally:
++        if _impl is not None:
++            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
+ 
+ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+     """One torch.npu.NPUGraph per shape; attention metadata captured
+@@ -117,7 +132,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+             stream=self._capture_stream,
+             auto_dispatch_capture=True,
+         ):
+-            out = forward_fn()
++            with _disable_tms_during_graph_capture():
++                out = forward_fn()
+ 
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = out
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+index 5a51ef4e96..7fbe869fad 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+@@ -5,6 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
+ 
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
++from sglang.srt.environ import envs
+ from sglang.srt.layers.moe.topk import (
+     StandardTopKOutput,
+     capture_routed_experts_if_allowed,
+@@ -15,6 +16,11 @@ if TYPE_CHECKING:
+     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
+ 
++# MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
++# renorm=1 单算子路由 + v2.2 自写 init_routing。默认关，开启：
++# SGLANG_MOE_FRONT_FUSION=1。仅作用于下方 fast path（无 group/无 bias）。
++_moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
++
+ 
+ def fused_topk_npu(
+     hidden_states: torch.Tensor,
+@@ -31,18 +37,43 @@ def fused_topk_npu(
+ 
+     # Fast path: simple top-k without grouped routing and bias
+     if not use_grouped_topk and correction_bias is None:
+-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+-            router_logits,
+-            k=topk_config.top_k,
+-        )
+-
+-        if renormalize:
+-            topk_weights = l1_norm(
+-                topk_weights
+-                if topk_config.num_fused_shared_experts == 0
+-                else topk_weights[:, :-1]
++        if (
++            _moe_front_fusion
++            and renormalize
++            and topk_config.num_fused_shared_experts == 0
++        ):
++            # renorm=1 single op = gating_top_k_softmax + l1_norm.
++            # Feed bf16 directly: aclnnMoeGatingTopK supports BF16 input and
++            # computes softmax in fp32 after exact widening, so ids are
++            # bitwise unchanged; no .to(fp32) on the output (with bf16 output
++            # that would be a real cast). The deepep path's fp32 contract for
++            # topk_weights is restored by the defensive .to(fp32) before the
++            # two dispatch_a call sites in deepep.py.
++            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
++                router_logits,
++                k=topk_config.top_k,
++                bias=None,
++                k_group=1,
++                group_count=1,
++                group_select_mode=0,
++                renorm=1,
++                norm_type=0,
++                routed_scaling_factor=1.0,
++                eps=float(1e-20),
+             )
+-        topk_weights = topk_weights.to(torch.float32)
++        else:
++            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
++                router_logits,
++                k=topk_config.top_k,
++            )
++
++            if renormalize:
++                topk_weights = l1_norm(
++                    topk_weights
++                    if topk_config.num_fused_shared_experts == 0
++                    else topk_weights[:, :-1]
++                )
++            topk_weights = topk_weights.to(torch.float32)
+ 
+     # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
+     # a torch path. top-k over (scores + bias); weights from un-biased scores.
+diff --git a/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
+new file mode 100644
+index 0000000000..5c05bffbaa
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
+@@ -0,0 +1,363 @@
++"""MoE expert weight L2 prefetch for NPU decode (aclgraph replay).
++
++Design:
++- Self-targeted single launch point: after this layer's prepare_attn, before
++  attention starts; the layer's own weight prefetch is launched there. EP
++  inter-layer communication (reduceScatter + allGather) completes inside the next
++  layer's prepare_attn, and TP's layer-end all_reduce inside the previous layer's
++  postprocess_layer — so this point sits after all inter-layer communication on
++  both paths and does not contend with it for bandwidth; self-targeting also gives
++  layer 0 an attention window.
++- GMM1 (w13) full prefetch: launches w13(j), GDN layers only; on by default.
++- GMM2 (w2) full prefetch: merged into the same launch point, w2(j) chunks appended
++  after w13(j) (consumption order: w2 is consumed by GMM2(j), one GMM1+SwiGLU later
++  than w13); off by default. Merged-launch gate: w13+w2 <= 0.8*L2.
++- Best-effort: the main stream does not wait for the CMO stream before GMM (cache
++  warm-up has no RAW hazard); drained at step end (prevents cross-step backlog, and
++  capture legality requires the side stream to return to the main stream via event).
++- Launched only during graph capture (eager / prefill never activate); CMO is an
++  SDMA task and occupies no AIV/AIC cores.
++- Only layer objects registered for the target model trigger launches
++  (`_moe_prefetch_emit` marker); layers of the MTP draft model never launch even if
++  they reuse this forward from the same file.
++
++Note: torch_npu is always lazily imported inside functions, so this module is safe
++to import on CUDA and other platforms.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import logging
++import os
++from typing import Dict, Optional
++
++import torch
++
++from sglang.srt.environ import envs
++
++logger = logging.getLogger(__name__)
++
++# ACL_DEV_ATTR_L2_CACHE_SIZE = RT_DEV_ATTR_L2_CACHE_SIZE = 302
++_L2_CACHE_ATTR = 302
++
++_VALID_OPS = ("gmm1", "gmm2")
++_VALID_MODES = ("auto", "full", "active")
++
++
++# ---------------------------------------------------------------------------
++# L2 capacity query (ctypes, no compilation needed)
++# ---------------------------------------------------------------------------
++def _dlopen_first(candidates):
++    for path in candidates:
++        try:
++            return ctypes.CDLL(path)
++        except OSError:
++            continue
++    return None
++
++
++def _try_get_info(lib, func_name) -> Optional[int]:
++    fn = getattr(lib, func_name, None)
++    if fn is None:
++        return None
++    fn.restype = ctypes.c_int
++    fn.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_int64)]
++    val = ctypes.c_int64(-1)
++    try:
++        rc = fn(0, _L2_CACHE_ATTR, ctypes.byref(val))
++    except Exception:
++        return None
++    if rc == 0 and val.value > 0:
++        return int(val.value)
++    return None
++
++
++def _query_l2_size_bytes() -> Optional[int]:
++    """Return the L2 cache size in bytes; None on query failure (caller disables prefetch)."""
++    home = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get("ASCEND_HOME_PATH")
++    acl_paths = ["libascendcl.so", "libascendcl.so.1"]
++    rt_paths = ["libruntime.so"]
++    if home:
++        acl_paths.append(os.path.join(home, "lib64", "libascendcl.so"))
++        rt_paths.append(os.path.join(home, "lib64", "libruntime.so"))
++    acl_paths += sorted(
++        glob.glob("/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so*")
++    )
++    rt_paths += sorted(
++        glob.glob("/usr/local/Ascend/ascend-toolkit/latest/lib64/libruntime.so*")
++    )
++
++    lib = _dlopen_first(acl_paths)
++    if lib is not None:
++        for name in ("aclrtGetDeviceInfo", "aclrtGetDeviceAttr"):
++            size = _try_get_info(lib, name)
++            if size is not None:
++                return size
++    lib = _dlopen_first(rt_paths)
++    if lib is not None:
++        size = _try_get_info(lib, "rtsDeviceGetInfo")
++        if size is not None:
++            return size
++    return None
++
++
++def _is_capture_mode() -> bool:
++    """Lazy import to avoid a module-level dependency on the model_executor chain."""
++    from sglang.srt.model_executor.runner_utils.capture_mode import (
++        get_is_capture_mode,
++    )
++
++    return get_is_capture_mode()
++
++
++# ---------------------------------------------------------------------------
++# Manager (process-level singleton)
++# ---------------------------------------------------------------------------
++class _MoeWeightPrefetchManager:
++    def __init__(self):
++        self.configured = False
++        self.enabled = False
++        self.prefetch_gmm1 = False
++        self.prefetch_gmm2 = False
++        self.mode = "full"
++        self.chunk_bytes = 16 << 20
++        self.l2_size: Optional[int] = None
++        self.budget_bytes = 0
++        self.stream = None
++        # layer_id -> {"w13": Tensor, "w2": Tensor, "prefetch_target": bool}
++        self.layers: Dict[int, dict] = {}
++        self._capacity_checked = False
++        self._emitted_in_pass = False
++
++    # ---- Configuration (parsed once at first registration) ----
++    def configure(self):
++        if self.configured:
++            return
++        self.configured = True
++
++        if not envs.SGLANG_NPU_MOE_PREFETCH.get():
++            return  # enabled stays False; everything below is a no-op
++
++        ops_raw = str(envs.SGLANG_NPU_MOE_PREFETCH_OPS.get()).lower()
++        ops = [t.strip() for t in ops_raw.split(",") if t.strip()]
++        unknown = [t for t in ops if t not in _VALID_OPS]
++        if unknown:
++            logger.warning(
++                f"[MOE_PREFETCH] unknown ops {unknown} ignored, valid: {_VALID_OPS}"
++            )
++        self.prefetch_gmm1 = "gmm1" in ops
++        self.prefetch_gmm2 = "gmm2" in ops
++
++        mode = str(envs.SGLANG_NPU_MOE_PREFETCH_MODE.get()).lower()
++        if mode not in _VALID_MODES:
++            logger.warning(
++                f"[MOE_PREFETCH] unknown mode {mode!r}, fallback to 'auto'"
++            )
++            mode = "auto"
++        if mode == "active":
++            # In-graph npu_prefetch offset/max_size are capture-time constants and
++            # nodes execute unconditionally, so runtime active indices cannot be fed
++            # into the baked CMO params; 'active' would need a copy-kernel +
++            # write-allocate design. Fall back to 'full'.
++            logger.warning(
++                "[MOE_PREFETCH] mode='active' is not supported "
++                "(in-graph CMO params are capture-time constants); "
++                "falling back to 'full'"
++            )
++            mode = "full"
++        self.mode = "full" if mode == "auto" else mode  # auto == full
++
++        chunk_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB.get())
++        if chunk_mib <= 0:
++            logger.warning(
++                f"[MOE_PREFETCH] invalid CHUNK_MIB={chunk_mib}, fallback to 16"
++            )
++            chunk_mib = 16
++        self.chunk_bytes = chunk_mib << 20
++
++        self.l2_size = _query_l2_size_bytes()
++        if self.l2_size is None:
++            logger.warning(
++                "[MOE_PREFETCH] failed to query L2 cache size "
++                "(aclrtGetDeviceInfo(302)); prefetch disabled"
++            )
++            return
++
++        budget_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB.get())
++        self.budget_bytes = (
++            (budget_mib << 20) if budget_mib > 0 else int(0.8 * self.l2_size)
++        )
++
++        self.enabled = self.prefetch_gmm1 or self.prefetch_gmm2
++        logger.info(
++            f"[MOE_PREFETCH] configured: enabled={self.enabled} "
++            f"gmm1={self.prefetch_gmm1} gmm2={self.prefetch_gmm2} "
++            f"mode={self.mode} chunk={chunk_mib}MiB "
++            f"l2={self.l2_size >> 20}MiB budget={self.budget_bytes >> 20}MiB"
++        )
++
++    # ---- Capacity check (checked once at first MoE layer registration; layers are homogeneous) ----
++    def _check_capacity(self, w13_bytes: int, w2_bytes: int):
++        if self._capacity_checked:
++            return
++        self._capacity_checked = True
++        mib = 1 << 20
++        if self.prefetch_gmm1 and w13_bytes > self.budget_bytes:
++            logger.warning(
++                f"[MOE_PREFETCH] w13 size {w13_bytes / mib:.1f}MiB > budget "
++                f"{self.budget_bytes / mib:.1f}MiB (0.8*L2 or BUDGET_MIB); "
++                f"gmm1 prefetch disabled for this config "
++                f"(e.g. TP4 w13=256MiB is a known unsupported case)"
++            )
++            self.prefetch_gmm1 = False
++        if self.prefetch_gmm2:
++            # Merged-launch gate: w13 (if gmm1 is on) + w2 stay resident in the same
++            # cross-layer window; gmm2 is allowed only if the total fits the budget.
++            resident = (w13_bytes if self.prefetch_gmm1 else 0) + w2_bytes
++            if resident > self.budget_bytes:
++                logger.warning(
++                    f"[MOE_PREFETCH] resident w13+w2 size {resident / mib:.1f}MiB "
++                    f"> budget {self.budget_bytes / mib:.1f}MiB; "
++                    f"merged gmm2 prefetch disabled for this config "
++                    f"(w13 and w2 launch together, so both must fit; "
++                    f"TP8 w13+w2=192MiB is a known unsupported case)"
++                )
++                self.prefetch_gmm2 = False
++        self.enabled = self.prefetch_gmm1 or self.prefetch_gmm2
++        if self.enabled:
++            logger.info(
++                f"[MOE_PREFETCH] capacity check passed: w13={w13_bytes / mib:.1f}MiB "
++                f"(gmm1={self.prefetch_gmm1}) w2={w2_bytes / mib:.1f}MiB "
++                f"(gmm2={self.prefetch_gmm2})"
++            )
++
++    # ---- Model registration (called during model init, outside capture) ----
++    def register_model(self, model):
++        self.configure()
++        if not self.enabled:
++            return
++
++        if self.stream is None:
++            import torch_npu  # noqa: F401
++
++            # Dedicated CMO stream: created outside capture (driver call), reused as a singleton.
++            self.stream = torch.npu.Stream()
++
++        block_types = None
++        config = getattr(model, "config", None)
++        if config is not None:
++            try:
++                block_types = config.layers_block_type
++            except Exception:
++                block_types = None
++
++        n_reg = 0
++        layers = getattr(model, "layers", None)
++        if layers is None:
++            return
++        for layer in layers:
++            mlp = getattr(layer, "mlp", None)
++            experts = getattr(mlp, "experts", None)
++            w13 = getattr(experts, "w13_weight", None)
++            w2 = getattr(experts, "w2_weight", None)
++            layer_id = getattr(layer, "layer_id", None)
++            if w13 is None or w2 is None or layer_id is None:
++                continue  # dense MLP / PPMissingLayer / non-MoE layer
++
++            self._check_capacity(
++                w13.numel() * w13.element_size(),
++                w2.numel() * w2.element_size(),
++            )
++            # Prefetch target: GDN layers only (an FA layer's FIA KV stream
++            # self-evicts and steals bandwidth); w13 and w2 share the target set.
++            is_gdn = (
++                block_types is not None
++                and 0 <= layer_id < len(block_types)
++                and block_types[layer_id] == "linear_attention"
++            )
++            self.layers[layer_id] = {
++                "w13": w13,
++                "w2": w2,
++                "prefetch_target": bool(is_gdn),
++            }
++            # The launch gate is marked per layer object: unregistered layers (e.g.
++            # MTP draft model layers, whose layer_id may collide with the registry)
++            # never launch.
++            layer._moe_prefetch_emit = True
++            n_reg += 1
++
++        if n_reg:
++            n_target = sum(1 for v in self.layers.values() if v["prefetch_target"])
++            logger.info(
++                f"[MOE_PREFETCH] registered {n_reg} MoE layers, "
++                f"{n_target} GDN prefetch targets"
++            )
++
++    # ---- Launch (capture only; best-effort, no wait) ----
++    def _emit_chunked(self, weights, anchor: torch.Tensor):
++        import torch_npu
++
++        cur = torch.npu.current_stream()
++        self.stream.wait_stream(cur)  # fork edge: the penalty is paid by the prefetch stream
++        with torch.npu.stream(self.stream):
++            for weight in weights:
++                nbytes = weight.numel() * weight.element_size()
++                offset = 0
++                while offset < nbytes:
++                    size = min(self.chunk_bytes, nbytes - offset)
++                    torch_npu.npu_prefetch(weight, anchor, size, offset)
++                    offset += size
++        self._emitted_in_pass = True
++
++    def emit(self, layer, anchor: torch.Tensor):
++        """Launch this layer's w13(+w2) prefetch before its attention starts (after all inter-layer communication).
++
++        Launch point = after prepare_attn in decoder layer forward. EP inter-layer
++        communication (reduceScatter + allGather) completes inside the next layer's
++        prepare_attn and TP's layer-end AR inside the previous layer's
++        postprocess_layer, so this point is after all inter-layer communication on
++        both paths. Chunk order: w13 first (consumed by GMM1), w2 after (consumed by
++        GMM2, with one extra GMM1+SwiGLU of slack).
++        """
++        if not self.enabled or not _is_capture_mode():
++            return
++        if not getattr(layer, "_moe_prefetch_emit", False):
++            return  # unregistered layers (MTP draft etc.) never launch
++        target = self.layers.get(layer.layer_id)
++        if target is None or not target["prefetch_target"]:
++            return
++        weights = []
++        if self.prefetch_gmm1:
++            weights.append(target["w13"])
++        if self.prefetch_gmm2:
++            weights.append(target["w2"])
++        if not weights:
++            return
++        self._emit_chunked(weights, anchor)
++
++    # ---- Step-end drain (called after the model forward layer loop) ----
++    def drain(self):
++        if not self.enabled or not self._emitted_in_pass or not _is_capture_mode():
++            return
++        torch.npu.current_stream().wait_stream(self.stream)
++        self._emitted_in_pass = False
++
++
++_MANAGER = _MoeWeightPrefetchManager()
++
++
++# ---------------------------------------------------------------------------
++# Public interface (called by qwen3_5.py)
++# ---------------------------------------------------------------------------
++def moe_prefetch_register_model(model):
++    _MANAGER.register_model(model)
++
++
++def moe_prefetch_emit(layer, anchor: torch.Tensor):
++    _MANAGER.emit(layer, anchor)
++
++
++def moe_prefetch_step_drain():
++    _MANAGER.drain()
+diff --git a/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py b/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
+new file mode 100644
+index 0000000000..ea67cd2293
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/tp_ascendc_fusion_npu.py
+@@ -0,0 +1,347 @@
++# Switch/guard module for Qwen3.5 NPU decode TP-path AscendC fusion.
++#
++# Two ops (registered by sgl-kernel-npu csrc as torch.ops.npu.*):
++#   op1 fused_qkvzba_conv1d            GDN decode: qkvzba split + causal_conv1d(UPDATE),
++#                                      single kernel, returns (y, z, b, a); conv_states updated in place.
++#   op2 fused_sigmoid_gating_recurrent GDN decode: sigmoid gating + delta rule update,
++#                                      single AIV_ONLY kernel; drop-in replacement for the
++#                                      production Triton kernel; ssm pool updated in place.
++#
++# fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm are not built in this version
++# (dropped); their guard functions are kept as always-disabled stubs so that an old
++# qwen3_5.py importing them still works.
++#
++# Switches:
++#   SGLANG_NPU_TP_ASCENDC_FUSION          master switch (default "0"), op1 only
++#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 switch: follows master when unset, explicit "0" disables op1 alone
++#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 switch (default "0"); evaluated at gdn_triton.py
++#                                         import time, must be set before graph capture / server start
++#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  log guard misses once per key
++# Guard decisions are baked into the graph at capture time; changing env afterwards has no effect.
++
++import logging
++import os
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_TP_FUSION_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION"
++_TP_FUSION_QKVZBA_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA"
++_GDN_RECURRENT_ASCENDC_ENV = "SGLANG_NPU_GDN_RECURRENT_ASCENDC"
++_TP_DEBUG_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG"
++_tp_debug_logged = set()
++
++# Host-side hard constraints of the ops (mirror the csrc host TORCH_CHECKs; see each REGISTRATION.md):
++_TP_C0_ALIGN = 16  # bf16 C0 alignment (op1 row width must be a multiple of 16)
++_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel specializes K/V to 128
++_RECURRENT_MAX_HV = 8  # gating [8] pad limit of the same kernel
++_RECURRENT_MAX_N = 256  # cu/idx UB residency limit of the same kernel
++
++_TP_OP_CACHE = {}
++
++
++def tp_fusion_enabled() -> bool:
++    """Master switch for TP-path AscendC fusion (default off; "1" enables, op1 only)."""
++    return os.environ.get(_TP_FUSION_ENV, "0") == "1"
++
++
++def tp_fusion_qkvzba_enabled() -> bool:
++    """op1 (fused_qkvzba_conv1d) switch: follows the master switch when unset; explicit "0" disables op1 alone."""
++    return os.environ.get(
++        _TP_FUSION_QKVZBA_ENV, os.environ.get(_TP_FUSION_ENV, "0")
++    ) == "1"
++
++
++def gdn_recurrent_ascendc_enabled() -> bool:
++    """op2 (fused_sigmoid_gating_recurrent, AscendC recurrent) switch: default "0", enabled only by explicit "1"."""
++    return os.environ.get(_GDN_RECURRENT_ASCENDC_ENV, "0") == "1"
++
++
++def tp_debug_log(key, msg):
++    """When the debug switch is on, log once per key (for locating guard misses)."""
++    if os.environ.get(_TP_DEBUG_ENV, "0") != "1":
++        return
++    if key in _tp_debug_logged:
++        return
++    _tp_debug_logged.add(key)
++    logger.warning("[tp_ascendc_fusion] %s", msg)
++
++
++def tp_op_available(name: str) -> bool:
++    """Whether the op is registered on torch.ops.npu (i.e. sgl-kernel-npu was built with these ops).
++
++    Registration happens when the sgl_kernel_npu extension loads (process start), so
++    the result is process-static and cached.
++    """
++    got = _TP_OP_CACHE.get(name)
++    if got is None:
++        got = hasattr(torch.ops.npu, name)
++        _TP_OP_CACHE[name] = got
++    return got
++
++
++# ---------------------------------------------------------------------------
++# op1 (GDN decode): fused_qkvzba_conv1d
++#   = fused_qkvzba_split_reshape_cat_contiguous + causal_conv1d(run_mode=1)
++# ---------------------------------------------------------------------------
++def tp_fused_qkvzba_conv1d_shape_supported(
++    num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim, conv_kernel_size
++) -> bool:
++    """Shape guard baked at init (Qwen3_5GatedDeltaNet level; head counts are per-rank after TP split).
++
++    Mirrors the op host TORCH_CHECKs: num_v % num_k == 0 with ratio in {1,2,4} (same
++    as the replaced qwen3_5.py split-branch condition), conv width in [2,4], qkvWidth
++    and qkvz row width 16-aligned (32B DataCopy alignment of the z copy), z row
++    bytes <= 65535 (single-block DataCopy limit).
++    """
++    ok = (
++        tp_fusion_qkvzba_enabled()
++        and tp_op_available("fused_qkvzba_conv1d")
++        and num_k_heads_tp > 0
++        and num_v_heads_tp > 0
++        and head_k_dim > 0
++        and head_v_dim > 0
++        and num_v_heads_tp % num_k_heads_tp == 0
++        and (num_v_heads_tp // num_k_heads_tp) in (1, 2, 4)
++        and 2 <= conv_kernel_size <= 4
++    )
++    if ok:
++        qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
++        x_row_stride = qkv_width + num_v_heads_tp * head_v_dim
++        ok = (
++            qkv_width % _TP_C0_ALIGN == 0
++            and x_row_stride % _TP_C0_ALIGN == 0
++            and num_v_heads_tp * head_v_dim * 2 <= 65535
++        )
++    if not ok:
++        tp_debug_log(
++            ("qkvzba_shape",),
++            "fused_qkvzba_conv1d init shape guard missed (falling back to stock split+causal_conv1d): "
++            f"nk_tp={num_k_heads_tp} nv_tp={num_v_heads_tp} dk={head_k_dim} "
++            f"dv={head_v_dim} width={conv_kernel_size} "
++            f"op_registered={tp_op_available('fused_qkvzba_conv1d')} "
++            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<follows master>')!r} "
++            f"{_TP_FUSION_ENV}={os.environ.get(_TP_FUSION_ENV, '0')!r}",
++        )
++    return ok
++
++
++def tp_fused_qkvzba_conv1d_inputs_ok(
++    qkvz, mixed_ba, num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim
++) -> bool:
++    """Lightweight runtime check on the backend side (tuple-input tensor attributes; the main shape set is baked at init).
++
++    Contiguity contract is a "row-stride view": column-contiguous (stride(1)==1), row
++    stride >= logical width, and qkvz row stride a multiple of 16 (mirrors the host
++    TORCH_CHECK for 32B alignment of the z copy). Contiguous inputs satisfy this
++    naturally; row-stride views (slices of the packed GEMM output) are read directly,
++    avoiding two .contiguous() calls. Must be deployed together with the matching
++    csrc host version (older hosts still TORCH_CHECK is_contiguous).
++    """
++    qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
++    return (
++        torch.is_tensor(qkvz)
++        and torch.is_tensor(mixed_ba)
++        and qkvz.dim() == 2
++        and mixed_ba.dim() == 2
++        and qkvz.dtype == torch.bfloat16
++        and mixed_ba.dtype == torch.bfloat16
++        and qkvz.stride(1) == 1
++        and qkvz.stride(0) >= qkvz.shape[1]
++        and qkvz.stride(0) % _TP_C0_ALIGN == 0
++        and mixed_ba.stride(1) == 1
++        and mixed_ba.stride(0) >= mixed_ba.shape[1]
++        and qkvz.shape[1] == qkv_width + num_v_heads_tp * head_v_dim
++        and mixed_ba.shape[0] == qkvz.shape[0]
++        and mixed_ba.shape[1] == 2 * num_v_heads_tp
++    )
++
++
++# ---------------------------------------------------------------------------
++# op2 (GDN decode): fused_sigmoid_gating_recurrent (AscendC recurrent)
++#
++# Not bit-exact with the production Triton kernel (K-dim reduction order +
++# instruction-level Exp/Ln/Div differences); acceptance follows bounded error +
++# long-run drift + e2e A/B (see the op package README "precision gate" section).
++# ---------------------------------------------------------------------------
++def _ascendc_recurrent_supported(
++    q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
++    A_log, dt_bias,
++) -> bool:
++    """Runtime guard (mirrors host TORCH_CHECKs; on miss the wrapper falls back to stock Triton).
++
++    Reads tensor attributes only (shape/stride/dtype/contiguity), never device data,
++    so it is graph-capture safe. fp32 dtype of A_log/dt_bias is not enforced here —
++    the wrapper widens losslessly (see call site); only numel is checked to avoid a
++    host TORCH_CHECK failure.
++    """
++    ok = (
++        tp_op_available("fused_sigmoid_gating_recurrent")
++        and torch.is_tensor(q)
++        and q.dim() == 4
++        and q.size(0) == 1
++        and cu_seqlens is not None
++        and torch.is_tensor(cu_seqlens)
++        and q.size(1) == cu_seqlens.numel() - 1  # T == N: 1 token per sequence
++        and 1 <= q.size(1) <= _RECURRENT_MAX_N
++        and q.size(3) == _RECURRENT_HEAD_DIM
++        and v.size(3) == _RECURRENT_HEAD_DIM
++        and q.size(2) >= 1
++        and v.size(2) >= 1
++        and v.size(2) <= _RECURRENT_MAX_HV
++        and v.size(2) % q.size(2) == 0
++        and q.dtype == torch.bfloat16
++        and k.dtype == torch.bfloat16
++        and v.dtype == torch.bfloat16
++        and a.dtype == torch.bfloat16
++        and b.dtype == torch.bfloat16
++        and initial_state_source.dtype in (torch.bfloat16, torch.float32)
++        and q.stride(3) == 1
++        and k.stride(3) == 1
++        and v.stride(3) == 1
++        and q.stride(2) == q.size(3)
++        and k.stride(2) == k.size(3)
++        and v.stride(2) == v.size(3)
++        and a.is_contiguous()
++        and b.is_contiguous()
++        and initial_state_source.is_contiguous()
++        and initial_state_source.dim() == 4
++        and initial_state_source.size(1) == v.size(2)
++        and initial_state_source.size(2) == _RECURRENT_HEAD_DIM
++        and initial_state_source.size(3) == _RECURRENT_HEAD_DIM
++        and initial_state_indices is not None
++        and initial_state_indices.numel() >= q.size(1)
++        and A_log.numel() == v.size(2)  # host: A_log/dt_bias numel == HV
++        and dt_bias.numel() == v.size(2)
++    )
++    if not ok:
++        tp_debug_log(
++            ("recurrent_shape",),
++            "fused_sigmoid_gating_recurrent runtime guard missed (falling back to stock Triton): "
++            f"q={tuple(q.shape)}/{q.dtype} v={tuple(v.shape)}/{v.dtype} "
++            f"pool={tuple(initial_state_source.shape)}/{initial_state_source.dtype} "
++            f"T_vs_N={q.size(1)}/{cu_seqlens.numel() - 1 if torch.is_tensor(cu_seqlens) else None} "
++            f"op_registered={tp_op_available('fused_sigmoid_gating_recurrent')}",
++        )
++    return ok
++
++
++def fused_sigmoid_gating_delta_rule_update_ascendc(
++    A_log,
++    a,
++    dt_bias,
++    softplus_beta,
++    softplus_threshold,
++    q,
++    k,
++    v,
++    b,
++    initial_state_source,
++    initial_state_indices,
++    scale=None,
++    use_qk_l2norm_in_kernel=False,
++    cu_seqlens=None,
++):
++    """AscendC drop-in replacement for the production Triton wrapper
++    (fused_sigmoid_gating_delta_rule_update_npu), same signature and semantics;
++    decode only (T==N).
++
++    On guard miss, falls back to the stock Triton wrapper (silent; with
++    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 the reason is logged once).
++    """
++    if not _ascendc_recurrent_supported(
++        q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
++        A_log, dt_bias,
++    ):
++        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
++            fused_sigmoid_gating_delta_rule_update_npu,
++        )
++
++        return fused_sigmoid_gating_delta_rule_update_npu(
++            A_log=A_log,
++            a=a,
++            dt_bias=dt_bias,
++            softplus_beta=softplus_beta,
++            softplus_threshold=softplus_threshold,
++            q=q,
++            k=k,
++            v=v,
++            b=b,
++            initial_state_source=initial_state_source,
++            initial_state_indices=initial_state_indices,
++            scale=scale,
++            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
++            cu_seqlens=cu_seqlens,
++        )
++    # scale default matches the Triton wrapper (python-side K**-0.5, same double->float path)
++    if scale is None:
++        scale = k.shape[-1] ** -0.5
++    else:
++        assert scale > 0, "scale must be positive"
++    # A_log/dt_bias: the host only accepts fp32, but they may be bf16 after checkpoint
++    # load. Widen losslessly here (bit-exact with the in-kernel .to(tl.float32) of the
++    # Triton kernel), mirroring the Triton wrapper's .contiguous().
++    if A_log.dtype != torch.float32:
++        A_log = A_log.float()
++    if dt_bias.dtype != torch.float32:
++        dt_bias = dt_bias.float()
++    A_log = A_log.contiguous()
++    dt_bias = dt_bias.contiguous()
++    return torch.ops.npu.fused_sigmoid_gating_recurrent(
++        A_log,
++        a,
++        dt_bias,
++        float(softplus_beta),
++        float(softplus_threshold),
++        q,
++        k,
++        v,
++        b,
++        initial_state_source,
++        initial_state_indices,
++        float(scale),
++        cu_seqlens,
++        bool(use_qk_l2norm_in_kernel),
++        q.stride(1),
++        k.stride(1),
++        v.stride(1),
++    )
++
++
++# ---------------------------------------------------------------------------
++# Legacy stubs (always disabled): fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
++# These two ops were dropped and are not built in this version. If an old qwen3_5.py
++# imports the 5 functions below, the stubs keep it working and never activate
++# (callers fall back to the original path).
++# ---------------------------------------------------------------------------
++def tp_fusion_nqps_enabled() -> bool:
++    """fused_norm_qkv_proj_scatter switch stub: always False (op not built)."""
++    return False
++
++
++def tp_fusion_sigmm_enabled() -> bool:
++    """fused_sigmoid_mul_mm switch stub: always False (op not built)."""
++    return False
++
++
++def tp_norm_qkv_scatter_shape_supported(layer) -> bool:
++    """fused_norm_qkv_proj_scatter init guard stub: always False."""
++    return False
++
++
++def tp_norm_qkv_scatter_context(
++    layer, hidden_states, residual, forward_batch, captured_last_layer_outputs
++):
++    """fused_norm_qkv_proj_scatter runtime guard stub: always None (caller falls back to the original path)."""
++    return None
++
++
++def tp_sigmoid_mul_mm_shape_supported(o_proj) -> bool:
++    """fused_sigmoid_mul_mm init guard stub: always False."""
++    return False
++
++
++def tp_sigmoid_mul_mm_runtime_ok(attn_output, gate) -> bool:
++    """fused_sigmoid_mul_mm runtime guard stub: always False."""
++    return False
+diff --git a/python/sglang/srt/layers/attention/fla/cumsum.py b/python/sglang/srt/layers/attention/fla/cumsum.py
+index 911b78e004..ff78179f56 100644
+--- a/python/sglang/srt/layers/attention/fla/cumsum.py
++++ b/python/sglang/srt/layers/attention/fla/cumsum.py
+@@ -75,7 +75,12 @@ def chunk_local_cumsum_scalar_kernel(
+         for num_warps in [2, 4, 8]
+         for num_stages in [2, 3, 4]
+     ],
+-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
++    # Keep key at 6 entries: triton-ascend's AutoTilingTuner (which replaces
++    # triton.autotune after the first Triton compile in the process) rejects
++    # longer key lists at decoration time, crashing engine boot if this module
++    # is imported late. The key only controls autotune cache granularity; the
++    # tuned configs are unchanged.
++    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+ )
+ @triton.jit(do_not_specialize=["T"])
+ def chunk_local_cumsum_vector_kernel(
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+index abdfa5e376..26b9d0a4fd 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+@@ -1,3 +1,5 @@
++import os
++
+ import torch
+ 
+ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+@@ -25,6 +27,25 @@ if is_npu():
+ 
+     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
++
++    # Three-way choice of the NPU decode recurrent kernel (resolved at import
++    # time — set the env before server start; changing it after capture has no
++    # effect):
++    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1 → AscendC version (falls back to
++    #                                        stock internally on guard miss)
++    #   SGLANG_NPU_GDN_UPDATE_FUSED=1      → decode-optimized Triton version
++    #   neither set                        → stock
++    # If both envs are set, ASCENDC wins.
++    if os.environ.get("SGLANG_NPU_GDN_RECURRENT_ASCENDC", "0") == "1":
++        from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
++            fused_sigmoid_gating_delta_rule_update_ascendc as _gdn_decode_update,
++        )
++    elif os.environ.get("SGLANG_NPU_GDN_UPDATE_FUSED", "0") == "1":
++        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
++            fused_sigmoid_gating_delta_rule_update_decode_npu as _gdn_decode_update,
++        )
++    else:
++        _gdn_decode_update = fused_sigmoid_gating_delta_rule_update
+ elif is_cpu():
+     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
+ 
+@@ -150,7 +171,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
+         query_start_loc: torch.Tensor,
+         **kwargs,
+     ) -> torch.Tensor:
+-        return fused_sigmoid_gating_delta_rule_update(
++        # _gdn_decode_update is bound by env at import time (three-way); the
++        # kwargs signatures are aligned across all three. target_verify passes
++        # extended args and bypasses this method, so it is unaffected.
++        return _gdn_decode_update(
+             A_log=A_log,
+             dt_bias=dt_bias,
+             q=q,
+diff --git a/python/sglang/srt/layers/exp_race_fused_triton.py b/python/sglang/srt/layers/exp_race_fused_triton.py
+new file mode 100644
+index 0000000000..f6ee69e480
+--- /dev/null
++++ b/python/sglang/srt/layers/exp_race_fused_triton.py
+@@ -0,0 +1,239 @@
++# Fused exponential-race sampling consumption for Ascend NPU.
++#
++# Replaces the main-stream consumption chain
++#   u.neg_().add_(1.0); torch.minimum(u, bound, out=u); u.log_().neg_()
++#   sampled = torch.div(probs, u).argmax(dim=-1)
++# with fused Triton kernels that read probs and u once and write one int32
++# index per row.
++#
++# Math is identical to the unfused chain (stock aten::exponential_ NPU
++# composite semantics):
++#   x = min(1 - u, 1 - eps/2);  q = -log(x);  out = argmax_rows(probs / q)
++# Tie-breaking matches torch.argmax: first occurrence wins, within a tile
++# (lowest lane holding the tile max) and across tiles (partials carry the
++# global index; the reducer takes the lowest index among value ties).
++#
++# Two-kernel "partials" structure: kernel 1 writes one (max, arg) slot per
++# tile with NO loop-carried state, kernel 2 reduces the <=64 partials in one
++# tile. Kernel 1 uses only compiler-verified idioms on triton-ascend:
++#   - loop form `for v0 in tl.range(0, V, BLOCK_V)`, loop variable IS the
++#     offset;
++#   - `lane = tl.arange(0, BLOCK_V)` is the only index vector used as a VALUE
++#     (never an arithmetically-derived offs);
++#   - global index assembled from scalars only: `v0 + tile_lane`,
++#     `v0 // BLOCK_V`.
++#
++# Fail-closed: if triton is unavailable the module still imports and
++# exp_race_argmax_available() returns False; the sampler keeps the unfused
++# chain.
++
++import torch
++
++try:
++    import triton
++    import triton.language as tl
++
++    _HAS_TRITON = True
++except Exception:  # pragma: no cover - depends on server env
++    _HAS_TRITON = False
++
++# BLOCK_V=4096 keeps the tile buffers within the per-AIV-core UB budget on
++# 910C; 8192 overflows UB at compile time. If a future triton-ascend version
++# still overflows, drop to 2048.
++_BLOCK_V = 4096
++
++# Partials reducer tile width: 64 covers any V <= 262144 with one tile.
++_BLOCK_NT = 64
++
++if _HAS_TRITON:
++
++    @triton.jit
++    def _exp_race_partial_kernel(
++        probs_ptr,
++        u_ptr,
++        pval_ptr,
++        parg_ptr,
++        V,
++        NT,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        pbase = row * NT
++        lane = tl.arange(0, BLOCK_V)
++
++        # No loop-carried state: every iteration writes only its own slot.
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + lane
++            mask = offs < V
++            # x = min(1 - u, 1 - eps/2): exact in fp32 (1-u is exact on the
++            # uniform grid, min is exact). q = -log(x) stays finite and
++            # strictly positive, so masked lanes pinned at -inf can never win.
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            p = tl.load(probs_ptr + base + offs, mask=mask, other=0.0)
++            s = p / q
++            s = tl.where(mask, s, float("-inf"))
++
++            tile_max = tl.max(s, axis=0)
++            # First-occurrence tie-break inside the tile: lowest LANE holding
++            # the tile max (pure arange as the only index value; global index
++            # reassembled from scalars below). Avoids tl.argmax whose tie
++            # semantics on triton-ascend are unverified.
++            cand = tl.where(s == tile_max, lane, BLOCK_V)
++            tile_lane = tl.min(cand, axis=0)
++            tile_arg = v0 + tile_lane
++
++            slot = v0 // BLOCK_V
++            tl.store(pval_ptr + pbase + slot, tile_max)
++            tl.store(parg_ptr + pbase + slot, tile_arg)
++
++    @triton.jit
++    def _exp_race_partial_argmax_kernel(
++        probs_ptr,
++        u_ptr,
++        pval_ptr,
++        parg_ptr,
++        V,
++        NT,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        # Diagnostic arm: identical to _exp_race_partial_kernel but takes the
++        # per-tile lane via tl.argmax (tie behavior unverified).
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        pbase = row * NT
++        lane = tl.arange(0, BLOCK_V)
++
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + lane
++            mask = offs < V
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            p = tl.load(probs_ptr + base + offs, mask=mask, other=0.0)
++            s = p / q
++            s = tl.where(mask, s, float("-inf"))
++
++            tile_max = tl.max(s, axis=0)
++            tile_lane = tl.argmax(s, axis=0)
++            tile_arg = v0 + tile_lane
++
++            slot = v0 // BLOCK_V
++            tl.store(pval_ptr + pbase + slot, tile_max)
++            tl.store(parg_ptr + pbase + slot, tile_arg)
++
++    @triton.jit
++    def _exp_race_reduce_kernel(
++        pval_ptr,
++        parg_ptr,
++        out_ptr,
++        NT,
++        BLOCK_NT: tl.constexpr,
++    ):
++        row = tl.program_id(0).to(tl.int64)
++        pbase = row * NT
++
++        offs = tl.arange(0, BLOCK_NT)
++        mask = offs < NT
++        vals = tl.load(pval_ptr + pbase + offs, mask=mask, other=float("-inf"))
++        args = tl.load(parg_ptr + pbase + offs, mask=mask, other=2147483647)
++
++        total = tl.max(vals, axis=0)
++        # First occurrence across tiles: lowest global index among value ties
++        # (partials store global indices, so min over matches == torch.argmax).
++        cand = tl.where(vals == total, args, 2147483647)
++        best = tl.min(cand, axis=0)
++
++        tl.store(out_ptr + row, best)
++
++    @triton.jit
++    def _exp_race_q_kernel(
++        u_ptr,
++        q_ptr,
++        V,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        # Validation twin (UT only): materializes q = -log(min(1-u, bound))
++        # elementwise so the UT can diff it against the unfused torch chain.
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + tl.arange(0, BLOCK_V)
++            mask = offs < V
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            tl.store(q_ptr + base + offs, q, mask=mask)
++
++
++def exp_race_argmax_available() -> bool:
++    return _HAS_TRITON
++
++
++def _bound_for(dtype: torch.dtype) -> float:
++    # Same bound as sampler._async_exp_min_bound: 1 - finfo(dtype).eps / 2
++    # (fp32 -> 1 - 2^-24, exactly representable; passed as an fp32 kernel arg).
++    return 1.0 - torch.finfo(dtype).eps / 2.0
++
++
++def _check_inputs(probs: torch.Tensor, u: torch.Tensor):
++    assert probs.dtype == torch.float32 and u.dtype == torch.float32
++    assert probs.shape == u.shape and probs.dim() == 2
++
++
++def _run_partials(partial_kernel, probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    B, V = probs.shape
++    NT = (V + _BLOCK_V - 1) // _BLOCK_V
++    assert NT <= _BLOCK_NT, "vocab too large for the partials reducer tile"
++    device = probs.device
++    pval = torch.empty((B, NT), dtype=torch.float32, device=device)
++    parg = torch.empty((B, NT), dtype=torch.int32, device=device)
++    bound = _bound_for(probs.dtype)
++    partial_kernel[(B,)](
++        probs, u, pval, parg, V, NT, bound, BLOCK_V=_BLOCK_V, num_warps=4
++    )
++    out = torch.empty(B, dtype=torch.int32, device=device)
++    _exp_race_reduce_kernel[(B,)](
++        pval, parg, out, NT, BLOCK_NT=_BLOCK_NT, num_warps=4
++    )
++    return out
++
++
++def exp_race_argmax(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    """Fused consumption: row argmax of probs / q(u), int32 [B].
++
++    Two-kernel partials path (production, exact first-occurrence tie-break).
++    Non-destructive: neither probs nor u is modified.
++    """
++    _check_inputs(probs, u)
++    probs = probs.contiguous()
++    u = u.contiguous()
++    return _run_partials(_exp_race_partial_kernel, probs, u)
++
++
++def exp_race_argmax_argmaxarm(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    """Diagnostic arm (UT only): per-tile lane via tl.argmax."""
++    _check_inputs(probs, u)
++    probs = probs.contiguous()
++    u = u.contiguous()
++    return _run_partials(_exp_race_partial_argmax_kernel, probs, u)
++
++
++def exp_race_q_values(u: torch.Tensor) -> torch.Tensor:
++    """Validation twin: materialize q for the ULP/bitwise diff (UT only)."""
++    assert u.dtype == torch.float32 and u.dim() == 2
++    u = u.contiguous()
++    B, V = u.shape
++    q = torch.empty_like(u)
++    _exp_race_q_kernel[(B,)](
++        u, q, V, _bound_for(u.dtype), BLOCK_V=_BLOCK_V, num_warps=4
++    )
++    return q
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 23c46113a1..492931c979 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -142,6 +142,13 @@ if _is_npu:
+     import torch_npu
+     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+ 
++    # full_attention A3a：行并行 add_gemma_rms_norm（grid=(batch,)），与 stock
++    # 逐位一致；调用点带形状守卫，未命中自动回退 stock
++    from sglang.srt.hardware_backend.npu.attention.full_attention_fusion_npu import (
++        fa_add_gemma_rms_norm_v2,
++        fa_add_gemma_rms_norm_v2_supported,
++    )
++
+ 
+ def _forward_with_allreduce_fusion(
+     norm_module,
+@@ -818,9 +825,17 @@ class GemmaRMSNorm(MultiPlatformOp):
+         if residual is not None:
+             if post_residual_addition is not None:
+                 residual = residual + post_residual_addition
+-            norm_out, residual = add_gemma_rms_norm(
+-                x, self.weight, residual, self.variance_epsilon
+-            )
++            # full_attention A3a：行并行版（grid=(batch,)），数学与 stock 完全
++            # 一致（fp32 中间、gemma w+1）；hidden 非 2 的幂/非 bf16/非连续时
++            # 回退 stock
++            if fa_add_gemma_rms_norm_v2_supported(x, residual):
++                norm_out, residual = fa_add_gemma_rms_norm_v2(
++                    x, self.weight, residual, self.variance_epsilon
++                )
++            else:
++                norm_out, residual = add_gemma_rms_norm(
++                    x, self.weight, residual, self.variance_epsilon
++                )
+             return norm_out, residual
+ 
+         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index 33a51a89da..9f0bc41b78 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -487,6 +487,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+         topk_output: TopKOutput,
+     ):
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
++        # Restore the deepep path's fp32 contract for topk_weights when
++        # front_fusion emits bf16 directly (no-op when the output is fp32).
++        topk_weights = topk_weights.to(torch.float32)
+         topk_ids = topk_ids.to(torch.int64)
+         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+             # TODO hard code 128 block quant,use fp8 communication
+@@ -652,6 +655,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+     ):
+         buffer = self._get_buffer()
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
++        # Restore the deepep path's fp32 contract for topk_weights when
++        # front_fusion emits bf16 directly (no-op when the output is fp32).
++        topk_weights = topk_weights.to(torch.float32)
+         topk_ids = topk_ids.to(torch.int64)
+         expected_m = (
+             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 1ade4ed9e4..0161bd398a 100644
+index 82a3d77f05..f42e166ce7 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
-@@ -314,12 +314,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+@@ -55,6 +55,13 @@ _is_hip = is_hip()
+ _is_cpu = is_cpu()
+ _is_npu = is_npu()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
++# MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
++# v2.2 自写 init_routing（0 容差逐位验收），仅作用于 BF16 无量化路径。
++_moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
++# GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton
++# persistent kernel（默认 stock，开启：SGLANG_GMM2_TRITON=1）。仅作用于
++# BF16 无量化无 bias 路径。
++_gmm2_triton = envs.SGLANG_GMM2_TRITON.get()
+ 
+ if _use_aiter:
+     from aiter.ops.shuffle import shuffle_weight
+@@ -402,10 +409,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+             layer.w2_weight.data = layer.w2_weight.data.reshape(
                  layer.num_local_experts, *new_shape_w2
              )
- 
 -        if _is_npu:
 -            for weight_name in ["w13_weight", "w2_weight"]:
 -                weight = getattr(layer, weight_name)
--                weight.data = weight.data.transpose(1, 2)
--                weight.data = npu_format_cast(weight.data)
--
+-                weight.data = npu_format_cast(weight)
++        if _is_npu and _gmm2_triton:
++            # Triton GMM2 kernel 以裸指针按 [E, N, K] ND 连续存储读取 w2，
++            # 必须保证 ND 连续：FRACTAL_NZ 分形重排会让裸指针读取出错
++            # （本分支 unquant NPU 路径本身不做 format cast，此处仅兜底）。
++            layer.w2_weight.data = layer.w2_weight.data.contiguous()
++        # if _is_npu:
++        #     for weight_name in ["w13_weight", "w2_weight"]:
++        #         weight = getattr(layer, weight_name)
++        #         weight.data = npu_format_cast(weight)
+ 
          return
  
-     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
-@@ -646,7 +640,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
-         # gmm1: gate_up_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w13_weight],
-+            weight=[layer.w13_weight.transpose(1, 2)],
-             bias=w13_bias,
-             split_item=2,
-             group_list_type=1,
-@@ -670,7 +664,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+@@ -739,19 +751,40 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+         num_experts = layer.num_experts
+         top_k = layer.top_k or topk_ids.shape[1]  # in case layer.top_k is not set
+ 
+-        hidden_states, expanded_row_idx, expert_tokens, _ = (
+-            torch.ops.npu.npu_moe_init_routing_v2(
+-                x,
+-                topk_ids,
+-                active_num=num_tokens * top_k,
+-                expert_num=num_experts,
+-                expert_tokens_num_type=1,
+-                expert_tokens_num_flag=True,
+-                active_expert_range=[0, num_experts],
+-                quant_mode=-1,
++        m = num_tokens * top_k
++        h = x.shape[1]
++        expert_offsets = None
++        if (
++            _moe_front_fusion
++            and m <= 512
++            and m % 8 == 0
++            and (h & (h - 1)) == 0
++            and x.dtype == torch.bfloat16
++        ):
++            # v2.2 自写 init routing（moe_front_fusion/v1，合入自 daikang 分支，
++            # 六轮单测 0 容差逐位验收）：语义与 npu_moe_init_routing_v2(type=1)
++            # 逐位一致，并原生输出 exclusive offsets（int32 [E]）供 persistent
++            # GMM2 offsets= 直用。形态门外回退 stock v2。
++            from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
++
++            hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
++                moe_init_routing_v22(x, topk_ids, num_experts, top_k)
+             )
+-        )
+-        expert_tokens = expert_tokens.to(torch.int64)
++            expert_offsets = excl
++        else:
++            hidden_states, expanded_row_idx, expert_tokens, _ = (
++                torch.ops.npu.npu_moe_init_routing_v2(
++                    x,
++                    topk_ids,
++                    active_num=m,
++                    expert_num=num_experts,
++                    expert_tokens_num_type=1,
++                    expert_tokens_num_flag=True,
++                    active_expert_range=[0, num_experts],
++                    quant_mode=-1,
++                )
++            )
++            expert_tokens = expert_tokens.to(torch.int64)
+         w13_bias = [layer.w13_weight_bias] if self.with_bias else None
+         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
+ 
+@@ -792,16 +825,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+             hidden_states = GeluAndMul()(hidden_states)
+ 
          # gmm2: down_proj
-         hidden_states = torch.ops.npu.npu_grouped_matmul(
-             x=[hidden_states],
--            weight=[layer.w2_weight],
-+            weight=[layer.w2_weight.transpose(1, 2)],
-             bias=w2_bias,
-             split_item=2,
-             group_list_type=1,
+-        hidden_states = torch.ops.npu.npu_grouped_matmul(
+-            x=[hidden_states],
+-            weight=[layer.w2_weight.transpose(1, 2)],
+-            bias=w2_bias,
+-            split_item=2,
+-            group_list_type=1,
+-            group_type=0,
+-            group_list=expert_tokens,
+-            output_dtype=original_dtype,
+-        )[0]
++        if _gmm2_triton and w2_bias is None:
++            # Triton persistent GMM2（gmm/v1，合入自 daikang 分支）：w2 为
++            # [E, N, K] ND 连续存储（跳过 FRACTAL_NZ cast），expert_tokens 为
++            # per-expert counts（group_list_type=1，int64）。offsets 缺省时由
++            # 内置前置 kernel 推导；SGLANG_MOE_FRONT_FUSION=1 时 v2.2 init
++            # 原生 excl 直喂，省 _gmm2_offsets_kernel ~4.4µs/层。
++            from sgl_kernel_npu.moe.persistent_gmm import persistent_grouped_matmul
++
++            hidden_states = persistent_grouped_matmul(
++                hidden_states,
++                layer.w2_weight,
++                expert_tokens,
++                offsets=expert_offsets,
++            )
++        else:
++            hidden_states = torch.ops.npu.npu_grouped_matmul(
++                x=[hidden_states],
++                weight=[layer.w2_weight.transpose(1, 2)],
++                bias=w2_bias,
++                split_item=2,
++                group_list_type=1,
++                group_type=0,
++                group_list=expert_tokens,
++                output_dtype=original_dtype,
++            )[0]
+ 
+         final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+             hidden_states,
+diff --git a/python/sglang/srt/layers/radix_linear_attention.py b/python/sglang/srt/layers/radix_linear_attention.py
+index 6696945d2c..7854f7a5f3 100644
+--- a/python/sglang/srt/layers/radix_linear_attention.py
++++ b/python/sglang/srt/layers/radix_linear_attention.py
+@@ -35,6 +35,27 @@ if TYPE_CHECKING:
+     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
++def wrap_conv1d_weight_loader(attn: RadixLinearAttention, base_loader):
++    """Wrap conv1d.weight's loader so every (re)load also refreshes the
++    transposed copy cached on the RadixLinearAttention wrapper.
++
++    mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++    ``Tensor.data`` carries a version counter independent of the Parameter's,
++    so ``_version``-based invalidation cannot observe online weight updates
++    (e.g. RL Actor->SGLang sync via ``update_weights_from_tensor``). The
++    refresh is explicit and in place so captured graphs keep referencing the
++    same storage.
++    """
++
++    def loader(param, loaded_weight):
++        base_loader(param, loaded_weight)
++        cached = getattr(attn, "_conv_weights_t", None)
++        if cached is not None:
++            cached.copy_(attn.conv_weights.transpose(0, 1))
++
++    return loader
++
++
+ class RadixLinearAttention(nn.Module):
+     """
+     The Linear Attention Layer Implementation.
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index e83e4157fa..1a9f98f12c 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -58,6 +58,25 @@ _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAM
+ if is_npu():
+     import torch_npu
+ 
++
++def _is_ascend_910c() -> bool:
++    """Return whether the current NPU is an Ascend 910C-series chip.
++
++    torch.npu.get_device_name() reports names like "Ascend910_9382" on 910C.
++    The async exponential-race path relies on uniform_() decomposing to
++    DSARandomUniform on the DSA_SQE core, which only exists on the 910C
++    series; other NPUs route uniform_() to AIV/AICore RNG kernels that would
++    contend with the model forward. Fail closed on any query error so
++    sampling stays on the stock torch.multinomial path.
++    """
++    if not is_npu():
++        return False
++    try:
++        return torch.npu.get_device_name().startswith("Ascend910_93")
++    except Exception:
++        return False
++
++
+ logger = logging.getLogger(__name__)
+ 
+ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+@@ -81,6 +100,253 @@ class Sampler(nn.Module):
+         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
+         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
+         self.use_ascend_backend = get_flags().sampling_backend == "ascend"
++        # Generate uniform noise on a side stream while the model is running, and
++        # apply the exponential-race transform at consumption time on the main
++        # stream, exactly matching stock aten::exponential_ semantics (NPU
++        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
++        # uniform_() decomposes to DSARandomUniform plus an async
++        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
++        # the side stream cannot contend with the model's vector-core kernels
++        # even when it overlaps the next forward (v1 ran the full exponential_()
++        # chain here and its AIV tail contended with forward).
++        # This is opt-in because it changes the random-number sequence, although it
++        # preserves the categorical sampling distribution. The gate is
++        # additionally restricted to the Ascend 910C series: the side stream is
++        # AIV-free only if uniform_() runs on the DSA_SQE core (910C-only).
++        # On any other device the flag stays off and every batch falls back to
++        # the stock torch.multinomial path.
++        async_exponential_requested = is_npu() and get_bool_env_var(
++            "SGLANG_NPU_ASYNC_EXPONENTIAL"
++        )
++        self.enable_async_exponential = (
++            async_exponential_requested and _is_ascend_910c()
++        )
++        if async_exponential_requested and not self.enable_async_exponential:
++            logger.warning(
++                "SGLANG_NPU_ASYNC_EXPONENTIAL is set but the current device is "
++                "not an Ascend 910C series NPU; async exponential-race sampling "
++                "is disabled, falling back to torch.multinomial"
++            )
++        self._async_exponential_stream = None
++        self._async_exponential_event = None
++        self._async_exponential_u = None
++        self._async_exponential_pending = False
++        self._async_exp_min_bound = None
++
++        # Optional fused Triton consumption kernel, replacing the multi-pass
++        # stock-exponential transform + RealDiv + ArgMaxV2 chain with one
++        # kernel that reads probs and u once. Same math, same torch.argmax
++        # first-occurrence tie-breaking. Fail-closed: any import/compile/smoke
++        # failure keeps the unfused chain.
++        self._exp_race_fused = None
++        if self.enable_async_exponential and get_bool_env_var(
++            "SGLANG_NPU_EXP_RACE_TRITON", "true"
++        ):
++            self._exp_race_fused = self._init_exp_race_fused()
++
++    @staticmethod
++    def _init_exp_race_fused():
++        """Resolve the fused kernel and smoke-test it against the unfused chain.
++
++        The smoke shape (4, 10000) deliberately exceeds BLOCK_V=4096 so the
++        masked tail path is exercised, and plants boundary u values (0 and
++        1-2^-24, the exact cap grid points) plus an exact score tie to check
++        first-occurrence tie-breaking. Any exception or mismatch disables the
++        fused path (fail-closed).
++        """
++        try:
++            from sglang.srt.layers.exp_race_fused_triton import exp_race_argmax
++
++            device = torch.device("npu")
++            u = torch.rand((4, 10000), dtype=torch.float32, device=device)
++            u[0, 0] = 0.0
++            u[1, 0] = 1.0 - 2.0**-24
++            probs = torch.rand((4, 10000), dtype=torch.float32, device=device)
++            probs = probs / probs.sum(dim=-1, keepdim=True)
++            # Exact score tie at the maximal score: identical (p, u) pair at
++            # two columns with u=0; the lower index must win, matching
++            # torch.argmax.
++            u[:, 50] = 0.0
++            u[:, 60] = 0.0
++            probs[:, 50] = 0.5
++            probs[:, 60] = 0.5
++            fused = exp_race_argmax(probs, u)
++            q = u.neg_().add_(1.0)
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(torch.float32).eps / 2.0,
++                dtype=torch.float32,
++                device=device,
++            )
++            torch.minimum(q, bound, out=q)
++            q.log_().neg_()
++            reference = torch.div(probs, q).argmax(dim=-1).view(-1).to(torch.int32)
++            if not torch.equal(fused, reference):
++                raise RuntimeError(
++                    f"fused exp-race smoke test mismatch: {fused} vs {reference}"
++                )
++            logger.info(
++                "Enabled fused Triton exp-race consumption kernel "
++                "(SGLANG_NPU_EXP_RACE_TRITON)"
++            )
++            return exp_race_argmax
++        except Exception as e:
++            logger.warning(
++                "Fused Triton exp-race kernel unavailable (%s); falling back "
++                "to the unfused stock-exponential chain",
++                e,
++            )
++            return None
++
++    def can_prepare_async_exponential(
++        self, sampling_info: SamplingBatchInfo
++    ) -> bool:
++        """Return whether this batch can use precomputed uniform noise."""
++        return (
++            self.enable_async_exponential
++            and not sampling_info.is_all_greedy
++            and sampling_info.sampling_seed is None
++            and not sampling_info.need_top_p_sampling
++            and not sampling_info.need_top_k_sampling
++            and not sampling_info.need_min_p_sampling
++        )
++
++    @torch.no_grad()
++    def prepare_async_exponential(
++        self,
++        batch_size: int,
++        vocab_size: int,
++        sampling_info: SamplingBatchInfo,
++        device: torch.device,
++    ) -> bool:
++        """Enqueue U(0,1) noise before model forward on a dedicated NPU stream.
++
++        Reusing the buffer is safe because the side stream first waits for all
++        previously enqueued work on the current stream. The sampling path later
++        inserts a device-side event wait; it never synchronizes the CPU.
++        """
++        if not self.can_prepare_async_exponential(sampling_info):
++            return False
++
++        # A delayed sampler may still own the previous buffer. Do not overwrite it.
++        if self._async_exponential_pending:
++            logger.warning(
++                "Skip async exponential preparation because the previous batch "
++                "has not consumed its random buffer"
++            )
++            return False
++
++        if self._async_exponential_stream is None:
++            self._async_exponential_stream = torch.npu.Stream()
++            self._async_exponential_event = torch.npu.Event()
++            logger.info(
++                "Enabled asynchronous NPU exponential-race sampling "
++                "(uniform noise on side stream, stock-exponential argmax consumption)"
++            )
++
++        current_stream = torch.npu.current_stream()
++        self._async_exponential_stream.wait_stream(current_stream)
++
++        expected_shape = (batch_size, vocab_size)
++        with torch.npu.stream(self._async_exponential_stream):
++            u = self._async_exponential_u
++            if (
++                u is None
++                or tuple(u.shape) != expected_shape
++                or u.dtype != torch.float32
++                or u.device.type != torch.device(device).type
++            ):
++                # SGLang converts next-token logits to FP32 before sampling; the
++                # noise grid must match CANN's fp32 uniform to preserve the
++                # incumbent sampling distribution.
++                u = torch.empty(
++                    expected_shape,
++                    dtype=torch.float32,
++                    device=device,
++                )
++                self._async_exponential_u = u
++            u.uniform_()
++            self._async_exponential_event.record()
++
++        self._async_exponential_pending = True
++        return True
++
++    def _sample_with_async_exponential(
++        self, probs: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        """Consume precomputed U(0,1) noise using the exponential-race identity.
++
++        The full stock exponential_ transform (complement + clamp + -log) runs
++        here on the main stream (serial work that the sampling path owns
++        anyway), keeping the side stream free of AIV kernels so it cannot
++        slow down the model forward.
++        """
++        if not self._async_exponential_pending:
++            return None
++
++        u = self._async_exponential_u
++        self._async_exponential_pending = False
++        if (
++            u is None
++            or u.shape != probs.shape
++            or u.dtype != probs.dtype
++            or u.device != probs.device
++        ):
++            logger.warning(
++                "Async uniform buffer does not match probs; falling back to "
++                "torch.multinomial (u=%s/%s/%s, probs=%s/%s/%s)",
++                None if u is None else tuple(u.shape),
++                None if u is None else u.dtype,
++                None if u is None else u.device,
++                tuple(probs.shape),
++                probs.dtype,
++                probs.device,
++            )
++            return None
++
++        current_stream = torch.npu.current_stream()
++        current_stream.wait_event(self._async_exponential_event)
++        u.record_stream(current_stream)
++
++        # Do not modify probs in place: the standard backend reuses it for logprobs.
++        # argmax over probs / q with q ~ Exp(1): v1's production consumption
++        # form, kept because the stock argmax kernel is healthy while argmin at
++        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
++        # q is produced by transforming u in place with the exact stock
++        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
++        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
++        # The guard is a single torch.minimum against a cached 0-dim bound
++        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
++        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
++        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
++        # the legacy-family ClipByValueV2 op with two scalar->device uploads
++        # per call, which costs more than the unary-template kernels used by
++        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
++        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
++        # mapped it to +inf/+0.0 instead). For fp32 q stays within
++        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
++        # inf/NaN edge.
++        # All transform ops run here on the main stream; the side stream stays
++        # pure DSA uniform with zero AIV kernels.
++        if self._exp_race_fused is not None:
++            # Same math as the chain below in one Triton kernel (single pass
++            # over probs and u). Non-destructive on u; returns int32 [B].
++            return self._exp_race_fused(probs, u)
++
++        bound = self._async_exp_min_bound
++        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(u.dtype).eps / 2.0,
++                dtype=u.dtype,
++                device=u.device,
++            )
++            self._async_exp_min_bound = bound
++        u.neg_().add_(1.0)
++        torch.minimum(u, bound, out=u)
++        u.log_().neg_()
++        sampled_index = torch.div(probs, u).argmax(dim=-1)
++        return sampled_index.view(-1).to(torch.int32)
+ 
+     def _preprocess_logits(
+         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+@@ -115,6 +381,9 @@ class Sampler(nn.Module):
+                 to get the unique seed for each position.
+         """
+         logits = logits_output.next_token_logits
++        # In the plain probability path, keep the softmax output and apply log
++        # only to the values requested by the caller.
++        logprobs_are_probs = False
+ 
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
+@@ -178,11 +447,20 @@ class Sampler(nn.Module):
+                     logprobs = logprobs_via_logsoftmax_kernel
+             else:
+                 # Standard path: do softmax and sample from probs.
+-                logits.div_(sampling_info.temperatures)
+-
+-                # In-place op to save memory
+-                logits[:] = torch.softmax(logits, dim=-1)
+-                probs = logits
++                # All temperature == 1.0 makes div_ an IEEE bitwise identity
++                # (x/1.0 == x), so skip the RealDiv. The flag is maintained
++                # host-side by SamplingBatchInfo; older versions without the
++                # field default to False (no skip) via getattr.
++                if not getattr(sampling_info, "temperatures_all_one", False):
++                    logits.div_(sampling_info.temperatures)
++
++                # Do not write the softmax output back into logits: the
++                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
++                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
++                # read again on this path and is overwritten by the next
++                # forward anyway. Trade-off: one extra live [batch, vocab]
++                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
++                probs = torch.softmax(logits, dim=-1)
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+@@ -191,8 +469,9 @@ class Sampler(nn.Module):
+                     logprobs = (
+                         logprobs_via_logsoftmax_kernel
+                         if logprobs_via_logsoftmax_kernel is not None
+-                        else torch.log(probs)
++                        else probs
+                     )
++                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
+                 del probs
+ 
+         # Attach logprobs to logits_output (in-place modification)
+@@ -206,6 +485,7 @@ class Sampler(nn.Module):
+                 token_ids_logprobs,
+                 sampling_info,
+                 batch_next_token_ids,
++                logprobs_are_probs,
+             )
+ 
+         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+@@ -225,11 +505,13 @@ class Sampler(nn.Module):
+         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
+         """
+         if simple_sampling_case:
+-            batch_next_token_ids = sampling_from_probs_torch(
+-                probs,
+-                sampling_seed=sampling_info.sampling_seed,
+-                positions=positions,
+-            )
++            batch_next_token_ids = self._sample_with_async_exponential(probs)
++            if batch_next_token_ids is None:
++                batch_next_token_ids = sampling_from_probs_torch(
++                    probs,
++                    sampling_seed=sampling_info.sampling_seed,
++                    positions=positions,
++                )
+         else:
+             backend = get_flags().sampling_backend
+             if backend == "flashinfer":
+@@ -302,7 +584,11 @@ class Sampler(nn.Module):
+                     probabilities, sampling_info.sampling_seed, positions
+                 ).view(-1)
+             else:
+-                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
++                batch_next_token_ids = self._sample_with_async_exponential(probs)
++                if batch_next_token_ids is None:
++                    batch_next_token_ids = torch.multinomial(
++                        probs, num_samples=1
++                    ).view(-1)
+             return batch_next_token_ids.to(torch.int32)
+         else:
+             assert (
+@@ -353,16 +639,31 @@ class Sampler(nn.Module):
+         token_ids_logprobs: List[List[int]],
+         sampling_info: SamplingBatchInfo,
+         batch_next_token_ids: torch.Tensor,
++        logprobs_are_probs: bool,
+     ):
+-        # clamp to avoid -inf values
+-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++        # Clamp the extracted values instead of the full [batch, vocab]
++        # matrix. clamp(min=const) is elementwise and monotone
++        # non-decreasing, so it commutes with topk/gather: clamping the
++        # small outputs gives identical results (-inf -> finfo.min) while
++        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
++        clamp_min = torch.finfo(logprobs.dtype).min
+ 
+         # Attach logprobs to logits_output (in-place modification)
+         if any(x > 0 for x in top_logprobs_nums):
+-            (
+-                logits_output.next_token_top_logprobs_val,
+-                logits_output.next_token_top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
++            # Same extraction as get_top_logprobs, but clamp the
++            # [batch, max_k] topk result in a single kernel before
++            # slicing per request. Runs topk exactly once.
++            max_k = max(top_logprobs_nums)
++            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
++            if logprobs_are_probs:
++                top_vals.log_()
++            top_vals.clamp_(min=clamp_min)
++            logits_output.next_token_top_logprobs_val = [
++                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
++            logits_output.next_token_top_logprobs_idx = [
++                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
+ 
+         if any(x is not None for x in token_ids_logprobs):
+             (
+@@ -372,10 +673,19 @@ class Sampler(nn.Module):
+                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
+             )
+ 
+-        logits_output.next_token_logprobs = logprobs[
+-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+-            batch_next_token_ids,
+-        ]
++            for row in logits_output.next_token_token_ids_logprobs_val:
++                if torch.is_tensor(row):
++                    if logprobs_are_probs:
++                        row.log_()
++                    row.clamp_(min=clamp_min)
++
++        # Gather one value per row directly; this removes the temporary arange
++        # and the 2-D advanced-index operation from the hot path.
++        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
++        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
++        if logprobs_are_probs:
++            next_token_logprobs.log_()
++        logits_output.next_token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
+ 
+     def _sync_token_ids_across_tp(
+         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index bfdd72bd54..5f3840e359 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3740,7 +3740,7 @@ class Scheduler(
+                 self.draft_worker.clear_cache_pool()
+ 
+             if empty_cache:
+-                current_platform.empty_cache()
++                torch.npu.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+             # state-synchronous, but DP groups may diverge.
+             if self.metrics_reporter.is_stats_logging_rank:
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 3db49daf82..fdc5f40d81 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -486,6 +486,35 @@ class TpModelWorker(BaseTpWorker):
+             can_run_cuda_graph=can_run_cuda_graph,
+         )
+ 
++    def _prepare_async_exponential(
++        self,
++        forward_batch: ForwardBatch,
++        is_verify: bool,
++    ) -> None:
++        """Start simple-sampling RNG before forward so it can overlap on NPU."""
++        if (
++            is_verify
++            or self.enable_spec
++            or forward_batch.is_prefill_only
++            or not forward_batch.forward_mode.is_decode()
++            or forward_batch.sampling_info is None
++            or forward_batch.sampling_info.grammars is not None
++        ):
++            return
++
++        sampler = self.model_runner.sampler
++        prepare = getattr(sampler, "prepare_async_exponential", None)
++        if prepare is None:
++            return
++
++        prepare(
++            batch_size=forward_batch.batch_size,
++            vocab_size=self.model_runner.model_config.vocab_size,
++            sampling_info=forward_batch.sampling_info,
++            device=forward_batch.input_ids.device,
++        )
++
++
+     def forward_batch_generation(
+         self,
+         batch: Optional[ScheduleBatch],
+@@ -511,6 +540,7 @@ class TpModelWorker(BaseTpWorker):
+             return self._forward_batch_generation_dllm(forward_batch)
+ 
+         if self.pp_group.is_last_rank:
++            self._prepare_async_exponential(forward_batch, is_verify)
+             out = self.model_runner.forward(
+                 forward_batch,
+                 pp_proxy_tensors=pp_proxy_tensors,
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 368781d8d5..0856caae48 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -1089,6 +1089,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         if self.disable or len(key) == 0:
+             return None
+ 
++        key = key.page_aligned(self.page_size)
++        if len(key) == 0:
++            return None
++
+         return key
+ 
+     def _match_post_processor(
+@@ -1158,6 +1162,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         )
+ 
+     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
++        assert (
++            0 < split_len < len(child.key)
++        ), f"split_len must create non-empty nodes, {split_len=}, {len(child.key)=}"
+         # new_node -> child
+         new_node = TreeNode()
+         new_node.children = {key[split_len:].child_key(self.page_size): child}
+@@ -1166,6 +1173,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+         new_node.full_lock_ref = child.full_lock_ref
+         new_node.mamba_lock_ref = 0
+         new_node.key = child.key[:split_len]
++        assert len(new_node.key) > 0, f"new_node.key should not be empty"
+         new_node.value = child.value[:split_len].clone()
+ 
+         # child time should be later than parent's time for mamba tombstone
+@@ -1176,6 +1184,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
+             self.mamba_lru_list.remove_node(child)
+         child.parent = new_node
+         child.key = child.key[split_len:]
++        assert len(child.key) > 0, f"child.key should not be empty"
+         child.value = child.value[split_len:].clone()
+         new_node.parent.children[key.child_key(self.page_size)] = new_node
+         new_node.hash_value, child.hash_value = split_node_hash_value(
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 031ab4fe87..93e14ff483 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -49,7 +49,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+     ForwardBatchDeepSeekMHAMixin,
+ )
+ from sglang.srt.model_executor.triton_ops.position import compute_position_triton
+-from sglang.srt.runtime_context import get_parallel
++from sglang.srt.runtime_context import get_parallel, get_server_args
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     is_cuda,
+@@ -1053,11 +1053,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         return mrope_positions
+ 
+     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
++        mm_inputs = batch.multimodal_inputs
++        rl_on_policy_target = get_server_args().rl_on_policy_target
++
++        if (
++            self.spec_info is None
++            and batch.dllm_config is None
++            and (
++                rl_on_policy_target is not None
++                or all(mm_input is None for mm_input in mm_inputs)
++            )
++        ):
++            # Regular text generation does not need to rebuild mRoPE on the
++            # host. init_new has already produced the same flattened token
++            # positions on model_runner.device: clamp_position() for decode,
++            # or compute_position() for extend/mixed. Text mRoPE has identical
++            # temporal/height/width coordinates, so materialize the three rows
++            # directly and avoid the per-request host factories, cat, and H2D.
++            self.mrope_positions = (
++                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
++            )
++            return
+         # batch_size * [3 * seq_len]
+         batch_size = self.seq_lens_cpu.shape[0]
+         mrope_positions_list = [[]] * batch_size
+         for batch_idx in range(batch_size):
+-            mm_input = batch.multimodal_inputs[batch_idx]
++            mm_input = mm_inputs[batch_idx]
+             if self.forward_mode.is_decode():
+                 # 3 * N
+                 if (
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index ea17a25587..22586658da 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -610,6 +610,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self._model_update_group = {}
+         self._weights_send_group = {}
+ 
++                   # profile采集
++        import os
++        import torch_npu
++        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
++            # Initialize profiler
++            import torch_npu
++            experimental_config = torch_npu.profiler._ExperimentalConfig(
++                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++            )
++            self.profiler_npu = torch_npu.profiler.profile(
++                   activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
++                   with_modules=os.environ.get('WITH_MODULES', "false") == "true",
++                   profile_memory=os.environ.get('WITH_MEMORY', "false") == "true",
++                   record_shapes=os.environ.get('WITH_SHAPE', "false") == "true",
++                   with_stack=os.environ.get('WITH_STACK', "false") == "true",
++                   experimental_config=experimental_config,
++                   # 跳过前29步，warmup一步，采集30步，重复1次。
++                   schedule=torch_npu.profiler.schedule(wait=29, warmup=0, active=10, repeat=1),
++                   on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(os.environ.get('ROLLOUT_PROFILE_PATH'), analyse_flag=False)  # 采集数据保存路径，是否在线解析
++            )
++            self.profiler_npu.start()
++
+     def _build_model_config(
+         self, server_args, model_path=None, model_revision=None, is_draft_model=False
+     ):
+@@ -3090,6 +3112,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         if self.server_args.elastic_ep_backend is not None:
+             self.maybe_recover_ep_ranks()
+ 
++        import os
++        if os.environ.get('ROLLOUT_PROFILE', "false") == "true":
++            self.profiler_npu.step()  # 驱动 schedule，对部分decode step进行采集
++
+         return output
+ 
+     def _maybe_execute_deferred_mamba_cow_and_clear(
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index d5aac381dc..c1b2966e84 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
+     moe_tensor_model_parallel_all_reduce,
+     tensor_model_parallel_all_reduce,
+ )
++from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+@@ -93,7 +94,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+ from sglang.srt.model_executor.runner import get_is_capture_mode
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+-from sglang.srt.runtime_context import get_flags, get_parallel
++from sglang.srt.runtime_context import (
++    get_flags,
++    get_parallel,
++)
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import (
+     add_prefix,
+@@ -106,14 +110,6 @@ from sglang.srt.utils import (
+     make_layers,
+     use_intel_amx_backend,
+ )
+-
+-if is_npu():
+-    from sglang.srt.hardware_backend.npu.cmo import (
+-        shared_expert_on_independent_stream,
+-        wait_share_stream,
+-    )
+-
+-from sglang.srt.environ import envs
+ from sglang.srt.utils.hf_transformers_utils import get_rope_config
+ 
+ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+@@ -446,9 +442,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             # router_logits: (num_tokens, n_experts)
+             router_logits, _ = self.gate(hidden_states)
+             if enable_dual_stream:
+-                shared_output = shared_expert_on_independent_stream(
+-                    hidden_states.clone(), self._forward_shared_experts
+-                )
++                current_stream = torch.npu.current_stream()
++                self.alt_stream.wait_stream(current_stream)
++                with torch.npu.stream(self.alt_stream):
++                    shared_output = self._forward_shared_experts(hidden_states)
++                    shared_output.record_stream(self.alt_stream)
++                    shared_event = self.alt_stream.record_event()
+             else:
+                 shared_output = self._forward_shared_experts(hidden_states)
+             topk_output = self.topk(
+@@ -469,8 +468,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             hidden_states=hidden_states,
+             topk_output=topk_output,
+         )
+-        if enable_dual_stream:
+-            wait_share_stream()
++        if hidden_states.shape[0] > 0 and enable_dual_stream:
++            torch.npu.current_stream().wait_event(shared_event)
+ 
+         if shared_output is not None:
+             final_hidden_states.add_(shared_output)
+@@ -494,6 +493,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+     ) -> torch.Tensor:
+         current_stream = torch.cuda.current_stream()
+         self.alt_stream.wait_stream(current_stream)
++        # [moe_whole_process/v1] enqueue 换序：先 alt 流长链（router+routed
++        # experts），再主流 shared expert。L0 profiling 证实原顺序下 shared 段
++        # （区域靠前部分）在 replay 时独占设备先跑、未被 routed 链掩盖；换序后
++        # 长链先起步，shared 的小 GEMM 可填 routed 前段小 kernel 的空窗。
++        # 依赖边不变（alt 仍只等 pre-MoE 主流点，汇合仍 main 等 alt），
++        # 两支对 hidden_states 均只读、clone 仍在主流——数值逐位等价。
++        with torch.cuda.stream(self.alt_stream):
++            router_output = self._forward_router_experts(hidden_states)
++
+         shared_output = (
+             self._forward_shared_experts(
+                 hidden_states.clone(), apply_gate=not use_fused_gate
+@@ -518,9 +526,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+                 staged = True
+         # ===== END TO BE REFACTORED ====
+ 
+-        with torch.cuda.stream(self.alt_stream):
+-            router_output = self._forward_router_experts(hidden_states)
+-
+         current_stream.wait_stream(self.alt_stream)
+ 
+         if staged and unstage_shared_expert_add() is None:
+@@ -991,7 +996,14 @@ class Qwen2MoeForCausalLM(nn.Module):
+         self.pp_group = get_pp_group()
+         self.config = config
+         self.quant_config = quant_config
+-        alt_stream = torch.cuda.Stream() if _is_cuda else None
++        # Mirror qwen3_5.py: on NPU, SGLANG_NPU_USE_MULTI_STREAM also needs a
++        # real stream — _forward_deepep's dual-stream branch dereferences
++        # self.alt_stream unconditionally once enabled.
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or (is_npu() and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
++            else None
++        )
+         self.model = Qwen2MoeModel(
+             config,
+             quant_config,
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+index fed78cf888..806eec9ffb 100644
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -15,6 +15,7 @@
+ """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+ 
+ import logging
++import os
+ from functools import lru_cache
+ from typing import Iterable, Optional, Set, Tuple, Union
+ 
+@@ -35,6 +36,15 @@ from sglang.srt.configs.qwen3_5 import (
+ 
+ # Distributed
+ from sglang.srt.distributed import get_pp_group
++from sglang.srt.environ import envs
++
++# MoE weight L2 prefetch (SGLANG_NPU_MOE_PREFETCH): launched after each layer's
++# prepare_attn, drained at step end; no torch_npu import at module top level, no-op when disabled.
++from sglang.srt.hardware_backend.npu.moe_weight_prefetch import (
++    moe_prefetch_emit,
++    moe_prefetch_register_model,
++    moe_prefetch_step_drain,
++)
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+ 
+@@ -64,7 +74,10 @@ from sglang.srt.layers.parameter import (
+ )
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.layers.radix_attention import RadixAttention
+-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
++from sglang.srt.layers.radix_linear_attention import (
++    RadixLinearAttention,
++    wrap_conv1d_weight_loader,
++)
+ from sglang.srt.layers.rotary_embedding import get_rope
+ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+@@ -127,6 +140,16 @@ _qknorm_use_alt_stream = _is_cuda or (
+ )
+ _is_amx_available = cpu_has_amx_support()
+ 
++# GDN_QKVZBA_PACK: pack the in_proj_qkvz / in_proj_ba weights of GDN layers along N
++# into a single [N_pack, K] block (N_pack zero-padded up to a multiple of 16 for the
++# row-stride alignment contract of downstream fused ops), replacing two GEMMs with one
++# stock linear; column-wise equivalent (pad output columns are never consumed).
++# On by default; =0 reverts. NPU + unquantized bf16/fp16 only, guarded at runtime.
++_gdn_qkvzba_pack_env = get_bool_env_var("SGLANG_NPU_GDN_QKVZBA_PACK", "true")
++# Pack only for small M: at large M the ragged-tiling penalty of the wide N
++# (not a multiple of the 256 tile) outweighs the saved ba GEMM.
++_gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"))
++
+ cached_get_processor = lru_cache(get_processor)
+ 
+ 
+@@ -153,6 +176,91 @@ if _is_npu:
+         split_qkvgate_gemma_rmsnorm_rope,
+     )
+ 
++    # NPU 启用融合 qkvzba split kernel：改用 sgl_kernel_npu 版
++    # （graph 口径比 sglang 侧 triton_gdn_fused_proj 版快，且逐 bit 等价）
++    from sgl_kernel_npu.fla.utils import (
++        fused_qkvzba_split_reshape_cat_contiguous,
++    )
++
++    # 全注意力段 decode 融合 kernel（full_attention A1b/A2）——
++    # A1b split+norm+rope+KV scatter 合一、A2 sigmoid_mul 融合；调用点带形状
++    # 守卫，未命中已验证形状自动回退 stock。
++    from sglang.srt.hardware_backend.npu.attention.full_attention_fusion_npu import (
++        fa_sigmoid_mul,
++        fa_sigmoid_mul_supported,
++        fa_split_qkvgate_scatter,
++        fa_split_qkvgate_scatter_supported,
++        fa_v4_scatter_context,
++    )
++
++    # TP AscendC fusion wiring (master switch SGLANG_NPU_TP_ASCENDC_FUSION, default
++    # off; candidates 2/3 are retired, their interfaces are permanently disabled
++    # stubs kept only for import compatibility)
++    from sglang.srt.hardware_backend.npu.tp_ascendc_fusion_npu import (
++        tp_fused_qkvzba_conv1d_shape_supported,
++        tp_norm_qkv_scatter_context,
++        tp_norm_qkv_scatter_shape_supported,
++        tp_sigmoid_mul_mm_runtime_ok,
++        tp_sigmoid_mul_mm_shape_supported,
++    )
++
++
++def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
++    """Runtime guard for GDN_QKVZBA_PACK (any failure -> fall back to two GEMMs).
++
++    Only plain unquantized 2D weights are allowed: quantized formats such as FP8
++    have scale layouts incompatible with the packed GEMM and are excluded
++    (detected via the quant_method class name).
++    """
++    wq = proj_qkvz.weight
++    wb = proj_ba.weight
++    if wq.dim() != 2 or wb.dim() != 2 or wq.shape[1] != wb.shape[1]:
++        return False
++    if wq.dtype != wb.dtype or wq.dtype not in (torch.bfloat16, torch.float16):
++        return False
++    if proj_qkvz.bias is not None or proj_ba.bias is not None:
++        return False
++    for proj in (proj_qkvz, proj_ba):
++        qm = getattr(proj, "quant_method", None)
++        if qm is not None and qm.__class__.__name__ != "UnquantizedLinearMethod":
++            return False
++    return True
++
++
++def _gdn_qkvzba_pack_materialize(proj_qkvz, proj_ba) -> torch.Tensor:
++    """Materialize the packed [N_pack, K] weight and rebind both modules'
++    weight.data to row slices of it.
++
++    N_pack = (N_qkvz+N_ba) rounded up to a multiple of 16, so the packed GEMM
++    output keeps a 16-aligned physical row stride as required by downstream fused
++    ops consuming row-stride views; pad rows are zero and pad output columns have
++    no consumer (the ba slice excludes the pad tail rows).
++
++    After rebinding, in-place narrow+copy_ writes from weight loaders / RL weight
++    sync land directly on the packed buffer; if some path replaces weight.data
++    wholesale (pointer drift), the caller's data_ptr check re-materializes on the
++    next forward.
++    """
++    wq = proj_qkvz.weight
++    wb = proj_ba.weight
++    n_qkvz = wq.shape[0]
++    n_ba = wb.shape[0]
++    n_pack = (n_qkvz + n_ba + 15) // 16 * 16
++    if n_pack == n_qkvz + n_ba:
++        packed = torch.cat([wq.detach(), wb.detach()], dim=0)
++    else:
++        packed = torch.cat(
++            [
++                wq.detach(),
++                wb.detach(),
++                wq.detach().new_zeros(n_pack - n_qkvz - n_ba, wq.shape[1]),
++            ],
++            dim=0,
++        )
++    wq.data = packed[:n_qkvz]
++    wb.data = packed[n_qkvz : n_qkvz + n_ba]
++    return packed
++
+ 
+ class Qwen3_5GatedDeltaNet(nn.Module):
+     def __init__(
+@@ -229,26 +337,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         self._bind_packed_weight_loaders(self.in_proj_qkvz)
+         self._bind_packed_weight_loaders(self.in_proj_ba)
+ 
+-        # Conv1d weight loader setup
+-        query_key_settings = (self.key_dim, 0, False)
+-        value_settings = (self.value_dim, 0, False)
+-
+-        self._override_weight_loader(
+-            self.conv1d.weight,
+-            mamba_v2_sharded_weight_loader(
+-                [
+-                    query_key_settings,
+-                    query_key_settings,
+-                    value_settings,
+-                ],
+-                self.attn_tp_size,
+-                self.attn_tp_rank,
+-            ),
+-        )
++        # GDN_QKVZBA_PACK: enable flag and lazily materialized pack cache. Packing
++        # only reorganizes compute — parameters, names, loaders and checkpoint
++        # mappings of the two modules are unchanged.
++        self._qkvzba_pack_enabled = _is_npu and _gdn_qkvzba_pack_env
++        self._packed_qkvzba_weight: Optional[torch.Tensor] = None
+ 
+         # State parameters
++        # dt_bias is materialized in fp32 like A_log: gating/recurrent kernels widen
++        # to fp32 losslessly anyway and the AscendC recurrent host requires fp32, so
++        # with fp32 at the source the wrapper's .float() becomes a no-op. Loading and
++        # RL weight sync are copy_-based (implicit cast), same as A_log.
+         self.dt_bias = nn.Parameter(
+-            torch.ones(self.num_v_heads // self.attn_tp_size),
++            torch.ones(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+         )
+         self.A_log = nn.Parameter(
+             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+@@ -275,6 +376,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             dt_bias=self.dt_bias,
+         )
+ 
++        # Conv1d weight loader setup. The wrapper refreshes the transposed
++        # copy cached on self.attn by the attention backend after every
++        # (re)load, so it must be bound after self.attn exists.
++        query_key_settings = (self.key_dim, 0, False)
++        value_settings = (self.value_dim, 0, False)
++
++        self._override_weight_loader(
++            self.conv1d.weight,
++            wrap_conv1d_weight_loader(
++                self.attn,
++                mamba_v2_sharded_weight_loader(
++                    [
++                        query_key_settings,
++                        query_key_settings,
++                        value_settings,
++                    ],
++                    self.attn_tp_size,
++                    self.attn_tp_rank,
++                ),
++            ),
++        )
++
+         self.norm = RMSNormGated(
+             self.head_v_dim,
+             eps=self.layer_norm_epsilon,
+@@ -301,6 +424,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             prefix=add_prefix("out_proj", prefix),
+         )
+ 
++        # TP_FUSION candidate 1: bake the init-time shape guard for
++        # fused_qkvzba_conv1d (split+causal_conv1d in one kernel); head counts are
++        # per-rank (post-TP) values. On guard miss or master switch off, forward
++        # uses the original split+causal_conv1d path.
++        self._tp_fused_qkvzba_ok = _is_npu and tp_fused_qkvzba_conv1d_shape_supported(
++            triton.cdiv(self.num_k_heads, self.attn_tp_size),
++            triton.cdiv(self.num_v_heads, self.attn_tp_size),
++            self.head_k_dim,
++            self.head_v_dim,
++            self.conv_kernel_size,
++        )
++
+     @staticmethod
+     def _override_weight_loader(param, loader):
+         """Robustly override loader for:
+@@ -493,10 +628,49 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
+             current_stream.wait_stream(self.alt_stream)
+         else:
+-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
++            if (
++                self._qkvzba_pack_enabled
++                and seq_len <= _gdn_qkvzba_pack_max_m
++                and _gdn_qkvzba_packable(self.in_proj_qkvz, self.in_proj_ba)
++            ):
++                # GDN_QKVZBA_PACK: one packed GEMM whose [M, N_pack] output is
++                # sliced into two row-stride views (contiguous within each row);
++                # all consumers take them with zero extra copies — the split kernel
++                # reads the row stride via stride(0), the op1 fused op accepts
++                # row-stride views natively, and the fix_query_key_value_ordering
++                # fallback copies anyway. The ba slice must explicitly exclude the
++                # pad tail columns (N_pack may exceed N_qkvz+N_ba). Graph capture
++                # bakes this branch per fixed batch size.
++                projected_states_qkvzba = nn.functional.linear(
++                    hidden_states, self._get_packed_qkvzba_weight()
++                )
++                n_qkvz = self.in_proj_qkvz.weight.shape[0]
++                n_ba = self.in_proj_ba.weight.shape[0]
++                projected_states_qkvz = projected_states_qkvzba[:, :n_qkvz]
++                projected_states_ba = projected_states_qkvzba[:, n_qkvz : n_qkvz + n_ba]
++            else:
++                projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
++                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+         return projected_states_qkvz, projected_states_ba
+ 
++    def _get_packed_qkvzba_weight(self) -> torch.Tensor:
++        """GDN_QKVZBA_PACK: return the packed [N_qkvz+N_ba, K] weight.
++
++        Materialized lazily on the first forward after weights are loaded; every
++        later forward revalidates via data_ptr — in-place writes (loader / RL weight
++        sync) keep the pointer so the buffer stays in sync, while wholesale .data
++        replacement moves the pointer and triggers re-materialization.
++        """
++        packed = self._packed_qkvzba_weight
++        if (
++            packed is not None
++            and self.in_proj_qkvz.weight.data_ptr() == packed.data_ptr()
++        ):
++            return packed
++        packed = _gdn_qkvzba_pack_materialize(self.in_proj_qkvz, self.in_proj_ba)
++        self._packed_qkvzba_weight = packed
++        return packed
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -512,48 +686,67 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             hidden_states
+         )
+ 
+-        if (
+-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+-            and not _is_cpu
+-            and not _is_npu
+-        ):
+-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+-                projected_states_qkvz,
+-                projected_states_ba,
+-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
+-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+-                self.head_k_dim,
+-                self.head_v_dim,
++        # TP_FUSION candidate 1: on decode with the init guard hit, pass the qkvz/ba
++        # projections to the GDN backend as a tuple — split+causal_conv1d run inside
++        # the single torch.ops.npu.fused_qkvzba_conv1d kernel, returning
++        # (core_attn_out, z); on runtime guard miss the backend falls back to local
++        # split+stock conv, still returning a tuple. Row-stride views from the
++        # packed path can be passed directly (host contract: contiguous within a row
++        # + 16-aligned row stride; the packed N is already padded).
++        core_attn_out = None
++        z = None
++        if self._tp_fused_qkvzba_ok and forward_batch.forward_mode.is_decode():
++            core_attn_out, z = self.attn(
++                forward_batch,
++                mixed_qkv=(projected_states_qkvz, projected_states_ba),
++                a=None,
++                b=None,
+             )
+-        elif _is_cpu and _is_amx_available:
+-            mixed_qkv, z, b, a = (
+-                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
++
++        if core_attn_out is None:
++            # NPU uses the fused split kernel too (the import above is rebound per
++            # platform to the sgl_kernel_npu version)
++            if (
++                self.num_v_heads // self.num_k_heads in [1, 2, 4]
++                and not _is_cpu
++            ):
++                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                     projected_states_qkvz,
+                     projected_states_ba,
+-                    self.num_k_heads // self.attn_tp_size,
+-                    self.num_v_heads // self.attn_tp_size,
++                    triton.cdiv(self.num_k_heads, self.attn_tp_size),
++                    triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                     self.head_k_dim,
+                     self.head_v_dim,
+                 )
+-            )
+-        else:
+-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+-                projected_states_qkvz, projected_states_ba
+-            )
+-            b = b.contiguous()
+-            a = a.contiguous()
++            elif _is_cpu and _is_amx_available:
++                mixed_qkv, z, b, a = (
++                    torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
++                        projected_states_qkvz,
++                        projected_states_ba,
++                        self.num_k_heads // self.attn_tp_size,
++                        self.num_v_heads // self.attn_tp_size,
++                        self.head_k_dim,
++                        self.head_v_dim,
++                    )
++                )
++            else:
++                query, key, value, z, b, a = self.fix_query_key_value_ordering(
++                    projected_states_qkvz, projected_states_ba
++                )
++                b = b.contiguous()
++                a = a.contiguous()
+ 
+-            query, key, value = map(
+-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+-            )
+-            mixed_qkv = torch.cat((query, key, value), dim=-1)
++                query, key, value = map(
++                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
++                )
++                mixed_qkv = torch.cat((query, key, value), dim=-1)
+ 
+-        core_attn_out = self.attn(
+-            forward_batch,
+-            mixed_qkv=mixed_qkv,
+-            a=a,
+-            b=b,
+-        )
++            core_attn_out = self.attn(
++                forward_batch,
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++            )
+ 
+         z_shape_og = z.shape
+         # reshape input data into 2D tensor
+@@ -608,7 +801,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+@@ -671,6 +868,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+             )
+         )
+ 
++        # MoE weight L2 prefetch: launched from the target itself — after this
++        # layer's prepare_attn and before attention, a point after all inter-layer
++        # communication on both TP and EP paths. GDN layers only; the main stream
++        # does not wait, everything is drained at step end.
++        moe_prefetch_emit(self, hidden_states)
++
+         if not forward_batch.forward_mode.is_idle():
+             hidden_states = self.linear_attn(
+                 hidden_states,
+@@ -824,7 +1027,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+                 quant_config=quant_config,
+                 alt_stream=(
+                     alt_stream
+-                    if (_is_cuda or _disable_shared_experts_fusion())
++                    if (
++                        _is_cuda
++                        or _disable_shared_experts_fusion()
++                        or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++                    )
+                     else None
+                 ),
+                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+@@ -863,6 +1070,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+ 
+         self.alt_stream = alt_stream
+ 
++        # full_attention A1b：TP 布局形状守卫在 init 时一次算定
++        # (per-rank q heads in {1,2,4} / 1 kv head / head_dim=256 / rope=64 / gated)
++        self._fa_v4_shape_ok = _is_npu and fa_split_qkvgate_scatter_supported(
++            self.num_heads,
++            self.num_kv_heads,
++            self.head_dim,
++            int(self.head_dim * self.partial_rotary_factor),
++            self.attn_output_gate,
++        )
++
++        # TP_FUSION candidates 2/3: bake init-time shape guards for the
++        # norm+qkv_proj+KV scatter triple fusion and the sigmoid_mul+o_proj fusion
++        # (guard miss or master switch off -> original path at runtime)
++        self._tp_fa_norm_qkv_scatter_ok = _is_npu and tp_norm_qkv_scatter_shape_supported(
++            self
++        )
++        self._tp_sigmoid_mul_mm_ok = _is_npu and tp_sigmoid_mul_mm_shape_supported(
++            self.o_proj
++        )
++
+     def _apply_qk_norm(
+         self, q: torch.Tensor, k: torch.Tensor
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+@@ -979,6 +1206,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+         if self.attn.layer_id == (self.config.full_attention_interval - 1):
+             self.rotary_emb.get_cos_sin_with_position(positions)
+ 
++        # full_attention A1b：decode 且命中已验证形状时，split+norm+rope 与 KV
++        # scatter 合一——k/v 由 kernel 按 out_cache_loc 直接写入 KV cache，返回
++        # k/v=None，self_attention 据此以 save_kv_cache=False 走 backend（跳过
++        # stock 的两次 npu_scatter_nd_update_）。守卫任一环节未命中则回退 stock
++        # split；SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 可按层打印未命中原因。
++        fa_ctx = fa_v4_scatter_context(self, forward_batch, qkv)
++        if fa_ctx is not None:
++            q, _, _, gate = fa_split_qkvgate_scatter(
++                qkv,
++                self.rotary_emb.position_sin,
++                self.rotary_emb.position_cos,
++                self.q_size,
++                self.kv_size,
++                self.head_dim,
++                int(self.head_dim * self.partial_rotary_factor),
++                eps=self.q_norm.variance_epsilon,
++                q_weight=self.q_norm.weight,
++                k_weight=self.k_norm.weight,
++                kbuf=fa_ctx[0],
++                vbuf=fa_ctx[1],
++                loc=fa_ctx[2],
++            )
++            return q, None, None, gate
++
+         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+             qkv,
+             self.rotary_emb.position_sin,
+@@ -1026,18 +1277,108 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+                 forward_batch=forward_batch,
+             )
+ 
+-        attn_output = self.attn(q, k, v, forward_batch)
++        # full_attention A1b：k is None ⟺ KV 已在融合 kernel 内 scatter 进 cache，
++        # backend 侧跳过 set_kv_buffer；其余路径 k 恒非 None，save_kv_cache=True
++        # 与 stock 默认值一致
++        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
+ 
+         if self.attn_output_gate:
+             if not _is_npu:
+                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+             else:
+                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+-                attn_output.mul_(torch.sigmoid(gate_val))
++                # TP_FUSION candidate 3: sigmoid_mul + o_proj GEMM in one kernel
++                # (outputs a partial sum, no bias no all-reduce, same return
++                # semantics as o_proj(reduce_results=False), so it is returned
++                # directly as this layer's output); guard miss falls back to the
++                # A2/stock path
++                if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
++                    attn_output, gate_val
++                ):
++                    return torch.ops.npu.fused_sigmoid_mul_mm(
++                        attn_output, gate_val, self.o_proj.weight
++                    )
++                # full_attention A2：sigmoid+mul 融合单 kernel，与 stock 双 op
++                # 舍入路径逐位一致；不满足守卫（非 bf16/非连续）回退 stock
++                if fa_sigmoid_mul_supported(attn_output, gate_val):
++                    attn_output = fa_sigmoid_mul(attn_output, gate_val)
++                else:
++                    attn_output.mul_(torch.sigmoid(gate_val))
+ 
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
++    def _self_attention_tp_fused(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor,
++        forward_batch: ForwardBatch,
++        tp_ctx,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """FA decode body of TP_FUSION candidate 2 (prepare's input_layernorm is
++        folded into the kernel).
++
++        hidden_states/residual are the raw pre-prepare tensors (no add+norm
++        applied); returns (o_proj partial output, add_out — the new residual
++        produced by the kernel) so forward can go straight to prepare_mlp. Caller
++        must have passed tp_norm_qkv_scatter_context (tp_ctx is not None).
++        """
++        # Same as forward_prepare_npu: the first full-attention layer refreshes the
++        # sin/cos cache first
++        if self.attn.layer_id == (self.config.full_attention_interval - 1):
++            self.rotary_emb.get_cos_sin_with_position(positions)
++
++        rope_dim = int(self.head_dim * self.partial_rotary_factor)
++        # The kernel requires contiguous [M,64] fp32; the NPU rope cache defaults to
++        # bf16, so widen-cast to fp32 (bf16 -> fp32 is exact)
++        sin = self.rotary_emb.position_sin.view(-1, rope_dim)
++        cos = self.rotary_emb.position_cos.view(-1, rope_dim)
++        if sin.dtype != torch.float32:
++            sin = sin.float()
++            cos = cos.float()
++
++        kbuf, vbuf, loc = tp_ctx
++        add_out, q, gate = torch.ops.npu.fused_norm_qkv_proj_scatter(
++            hidden_states,
++            residual,
++            self.input_layernorm.weight,
++            self.qkv_proj.weight,
++            self.q_norm.weight,
++            self.k_norm.weight,
++            sin,
++            cos,
++            loc,
++            kbuf,
++            vbuf,
++            self.num_heads,
++            self.num_kv_heads,
++            self.head_dim,
++            rope_dim,
++            self.input_layernorm.variance_epsilon,
++            self.q_norm.variance_epsilon,
++        )
++        # k/v were already written into the cache by the kernel at out_cache_loc
++        # (same contract as A1b: save_kv_cache=False)
++        attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
++
++        # Candidate 3 (same guards as the self_attention tail): on hit, A2+o_proj
++        # are fused together; on miss, fall back to the A2/stock tail (gate is a
++        # contiguous 2D tensor straight from the kernel)
++        if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
++            attn_output, gate
++        ):
++            output = torch.ops.npu.fused_sigmoid_mul_mm(
++                attn_output, gate, self.o_proj.weight
++            )
++        elif fa_sigmoid_mul_supported(attn_output, gate):
++            attn_output = fa_sigmoid_mul(attn_output, gate)
++            output, _ = self.o_proj(attn_output)
++        else:
++            attn_output.mul_(torch.sigmoid(gate))
++            output, _ = self.o_proj(attn_output)
++        return output, add_out
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -1047,21 +1388,52 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+         **kwargs,
+     ):
+-        hidden_states, residual = (
+-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++        # TP_FUSION candidate 2: on decode with all runtime guards hit, skip the
++        # input_layernorm inside prepare — add+norm is folded into
++        # fused_norm_qkv_proj_scatter, the raw hidden_states/residual go straight
++        # into the kernel, and add_out becomes the new residual for prepare_mlp.
++        # In this configuration (TP, no dp-attention, not the first layer, no
++        # pending AR fusion) prepare_attn is a no-op apart from the norm, so
++        # skipping it loses nothing; if any premise breaks, tp_ctx is None and the
++        # original path below runs.
++        tp_ctx = (
++            tp_norm_qkv_scatter_context(
++                self,
+                 hidden_states,
+                 residual,
+                 forward_batch,
+-                captured_last_layer_outputs=captured_last_layer_outputs,
++                captured_last_layer_outputs,
+             )
++            if (_is_npu and self._tp_fa_norm_qkv_scatter_ok)
++            else None
+         )
++        if tp_ctx is None:
++            hidden_states, residual = (
++                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++                    hidden_states,
++                    residual,
++                    forward_batch,
++                    captured_last_layer_outputs=captured_last_layer_outputs,
++                )
++            )
+ 
+-        if not forward_batch.forward_mode.is_idle():
+-            hidden_states = self.self_attention(
+-                positions=positions,
+-                hidden_states=hidden_states,
+-                forward_batch=forward_batch,
++        # MoE weight L2 prefetch: keep this after all inter-layer communication of
++        # the layer and before attention. When TP candidate 2 hits, prepare_attn is
++        # replaced by the equivalent fused path and the inter-layer AR was already
++        # done by the previous layer.
++        moe_prefetch_emit(self, hidden_states)
++
++        if tp_ctx is not None:
++            hidden_states, residual = self._self_attention_tp_fused(
++                positions, hidden_states, residual, forward_batch, tp_ctx
+             )
++        else:
++            if not forward_batch.forward_mode.is_idle():
++                hidden_states = self.self_attention(
++                    positions=positions,
++                    hidden_states=hidden_states,
++                    forward_batch=forward_batch,
++                )
+ 
+         # Fully Connected
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+@@ -1207,6 +1579,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+             self._maybe_autodisable_shared_experts_fusion(config, quant_config)
+ 
+         alt_stream = torch.cuda.Stream() if _is_cuda or _hip_use_alt_stream else None
++        alt_stream = (
++            torch.cuda.Stream()
++            if _is_cuda or _hip_use_alt_stream or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
++            else None
++        )
+ 
+         # Embedding layer
+         if self.pp_group.is_first_rank:
+@@ -1252,6 +1629,13 @@ class Qwen3_5ForCausalLM(nn.Module):
+ 
+         self.layers_to_capture = []
+ 
++        # MoE weight L2 prefetch: register each layer's MoE weights (layer_id ->
++        # w13/w2 plus the GDN target-layer flag) and create a dedicated prefetch
++        # stream outside capture; the is_nextn MTP draft model is not registered
++        # (its layers carry no launch flag, so draft capture never launches prefetch).
++        if not is_nextn:
++            moe_prefetch_register_model(self)
++
+     def get_input_embeddings(self):
+         return self.embed_tokens
+ 
+@@ -1320,6 +1704,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                 )
+ 
++        # MoE weight L2 prefetch: drain at step end — the main stream joins the
++        # prefetch stream (capture legality + no cross-step backlog); no-op when
++        # disabled or when this pass launched nothing.
++        moe_prefetch_step_drain()
++
+         # Return intermediate tensors for pipeline parallelism
+         if not self.pp_group.is_last_rank:
+             return PPProxyTensors(
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index cfb22d8419..4f478f3539 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -42,6 +42,12 @@ class SamplingBatchInfo:
+ 
+     # Masking tensors for grammar-guided structured outputs
+     vocab_size: int
++    # Whether all requests use temperature == 1.0 (computed host-side in
++    # from_schedule_batch; merge_batch takes the AND, filter_batch subsetting
++    # preserves it). True means logits.div_(temperatures) is a bitwise
++    # identity and the sampler skips it. Must sit after the non-default
++    # fields above (dataclass field ordering).
++    temperatures_all_one: bool = False
+     grammars: Optional[List] = None
+     rids_int: Optional[torch.Tensor] = None
+     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+@@ -191,6 +197,9 @@ class SamplingBatchInfo:
+             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
++            temperatures_all_one=all(
++                r.sampling_params.temperature == 1.0 for r in reqs
++            ),
+             vocab_size=vocab_size,
+             penalizer_orchestrator=penalizer_orchestrator,
+             has_custom_logit_processor=has_custom_logit_processor,
+@@ -412,6 +421,7 @@ class SamplingBatchInfo:
+         self.need_top_p_sampling |= other.need_top_p_sampling
+         self.need_top_k_sampling |= other.need_top_k_sampling
+         self.need_min_p_sampling |= other.need_min_p_sampling
++        self.temperatures_all_one &= other.temperatures_all_one
+ 
+         self.adjusted_merge_batch(other)
+ 
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index daf9fa82e2..f00f718fd2 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -617,7 +617,7 @@ def eagle_sample(
+ 
+     # Sample tokens
+     target_predict = None
+-    if sampling_info.is_all_greedy or _is_npu or _is_hip or _is_xpu:
++    if sampling_info.is_all_greedy or _is_hip or _is_xpu:
+         target_predict = torch.argmax(next_token_logits, dim=-1)
+         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+@@ -632,43 +632,80 @@ def eagle_sample(
+             topk=verify_input.tree_topk,
+         )
+     else:
+-        from sgl_kernel import (
+-            top_k_renorm_prob,
+-            top_p_renorm_prob,
+-            tree_speculative_sampling_target_only,
+-        )
+-
+-        from sglang.srt.speculative.reject_sampling import (
+-            chain_speculative_sampling_triton,
+-        )
+-
+         use_rejection_sampling = (
+             get_global_server_args().speculative_use_rejection_sampling
+         )
+ 
++        if _is_npu:
++            from sgl_kernel_npu.sample import (
++                chain_speculative_sampling_rejection,
++                top_k_top_p_renorm_probs,
++                tree_speculative_sampling_target_only,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_rejection
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++        else:
++            from sgl_kernel import (
++                top_k_renorm_prob,
++                top_p_renorm_prob,
++                tree_speculative_sampling_target_only,
++            )
++
++            from sglang.srt.speculative.reject_sampling import (
++                chain_speculative_sampling_triton,
++            )
++
++            sampling_fn = (
++                chain_speculative_sampling_triton
++                if use_rejection_sampling
++                else tree_speculative_sampling_target_only
++            )
++
+         # Apply temperature and get target probs
+         expanded_temperature = torch.repeat_interleave(
+             sampling_info.temperatures, verify_input.draft_token_num, dim=0
+         )  # (bs * num_draft_tokens, 1)
+ 
++        sampling_logits = next_token_logits.float() if _is_npu else next_token_logits
+         target_probs = F.softmax(
+-            next_token_logits / expanded_temperature, dim=-1
++            sampling_logits / expanded_temperature, dim=-1
+         )  # (bs * num_draft_tokens, vocab_size)
+         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+-        target_probs = top_k_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ks, verify_input.draft_token_num, dim=0
+-            ),
+-        )  # (bs * num_draft_tokens, vocab_size)
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+-        target_probs = top_p_renorm_prob(
+-            target_probs,
+-            torch.repeat_interleave(
+-                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+-            ),
+-        )
+-        maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
++
++        if _is_npu:
++            target_probs = top_k_top_p_renorm_probs(
++                target_probs,
++                torch.repeat_interleave(
++                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                ),
++                torch.repeat_interleave(
++                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                ),
++                sampling_info.need_top_k_sampling,
++                sampling_info.need_top_p_sampling,
++            )
++            maybe_detect_nan(target_probs, "v2 verify: target_probs after renorm")
++        else:
++            if sampling_info.need_top_k_sampling:
++                target_probs = top_k_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
++                    ),
++                )  # (bs * num_draft_tokens, vocab_size)
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
++            if sampling_info.need_top_p_sampling:
++                target_probs = top_p_renorm_prob(
++                    target_probs,
++                    torch.repeat_interleave(
++                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
++                    ),
++                )
++                maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+         draft_probs = (
+             verify_input.draft_probs
+@@ -687,16 +724,15 @@ def eagle_sample(
+                 "does not produce one (draft_probs missing or vocab-mismatched)."
+             )
+ 
++        if _is_npu:
++            target_probs = target_probs.contiguous()
++            draft_probs = draft_probs.float().contiguous()
++
+         # coins for rejection sampling
+         coins = torch.rand_like(candidates, dtype=torch.float32, device=device)
+         # coins for final sampling
+         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
+ 
+-        sampling_fn = (
+-            chain_speculative_sampling_triton
+-            if use_rejection_sampling
+-            else tree_speculative_sampling_target_only
+-        )
+         sampling_fn(
+             predicts=predict,  # mutable
+             accept_index=accept_index,  # mutable
+diff --git a/python/sglang/srt/speculative/triton_ops/cache_locs.py b/python/sglang/srt/speculative/triton_ops/cache_locs.py
+index 663c238722..522fd5ee44 100644
+--- a/python/sglang/srt/speculative/triton_ops/cache_locs.py
++++ b/python/sglang/srt/speculative/triton_ops/cache_locs.py
+@@ -363,6 +363,14 @@ def assign_extend_cache_locs_func(
+         return out_cache_loc
+ 
+     elif _is_npu:
++        '''
++        sgl-kernel-npu's cache_loc_assign / cache_loc_update operate under an explicit contract:
++        each row processes max_step tokens, and the tiling dimension of out_cache_loc is
++        cacheLocSize = batchSize * max_step, which is validated on the host side.
++        The host enforces 1 <= max_step <= MAX_STEP (16) and checks the size of out_cache_loc.
++        Therefore, here we allocate exactly batch_size * draft_token_num and pass draft_token_num
++        as max_step; no padding to 16 is needed.
++        '''
+         out_cache_loc = torch.empty(
+             (batch_size * draft_token_num,),
+             dtype=torch.int32,
+@@ -374,6 +382,7 @@ def assign_extend_cache_locs_func(
+             start_offset,
+             end_offset,
+             out_cache_loc,
++            draft_token_num,
+         )
+ 
+         return out_cache_loc
 diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
-index f68721f3d0..3e85ee7c10 100644
+index 82db90da3b..aabd222d7e 100644
 --- a/python/sglang/srt/utils/common.py
 +++ b/python/sglang/srt/utils/common.py
-@@ -46,6 +46,7 @@ import types
- import uuid
- import warnings
- from collections import OrderedDict, defaultdict
+@@ -73,6 +73,7 @@ from typing import (
+     TypeVar,
+     Union,
+ )
 +from relax.utils.device import is_npu_available
- from contextlib import contextmanager
- from dataclasses import dataclass
- from decimal import Decimal
-@@ -150,7 +151,7 @@ def is_npu() -> bool:
+ from unittest import SkipTest
+ from unittest.case import _ShouldStop
+ from urllib.parse import unquote, urlparse
+@@ -176,7 +177,8 @@ def is_npu() -> bool:
      if not hasattr(torch, "npu"):
          return False
  
 -    if not torch.npu.is_available():
++    # if not torch.npu.is_available():
 +    if not is_npu_available:
          raise RuntimeError(
              "torch_npu detected, but NPU device is not available or visible."
          )
+diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+index ad98e59283..a5b2cdfd32 100644
+--- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
++++ b/python/sglang/srt/utils/torch_memory_saver_adapter.py
+@@ -41,7 +41,7 @@ class TorchMemorySaverAdapter(ABC):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         raise NotImplementedError
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         raise NotImplementedError
+ 
+     def disable(self):
+@@ -67,7 +67,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+     def region(self, tag: str, enable_cpu_backup: bool = False):
+         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+ 
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
++        if cuda_graph is not None:
++            kwargs["cuda_graph"] = cuda_graph
++        # kwargs.pop("auto_dispatch_capture", None)  # torch_memory_saver 0.0.8 does not support this arg
+         return _memory_saver.cuda_graph(**kwargs)
+ 
+     def disable(self):
+@@ -94,7 +97,7 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+         yield
+ 
+     @contextmanager
+-    def cuda_graph(self, **kwargs):
++    def cuda_graph(self, cuda_graph=None, **kwargs):
+         yield
+ 
+     @contextmanager
+diff --git a/test/registered/unit/layers/test_conv_weight_cache_refresh.py b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+new file mode 100644
+index 0000000000..ed2574df66
+--- /dev/null
++++ b/test/registered/unit/layers/test_conv_weight_cache_refresh.py
+@@ -0,0 +1,109 @@
++"""Regression tests for the GDN conv1d weight cache refresh.
++
++The Ascend GDN backend caches a transposed copy of conv1d.weight on the
++RadixLinearAttention wrapper (AscendGDNAttnBackend._get_conv_weights_t).
++mamba_v2_sharded_weight_loader writes through ``param.data[...] = ...``;
++because ``Tensor.data`` carries a version counter independent of the
++Parameter's, online weight updates (e.g. RL Actor->SGLang sync via
++``update_weights_from_tensor``) are invisible to ``_version``-based
++invalidation. conv1d.weight's loader is therefore wrapped with
++``wrap_conv1d_weight_loader`` to refresh the cached copy explicitly, in
++place, so captured graphs keep referencing the same storage.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
++from sglang.srt.layers.radix_linear_attention import wrap_conv1d_weight_loader
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_CHANNELS = 16  # q(4) + k(4) + v(8) on a single TP rank
++_KERNEL = 4
++
++
++def _make_conv_param() -> torch.nn.Parameter:
++    # conv1d.weight layout: [channels, 1, kernel]
++    return torch.nn.Parameter(
++        torch.randn(_CHANNELS, 1, _KERNEL), requires_grad=False
++    )
++
++
++def _make_base_loader():
++    # Same shard layout as Qwen3_5: q/k shards then the v shard, TP size 1.
++    return mamba_v2_sharded_weight_loader(
++        [(4, 0, False), (4, 0, False), (8, 0, False)], 1, 0
++    )
++
++
++class _FakeAttn:
++    """Stands in for RadixLinearAttention: holds conv_weights and the cache."""
++
++    def __init__(self, conv_param: torch.nn.Parameter):
++        self.conv_weights = conv_param.view(_CHANNELS, _KERNEL)
++        self._conv_weights_t = self.conv_weights.transpose(0, 1).contiguous()
++
++
++class TestConvWeightCacheRefresh(CustomTestCase):
++
++    def test_mamba_loader_write_bypasses_param_version(self):
++        """Root-cause guard: the real loader must not bump ``_version``.
++
++        If a future PyTorch/SGLang change makes param.data writes bump the
++        shared version counter, this test fails and the explicit wrapper may
++        be revisited.
++        """
++        param = _make_conv_param()
++        view = param.view(_CHANNELS, _KERNEL)
++        param_version = param._version
++        view_version = view._version
++
++        _make_base_loader()(param, torch.randn_like(param))
++
++        self.assertEqual(param._version, param_version)
++        self.assertEqual(view._version, view_version)
++
++    def test_wrapped_loader_refreshes_cache_in_place(self):
++        """An online reload must refresh the cached transpose in place."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        cached = attn._conv_weights_t
++        cached_ptr = cached.data_ptr()
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        # The loader actually wrote the new weights.
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++        # The cache is refreshed in place: same tensor object, same storage
++        # (captured graphs keep referencing it), content matches the
++        # transpose of the new weights.
++        self.assertIs(attn._conv_weights_t, cached)
++        self.assertEqual(attn._conv_weights_t.data_ptr(), cached_ptr)
++        reference = param.view(_CHANNELS, _KERNEL).transpose(0, 1)
++        torch.testing.assert_close(attn._conv_weights_t, reference, rtol=0, atol=0)
++
++    def test_wrapped_loader_without_cache_is_noop(self):
++        """Initial load (before the first forward) must not create a cache."""
++        param = _make_conv_param()
++        attn = _FakeAttn(param)
++        del attn._conv_weights_t
++
++        new_weight = torch.randn_like(param)
++        wrapped = wrap_conv1d_weight_loader(attn, _make_base_loader())
++        wrapped(param, new_weight)
++
++        self.assertFalse(hasattr(attn, "_conv_weights_t"))
++        torch.testing.assert_close(param.detach(), new_weight, rtol=0, atol=0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/layers/test_sampler_attach_logprobs.py b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+new file mode 100644
+index 0000000000..9dfc930392
+--- /dev/null
++++ b/test/registered/unit/layers/test_sampler_attach_logprobs.py
+@@ -0,0 +1,156 @@
++"""Unit tests for Sampler._attach_logprobs_to_output.
++
++Regression coverage for two bugs in the decode logprob attach path:
++  - iterating ``logits_output.token_ids_logprobs_val`` (a nonexistent field on
++    LogitsProcessorOutput) instead of ``next_token_token_ids_logprobs_val``
++    raised AttributeError for any request with specific token-ID logprobs;
++  - the top-logprob branch ran a full-vocab topk twice (get_top_logprobs plus
++    an immediate re-topk that overwrote the first result).
++
++The method under test does not touch ``self``, so the Sampler is allocated
++with ``__new__`` to skip the distributed-group init in ``__init__``.
++"""
++
++import unittest
++
++import torch
++
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
++
++maybe_stub_sgl_kernel()
++
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.sampler import Sampler
++
++register_cpu_ci(est_time=10, suite="base-a-test-cpu")
++
++_VOCAB = 1000
++
++
++def _make_sampler() -> Sampler:
++    # _attach_logprobs_to_output never reads instance state; bypass __init__
++    # (which requires an initialized torch distributed group).
++    return Sampler.__new__(Sampler)
++
++
++def _attach(
++    logprobs: torch.Tensor,
++    top_logprobs_nums,
++    token_ids_logprobs,
++    batch_next_token_ids: torch.Tensor,
++    logprobs_are_probs: bool = False,
++) -> LogitsProcessorOutput:
++    logits_output = LogitsProcessorOutput(next_token_logits=None)
++    _make_sampler()._attach_logprobs_to_output(
++        logits_output=logits_output,
++        logprobs=logprobs,
++        top_logprobs_nums=top_logprobs_nums,
++        token_ids_logprobs=token_ids_logprobs,
++        sampling_info=None,
++        batch_next_token_ids=batch_next_token_ids,
++        logprobs_are_probs=logprobs_are_probs,
++    )
++    return logits_output
++
++
++class TestAttachTokenIdsLogprobs(CustomTestCase):
++
++    def test_token_ids_logprobs_no_attribute_error(self):
++        """Specific token-ID logprob requests must not raise AttributeError."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[5, 7], [42]],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_val)
++        self.assertIsNotNone(out.next_token_token_ids_logprobs_idx)
++
++    def test_token_ids_logprobs_values(self):
++        logprobs = torch.log_softmax(torch.randn(3, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        requested = [[5, 7], None, [42]]
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0, 0],
++            token_ids_logprobs=requested,
++            batch_next_token_ids=torch.tensor([3, 4, 9], dtype=torch.int32),
++        )
++        vals = out.next_token_token_ids_logprobs_val
++        idxs = out.next_token_token_ids_logprobs_idx
++        self.assertEqual(len(vals), 3)
++        torch.testing.assert_close(
++            vals[0], reference[0, torch.tensor([5, 7])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[0], [5, 7])
++        # None request yields empty placeholders.
++        self.assertEqual(vals[1], [])
++        self.assertEqual(idxs[1], [])
++        torch.testing.assert_close(
++            vals[2], reference[2, torch.tensor([42])], rtol=0, atol=0
++        )
++        self.assertEqual(idxs[2], [42])
++
++    def test_token_ids_logprobs_probs_input(self):
++        """logprobs_are_probs=True applies log() before clamping, per row."""
++        probs = torch.softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = probs.clone()
++        out = _attach(
++            logprobs=probs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[[1, 2], [3]],
++            batch_next_token_ids=torch.tensor([0, 1], dtype=torch.int32),
++            logprobs_are_probs=True,
++        )
++        torch.testing.assert_close(
++            out.next_token_token_ids_logprobs_val[0],
++            reference[0, torch.tensor([1, 2])].log(),
++            rtol=1e-6,
++            atol=1e-6,
++        )
++
++
++class TestAttachTopLogprobs(CustomTestCase):
++
++    def test_top_logprobs_values(self):
++        """Per-request k slicing stays correct with the single-topk path."""
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[3, 1],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        ref_vals, ref_idx = reference.topk(3, dim=-1)
++        self.assertEqual(len(out.next_token_top_logprobs_val), 2)
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[0], ref_vals[0], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[0], ref_idx[0]))
++        torch.testing.assert_close(
++            out.next_token_top_logprobs_val[1], ref_vals[1][:1], rtol=0, atol=0
++        )
++        self.assertTrue(torch.equal(out.next_token_top_logprobs_idx[1], ref_idx[1][:1]))
++
++    def test_next_token_logprobs_gather(self):
++        logprobs = torch.log_softmax(torch.randn(2, _VOCAB), dim=-1)
++        reference = logprobs.clone()
++        out = _attach(
++            logprobs=logprobs.clone(),
++            top_logprobs_nums=[0, 0],
++            token_ids_logprobs=[None, None],
++            batch_next_token_ids=torch.tensor([3, 4], dtype=torch.int32),
++        )
++        torch.testing.assert_close(
++            out.next_token_logprobs,
++            torch.stack([reference[0, 3], reference[1, 4]]),
++            rtol=0,
++            atol=0,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.54.0.windows.1

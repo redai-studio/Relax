@@ -26,6 +26,7 @@ EXP_NAME="${EXP_NAME:-qwen3.5-35b-a3b-mtp-sft-8xklx}"
 
 export MEGATRON=${WORKDIR}/Megatron-LM
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export XMLIR_USE_HYDRA_LINEAR=${XMLIR_USE_HYDRA_LINEAR:-1}
 export XMLIR_ENABLE_FAST_FC=${XMLIR_ENABLE_FAST_FC:-1}
 export XMLIR_MATMUL_FAST_MODE=${XMLIR_MATMUL_FAST_MODE:-1}
@@ -149,6 +150,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP:-127.0.0.1}
    --resource '{"sft": [1, 0], "actor": [1, 8]}' \
    --max-staleness 0 \
    --num-data-storage-units 1 \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${SFT_ARGS[@]}" \

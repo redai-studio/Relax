@@ -7,10 +7,18 @@ from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
-from megatron.bridge.peft.lora import LoRAMerge
 from megatron.core import mpu
 
+
+try:
+    # Megatron-Bridge >= 0.6.0 moved LoRAMerge out of peft.lora into its own module.
+    from megatron.bridge.peft.lora_merge import LoRAMerge
+except ImportError:  # bridge <= 0.5.x
+    from megatron.bridge.peft.lora import LoRAMerge
+
+
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     is_lora_adapter_mode,
@@ -50,9 +58,14 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             # Expert LoRA merge selects a per-expert adapter slice locally on the owning EP
             # rank (no ETP collective). Expert-TP > 1 would need an ETP all-gather that only
             # the single owning rank reaches -> deadlock; fail loud rather than mis-merge.
+            # MoE LoRA merge is therefore supported only with expert-tensor-parallel-size=1
+            # (expert-model-parallel-size / EP may be > 1). Attention/dense LoRA is unaffected.
             assert mpu.get_expert_tensor_parallel_world_size() == 1, (
-                "LoRA merge mode in the fast bridge path requires expert-tensor-parallel-size=1 "
-                f"(got {mpu.get_expert_tensor_parallel_world_size()})."
+                "MoE LoRA merge mode requires --expert-tensor-parallel-size 1 "
+                f"(got {mpu.get_expert_tensor_parallel_world_size()}). Set ETP=1 (EP may stay > 1), "
+                "or use --lora-adapter-mode: in colocate the reference stays in-process (no fold), "
+                "so colocate adapter mode is unaffected by ETP. (Fully-async off-policy adapter mode "
+                "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
             )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
@@ -161,8 +174,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         if slot is None or "in" not in slot or "out" not in slot:
             return param
 
-        linear_in = megatron_local_weights[slot["in"]].to(device=device).float()
-        linear_out = megatron_local_weights[slot["out"]].to(device=device).float()
+        linear_in = megatron_local_weights[slot["in"]]
+        linear_out = megatron_local_weights[slot["out"]]
 
         if ".experts." in info.name:
             # Grouped experts: base is per-expert (``...weight{N}``) while the adapter is a
@@ -172,6 +185,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 ep_rank = mpu.get_expert_model_parallel_rank()
                 global_idx = int(re.search(r"weight(\d+)$", info.name).group(1))
                 local_idx = global_idx - ep_rank * self.args.num_experts // ep_size
+                # Slice on CPU before moving to device: only this expert's slice is used.
                 linear_in = linear_in[local_idx]
                 linear_out = linear_out[local_idx]
             tp_size = mpu.get_expert_tensor_parallel_world_size()
@@ -179,6 +193,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         else:
             tp_size = mpu.get_tensor_model_parallel_world_size()
             tp_group = mpu.get_tensor_model_parallel_group()
+
+        linear_in = linear_in.to(device=device).float()
+        linear_out = linear_out.to(device=device).float()
 
         merged = (
             LoRAMerge()
@@ -354,7 +371,7 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_utils.synchronize()
+    device_module.synchronize()
     return params
 
 

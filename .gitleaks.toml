@@ -70,13 +70,15 @@ tags = ["internal", "token"]
 [[rules]]
 id = "private-ip-10-range"
 description = "Detects hardcoded private IP addresses in 10.0.0.0/8 range (RFC 1918)"
-regex = '''\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'''
+regex = '''\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b(?:/\d{1,2}\b)?'''
 tags = ["internal", "ip", "private"]
   [rules.allowlist]
   regexTarget = "match"
   regexes = [
     # 10.0.0.1 is a conventional placeholder IP in examples and tests.
     '''^10\.0\.0\.1$''',
+    # The full RFC 1918 network is public, not a deployment-specific endpoint.
+    '''^10\.0\.0\.0/8$''',
   ]
   paths = ['''scripts/ci/benchmark\.sh$''']
 

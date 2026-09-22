@@ -1124,13 +1124,6 @@ async def generate_rollout_async(
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
             )
-            staleness_gaps = [
-                rollout_id - s.metadata.get("start_rollout_id", rollout_id) for group in data for s in group
-            ]
-            rollout_metrics["rollout/staleness/avg"] = np.mean(staleness_gaps).item()
-            rollout_metrics["rollout/staleness/max"] = np.max(staleness_gaps).item()
-            rollout_metrics["rollout/staleness/min"] = np.min(staleness_gaps).item()
-            rollout_metrics["rollout/global_batch_size"] = len(data) * args.n_samples_per_prompt
         _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")

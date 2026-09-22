@@ -1,667 +1,880 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+"""IPC contracts between resident sessions and external agent processes."""
+
 from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
+import copy
+import ctypes
 import fcntl
+import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from typing import Any, Mapping, Optional
 
+from relax.agentic.profile import agentic_trace_events, mark_agentic_event
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
-logger = get_logger(__name__)
-_DEFAULT_BOOTSTRAP_TIMEOUT_S = 30.0
-_DEFAULT_REQUEST_RETRY_ATTEMPTS = 3
-_LENGTH_PREFIX_STRUCT = struct.Struct("!I")
-# One rollout can burst hundreds of concurrent launch RPCs into this single UDS.
-# asyncio/uvloop defaults backlog to 100, which drops connect() with EAGAIN under that load.
+# Repository root used as the launcher subprocess import root and local socket
+# namespace. Its depth follows the package path ``relax/agentic/runner``;
+# moving this module requires updating the relationship atomically.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+# Grace period between cooperative termination and forced process-group kill.
+# Increasing it retains Session resources longer; decreasing it risks cutting
+# off an agent while it is flushing output and cleanup.
+_TERMINATION_GRACE_SECONDS = 5.0
+_TERMINATION_RESPONSE_TIMEOUT_SECONDS = 2 * _TERMINATION_GRACE_SECONDS + 1.0
+# Deadline for the node-local launcher daemon to publish its Unix socket.
+# This covers process bootstrap rather than the agent's active timeout.
+_LAUNCHER_BOOTSTRAP_TIMEOUT_SECONDS = 30.0
+# Wire-format version shared by LauncherClient and the daemon. A mismatch is a
+# hard compatibility break and must be rolled out atomically.
+_LAUNCHER_PROTOCOL_VERSION = 1
+# Four-byte network-order length prefix. Changing it makes every existing
+# launcher connection undecodable.
+_LAUNCHER_MESSAGE_SIZE = struct.Struct("!I")
+# Pending Unix-socket connections queue at the OS boundary. A low value rejects
+# bursty launches before application-level scheduling can observe them.
 _LAUNCHER_SERVER_BACKLOG = max(1024, socket.SOMAXCONN)
-_LAUNCH_SEMAPHORE: asyncio.BoundedSemaphore | None = None
-_DEFAULT_TERMINATION_WAIT_TIMEOUT_S = 5.0
-_DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S = 5.0
+_PR_SET_CHILD_SUBREAPER = 36
+
+logger = get_logger(__name__)
+
+
+class AgentExecutionError(RuntimeError):
+    """Expected agent-level failure that drops its rollout group."""
 
 
 class LauncherProtocolError(RuntimeError):
-    pass
+    """The node-local launcher returned an invalid message."""
 
 
-def encode_message(payload: dict[str, Any]) -> bytes:
+def _encode_launcher_message(payload: Mapping[str, Any]) -> bytes:
+    """Encode one length-prefixed launcher message."""
+
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return _LENGTH_PREFIX_STRUCT.pack(len(body)) + body
+    return _LAUNCHER_MESSAGE_SIZE.pack(len(body)) + body
 
 
-async def read_message(reader) -> dict[str, Any]:
-    raw_size = await reader.readexactly(_LENGTH_PREFIX_STRUCT.size)
-    (size,) = _LENGTH_PREFIX_STRUCT.unpack(raw_size)
+async def _read_launcher_message(reader: asyncio.StreamReader) -> dict[str, Any]:
+    """Decode and validate one launcher message."""
+
+    (size,) = _LAUNCHER_MESSAGE_SIZE.unpack(await reader.readexactly(_LAUNCHER_MESSAGE_SIZE.size))
     if size <= 0:
-        raise LauncherProtocolError("Launcher protocol received non-positive message size.")
-    body = await reader.readexactly(size)
-    payload = json.loads(body.decode("utf-8"))
+        raise LauncherProtocolError("launcher message size must be positive")
+    payload = json.loads((await reader.readexactly(size)).decode("utf-8"))
     if not isinstance(payload, dict):
-        raise LauncherProtocolError("Launcher protocol payload must be a JSON object.")
+        raise LauncherProtocolError("launcher message must be a JSON object")
     return payload
 
 
-async def write_message(writer, payload: dict[str, Any]) -> None:
-    writer.write(encode_message(payload))
+async def _write_launcher_message(writer: asyncio.StreamWriter, payload: Mapping[str, Any]) -> None:
+    """Write and drain one launcher message."""
+
+    writer.write(_encode_launcher_message(payload))
     await writer.drain()
 
 
-def _ping_socket(socket_path: str) -> None:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        client.settimeout(1.0)
-        client.connect(socket_path)
-        client.sendall(encode_message({"op": "ping"}))
-        raw_size = client.recv(_LENGTH_PREFIX_STRUCT.size)
-        if len(raw_size) != _LENGTH_PREFIX_STRUCT.size:
-            raise RuntimeError("Launcher daemon ping did not return a valid length prefix.")
-        (size,) = _LENGTH_PREFIX_STRUCT.unpack(raw_size)
-        payload = b""
-        while len(payload) < size:
-            chunk = client.recv(size - len(payload))
-            if not chunk:
-                raise RuntimeError("Launcher daemon ping response closed early.")
-            payload += chunk
-        response = json.loads(payload.decode("utf-8"))
-        if not isinstance(response, dict) or response.get("ok") is not True:
-            raise RuntimeError(f"Launcher daemon ping failed: {response!r}")
-    finally:
-        client.close()
+class _LauncherProcess:
+    """One live daemon connection that owns a process capability."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._exit = asyncio.create_task(self._read_exit(), name="launcher-process")
+
+    async def wait(self) -> int:
+        """Wait for the process exit frame."""
+
+        return await asyncio.shield(self._exit)
+
+    async def terminate(self) -> None:
+        """Ask the daemon to terminate and join the complete process group."""
+
+        try:
+            if not self._exit.done():
+                await _write_launcher_message(self._writer, {"op": "terminate"})
+            await asyncio.wait_for(
+                asyncio.shield(self._exit),
+                timeout=_TERMINATION_RESPONSE_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            await self.close()
+
+    async def close(self) -> None:
+        """Release the process capability and trigger daemon cleanup."""
+
+        self._writer.close()
+        try:
+            await asyncio.wait_for(self._writer.wait_closed(), timeout=_TERMINATION_GRACE_SECONDS)
+        except Exception:
+            pass
+        if not self._exit.done():
+            self._exit.cancel()
+        await asyncio.gather(self._exit, return_exceptions=True)
+
+    async def _read_exit(self) -> int:
+        """Decode the daemon exit frame."""
+
+        response = await _read_launcher_message(self._reader)
+        if (
+            response.get("op") != "exit"
+            or not isinstance(response.get("return_code"), int)
+            or not isinstance(response.get("group_closed"), bool)
+        ):
+            raise LauncherProtocolError(f"launcher expected an exit message, got {response!r}")
+        return response["return_code"]
 
 
 class LauncherClient:
-    def __init__(self, *, socket_path: str):
+    """Open one ownership connection for each node-local agent process."""
+
+    def __init__(self, socket_path: str) -> None:
         self._socket_path = socket_path
-
-    def _recover_default_launcher_socket(self) -> None:
-        expected_socket_path = launcher_socket_path()
-        if self._socket_path != expected_socket_path:
-            return
-        self._socket_path = ensure_local_launcher_daemon()
-
-    @staticmethod
-    def _request_retry_backoff_s(*, attempt: int) -> float:
-        return min(0.5, 0.1 * (2**attempt))
-
-    async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for attempt in range(_DEFAULT_REQUEST_RETRY_ATTEMPTS):
-            try:
-                reader, writer = await asyncio.open_unix_connection(self._socket_path)
-                try:
-                    await write_message(writer, payload)
-                    response = await read_message(reader)
-                finally:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-                error = response.get("error")
-                if isinstance(error, dict):
-                    message = error.get("message")
-                    if not isinstance(message, str) or not message:
-                        message = "Launcher daemon request failed."
-                    raise RuntimeError(message)
-                return response
-            except (
-                OSError,
-                asyncio.TimeoutError,
-                asyncio.IncompleteReadError,
-                json.JSONDecodeError,
-                LauncherProtocolError,
-            ) as exc:
-                last_error = exc
-                if attempt >= _DEFAULT_REQUEST_RETRY_ATTEMPTS - 1:
-                    break
-                try:
-                    self._recover_default_launcher_socket()
-                except Exception as recovery_exc:
-                    logger.warning(
-                        "Launcher daemon recovery attempt %d failed for %s: %s",
-                        attempt + 1,
-                        self._socket_path,
-                        recovery_exc,
-                    )
-                await asyncio.sleep(self._request_retry_backoff_s(attempt=attempt))
-        raise RuntimeError(
-            f"Launcher daemon request failed after {_DEFAULT_REQUEST_RETRY_ATTEMPTS} attempts."
-        ) from last_error
-
-    async def ping(self) -> dict[str, Any]:
-        return await self._request({"op": "ping"})
 
     async def launch(
         self,
         *,
         command: str,
-        cwd: str | None,
-        env: dict[str, str],
-    ) -> dict[str, Any]:
-        return await self._request({"op": "launch", "command": command, "cwd": cwd, "env": env})
+        cwd: str,
+        env: Mapping[str, str],
+        log_path: str,
+        session_dir: str,
+    ) -> _LauncherProcess:
+        """Launch an agent and return its connection capability."""
 
-    async def wait(self, *, handle: str) -> dict[str, Any]:
-        return await self._request({"op": "wait", "handle": handle})
+        reader, writer = await asyncio.open_unix_connection(self._socket_path)
+        try:
+            await _write_launcher_message(
+                writer,
+                {
+                    "op": "launch",
+                    "command": command,
+                    "cwd": cwd,
+                    "env": dict(env),
+                    "log_path": log_path,
+                    "session_dir": session_dir,
+                },
+            )
+            response = await _read_launcher_message(reader)
+            error = response.get("error")
+            if isinstance(error, str):
+                raise RuntimeError(error)
+            if response != {"op": "started"}:
+                raise LauncherProtocolError(f"launcher expected a started message, got {response!r}")
+            return _LauncherProcess(reader, writer)
+        except BaseException:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=_TERMINATION_GRACE_SECONDS)
+            except Exception:
+                pass
+            raise
 
-    async def kill(
+
+RewardValue = float | dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class SessionOutput:
+    """Agent output normalized at the process boundary."""
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    reward: RewardValue = None
+    records: tuple[dict[str, Any], ...] = ()
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionOutput":
+        if not isinstance(payload, dict):
+            raise TypeError(f"SessionOutput payload must be a JSON object, got {type(payload)}")
+        if "messages" in payload:
+            return cls.from_records([payload])
+        unknown_keys = set(payload) - {"metadata", "reward"}
+        if unknown_keys:
+            logger.warning(
+                "SessionOutput ignoring unknown top-level keys: %s. "
+                "Only 'metadata' and 'reward' are consumed by Relax.",
+                sorted(unknown_keys),
+            )
+        metadata = payload.get("metadata", {})
+        reward = payload.get("reward")
+        if not isinstance(metadata, dict):
+            raise TypeError("SessionOutput 'metadata' must be a JSON object")
+        if reward is not None and not isinstance(reward, (int, float, dict)):
+            raise TypeError("SessionOutput 'reward' must be null, number, or JSON object")
+        return cls(metadata=metadata, reward=reward)
+
+    @classmethod
+    def from_records(cls, records: list[dict[str, Any]]) -> "SessionOutput":
+        normalized_records = tuple(_normalize_session_output_record(record) for record in records)
+        names: set[str] = set()
+        for record in normalized_records:
+            name = record["name"]
+            if name in names:
+                raise TypeError(f"Session output record name must be unique within one explicit export: {name!r}")
+            names.add(name)
+        return cls(records=normalized_records)
+
+
+def _normalize_session_output_record(record: dict[str, Any]) -> dict[str, Any]:
+    from relax.agentic.session.state import check_messages, normalize_template_kwargs, normalize_tools
+
+    if not isinstance(record, dict):
+        raise TypeError(f"Session output record must be a JSON object, got {type(record)}")
+    known_keys = {"name", "messages", "tools", "chat_template_kwargs", "metadata", "reward"}
+    unknown_keys = set(record) - known_keys
+    if unknown_keys:
+        logger.warning(
+            "Session output record ignoring unknown keys: %s. Only 'name', 'messages', 'tools', "
+            "'chat_template_kwargs', 'metadata', and 'reward' are consumed by Relax.",
+            sorted(unknown_keys),
+        )
+    if "messages" not in record:
+        raise TypeError("Session output record must include 'messages'")
+    name = record.get("name")
+    if not isinstance(name, str) or not name:
+        raise TypeError("Session output record must include non-empty string 'name'")
+    metadata = record.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise TypeError("Session output record 'metadata' must be a JSON object")
+    reward = record.get("reward")
+    if reward is not None and not isinstance(reward, (int, float, dict)):
+        raise TypeError("Session output record 'reward' must be null, number, or JSON object")
+    normalized_record = {
+        "name": name,
+        "messages": check_messages(record["messages"]),
+        "metadata": copy.deepcopy(metadata),
+    }
+    if "reward" in record:
+        normalized_record["reward"] = copy.deepcopy(reward)
+    if "tools" in record:
+        normalized_record["tools"] = normalize_tools(record["tools"])
+    if "chat_template_kwargs" in record:
+        normalized_record["chat_template_kwargs"] = normalize_template_kwargs(record["chat_template_kwargs"])
+    return normalized_record
+
+
+def _session_output_from_text(raw_text: str) -> SessionOutput:
+    stripped = raw_text.strip()
+    if not stripped:
+        return SessionOutput()
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        records = [json.loads(line) for line in stripped.split("\n") if line.strip()]
+        return SessionOutput.from_records(records)
+    if isinstance(payload, dict):
+        return SessionOutput.from_payload(payload)
+    if isinstance(payload, list):
+        raise TypeError("Session output explicit records must be written as JSONL, not a JSON array")
+    raise TypeError(f"Managed command output must be a JSON object or JSONL records, got {type(payload)}")
+
+
+@dataclass(frozen=True)
+class ManagedCommandAppSpec:
+    """Normalized agent command, cwd, environment, and timeout."""
+
+    command: str
+    cwd: str
+    env: Mapping[str, str] = field(default_factory=dict)
+    timeout_s: float = 1800.0
+
+    def __post_init__(self) -> None:
+        if not self.command.strip():
+            raise ValueError("managed agent command must be non-empty")
+        if not Path(self.cwd).is_dir():
+            raise ValueError(f"managed agent cwd must be an existing directory: {self.cwd}")
+        if self.timeout_s <= 0:
+            raise ValueError("managed agent timeout must be positive")
+
+
+def load_agent_app_spec_from_args(args: argparse.Namespace) -> ManagedCommandAppSpec:
+    """Normalize CLI-shaped agent settings once."""
+
+    agent_env = {}
+    for item in args.agent_env:
+        key, value = item.split("=", 1)
+        agent_env[key.strip()] = value
+    return ManagedCommandAppSpec(
+        command=args.agent_command.strip(),
+        cwd=str(Path(args.agent_cwd).expanduser().resolve()),
+        env=agent_env,
+        timeout_s=float(args.agent_timeout),
+    )
+
+
+@dataclass(frozen=True)
+class SessionInput:
+    """Agent entrypoint input."""
+
+    session_id: str
+    rollout_mode: str
+    group_id: str
+    input_payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_agent_payload(self) -> dict[str, Any]:
+        return copy.deepcopy(self.input_payload)
+
+
+class ManagedAgentProcess:
+    """One Session-owned command process with an active-time budget."""
+
+    def __init__(
         self,
-        *,
-        handle: str,
-        signal_value: int = 15,
-        forget: bool = True,
-        wait: bool = False,
-        force: bool = False,
-        wait_timeout_s: float = _DEFAULT_TERMINATION_WAIT_TIMEOUT_S,
-        force_signal_value: int = signal.SIGKILL,
-        force_wait_timeout_s: float = _DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
-    ) -> dict[str, Any]:
-        return await self._request(
-            {
-                "op": "kill",
-                "handle": handle,
-                "signal": int(signal_value),
-                "forget": forget,
-                "wait": wait,
-                "force": force,
-                "wait_timeout_s": wait_timeout_s,
-                "force_signal": int(force_signal_value),
-                "force_wait_timeout_s": force_wait_timeout_s,
+        launcher: LauncherClient,
+        spec: ManagedCommandAppSpec,
+        session_input: SessionInput,
+    ) -> None:
+        self._launcher = launcher
+        self._spec = spec
+        self._session_id = session_input.session_id
+        self._group_id = session_input.group_id
+        self._rollout_mode = session_input.rollout_mode
+        self._remaining_timeout = spec.timeout_s
+        self._process: Optional[_LauncherProcess] = None
+        self._launch_finished = asyncio.Event()
+        self._timeout_started: Optional[float] = None
+        self._timeout_task: Optional["asyncio.Task[None]"] = None
+        self._timed_out = False
+        self._terminated = False
+        self._output = SessionOutput()
+        self._task = asyncio.create_task(
+            self._run(session_input.to_agent_payload()),
+            name=f"managed-agent:{session_input.session_id}",
+        )
+        self._task.add_done_callback(lambda _: self._launch_finished.set())
+
+    async def wait(self) -> None:
+        """Wait for the managed process task."""
+
+        await asyncio.shield(self._task)
+
+    @property
+    def output(self) -> SessionOutput:
+        """Expose terminal agent output after process completion."""
+
+        return self._output
+
+    async def set_timeout_active(self, active: bool) -> None:
+        """Start or pause the process active-time budget."""
+
+        if self._task.done():
+            return
+        if active:
+            if self._timeout_started is not None:
+                return
+            self._timeout_started = time.monotonic()
+            self._timeout_task = asyncio.create_task(
+                self._expire_timeout(),
+                name=f"managed-agent-timeout:{self._session_id}",
+            )
+            return
+        await self._pause_timeout()
+
+    async def terminate_and_join(self) -> None:
+        """Terminate the process group and join its task."""
+
+        self._terminated = True
+        await self._pause_timeout()
+
+        async def terminate() -> None:
+            await self._launch_finished.wait()
+            process = self._process
+            if process is not None:
+                await process.terminate()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+        try:
+            await asyncio.wait_for(
+                terminate(),
+                timeout=_TERMINATION_RESPONSE_TIMEOUT_SECONDS + _TERMINATION_GRACE_SECONDS,
+            )
+        except Exception:
+            pass
+        finally:
+            if not self._task.done():
+                self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _run(self, input_payload: Mapping[str, Any]) -> None:
+        """Run one external agent process for its owning Session."""
+
+        process_events: dict[str, Any] = {}
+        mark_agentic_event(process_events, "managed_prepare_start_at")
+        with tempfile.TemporaryDirectory(prefix="relax-agentic-command-") as session_dir:
+            session_path = Path(session_dir)
+            input_path = session_path / "session_input.json"
+            output_path = session_path / "session_output.json"
+            log_path = session_path / "command.log"
+            input_path.write_text(
+                json.dumps(input_payload, separators=(",", ":"), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            del input_payload
+            env = {
+                **os.environ,
+                **{str(key): str(value) for key, value in self._spec.env.items()},
+                "RELAX_SESSION_ID": self._session_id,
+                "RELAX_ROLLOUT_MODE": self._rollout_mode,
+                "RELAX_GROUP_ID": self._group_id,
+                "RELAX_SESSION_IO_DIR": session_dir,
+                "RELAX_INPUT_JSON": str(input_path),
+                "RELAX_OUTPUT_JSON": str(output_path),
             }
+            mark_agentic_event(process_events, "managed_prepare_end_at")
+            try:
+                mark_agentic_event(process_events, "managed_launch_start_at")
+                mark_agentic_event(process_events, "managed_process_start_at")
+                self._process = await self._launcher.launch(
+                    command=self._spec.command,
+                    cwd=self._spec.cwd,
+                    env=env,
+                    log_path=str(log_path),
+                    session_dir=session_dir,
+                )
+                mark_agentic_event(process_events, "managed_process_spawn_return_at")
+                mark_agentic_event(process_events, "managed_launch_return_at")
+                self._launch_finished.set()
+                return_code = await self._process.wait()
+                mark_agentic_event(process_events, "managed_process_exit_at")
+                log_tail = _read_log_tail(log_path)
+                if self._timed_out:
+                    raise AgentExecutionError(
+                        f"Managed command agent timed out after {self._spec.timeout_s} seconds.\n{log_tail}".rstrip()
+                    )
+                if return_code != 0 and not self._terminated:
+                    raise AgentExecutionError(
+                        f"Managed command agent exited with code {return_code}.\n{log_tail}".rstrip()
+                    )
+                if output_path.exists():
+                    try:
+                        output_text = output_path.read_text(encoding="utf-8")
+                        mark_agentic_event(process_events, "managed_output_read_at")
+                        self._output = _session_output_from_text(output_text)
+                    except Exception as error:
+                        raise AgentExecutionError(
+                            f"Managed command agent produced invalid output.\n{log_tail}".rstrip()
+                        ) from error
+                mark_agentic_event(process_events, "managed_output_ready_at")
+                agentic_trace_events(self._output.metadata).update(process_events)
+            finally:
+                self._launch_finished.set()
+                if self._process is not None:
+                    await self._process.close()
+                    self._process = None
+                await self._pause_timeout()
+
+    async def _expire_timeout(self) -> None:
+        """Terminate the process after its active-time budget expires."""
+
+        await asyncio.sleep(self._remaining_timeout)
+        self._timed_out = True
+        await self._launch_finished.wait()
+        process = self._process
+        if process is not None:
+            await process.terminate()
+
+    async def _pause_timeout(self) -> None:
+        """Retain the remaining timeout budget across generation gates."""
+
+        started = self._timeout_started
+        self._timeout_started = None
+        if started is not None:
+            self._remaining_timeout -= time.monotonic() - started
+        timeout_task = self._timeout_task
+        self._timeout_task = None
+        if timeout_task is not None and timeout_task is not asyncio.current_task():
+            timeout_task.cancel()
+            await asyncio.gather(timeout_task, return_exceptions=True)
+
+
+def _read_log_tail(path: Path, limit: int = 8192) -> str:
+    """Read bounded managed-agent diagnostics."""
+
+    with path.open("rb") as log_file:
+        log_file.seek(0, os.SEEK_END)
+        size = log_file.tell()
+        log_file.seek(max(0, size - limit))
+        return log_file.read().decode("utf-8", errors="replace")
+
+
+class ManagedAgentLauncher:
+    """Bind the managed command template to the node-local launcher."""
+
+    def __init__(self, app: ManagedCommandAppSpec, base_url: str) -> None:
+        self._app = ManagedCommandAppSpec(
+            command=app.command,
+            cwd=app.cwd,
+            env={**app.env, "RELAX_BASE_URL": base_url},
+            timeout_s=app.timeout_s,
+        )
+        self._launcher = LauncherClient(ensure_local_launcher_daemon())
+
+    def start_agent(self, session_input: SessionInput) -> ManagedAgentProcess:
+        """Create one process whose lifetime is owned by the Session record."""
+
+        return ManagedAgentProcess(
+            self._launcher,
+            self._app,
+            session_input,
         )
 
-    async def kill_all(self, *, signal_value: int = 15) -> dict[str, Any]:
-        return await self._request({"op": "kill_all", "signal": int(signal_value)})
 
-    async def shutdown(self) -> dict[str, Any]:
-        return await self._request({"op": "shutdown"})
+def _launcher_token(value: str) -> str:
+    """Normalize one launcher namespace token."""
 
-
-def _sanitize_token(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "-", value).strip("-") or "unknown"
 
 
-def _launcher_launch_concurrency() -> int:
-    raw_value = Envs.RELAX_AGENTIC_LAUNCHER_CONCURRENCY
-    if raw_value is not None:
-        concurrency = int(raw_value)
-        if concurrency <= 0:
-            raise ValueError("RELAX_AGENTIC_LAUNCHER_CONCURRENCY must be a positive integer.")
-        return concurrency
-    return max(16, min(128, os.cpu_count() or 16))
+def _launcher_namespace() -> str:
+    """Derive the per-Ray-job launcher namespace."""
 
-
-def _launcher_launch_semaphore() -> asyncio.BoundedSemaphore:
-    global _LAUNCH_SEMAPHORE
-    if _LAUNCH_SEMAPHORE is None:
-        _LAUNCH_SEMAPHORE = asyncio.BoundedSemaphore(_launcher_launch_concurrency())
-    return _LAUNCH_SEMAPHORE
-
-
-def _launcher_job_token() -> str:
-    explicit_namespace = Envs.RELAX_LAUNCHER_NAMESPACE
-    if explicit_namespace:
-        return _sanitize_token(explicit_namespace)
-    job_id = Envs.RAY_JOB_ID
-    if job_id:
-        return _sanitize_token(job_id)
-    repo_root = Envs.RELAX
-    if repo_root:
-        return _sanitize_token(repo_root)
-    return "standalone"
-
-
-def _launcher_user_token() -> str:
-    user = Envs.USER or Envs.LOGNAME
-    if user:
-        return _sanitize_token(user)
-    return str(os.getuid())
+    explicit = Envs.RELAX_LAUNCHER_NAMESPACE
+    if explicit:
+        return _launcher_token(explicit)
+    ray_job_id = Envs.RAY_JOB_ID
+    if ray_job_id:
+        return _launcher_token(ray_job_id)
+    repository = str(_REPOSITORY_ROOT)
+    return f"local-{hashlib.sha256(repository.encode()).hexdigest()[:12]}"
 
 
 def launcher_socket_path() -> str:
-    return f"/tmp/relax-agentic-launcher-{_launcher_user_token()}-{_launcher_job_token()}.sock"
+    """Return the node-local launcher socket path."""
+
+    user = _launcher_token(Envs.USER or Envs.LOGNAME or str(os.getuid()))
+    return f"/tmp/relax-agentic-launcher-{user}-{_launcher_namespace()}.sock"
 
 
-def _launcher_log_dir() -> str:
-    return f"/tmp/relax-agentic-launcher-{_launcher_user_token()}-{_launcher_job_token()}-logs"
+def _ping_launcher(socket_path: str) -> None:
+    """Probe launcher readiness and protocol compatibility."""
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(1.0)
+        client.connect(socket_path)
+        client.sendall(_encode_launcher_message({"op": "ping"}))
+        raw_size = bytearray()
+        while len(raw_size) < _LAUNCHER_MESSAGE_SIZE.size:
+            chunk = client.recv(_LAUNCHER_MESSAGE_SIZE.size - len(raw_size))
+            if not chunk:
+                raise LauncherProtocolError("launcher ping returned an incomplete size")
+            raw_size.extend(chunk)
+        (size,) = _LAUNCHER_MESSAGE_SIZE.unpack(raw_size)
+        body = bytearray()
+        while len(body) < size:
+            chunk = client.recv(size - len(body))
+            if not chunk:
+                raise LauncherProtocolError("launcher ping returned an incomplete body")
+            body.extend(chunk)
+        if json.loads(body) != {"ok": True, "protocol": _LAUNCHER_PROTOCOL_VERSION}:
+            raise LauncherProtocolError("launcher ping returned an invalid response")
 
 
-def _launcher_lock_path(socket_path: str) -> str:
-    return f"{socket_path}.lock"
+def _wait_for_launcher(socket_path: str) -> None:
+    """Wait for bounded launcher daemon bootstrap."""
 
-
-class _LauncherBootstrapLock:
-    def __init__(self, *, socket_path: str):
-        self._lock_path = _launcher_lock_path(socket_path)
-        self._fh = None
-
-    def __enter__(self):
-        self._fh = open(self._lock_path, "a+", encoding="utf-8")
-        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        del exc_type, exc, tb
-        if self._fh is None:
-            return
+    deadline = time.monotonic() + _LAUNCHER_BOOTSTRAP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
         try:
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._fh.close()
-            self._fh = None
-
-
-def _wait_for_socket(socket_path: str, *, timeout_s: float = _DEFAULT_BOOTSTRAP_TIMEOUT_S) -> None:
-    deadline = time.time() + timeout_s
-    last_error: Exception | None = None
-    while time.time() < deadline:
-        try:
-            _ping_socket(socket_path)
+            _ping_launcher(socket_path)
             return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.1)
-    raise RuntimeError(f"Launcher daemon did not become ready at {socket_path}: {last_error}")
+        except (OSError, LauncherProtocolError, json.JSONDecodeError):
+            time.sleep(0.05)
+    raise RuntimeError(f"launcher daemon did not become ready: {socket_path}")
 
 
-def _spawn_daemon_process(*, socket_path: str, log_dir: str) -> None:
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
-    node_name = _sanitize_token(socket.gethostname())
-    log_path = Path(log_dir) / f"launcher-{node_name}.log"
-    log_fh = log_path.open("a", encoding="utf-8")
-    env = os.environ.copy()
-    repo_root = str(Path(__file__).resolve().parents[3])
-    try:
+def _spawn_launcher_daemon(socket_path: str) -> None:
+    """Spawn the node-local launcher daemon."""
+
+    with Path(f"{socket_path}.log").open("a", encoding="utf-8") as log_file:
         subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "relax.agentic.runner.ipc",
-                "--sock",
+                "-c",
+                f"from {__name__} import _main; _main()",
+                "--launcher-socket",
                 socket_path,
             ],
-            cwd=repo_root,
-            env=env,
+            cwd=_REPOSITORY_ROOT,
+            env=os.environ.copy(),
             stdin=subprocess.DEVNULL,
-            stdout=log_fh,
+            stdout=log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
         )
-    finally:
-        log_fh.close()
 
 
 def ensure_local_launcher_daemon() -> str:
+    """Return this node's launcher socket, starting its daemon when needed."""
+
     socket_path = launcher_socket_path()
-    with _LauncherBootstrapLock(socket_path=socket_path):
-        if os.path.exists(socket_path):
+    with open(f"{socket_path}.lock", "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if Path(socket_path).exists():
             try:
-                _wait_for_socket(socket_path, timeout_s=0.2)
+                _ping_launcher(socket_path)
                 return socket_path
-            except Exception:
-                try:
-                    os.unlink(socket_path)
-                except OSError:
-                    pass
-        _spawn_daemon_process(socket_path=socket_path, log_dir=_launcher_log_dir())
-        _wait_for_socket(socket_path)
-    return socket_path
+            except (OSError, LauncherProtocolError, json.JSONDecodeError):
+                Path(socket_path).unlink()
+        _spawn_launcher_daemon(socket_path)
+        _wait_for_launcher(socket_path)
+        return socket_path
 
 
-@dataclass
-class _CompletedProcess:
-    exit_code: int
-    stdout_b64: str
-    stderr_b64: str
-    started_at: float
-    exited_at: float
+class _ProcessGroup:
+    """Daemon-owned lifetime for one launcher command and all descendants."""
 
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self._process = process
+        # start_new_session=True makes the child a session and process-group
+        # leader, so its PID is the stable PGID even if the leader exits before
+        # the daemon can query the kernel again.
+        self.pgid = process.pid
+        self.exit_task = asyncio.create_task(process.wait(), name=f"launcher-pgid:{self.pgid}")
+        self._termination_task: Optional["asyncio.Task[tuple[int, bool]]"] = None
 
-@dataclass
-class _ProcHandle:
-    proc: asyncio.subprocess.Process
-    pgid: int | None
-    started_at: float
-    completed: _CompletedProcess | None = None
-    wait_task: asyncio.Task | None = None
+    def alive(self) -> bool:
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
 
-    async def _wait_once(self) -> _CompletedProcess:
-        stdout, stderr = await self.proc.communicate()
-        exited_at = time.time()
-        self.completed = _CompletedProcess(
-            exit_code=int(self.proc.returncode if self.proc.returncode is not None else -1),
-            stdout_b64=base64.b64encode(stdout).decode("ascii"),
-            stderr_b64=base64.b64encode(stderr).decode("ascii"),
-            started_at=self.started_at,
-            exited_at=exited_at,
-        )
-        return self.completed
+    def signal(self, signal_value: signal.Signals) -> None:
+        try:
+            os.killpg(self.pgid, signal_value)
+        except ProcessLookupError:
+            pass
 
-    async def wait(self) -> _CompletedProcess:
-        if self.completed is not None:
-            return self.completed
-        if self.wait_task is None:
-            self.wait_task = asyncio.create_task(self._wait_once())
-        return await self.wait_task
+    async def terminate_and_join(self) -> tuple[int, bool]:
+        """Close the whole group once, escalating from TERM to KILL."""
 
+        if self._termination_task is None:
+            self._termination_task = asyncio.create_task(
+                self._terminate_and_join(),
+                name=f"launcher-terminate-pgid:{self.pgid}",
+            )
+        try:
+            return await asyncio.shield(self._termination_task)
+        except asyncio.CancelledError:
+            await self._termination_task
+            raise
 
-_HANDLES: dict[str, _ProcHandle] = {}
+    async def _terminate_and_join(self) -> tuple[int, bool]:
+        if await self._wait_closed(0):
+            return self._return_code(), True
+        self.signal(signal.SIGTERM)
+        if not await self._wait_closed(_TERMINATION_GRACE_SECONDS):
+            self.signal(signal.SIGKILL)
+            if not await self._wait_closed(_TERMINATION_GRACE_SECONDS):
+                return self._return_code(), False
+        return self._return_code(), True
 
+    def _return_code(self) -> int:
+        return_code = self._process.returncode
+        return return_code if return_code is not None else -int(signal.SIGKILL)
 
-def _process_group_alive(pgid: int | None) -> bool:
-    if pgid is None:
-        return False
-    try:
-        os.killpg(pgid, 0)
-        return True
-    except ProcessLookupError:
-        return False
+    async def _wait_closed(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            if self.exit_task.done():
+                self._reap_exited_descendants()
+                if not self.alive():
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.05, deadline - time.monotonic()))
 
-
-def _kill_process_group(pgid: int | None, signal_value: int) -> bool:
-    if pgid is None:
-        return False
-    try:
-        os.killpg(pgid, signal_value)
-        return True
-    except ProcessLookupError:
-        return False
-
-
-async def _wait_for_process_exit(proc_handle: _ProcHandle, *, timeout_s: float) -> _CompletedProcess | None:
-    deadline = time.monotonic() + max(0.0, timeout_s)
-    completed = proc_handle.completed
-    while True:
-        remaining_s = deadline - time.monotonic()
-        if completed is None:
-            if remaining_s <= 0:
-                return None
+    def _reap_exited_descendants(self) -> None:
+        while True:
             try:
-                completed = await asyncio.wait_for(asyncio.shield(proc_handle.wait()), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                return None
-        if not _process_group_alive(proc_handle.pgid):
-            return completed
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0:
-            return None
-        await asyncio.sleep(min(0.05, remaining_s))
+                pid, _ = os.waitpid(-self.pgid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid <= 0:
+                return
 
 
-async def _launch(request: dict[str, object]) -> dict[str, object]:
+async def _supervise_launcher_process(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    process_group: _ProcessGroup,
+    session_dir: Path,
+) -> None:
+    """Bind process lifetime and orphan cleanup to its owner connection."""
+
+    request_task = asyncio.create_task(_read_launcher_message(reader))
+    owner_disappeared = False
+    try:
+        done, _ = await asyncio.wait(
+            (process_group.exit_task, request_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if process_group.exit_task not in done:
+            try:
+                request = request_task.result()
+            except asyncio.IncompleteReadError:
+                owner_disappeared = True
+                return
+            if request.get("op") != "terminate":
+                raise LauncherProtocolError(f"launcher expected a terminate message, got {request!r}")
+        return_code, group_closed = await process_group.terminate_and_join()
+        try:
+            await _write_launcher_message(
+                writer,
+                {"op": "exit", "return_code": return_code, "group_closed": group_closed},
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            owner_disappeared = True
+            return
+        if not request_task.done():
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        await reader.read()
+    finally:
+        await process_group.terminate_and_join()
+        if not request_task.done():
+            request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        if owner_disappeared:
+            try:
+                shutil.rmtree(session_dir)
+            except FileNotFoundError:
+                pass
+
+
+async def _launch_for_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: Mapping[str, Any],
+) -> None:
+    """Execute one command with file-backed diagnostics."""
+
     command = request.get("command")
     cwd = request.get("cwd")
     env = request.get("env")
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("Launcher daemon requires a non-empty command string.")
-    if cwd is not None and not isinstance(cwd, str):
-        raise TypeError("Launcher daemon cwd must be a string when provided.")
+    log_path = request.get("log_path")
+    session_dir = request.get("session_dir")
+    if not all(isinstance(value, str) for value in (command, cwd, log_path, session_dir)):
+        raise LauncherProtocolError("launcher command, cwd, log_path, and session_dir must be strings")
     if not isinstance(env, dict):
-        raise TypeError("Launcher daemon env must be a JSON object.")
-    merged_env = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
-    queue_entered_at = time.time()
-    async with _launcher_launch_semaphore():
-        permit_acquired_at = time.time()
-        started_at = time.time()
-        proc = await asyncio.create_subprocess_exec(
+        raise LauncherProtocolError("launcher env must be a JSON object")
+    with Path(log_path).open("ab") as log_file:
+        process = await asyncio.create_subprocess_exec(
             "/bin/bash",
             "-lc",
             command,
             cwd=cwd,
-            env=merged_env,
+            env={str(key): str(value) for key, value in env.items()},
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=log_file,
+            stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
-            close_fds=True,
         )
-    spawn_returned_at = time.time()
+    process_group = _ProcessGroup(process)
     try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        pgid = None
-    handle = uuid4().hex
-    _HANDLES[handle] = _ProcHandle(proc=proc, pgid=pgid, started_at=started_at)
-    return {
-        "handle": handle,
-        "pid": proc.pid,
-        "launch_queue_entered_at": queue_entered_at,
-        "launch_permit_acquired_at": permit_acquired_at,
-        "started_at": started_at,
-        "spawn_returned_at": spawn_returned_at,
-    }
-
-
-async def _wait(request: dict[str, object]) -> dict[str, object]:
-    handle = request.get("handle")
-    if not isinstance(handle, str) or not handle:
-        raise ValueError("Launcher daemon wait requires a non-empty handle.")
-    proc_handle = _HANDLES.get(handle)
-    if proc_handle is None:
-        raise KeyError(f"Unknown launcher handle: {handle}")
-    try:
-        completed = await proc_handle.wait()
-        return {
-            "handle": handle,
-            "exit_code": completed.exit_code,
-            "stdout_b64": completed.stdout_b64,
-            "stderr_b64": completed.stderr_b64,
-            "started_at": completed.started_at,
-            "exited_at": completed.exited_at,
-        }
+        await _write_launcher_message(writer, {"op": "started"})
+        await _supervise_launcher_process(reader, writer, process_group, Path(session_dir))
+    except (BrokenPipeError, ConnectionResetError):
+        try:
+            shutil.rmtree(session_dir)
+        except FileNotFoundError:
+            pass
     finally:
-        _HANDLES.pop(handle, None)
+        await process_group.terminate_and_join()
 
 
-async def _kill(request: dict[str, object]) -> dict[str, object]:
-    handle = request.get("handle")
-    signal_value = request.get("signal", signal.SIGTERM)
-    forget = request.get("forget", True)
-    wait = request.get("wait", False)
-    force = request.get("force", False)
-    wait_timeout_s = request.get("wait_timeout_s", _DEFAULT_TERMINATION_WAIT_TIMEOUT_S)
-    force_signal_value = request.get("force_signal", signal.SIGKILL)
-    force_wait_timeout_s = request.get(
-        "force_wait_timeout_s",
-        _DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
-    )
-    if not isinstance(handle, str) or not handle:
-        raise ValueError("Launcher daemon kill requires a non-empty handle.")
-    if not isinstance(signal_value, int):
-        raise TypeError("Launcher daemon signal must be an integer.")
-    if not isinstance(forget, bool):
-        raise TypeError("Launcher daemon forget flag must be a boolean.")
-    if not isinstance(wait, bool):
-        raise TypeError("Launcher daemon wait flag must be a boolean.")
-    if not isinstance(force, bool):
-        raise TypeError("Launcher daemon force flag must be a boolean.")
-    if not isinstance(wait_timeout_s, (int, float)):
-        raise TypeError("Launcher daemon wait timeout must be numeric.")
-    if not isinstance(force_signal_value, int):
-        raise TypeError("Launcher daemon force signal must be an integer.")
-    if not isinstance(force_wait_timeout_s, (int, float)):
-        raise TypeError("Launcher daemon force wait timeout must be numeric.")
-    proc_handle = _HANDLES.get(handle)
-    if proc_handle is None:
-        # Killing an unknown handle is idempotent success: the target process is
-        # already gone (daemon restarted, handle already forgotten, or process
-        # reaped), so the goal of kill is satisfied. Raising here would surface a
-        # spurious release failure and trigger an unnecessary Global Restart.
-        logger.warning("Launcher daemon kill for unknown handle treated as already-terminated: %s", handle)
-        return {"handle": handle, "killed": False, "waited": bool(wait), "already_gone": True}
-    completed: _CompletedProcess | None = None
-    forced_best_effort = False
+async def _handle_launcher_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Dispatch ping or launch for one daemon connection."""
+
     try:
-        killed = _kill_process_group(proc_handle.pgid, signal_value)
-        if wait:
-            completed = await _wait_for_process_exit(proc_handle, timeout_s=float(wait_timeout_s))
-            force_sent = False
-            if completed is None and force:
-                force_sent = _kill_process_group(proc_handle.pgid, int(force_signal_value))
-                completed = await _wait_for_process_exit(proc_handle, timeout_s=float(force_wait_timeout_s))
-            if completed is None:
-                if force_sent:
-                    # SIGKILL has been delivered but the process group has not
-                    # confirmed exit within the wait window. This happens when a
-                    # descendant (e.g. an apptainer `starter`) is wedged in an
-                    # uninterruptible (D-state) kernel call on slow shared
-                    # storage: SIGKILL cannot be caught or ignored, so the target
-                    # is guaranteed to terminate once that call returns, but we
-                    # cannot observe it now. Raising here surfaces a spurious
-                    # release failure that escalates to a Controller global
-                    # restart (which force-kills the actor + inference engine
-                    # mid-step) -- far more destructive than tolerating a doomed
-                    # process. Report best-effort success and forget the handle;
-                    # normal child reaping collects it once the syscall returns.
-                    forced_best_effort = True
-                    logger.warning(
-                        "Launcher process not confirmed exited after SIGKILL; treating as "
-                        "best-effort terminated (kill pending, likely a D-state child on slow "
-                        "storage): handle=%s pid=%s pgid=%s",
-                        handle,
-                        proc_handle.proc.pid,
-                        proc_handle.pgid,
-                    )
-                    return {
-                        "handle": handle,
-                        "killed": killed,
-                        "waited": True,
-                        "force_sent": force_sent,
-                        "exit_code": None,
-                        "exited_at": None,
-                        "exit_confirmed": False,
-                    }
-                raise RuntimeError(
-                    "Launcher process did not exit after termination: "
-                    f"handle={handle} pid={proc_handle.proc.pid} pgid={proc_handle.pgid} signal={signal_value} "
-                    f"force_sent={force_sent}."
-                )
-            return {
-                "handle": handle,
-                "killed": killed,
-                "waited": True,
-                "force_sent": force_sent,
-                "exit_code": completed.exit_code,
-                "exited_at": completed.exited_at,
-            }
-        return {"handle": handle, "killed": killed, "waited": False}
-    finally:
-        if forget and (not wait or completed is not None or forced_best_effort):
-            _HANDLES.pop(handle, None)
-
-
-async def _kill_all(request: dict[str, object]) -> dict[str, object]:
-    signal_value = request.get("signal", signal.SIGTERM)
-    if not isinstance(signal_value, int):
-        raise TypeError("Launcher daemon signal must be an integer.")
-    handles = list(_HANDLES.items())
-    for handle, proc_handle in handles:
-        _kill_process_group(proc_handle.pgid, signal_value)
-    failed_handles: list[str] = []
-    for handle, proc_handle in handles:
-        completed = await _wait_for_process_exit(
-            proc_handle,
-            timeout_s=_DEFAULT_TERMINATION_WAIT_TIMEOUT_S,
-        )
-        if completed is None:
-            _kill_process_group(proc_handle.pgid, signal.SIGKILL)
-            completed = await _wait_for_process_exit(
-                proc_handle,
-                timeout_s=_DEFAULT_FORCE_TERMINATION_WAIT_TIMEOUT_S,
+        request = await _read_launcher_message(reader)
+        if request.get("op") == "ping":
+            await _write_launcher_message(
+                writer,
+                {"ok": True, "protocol": _LAUNCHER_PROTOCOL_VERSION},
             )
-        if completed is None:
-            failed_handles.append(handle)
-            continue
-        _HANDLES.pop(handle, None)
-    return {"killed": len(handles) - len(failed_handles), "failed": len(failed_handles)}
-
-
-async def _shutdown() -> dict[str, object]:
-    await _kill_all({"signal": int(signal.SIGTERM)})
-    asyncio.get_running_loop().call_soon(asyncio.get_running_loop().stop)
-    return {"shutdown": True}
-
-
-async def _dispatch(request: dict[str, object]) -> dict[str, object]:
-    op = request.get("op")
-    if op == "ping":
-        return {"ok": True}
-    if op == "launch":
-        return await _launch(request)
-    if op == "wait":
-        return await _wait(request)
-    if op == "kill":
-        return await _kill(request)
-    if op == "kill_all":
-        return await _kill_all(request)
-    if op == "shutdown":
-        return await _shutdown()
-    raise ValueError(f"Unknown launcher daemon operation: {op!r}")
-
-
-async def _handle_client(reader, writer) -> None:
-    response: dict[str, object] | None = None
-    try:
-        request = await read_message(reader)
-        response = await _dispatch(request)
+        elif request.get("op") == "launch":
+            await _launch_for_client(reader, writer, request)
+        else:
+            raise LauncherProtocolError(f"unknown launcher operation: {request.get('op')!r}")
     except asyncio.IncompleteReadError:
-        response = None
-    except Exception as exc:
-        logger.exception("Launcher daemon request failed: %s", exc)
-        response = {"error": {"type": type(exc).__name__, "message": str(exc)}}
-    try:
-        if response is not None:
-            await write_message(writer, response)
+        pass
+    except Exception as error:
+        try:
+            await _write_launcher_message(writer, {"error": str(error)})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     finally:
         writer.close()
         try:
             await writer.wait_closed()
-        except Exception:
-            return
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
-async def _run_server(*, socket_path: str) -> None:
+async def _run_launcher_daemon(socket_path: str) -> None:
+    """Run the node-local launcher Unix server."""
+
     socket_file = Path(socket_path)
-    socket_file.parent.mkdir(parents=True, exist_ok=True)
-    if socket_file.exists():
-        socket_file.unlink()
-    server = await asyncio.start_unix_server(_handle_client, path=socket_path, backlog=_LAUNCHER_SERVER_BACKLOG)
-    async with server:
-        await server.serve_forever()
+    socket_file.unlink(missing_ok=True)
+    loop = asyncio.get_running_loop()
+    stop_requested = asyncio.Event()
+    for signal_value in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(signal_value, stop_requested.set)
+    try:
+        server = await asyncio.start_unix_server(
+            _handle_launcher_client,
+            path=socket_path,
+            backlog=_LAUNCHER_SERVER_BACKLOG,
+        )
+        async with server:
+            await stop_requested.wait()
+    finally:
+        for signal_value in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(signal_value)
+        socket_file.unlink(missing_ok=True)
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
+def _enable_child_subreaper() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _main() -> None:
+    """Run the launcher daemon CLI entrypoint."""
+
     parser = argparse.ArgumentParser(description="Relax agentic launcher daemon")
-    parser.add_argument("--sock", required=True, help="Unix domain socket path for the launcher daemon.")
-    return parser
-
-
-def main() -> None:
-    args = _build_arg_parser().parse_args()
-    logger.info(
-        "Starting launcher daemon on socket %s with backlog=%d launch_concurrency=%d",
-        args.sock,
-        _LAUNCHER_SERVER_BACKLOG,
-        _launcher_launch_concurrency(),
-    )
-    asyncio.run(_run_server(socket_path=args.sock))
+    parser.add_argument("--launcher-socket", required=True)
+    args = parser.parse_args()
+    _enable_child_subreaper()
+    asyncio.run(_run_launcher_daemon(args.launcher_socket))
 
 
 if __name__ == "__main__":
-    main()
+    _main()

@@ -23,6 +23,8 @@ WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
 WEB_PROXY="${WEB_PROXY:-}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=1000}"
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RL_MODEL_TYPE="Qwen36_27B_text"
 export XMLIR_USE_HYDRA_LINEAR=${XMLIR_USE_HYDRA_LINEAR:-1}
 export XMLIR_ENABLE_FAST_FC=${XMLIR_ENABLE_FAST_FC:-1}
 export XMLIR_MATMUL_FAST_MODE=${XMLIR_MATMUL_FAST_MODE:-1}
@@ -194,6 +196,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS}" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --use-health-check \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

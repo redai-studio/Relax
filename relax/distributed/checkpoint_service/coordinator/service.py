@@ -471,14 +471,18 @@ class DCSCoordinator:
 # ============================================================================
 
 
-def create_dcs_deployment(config: Optional[DCSConfig] = None):
+def create_dcs_deployment(
+    config: Optional[DCSConfig] = None,
+    ray_actor_options: Optional[Dict[str, Any]] = None,
+):
     """Create a Ray Serve deployment for the coordinator.
 
     Usage:
         deployment = create_dcs_deployment()
     """
-    coordinator = serve.run(
-        DCSCoordinator.bind(config=config), name="dcs_coordinator", route_prefix="/dcs_coordinator"
-    )
+    deployment = DCSCoordinator
+    if ray_actor_options is not None:
+        deployment = deployment.options(ray_actor_options=ray_actor_options)
+    coordinator = serve.run(deployment.bind(config=config), name="dcs_coordinator", route_prefix="/dcs_coordinator")
     coordinator_url = get_serve_url("dcs_coordinator")
     return coordinator, coordinator_url

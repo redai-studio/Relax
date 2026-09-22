@@ -8,7 +8,7 @@ import pytest
 from relax_nemo_gym_example.app.protocol import TrialResult, TrialStatus
 from relax_nemo_gym_example.app.result import to_relax_output, write_relax_output
 
-from relax.agentic.pipeline.runtime import SessionOutput
+from relax.agentic.runner import SessionOutput
 
 
 def test_scalar_reward_wrapper_maps_to_relax_reward_and_metadata():
@@ -30,7 +30,7 @@ def test_scalar_reward_wrapper_maps_to_relax_reward_and_metadata():
     assert parsed.metadata == payload["metadata"]
 
 
-@pytest.mark.parametrize("reward", [None, 1.0, {"verifier": 1.0}])
+@pytest.mark.parametrize("reward", [0.0, 1.0, {"verifier": 1.0}])
 def test_relax_reward_shapes_are_preserved(reward):
     result = TrialResult(request_id="request-1", status=TrialStatus.TRUNCATED, reward=reward)
 
@@ -47,10 +47,19 @@ def test_non_success_result_cannot_be_materialized():
         to_relax_output(result)
 
 
+@pytest.mark.parametrize("status", [TrialStatus.COMPLETED, TrialStatus.TRUNCATED])
+def test_terminal_result_without_reward_cannot_be_materialized(status):
+    result = TrialResult(request_id="request-1", status=status, reward=None)
+
+    with pytest.raises(ValueError, match="NeMo Gym trial has no reward:.*error_code=missing_reward"):
+        to_relax_output(result)
+
+
 def test_output_drops_gateway_error_message_that_could_contain_secrets():
     result = TrialResult(
         request_id="request-1",
         status=TrialStatus.TRUNCATED,
+        reward=0.0,
         error={"code": "deadline_exceeded", "type": "timeout", "message": "token=session-secret"},
     )
 
