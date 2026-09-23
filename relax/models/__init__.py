@@ -52,6 +52,15 @@ except Exception as _e:
     _logging.getLogger(__name__).warning("Failed to import relax.models.gemma4: %s", _e)
 
 
+# Register the complete K3 VL model in place of upstream's language-only bridge.
+try:
+    from relax.models import kimi_k3  # noqa: F401
+except Exception as _e:
+    from relax.utils.logging_utils import get_logger
+
+    get_logger(__name__).warning("Failed to import relax.models.kimi_k3: %s", _e)
+
+
 # Only advertise what actually got bound: exporting an unbound name here makes
 # `from relax.models import *` die with an unrelated AttributeError.
 __all__ = [_name for _name in _OMNI_NAMES if _name in globals()]
