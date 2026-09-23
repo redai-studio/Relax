@@ -307,3 +307,102 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     _, num_microbatches = data_module.get_data_iterator(args, object(), rollout_data)
 
     assert num_microbatches == [2, 2]
+
+
+@pytest.mark.parametrize("cp_size", [1, 8])
+@pytest.mark.parametrize("text_only", [False, True])
+def test_sft_multimodal_metrics_include_text_samples(monkeypatch, cp_size, text_only):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: cp_size, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group", lambda **kwargs: object(), raising=False)
+    monkeypatch.setattr(data_module.device_utils, "make_current_torch_device", lambda: "cpu")
+    monkeypatch.setattr(data_module.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(data_module, "maybe_padded_total_lengths", lambda *args, **kwargs: None)
+    captured = {}
+
+    def capture(name, args, step, metrics, weights, reductions):
+        captured.update(metrics=metrics, weights=weights, reductions=reductions)
+
+    monkeypatch.setattr(data_module, "gather_log_data", capture)
+    args = Namespace(
+        loss_type="sft",
+        qkv_format="thd",
+        use_opd=False,
+        rollout_batch_size=3,
+        n_samples_per_prompt=1,
+        ci_test=False,
+        log_multi_turn=False,
+    )
+    batch = {
+        "total_lengths": [10, 100, 80],
+        "response_lengths": [10, 100, 80],
+        "loss_masks": [],
+        "learn_lengths": [4, 20, 60],
+        "non_learn_lengths": [6, 80, 20],
+    }
+    if not text_only:
+        batch["multimodal_train_inputs"] = [
+            None,
+            {"image_grid_thw": torch.tensor([[1, 14, 24]])},
+            {
+                "image_grid_thw": torch.tensor([[1, 8, 8], [1, 8, 8]]),
+                "video_grid_thw": torch.tensor([[2, 4, 4]]),
+                "audio_seqlens": torch.tensor([5]),
+            },
+        ]
+    data_module.log_rollout_data(0, args, batch)
+
+    assert "response_lengths" not in captured["metrics"]
+    assert "total_lengths" not in captured["metrics"]
+    for name, values in {
+        "total_lengths": (10, 190 / 3, 100),
+        "learn_lengths": (4, 28, 60),
+        "non_learn_lengths": (6, 106 / 3, 80),
+    }.items():
+        for suffix, value in zip(("min", "mean", "max"), values, strict=True):
+            assert captured["metrics"][f"{name}/{suffix}"] == pytest.approx(value)
+        assert captured["weights"][f"{name}/mean"] == 3
+    expected = {"image_count": (0, 1, 2), "multimodal_token_count": (0, 43, 84)}
+    for name, values in expected.items():
+        for suffix, value in zip(("min", "mean", "max"), values, strict=True):
+            assert captured["metrics"][f"{name}/{suffix}"] == (0 if text_only else value)
+        assert captured["weights"][f"{name}/mean"] == 3
+        assert captured["reductions"][f"{name}/min"] == "min"
+        assert captured["reductions"][f"{name}/max"] == "max"
+
+
+@pytest.mark.parametrize("cp_size", [1, 8])
+def test_gather_multimodal_metrics_weights_dp_samples_and_preserves_extrema(monkeypatch, cp_size):
+    data_module = _load_data_module(monkeypatch)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_rank", lambda **kwargs: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 2 * cp_size, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_src_rank", lambda **kwargs: 0, raising=False)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: "dp_cp", raising=False)
+    monkeypatch.setattr(data_module, "compute_rollout_step", lambda args, step: step)
+    logged = []
+    monkeypatch.setattr(
+        data_module.tracking_utils, "log", lambda args, metrics, **kwargs: logged.append(metrics), raising=False
+    )
+    first = {"image_count/min": 0, "image_count/mean": 0.5, "image_count/max": 1}
+    second = {"image_count/min": 3, "image_count/mean": 3, "image_count/max": 3}
+    weights = {"image_count/mean": 2}
+
+    def gather(local, output, *, dst, group):
+        assert group == "dp_cp"
+        output[:] = [(first, weights)] * cp_size + [(second, {"image_count/mean": 1})] * cp_size
+
+    monkeypatch.setattr(data_module.dist, "gather_object", gather)
+    result = data_module.gather_log_data(
+        "rollout",
+        Namespace(),
+        2,
+        first,
+        weights,
+        {"image_count/min": "min", "image_count/max": "max"},
+    )
+    assert result["rollout/image_count/min"] == 0
+    assert result["rollout/image_count/mean"] == pytest.approx(4 / 3)
+    assert result["rollout/image_count/max"] == 3
+    assert logged == [result]

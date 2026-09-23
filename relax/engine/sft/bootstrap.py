@@ -51,6 +51,7 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
         if config.num_epoch is not None:
             logger.warning("--num-epoch is ignored with --custom-dataset-class; use --num-rollout instead.")
         config.num_rollout_per_epoch = None
+        config.num_rollout_per_epoch_for_metrics = None
         assert config.num_rollout > 0
         return
 
@@ -77,6 +78,9 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
     )
     num_per_epoch, remainder = divmod(dataset_size, config.rollout_batch_size)
     config.num_rollout_per_epoch = num_per_epoch if remainder == 0 else None
+    # Fractional epochs remain meaningful for progress reporting even when
+    # there is no integer step interval suitable for epoch-boundary triggers.
+    config.num_rollout_per_epoch_for_metrics = dataset_size / config.rollout_batch_size
     if config.num_epoch is not None:
         epoch_rollout = dataset_size * config.num_epoch // config.rollout_batch_size
         if config.num_rollout is not None:

@@ -1082,11 +1082,30 @@ def get_data_from_transfer_queue(
 
     if post_process:
         post_process_rollout_data(args, rollout_data)
+    else:
+        _add_sft_token_lengths(args, rollout_data)
 
     return rollout_data, batch_meta
 
 
+def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> None:
+    """Count raw SFT mask positions before moving the masks to the GPU."""
+    if getattr(args, "loss_type", None) != "sft" or "learn_lengths" in rollout_data:
+        return
+    learn_lengths = []
+    for mask in rollout_data["loss_masks"]:
+        mask = torch.as_tensor(mask)
+        if mask.device.type != "cpu":
+            raise ValueError("SFT token lengths must be recorded while loss masks are on CPU")
+        learn_lengths.append(int((mask == 1).sum().item()))
+    rollout_data["learn_lengths"] = learn_lengths
+    rollout_data["non_learn_lengths"] = [
+        total - learn for total, learn in zip(rollout_data["total_lengths"], learn_lengths, strict=True)
+    ]
+
+
 def post_process_rollout_data(args, rollout_data):
+    _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
     if "tokens" not in rollout_data and "chosen_tokens" in rollout_data:

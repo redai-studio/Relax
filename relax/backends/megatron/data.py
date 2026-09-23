@@ -22,6 +22,7 @@ from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
 from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
@@ -815,11 +816,13 @@ def gather_log_data(
     rollout_id: int,
     log_dict: dict[str, float],
     metric_weights: dict[str, int] | None = None,
+    metric_reductions: dict[str, str] | None = None,
 ) -> dict[str, float] | None:
     """Gather per-rank metrics, reduce on the DP source rank, and log.
 
     Expects `log_dict` to contain plain scalars. `metric_weights` provides
     local observation counts for metrics whose DP shards have different sizes.
+    `metric_reductions` selects min/max instead of the default weighted mean.
     The DP source rank prints and optionally logs to WandB/TensorBoard with a
     step derived from `rollout_id` and batch sizes. Returns the reduced dict on
     the DP source rank; returns None on others.
@@ -839,6 +842,11 @@ def gather_log_data(
 
         reduced_log_dict = {}
         for key in log_dict:
+            reduction = (metric_reductions or {}).get(key)
+            if reduction in ("min", "max"):
+                reduce_fn = min if reduction == "min" else max
+                reduced_log_dict[f"{metric_name}/{key}"] = reduce_fn(metrics[key] for metrics, _ in gathered_metrics)
+                continue
             weights = [weights_by_key.get(key, 1) for _, weights_by_key in gathered_metrics]
             reduced_log_dict[f"{metric_name}/{key}"] = sum(
                 metrics[key] * weight for (metrics, _), weight in zip(gathered_metrics, weights, strict=True)
@@ -1313,6 +1321,8 @@ def log_rollout_data(
         cp_size = 1 if getattr(args, "dynamic_context_parallel", False) else mpu.get_context_parallel_world_size()
         log_dict = {}
         metric_weights = {}
+        metric_reductions = {}
+        is_sft = getattr(args, "loss_type", None) == "sft"
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
@@ -1334,6 +1344,8 @@ def log_rollout_data(
         )
 
         for key, val in rollout_data.items():
+            if is_sft and key in ("response_lengths", "total_lengths", "learn_lengths", "non_learn_lengths"):
+                continue
             if key in [
                 "tokens",
                 "multimodal_train_inputs",
@@ -1409,7 +1421,28 @@ def log_rollout_data(
                 continue
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
-        if total_lengths:
+        if is_sft and total_lengths:
+            # Raw per-sample multimodal inputs stay on CPU; count before packing
+            # and include text-only rows as zeros, matching rollout metrics.
+            mm_inputs = rollout_data.get("multimodal_train_inputs")
+            if mm_inputs is None:
+                mm_inputs = [None] * len(total_lengths)
+            counts = {
+                "total_lengths": total_lengths,
+                "learn_lengths": rollout_data["learn_lengths"],
+                "non_learn_lengths": rollout_data["non_learn_lengths"],
+                "image_count": [count_images(None, mm) for mm in mm_inputs],
+                "multimodal_token_count": [get_multimodal_token_counts(mm)["total"] for mm in mm_inputs],
+            }
+            for name, values in counts.items():
+                log_dict[f"{name}/min"] = min(values)
+                log_dict[f"{name}/mean"] = sum(values) / len(values)
+                log_dict[f"{name}/max"] = max(values)
+                metric_weights[f"{name}/mean"] = len(values)
+                metric_reductions[f"{name}/min"] = "min"
+                metric_reductions[f"{name}/max"] = "max"
+
+        if total_lengths and not is_sft:
             dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             stats = torch.tensor(
                 [max(total_lengths), -min(total_lengths)],
@@ -1420,7 +1453,7 @@ def log_rollout_data(
             log_dict["total_lengths/max"] = int(stats[0].item())
             log_dict["total_lengths/min"] = -int(stats[1].item())
 
-        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_weights)
+        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict, metric_weights, metric_reductions)
         if args.ci_test and reduced_log_dict is not None:
             if (
                 rollout_id == 0
