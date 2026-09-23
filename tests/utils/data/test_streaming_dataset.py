@@ -205,6 +205,52 @@ class TestStreamingReader:
         assert len(reader) == 4
         assert [reader[i] for i in range(len(reader))] == combined[1:5]
 
+    def test_composite_reader_parallel_index_preserves_order(self, multi_jsonl_files, monkeypatch):
+        from relax.utils.data.streaming_dataset import CompositeStreamingReader, StreamingReader
+
+        paths, combined = multi_jsonl_files
+        second_done = threading.Event()
+        build_index = StreamingReader._build_index
+
+        def build_out_of_order(reader):
+            if reader.path == paths[0]:
+                assert second_done.wait(timeout=5), "Indexing did not run concurrently"
+            build_index(reader)
+            if reader.path == paths[1]:
+                second_done.set()
+
+        monkeypatch.setattr(StreamingReader, "_build_index", build_out_of_order)
+        reader = CompositeStreamingReader(paths)
+
+        assert [reader[i] for i in range(len(reader))] == combined
+
+    def test_composite_reader_parallel_index_propagates_error(self, multi_jsonl_files, monkeypatch):
+        from relax.utils.data.streaming_dataset import CompositeStreamingReader, StreamingReader
+
+        paths, _ = multi_jsonl_files
+        build_index = StreamingReader._build_index
+
+        def fail_index(reader):
+            if reader.path == paths[1]:
+                raise OSError("index read failed")
+            build_index(reader)
+
+        monkeypatch.setattr(StreamingReader, "_build_index", fail_index)
+        with pytest.raises(OSError, match="index read failed"):
+            CompositeStreamingReader(paths)
+
+    def test_composite_reader_parallel_index_empty_shard_and_slice(self, tmp_path):
+        from relax.utils.data.streaming_dataset import CompositeStreamingReader
+
+        paths = [tmp_path / f"{i}.jsonl" for i in range(3)]
+        paths[0].write_text('\n{"id": 0}\n{"id": 1}\n', encoding="utf-8")
+        paths[1].write_text("\n  \n", encoding="utf-8")
+        paths[2].write_text('{"id": 2}\n{"id": 3}', encoding="utf-8")
+        reader = CompositeStreamingReader([str(path) for path in paths], slice(None, None, -2))
+
+        assert len(reader) == 2
+        assert list(reader.iter_batch([1, 0, 1])) == [(1, {"id": 1}), (0, {"id": 3}), (1, {"id": 1})]
+
 
 class TestSampleBuffer:
     """Tests for SampleBuffer class."""
