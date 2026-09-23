@@ -12,7 +12,7 @@ import torch.distributed as dist
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
-from relax.utils.device import ray_get_device_ids
+from relax.utils.device import device_module, ray_get_device_ids
 from relax.utils.distributed_utils import init_gloo_group
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -63,7 +63,7 @@ class TrainRayActor(RayActor):
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
         local_rank = Envs.LOCAL_RANK
-        device_utils.set_device(f"{device_utils.get_device_name()}:{local_rank}")
+        device_module.set_device(f"{device_utils.get_device_name()}:{local_rank}")
 
         backend = args.distributed_backend
 
