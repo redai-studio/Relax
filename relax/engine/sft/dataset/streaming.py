@@ -184,6 +184,30 @@ def _canonicalize_messages(raw_messages: list[dict], *, require_response: bool) 
             raise ValueError(f"SFT message missing role: {raw}")
         if "content" not in raw:
             raise ValueError(f"SFT message missing content: {raw}")
+        if role == "tool_call":
+            content = raw["content"]
+            # Multimodal build_messages wraps string content in text parts.
+            if isinstance(content, list):
+                if any(not isinstance(part, dict) or part.get("type") != "text" for part in content):
+                    raise ValueError("SFT tool_call content must contain only JSON text.")
+                content = "".join(part["text"] for part in content)
+            call = json.loads(content) if isinstance(content, str) else content
+            if not isinstance(call, dict) or not isinstance(call.get("name"), str) or not call["name"]:
+                raise ValueError("SFT tool_call content must be a JSON object with a nonempty name.")
+            tool_call = {
+                "type": "function",
+                "function": {"name": call["name"], "arguments": call.get("arguments", {})},
+            }
+            learn = bool(raw.get("learn", True))
+            has_learn = has_learn or learn
+            if messages and messages[-1].role == "assistant" and messages[-1].learn == learn:
+                previous = messages[-1]
+                previous.tool_calls = [*(previous.tool_calls or []), tool_call]
+            else:
+                messages.append(CanonicalMessage(role="assistant", content="", learn=learn, tool_calls=[tool_call]))
+            continue
+        if role == "tool_response":
+            role = "tool"
         learn = bool(raw.get("learn", role in _LEARN_ROLES))
         has_learn = has_learn or learn
         messages.append(
