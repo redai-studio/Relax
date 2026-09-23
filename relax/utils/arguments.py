@@ -706,6 +706,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-training-mode",
+                choices=["sft", "cpt"],
+                default="sft",
+                help=(
+                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
+                    "Read text from --input-key (or text/messages when the default input key is absent)."
+                ),
+            )
+            parser.add_argument(
+                "--sft-cpt-template",
+                choices=["raw", "qwen3_5"],
+                default="raw",
+                help=(
+                    "CPT text preprocessing. raw preserves text and supervises all tokens; "
+                    "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
+                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
+                ),
+            )
+            parser.add_argument(
                 "--sft-oversize-strategy",
                 type=str,
                 default="keep",
@@ -3215,6 +3235,33 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_cpt_args(args) -> None:
+    if getattr(args, "sft_training_mode", "sft") != "cpt":
+        if getattr(args, "sft_cpt_template", "raw") != "raw":
+            raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
+        return
+    if args.loss_type != "sft" or getattr(args, "task_type", "causal_lm") != "causal_lm":
+        raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
+    incompatible = {
+        "--label-key": getattr(args, "label_key", None),
+        "--eval-label-key": getattr(args, "eval_label_key", None),
+        "--multimodal-keys": getattr(args, "multimodal_keys", None),
+        "--conversation-key-map": getattr(args, "conversation_key_map", None),
+        "--system-prompt": getattr(args, "system_prompt", None),
+        "--tool-key": getattr(args, "tool_key", None),
+        "--eval-tool-key": getattr(args, "eval_tool_key", None),
+        "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
+        "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
+        "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
+        "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
+        "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
+        "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
+    }
+    enabled = [name for name, value in incompatible.items() if value]
+    if enabled:
+        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+
+
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
     sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
     if sft_max_in_flight_steps is None:
@@ -4233,6 +4280,8 @@ def slime_validate_args(args):
             "will not instantiate sglang servers and will only run the training process."
         )
         args.debug_train_only = True
+
+    _validate_cpt_args(args)
 
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:

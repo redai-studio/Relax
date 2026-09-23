@@ -1,5 +1,7 @@
 # SFT 训练
 
+纯文本持续预训练请参考 [CPT 训练](cpt-training.md)，通过 `--sft-training-mode cpt` 复用本管线。
+
 本指南展示 Relax 中监督微调（SFT）的完整流程，覆盖 [`scripts/training/sft/`](../../../scripts/training/sft/) 下的生成式 SFT、[`examples/seq_cls_sft/`](../../../examples/seq_cls_sft/) 下的原生序列分类 SFT、模型与数据准备、启动命令以及常用调参方法。
 
 开始之前，请先完成[安装](./installation.md)。

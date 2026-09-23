@@ -1,5 +1,7 @@
 # SFT Training
 
+For text-only continued pretraining, see [CPT Training](cpt-training.md). It reuses this pipeline through `--sft-training-mode cpt`.
+
 This guide shows the end-to-end supervised fine-tuning (SFT) workflow in Relax. It covers generative SFT with the current scripts under [`scripts/training/sft/`](../../../scripts/training/sft/), native sequence-classification SFT under [`examples/seq_cls_sft/`](../../../examples/seq_cls_sft/), model and data preparation, launch commands, and practical tuning.
 
 Make sure you have completed [Installation](./installation.md) before running the commands below.

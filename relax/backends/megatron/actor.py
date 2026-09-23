@@ -709,8 +709,6 @@ class MegatronTrainRayActor(TrainRayActor):
             unsupported.append("virtual pipeline parallelism")
         if getattr(self.args, "dynamic_context_parallel", False):
             unsupported.append("dynamic context parallelism")
-        if getattr(self.args, "calculate_per_token_loss", False):
-            unsupported.append("per-token loss")
         if device_utils.get_device_name() != "cuda":
             unsupported.append(f"device={device_utils.get_device_name()}")
         if self.args.qkv_format != "thd":
