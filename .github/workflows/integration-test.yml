@@ -145,13 +145,13 @@ jobs:
           retention-days: 14
 
   npu-integration:
-    name: Qwen3-4B-async-4xnpu
+    name: Qwen3-4B-4xnpu-async
     runs-on: [self-hosted, linux, ARM64, 910c, npu]
     timeout-minutes: 185
     env:
       CI_CONTAINER_NAME: relax-npu-integration-${{ github.run_id }}-${{ github.run_attempt }}
       TRAINING_SCRIPT: scripts/training/text/run-qwen3-4B-4xgpu-async-npu.sh
-      ARTIFACT_NAME: integration-Qwen3-4B-async-4xnpu-${{ github.run_id }}-${{ github.run_attempt }}
+      ARTIFACT_NAME: integration-Qwen3-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
       CLEARML_TAGS: branch=${{ github.head_ref || github.ref_name }},commit=${{ github.sha }}
     steps:
       - name: Checkout
