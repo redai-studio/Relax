@@ -1378,3 +1378,421 @@ index 8503a66..82f5640 100644
      HAVE_TORCH_MEMORY_SAVER = True
  except ImportError:
      HAVE_TORCH_MEMORY_SAVER = False
+--- a/megatron/bridge/models/kimi/kimi_k3_layers.py
++++ b/megatron/bridge/models/kimi/kimi_k3_layers.py
+@@ -23,6 +23,8 @@
+ import torch
+ from einops import rearrange
+ from fla.modules import FusedRMSNormGated, ShortConvolution
++from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
++from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
+ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+ from megatron.core.extensions.transformer_engine import (
+     TEColumnParallelLinear,
+@@ -33,6 +35,13 @@
+ from megatron.core.inference.contexts import BaseInferenceContext
+ from megatron.core.packed_seq_params import PackedSeqParams
+ from megatron.core.process_groups_config import ProcessGroupCollection
++from megatron.core.ssm.gated_delta_net.common import (
++    a2a_cp_to_hp,
++    a2a_hp_to_cp,
++    build_cp_context,
++    causal_conv1d,
++    get_parameter_local_cp,
++)
+ from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+ from megatron.core.tensor_parallel.mappings import (
+     copy_to_tensor_model_parallel_region,
+@@ -123,8 +132,6 @@
+ 
+         self.layer_idx = layer_number - 1
+         self.is_kda = layer_number in config.kimi_kda_layers
+-        if self.is_kda and self.cp_size > 1:
+-            raise ValueError("Kimi K3 KDA context parallelism is not supported yet")
+         if self.is_kda:
+             self._init_kda(config)
+         else:
+@@ -169,6 +176,8 @@
+         )
+ 
+     def _init_kda(self, config) -> None:
++        if getattr(config, "dynamic_context_parallel", False):
++            raise ValueError("Kimi K3 KDA currently supports fixed context parallel groups only.")
+         hidden_size = config.hidden_size
+         device = torch.cuda.current_device()
+         dtype = config.params_dtype
+@@ -176,6 +185,14 @@
+         if self.num_heads % self.tp_size:
+             raise ValueError(f"KDA heads {self.num_heads} must be divisible by TP size {self.tp_size}")
+         self.local_num_heads = self.num_heads // self.tp_size
++        if self.cp_size > 1:
++            cp_mode = config.linear_cp_mode
++            if cp_mode not in ("headwise", "chunkwise"):
++                raise ValueError("Kimi K3 KDA linear_cp_mode must be 'headwise' or 'chunkwise'.")
++            if cp_mode == "headwise" and self.local_num_heads % self.cp_size:
++                raise ValueError("Kimi K3 KDA headwise CP must evenly divide the number of heads per TP rank.")
++            if causal_conv1d is None or (cp_mode == "chunkwise" and build_cp_context is None):
++                raise RuntimeError("Kimi K3 KDA CP requires FLA causal_conv1d and chunkwise CP context support.")
+         self.head_dim = config.kimi_linear_head_dim
+         self.projection_size = self.num_heads * self.head_dim
+         self.local_projection_size = self.local_num_heads * self.head_dim
+@@ -285,6 +302,13 @@
+         hidden_states: torch.Tensor,
+         packed_seq_params: PackedSeqParams | None,
+     ) -> torch.Tensor:
++        if packed_seq_params is not None and (
++            getattr(packed_seq_params, "local_cp_size", None) not in (None, self.cp_size)
++            or getattr(packed_seq_params, "cp_group", None) not in (None, self.cp_group)
++        ):
++            raise ValueError("Kimi K3 KDA currently supports fixed context parallel groups only.")
++        if self.cp_size > 1:
++            return self._forward_kda_context_parallel(hidden_states, packed_seq_params)
+         x = hidden_states.transpose(0, 1)
+         cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
+         if packed_seq_params is not None and cu_seqlens is None:
+@@ -318,6 +342,170 @@
+         output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
+         output = output.view(*gate.shape).flatten(-2)
+         return _linear(self.o_proj, output.to(hidden_states.dtype)).transpose(0, 1)
++
++    def _forward_kda_context_parallel(
++        self,
++        hidden_states: torch.Tensor,
++        packed_seq_params: PackedSeqParams | None,
++    ) -> torch.Tensor:
++        """Run fixed KDA CP while retaining the checkpoint's separate projections."""
++        cp_mode = self.config.linear_cp_mode
++        headwise = cp_mode == "headwise"
++        cp_group_headwise = self.cp_group if headwise else None
++        cp_size_headwise = self.cp_size if headwise else 1
++        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
++        partition_mode = packed_seq_params.cp_partition_mode if is_thd else self.config.cp_partition_mode
++        if headwise and partition_mode != "zigzag":
++            raise ValueError("Kimi K3 KDA headwise CP requires zigzag CP input layout.")
++        if not headwise and hidden_states.shape[1] != 1:
++            raise ValueError("Kimi K3 KDA chunkwise CP requires packed THD or micro_batch_size=1.")
++        if not headwise and hidden_states.shape[0] < self.config.kimi_linear_conv_kernel_size - 1:
++            raise ValueError("Kimi K3 KDA chunkwise CP requires at least convolution kernel size - 1 tokens per rank.")
++        if not headwise and getattr(self.config, "gdn_conv_pad_alignment", None) is not None:
++            raise ValueError("Kimi K3 KDA chunkwise CP does not support gdn_conv_pad_alignment.")
++        if is_thd and hidden_states.shape[1] != 1:
++            raise ValueError("Packed Kimi K3 KDA expects batch dimension 1.")
++
++        cu_seqlens = None
++        cu_seqlens_cpu = None
++        if is_thd:
++            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
++            if cu_seqlens is None:
++                cu_seqlens = packed_seq_params.cu_seqlens_q
++            if cu_seqlens is None:
++                raise ValueError("Packed Kimi K3 KDA requires global cu_seqlens_q boundaries.")
++            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
++            if cu_seqlens_kv is None:
++                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
++            if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
++                raise ValueError("Kimi K3 KDA packed boundaries must be a vector with at least two entries.")
++            if cu_seqlens_kv is None or cu_seqlens.shape != cu_seqlens_kv.shape:
++                raise ValueError("Kimi K3 KDA requires matching query and key/value physical boundaries.")
++            torch._assert_async(
++                (cu_seqlens == cu_seqlens_kv).all(),
++                "Kimi K3 KDA requires matching query and key/value physical boundaries.",
++            )
++            torch._assert_async(
++                (cu_seqlens[0] == 0) & ((cu_seqlens[1:] - cu_seqlens[:-1]) > 0).all(),
++                "Kimi K3 KDA packed boundaries must start at zero and strictly increase.",
++            )
++            torch._assert_async(
++                cu_seqlens[-1] == hidden_states.shape[0] * self.cp_size,
++                "Kimi K3 KDA packed boundaries must cover the global CP sequence.",
++            )
++            if partition_mode == "zigzag":
++                torch._assert_async(
++                    ((cu_seqlens[1:] - cu_seqlens[:-1]) % (2 * self.cp_size) == 0).all(),
++                    "Kimi K3 KDA zigzag packed sequence lengths must be divisible by 2 * CP size.",
++                )
++            host_boundaries = getattr(packed_seq_params, "cu_seqlens_q_cpu", None)
++            if not headwise and host_boundaries is not None:
++                if torch.is_tensor(host_boundaries) and host_boundaries.device.type != "cpu":
++                    raise ValueError("Kimi K3 KDA cu_seqlens_q_cpu must reside on the CPU.")
++                cu_seqlens_cpu = torch.as_tensor(host_boundaries, dtype=cu_seqlens.dtype, device="cpu")
++                if cu_seqlens_cpu.shape != cu_seqlens.shape:
++                    raise ValueError("Kimi K3 KDA host boundaries must match the physical packed boundaries.")
++                torch._assert_async(
++                    (cu_seqlens == cu_seqlens_cpu.to(device=cu_seqlens.device)).all(),
++                    "Kimi K3 KDA host boundaries must match the physical packed boundaries.",
++                )
++                if self.config.cp_partition_mode != "contiguous" and (
++                    getattr(packed_seq_params, "cp_partition_route", None) is None
++                ):
++                    # Reuse this microbatch's route during later layers and
++                    # checkpoint replay without copying CUDA boundaries to CPU.
++                    packed_seq_params.cp_partition_route = build_thd_cp_partition_route(
++                        cu_seqlens_cpu, self.cp_size, self.cp_group.rank(), device=hidden_states.device
++                    )
++
++        back_to_input = None
++        cp_context = None
++        if not headwise:
++            # forward() has already gathered SP shards. Convert the CP layout
++            # without performing a second SP gather or multiplying TP gradients.
++            hidden_states, back_to_input = convert_module_input_tensors_cp_partition_mode(
++                hidden_states=hidden_states,
++                packed_seq_params=packed_seq_params,
++                cp_group=self.cp_group,
++                tp_group=self.tp_group,
++                target_partition_mode="contiguous",
++                sequence_parallel=False,
++                config=self.config,
++            )
++            if cu_seqlens is None:
++                cu_seqlens_cpu = torch.tensor([0, hidden_states.shape[0] * self.cp_size], dtype=torch.long)
++                cu_seqlens = cu_seqlens_cpu.to(device=hidden_states.device)
++            cp_context = build_cp_context(
++                cu_seqlens=cu_seqlens,
++                group=self.cp_group,
++                conv1d_kernel_size=self.config.kimi_linear_conv_kernel_size,
++                cu_seqlens_cpu=cu_seqlens_cpu,
++            )
++
++        projected = (
++            _linear(self.q_proj, hidden_states),
++            _linear(self.k_proj, hidden_states),
++            _linear(self.v_proj, hidden_states),
++            _linear(self.f_b_proj, _linear(self.f_a_proj, hidden_states)),
++            _linear(self.g_proj, hidden_states),
++        )
++        seq_len = hidden_states.shape[0] * cp_size_headwise
++        qkvfg, inverse = a2a_cp_to_hp(
++            torch.cat(projected, dim=-1),
++            (self.local_projection_size,) * 5,
++            cp_size_headwise,
++            cp_group_headwise,
++            cu_seqlens,
++            seq_len,
++            packed_seq_params,
++        )
++        beta, _ = a2a_cp_to_hp(
++            _linear(self.b_proj, hidden_states),
++            (self.local_num_heads,),
++            cp_size_headwise,
++            cp_group_headwise,
++            cu_seqlens,
++            seq_len,
++            packed_seq_params,
++        )
++        q, k, v, forget_gate, gate = torch.chunk(qkvfg.transpose(0, 1), 5, dim=-1)
++        local_heads = self.local_num_heads // cp_size_headwise
++        convolved = []
++        for value, convolution in ((q, self.q_conv1d), (k, self.k_conv1d), (v, self.v_conv1d)):
++            weight = get_parameter_local_cp(convolution.weight, dim=0, cp_group=cp_group_headwise)
++            bias = getattr(convolution, "bias", None)
++            if bias is not None:
++                bias = get_parameter_local_cp(bias, dim=0, cp_group=cp_group_headwise)
++            value, _ = causal_conv1d(
++                x=value.contiguous(),
++                weight=weight.squeeze(1),
++                bias=bias,
++                activation="silu",
++                initial_state=None,
++                output_final_state=False,
++                cu_seqlens=cu_seqlens,
++                cp_context=cp_context,
++            )
++            convolved.append(rearrange(value, "b s (h d) -> b s h d", h=local_heads))
++        forget_gate = rearrange(forget_gate, "b s (h d) -> b s h d", h=local_heads)
++        gate = rearrange(gate, "b s (h d) -> b s h d", h=local_heads)
++        output = kda(
++            *convolved,
++            forget_gate,
++            beta.transpose(0, 1).float().sigmoid(),
++            get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise),
++            get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise),
++            self.gate_lower_bound,
++            cu_seqlens=cu_seqlens,
++            cp_context=cp_context,
++        )
++        output = self.o_norm(output.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim))
++        output = output.reshape(*gate.shape).flatten(-2).transpose(0, 1).contiguous()
++        output = a2a_hp_to_cp(output, cp_size_headwise, cp_group_headwise, packed_seq_params, inverse)
++        output = _linear(self.o_proj, output.to(hidden_states.dtype))
++        if back_to_input is not None:
++            output = back_to_input.convert(output, seq_dim=0, sequence_parallel=False)
++        return output
+ 
+     def _forward_mla(
+         self,
+--- a/megatron/bridge/models/kimi/kimi_k3_ops.py
++++ b/megatron/bridge/models/kimi/kimi_k3_ops.py
+@@ -13,6 +13,8 @@
+ # limitations under the License.
+ 
+ """Numerical operators used by the Kimi K3 language backbone."""
++
++from typing import Any
+ 
+ import torch
+ from torch import nn
+@@ -47,6 +49,7 @@
+     lower_bound: float,
+     *,
+     cu_seqlens: torch.Tensor | None = None,
++    cp_context: Any = None,
+ ) -> torch.Tensor:
+     """Run Kimi Delta Attention while preserving packed-sequence boundaries."""
+     from fla.ops.kda import chunk_kda
+@@ -68,6 +71,7 @@
+         lower_bound=lower_bound,
+         transpose_state_layout=True,
+         cu_seqlens=cu_seqlens,
++        cp_context=cp_context,
+     )
+     return output
+ 
+diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -1330,19 +1330,13 @@
+                             device=torch.cuda.current_device(),
+                             requires_grad=False,
+                         )
+-                with grad_mem_alloc_context():
+-                    self.grad_data = torch.zeros(
+-                        self.numel,
+-                        dtype=self.grad_dtype,
+-                        device=torch.cuda.current_device(),
+-                        requires_grad=False,
+-                    )
+ 
+         self.grad_data_size = 0
+         self.param_data_size = 0
+         self.param_data_cpu = None
+ 
+-        # Finally, map param.data and param.main_grad fields to buffers.
++        # Remap parameters before allocating a separate gradient buffer so the old
++        # parameter storage can be released without overlapping both new buffers.
+         def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+             """
+             Look up precomputed bucket indices and create a new bucket.
+@@ -1374,9 +1368,6 @@
+                 bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+             )
+ 
+-        bucket_params = []
+-        bucket_params_with_extra_main_grads = []
+-        cur_bucket_id = 0
+         for param, param_name in params_with_names[::-1]:
+             # Get parameter indices computed in previous loop.
+             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+@@ -1507,6 +1498,21 @@
+                                     "storage into DDP param_data."
+                                 )
+ 
++        if self.grad_data is None:
++            with mem_alloc_context(), grad_mem_alloc_context():
++                self.grad_data = torch.zeros(
++                    self.numel,
++                    dtype=self.grad_dtype,
++                    device=torch.cuda.current_device(),
++                    requires_grad=False,
++                )
++
++        # Map gradients and construct buckets after all parameter storage is remapped.
++        bucket_params = []
++        bucket_params_with_extra_main_grads = []
++        cur_bucket_id = 0
++        for param, param_name in params_with_names[::-1]:
++            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+             # Grad buffer always uses full-numel offsets from param_index_map.
+             param.main_grad = self._get(
+                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
+diff --git a/megatron/core/optimizer/clip_grads.py b/megatron/core/optimizer/clip_grads.py
+--- a/megatron/core/optimizer/clip_grads.py
++++ b/megatron/core/optimizer/clip_grads.py
+@@ -113,12 +113,17 @@
+             # Use apex's multi-tensor applier for efficiency reasons.
+             # Multi-tensor applier takes a function and a list of list
+             # and performs the operation on that list all in one kernel.
+-            grad_norm, _ = multi_tensor_applier(
+-                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
+-            )
+-            # Since we will be summing across data parallel groups,
+-            # we need the pow(norm-type).
+-            total_norm = grad_norm**norm_type
++            # Fused kernels dispatch on the first tensor's dtype. Precision-aware
++            # optimizers can expose both BF16 and FP32 gradients, so split the calls.
++            grads_by_dtype = {}
++            for grad in grads_for_norm:
++                grads_by_dtype.setdefault(grad.dtype, []).append(grad)
++            for dtype_grads in grads_by_dtype.values():
++                grad_norm, _ = multi_tensor_applier(
++                    l2_norm_impl, dummy_overflow_buf, [dtype_grads], False
++                )
++                # Sum squared norms before the single distributed reduction.
++                total_norm += grad_norm**norm_type
+         else:
+             for grad in grads_for_norm:
+                 grad_norm = torch.norm(grad, norm_type)
+@@ -175,6 +180,11 @@
+                 params.append(param)
+                 grads.append(to_local_if_dtensor(param.grad).detach())
+ 
++    # Fused scaling kernels also require each tensor list to have one dtype.
++    grads_by_dtype = {}
++    for grad in grads:
++        grads_by_dtype.setdefault(grad.dtype, []).append(grad)
++
+     # Scale.
+     clip_coeff = max_norm / (total_norm + 1.0e-6)
+     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+@@ -183,13 +193,18 @@
+         assert (
+             multi_tensor_scale_tensor_impl is not None
+         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+-        multi_tensor_applier(
+-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+-        )
++        for dtype_grads in grads_by_dtype.values():
++            multi_tensor_applier(
++                multi_tensor_scale_tensor_impl,
++                dummy_overflow_buf,
++                [dtype_grads, dtype_grads],
++                clip_coeff,
++            )
+     elif clip_coeff < 1.0:
+-        multi_tensor_applier(
+-            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+-        )
++        for dtype_grads in grads_by_dtype.values():
++            multi_tensor_applier(
++                multi_tensor_scale_impl, dummy_overflow_buf, [dtype_grads, dtype_grads], clip_coeff
++            )
+ 
+ 
+ def count_zeros_fp32(
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -136,6 +136,8 @@
+ 
+ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+     """Copy optimizer-relevant metadata when creating param views/copies."""
++    if hasattr(source, 'allreduce'):
++        destination.allreduce = source.allreduce
+     if hasattr(source, 'shared'):
+         destination.shared = source.shared
+     if hasattr(source, GRAD_NORM_GROUP_ATTR):
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -98,7 +98,10 @@
+     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
+         return True
+     # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
+-    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
++    if not getattr(param, "allreduce", True):
++        if expert_tp_group is None:
++            # Legacy callers pass ordinary TP, which must not filter expert shards.
++            return True
+         tp_group = expert_tp_group
+     # Prefer provided tp_group when available (new explicit path).
+     if tp_group is not None:

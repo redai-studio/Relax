@@ -29,6 +29,7 @@ from relax.engine.sft.dataset.deepseek_chat_template_patch import (
 from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
 from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
+from relax.utils.data.kimi_k3 import encode_kimi_k3_sft, is_kimi_k3_tokenizer, make_kimi_k3_sft_request
 from relax.utils.logging_utils import get_logger
 
 
@@ -705,6 +706,15 @@ def render_with_loss_mask(
     Only supported on the per-message fallback path (the ``{% generation %}``
     template path has no think info).
     """
+    if is_kimi_k3_tokenizer(tokenizer):
+        request = make_kimi_k3_sft_request(
+            sample,
+            apply_chat_template_kwargs,
+            last_turn_only=last_turn_only,
+            ignore_empty_think=ignore_empty_think,
+        )
+        ids, mask = encode_kimi_k3_sft(tokenizer, request)
+        return torch.tensor(ids, dtype=torch.long), torch.tensor(mask, dtype=torch.long)
     patch_result = _resolve_sft_template_kwargs(
         sample,
         tokenizer=tokenizer,
@@ -793,6 +803,11 @@ def render_to_text(
     expands those placeholders to per-image-grid token runs and produces the
     ``input_ids`` the model actually consumes.
     """
+    if is_kimi_k3_tokenizer(tokenizer):
+        request = make_kimi_k3_sft_request(sample, apply_chat_template_kwargs, last_turn_only=last_turn_only)
+        return tokenizer.apply_chat_template(
+            request["messages"], tools=request["tools"], tokenize=False, **request["kwargs"]
+        )
     patch_result = _resolve_sft_template_kwargs(
         sample,
         tokenizer=tokenizer,

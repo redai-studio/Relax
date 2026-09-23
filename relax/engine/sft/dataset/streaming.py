@@ -25,6 +25,12 @@ from relax.utils.data.data_utils import (
     count_message_multimodal_items,
     resolve_path_plan,
 )
+from relax.utils.data.kimi_k3 import (
+    KIMI_K3_SFT_LOSS_MASK,
+    KIMI_K3_SFT_REQUEST,
+    is_kimi_k3_tokenizer,
+    make_kimi_k3_sft_request,
+)
 from relax.utils.data.streaming_dataset import CompositeStreamingReader, IndexManager, PrefetchBuffer, StreamingReader
 from relax.utils.logging_utils import get_logger
 
@@ -768,6 +774,7 @@ class SFTStreamingDataset:
                 rendered.sample,
                 processor_pool=self.processor_pool,
                 rendered_text=rendered.rendered_text or "",
+                **({"processor_kwargs": rendered.processor_kwargs} if rendered.processor_kwargs else {}),
             )
         except Exception as exc:
             if not self._skip_multimodal_processing_error(rendered, exc):
@@ -802,13 +809,27 @@ class SFTStreamingDataset:
             )
             return None
         rendered_text = None
+        processor_kwargs = None
         if has_multimodal_content(sample):
-            rendered_text = render_to_text(
-                sample,
-                tokenizer=self.tokenizer,
-                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
-                last_turn_only=self.loss_last_turn_only,
-            )
+            if is_kimi_k3_tokenizer(self.tokenizer):
+                # Image dimensions are only known inside the processor worker.
+                # K3 must encode its original segments after those prompts are
+                # available; a rendered string would lose literal-token safety.
+                processor_kwargs = {
+                    KIMI_K3_SFT_REQUEST: make_kimi_k3_sft_request(
+                        sample,
+                        self.apply_chat_template_kwargs,
+                        last_turn_only=self.loss_last_turn_only,
+                        ignore_empty_think=self.loss_ignore_empty_think,
+                    )
+                }
+            else:
+                rendered_text = render_to_text(
+                    sample,
+                    tokenizer=self.tokenizer,
+                    apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                    last_turn_only=self.loss_last_turn_only,
+                )
         return _RenderedSample(
             idx=idx,
             sample=sample,
@@ -817,6 +838,7 @@ class SFTStreamingDataset:
             rendered_text=rendered_text,
             total_length=effective_n,
             classification_label=self.get_classification_label(idx, row=row),
+            processor_kwargs=processor_kwargs,
         )
 
     async def _finalize_async(self, rendered: "_RenderedSample") -> ProcessedSample | None:
@@ -825,6 +847,7 @@ class SFTStreamingDataset:
                 rendered.sample,
                 processor_pool=self.processor_pool,
                 rendered_text=rendered.rendered_text or "",
+                **({"processor_kwargs": rendered.processor_kwargs} if rendered.processor_kwargs else {}),
             )
         except Exception as exc:
             if not self._skip_multimodal_processing_error(rendered, exc):
@@ -848,6 +871,11 @@ class SFTStreamingDataset:
         prompt_ids: Any | None,
         mm_inputs: dict[str, Any] | None,
     ) -> ProcessedSample | None:
+        precomputed_mask = None
+        if mm_inputs is not None and KIMI_K3_SFT_LOSS_MASK in mm_inputs:
+            mm_inputs = dict(mm_inputs)
+            precomputed_mask = mm_inputs.pop(KIMI_K3_SFT_LOSS_MASK)
+            mm_inputs = mm_inputs or None
         if prompt_ids is None:
             tokens = rendered.short_ids
             loss_mask = rendered.short_mask
@@ -855,6 +883,10 @@ class SFTStreamingDataset:
             tokens = _to_long_tensor(prompt_ids)
             if self.task_type == "seq_cls":
                 loss_mask = torch.zeros_like(tokens)
+            elif precomputed_mask is not None:
+                loss_mask = _to_long_tensor(precomputed_mask)
+                if loss_mask.shape != tokens.shape:
+                    raise ValueError("Kimi K3 processor loss mask must match the expanded token sequence.")
             else:
                 loss_mask = _expand_loss_mask_via_alignment(
                     short_ids=rendered.short_ids,
@@ -862,6 +894,7 @@ class SFTStreamingDataset:
                     expanded_ids=tokens,
                     pad_token_ids=self._pad_token_ids,
                 )
+        untruncated_tokens = tokens
         if self.task_type == "seq_cls":
             if tokens.numel() == 0:
                 raise ValueError(
@@ -900,6 +933,16 @@ class SFTStreamingDataset:
             if result is None:
                 return None
             tokens, loss_mask = result
+        if tokens is not untruncated_tokens and mm_inputs is not None and is_kimi_k3_tokenizer(self.tokenizer):
+            image_token_id = self.tokenizer.convert_tokens_to_ids("<|media_pad|>")
+            before = int(torch.count_nonzero(untruncated_tokens == image_token_id))
+            after = int(torch.count_nonzero(tokens == image_token_id))
+            if before != after:
+                raise ValueError(
+                    f"Kimi K3 SFT sample idx={rendered.idx}: truncation changed the image token count "
+                    f"from {before} to {after}, but its image features were retained. "
+                    "Increase capacity or use oversize_strategy='skip' to keep image tokens and features aligned."
+                )
         n = int(tokens.shape[0])
         return ProcessedSample(
             tokens=tokens,
@@ -982,6 +1025,7 @@ class _RenderedSample:
     rendered_text: str | None
     total_length: int
     classification_label: torch.Tensor | None
+    processor_kwargs: dict[str, Any] | None = None
 
 
 def _to_long_tensor(ids: Any) -> torch.Tensor:
