@@ -167,7 +167,7 @@ jobs:
           dockerfile: docker/Dockerfile.npu
           platform: linux/arm64
           build-args: |
-            NO_PROXY=localhost,127.0.0.1,::1,gitcode.com,.gitcode.com
+            NO_PROXY=localhost,127.0.0.1,::1,mirrors.tuna.tsinghua.edu.cn
             SOC_VERSION=ascend910_9362
             SOC_VERSION_FOR_SGL_BUILD=Ascend910_9362
           hash-key: ${{ hashFiles('docker/Dockerfile.npu', '.dockerignore', 'requirements.txt', 'docker/npu_patch/**', '.github/actions/prepare-image/action.yml') }}
