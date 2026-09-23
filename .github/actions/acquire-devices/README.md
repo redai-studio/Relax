@@ -5,11 +5,13 @@ steps of a job. The post action releases the reservation at job completion,
 including normal failure and cancellation cleanup.
 
 The action name and allocation core are independent of the accelerator vendor.
-The first supported `backend` is `nvidia`. It discovers whole GPUs using
+The `nvidia` backend discovers whole GPUs using
 `nvidia-smi`, resolves physical indices to UUIDs, and exports
-`CUDA_VISIBLE_DEVICES`. Future NPU/XPU backends can provide discovery and
-visibility handling without changing the lock lifecycle. Unsupported backends
-fail explicitly; this version does not claim NPU, XPU, or MIG support.
+`CUDA_VISIBLE_DEVICES`. The `ascend` backend discovers compute chips using
+`npu-smi info -m` and exports their physical IDs through `ASCEND_VISIBLE_DEVICES`
+for Ascend Docker Runtime. Both backends share the same lock lifecycle.
+Unsupported backends fail explicitly; virtual NPU, XPU, and MIG allocation is
+not supported.
 
 ## Usage
 
@@ -38,16 +40,16 @@ action repository download.
 
 | Input      | Default                | Meaning                                                                                                                            |
 | ---------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `backend`  | `nvidia`               | Device discovery/visibility backend. Currently only `nvidia` is supported.                                                         |
+| `backend`  | `nvidia`               | Device discovery/visibility backend: `nvidia` or `ascend`.                                                                         |
 | `count`    | `1`                    | Positive integer; reserve this many devices from the candidate pool.                                                               |
 | `devices`  | All discovered devices | Optional comma-separated candidate pool of physical `nvidia-smi` indices or full GPU UUIDs. It is a pool, not an additional count. |
 | `timeout`  | `1800`                 | Nonnegative integer seconds waiting for locks, after discovery. `0` tries once. This does not expire an acquired reservation.      |
 | `lock-dir` | `/tmp/acquire-devices` | Absolute local directory shared by all competing runners on the host.                                                              |
 
-Outputs are `devices` (comma-separated canonical UUIDs) and `count`. NVIDIA
+Outputs are `devices` (comma-separated NVIDIA UUIDs or Ascend chip physical IDs) and `count`. NVIDIA
 allocations also set `CUDA_VISIBLE_DEVICES` for subsequent steps. No Python or
-Node package installation is needed; the runner needs Python 3.10+ and
-`nvidia-smi`. Node 24 is supplied by the Actions runner.
+Node package installation is needed; the runner needs Python 3.9+ and
+`nvidia-smi` or `npu-smi` for the selected backend. Node 24 is supplied by the Actions runner.
 
 Use `devices` to restrict allocation to the host devices assigned to CI, for
 example `devices: '0,1,2,3'` with `count: 2`. Indices and UUIDs for the same GPU
@@ -100,6 +102,15 @@ the test workspace/dependencies in the container as appropriate. Container
 cleanup runs before the action's post step. Do not pass host numeric indices
 into the container's `CUDA_VISIBLE_DEVICES`; use UUIDs or let Docker expose
 only the selected devices.
+
+For Ascend, use `backend: ascend` and pass the allocation as
+`--runtime ascend --env "ASCEND_VISIBLE_DEVICES=$CI_DEVICES"`. The optional
+`devices` pool contains chip physical IDs from `npu-smi info -m`, not board IDs
+or container logical IDs. A dual-chip 910C card contributes two devices, so
+`count: 4` reserves four chips (two cards when selecting paired chips).
+Inside a four-chip container, use `ASCEND_RT_VISIBLE_DEVICES=0,1,2,3`.
+Do not copy host physical IDs into that variable. All jobs competing for these
+chips must use this backend and the same host lock directory.
 
 ## Lock and lifecycle contract
 

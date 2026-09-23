@@ -2,7 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 4xGPU fully async training script for CI.
+# Qwen3-4B fully async CI on 4 logical NPUs (2 physical 910C cards when paired).
 #
 # Usage:
 #   bash scripts/training/text/run-qwen3-4B-4xgpu-async-npu.sh
@@ -12,7 +12,7 @@ set -o pipefail
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
-export ASCEND_RT_VISIBLE_DEVICES="12,13,14,15"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}"
 export HCCL_NPU_SOCKET_PORT_RANGE="62000-62050"
 export HCCL_HOST_SOCKET_PORT_RANGE="62100-62200"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -20,26 +20,25 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
-    source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
+   source "${SCRIPT_DIR}/../../entrypoint/local-npu.sh"
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-4B.sh"
 
 PROJECT_NAME="${PROJECT_NAME:-Relax/dev/dapo-math}"
 EXP_DIR="${EXP_DIR:-${SCRIPT_DIR}/../../../../exps}"
+MODEL_DIR="${MODEL_DIR:-${EXP_DIR}}"
+DATA_DIR="${DATA_DIR:-${EXP_DIR}}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-4}"
 
 
 
 CKPT_ARGS=(
-   --hf-checkpoint ${EXP_DIR}/Qwen3-4B/
-   --ref-load ${EXP_DIR}/Qwen3-4B/
+   --hf-checkpoint ${MODEL_DIR}/Qwen3-4B/
+   --ref-load ${MODEL_DIR}/Qwen3-4B/
    --megatron-to-hf-mode bridge
-   # --load ${EXP_DIR}/Qwen3-4B_mcore_4xgpu/
-   --save ${EXP_DIR}/Qwen3-4B_mcore_4xgpu/
-   --save-interval 100
-   )
+)
 
-PROMPT_SET=${EXP_DIR}/dapo-math-17k/dapo-math-17k.jsonl
+PROMPT_SET=${DATA_DIR}/dapo-math-17k/dapo-math-17k.jsonl
 
 ROLLOUT_ARGS=(
    --prompt-data ${PROMPT_SET}
