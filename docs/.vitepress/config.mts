@@ -308,7 +308,8 @@ export default defineConfig({
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
                 { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
-                { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' }
+                { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' },
+                { text: 'Repetition Diagnostics', link: '/en/guide/repetition-diagnostics' }
               ]
             }
           ],
@@ -429,7 +430,8 @@ export default defineConfig({
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
                 { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
-                { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' }
+                { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' },
+                { text: '重复检测与离线诊断', link: '/zh/guide/repetition-diagnostics' }
               ]
             }
           ],
