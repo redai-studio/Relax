@@ -63,6 +63,7 @@ jobs:
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \
+            -v /etc/hosts:/etc/hosts:ro \
             -v "$GITHUB_WORKSPACE:/source:ro" \
             -v "$ARTIFACT_DIR:/artifacts" \
             -v "$HOST_UV_CACHE_DIR:$UV_CACHE_DIR" \
