@@ -123,6 +123,56 @@ python examples/deepeyes_v2_agentic/convert_tool/cache_convert.py \
 
 then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 
+## Text search backends
+
+The `<tool_call>search</tool_call>` branch dispatches through a pluggable
+backend (`app/search_backends.py`), selected with
+`DEEPEYES_V2_SEARCH_BACKEND` (set it in `env.sh`):
+
+| Backend             | Value       | Behaviour                                                                                                                                                                                                                                                    |
+| ------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Mock (default)      | `mock`      | Deterministic offline snippets — no network, no keys, same query always yields the same results.                                                                                                                                                             |
+| Search-R1 retriever | `retriever` | POSTs `{"queries": [...], "topk": k, "return_scores": false}` to any Search-R1 compatible service (e.g. `examples/search_r1/retrieval_server.py`) and maps `result[0]` onto the unified schema (`contents` becomes the snippet fallback).                    |
+| External API        | `external`  | POSTs to a generic JSON web-search API. Defaults match the Serper.dev `POST /search` preset (`X-API-KEY` header, `{"q": …, "num": …}` body, results under `organic`); endpoint, auth header, request fields and response field mapping are all configurable. |
+
+All backends return `{"elapsed_time": float, "data": [{"title", "link", "snippet", "date"|None}, ...]}`; on timeout, connection failure, non-2xx
+status or malformed payloads the tool returns `"Error"` (after configurable
+retries) and the env surfaces it as a clean in-trajectory tool error — the
+agent process keeps running. Knobs (all optional, defaults in parentheses):
+`DEEPEYES_V2_SEARCH_TOP_K` (5), `DEEPEYES_V2_SEARCH_TIMEOUT_SECONDS` (30 —
+this bounds a single HTTP request, so one search call can take up to roughly
+`timeout × attempts` plus retry delays, ≈93 s at the defaults; lower
+`DEEPEYES_V2_SEARCH_MAX_RETRIES` when rollout latency matters),
+`DEEPEYES_V2_SEARCH_MAX_RETRIES` (3), `DEEPEYES_V2_SEARCH_RETRY_DELAY_SECONDS`
+(1.0); per-backend: `DEEPEYES_V2_RETRIEVER_URL` (required for `retriever`),
+`DEEPEYES_V2_EXTERNAL_SEARCH_ENDPOINT` (required for `external`),
+`_API_KEY` / `_AUTH_HEADER` (`X-API-KEY`) / `_QUERY_FIELD` (`q`) /
+`_TOPK_FIELD` (`num`) / `_RESULTS_FIELD` (`organic`) / `_FIELD_MAP` (JSON,
+e.g. `'{"date": "published_date"}'`). API keys live only in the gitignored
+`env.sh` — never in committed code. See `env.sh.example` for a template.
+All of these variables are forwarded into the Ray workers by
+`run_deepeyes_v2_agentic.sh` / `run_deepeyes_v2_agentic_klx.sh`.
+
+### Verifying against a real service
+
+The unit tests run against a local stub; to exercise a real backend, set the
+exports above in `env.sh` and call `search()` once from the repo root:
+
+```bash
+# Search-R1 retriever: start the vendored server first (index setup in
+# examples/search_r1/README.md, entry point examples/search_r1/run_retriever.sh):
+bash examples/search_r1/run_retriever.sh
+export DEEPEYES_V2_SEARCH_BACKEND=retriever
+export DEEPEYES_V2_RETRIEVER_URL=http://127.0.0.1:17389/retrieve
+
+# Or an external API (Serper.dev shown; the key stays in the gitignored env.sh):
+export DEEPEYES_V2_SEARCH_BACKEND=external
+export DEEPEYES_V2_EXTERNAL_SEARCH_ENDPOINT=https://google.serper.dev/search
+export DEEPEYES_V2_EXTERNAL_SEARCH_API_KEY=...
+
+python -c "import sys, json; sys.path.insert(0, 'examples/deepeyes_v2_agentic'); from app.search_utils import search; print(json.dumps(search('relax'), ensure_ascii=False)[:500])"
+```
+
 ## Layout
 
 | Path                             | Role                                                                                     |
@@ -135,7 +185,8 @@ then `export DEEPEYES_V2_SEARCH_CACHE_PATHS=...` before launching.
 | `app/agent.py`                   | Per-session agent driver                                                                 |
 | `app/env_deepeyes_v2.py`         | Tool handlers (exec_code / exec_tool / close)                                            |
 | `app/prompt.py`                  | Observation templates + sandbox init code                                                |
-| `app/search_utils.py`            | Text + image-search backend                                                              |
+| `app/search_utils.py`            | Text + image-search entry points (`search` dispatches to `app/search_backends.py`)       |
+| `app/search_backends.py`         | Pluggable text-search backends: mock (default) / Search-R1 retriever / external API      |
 | `app/sandboxes/`                 | Jupyter sandbox abstraction + apptainer backend                                          |
 | `reward_deepeyes_v2.py`          | Post-trajectory scorer (data_source-routed, LLM-judge)                                   |
 | `convert_tool/`                  | `rl_data_convert.py` (data_source injection) + `cache_convert.py` (search cache rewrite) |
