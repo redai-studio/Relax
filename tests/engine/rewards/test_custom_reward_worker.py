@@ -47,6 +47,7 @@ SYNC_LOAD_COUNT_REWARD = f"{CUSTOM_REWARD_MODULE}.sync_load_count_reward"
 SYNC_RELOAD_COUNT_REWARD = f"{CUSTOM_REWARD_MODULE}.sync_reload_count_reward"
 ASYNC_RELOAD_COUNT_REWARD = f"{CUSTOM_REWARD_MODULE}.async_reload_count_reward"
 RAY_TEST_TIMEOUT = 10
+RAY_WORKER_STARTUP_TIMEOUT = 60
 
 
 T = TypeVar("T")
@@ -102,6 +103,20 @@ async def _wait(awaitable: Awaitable[T], timeout: float = RAY_TEST_TIMEOUT) -> T
     return await asyncio.wait_for(awaitable, timeout=timeout)
 
 
+async def _ready_workers(args: SimpleNamespace) -> None:
+    """Keep worker startup outside the reward execution deadline."""
+
+    async def start() -> None:
+        executor = rewards_module._get_reward_executor(args)
+        await executor._ensure_workers(args)
+        await asyncio.gather(*(worker.__ray_ready__.remote() for worker in executor._workers))
+
+    try:
+        await _wait(start(), timeout=RAY_WORKER_STARTUP_TIMEOUT)
+    except TimeoutError:
+        pytest.fail(f"Reward worker startup did not complete within {RAY_WORKER_STARTUP_TIMEOUT}s.")
+
+
 @pytest.fixture(autouse=True)
 def _reset_executor() -> Iterator[None]:
     _kill_workers(RewardExecutor._instance)
@@ -141,6 +156,8 @@ class TestCustomRewardDispatch:
         monkeypatch.setattr(asyncio, "to_thread", tracked_to_thread)
         args = _make_args(custom_rm_path=SYNC_PID_REWARD, reward_num_workers=1)
 
+        await _ready_workers(args)
+
         result = await _wait(async_rm(args, _make_sample(index=3)))
 
         assert len(submission_threads) >= 2
@@ -152,6 +169,8 @@ class TestCustomRewardDispatch:
     async def test_batched_sync_custom_reward_keeps_payload_contract(self):
         args = _make_args(custom_rm_path=SYNC_BATCH_CONDITIONAL_REWARD, group_rm=False, fail_reward=False)
         samples = [_make_sample(index=index) for index in range(3)]
+
+        await _ready_workers(args)
 
         rewards = await _wait(batched_async_rm(args, samples))
 
@@ -213,6 +232,8 @@ class TestRewardExecutorConfiguration:
         )
         samples = [_make_sample(index=index) for index in range(8)]
 
+        await _ready_workers(args)
+
         await _wait(asyncio.gather(*(async_rm(args, sample) for sample in samples)))
 
         current, maximum = (int(value) for value in counter_path.read_text(encoding="utf-8").split(","))
@@ -232,6 +253,8 @@ class TestRewardExecutorConfiguration:
         )
         batches = [[_make_sample(index=batch_index * 3 + offset) for offset in range(3)] for batch_index in range(6)]
 
+        await _ready_workers(args)
+
         rewards = await _wait(asyncio.gather(*(batched_async_rm(args, samples) for samples in batches)))
 
         current, maximum = (int(value) for value in counter_path.read_text(encoding="utf-8").split(","))
@@ -250,6 +273,8 @@ class TestCustomRewardLoading:
         )
         samples = [_make_sample(index=index) for index in range(12)]
 
+        await _ready_workers(args)
+
         results = await _wait(asyncio.gather(*(async_rm(args, sample) for sample in samples)))
 
         assert loaded_reward_paths == [SYNC_LOAD_COUNT_REWARD]
@@ -261,6 +286,8 @@ class TestCustomRewardLoading:
     async def test_explicit_reload_refreshes_custom_reward_in_all_worker_processes(self):
         args = _make_args(custom_rm_path=SYNC_RELOAD_COUNT_REWARD, reward_num_workers=3)
         samples = [_make_sample(index=index) for index in range(3)]
+
+        await _ready_workers(args)
 
         before_reload = await _wait(asyncio.gather(*(async_rm(args, sample) for sample in samples)))
         reload_owner = ReloadableMixin()
@@ -301,6 +328,8 @@ class TestCustomRewardErrors:
             reward_max_concurrency=1,
             reward_num_workers=1,
         )
+        await _ready_workers(args)
+
         await _wait(async_rm(args, _make_sample(index=-1)))
 
         submission_started = threading.Event()
@@ -359,6 +388,8 @@ class TestCustomRewardErrors:
             reward_max_concurrency=1,
             reward_num_workers=1,
         )
+        await _ready_workers(args)
+
         cancelled_call = asyncio.create_task(async_rm(args, _make_sample(index=0)))
         for _ in range(RAY_TEST_TIMEOUT * 50):
             if cancelled_call.done():
@@ -383,6 +414,8 @@ class TestCustomRewardErrors:
     async def test_custom_reward_error_identifies_sample_and_next_call_completes(self):
         args = _make_args(custom_rm_path=SYNC_CONDITIONAL_REWARD, fail_reward=True)
         sample = _make_sample(index=17, group_index=2, session_id="session-17")
+
+        await _ready_workers(args)
 
         with pytest.raises(RewardExecutionError, match="index=17") as error_info:
             await _wait(async_rm(args, sample))
@@ -414,6 +447,8 @@ class TestCustomRewardErrors:
             )
             for index in range(20)
         ]
+
+        await _ready_workers(args)
 
         with pytest.raises(RewardExecutionError) as error_info:
             await _wait(batched_async_rm(args, samples))
@@ -451,6 +486,8 @@ class TestCustomRewardAndRouterCoexistence:
             metadata={"rm_type": "totally_unknown_type"},
         )
 
+        await _ready_workers(args)
+
         result = await _wait(async_rm(args, sample))
 
         assert result == {"pid": result["pid"], "index": 9}
@@ -472,6 +509,8 @@ class TestCustomRewardAndRouterCoexistence:
             _make_sample(index=0, metadata={"rm_type": "totally_unknown_type"}),
             _make_sample(index=1, metadata={"rm_type": "another_unknown_type"}),
         ]
+
+        await _ready_workers(args)
 
         rewards = await _wait(batched_async_rm(args, samples))
 

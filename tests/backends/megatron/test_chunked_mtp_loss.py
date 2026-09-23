@@ -80,6 +80,8 @@ def _make_config(calculate_per_token_loss=False, fuse_linear=False):
         calculate_per_token_loss=calculate_per_token_loss,
         cross_entropy_loss_fusion=fuse_linear,
         cross_entropy_fusion_impl="linear" if fuse_linear else "native",
+        mtp_detach_heads=False,
+        mtp_detach_lm_head=True,
     )
 
 
@@ -296,8 +298,8 @@ def test_gate_off_delegates(monkeypatch):
 
 
 def test_new_megatron_kwargs_are_accepted_and_version_filtered(monkeypatch):
-    """Newer Megatron callers pass tp_group/input_ids; old originals must still
-    work."""
+    """New caller keywords must be filtered before delegating to old
+    Megatron."""
     head = _FakeHead(H, V)
     cfg = _make_config()
     called = {}
@@ -331,9 +333,190 @@ def test_new_megatron_kwargs_are_accepted_and_version_filtered(monkeypatch):
         cfg,
         tp_group=object(),
         input_ids=torch.ones(B, S, dtype=torch.long),
+        sequence_roll_context=object(),
     )
     assert result is hidden
     assert called == {"cp_group": None, "packed_seq_params": None, "scale_logits_fn": None}
+
+
+def test_chunked_mtp_delegates_sequence_roll_context(monkeypatch):
+    """A gate-off call must retain the context needed by upstream packed CP
+    rolls."""
+    seen = {}
+
+    def upstream(*args, **kwargs):
+        seen.update(kwargs)
+        return args[0]
+
+    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS", upstream)
+    monkeypatch.setattr(_patch, "_ORIG_PROCESS_MTP_LOSS_PARAMETERS", {"sequence_roll_context"})
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: False)
+    context = object()
+    hidden = torch.randn(S * (1 + LAYERS), B, H)
+    result = _patch.process_mtp_loss(
+        hidden,
+        torch.zeros(B, S, dtype=torch.long),
+        None,
+        _FakeHead(H, V),
+        None,
+        None,
+        False,
+        _stub_clml,
+        _make_config(),
+        sequence_roll_context=context,
+    )
+    assert result is hidden
+    assert seen["sequence_roll_context"] is context
+
+
+@pytest.mark.parametrize("batched_roll", [False, True])
+def test_chunked_mtp_roll_preserves_depth_labels_mask_and_context(monkeypatch, batched_roll):
+    """Both roll APIs must produce the same successive MTP targets and
+    masks."""
+    cp_group, packed_seq_params, context = object(), object(), object()
+    calls = []
+
+    def roll_one(tensor, shifts, dims):
+        rolled = torch.roll(tensor, shifts=shifts, dims=dims)
+        rolled.select(dims, shifts).zero_()
+        return rolled
+
+    def batched(tensors, *, shifts, dims, cp_group, packed_seq_params, **kwargs):
+        calls.append((cp_group, packed_seq_params, kwargs))
+        return [roll_one(tensor, shifts, dims) for tensor in tensors]
+
+    def legacy(tensor, *, shifts, dims, cp_group, packed_seq_params):
+        calls.append((cp_group, packed_seq_params, {}))
+        rolled = roll_one(tensor, shifts, dims)
+        return rolled, rolled.sum()
+
+    monkeypatch.setattr(_patch, "roll_tensor", batched if batched_roll else legacy)
+    monkeypatch.setattr(_patch, "_ROLL_TENSOR_PARAMETERS", {"tensors" if batched_roll else "tensor"})
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: 2)
+    labels = torch.tensor([[1, 2, 3, 4, 5]])
+    mask = torch.tensor([[1, 0, 1, 1, 1]])
+    seen_labels = []
+    seen_masks = []
+
+    def head_ce(hidden, labels, *args, **kwargs):
+        seen_labels.append(labels.clone())
+        return torch.ones_like(labels), None, None
+
+    monkeypatch.setattr(_patch, "_chunked_head_ce", head_ce)
+    monkeypatch.setattr(
+        _patch,
+        "MTPLossAutoScaler",
+        types.SimpleNamespace(apply=lambda hs, loss: seen_masks.append(loss.detach().clone()) or hs),
+    )
+    cfg = _make_config()
+    _patch.process_mtp_loss(
+        torch.zeros(5 * (1 + LAYERS), 1, H),
+        labels,
+        mask,
+        _FakeHead(H, V),
+        None,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        sequence_roll_context=context,
+    )
+    for depth in range(LAYERS):
+        shifted = depth + 1
+        expected_labels = torch.cat([labels[:, shifted:], torch.zeros(1, shifted, dtype=labels.dtype)], dim=1)
+        expected_mask = torch.cat([mask[:, shifted:], torch.zeros(1, shifted, dtype=mask.dtype)], dim=1)
+        assert torch.equal(seen_labels[depth], expected_labels)
+        torch.testing.assert_close(
+            seen_masks[depth], cfg.mtp_loss_scaling_factor / LAYERS * expected_mask / expected_mask.sum()
+        )
+    assert len(calls) == LAYERS * (1 if batched_roll else 2)
+    for depth, (called_cp, called_packed, kwargs) in enumerate(calls):
+        assert called_cp is cp_group
+        assert called_packed is packed_seq_params
+        if batched_roll:
+            assert kwargs == {
+                "roll_context": context,
+                "sequence_fields": ["labels", "loss_mask"],
+                "roll_depth": depth,
+            }
+    assert torch.equal(labels, torch.tensor([[1, 2, 3, 4, 5]]))
+    assert torch.equal(mask, torch.tensor([[1, 0, 1, 1, 1]]))
+
+
+@pytest.mark.parametrize("detach_lm_head", [False, True, None])
+@pytest.mark.parametrize("shared_weight", [False, True])
+def test_chunked_mtp_detach_lm_head_preserves_hidden_gradients(monkeypatch, detach_lm_head, shared_weight):
+    """MTP must train its hidden states while respecting Relax's LM-head detach
+    path."""
+    cfg = _make_config()
+    if detach_lm_head is None:
+        del cfg.mtp_detach_lm_head
+    else:
+        cfg.mtp_detach_lm_head = detach_lm_head
+    head = _FakeHead(H, V)
+    weight = nn.Parameter(head.weight.detach().clone()) if shared_weight else None
+    hidden = torch.randn(S * (1 + LAYERS), B, H, requires_grad=True)
+    monkeypatch.setattr(_patch, "_chunked_mtp_enabled", lambda: True)
+    monkeypatch.setattr(_patch, "_resolve_chunk_size", lambda: 3)
+    monkeypatch.setattr(_patch, "MTPLossAutoScaler", types.SimpleNamespace(apply=lambda hs, loss: hs + loss.sum()))
+    result = _patch.process_mtp_loss(
+        hidden,
+        torch.randint(0, V, (B, S)),
+        None,
+        head,
+        weight,
+        None,
+        False,
+        _stub_clml,
+        cfg,
+    )
+    result.sum().backward()
+    effective_weight = weight if shared_weight else head.weight
+    assert (effective_weight.grad is None) is (detach_lm_head is not False)
+    assert hidden.grad is not None
+    assert torch.count_nonzero(hidden.grad[S:]) > 0
+    if shared_weight:
+        assert head.weight.grad is None
+
+
+@pytest.mark.parametrize("is_training, collect", [(False, True), (True, False), (True, True)])
+def test_chunked_mtp_acceptance_obeys_logging_gate(monkeypatch, is_training, collect):
+    """Skip vocabulary argmax work except on training steps selected for
+    logging."""
+    calls = []
+    logged = []
+
+    def counts(logits, labels, loss_mask, *args):
+        calls.append(labels.shape[1])
+        total = loss_mask.sum()
+        return total, total
+
+    monkeypatch.setattr(_patch, "_COMPUTE_MTP_ACCEPTANCE_COUNTS", counts)
+    monkeypatch.setattr(_patch.MTPLossLoggingHelper, "should_collect_acceptance", lambda: collect, raising=False)
+    monkeypatch.setattr(
+        _patch,
+        "_save_mtp_loss_to_tracker",
+        lambda loss, num_tokens, layer, cfg, correct, total: logged.append((correct, total)),
+    )
+    _run_and_capture(
+        _patch.process_mtp_loss,
+        head=_FakeHead(H, V),
+        config=_make_config(),
+        monkeypatch=monkeypatch,
+        chunk_size=3,
+        is_training=is_training,
+    )
+    assert bool(calls) is (is_training and collect)
+    if is_training:
+        assert len(logged) == LAYERS
+        for correct, total in logged:
+            assert (correct is not None) is collect
+            assert (total is not None) is collect
+            if collect:
+                assert torch.equal(correct, total)
 
 
 def test_sequence_parallel_gathers_hidden_once(monkeypatch):

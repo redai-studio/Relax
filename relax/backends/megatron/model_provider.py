@@ -248,6 +248,20 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
     )
 
 
+def _call_model_provider(provider: Any, *args: Any, **kwargs: Any) -> GPTModel:
+    """Forward current MCore arguments while supporting older/custom
+    providers."""
+    parameters = inspect.signature(provider).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+            and parameters[key].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+    return provider(*args, **kwargs)
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -256,15 +270,16 @@ def get_model_provider_func(
     if getattr(args, "custom_model_provider_path", None):
 
         def wrapped_model_provider(
-            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None
+            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None, **kwargs: Any
         ) -> GPTModel:
             custom_model_provider = load_function(args.custom_model_provider_path)
-            # Check if the custom provider supports vp_stage parameter
-            has_vp_stage = "vp_stage" in inspect.signature(custom_model_provider).parameters
-            if has_vp_stage:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-            else:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            model = _call_model_provider(
+                custom_model_provider,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=vp_stage,
+                **kwargs,
+            )
             for module in model.modules():
                 if getattr(module, "config", None) is not None:
                     _validate_linear_cp_mode(args, module.config)
@@ -380,6 +395,7 @@ def get_model_provider_func(
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Dynamic CP related args
             "dynamic_context_parallel",
+            "linear_cp_mode",
         ]
 
         args_dict = vars(args)
@@ -499,7 +515,14 @@ def get_model_provider_func(
         original_provide = provider.provide
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
-            model = original_provide(*p_args, **p_kwargs)
+            # Bridge providers are their own TransformerConfig. MCore's config
+            # argument belongs to the raw/custom path; its process groups must
+            # still reach Bridge's GPTModel constructor.
+            p_kwargs.pop("config", None)
+            pg_collection = p_kwargs.pop("pg_collection", None)
+            if pg_collection is not None:
+                provider._pg_collection = pg_collection
+            model = _call_model_provider(original_provide, *p_args, **p_kwargs)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
@@ -522,7 +545,13 @@ def get_model_provider_func(
 
         return provide_with_cp_probe
 
-    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
+    def model_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: TransformerConfig | None = None,
+        pg_collection: Any = None,
+    ) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -538,7 +567,8 @@ def get_model_provider_func(
         use_te = args.transformer_impl == "transformer_engine"
 
         # Experimental loading arguments from yaml
-        config: TransformerConfig = core_transformer_config_from_args(args)
+        if config is None:
+            config = core_transformer_config_from_args(args)
         _validate_linear_cp_mode(args, config)
 
         if args.spec is not None:
@@ -609,6 +639,8 @@ def get_model_provider_func(
 
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
 
         if args.mtp_num_layers:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
@@ -677,14 +709,13 @@ def wrap_model_provider_with_lora(original_provider, args):
         return original_provider
 
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         try:
             peft = build_lora_peft(args)
@@ -753,14 +784,13 @@ def wrap_model_provider_with_freeze(original_provider, args):
         if vp_stage is None and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
             vp_stage = mpu.get_virtual_pipeline_model_parallel_rank()
 
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
