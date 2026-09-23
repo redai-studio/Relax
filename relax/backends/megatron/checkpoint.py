@@ -524,7 +524,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             and getattr(args, "optimizer_cpu_offload", False)
             and patch_hybrid_optimizer_native_fp32_checkpoint_load()
         ):
-            logger.info("Applied Megatron-LM 86e928a compatibility fix for native-FP32 optimizer checkpoint load")
+            logger.info("Applied compatibility fix for native-FP32 CPU-offloaded optimizer checkpoint load")
         lora_metadata = _read_lora_checkpoint_metadata(load_path)
         try:
             if lora_metadata is None:
