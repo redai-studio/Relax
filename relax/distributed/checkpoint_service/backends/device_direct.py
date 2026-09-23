@@ -36,7 +36,7 @@ from urllib3.exceptions import NewConnectionError
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
-from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
@@ -173,7 +173,7 @@ class DeviceDirectBackend(CommBackend):
         self.coordinator_url = coordinator_url
         self.lock = lock
         self.timeout_seconds = timeout_seconds
-        self.device = next(model[0].parameters()).device if model else device_utils.current_device()
+        self.device = next(model[0].parameters()).device if model else device_module.current_device()
 
         self._comm_stream: Optional[Any] = None  # CUDA stream
         self._thread_pool = ThreadPoolExecutor(max_workers=4)
@@ -194,7 +194,7 @@ class DeviceDirectBackend(CommBackend):
         # proxy actors are reused across weight updates instead of being torn down
         # and rebuilt every step. None forces a (re)build on the next update.
         self._rollout_topology_signature: Optional[frozenset] = None
-        device_utils.set_device(self.device)
+        device_module.set_device(self.device)
 
         # Bridge-based HF weight converter (lazy-initialized on first use)
         self._use_bridge = getattr(args, "megatron_to_hf_mode", None) == "bridge"
@@ -808,7 +808,7 @@ class DeviceDirectBackend(CommBackend):
         # allocator keeps large reserved blocks that are internally
         # fragmented, which can cause OOM when the optimizer later tries
         # to allocate contiguous Adam state buffers.
-        device_utils.empty_cache()
+        device_module.empty_cache()
 
     def _update_weight_from_distributed(
         self,

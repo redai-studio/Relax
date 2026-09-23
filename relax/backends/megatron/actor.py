@@ -60,6 +60,7 @@ from relax.utils.data.stream_dataloader import (
     get_data_from_transfer_queue,
     post_process_rollout_data,
 )
+from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
 from relax.utils.megatron_peft_utils import (
@@ -302,16 +303,16 @@ class _SFTPrepackedDeviceIterator:
 
         assert self._next_device_micro_batch is not None
         current_batch, current_meta = self._next_device_micro_batch
-        train_stream = device_utils.current_stream(self._device)
+        train_stream = device_module.current_stream(self._device)
         train_stream.wait_event(self._next_ready_event)
         record_tensors_on_stream(current_batch, train_stream)
 
         self._offset += 1
         if self._offset < len(self._packed_cpu):
             next_cpu_batch, next_meta = self._packed_cpu[self._offset]
-            with device_utils.stream_context(self._copy_stream):
+            with device_module.stream_context(self._copy_stream):
                 next_device_batch = move_tensors_to_device(next_cpu_batch, self._device, non_blocking=True)
-                next_ready_event = device_utils.Event()
+                next_ready_event = device_module.Event()
                 next_ready_event.record(self._copy_stream)
             # move_tensors_to_device returns a plain dict; re-wrap so
             # get_batch() short-circuits on the PrepackedBatch marker.
@@ -598,8 +599,8 @@ class MegatronTrainRayActor(TrainRayActor):
             # Sharing one stream would let both host threads race on the
             # enqueue order and let the next window's copy jump ahead of the
             # current step's remaining copies.
-            self._sft_prefetch_stream = device_utils.Stream(device=self._sft_device)
-            self._sft_copy_stream = device_utils.Stream(device=self._sft_device)
+            self._sft_prefetch_stream = device_module.Stream(device=self._sft_device)
+            self._sft_copy_stream = device_module.Stream(device=self._sft_device)
 
         if role == "actor":
             capture_hooks.maybe_enable_for_actor()
@@ -1182,12 +1183,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 assert self._sft_copy_stream is not None
                 assert self._sft_device is not None
-                with device_utils.stream_context(self._sft_copy_stream):
+                with device_module.stream_context(self._sft_copy_stream):
                     first_cpu_batch, first_meta = packed_micro_batches[0]
                     first_device_batch = PrepackedBatch(
                         move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
                     )
-                    first_ready_event = device_utils.Event()
+                    first_ready_event = device_module.Event()
                     first_ready_event.record(self._sft_copy_stream)
                 first_device_micro_batch = (first_device_batch, first_meta)
             except BaseException as exc:  # noqa: BLE001
@@ -1343,16 +1344,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
         assert self._sft_prefetch_stream is not None
         assert self._sft_device is not None
-        device_utils.set_device(self._sft_device)
+        device_module.set_device(self._sft_device)
         # First H2D goes on the prefetch-owned stream so the training thread's
         # _sft_copy_stream (used by _SFTPrepackedDeviceIterator) never has
         # background enqueues racing in front of the current step's copies.
-        with device_utils.stream_context(self._sft_prefetch_stream):
+        with device_module.stream_context(self._sft_prefetch_stream):
             first_cpu_batch, first_meta = packed_cpu[0]
             first_device_batch = PrepackedBatch(
                 move_tensors_to_device(first_cpu_batch, self._sft_device, non_blocking=True)
             )
-            first_ready_event = device_utils.Event()
+            first_ready_event = device_module.Event()
             first_ready_event.record(self._sft_prefetch_stream)
 
         logger.info(

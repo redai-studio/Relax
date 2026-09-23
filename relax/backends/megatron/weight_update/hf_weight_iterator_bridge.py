@@ -18,6 +18,7 @@ except ImportError:  # bridge <= 0.5.x
 
 
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_peft_utils import (
     is_lora_adapter_mode,
@@ -370,7 +371,7 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
         if merge_fn is not None and rank == info.src_rank:
             param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_utils.synchronize()
+    device_module.synchronize()
     return params
 
 

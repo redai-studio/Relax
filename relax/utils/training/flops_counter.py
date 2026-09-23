@@ -54,9 +54,9 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
     """
     if device_name is None:
         try:
-            from relax.utils.device import get_device_properties
+            from relax.utils.device import device_module
 
-            device_name = get_device_properties().name
+            device_name = device_module.get_device_properties().name
         except (AttributeError, ImportError):
             device_name = "CPU"
 
