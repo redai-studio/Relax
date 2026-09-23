@@ -15,6 +15,7 @@ import ray
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray import serve
+from ray.util.placement_group import remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 from transfer_queue import SeqlenBalancedSampler
 
@@ -195,6 +196,9 @@ class Controller:
             self._pending_task_refs_lock = threading.Lock()
         if not hasattr(self, "_global_restart_count"):
             self._global_restart_count = 0
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
+        self._startup_abort_event.clear()
         self._model_cache_node_bindings: dict[str, tuple[Any, int]] = {}
         self._model_cache_node_ids: set[str] = set()
 
@@ -399,13 +403,17 @@ class Controller:
             raise
 
     def _cancel_pending_tasks(self) -> None:
-        """Cancel all pending service ObjectRefs to unblock the main thread.
+        """Cancel all pending service task handles to unblock the main thread.
 
         Must be called BEFORE ray.shutdown() during global restart. Without
         this, the main thread remains blocked awaiting ObjectRefs that become
         dangling after ray.shutdown(), causing a fatal C++ crash:
         ``TryReadObjectRefStream API can be used only when the stream has been
         created and not removed.``
+
+        Ray Serve task handles expose ``cancel()``; ObjectRefs require
+        ``ray.cancel()``. Use the appropriate API for each handle and report
+        cancellation failures, which can block restart recovery.
         """
         with self._pending_task_refs_lock:
             refs_to_cancel = list(self._pending_task_refs)
@@ -415,12 +423,26 @@ class Controller:
             return
 
         logger.info(f"[Global Restart] Cancelling {len(refs_to_cancel)} pending task ref(s)...")
+        cancelled = 0
         for ref in refs_to_cancel:
             try:
-                ray.cancel(ref, force=True)
+                # DeploymentResponse / DeploymentResponseGenerator carry their own
+                # cancel(); plain ObjectRefs go through ray.cancel().
+                if isinstance(ref, ray.ObjectRef):
+                    ray.cancel(ref, force=True)
+                elif hasattr(ref, "cancel"):
+                    ref.cancel()
+                else:
+                    logger.warning(
+                        f"[Global Restart] Don't know how to cancel {type(ref).__name__}; "
+                        "the main thread may stay blocked in run_all_services()"
+                    )
+                    continue
+                cancelled += 1
             except Exception as e:
-                logger.debug(f"[Global Restart] Failed to cancel task ref (may already be done): {e}")
-        logger.info("[Global Restart] All pending task refs cancelled")
+                # Cancellation failures must remain visible because they can block restart recovery.
+                logger.warning(f"[Global Restart] Failed to cancel {type(ref).__name__} (may already be done): {e!r}")
+        logger.info(f"[Global Restart] Cancelled {cancelled}/{len(refs_to_cancel)} pending task ref(s)")
 
     def _consume_restart_cycle(self) -> tuple[str, Optional[BaseException]]:
         """Snapshot one completed restart before acknowledging its
@@ -476,6 +498,8 @@ class Controller:
         """
         if actor_rollout_pg_roles is None:
             actor_rollout_pg_roles = ACTOR_ROLLOUT_PG_ROLES
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
         try:
             service = Service(
                 cls,
@@ -485,23 +509,38 @@ class Controller:
                 num_gpus=num_gpus,
                 data_source=data_source,
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
-                defer_deploy=defer_deploy,
+                defer_deploy=True,
                 runtime_env=self.runtime_env,
             )
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=False)
+                return (role, None, "startup phase aborted")
+            if not defer_deploy:
+                service.deploy()
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=not defer_deploy)
+                return (role, None, "startup phase aborted")
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to create service {role}: {e}")
-            return (role, None, str(e))
+            return (role, locals().get("service"), str(e))
 
-    @staticmethod
-    def _deploy_service_task(role, service):
+    def _deploy_service_task(self, role, service):
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
         try:
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=False)
+                return (role, None, "startup phase aborted")
             service.deploy()
+            if self._startup_abort_event.is_set():
+                self._cleanup_aborted_service(role, service, deploy=True)
+                return (role, None, "startup phase aborted")
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to deploy service {role}: {e}")
-            return (role, None, str(e))
+            return (role, service, str(e))
 
     def _run_service_phase(
         self,
@@ -513,20 +552,132 @@ class Controller:
         concurrency."""
         if not task_args:
             return {}
-        if self.config.fully_async:
-            logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args)) as executor:
-                futures = [executor.submit(task, *args) for args in task_args]
-                results = [future.result() for future in concurrent.futures.as_completed(futures)]
-        else:
-            logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
-            results = [task(*args) for args in task_args]
+        if not hasattr(self, "_startup_abort_event"):
+            self._startup_abort_event = threading.Event()
+        self._startup_abort_event.clear()
+        executor = None
+        try:
+            if self.config.fully_async:
+                logger.info(f"Using parallel service {phase.value} mode with {len(task_args)} services")
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(task_args))
+                futures = {executor.submit(task, *args): args[0] for args in task_args}
+            else:
+                logger.info(f"Using serial service {phase.value} mode (fully_async=False)")
+                futures = {}
 
-        failed_roles = [(role, error) for role, _service, error in results if error is not None]
-        if failed_roles:
-            error_msg = "; ".join(f"{role}: {error}" for role, error in failed_roles)
-            raise RuntimeError(f"Failed to {phase.value} {len(failed_roles)} services: {error_msg}")
-        return {role: service for role, service, _error in results}
+            services: dict[Any, Service] = {}
+            result_futures = concurrent.futures.as_completed(futures) if futures else (None for _ in task_args)
+            for future in result_futures:
+                if future is None:
+                    role, service, error = task(*task_args[len(services)])
+                else:
+                    try:
+                        role, service, error = future.result()
+                    except Exception as exc:
+                        role = futures[future]
+                        service = None
+                        error = str(exc)
+                if error is not None:
+                    self._startup_abort_event.set()
+                    failed_services = {role: service} if service is not None else {}
+                    for pending_future, pending_role in futures.items():
+                        if pending_future is future:
+                            continue
+                        if pending_future.done():
+                            try:
+                                done_role, done_service, done_error = pending_future.result()
+                            except Exception:
+                                continue
+                            if done_service is not None:
+                                if done_error is None:
+                                    services[done_role] = done_service
+                                else:
+                                    failed_services[done_role] = done_service
+                        else:
+                            pending_future.cancel()
+                            if phase == ServiceStartupPhase.DEPLOY:
+                                try:
+                                    serve.delete(pending_role)
+                                except Exception as exc:
+                                    logger.warning(
+                                        f"[{pending_role}] Failed to cancel deployment during phase abort: {exc}"
+                                    )
+                    self._abort_service_phase(phase, services, failed_services)
+                    raise RuntimeError(f"Failed to {phase.value} service {role}: {error}")
+                services[role] = service
+            self._startup_abort_event.clear()
+            return services
+        finally:
+            if executor is not None:
+                # A sibling may still be blocked in serve.run(). Let the driver
+                # handle the failure and tear down Serve instead of joining it.
+                executor.shutdown(wait=False, cancel_futures=True)
+
+    def _abort_service_phase(
+        self,
+        phase: ServiceStartupPhase,
+        services: dict[Any, Service],
+        failed_services: Optional[dict[Any, Service]] = None,
+    ) -> None:
+        """Roll back partially-successful services when a phase peer failed.
+
+        DEPLOY successes are alive Ray Serve deployments; hand them to
+        ``self.serve_dict`` so ``Controller.shutdown()`` can dispose SGLang
+        engines and detach handles. ALLOCATE_RESOURCES successes only hold
+        placement groups and have no ``handle`` yet — putting them in
+        ``serve_dict`` would make shutdown ``AttributeError`` on ``handle``, so
+        release their PGs directly here.
+        """
+        failed_services = failed_services or {}
+        if not services and not failed_services:
+            return
+        if phase == ServiceStartupPhase.DEPLOY:
+            self.serve_dict.update(services)
+            for role, service in failed_services.items():
+                self._cleanup_aborted_service(role, service, deploy=True)
+            return
+        seen_pgs = set()
+        for role, service in {**services, **failed_services}.items():
+            pgs = getattr(service, "pgs", None)
+            if pgs is None or getattr(service, "_is_shared_pgs", False):
+                continue
+            pg = pgs[0] if isinstance(pgs, tuple) else pgs
+            if id(pg) in seen_pgs:
+                continue
+            seen_pgs.add(id(pg))
+            try:
+                remove_placement_group(pg)
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to release placement group during phase abort: {e}")
+
+    def _cleanup_aborted_service(self, role: Any, service: Service, *, deploy: bool) -> None:
+        """Release resources for a service that finished after startup
+        abort."""
+        if deploy:
+            try:
+                service._stop_heartbeat_thread()
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
+            if str(role) == "rollout" and getattr(service, "_deployed", False):
+                try:
+                    rollout_manager = run(service.get_rollout_manager())
+                    ray.get(rollout_manager.dispose.remote(), timeout=30)
+                except Exception as e:
+                    logger.warning(f"[{role}] Failed to dispose rollout manager during phase abort: {e}")
+            try:
+                serve.delete(role)
+            except Exception as e:
+                logger.warning(f"[{role}] Failed to delete deployment during phase abort: {e}")
+        if getattr(service, "_is_shared_pgs", False):
+            return
+        pgs = getattr(service, "pgs", None)
+        if pgs is None:
+            return
+        pg = pgs[0] if isinstance(pgs, tuple) else pgs
+        try:
+            remove_placement_group(pg)
+        except Exception as e:
+            logger.warning(f"[{role}] Failed to release placement group during phase abort: {e}")
 
     def _start_services(self, service_args: list[tuple]) -> list[Any]:
         """Start services, staging deployment only when S3 prefetch needs
@@ -991,7 +1142,8 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
-        self.stop_health_check()
+        if hasattr(self, "_health_manager"):
+            self.stop_health_check()
 
         # Shut down rollout engines via RolloutManager.dispose()
         if ROLES.rollout in self.serve_dict:

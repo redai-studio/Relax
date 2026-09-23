@@ -486,7 +486,7 @@ index 8d65e29..e4af4f2 100644
                  flatten_sharded_tensors=False,
              ),
 diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
-index 8d797e8..98f6241 100644
+index 8d797e8..7f85fab 100644
 --- a/megatron/core/extensions/transformer_engine.py
 +++ b/megatron/core/extensions/transformer_engine.py
 @@ -918,6 +918,7 @@ class TELinear(te.pytorch.Linear):
@@ -497,69 +497,7 @@ index 8d797e8..98f6241 100644
              if is_expert:
                  # Reduce the gradient on the expert_data_parallel group for expert linear layers
                  setattr(param, "allreduce", not self.expert_parallel)
-@@ -1948,6 +1949,61 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
- 
- 
- if HAVE_TE and is_te_min_version("1.9.0.dev0"):
-+    def ceil_div(x: int, y: int) -> int:
-+        return (x + y - 1) // y
-+
-+    class _FakeInt4QuantizationSTE(torch.autograd.Function):
-+        @staticmethod
-+        def forward(ctx, x, group_size):
-+            m, n = x.shape
-+            block_size_m, block_size_n = 1, group_size
-+
-+
-+            m_padded = ceil_div(m, block_size_m) * block_size_m
-+            n_padded = ceil_div(n, block_size_n) * block_size_n
-+
-+            x_padded = torch.zeros(
-+                (m_padded, n_padded),
-+                dtype=x.dtype, device=x.device
-+            )
-+            x_padded[:m, :n] = x
-+
-+            x_view = x_padded.view(
-+                m_padded // block_size_m,
-+                block_size_m,
-+                n_padded // block_size_n,
-+                block_size_n
-+            )
-+
-+            x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
-+            q_max = 7
-+            x_scale = x_max / q_max
-+
-+            x_scale = x_scale.clamp(min=1e-5)
-+
-+            x_div = x_view / x_scale
-+            x_round = torch.round(x_div)
-+
-+            x_q_clamped = x_round.clamp(-q_max, q_max)
-+
-+            x_dequant_view = x_q_clamped * x_scale
-+
-+            x_dequant_full = x_dequant_view.view_as(x_padded)
-+            x_out = x_dequant_full[:m, :n].contiguous().to(x.dtype)
-+
-+            return x_out
-+
-+        @staticmethod
-+        def backward(ctx, grad_output):
-+            return grad_output, None
-+
-+    def fake_int4_quantization_ste(x, group_size):
-+        x_out = _FakeInt4QuantizationSTE.apply(x, group_size)
-+        
-+        if hasattr(x, 'main_grad'):
-+            x_out.main_grad = x.main_grad
-+            
-+        return x_out
- 
-     class TEGroupedLinear(te.pytorch.GroupedLinear):
-         """
-@@ -2179,6 +2235,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+@@ -2179,6 +2180,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                              "amax_history_bwd": torch.cat(
                                  [state["amax_history_bwd"].view(-1, 1) for state in state_list],
                                  dim=1,
@@ -567,39 +505,6 @@ index 8d797e8..98f6241 100644
                              ).view(self.fp8_meta["recipe"].amax_history_len, -1),
                          }
                      )
-@@ -2304,10 +2361,31 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
-         def _get_weight_tensors(self):
-             """Get the weight tensors of the module."""
-             weight_tensors = super()._get_weight_tensors()
--            return maybe_fake_quantize_int4_weight_tensors(
-+
-+            # Two independent int4 fake-QAT paths coexist here. Upstream's is
-+            # config-driven and ships with the .dev.commit core; Relax's is the
-+            # env-var one below, which is load-bearing -- documented in
-+            # docs/zh/examples/low-precision-training.md and switched on by
-+            # scripts/training/{text,multimodal}/run-{qwen3-30B-A3B,kimi-k2.6}*int4*.sh.
-+            # The Relax patch appends its version verbatim, which alongside
-+            # upstream's would define this method twice (second silently wins,
-+            # disabling upstream's path). Compose them: each is a no-op unless its
-+            # own switch is set. Enabling both at once would quantize twice -- a
-+            # configuration error, not a case to arbitrate here.
-+            weight_tensors = maybe_fake_quantize_int4_weight_tensors(
-                 self.config, self.delay_wgrad_compute, weight_tensors
-             )
- 
-+            if os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
-+                group_size = int(os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
-+
-+                weight_tensors = [
-+                    fake_int4_quantization_ste(w, group_size)
-+                    for w in weight_tensors
-+                ]
-+
-+            return weight_tensors
-+
-         def _encode_extra_state(self, state):
-             # TE 2.0 changed the format of extra_state to be a byte tensor
-             if is_te_min_version("2.0.0"):
 diff --git a/megatron/core/fusions/fused_mla_yarn_rope_apply.py b/megatron/core/fusions/fused_mla_yarn_rope_apply.py
 index d4cdaa2..31c7c91 100644
 --- a/megatron/core/fusions/fused_mla_yarn_rope_apply.py
@@ -963,7 +868,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
 +            fp32_param = self.param_to_fp32_param.get(param)
 +            if fp32_param is not None:
 +                fp32_param.data.copy_(v["master_param"])
-
+ 
      def update_fp32_param_by_new_param(self):
          """
 @@ -379,6 +387,16 @@
@@ -988,7 +893,7 @@ index 9baed75..8f68e3d 100644
 --- a/megatron/core/optimizer/distrib_optimizer.py
 +++ b/megatron/core/optimizer/distrib_optimizer.py
 @@ -471,7 +471,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
-
+ 
                  # fp32 params.
                  elif model_param.type() == 'torch.cuda.FloatTensor':
 -                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -1489,10 +1394,10 @@ diff --git a/megatron/core/fp8_utils.py b/megatron/core/fp8_utils.py
 +
      return custom_recipe
 diff --git a/megatron/core/safe_globals.py b/megatron/core/safe_globals.py
+index d046c3e1e3..59ac05e1c1 100644
 --- a/megatron/core/safe_globals.py
 +++ b/megatron/core/safe_globals.py
-@@ -102,13 +102,15 @@ class SafeUnpickler(pickle.Unpickler):
-             ("torch.storage", "_load_from_bytes"),
+@@ -103,12 +103,14 @@
              ("transformer_engine.common.recipe", "DelayedScaling"),
              ("transformer_engine.common.recipe", "Float8CurrentScaling"),
              ("transformer_engine.common.recipe", "Float8BlockScaling"),
@@ -1837,6 +1742,40 @@ diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/m
                  weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
  
                  indexer_compressed_local, _ = indexer.compressor._forward_thd(
+diff --git a/megatron/bridge/data/builders/energon.py b/megatron/bridge/data/builders/energon.py
+--- a/megatron/bridge/data/builders/energon.py
++++ b/megatron/bridge/data/builders/energon.py
+@@ -22,7 +22,6 @@ from typing import Any, Literal
+ from transformers import AutoProcessor, AutoTokenizer, Qwen3VLProcessor
+ 
+ from megatron.bridge.data.base import DataloaderConfig, DatasetBuildContext, validate_declarative_mapping
+-from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
+ from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
+ 
+ 
+@@ -289,6 +288,8 @@ class EnergonDatasetBuilder:
+ 
+     def build(self, context: DatasetBuildContext) -> tuple[Any | None, Any | None, None]:
+         """Build requested Energon train and validation iterators."""
++        from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
++
+         assert self.config.path is not None
+         build_train = context.train_samples > 0
+         build_validation = self.config.do_validation and context.valid_samples > 0
+diff --git a/megatron/core/transformer/experimental_attention_variant/csa.py b/megatron/core/transformer/experimental_attention_variant/csa.py
+--- a/megatron/core/transformer/experimental_attention_variant/csa.py
++++ b/megatron/core/transformer/experimental_attention_variant/csa.py
+@@ -2576,3 +2576,9 @@
+                 )
+-
++                if getattr(self.config, "relax_use_indexer_replay", False):
++                    from relax.utils.training.indexer_replay import maybe_replay_indexer_topk
++                    compressed_topk = maybe_replay_indexer_topk(
++                        layer_number=self.layer_number,
++                        computed_topk=compressed_topk,
++                    )
++
+             # ---- Step 5: attention compressed KV path -------------------------
 diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge/models/conversion/model_bridge.py
 --- a/megatron/bridge/models/conversion/model_bridge.py
 +++ b/megatron/bridge/models/conversion/model_bridge.py
@@ -1864,3 +1803,27 @@ diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index b553201..e123ab9 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -125,4 +125,6 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+     """Copy optimizer-relevant metadata when creating param views/copies."""
++    if hasattr(source, 'allreduce'):
++        destination.allreduce = source.allreduce
+     if hasattr(source, 'shared'):
+         destination.shared = source.shared
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index c072c52..bd18b47 100644
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -93,6 +93,8 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
+     """Returns true if the passed-in parameter is not a duplicate parameter
+     on another TP rank."""
+     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
++        return True
++    if not getattr(param, "allreduce", True):
+         return True
+     # Prefer provided tp_group when available (new explicit path).
+     if tp_group is not None:

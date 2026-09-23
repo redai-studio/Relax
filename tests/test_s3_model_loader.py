@@ -905,7 +905,9 @@ def test_download_model_metadata_to_shm_once_checks_available_capacity(tmp_path,
 
 def test_download_model_metadata_to_shm_once_cleans_failed_download(tmp_path, monkeypatch):
     dest = str(tmp_path / "model")
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_list_cli({"pfx/config.json": 2}))
+    monkeypatch.setattr(
+        m, "_make_s3_client", lambda **kwargs: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 2})
+    )
 
     def fail_metadata_download(_cli, _bucket, _keys, _prefix, staging, **kwargs):
         if kwargs["description"] == "metadata":
@@ -921,7 +923,9 @@ def test_download_model_metadata_to_shm_once_cleans_failed_download(tmp_path, mo
 
 def test_download_model_metadata_to_shm_once_rolls_back_marker_failure(tmp_path, monkeypatch):
     dest = str(tmp_path / "model")
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}"}))
+    monkeypatch.setattr(
+        m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok"})
+    )
 
     def fail_marker(path, _identity):
         Path(path + ".tmp").write_text("partial marker")
@@ -936,7 +940,9 @@ def test_download_model_metadata_to_shm_once_rolls_back_marker_failure(tmp_path,
 
 def test_download_model_metadata_to_shm_once_reloads_incomplete_cache(tmp_path, monkeypatch):
     dest = str(tmp_path / "model")
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}"}))
+    monkeypatch.setattr(
+        m, "_make_s3_client", lambda **kwargs: _fake_s3({"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok"})
+    )
 
     m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
     os.remove(os.path.join(dest, "config.json"))
@@ -1053,9 +1059,15 @@ def test_download_model_to_shm_once_idempotent(tmp_path, monkeypatch):
         calls["n"] += 1
         os.makedirs(a[2], exist_ok=True)
         open(os.path.join(a[2], "a.bin"), "wb").write(b"xx")
+        open(os.path.join(a[2], "config.json"), "wb").write(b"xx")
+        open(os.path.join(a[2], "tokenizer.json"), "wb").write(b"tok")
 
     # _download_model_to_shm_once 锁内预检需要 list 一次远端；mock client + 充足 free 让预检通过
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/a.bin": 2}))
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kw: _fake_list_cli({"pfx/a.bin": 2, "pfx/config.json": 2, "pfx/tokenizer.json": 3}),
+    )
     monkeypatch.setattr(m, "_free_bytes", lambda p: 10**12)
     monkeypatch.setattr(m, "_download_prefix", fake_dl)
     dest = str(tmp_path / "relax_model_x")
@@ -1100,7 +1112,9 @@ def _fake_list_cli(sizes, *, respect_prefix=False):
 
 def test_resolve_capacity_precheck(tmp_path, monkeypatch):
     # 远端一个超大对象、free 很小 → _download_model_to_shm_once 锁内预检应抛 RuntimeError
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/big.bin": 10**15}))
+    monkeypatch.setattr(
+        m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/config.json": 2, "pfx/big.bin": 10**15})
+    )
     monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)  # 1GB
 
     class A:
@@ -1131,7 +1145,7 @@ def test_download_model_to_shm_once_marker_hit_skips_precheck(tmp_path, monkeypa
 
 
 def test_download_model_to_shm_once_replaces_legacy_cache_atomically(tmp_path, monkeypatch):
-    objects = {"pfx/config.json": b"{}", "pfx/model.safetensors": b"weights"}
+    objects = {"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok", "pfx/model.safetensors": b"weights"}
     dest = str(tmp_path / "relax_model_legacy")
     os.makedirs(dest, exist_ok=True)
     for key, body in objects.items():
@@ -1152,17 +1166,18 @@ def test_download_model_to_shm_once_replaces_legacy_cache_atomically(tmp_path, m
 
     manifest = m._read_model_manifest(dest, "s3://bkt/pfx/")
     assert manifest is not None
-    assert {entry["path"] for entry in manifest["files"]} == {"config.json", "model.safetensors"}
+    assert {entry["path"] for entry in manifest["files"]} == {"config.json", "tokenizer.json", "model.safetensors"}
 
 
 def test_download_model_to_shm_once_rolls_back_manifest_publish_failure(tmp_path, monkeypatch):
     dest = str(tmp_path / "model")
-    objects = {"pfx/config.json": b"{}"}
+    objects = {"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok"}
     monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3(objects))
 
     def download(_bucket, _prefix, staging, **_kwargs):
         os.makedirs(staging, exist_ok=True)
         Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
 
     original_replace = m.os.replace
 
@@ -1181,12 +1196,13 @@ def test_download_model_to_shm_once_rolls_back_manifest_publish_failure(tmp_path
 
 def test_download_model_to_shm_once_rolls_back_marker_failure(tmp_path, monkeypatch):
     dest = str(tmp_path / "model")
-    objects = {"pfx/config.json": b"{}"}
+    objects = {"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok"}
     monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_s3(objects))
 
     def download(_bucket, _prefix, staging, **_kwargs):
         os.makedirs(staging, exist_ok=True)
         Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
 
     def fail_marker(path, _identity):
         Path(path + ".tmp").write_text("partial marker")
@@ -1205,7 +1221,9 @@ def test_download_model_to_shm_once_precheck_does_not_resume_partial_cache(tmp_p
     dest.mkdir()
     (dest / "a.bin").write_bytes(b"x" * 100)  # 预置与远端 size 一致
 
-    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/a.bin": 100, "pfx/b.bin": 100}))
+    monkeypatch.setattr(
+        m, "_make_s3_client", lambda **kw: _fake_list_cli({"pfx/config.json": 2, "pfx/a.bin": 100, "pfx/b.bin": 100})
+    )
     monkeypatch.setattr(m, "_free_bytes", lambda p: 150)
 
     dl = {"n": 0}
@@ -1218,7 +1236,10 @@ def test_download_model_to_shm_once_precheck_does_not_resume_partial_cache(tmp_p
 
 def test_download_model_to_shm_once_precheck_normalizes_prefix(tmp_path, monkeypatch):
     # uri 无尾斜杠：list/容量口径必须只算 pfx/ 下对象，不含兄弟前缀 pfx-v2/
-    cli = _fake_list_cli({"pfx/a.bin": 10, "pfx-v2/huge.bin": 10**15}, respect_prefix=True)
+    cli = _fake_list_cli(
+        {"pfx/a.bin": 10, "pfx/config.json": 1, "pfx/tokenizer.json": 1, "pfx-v2/huge.bin": 10**15},
+        respect_prefix=True,
+    )
     monkeypatch.setattr(m, "_make_s3_client", lambda **kw: cli)
     monkeypatch.setattr(m, "_free_bytes", lambda p: 100)  # 兄弟前缀若算入则必拒
     dl = {"n": 0}
@@ -1227,6 +1248,8 @@ def test_download_model_to_shm_once_precheck_normalizes_prefix(tmp_path, monkeyp
         dl["n"] += 1
         os.makedirs(staging, exist_ok=True)
         Path(staging, "a.bin").write_bytes(b"x" * 10)
+        Path(staging, "config.json").write_bytes(b"x")
+        Path(staging, "tokenizer.json").write_bytes(b"x")
 
     monkeypatch.setattr(m, "_download_prefix", download)
 
@@ -1573,3 +1596,400 @@ def test_build_runai_streamer_env_for_load_ignores_unsupported_formats(load_form
     source = m.ModelSource("s3://bucket/model/", "http://provider.example")
 
     assert m.build_runai_streamer_env_for_load(source, source.uri, load_format, {}) == {}
+
+
+def test_assert_listing_has_essential_files():
+    prefix = "pfx/"
+    # config.json present -> accepted regardless of tokenizer layout (the check
+    # must not allow-list tokenizer formats or it false-rejects valid models
+    # like XLM-R / DeBERTa / Marian).
+    m._assert_listing_has_essential_files([("pfx/config.json", 1), ("pfx/tokenizer.json", 1)], prefix)
+    m._assert_listing_has_essential_files([("pfx/config.json", 1), ("pfx/sentencepiece.bpe.model", 1)], prefix)
+    m._assert_listing_has_essential_files(
+        [("pfx/config.json", 1), ("pfx/source.spm", 1), ("pfx/target.spm", 1)], prefix
+    )
+    m._assert_listing_has_essential_files([("pfx/config.json", 1)], prefix)
+    # Missing config.json -> treated as a truncated listing.
+    with pytest.raises(RuntimeError, match="essential files"):
+        m._assert_listing_has_essential_files([("pfx/tokenizer.json", 1)], prefix)
+
+
+def test_download_rejects_truncated_listing_missing_config(tmp_path, monkeypatch):
+    # A listing missing config.json must fail loudly instead of publishing a
+    # subset that self-validates as complete.
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: _fake_list_cli({"pfx/tokenizer.json": 2}))
+    monkeypatch.setattr(m.time, "sleep", lambda *_a: None)
+    dest = str(tmp_path / "model")
+
+    with pytest.raises(RuntimeError, match="truncated remote listing"):
+        m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    _assert_cache_payload_removed(dest)
+
+
+def test_download_retries_listing_then_succeeds(tmp_path, monkeypatch):
+    # First listing is truncated (missing config.json); a re-list returns it.
+    from unittest.mock import MagicMock
+
+    full = {"pfx/config.json": b"{}", "pfx/tokenizer.json": b"tok"}
+    truncated_pages = [{"Contents": [{"Key": "pfx/tokenizer.json", "Size": 3}]}]
+    full_pages = [{"Contents": [{"Key": k, "Size": len(v)} for k, v in full.items()]}]
+    state = {"n": 0}
+    cli = MagicMock()
+
+    def paginate(Bucket, Prefix):
+        state["n"] += 1
+        return truncated_pages if state["n"] == 1 else full_pages
+
+    def get(Bucket, Key):
+        body = MagicMock()
+        body.iter_chunks.return_value = [full[Key]]
+        return {"Body": body, "ContentLength": len(full[Key])}
+
+    cli.get_paginator.return_value.paginate.side_effect = paginate
+    cli.head_object.side_effect = lambda Bucket, Key: {"ContentLength": len(full[Key])}
+    cli.get_object.side_effect = get
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kwargs: cli)
+    monkeypatch.setattr(m.time, "sleep", lambda *_a: None)
+    dest = str(tmp_path / "model")
+
+    m._download_model_metadata_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    assert state["n"] >= 2  # re-listed at least once
+    assert (tmp_path / "model" / "config.json").is_file()
+    assert (tmp_path / "model" / "tokenizer.json").is_file()
+
+
+def _seed_metadata_payload(dest: str, identity: str) -> None:
+    os.makedirs(dest, exist_ok=True)
+    Path(dest, "config.json").write_bytes(b"{}")
+    Path(dest, "tokenizer.json").write_bytes(b"tok")
+    m._write_model_manifest(dest, identity, [("pfx/config.json", 2), ("pfx/tokenizer.json", 3)], "pfx/")
+    Path(dest + ".metadata.done").write_text(identity)
+
+
+def test_full_download_preserves_live_metadata_payload(tmp_path, monkeypatch):
+    # A colocated reader may depend on an already-published metadata payload; a
+    # concurrent full download must not wipe it (the reported OSError regression).
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    _seed_metadata_payload(dest, identity)
+
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kwargs: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 7}),
+    )
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+    observed = {}
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        observed["config_present"] = os.path.isfile(os.path.join(dest, "config.json"))
+        observed["tokenizer_present"] = os.path.isfile(os.path.join(dest, "tokenizer.json"))
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
+        Path(staging, "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    assert observed == {"config_present": True, "tokenizer_present": True}
+    assert os.path.isfile(dest + ".done")
+    manifest = m._read_model_manifest(dest, identity)
+    assert manifest is not None and m._manifest_files_complete(dest, manifest)
+
+
+def test_full_download_failure_keeps_live_metadata_payload(tmp_path, monkeypatch):
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    _seed_metadata_payload(dest, identity)
+
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kwargs: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 7}),
+    )
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+
+    def download(*_a, **_k):
+        raise RuntimeError("injected download failure")
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    with pytest.raises(RuntimeError, match="injected download failure"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    assert os.path.isfile(os.path.join(dest, "config.json"))
+    assert os.path.isfile(os.path.join(dest, "tokenizer.json"))
+    assert os.path.isfile(dest + ".metadata.done")
+    assert not os.path.exists(dest + ".tmp")
+
+
+def test_download_lock_wait_is_bounded(monkeypatch, tmp_path):
+    monotonic_values = iter((0.0, 5.0))
+    monkeypatch.setattr(m.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(m, "_DOWNLOAD_LOCK_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(m.fcntl, "flock", lambda *_args: (_ for _ in ()).throw(BlockingIOError()))
+
+    with pytest.raises(TimeoutError, match="SHM cache lock"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", str(tmp_path / "model"), endpoint=None, workers=1, retries=0)
+
+
+def test_full_download_swap_failure_restores_live_metadata_payload(tmp_path, monkeypatch):
+    # If the atomic dir swap fails (e.g. os.replace raises), the preserved
+    # metadata payload must be rolled back into dest, not stranded in .old.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    _seed_metadata_payload(dest, identity)
+
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kwargs: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 7}),
+    )
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
+        Path(staging, "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    original_replace = m.os.replace
+
+    def fail_dir_swap(src, dst):
+        if src == dest + ".tmp" and dst == dest:
+            raise OSError("injected swap failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(m.os, "replace", fail_dir_swap)
+
+    with pytest.raises(OSError, match="injected swap failure"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    # Live payload restored at dest; nothing stranded in .old and staging cleaned.
+    assert os.path.isfile(os.path.join(dest, "config.json"))
+    assert os.path.isfile(os.path.join(dest, "tokenizer.json"))
+    assert os.path.isfile(dest + ".metadata.done")
+    assert not os.path.exists(dest + ".old")
+    assert not os.path.exists(dest + ".tmp")
+
+
+def test_full_download_post_swap_manifest_failure_wipes_orphaned_payload(tmp_path, monkeypatch):
+    # If the manifest publish fails AFTER the dir swap (dest already holds the
+    # new full payload, the preserved metadata copy is gone), the failure must
+    # wipe dest fully instead of leaking weights under a stale metadata manifest.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    _seed_metadata_payload(dest, identity)
+
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kwargs: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 7}),
+    )
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+
+    def download(_bucket, _prefix, staging, **_kwargs):
+        os.makedirs(staging, exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
+        Path(staging, "model.safetensors").write_bytes(b"weights")
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    original_replace = m.os.replace
+
+    def fail_manifest_publish(src, dst):
+        # Allow the dir swap (dest.tmp -> dest); fail only the manifest publish.
+        if src == dest + ".tmp.manifest.json" and dst == dest + ".manifest.json":
+            raise OSError("injected manifest publish failure")
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(m.os, "replace", fail_manifest_publish)
+
+    with pytest.raises(OSError, match="injected manifest publish failure"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+
+    # No orphaned weights, no stale metadata marker/manifest, clean slate.
+    _assert_cache_payload_removed(dest)
+
+
+def test_full_download_self_heals_stale_staging(tmp_path, monkeypatch):
+    # A leftover dest.tmp from a SIGKILLed prior attempt must not break a retry
+    # while a live metadata payload is preserved. Regression: the preserve
+    # branch used to skip cleanup, so os.makedirs(staging) raised FileExistsError
+    # and (with prefetch retries=0) the whole startup failed instead of healing.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    _seed_metadata_payload(dest, identity)
+    os.makedirs(dest + ".tmp")
+    Path(dest + ".tmp", "partial.safetensors").write_bytes(b"xxxx")
+
+    monkeypatch.setattr(
+        m,
+        "_make_s3_client",
+        lambda **kw: _fake_list_cli({"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 7}),
+    )
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+
+    def download(_b, _p, staging, **k):
+        os.makedirs(staging, exist_ok=True)
+        for name, body in [("config.json", b"{}"), ("tokenizer.json", b"tok"), ("model.safetensors", b"weights")]:
+            Path(staging, name).write_bytes(body)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    # Single call must succeed (no FileExistsError, no fail-then-retry).
+    m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    assert os.path.isfile(dest + ".done")
+    assert os.path.isfile(os.path.join(dest, "model.safetensors"))
+    assert not os.path.exists(dest + ".tmp")
+
+
+def test_full_download_reclaims_residual_weights_before_capacity(tmp_path, monkeypatch):
+    # An interrupted cleanup can leave weight shards under a metadata payload.
+    # They must be reclaimed before the capacity check, or a re-download is
+    # wrongly rejected for Insufficient SHM capacity.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    os.makedirs(dest)
+    Path(dest, "config.json").write_bytes(b"{}")
+    Path(dest, "tokenizer.json").write_bytes(b"tok")
+    Path(dest, "model.safetensors").write_bytes(b"w" * 100)  # residual weight
+    m._write_model_manifest(
+        dest,
+        identity,
+        [("pfx/config.json", 2), ("pfx/tokenizer.json", 3), ("pfx/model.safetensors", 100)],
+        "pfx/",
+    )
+    Path(dest + ".metadata.done").write_text(identity)  # cleanup dropped .done, kept metadata
+
+    sizes = {"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 100}
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli(sizes))
+
+    # Emulate real free space: tight while the residual weight occupies dest,
+    # ample once it is reclaimed.
+    def fake_free(path):
+        return 50 if os.path.exists(os.path.join(dest, "model.safetensors")) else 10**9
+
+    monkeypatch.setattr(m, "_free_bytes", fake_free)
+
+    def download(_b, _p, staging, **k):
+        os.makedirs(staging, exist_ok=True)
+        for name, body in [("config.json", b"{}"), ("tokenizer.json", b"tok"), ("model.safetensors", b"w" * 100)]:
+            Path(staging, name).write_bytes(body)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    # need=105 > 0.95*50 would reject if the residual weight were not reclaimed.
+    m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    assert os.path.isfile(dest + ".done")
+
+
+def test_full_download_reclaims_untracked_weights_from_crashed_swap(tmp_path, monkeypatch):
+    # Crash between the dir swap and the manifest publish leaves dest holding the
+    # full payload (weights included) while the on-disk manifest is still the old
+    # metadata-only one. Reclaim must physically scan dest -- not trust the stale
+    # manifest -- or the untracked weights count against capacity and the first
+    # retry is wrongly rejected.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    os.makedirs(dest)
+    Path(dest, "config.json").write_bytes(b"{}")
+    Path(dest, "tokenizer.json").write_bytes(b"tok")
+    Path(dest, "model.safetensors").write_bytes(b"w" * 100)  # untracked weight from the crashed swap
+    # published manifest is metadata-only (does NOT list model.safetensors)
+    m._write_model_manifest(dest, identity, [("pfx/config.json", 2), ("pfx/tokenizer.json", 3)], "pfx/")
+    Path(dest + ".metadata.done").write_text(identity)
+    # crashed-swap leftovers
+    os.makedirs(dest + ".old")
+    Path(dest + ".old", "config.json").write_bytes(b"{}")
+    Path(dest + ".tmp.manifest.json").write_text("{}")
+
+    sizes = {"pfx/config.json": 2, "pfx/tokenizer.json": 3, "pfx/model.safetensors": 100}
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli(sizes))
+
+    def fake_free(path):
+        return 50 if os.path.exists(os.path.join(dest, "model.safetensors")) else 10**9
+
+    monkeypatch.setattr(m, "_free_bytes", fake_free)
+
+    def download(_b, _p, staging, **k):
+        os.makedirs(staging, exist_ok=True)
+        for name, body in [("config.json", b"{}"), ("tokenizer.json", b"tok"), ("model.safetensors", b"w" * 100)]:
+            Path(staging, name).write_bytes(body)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    # Must self-heal on the first call: untracked weight reclaimed -> capacity ok.
+    m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    assert os.path.isfile(dest + ".done")
+    assert not os.path.exists(dest + ".old")
+
+
+def test_full_download_capacity_checks_relisted_listing(tmp_path, monkeypatch):
+    # A truncated first listing must not let the capacity precheck pass on a
+    # small subset; capacity is computed after relisting the full set.
+    from unittest.mock import MagicMock
+
+    truncated = [{"Contents": [{"Key": "pfx/tokenizer.json", "Size": 2}]}]  # missing config.json
+    full = [
+        {
+            "Contents": [
+                {"Key": k, "Size": s}
+                for k, s in {"pfx/config.json": 2, "pfx/tokenizer.json": 2, "pfx/big.safetensors": 10**15}.items()
+            ]
+        }
+    ]
+    state = {"n": 0}
+    cli = MagicMock()
+
+    def paginate(Bucket, Prefix):
+        state["n"] += 1
+        return truncated if state["n"] == 1 else full
+
+    cli.get_paginator.return_value.paginate.side_effect = paginate
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: cli)
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 10**9)
+    monkeypatch.setattr(m.time, "sleep", lambda *_a: None)
+
+    with pytest.raises(RuntimeError, match="Insufficient SHM capacity"):
+        m._download_model_to_shm_once("s3://bkt/pfx/", str(tmp_path / "model"), endpoint=None, workers=1, retries=0)
+    assert state["n"] >= 2  # relisted before the capacity check
+
+
+def test_full_download_reclaims_nested_untracked_weights(tmp_path, monkeypatch):
+    # Reclaim must also drop nested shards (e.g. weights/model-*.safetensors),
+    # not just top-level ones, or a crashed-swap retry is rejected on capacity.
+    identity = m._cache_identity("s3://bkt/pfx/", None)
+    dest = str(tmp_path / "relax_model_x")
+    os.makedirs(os.path.join(dest, "weights"))
+    Path(dest, "config.json").write_bytes(b"{}")
+    Path(dest, "tokenizer.json").write_bytes(b"tok")
+    nested = os.path.join(dest, "weights", "model-00001-of-00001.safetensors")
+    Path(nested).write_bytes(b"w" * 100)  # nested untracked shard from a crashed swap
+    m._write_model_manifest(dest, identity, [("pfx/config.json", 2), ("pfx/tokenizer.json", 3)], "pfx/")
+    Path(dest + ".metadata.done").write_text(identity)
+
+    sizes = {
+        "pfx/config.json": 2,
+        "pfx/tokenizer.json": 3,
+        "pfx/weights/model-00001-of-00001.safetensors": 100,
+    }
+    monkeypatch.setattr(m, "_make_s3_client", lambda **kw: _fake_list_cli(sizes))
+    monkeypatch.setattr(m, "_free_bytes", lambda p: 50 if os.path.exists(nested) else 10**9)
+
+    def download(_b, _p, staging, **k):
+        os.makedirs(os.path.join(staging, "weights"), exist_ok=True)
+        Path(staging, "config.json").write_bytes(b"{}")
+        Path(staging, "tokenizer.json").write_bytes(b"tok")
+        Path(staging, "weights", "model-00001-of-00001.safetensors").write_bytes(b"w" * 100)
+
+    monkeypatch.setattr(m, "_download_prefix", download)
+
+    m._download_model_to_shm_once("s3://bkt/pfx/", dest, endpoint=None, workers=1, retries=0)
+    assert os.path.isfile(dest + ".done")

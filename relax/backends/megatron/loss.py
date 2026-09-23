@@ -445,8 +445,13 @@ def get_log_probs_and_entropy(
     if gather_topk_token_ids is not None:
         res["topk_log_probs"] = topk_log_probs_list
 
-    # we need to turn the all gather kv into zigzag ring attn kv
-    if args.allgather_cp:
+    # we need to turn the all gather kv into zigzag ring attn kv. Guard on
+    # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
+    # rank already holds the full sequence and get_responses returned per-sample
+    # log_probs of length response_length, so redistribution is a no-op — and
+    # its prompt_length==0 (SFT) path would otherwise mis-pad the first sample
+    # by +1 (logit_global_start=-1 at seq_start=0).
+    if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         _allgather_cp_redistribute(
             res,
             logits=logits,

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
@@ -11,6 +13,111 @@ except ModuleNotFoundError as exc:
     if exc.name not in {"megatron", "megatron.core"}:
         raise
     mpu = None
+
+from relax.utils.logging_utils import get_logger
+from relax.utils.reloadable_process_group import ReloadableProcessGroup
+
+
+logger = get_logger(__name__)
+
+
+def warmup_pipeline_process_group() -> None:
+    """Initialize a reloaded PP NCCL communicator before its first batched
+    P2P."""
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    if isinstance(pp_group, ReloadableProcessGroup):
+        if pp_group.group is None:
+            raise RuntimeError("PP group warmup requires a reloaded pipeline-parallel process group")
+        pp_group = pp_group.group
+    if dist.get_backend(pp_group) != "nccl":
+        return
+    dist.barrier(group=pp_group, device_ids=[torch.cuda.current_device()])
+
+
+def warmup_static_cp_forward_neighbor_p2p() -> None:
+    """Preconnect the static CP neighbors used by DSV4 CSA forward.
+
+    Relax destroys and recreates NCCL process groups between colocated phases.
+    The first DSV4 CSA forward after a wake-up then becomes the first operation
+    to exercise the CP group's neighbor P2P transports.  Run the same
+    ``irecv(left) + isend(right)`` batch once on a one-element tensor so a
+    transport setup failure is isolated to wake-up rather than a model layer.
+
+    The caller is responsible for restricting this diagnostic to DSV4 static
+    CP.  All ranks in the static CP group must call the function together.
+    """
+    cp_group = mpu.get_context_parallel_group()
+    if isinstance(cp_group, ReloadableProcessGroup):
+        if cp_group.group is None:
+            raise RuntimeError("DSV4 CP P2P warmup requires a reloaded context-parallel process group")
+        cp_group = cp_group.group
+    cp_rank = dist.get_rank(cp_group)
+    cp_size = dist.get_world_size(cp_group)
+    if cp_size <= 1:
+        raise RuntimeError("DSV4 CP P2P warmup requires context_parallel_size > 1")
+
+    global_rank = dist.get_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    device = torch.cuda.current_device()
+    send_buffer = torch.zeros(1, dtype=torch.int32, device=device)
+    recv_buffer = torch.empty_like(send_buffer)
+
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] enter global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+    dist.barrier(group=cp_group, device_ids=[device])
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] phase=forward_p2p_enter global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+
+    ops: list[dist.P2POp] = []
+    if cp_rank > 0:
+        ops.append(
+            dist.P2POp(
+                dist.irecv,
+                recv_buffer,
+                group=cp_group,
+                group_peer=cp_rank - 1,
+            )
+        )
+    if cp_rank + 1 < cp_size:
+        ops.append(
+            dist.P2POp(
+                dist.isend,
+                send_buffer,
+                group=cp_group,
+                group_peer=cp_rank + 1,
+            )
+        )
+
+    for request in dist.batch_isend_irecv(ops):
+        request.wait()
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] phase=forward_p2p_done global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
+    dist.barrier(group=cp_group, device_ids=[device])
+    torch.cuda.synchronize(device)
+    logger.info(
+        "[debug][dsv4-cp-p2p-warmup] done global_rank=%s pp_rank=%s cp_rank=%s/%s",
+        global_rank,
+        pp_rank,
+        cp_rank,
+        cp_size,
+    )
 
 
 def maybe_padded_total_lengths(

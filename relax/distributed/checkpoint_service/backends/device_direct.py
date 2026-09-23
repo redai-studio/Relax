@@ -636,6 +636,12 @@ class DeviceDirectBackend(CommBackend):
         """
         self.weight_version += 1
 
+        if self._use_bridge:
+            # Bridge task construction and config exchange contain PP
+            # collectives, so every rank must enter them before filtering.
+            self._bridge_converter.init_tasks()
+            self._bridge_converter.broadcast_and_apply_configs()
+
         # LoRA: in merge mode, pre-gather every adapter to a full tensor so each base weight can
         # be folded before conversion (reuses the existing NCCL broadcast). In adapter mode, the
         # base is broadcast to rollout only on the first sync; afterwards only the adapter is
@@ -694,7 +700,11 @@ class DeviceDirectBackend(CommBackend):
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights") if self._is_pp_src_rank else None
 
-        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if not self._should_sync_tensor(name, param):
+                continue
             if ".experts." in name:
                 continue
             buffer_size = self._update_weight_from_distributed(
@@ -810,10 +820,15 @@ class DeviceDirectBackend(CommBackend):
         # to allocate contiguous Adam state buffers.
         device_module.empty_cache()
 
+    def _should_sync_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        return (
+            not self._use_bridge or isinstance(tensor, torch.nn.Parameter) or self._bridge_converter.can_convert(name)
+        )
+
     def _update_weight_from_distributed(
         self,
         name: str,
-        param: torch.nn.Parameter,
+        param: torch.Tensor,
         converted_named_tensors: list[tuple[str, torch.Tensor]],
         origin_named_tensors: list[tuple[str, torch.Tensor]],
         buffer_size: int,
@@ -870,7 +885,11 @@ class DeviceDirectBackend(CommBackend):
         """
         buffer_size = 0
         named_tensors: list[tuple[str, torch.Tensor]] = []
-        for name, param in self._megatron.named_params_and_buffers(self.args, self.model):
+        for name, param in self._megatron.named_params_and_buffers(
+            self.args, self.model, include_persistent_buffers=self._use_bridge
+        ):
+            if not self._should_sync_tensor(name, param):
+                continue
             if ".experts." not in name:
                 continue
             buffer_size = self._update_expert_weight_from_distributed(
@@ -884,7 +903,7 @@ class DeviceDirectBackend(CommBackend):
     def _update_expert_weight_from_distributed(
         self,
         name: str,
-        param: torch.nn.Parameter,
+        param: torch.Tensor,
         named_tensors: list[tuple[str, torch.Tensor]],
         buffer_size: int,
         rollout_only: bool = False,

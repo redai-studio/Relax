@@ -85,7 +85,6 @@ RUN MAX_JOBS=64 \
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
-    pip install megatron-energon fsspec==2024.3.1 --no-cache-dir&& \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \

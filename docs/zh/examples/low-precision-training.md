@@ -183,7 +183,7 @@ Relax 在 Qwen3-30B-A3B（8 卡 colocate）上提供两条参考配方：**FP8 �
 ### 共同前置条件
 
 1. 一个 BF16 HF checkpoint（例如 `Qwen3-30B-A3B`）。
-2. 应用 Megatron patch `docker/patch/megatron/20260506-85bced0ae.patch`（项目 Dockerfile 已自动应用）—— 该 patch 同时提供 FP8 配套的 override 与 INT4 假量化的 `_FakeInt4QuantizationSTE`（override 了 `TEGroupedLinear._get_weight_tensors()`）。
+2. 使用项目 Dockerfile 固定的 Megatron 版本，并应用 `docker/patch/latest/megatron.patch`。当前 Megatron Core 在 `megatron/core/extensions/transformer_engine_int4_fake_qat.py` 中提供 INT4 fake-QAT，由 `TEGroupedLinear._get_weight_tensors()` 调用一次；Relax patch 不再叠加第二次量化。
 
 FP8 配方额外需要一个支持 FP8 blockwise scaling 的 TransformerEngine 构建；INT4 配方额外需要编译 `fake_int4_quant_cuda` CUDA 扩展，见下文 [编译 int4_qat kernel](#build-int4-qat-kernel)。
 
@@ -215,6 +215,8 @@ FP8 配方额外需要一个支持 FP8 blockwise scaling 的 TransformerEngine �
    ``` 
 
 ### INT4 低精度训练
+
+INT4 fake-QAT 必须配置 `--no-gradient-accumulation-fusion`：STE 会替换权重张量，而 TE 融合权重梯度累积依赖原始张量上的属性。此参数关闭融合优化，仍保留梯度累积。Qwen3 和 Kimi 的 INT4 脚本已包含该参数，改写脚本时请保留。
 
 #### 编译 int4_qat kernel {#build-int4-qat-kernel}
 
@@ -310,7 +312,7 @@ bash scripts/entrypoint/ray-job.sh scripts/training/multimodal/run-kimi-k2.6-256
 | 配置项                                              | 取值                                                                                       | 说明                                                                                                  |
 | --------------------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
 | 并行布局                                            | TP=8、PP=8、CP=4、EP=32、ETP=1                                                              | 共 256 GPU。INT4 QAT 只影响权重更新路径，并行布局保持不变。                                            |
-| `OPEN_TRAINING_INT4_FAKE_QAT_FLAG`                  | `1`                                                                                        | 启用 `TEGroupedLinear._get_weight_tensors()` 中的 `_FakeInt4QuantizationSTE`。                        |
+| `OPEN_TRAINING_INT4_FAKE_QAT_FLAG`                  | `1`                                                                                        | 启用 `TEGroupedLinear._get_weight_tensors()` 调用的 Megatron INT4 fake-QAT helper。                   |
 | `OPEN_TRAINING_INT4_GROUP_SIZE`                     | `32`                                                                                       | 与 W4A16 发布版的 per-group scale 布局保持一致（Kimi 使用 **32**，而不是 Qwen3-30B 配方里的 128）。     |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`    | `256`                                                                                      | DeepEP 低延迟 dispatch 缓冲；默认 128 会与 bs=128 时的 cuda_graph capture 冲突。                       |
 | `--rollout-num-gpus-per-engine`                     | `16`                                                                                       | 每个 SGLang 引擎占 16 GPU → 256 GPU 总共 16 个引擎。                                                   |
