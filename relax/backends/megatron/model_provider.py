@@ -33,6 +33,7 @@ from relax.utils.megatron_peft_utils import (
     build_lora_peft,
     count_adapter_parameters,
     exclude_frozen_lora_target_modules,
+    inherit_lora_tp_grad_sync,
     install_gdn_gate_mask_hooks,
     is_lora_adapter_mode,
     is_lora_adapter_param,
@@ -303,6 +304,10 @@ def get_model_provider_func(
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
+        is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+        if is_kimi_k3:
+            from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
+
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
@@ -401,6 +406,8 @@ def get_model_provider_func(
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
+                if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
+                    continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
                 if getattr(args, "dynamic_context_parallel", False):
@@ -409,6 +416,9 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if is_kimi_k3:
+            configure_runtime(provider, args)
 
         # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
         # the vision encoder input before its CP all-gather.  Relax's public
@@ -730,6 +740,7 @@ def wrap_model_provider_with_lora(original_provider, args):
                     model, list(peft.target_modules), args.freeze_params_name_list
                 )
             model = peft(model, training=True)
+            inherit_lora_tp_grad_sync(model)
             ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
             adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]

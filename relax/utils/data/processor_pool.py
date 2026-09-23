@@ -28,6 +28,7 @@ import torch
 import torch.multiprocessing as mp
 from PIL import Image
 
+from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
 from relax.utils.data.processing_utils import (
     adapt_processor_kwargs,
     expand_kimi_k25_placeholders,
@@ -166,8 +167,12 @@ def process_sample_in_worker(
 
         # Translate to the processor's native call shape (no-op for Qwen-VL etc.;
         # rewrites images→medias and drops conflicting return_tensors for Kimi K2.x).
-        adapted = adapt_processor_kwargs(_worker_processor, restored, processor_kwargs)
-        processor_output = _worker_processor(text=text, **adapted)
+        kimi_request = processor_kwargs.get(KIMI_K3_SFT_REQUEST)
+        if kimi_request is not None:
+            processor_output = process_kimi_k3_sft_images(_worker_processor, restored, kimi_request)
+        else:
+            adapted = adapt_processor_kwargs(_worker_processor, restored, processor_kwargs)
+            processor_output = _worker_processor(text=text, **adapted)
 
         prompt_ids = processor_output["input_ids"][0]
         # K2.x adapt_processor_kwargs forces return_tensors="pt", so
@@ -197,7 +202,8 @@ def process_sample_in_worker(
                 mm_train_inputs[k] = v.contiguous().share_memory_()
 
         train_inputs = remap_mm_train_inputs(_worker_processor, mm_train_inputs or None)
-        prompt_ids = expand_kimi_k25_placeholders(_worker_processor, prompt_ids, train_inputs)
+        if kimi_request is None:
+            prompt_ids = expand_kimi_k25_placeholders(_worker_processor, prompt_ids, train_inputs)
         return prompt_ids, train_inputs
 
     except Exception as e:

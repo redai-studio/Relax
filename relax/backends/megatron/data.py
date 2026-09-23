@@ -537,6 +537,12 @@ def get_batch(
                 cu_seqlens_q_padded=cu_seqlens_padded,
                 cu_seqlens_kv_padded=cu_seqlens_padded,
             )
+            # Keep the physical boundaries on the host for VL input repacking;
+            # reading CUDA cu_seqlens in each model forward would synchronize.
+            vlm_cu_seqlens_cpu = [0]
+            for sequence_length in seqlens_padded:
+                vlm_cu_seqlens_cpu.append(vlm_cu_seqlens_cpu[-1] + sequence_length)
+            vlm_packed_seq_params.cu_seqlens_q_cpu = vlm_cu_seqlens_cpu
             if use_dynamic_context_parallel:
                 vlm_packed_seq_params.local_cp_size = cp_size
                 vlm_packed_seq_params.cp_group = cp_group
@@ -714,14 +720,18 @@ def get_batch(
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
+        input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
                 continue
             for key, mm_tensor in mm_input_dict.items():
+                mapped_key = input_key_map.get(key, key)
+                if mapped_key != key and mapped_key in mm_input_dict:
+                    raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
                 if isinstance(mm_tensor, list):
                     mm_tensor = torch.tensor(mm_tensor)
-                tensor_dict_list.setdefault(key, []).append(mm_tensor)
+                tensor_dict_list.setdefault(mapped_key, []).append(mm_tensor)
 
         for key, tensor_list in tensor_dict_list.items():
             if key in PAD_RULES:
@@ -1569,7 +1579,12 @@ def move_tensors_to_device(data: Any, device: torch.device, *, non_blocking: boo
     Non-tensor values are left unchanged.
     """
     if isinstance(data, dict):
-        return {k: move_tensors_to_device(v, device, non_blocking=non_blocking) for k, v in data.items()}
+        # MoonViT consumes grid_thws as Python geometry. Preserve host metadata
+        # instead of copying it to CUDA only to synchronize it back in forward.
+        return {
+            k: v if k == "grid_thws" else move_tensors_to_device(v, device, non_blocking=non_blocking)
+            for k, v in data.items()
+        }
     if isinstance(data, list):
         return [move_tensors_to_device(v, device, non_blocking=non_blocking) for v in data]
     if isinstance(data, tuple):
@@ -1615,5 +1630,5 @@ def record_tensors_on_stream(data: Any, stream: Any) -> None:
     elif isinstance(data, PackedSeqParams):
         for value in vars(data).values():
             record_tensors_on_stream(value, stream)
-    elif isinstance(data, torch.Tensor):
+    elif isinstance(data, torch.Tensor) and data.device.type != "cpu":
         data.record_stream(stream)
