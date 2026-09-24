@@ -26,6 +26,7 @@ import torch
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
+from relax.utils.inference_sync import notify_inference_weight_update
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import load_function
 
@@ -1342,6 +1343,10 @@ class FSDPTrainRayActor(TrainRayActor):
         if getattr(self.args, "debug_train_only", False):
             return False
 
+        from relax.utils.distributed_utils import get_gloo_group
+
+        inference_sync = notify_inference_weight_update(self.rollout_manager, get_gloo_group())
+
         def _mem(tag: str) -> None:
             a = torch.cuda.memory_allocated(self.device) / 1e9
             r = torch.cuda.memory_reserved(self.device) / 1e9
@@ -1418,7 +1423,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         with timer("weight_sync"):
             try:
-                self._run_weight_transaction(manifest, iterator)
+                updated_engines = self._run_weight_transaction(manifest, iterator)
             except WeightSyncError as exc:
                 # The streamed version is INVALID on some/all engines. Roll back the
                 # version bump so a whole-round retry rebuilds the manifest with the
@@ -1448,6 +1453,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 finally:
                     self._invalidate_ipc_topology()
                 raise
+        notify_inference_weight_update(self.rollout_manager, get_gloo_group(), inference_sync, engines=updated_engines)
         _mem("after weight transaction")
         _lap("bucket_loop")
         if offload_after_sync:
@@ -1781,7 +1787,7 @@ class FSDPTrainRayActor(TrainRayActor):
             f"tp={self._ipc_tp} block_offset={self._ipc_block_offset}"
         )
 
-    def _run_weight_transaction(self, manifest, iterator) -> None:
+    def _run_weight_transaction(self, manifest, iterator) -> list[Any]:
         """Stream the full transformer to the co-located engine(s) via CUDA
         IPC.
 
@@ -1827,7 +1833,7 @@ class FSDPTrainRayActor(TrainRayActor):
             raise WeightSyncError(version, "no rollout engines available")
         if self.args.weight_sync_mode == "adapter":
             self._run_adapter_transaction(manifest, engines)
-            return
+            return engines
         # _rest = [num_new_engines, engine_gpu_counts, engine_gpu_offsets].
         gpu_counts = _rest[1] if len(_rest) >= 2 else [1] * len(engines)
         world = dist.get_world_size(self._device_group())
@@ -2017,6 +2023,7 @@ class FSDPTrainRayActor(TrainRayActor):
             raise
         except Exception as exc:  # any transport / engine RPC failure invalidates the version
             raise WeightSyncError(version, str(exc)) from exc
+        return engines
 
     def _verify_and_commit_engines(self, engines, manifest) -> None:
         """Verify every engine replica before committing the policy version."""

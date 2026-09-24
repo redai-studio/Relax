@@ -239,6 +239,15 @@ class DeviceDirectBackend(CommBackend):
             )
         return frozenset(sig)
 
+    def updated_rollout_urls(self) -> set[str] | None:
+        """Endpoints actually updated by this PP source, after health
+        pruning."""
+        from relax.engine.inference import base_url
+
+        if not self._is_pp_src_rank:
+            return None
+        return {base_url(info["ip"], info["port"]) for info in self.rollout_topology.values()}
+
     def _create_rollout_engines(self, rollout_topology: Dict[int, Dict[str, Any]]) -> None:
         """Create Ray actors for each rollout node.
 

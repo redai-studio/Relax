@@ -64,6 +64,7 @@ class Service:
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
+        self.inference_gateway = None
         if actor_rollout_pgs is not None:
             pgs = actor_rollout_pgs
         elif num_gpus == 0:
@@ -107,7 +108,33 @@ class Service:
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
-        self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
+        if self.role in ("rollout", "genrm"):
+            from relax.core.inference import bind_inference_gateway, deploy_inference_gateway
+
+            created_gateway = self.inference_gateway is None
+            if created_gateway:
+                self.inference_gateway = deploy_inference_gateway(self.role, self.config, self.runtime_env)
+            try:
+                self.handle = serve.run(self.service, name=self.role, route_prefix=None)
+                bindings = self.handle.get_inference_bindings.remote().result(timeout_s=30)
+                bind_inference_gateway(self.inference_gateway, bindings, self.handle)
+            except Exception:
+                try:
+                    self.quiesce_inference()
+                except Exception as exc:
+                    logger.warning("Failed to quiesce inference gateway: %s", exc)
+                finally:
+                    if created_gateway:
+                        serve.delete(f"inference_{self.role}")
+                        self.inference_gateway = None
+                raise
+        else:
+            self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
+
+    def quiesce_inference(self) -> None:
+        from relax.core.inference import quiesce_inference_gateway
+
+        quiesce_inference_gateway(self.inference_gateway)
 
     def _start_heartbeat(self) -> None:
         """Start background heartbeat thread to report health status."""
@@ -232,6 +259,7 @@ class Service:
         9. Restart heartbeat and re-run the service task.
         """
         logger.info(f"[{self.role}] Starting in-place restart...")
+        self.quiesce_inference()
 
         self._stop_heartbeat_thread()
 

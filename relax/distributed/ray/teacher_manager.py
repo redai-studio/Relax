@@ -55,7 +55,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
     return env_vars
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"discovery": 1})
 class TeacherManager(MultiEngineManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 

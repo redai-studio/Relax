@@ -180,6 +180,14 @@ class GenRM(Base):
         """
         return None
 
+    def get_inference_bindings(self) -> list[dict[str, Any]]:
+        return [{"manager": manager, "model": key} for key, manager in self.genrm_managers.items()]
+
+    async def inference_legacy_http(self, method: str, path: str, query: str, body: bytes) -> dict[str, Any]:
+        from relax.engine.inference_http import legacy_http
+
+        return await legacy_http(self.app, method, path, query, body)
+
     @app.post("/generate")
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         """Generate response for given chat messages.
@@ -235,23 +243,12 @@ class GenRM(Base):
         host, port = hosts_ports[idx]
         return key, idx, host, port
 
-    async def _call_engine(
-        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+    async def prepare_inference_request(
+        self, key: str, messages: list, sampling_params: Optional[dict] = None
     ) -> dict:
-        """Call an SGLang engine for text generation.
-
-        Uses the engine addresses obtained from the selected instance's
-        GenRMManager to send HTTP requests to the underlying SGLang server.
-
-        Args:
-            route_key: Selects which genRM instance to use.
-            messages: List of chat messages in OpenAI format.
-            sampling_params: Optional per-request sampling params that override defaults.
-
-        Returns:
-            Dict containing at least {"text": str} from the SGLang server.
-        """
-        key, idx, host, port = self._pick_engine(route_key)
+        """Render the legacy GenRM prompt without choosing or calling an
+        engine."""
+        messages = [message.model_dump() if isinstance(message, BaseModel) else message for message in messages]
         spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
@@ -290,10 +287,29 @@ class GenRM(Base):
         if sampling_params:
             default_sampling.update(sampling_params)
 
-        payload = {
+        return {
             "input_ids": input_ids,
             "sampling_params": default_sampling,
         }
+
+    async def _call_engine(
+        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+    ) -> dict:
+        """Call an SGLang engine for text generation.
+
+        Uses the engine addresses obtained from the selected instance's
+        GenRMManager to send HTTP requests to the underlying SGLang server.
+
+        Args:
+            route_key: Selects which genRM instance to use.
+            messages: List of chat messages in OpenAI format.
+            sampling_params: Optional per-request sampling params that override defaults.
+
+        Returns:
+            Dict containing at least {"text": str} from the SGLang server.
+        """
+        key, idx, host, port = self._pick_engine(route_key)
+        payload = await self.prepare_inference_request(key, messages, sampling_params)
 
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
