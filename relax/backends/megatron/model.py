@@ -200,7 +200,7 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
     # tensors when the unsplit path is taken with MTP enabled; use them so
     # the rolled labels/mask line up with the MTP chunked hidden_states.
     if batch.get("unsplit_mtp_labels") is not None:
-        forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["unsplit_mtp_labels"]}
+        forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["unsplit_mtp_labels"], "labels_are_shifted": True}
         if forward_kwargs.get("loss_mask") is None:
             forward_kwargs["loss_mask"] = batch["unsplit_mtp_loss_mask"]
         return
@@ -518,8 +518,13 @@ def _relax_gdn_cp_config_assert() -> None:
     edit), matching ``_patch_gdn_for_dynamic_cp``.
     """
     try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.transformer_config import TransformerConfig
     except ImportError:
+        return
+
+    if hasattr(GatedDeltaNet, "_prepare_input_for_gated_delta_rule"):
+        # The packaged GDN implementation handles dynamic/chunkwise CP natively.
         return
 
     if getattr(TransformerConfig, "_gdn_cp_relaxed", False):
@@ -577,6 +582,9 @@ def _patch_gdn_for_dynamic_cp() -> None:
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     except ImportError:
+        return
+
+    if hasattr(GatedDeltaNet, "_prepare_input_for_gated_delta_rule"):
         return
 
     if getattr(GatedDeltaNet, "_dcp_patched", False):

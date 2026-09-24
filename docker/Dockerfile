@@ -108,7 +108,7 @@ WORKDIR /root
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
 
-ARG MEGATRON_BRIDGE_COMMIT=af17edf52c514c58c79cd291b04a9b42bc5c57f3
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -132,6 +132,21 @@ RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps
+
+# MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
+# Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
+# The final stage also covers externally supplied TRAIN_IMAGE builds.
+RUN pip install --no-cache-dir \
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+
+# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
+COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
 
 # sgl-router: override the official wheel (pulled by requirements.txt above) with
 # slime's r3-capable fork. The official sglang-router drops the routed_experts
