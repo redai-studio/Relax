@@ -586,5 +586,60 @@ class TestWatcherCrashCapacity(unittest.TestCase):
         self.assertIn("watcher crashed", status["error_message"])
 
 
+class TestRequestSamplingSeed(unittest.TestCase):
+    """Product semantics: a stochastic scoring request draws its random stream
+    from a seed derived from (judge model, model-facing input, effective
+    sampling) -- identical requests produce identical verdicts on every
+    replica, independent of each engine's RNG-consumption history (adversarial
+    finding: server-level seeding alone flipped 2/50 verdicts across replicas
+    after diverged request histories)."""
+
+    SPEC = {
+        "model_path": "/models/qwen3-0.6b",
+        "sampling_config": {"temperature": 0.1, "top_p": 1.0, "top_k": -1, "max_response_len": 64},
+    }
+
+    def _replica(self):
+        replica = _replica()
+        replica.instance_specs = {"__default__": dict(self.SPEC)}
+        return replica
+
+    def test_stochastic_request_gets_a_stable_seed(self):
+        replica = self._replica()
+        first = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        second = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        self.assertIn("sampling_seed", first)
+        self.assertEqual(first["sampling_seed"], second["sampling_seed"])
+        self.assertIsInstance(first["sampling_seed"], int)
+        self.assertGreaterEqual(first["sampling_seed"], 0)
+        self.assertLessEqual(first["sampling_seed"], 2**31 - 1)  # int32-safe for SGLang
+
+    def test_seed_depends_on_input_and_sampling_and_model(self):
+        replica = self._replica()
+        base = replica._derive_sampling_seed("/m", [1, 2], {"temperature": 0.1})
+        self.assertNotEqual(base, replica._derive_sampling_seed("/m", [1, 3], {"temperature": 0.1}))
+        self.assertNotEqual(base, replica._derive_sampling_seed("/m", [1, 2], {"temperature": 0.2}))
+        self.assertNotEqual(base, replica._derive_sampling_seed("/other", [1, 2], {"temperature": 0.1}))
+
+    def test_greedy_request_gets_no_seed(self):
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"temperature": 0.0}, [1, 2, 3])
+        self.assertNotIn("sampling_seed", effective)
+        self.assertEqual(effective["temperature"], 0.0)
+
+    def test_explicit_caller_seed_is_respected(self):
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"sampling_seed": 12345}, [1, 2, 3])
+        self.assertEqual(effective["sampling_seed"], 12345)
+
+    def test_override_changes_the_seed_not_just_the_params(self):
+        """The seed is derived from the *effective* params, so an override that
+        changes sampling draws a different stream."""
+        replica = self._replica()
+        default = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        overridden = replica._effective_sampling(self.SPEC, {"temperature": 0.7}, [1, 2, 3])
+        self.assertNotEqual(default["sampling_seed"], overridden["sampling_seed"])
+
+
 if __name__ == "__main__":
     unittest.main()

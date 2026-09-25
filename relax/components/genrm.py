@@ -12,6 +12,8 @@ fall back to the sole "__default__" instance (the legacy single-model config).
 """
 
 import asyncio
+import hashlib
+import json
 import time
 from argparse import Namespace
 from itertools import cycle
@@ -385,6 +387,48 @@ class GenRM(Base):
             self._engine_inflight[final_key] = max(0, remaining)
             self._engine_served[final_key] = self._engine_served.get(final_key, 0) + 1
 
+    def _effective_sampling(self, spec: dict, sampling_params: Optional[dict], input_ids: list) -> dict:
+        """Effective per-request sampling params (defaults merged with the
+        caller's override) plus the request-level sampling seed.
+
+        Seed contract (product semantics): a stochastic scoring request
+        (``temperature > 0``) draws its random stream from a seed derived from
+        the judge identity, the exact model-facing input and the effective
+        sampling config -- never from a replica's RNG-consumption history.
+        Identical scoring requests therefore produce identical verdicts on
+        every replica (adversarial finding: server-level ``args.seed`` seeding
+        alone flips verdicts across replicas whose request histories diverged;
+        2/50 on Qwen3-0.6B, temp 0.1). Greedy requests (``temperature == 0``)
+        are already deterministic and get no seed; an explicit caller-provided
+        ``sampling_seed`` is respected.
+        """
+        sampling_config = spec["sampling_config"]
+        effective = {
+            "temperature": sampling_config.get("temperature", 0.2),
+            "top_p": sampling_config.get("top_p", 1.0),
+            "top_k": sampling_config.get("top_k", -1),
+            "max_new_tokens": sampling_config.get("max_response_len", 1024),
+        }
+        if sampling_params:
+            effective.update(sampling_params)
+        if effective.get("sampling_seed") is None and float(effective.get("temperature", 0.0) or 0.0) > 0.0:
+            effective["sampling_seed"] = self._derive_sampling_seed(
+                model_path=spec["model_path"],
+                input_ids=input_ids,
+                sampling=effective,
+            )
+        return effective
+
+    @staticmethod
+    def _derive_sampling_seed(model_path: str, input_ids: list, sampling: dict) -> int:
+        """Stable int32 seed: SHA256(model, model-facing input, sampling)."""
+        canonical = json.dumps(
+            {"model": model_path, "input_ids": list(input_ids), "sampling": sampling},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return int.from_bytes(hashlib.sha256(canonical.encode("utf-8")).digest()[:4], "big") & 0x7FFFFFFF
+
     async def _call_engine_tracked(
         self,
         route_key: Optional[str],
@@ -427,16 +471,9 @@ class GenRM(Base):
                 else list(input_ids)
             )
 
-        # Merge per-request sampling params with default config
-        default_sampling = {
-            "temperature": sampling_config.get("temperature", 0.2),
-            "top_p": sampling_config.get("top_p", 1.0),
-            "top_k": sampling_config.get("top_k", -1),
-            "max_new_tokens": sampling_config.get("max_response_len", 1024),
-        }
-        # Override defaults with per-request params
-        if sampling_params:
-            default_sampling.update(sampling_params)
+        # Merge per-request sampling params with default config and derive
+        # the request-level sampling seed.
+        default_sampling = self._effective_sampling(spec, sampling_params, input_ids)
 
         payload = {
             "input_ids": input_ids,
