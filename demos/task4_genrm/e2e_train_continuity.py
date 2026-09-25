@@ -196,6 +196,7 @@ def main() -> int:
     # ---- scale-out window ---- #
     so = http_post("/scale_out", {"num_replicas": 2, "timeout_secs": 900.0})
     rid = so["request_id"]
+    so_submit_ts = time.time()
     log_event("scale_out_submitted", request_id=rid)
     so_final = poll_status("scale_out", rid, {"ACTIVE", "PARTIAL", "FAILED"}, 900)
     so_active_ts = time.time()
@@ -228,6 +229,7 @@ def main() -> int:
     # ---- scale-in window ---- #
     si = http_post("/scale_in", {"num_replicas": 1, "timeout_secs": 600.0})
     rid_si = si["request_id"]
+    si_submit_ts = time.time()
     log_event("scale_in_submitted", request_id=rid_si)
     si_final = poll_status("scale_in", rid_si, {"COMPLETED", "FAILED"}, 600)
     si_done_ts = time.time()
@@ -265,13 +267,25 @@ def main() -> int:
     # `>=` assertion passed on a doubled numerator).
     rollout_idx = {int(kind.split()[1]) for _, kind in events if kind.startswith("rollout ")}
     rollouts = sorted(ts for ts, kind in events if kind.startswith("rollout "))
-    max_gap = max((b - a for a, b in zip(steps + rollouts, (steps + rollouts)[1:])), default=0.0)
-    in_window = [ts for ts in steps + rollouts if so_active_ts <= ts <= si_done_ts]
+    all_events_ts = sorted(steps + rollouts)
+    max_gap = max((b - a for a, b in zip(all_events_ts, all_events_ts[1:])), default=0.0)
+    # Progress coverage across the scaling span, in observable windows
+    # (review finding: the old single in-window check used the scale-out
+    # *completion* as its lower bound, so one event between the two operations
+    # passed even with nothing inside the scale-out window itself). The 1 s
+    # scale-in window is shorter than one training iteration, so the honest
+    # claim is progress before, between, and after the operations -- each
+    # window is asserted separately below.
+    before_scaling = [ts for ts in all_events_ts if ts < so_submit_ts]
+    between_operations = [ts for ts in all_events_ts if so_active_ts <= ts < si_submit_ts]
+    after_scale_in = [ts for ts in all_events_ts if ts > si_done_ts]
 
     verdicts["scale_out_active"] = so_final["status"] == "ACTIVE"
     verdicts["scale_in_completed"] = si_final["status"] == "COMPLETED"
     verdicts["elastic_engine_served_rewards"] = bool(elastic) and sum(elastic.values()) > 0
-    verdicts["train_events_during_scaling_window"] = len(in_window) > 0
+    verdicts["train_events_before_scaling"] = len(before_scaling) > 0
+    verdicts["train_events_between_operations"] = len(between_operations) > 0
+    verdicts["train_events_after_scale_in"] = len(after_scale_in) > 0
     verdicts["no_train_stall_over_120s"] = max_gap <= 120.0
     verdicts["training_finished_after_scale_in"] = finished
     verdicts["final_capacity_is_initial"] = final["current"] == 1 and initial_ids <= final_ids
