@@ -199,6 +199,20 @@ class Envs(metaclass=_EnvsMeta):
     USER = EnvProperty("USER", str, None)
     LOGNAME = EnvProperty("LOGNAME", str, None)
 
+    # ------------- Straggler profiler (Task 11) -------------
+    # Every knob defaults to off/inert; the profiler must be opt-in per run.
+    RELAX_STRAGGLER_ENABLE = EnvProperty("RELAX_STRAGGLER_ENABLE", bool, False)
+    RELAX_STRAGGLER_TIMER_LOG_LEVEL = EnvProperty("RELAX_STRAGGLER_TIMER_LOG_LEVEL", int, 2)
+    RELAX_STRAGGLER_EVENT_POOL = EnvProperty("RELAX_STRAGGLER_EVENT_POOL", int, 512)
+    RELAX_STRAGGLER_QUEUE_MAX = EnvProperty("RELAX_STRAGGLER_QUEUE_MAX", int, 4096)
+    RELAX_STRAGGLER_OUTPUT_DIR = EnvProperty("RELAX_STRAGGLER_OUTPUT_DIR", str, None)
+    RELAX_STRAGGLER_WORK_TOLERANCE = EnvProperty("RELAX_STRAGGLER_WORK_TOLERANCE", float, 0.05)
+    RELAX_STRAGGLER_WINDOW_S = EnvProperty("RELAX_STRAGGLER_WINDOW_S", float, 5.0)
+    RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
+    RELAX_STRAGGLER_MIN_COHORT = EnvProperty("RELAX_STRAGGLER_MIN_COHORT", int, 2)
+    RELAX_STRAGGLER_REPORT_INTERVAL_S = EnvProperty("RELAX_STRAGGLER_REPORT_INTERVAL_S", float, 10.0)
+    RELAX_STRAGGLER_COLLECTOR_ADDR = EnvProperty("RELAX_STRAGGLER_COLLECTOR_ADDR", str, None)
+
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PREEXPANDED_PATCH = EnvProperty("RELAX_OPD_PREEXPANDED_PATCH", bool, False)
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
