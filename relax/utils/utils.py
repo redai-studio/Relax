@@ -24,39 +24,31 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
-def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
-    """Extract per-image ViT token counts from multimodal_train_inputs.
+def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
+    """Keep original CPU (T,H,W) geometry for model-specific FLOPs estimates.
 
-    Accepts either:
-      - ``list[dict | None]``: per-sample dicts (pre-batch format)
-      - ``dict``: concatenated tensors (post-``prepare_batch`` format)
-
-    For each image, the ViT input sequence length = H * W (repeated T times
-    along the temporal axis).
+    MoonViT attends over T*H*W before temporal pooling; a list of per-frame H*W
+    lengths loses this information. Called on rollout metadata, before the
+    training batch moves tensors to the accelerator.
     """
-    if isinstance(multimodal_train_inputs, dict):
-        grid_thw = multimodal_train_inputs.get("image_grid_thw")
-        if grid_thw is None:
-            return []
-        if isinstance(grid_thw, torch.Tensor):
-            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-            return seqlens.tolist()
-        return [int(h * w) for t, h, w in grid_thw for _ in range(int(t))]
-
-    images_seqlens: list[int] = []
-    for mm_input in multimodal_train_inputs:
+    inputs = [multimodal_train_inputs] if isinstance(multimodal_train_inputs, dict) else multimodal_train_inputs
+    grids: list[tuple[int, int, int]] = []
+    for mm_input in inputs:
         if mm_input is None:
             continue
-        grid_thw = mm_input.get("image_grid_thw")
-        if grid_thw is None:
+        grid = mm_input.get("image_grid_thw")
+        if grid is None:
             continue
-        if isinstance(grid_thw, torch.Tensor):
-            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-            images_seqlens.extend(seqlens.tolist())
-        elif isinstance(grid_thw, (list, np.ndarray)):
-            for t, h, w in grid_thw:
-                images_seqlens.extend([int(h * w)] * int(t))
-    return images_seqlens
+        if isinstance(grid, torch.Tensor):
+            grid = grid.tolist()
+        grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
+    return grids
+
+
+def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
+    """Legacy per-frame H*W counts; keep existing non-K3 estimator
+    semantics."""
+    return [h * w for t, h, w in _extract_image_grids(multimodal_train_inputs) for _ in range(t)]
 
 
 def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:

@@ -93,7 +93,7 @@ from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
     _extract_audio_seqlens,
-    _extract_images_seqlens,
+    _extract_image_grids,
     get_debug_data,
     get_serve_url,
     merge_dict_list,
@@ -2115,14 +2115,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_response_token_counts = sum(all_response_token_counts, [])  # flatten
         Timer().response_lens = all_response_token_counts
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
@@ -2574,14 +2578,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_total_lengths = sum(all_total_lengths, [])  # flatten
         Timer().seq_lens = all_total_lengths
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
@@ -2746,14 +2754,18 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         all_response_token_counts = sum(all_response_token_counts, [])  # flatten
         Timer().response_lens = all_response_token_counts
+        Timer().images_seqlens = []
+        Timer().image_grid_thw = []
+        Timer().audio_seqlens = []
         mm_inputs = rollout_data.get("multimodal_train_inputs")
         if mm_inputs is not None:
-            images_seqlens = _extract_images_seqlens(mm_inputs)
-            all_images_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
+            image_grids = _extract_image_grids(mm_inputs)
+            all_image_grids = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
-                all_images_seqlens, images_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
+                all_image_grids, image_grids, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
-            Timer().images_seqlens = sum(all_images_seqlens, [])
+            Timer().image_grid_thw = sum(all_image_grids, [])
+            Timer().images_seqlens = [h * w for t, h, w in Timer().image_grid_thw for _ in range(t)]
             audio_seqlens = _extract_audio_seqlens(mm_inputs)
             all_audio_seqlens = [None] * mpu.get_data_parallel_world_size(with_context_parallel=False)
             dist.all_gather_object(
