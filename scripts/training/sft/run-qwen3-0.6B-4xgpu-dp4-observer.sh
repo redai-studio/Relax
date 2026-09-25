@@ -40,6 +40,11 @@
 #   NUM_ROLLOUT     optimizer steps  (default 48; rollout_batch_size == global_batch_size)
 #   GLOBAL_BATCH_SIZE  samples per step (default 32)
 #   SAVE_INTERVAL   periodic save interval (default 1000000 == effectively off)
+#   SAVE=0          omit --save entirely. The finish path performs one forced
+#                   synchronous checkpoint even with --save-interval off, which
+#                   would dominate a short whole-run wall-time comparison; the
+#                   timing arms set SAVE=0 in BOTH arms so only the observer
+#                   differs.
 #   DRY_RUN=1       print the resolved runtime env + command and exit without
 #                   starting Ray or submitting anything
 #
@@ -103,6 +108,7 @@ SAVE_DIR="${SAVE_DIR:-/root/autodl-tmp/relax-checkpoints/qwen3-0.6B-sft-dp4-obse
 NUM_ROLLOUT="${NUM_ROLLOUT:-48}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-1000000}"
+SAVE="${SAVE:-1}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 RELAX="${RELAX:-$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)}"
@@ -205,10 +211,15 @@ CKPT_ARGS=(
    --ref-load "${MODEL_PATH}"
 
    --megatron-to-hf-mode bridge
-   --save "${SAVE_DIR}/sft/${EXP_NAME}"
-   --save-interval "${SAVE_INTERVAL}"
-   --no-save-rng
 )
+
+if [ "${SAVE}" = "1" ]; then
+   CKPT_ARGS+=(
+      --save "${SAVE_DIR}/sft/${EXP_NAME}"
+      --save-interval "${SAVE_INTERVAL}"
+      --no-save-rng
+   )
+fi
 
 SFT_ARGS=(
    --loss-type sft
