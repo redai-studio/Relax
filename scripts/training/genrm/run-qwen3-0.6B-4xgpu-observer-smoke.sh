@@ -41,6 +41,11 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
+# Mandatory: submit with an explicit working directory so the Ray driver and its
+# actors import THIS repo's `relax` package. Without --working-dir the Ray daemon
+# resolves `relax` from its own cwd, which can be another worktree entirely.
+WORKING_DIR="${WORKING_DIR:-$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)}"
+
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../entrypoint/local.sh"
 fi

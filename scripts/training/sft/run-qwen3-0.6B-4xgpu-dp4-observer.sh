@@ -112,6 +112,10 @@ SAVE="${SAVE:-1}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 RELAX="${RELAX:-$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)}"
+# Mandatory: submit with an explicit working directory so the Ray driver and its
+# actors import THIS repo's `relax` package. Without --working-dir the Ray daemon
+# resolves `relax` from its own cwd, which can be another worktree entirely.
+WORKING_DIR="${WORKING_DIR:-${RELAX}}"
 MODEL_CONFIG_DIR="${MODEL_CONFIG_DIR:-${SCRIPT_DIR}/../../models}"
 PROMPT_SET="${PROMPT_SET:-${SCRIPT_DIR}/data/dapo-math-17k-sft-256.jsonl}"
 LOG_DIR="${LOG_DIR:-${RELAX}/log}"
