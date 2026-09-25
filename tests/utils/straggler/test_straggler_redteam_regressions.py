@@ -314,7 +314,8 @@ def test_cohort_separates_expert_parallel_roles() -> None:
 
 
 def test_two_expert_roles_do_not_produce_a_false_accusation() -> None:
-    """A 3x timing difference across EP roles must not be judged a straggler."""
+    """A 3x timing difference across EP roles must not be judged a
+    straggler."""
     left = RuntimeIdentity(
         run_id="rt", rank=0, world_size=8, tensor_parallel_rank=0, expert_parallel_rank=0, data_parallel_rank=0
     )
@@ -381,9 +382,9 @@ def test_rank_starting_three_windows_late_is_still_compared() -> None:
     """The straight-line form of the original defect.
 
     rank 1 starts 15 s (three 5 s windows) after rank 0 and is 3x slow. Windows
-    are anchored to the cohort, so both ranks land in the same wall-clock window
-    once rank 1 is up; before the fix rank 0 closed every shared window before
-    rank 1's first sample and the straggler was never named.
+    are anchored to the cohort, so both ranks land in the same wall-clock
+    window once rank 1 is up; before the fix rank 0 closed every shared window
+    before rank 1's first sample and the straggler was never named.
     """
     detector = StragglerDetector(
         StragglerConfig(enabled=True, window_seconds=5.0, warmup_windows=0, persist_windows=1, work_tolerance=0.05)
@@ -437,17 +438,19 @@ def test_late_rank_cold_start_is_warmup_not_a_straggler() -> None:
 
 
 def test_concurrent_ingest_conserves_every_tally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hammer the real ingest path from several threads and require exact tallies.
+    """Hammer the real ingest path from several threads and require exact
+    tallies.
 
-    The collector is fed by one thread per accepted connection plus the observer
-    readout thread, and its state used to be lock-free. Two silent losses were
-    reproducible under a 1 us interpreter switch interval: ``BoundedDedup``
-    raised ``OrderedDict mutated during iteration`` inside its expiry walk and
-    swallowed it (13-15 keys per run were never recorded, so a resend of those
-    keys could be judged twice), and a window close racing a concurrent
-    ``_Window.add`` raised ``StatisticsError: no median for empty data`` and
-    dropped that window's verdicts with only a log line. Neither showed up in
-    the counters, so the test asserts conservation rather than "did not crash".
+    The collector is fed by one thread per accepted connection plus the
+    observer readout thread, and its state used to be lock-free. Two silent
+    losses were reproducible under a 1 us interpreter switch interval:
+    ``BoundedDedup`` raised ``OrderedDict mutated during iteration`` inside its
+    expiry walk and swallowed it (13-15 keys per run were never recorded, so a
+    resend of those keys could be judged twice), and a window close racing a
+    concurrent ``_Window.add`` raised ``StatisticsError: no median for empty
+    data`` and dropped that window's verdicts with only a log line. Neither
+    showed up in the counters, so the test asserts conservation rather than
+    "did not crash".
     """
     monkeypatch.setattr(collector_module, "WRITE_BATCH", 8)
     collector = make_collector(tmp_path, output_dir=str(tmp_path), window_seconds=0.1)

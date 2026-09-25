@@ -128,7 +128,8 @@ def _local_remove_non_pickleables(obj: Any, max_depth: int = 3, current_depth: i
 
 
 class _PreFixTimers:
-    """The shape of ``StragglerTimers`` *before* commit c6d425f: no ``__slots__``.
+    """The shape of ``StragglerTimers`` *before* commit c6d425f: no
+    ``__slots__``.
 
     It keeps the frozen ``StragglerConfig`` reachable through ``__dict__``,
     exactly like the object that made the bridge converter raise
@@ -145,7 +146,8 @@ class _PreFixTimers:
 
 
 class _BroadcastConfig:
-    """Minimal stand-in for the ``TransformerConfig`` the walk is applied to."""
+    """Minimal stand-in for the ``TransformerConfig`` the walk is applied
+    to."""
 
     def __init__(self, timers: Any) -> None:
         self.timers = timers
@@ -217,7 +219,8 @@ def test_local_walker_reproduces_the_pre_fix_frozen_config_crash() -> None:
 
 
 def test_local_walker_leaves_the_current_shim_usable() -> None:
-    """The current slotted shim is skipped by the walk and survives broadcast."""
+    """The current slotted shim is skipped by the walk and survives
+    broadcast."""
     timers = StragglerTimers(StragglerConfig(enabled=True), sink=NullTimerSink())
     config = _BroadcastConfig(timers)
 

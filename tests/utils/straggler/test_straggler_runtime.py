@@ -323,8 +323,8 @@ def test_a_sigterm_loses_at_most_one_flush_interval(tmp_path: Any) -> None:
 
     This is the deliberate termination experiment: the child delivers six
     intervals, waits for at least one periodic flush, then is SIGTERMed without
-    any ``close()``. The whole run's JSONL used to be lost; now at most the last
-    flush interval may be missing.
+    any ``close()``. The whole run's JSONL used to be lost; now at most the
+    last flush interval may be missing.
     """
     child = textwrap.dedent(
         """

@@ -123,8 +123,7 @@ class RuntimeIdentity:
 
     @property
     def cohort(self) -> str:
-        """Key shared by ranks that differ only in the data-parallel
-        dimension.
+        """Key shared by ranks that differ only in the data-parallel dimension.
 
         Two ranks may be compared only when they execute the same parallel role
         for the same model chunk under the same topology, so TP, PP, VPP, CP,
@@ -190,7 +189,8 @@ class RuntimeIdentity:
 
 
 def _env_str(name: str, fallback: str) -> str:
-    """Read a declared env knob without importing the framework at module load."""
+    """Read a declared env knob without importing the framework at module
+    load."""
     try:
         from relax.utils.env import Envs
 

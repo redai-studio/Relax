@@ -202,8 +202,8 @@ class TimingCollector:
         Appending is safe from any thread: the pending buffer and its counter
         updates are guarded by a lock that is released before any file is
         touched. A batch is only written when the caller is *not* the training
-        thread, so the training path never performs file I/O; lines that pile up
-        there are capped by :data:`MAX_PENDING_LINES` and drained by the
+        thread, so the training path never performs file I/O; lines that pile
+        up there are capped by :data:`MAX_PENDING_LINES` and drained by the
         background/close paths.
         """
         if not self._writers_ready or not path or serialiser is None:

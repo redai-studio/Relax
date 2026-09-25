@@ -61,7 +61,8 @@ def test_communication_suffix_rule_covers_unlisted_names() -> None:
 
 
 def test_attention_and_moe_are_schema_only() -> None:
-    """Megatron core 0.19 exposes no attention/MoE timer, so C2 claims neither."""
+    """Megatron core 0.19 exposes no attention/MoE timer, so C2 claims
+    neither."""
     assert SCHEMA_ONLY_GROUPS == ("attention", "moe")
     assert "attention" not in STAGE_GROUPS.values()
     assert "moe" not in STAGE_GROUPS.values()

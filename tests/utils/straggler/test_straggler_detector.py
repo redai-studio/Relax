@@ -344,13 +344,13 @@ def test_malformed_envelope_does_not_raise() -> None:
 def test_staggered_rank_starts_are_aligned_by_relative_time() -> None:
     """A rank that began profiling seconds later must still be comparable.
 
-    Process startup is staggered in practice (imports, actor placement), but the
-    training loop is collective-synchronised afterwards, so every live rank
+    Process startup is staggered in practice (imports, actor placement), but
+    the training loop is collective-synchronised afterwards, so every live rank
     reports the *same wall-clock* window. Windows are anchored to the cohort's
     first observation, not to each rank's own, so a rank joining three windows
-    in still shares a window with its peers. (The previous form of this test fed
-    each rank's own relative window at a different wall time, which is exactly
-    the non-contemporaneous comparison the cohort anchor removes.)
+    in still shares a window with its peers. (The previous form of this test
+    fed each rank's own relative window at a different wall time, which is
+    exactly the non-contemporaneous comparison the cohort anchor removes.)
     """
     detector = make_detector(persist_windows=1)
 

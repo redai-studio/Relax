@@ -78,7 +78,8 @@ class RecordingSink:
 
 
 class _OwnerStub:
-    """Stands in for StragglerTimers, which reaches the rank through its sink."""
+    """Stands in for StragglerTimers, which reaches the rank through its
+    sink."""
 
     def __init__(self, rank: int) -> None:
         self.identity = _IdentityStub(rank)
@@ -444,7 +445,8 @@ def test_injection_targets_only_the_named_rank_and_stage(monkeypatch: pytest.Mon
 
 
 def test_injection_delay_is_applied_inside_the_measured_interval(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The sleep must happen between the two clock reads, like a real slow stage."""
+    """The sleep must happen between the two clock reads, like a real slow
+    stage."""
     slept: list = []
     monkeypatch.setattr(shim_mod.time, "sleep", lambda seconds: slept.append(seconds))
     sink = RecordingSink()
