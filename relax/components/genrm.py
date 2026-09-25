@@ -638,9 +638,9 @@ class GenRM(Base):
         and degrade to the routable count when the manager cannot be queried.
         Mutating paths (scale submit) pass ``strict=True``: deciding a scale
         target on a fallback capacity would misread draining victims and
-        pending cleanup, so an unreadable capacity fails closed instead
-        (review finding: never let ``ready`` impersonate authoritative
-        ``current`` on the control path).
+        pending cleanup, so an unreadable capacity fails closed instead (review
+        finding: never let ``ready`` impersonate authoritative ``current`` on
+        the control path).
         """
         manager = self.genrm_managers[key]
         if getattr(manager, "get_engine_capacity", None) is None:
@@ -764,27 +764,38 @@ class GenRM(Base):
         # time (registry created_at), not from watcher start.
         timeout_secs = float(op.get("timeout_secs") or 600.0)
         deadline = float(op.get("created_at") or time.time()) + timeout_secs
+        # Freshest real progress snapshot; a watcher crash merges its
+        # capacity counts into the FAILED finish instead of inventing zeros.
+        last_progress: dict = {}
         try:
             while time.time() < deadline:
                 progress = await asyncio.to_thread(self._manager_progress, manager, request_id)
+                if progress:
+                    last_progress = progress
                 phase = progress.get("phase")
 
                 if direction == "scale_in" and phase == "DRAINING":
                     victim = progress.get("victim")
+                    victim_rank = progress.get("victim_rank")
                     if victim:
                         self._close_victim_admission(model, victim)
-                        if self._victim_inflight_zero(model, victim):
+                        # The drain proof must carry the full victim identity
+                        # (address + rank): a rank-less DRAINING snapshot
+                        # cannot be bound to a victim, so no confirmation is
+                        # sent and the drain fence fails closed on timeout.
+                        if victim_rank is not None and self._victim_inflight_zero(model, victim):
                             # Bind the confirmation to the victim this poll
                             # observed: a multi-victim scale-in reuses the
                             # request id and swaps the drain event per victim,
                             # so a delayed duplicate confirm for the previous
-                            # victim must not release the next one.
+                            # victim must be ignored instead of releasing the
+                            # next one.
                             await asyncio.to_thread(
                                 ray.get,
                                 manager.confirm_scale_drained.remote(
                                     request_id,
                                     victim=victim,
-                                    victim_rank=progress.get("victim_rank"),
+                                    victim_rank=victim_rank,
                                 ),
                             )
 
@@ -824,18 +835,13 @@ class GenRM(Base):
             self._finish_scale_from_progress(direction, request_id, "FAILED", progress or {})
         except Exception as e:
             self._logger.error(f"GenRM scale watcher for {request_id} crashed: {e}")
-            self._finish_scale_from_progress(
-                direction,
-                request_id,
-                "FAILED",
-                {
-                    "error": f"watcher crashed: {e}",
-                    # A watcher failure gives us no proof that the manager
-                    # has released actors or its placement group.  Keep the
-                    # model blocked until reconcile obtains that proof.
-                    "cleanup_required": True,
-                },
-            )
+            # A crash carries no cleanup proof, but it also must not invent
+            # capacity: reuse the freshest observed progress counts (missing
+            # != 0) and keep the model blocked until reconcile provides proof.
+            merged = dict(last_progress)
+            merged["error"] = f"watcher crashed: {e}"
+            merged["cleanup_required"] = True
+            self._finish_scale_from_progress(direction, request_id, "FAILED", merged)
 
     def _manager_progress(self, manager: Any, request_id: str) -> dict:
         try:

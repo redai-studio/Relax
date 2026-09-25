@@ -10,7 +10,6 @@ onload/offload) with GenRM-specific placement and engine wiring.
 import logging
 import threading
 import time
-from typing import Optional
 
 import ray
 
@@ -136,7 +135,10 @@ class GenRMManager(MultiEngineManager):
     #   begin_scale_op(request_id, direction, target)   - register parameters
     #   execute_genrm_scale_out/in(request_id)          - fire-and-forget hook
     #   get_scale_progress(request_id)                  - polled by the watcher
-    #   confirm_scale_drained(request_id)               - component drain proof
+    #   confirm_scale_drained(request_id, victim,
+    #                         victim_rank)            - component drain proof,
+    #                                                   bound to the observed
+    #                                                   victim identity
     #   abort_scale_op(request_id)                      - watcher deadline
     #
     # The component owns the operation registry (HTTP status queries); this
@@ -188,28 +190,30 @@ class GenRMManager(MultiEngineManager):
         with self._scale_lock:
             return dict(self._scale_progress.get(request_id) or {})
 
-    def confirm_scale_drained(
-        self, request_id: str, victim: Optional[list] = None, victim_rank: Optional[int] = None
-    ) -> None:
+    def confirm_scale_drained(self, request_id: str, victim: list, victim_rank: int) -> None:
         """Component-side drain proof: no in-flight request targets the
-        current victim any more.
+        observed victim any more.
 
-        The proof is bound to the victim the caller observed in its progress
-        snapshot. A multi-victim scale-in reuses the request id and swaps the
-        drain event per victim, so a delayed duplicate confirmation for a
-        previous victim must be ignored instead of releasing the next one
-        (whose in-flight count was never proven zero). Legacy callers that
-        omit both identifiers keep the old behavior.
+        The proof is always bound to the victim identity the caller observed
+        in its progress snapshot (address + rank); this is a Task-4 API with
+        no legacy callers, so a confirmation without identity is a contract
+        violation and never releases the fence. A multi-victim scale-in
+        reuses the request id and swaps the drain event per victim, so a
+        delayed duplicate confirmation for a previous victim must be ignored
+        instead of releasing the next one (whose in-flight count was never
+        proven zero); a mismatched or unknown identity is logged and dropped
+        (fail-closed: the drain fence then times out and the operation
+        fails).
         """
         with self._scale_lock:
             progress = self._scale_progress.get(request_id) or {}
-            if victim_rank is not None and progress.get("victim_rank") != victim_rank:
+            if progress.get("victim_rank") != victim_rank:
                 logger.info(
-                    f"GenRM drain confirm for {request_id} ignored: stale victim "
+                    f"GenRM drain confirm for {request_id} ignored: victim "
                     f"rank={victim_rank}, current={progress.get('victim_rank')}"
                 )
                 return
-            if victim is not None and [str(v) for v in (progress.get("victim") or [])] != [str(v) for v in victim]:
+            if [str(v) for v in (progress.get("victim") or [])] != [str(v) for v in victim]:
                 logger.info(f"GenRM drain confirm for {request_id} ignored: stale victim address")
                 return
             event = self._scale_drain_confirmed.get(request_id)

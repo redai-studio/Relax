@@ -294,8 +294,10 @@ class TestPatchConfig(unittest.TestCase):
     def test_legacy_rollout_url_patch_is_not_shadowed(self):
         """Review finding: ``from_yaml`` seeds service_targets["rollout"] from
         the startup ``rollout_service_url``; a later legacy PATCH updated only
-        the field, so the stale map entry kept serving the old URL. The two
-        spellings must stay in sync."""
+        the field, so the stale map entry kept serving the old URL.
+
+        The two spellings must stay in sync.
+        """
         config = AutoscalerConfig()
         # Simulate the startup override (controller passes get_serve_url).
         config.rollout_service_url = "http://old:8000/rollout"
@@ -317,6 +319,58 @@ class TestPatchConfig(unittest.TestCase):
         )
         self.assertEqual(svc.config.rollout_service_url, "http://new:8000/rollout")
         self.assertEqual(svc.config.get_service_url("rollout"), "http://new:8000/rollout")
+
+    def _svc_with_genrm_runtime(self):
+        config = AutoscalerConfig(service_targets={"genrm": "http://genrm:8000/genrm"})
+        svc = object.__new__(_AutoscalerService)
+        svc.config = config
+        svc._services = {}
+        svc._rebuild_service_runtimes()
+        return svc
+
+    def test_remove_target_with_pending_operation_is_409(self):
+        """Removing a service target that still owns a non-terminal scale
+        operation must fail closed: the runtime's record of the request is the
+        only link between the autoscaler and the target's registry mutex
+        (review finding)."""
+        svc = self._svc_with_genrm_runtime()
+        svc._services["genrm"].state.pending_requests.append(
+            {"action": "scale_out", "request_id": "req-1", "status": "PENDING", "delta": 1}
+        )
+        with self.assertRaises(svc_module.HTTPException) as ctx:
+            asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertEqual(ctx.exception.status_code, 409)
+        # Nothing was mutated: the target and its pending request survive.
+        self.assertIn("genrm", svc._services)
+        self.assertEqual(len(svc._services["genrm"].state.pending_requests), 1)
+        self.assertIn("genrm", svc.config.service_targets)
+
+    def test_remove_target_with_cleanup_required_is_409(self):
+        svc = self._svc_with_genrm_runtime()
+        svc._services["genrm"].state.pending_requests.append(
+            {
+                "action": "scale_in",
+                "request_id": "req-2",
+                "status": "FAILED",
+                "delta": -1,
+                "cleanup_required": True,
+            }
+        )
+        with self.assertRaises(svc_module.HTTPException) as ctx:
+            asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("genrm", svc._services)
+
+    def test_remove_target_with_clean_history_succeeds(self):
+        """Terminal, reconciled requests do not block removal."""
+        svc = self._svc_with_genrm_runtime()
+        svc._services["genrm"].state.pending_requests.append(
+            # scale_out terminal vocabulary: ACTIVE (not COMPLETED).
+            {"action": "scale_out", "request_id": "req-3", "status": "ACTIVE", "delta": 1}
+        )
+        asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertNotIn("genrm", svc._services)
+        self.assertNotIn("genrm", svc.config.service_targets)
 
     def test_status_reports_per_service_scale_history(self):
         """Review finding: the per-service status lacked last_scale_action /

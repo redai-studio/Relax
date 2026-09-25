@@ -211,12 +211,17 @@ class GenRMScaleOperation:
 
 @dataclass
 class _IdempotencyRecord:
-    """Outcome recorded for one (direction, idempotency_key)."""
+    """Outcome recorded for one (direction, idempotency_key).
+
+    ``created_at`` anchors the fixed (non-sliding) replay window: a record is
+    evictable once it aged out, regardless of how often it was replayed.
+    """
 
     fingerprint: tuple
     # None outcome.request_id marks a recorded NOOP decision (replayed verbatim).
     request_id: Optional[str] = None
     noop_response: Optional[Dict[str, Any]] = None
+    created_at: float = field(default_factory=time.time)
 
 
 class GenRMScaleRegistry:
@@ -234,12 +239,20 @@ class GenRMScaleRegistry:
         self._operations: Dict[str, GenRMScaleOperation] = {}
         # model_name -> protected lower bound (initial engine count).
         self._initial_capacity: Dict[str, int] = {}
-        # Bounded history for a long-running control plane: clean terminal
-        # operations beyond ``max_history`` (oldest first) and idempotency
-        # records older than ``replay_window_secs`` are evicted. Dirty
-        # terminals (cleanup pending) and live operations are never evicted.
+        # Bounded memory for a long-running control plane. Every container
+        # has a hard ceiling:
+        #   _operations       <= max_history + 2 * len(_initial_capacity)
+        #   _idempotency      <= max_idempotency_records + 2 * len(_initial_capacity)
+        # Protected (never evicted) entries are live and dirty-terminal
+        # operations: per-model mutual exclusion admits at most one live
+        # operation per model and a dirty terminal blocks its model, so at
+        # most one live + one dirty record per registered model survives.
+        # Evictable entries -- clean terminals, keyed NOOP decisions and
+        # dangling keys whose operation was already evicted -- are dropped
+        # oldest-first by the replay TTL and by ``max_idempotency_records``.
         self.max_history = 1024
         self.replay_window_secs = 24 * 3600.0
+        self.max_idempotency_records = 4096
         self.history_truncated = 0
 
     # ------------------------------------------------------------------
@@ -337,6 +350,9 @@ class GenRMScaleRegistry:
                         request_id=None,
                         noop_response=dict(response),
                     )
+                    # A pure-NOOP workload never reaches ``finish``, so the
+                    # bound must also be enforced on this path.
+                    self._evict_bounded_history_locked()
                 return response
 
             # 5. Admit the operation.
@@ -445,12 +461,13 @@ class GenRMScaleRegistry:
         """Bound memory for a long-running control plane (caller holds lock).
 
         Evicts, oldest first: clean terminal operations beyond ``max_history``
-        and idempotency records whose outcome is a clean terminal operation
-        older than ``replay_window_secs``. Live, PENDING and dirty-terminal
-        (cleanup_required) operations are never evicted; an idempotency key
-        whose operation was evicted replays as a fresh request, matching the
-        documented "records are kept for the process lifetime *of the bounded
-        history*" contract. ``history_truncated`` counts evicted operations.
+        and evictable idempotency records -- clean-terminal outcomes, keyed
+        NOOP decisions and dangling keys -- beyond ``replay_window_secs`` or
+        ``max_idempotency_records``. Live, PENDING and dirty-terminal
+        (cleanup_required) operations are never evicted; an evicted key replays
+        as a fresh request, matching the documented "records are kept for the
+        process lifetime *of the bounded history*" contract.
+        ``history_truncated`` counts evicted operations.
         """
         self.history_truncated += self._evict_old_idempotency_locked()
         terminal_clean = [
@@ -465,22 +482,54 @@ class GenRMScaleRegistry:
             self._operations.pop(op.request_id, None)
             self.history_truncated += 1
 
+    def _idempotency_record_evictable_locked(self, record: _IdempotencyRecord) -> bool:
+        """A record whose outcome is neither live nor dirty-terminal.
+
+        NOOP decisions (``request_id is None``) and dangling keys (operation
+        already evicted, hence clean-terminal -- dirty operations are never
+        evicted from ``_operations``) are always evictable.
+        """
+        if record.request_id is None:
+            return True
+        op = self._operations.get(record.request_id)
+        if op is None:
+            return True
+        return _is_status_terminal(op.direction, op.status) and not op.cleanup_required
+
     def _evict_old_idempotency_locked(self) -> int:
-        """Drop replay records whose clean outcome aged out of the window."""
+        """Drop evictable replay records: aged-out first, then oldest-first
+        while the record count exceeds ``max_idempotency_records``.
+
+        The replay window is fixed (anchored at ``created_at``), not sliding.
+        Protected records (live / dirty-terminal outcomes) are never dropped,
+        so eviction can only reduce the count towards the protected floor (see
+        the ceiling derivation on ``__init__``).
+        """
         now = time.time()
         evicted = 0
         for key in list(self._idempotency.keys()):
             record = self._idempotency[key]
-            request_id = record.request_id
-            if request_id is None:
-                continue  # recorded NOOP: cheap, keep
-            op = self._operations.get(request_id)
-            if op is None:
+            if not self._idempotency_record_evictable_locked(record):
                 continue
-            if _is_status_terminal(op.direction, op.status) and not op.cleanup_required:
-                if now - op.updated_at > self.replay_window_secs:
-                    del self._idempotency[key]
-                    evicted += 1
+            if now - record.created_at > self.replay_window_secs:
+                del self._idempotency[key]
+                evicted += 1
+        # Hard cap: evictable records beyond the cap leave oldest-first. A
+        # key evicted here replays as a fresh request on its next use, which
+        # is safe (the outcome it masked was a clean terminal / NOOP).
+        excess = len(self._idempotency) - self.max_idempotency_records
+        if excess <= 0:
+            return evicted
+        evictable = sorted(
+            (
+                (record.created_at, key)
+                for key, record in self._idempotency.items()
+                if self._idempotency_record_evictable_locked(record)
+            ),
+        )
+        for _, key in evictable[:excess]:
+            del self._idempotency[key]
+            evicted += 1
         return evicted
 
     def set_detail(self, request_id: str, detail: Optional[str]) -> None:

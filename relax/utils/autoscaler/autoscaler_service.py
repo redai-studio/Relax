@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from ray import serve
 
@@ -395,13 +395,15 @@ class AutoscalerService(Base):
         logger.info("Autoscaler main loop exited")
 
     async def _evaluate_and_scale(self) -> None:
-        """Evaluate each configured service with independent mutable state.
+        """Evaluate each configured service with isolated mutable state.
 
-        Services are evaluated concurrently: one slow/stalled service (e.g. a
-        GenRM metrics endpoint hanging) must not delay another service's
-        evaluation cadence or scaling decisions. Per-service failures are
-        captured on that service's state and never abort the batch (review
-        finding: cross-service interference).
+        Services are evaluated concurrently within each autoscaler cycle via
+        ``asyncio.gather``; mutable decision state and history are isolated per
+        service. This is not a per-service periodic scheduler: a cycle waits
+        for every service's evaluation, so a persistently slow service can
+        still lengthen the shared cycle for all services (it just cannot block
+        another service *within* the same cycle). Per-service failures are
+        captured on that service's state and never abort the batch.
         """
         services = getattr(self, "_services", None)
         runtimes = list(services.values()) if services is not None else [self._runtime(None)]
@@ -999,6 +1001,32 @@ class AutoscalerService(Base):
             updates_made.append(f"rollout_service_url={request.rollout_service_url}")
 
         if request.service_targets is not None:
+            # Fail-closed removal guard, checked before any mutation: dropping
+            # a runtime that still owns unresolved scale operations would lose
+            # the autoscaler's record of them while the target service keeps
+            # its registry mutex held -- re-adding the target later starts a
+            # blank runtime that no longer knows which request to reconcile
+            # (review finding: pending/dirty operation state was silently
+            # discarded with the runtime).
+            new_names = {"rollout", *request.service_targets}
+            for name, old in getattr(self, "_services", {}).items():
+                if name in new_names:
+                    continue
+                unresolved = [
+                    req
+                    for req in old.state.pending_requests
+                    if req.get("cleanup_required")
+                    or not is_scale_request_terminal(req.get("action", "scale_out"), req.get("status"))
+                ]
+                if unresolved:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"cannot remove service target '{name}': {len(unresolved)} unresolved scale "
+                            "operation(s) (non-terminal or cleanup_required) still reference it; let them "
+                            "finish or reconcile them first"
+                        ),
+                    )
             self.config.service_targets = dict(request.service_targets)
             # Mirror a rollout target back into the legacy field for the same
             # reason: the two spellings must never disagree.

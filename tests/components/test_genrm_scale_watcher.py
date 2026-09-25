@@ -74,6 +74,7 @@ class _ScriptedManager:
             "current": 1,
             "ready": 1,
             "victim": None,
+            "victim_rank": None,
             "error": None,
             # The production protocol requires an explicit physical
             # completion fence.  Ordinary scripted terminal states
@@ -425,7 +426,7 @@ class TestScaleInWatcher(unittest.TestCase):
 
     def test_drain_proof_waits_for_inflight_zero_then_confirms(self):
         manager = _remote_wrap(_ScriptedManager("scale_in"))
-        manager.state = dict(manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim())
+        manager.state = dict(manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim(), victim_rank=7)
         replica = _replica(manager)
         # Admission cache still holds the victim and one request is in flight.
         replica._engine_caches["__default__"].refresh([tuple(self._victim()), ("192.0.2.1", 16001)])
@@ -446,6 +447,7 @@ class TestScaleInWatcher(unittest.TestCase):
         self.assertEqual([c[0] for c in manager.confirms], [request_id])
         # The confirmation must carry the victim identity it proved drained.
         self.assertEqual([c[1] for c in manager.confirms], [tuple(self._victim())])
+        self.assertEqual([c[2] for c in manager.confirms], [7])
         result = replica._scale_registry.get_status("scale_in", request_id)
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(result["removed"], 1)
@@ -455,7 +457,9 @@ class TestScaleInWatcher(unittest.TestCase):
 
     def test_no_confirm_while_inflight_positive(self):
         manager = _remote_wrap(_ScriptedManager("scale_in"))
-        manager.state = dict(manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim(), hold=True)
+        manager.state = dict(
+            manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim(), victim_rank=7, hold=True
+        )
         replica = _replica(manager)
         replica._engine_inflight[("__default__", *self._victim())] = 3
         request_id = self._submit(replica)
@@ -476,7 +480,7 @@ class TestScaleInWatcher(unittest.TestCase):
 
     def test_victim_leaves_engine_table_on_completion(self):
         manager = _remote_wrap(_ScriptedManager("scale_in"))
-        manager.state = dict(manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim())
+        manager.state = dict(manager.state, phase="DRAINING", current=2, ready=2, victim=self._victim(), victim_rank=7)
         replica = _replica(manager)
         replica._engine_caches["__default__"].refresh([("192.0.2.1", 16001), tuple(self._victim())])
         request_id = self._submit(replica)

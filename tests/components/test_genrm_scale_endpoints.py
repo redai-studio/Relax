@@ -314,9 +314,12 @@ class TestGenerateEngineAttribution(unittest.TestCase):
 
 class TestReconcileDrainFence(unittest.TestCase):
     """Review finding: a failed progress query must not fall through to
-    reconcile. The manager retires its recorded victim on the caller's drain
-    proof alone, so an unidentified victim (progress {} or victim None) is
-    not a proof and reconcile must fail closed instead."""
+    reconcile.
+
+    The manager retires its recorded victim on the caller's drain proof alone,
+    so an unidentified victim (progress {} or victim None) is not a proof and
+    reconcile must fail closed instead.
+    """
 
     def _dirty_scale_in(self, replica, manager):
         """Register a terminal-dirty scale-in the reconcile path targets."""
@@ -417,9 +420,9 @@ class TestReconcileDrainFence(unittest.TestCase):
 
 
 class TestScaleSubmitCapacityContract(unittest.TestCase):
-    """Review findings: strict integer validation on the mutating request,
-    and fail-closed capacity on the scale path (never let a degraded
-    snapshot impersonate authoritative capacity)."""
+    """Review findings: strict integer validation on the mutating request, and
+    fail-closed capacity on the scale path (never let a degraded snapshot
+    impersonate authoritative capacity)."""
 
     def test_num_replicas_rejects_coercible_non_integers(self):
         from pydantic import ValidationError
@@ -484,6 +487,42 @@ class TestWatcherCrashCapacity(unittest.TestCase):
         self.assertEqual(status["current"], 2)
         self.assertEqual(status["ready"], 2)
         self.assertTrue(status["cleanup_required"])
+
+    def test_crash_after_polls_merges_freshest_observed_capacity(self):
+        """A watcher that crashes mid-flight carries the freshest observed
+        progress counts into its FAILED finish instead of dropping back to the
+        submit-time observation (review finding: missing != 0, and the freshest
+        reading beats the oldest one)."""
+
+        class _FlakyProgressManager:
+            def __init__(self):
+                self.calls = 0
+
+            def get_scale_progress(self, _request_id):
+                self.calls += 1
+                if self.calls >= 3:
+                    raise RuntimeError("progress poll exploded")
+                return {"phase": "REMOVING", "current": 1, "ready": 1, "removed": 1, "physical_done": False}
+
+        flaky = _FlakyProgressManager()
+        manager = _fake_manager()
+        manager.get_scale_progress = SimpleNamespace(remote=flaky.get_scale_progress)
+        replica = _replica(manager)
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        with self.assertLogs("relax.components.genrm", level="ERROR"):
+            _run(replica._watch_scale_operation("scale_in", "__default__", request_id))
+        status = replica._scale_registry.get_status("scale_in", request_id)
+        self.assertEqual(status["status"], "FAILED")
+        # Freshest observed counts (current=1 from the last good poll), not
+        # the submit-time observation (2) and not zeros.
+        self.assertEqual(status["current"], 1)
+        self.assertEqual(status["ready"], 1)
+        self.assertEqual(status["removed"], 1)
+        self.assertTrue(status["cleanup_required"])
+        self.assertIn("watcher crashed", status["error_message"])
 
 
 if __name__ == "__main__":

@@ -385,9 +385,12 @@ class TestCreateScalePgOwnershipFence(unittest.TestCase):
 
 
 class TestVictimBoundDrainConfirm(unittest.TestCase):
-    """Review finding: a multi-victim scale-in reuses the request id and
-    swaps the drain event per victim. A delayed duplicate confirmation for
-    the previous victim must not release the current one."""
+    """Review finding: a multi-victim scale-in reuses the request id and swaps
+    the drain event per victim.
+
+    A delayed duplicate confirmation for the previous victim must not release
+    the current one.
+    """
 
     def _manager(self):
         manager = _manager(num_slots=4)
@@ -426,7 +429,7 @@ class TestVictimBoundDrainConfirm(unittest.TestCase):
 
     def test_stale_confirm_between_victims_is_ignored(self):
         manager = self._manager()
-        event_a = self._install_victim(manager, rank=3)
+        self._install_victim(manager, rank=3)
         manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
         # Lifecycle retired A; progress momentarily carries no victim.
         manager._scale_progress["req-1"].update(victim=None, victim_rank=None)
@@ -434,18 +437,35 @@ class TestVictimBoundDrainConfirm(unittest.TestCase):
         manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
         self.assertFalse(event_b.is_set())
 
-    def test_legacy_confirm_without_victim_still_works(self):
+    def test_identity_less_confirm_is_rejected(self):
+        """The drain-proof API carries no legacy unbound form: the victim
+        identity (address + rank) is a required part of the contract, and a
+        mismatched identity never releases the fence."""
         manager = self._manager()
         event = self._install_victim(manager, rank=3)
-        manager.confirm_scale_drained("req-1")
+        # Identity-less invocation is a contract violation, not a legacy
+        # fallback: the signature makes it impossible to call without the
+        # victim binding.
+        with self.assertRaises(TypeError):
+            manager.confirm_scale_drained("req-1")
+        self.assertFalse(event.is_set())
+        # A wrong rank is logged and dropped (fail-closed): the fence then
+        # only releases via a correctly bound proof or its timeout.
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=99)
+        self.assertFalse(event.is_set())
+        # The correctly bound proof still releases the fence.
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        self.assertTrue(event.is_set())
         self.assertTrue(event.is_set())
 
 
 class TestPgRemoveResubmission(unittest.TestCase):
-    """Review finding: an exception from remove_placement_group() on the
-    first attempt used to put the rank into _pending_pg_cleanup, which then
-    suppressed every resubmission -- the PG stayed CREATED forever. The fix
-    separates "deletion submitted" from "release unconfirmed"."""
+    """Review finding: an exception from remove_placement_group() on the first
+    attempt used to put the rank into _pending_pg_cleanup, which then
+    suppressed every resubmission -- the PG stayed CREATED forever.
+
+    The fix separates "deletion submitted" from "release unconfirmed".
+    """
 
     def _manager_with_pg(self):
         manager = _manager(num_slots=2)

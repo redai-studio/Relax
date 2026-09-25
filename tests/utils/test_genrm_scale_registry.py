@@ -300,9 +300,11 @@ class TestListOperations(unittest.TestCase):
 
 class TestBoundedHistory(unittest.TestCase):
     """Review finding: the registry is a long-running control plane; clean
-    terminal operations and aged idempotency records must be evicted so
-    months of scale cycles cannot grow memory without bound. Dirty terminals
-    and live operations are never evicted."""
+    terminal operations and aged idempotency records must be evicted so months
+    of scale cycles cannot grow memory without bound.
+
+    Dirty terminals and live operations are never evicted.
+    """
 
     def _finished_op(
         self, registry, direction="scale_out", target=2, current=1, dirty=False, key=None, model="__default__"
@@ -368,9 +370,10 @@ class TestBoundedHistory(unittest.TestCase):
         )
         self.assertEqual(replay.get("request_id"), request_id)
         self.assertEqual(replay["status"], "ACTIVE")  # verbatim terminal replay
-        # Age the operation beyond the replay window, then trigger eviction.
-        op = registry._operations[request_id]
-        op.updated_at -= registry.replay_window_secs + 1
+        # Age the record beyond the (fixed, creation-anchored) replay window,
+        # then trigger eviction.
+        record = registry._idempotency[("scale_out", "replay-me")]
+        record.created_at -= registry.replay_window_secs + 1
         registry._evict_bounded_history_locked()
         replay_after = registry.submit(
             "scale_out",
@@ -382,6 +385,178 @@ class TestBoundedHistory(unittest.TestCase):
             ready=2,
         )
         self.assertEqual(replay_after["status"], "NOOP")  # treated as fresh
+
+
+class TestStrictBounds(unittest.TestCase):
+    """Hard memory ceilings for a long-running control plane.
+
+    The first bounded-history pass still let two record classes grow without
+    bound: keyed NOOP decisions (``request_id is None``) were never evicted,
+    and an idempotency record whose operation had already been evicted by
+    ``max_history`` became a permanent dangling entry. Both are evictable
+    now, and ``max_idempotency_records`` caps the evictable pool
+    oldest-first, so every container has a provable ceiling:
+
+        _operations  <= max_history + 2 * len(_initial_capacity)
+        _idempotency <= max_idempotency_records + 2 * len(_initial_capacity)
+
+    (per-model mutual exclusion admits at most one live plus one
+    dirty-terminal record per registered model; those are never evicted).
+    """
+
+    def _registry(self):
+        registry = GenRMScaleRegistry()
+        registry.register_initial("__default__", 1)
+        return registry
+
+    def test_noop_key_flood_is_bounded(self):
+        """10k unique idempotency keys on pure-NOOP decisions (a workload that
+        never reaches ``finish``) must not grow ``_idempotency`` past the
+        record cap."""
+        registry = self._registry()
+        for i in range(10_000):
+            decision = registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=1,
+                timeout_secs=60.0,
+                idempotency_key=f"noop-{i}",
+                current=1,
+                ready=1,
+            )
+            self.assertEqual(decision["status"], "NOOP")
+        self.assertLessEqual(len(registry._idempotency), registry.max_idempotency_records)
+        self.assertEqual(len(registry._operations), 0)
+        # The newest key is still replayable; the oldest were evicted.
+        replay = registry.submit(
+            "scale_out",
+            model_name="__default__",
+            target=1,
+            timeout_secs=60.0,
+            idempotency_key="noop-9999",
+            current=1,
+            ready=1,
+        )
+        self.assertEqual(replay["status"], "NOOP")
+
+    def test_clean_terminal_flood_is_bounded(self):
+        """10k unique keys on completed operations bound both containers."""
+        registry = self._registry()
+        for i in range(10_000):
+            decision = registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=2,
+                timeout_secs=60.0,
+                idempotency_key=f"op-{i}",
+                current=1,
+                ready=1,
+            )
+            registry.finish(decision["request_id"], status="ACTIVE", current=2, ready=2, created=1)
+        self.assertLessEqual(len(registry._operations), registry.max_history)
+        self.assertLessEqual(len(registry._idempotency), registry.max_idempotency_records)
+
+    def test_dangling_records_are_evictable_under_cap(self):
+        """A key whose operation was evicted by ``max_history`` must not become
+        a permanent entry: it is evictable by TTL and by the record cap."""
+        registry = self._registry()
+        early = registry.submit(
+            "scale_out",
+            model_name="__default__",
+            target=2,
+            timeout_secs=60.0,
+            idempotency_key="dangling",
+            current=1,
+            ready=1,
+        )["request_id"]
+        # Clean terminal: the mutex releases, but the record survives until
+        # its operation is evicted from bounded history.
+        registry.finish(early, status="ACTIVE", current=2, ready=2, created=1)
+        # Flood clean terminals so the dangling key's operation is evicted
+        # from history, then keep flooding until the record cap forces the
+        # dangling record itself out.
+        for i in range(10_000):
+            decision = registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=2,
+                timeout_secs=60.0,
+                idempotency_key=f"later-{i}",
+                current=1,
+                ready=1,
+            )
+            registry.finish(decision["request_id"], status="ACTIVE", current=2, ready=2, created=1)
+        self.assertNotIn(early, registry._operations)
+        self.assertNotIn(("scale_out", "dangling"), registry._idempotency)
+        self.assertLessEqual(len(registry._idempotency), registry.max_idempotency_records)
+
+    def test_protected_records_survive_the_cap(self):
+        """Live and dirty-terminal outcomes are never evicted, even while the
+        evictable pool is far beyond the record cap."""
+        registry = self._registry()
+        registry.register_initial("other", 1)
+        live = registry.submit(
+            "scale_out",
+            model_name="__default__",
+            target=2,
+            timeout_secs=60.0,
+            idempotency_key="live-key",
+            current=1,
+            ready=1,
+        )["request_id"]
+        dirty = registry.submit(
+            "scale_in",
+            model_name="other",
+            target=1,
+            timeout_secs=60.0,
+            idempotency_key="dirty-key",
+            current=2,
+            ready=2,
+        )["request_id"]
+        registry.finish(dirty, status="FAILED", current=2, ready=2, cleanup_required=True)
+        for i in range(10_000):
+            registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=1,
+                timeout_secs=60.0,
+                idempotency_key=f"noise-{i}",
+                current=1,
+                ready=1,
+            )
+        self.assertIn(live, registry._operations)
+        self.assertIn(dirty, registry._operations)
+        self.assertIn(("scale_out", "live-key"), registry._idempotency)
+        self.assertIn(("scale_in", "dirty-key"), registry._idempotency)
+
+    def test_documented_ceiling_formula_holds(self):
+        """len(operations) <= max_history + 2*models and len(idempotency) <=
+        max_idempotency_records + 2*models, verified after a mixed flood."""
+        registry = self._registry()
+        registry.register_initial("other", 1)
+        for i in range(5_000):
+            decision = registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=2,
+                timeout_secs=60.0,
+                idempotency_key=f"k-{i}",
+                current=1,
+                ready=1,
+            )
+            registry.finish(decision["request_id"], status="ACTIVE", current=2, ready=2, created=1)
+            registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=1,
+                timeout_secs=60.0,
+                idempotency_key=f"n-{i}",
+                current=1,
+                ready=1,
+            )
+        models = len(registry._initial_capacity)
+        self.assertLessEqual(len(registry._operations), registry.max_history + 2 * models)
+        self.assertLessEqual(len(registry._idempotency), registry.max_idempotency_records + 2 * models)
 
 
 if __name__ == "__main__":
