@@ -77,13 +77,17 @@ def _megatron_root() -> Optional[str]:
     return None
 
 
-def _load_remove_non_pickleables() -> Optional[Callable[..., Any]]:
-    """Load the exact upstream function, or ``None`` when unavailable."""
+def _load_remove_non_pickleables(monkeypatch: pytest.MonkeyPatch) -> Optional[Callable[..., Any]]:
+    """Load the exact upstream function, or ``None`` when unavailable.
+
+    The Megatron root is prepended through ``monkeypatch`` so the checkout
+    cannot leak out of the test and open the ``importorskip("megatron")`` gate
+    for the rest of the session.
+    """
     root = _megatron_root()
     if root is None:
         return None
-    if root not in sys.path:
-        sys.path.insert(0, root)
+    monkeypatch.syspath_prepend(root)
     path = Path(root) / _UTILS_RELATIVE_PATH
     spec = importlib.util.spec_from_file_location("_task11_bridge_conversion_utils", path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
@@ -160,6 +164,21 @@ def _reset_profiler() -> Any:
     straggler.reset_straggler_state_for_tests()
     yield
     straggler.reset_straggler_state_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _do_not_leak_megatron_modules() -> Any:
+    """Keep this file's Megatron imports from opening other tests' gates.
+
+    Loading the bridge converter imports ``megatron`` submodules; because
+    ``importorskip("megatron")`` is satisfied from ``sys.modules``, a leftover
+    entry makes 23 pre-existing files run tests they would otherwise skip.
+    """
+    before = {name for name in sys.modules if name == "megatron" or name.startswith("megatron.")}
+    yield
+    for name in [name for name in sys.modules if name == "megatron" or name.startswith("megatron.")]:
+        if name not in before:
+            sys.modules.pop(name, None)
 
 
 def test_shim_has_no_instance_dict() -> None:
@@ -245,7 +264,7 @@ def test_local_walker_leaves_the_current_shim_usable() -> None:
 
 def test_remove_non_pickleables_leaves_enabled_timers_usable(monkeypatch: pytest.MonkeyPatch) -> None:
     """End-to-end A7 regression: the real walk plus the real broadcast."""
-    remove_non_pickleables = _load_remove_non_pickleables()
+    remove_non_pickleables = _load_remove_non_pickleables(monkeypatch)
     if remove_non_pickleables is None:
         pytest.skip(
             "Megatron-LM checkout not available; set MEGATRON_PATH (or MEGATRON) to the "
