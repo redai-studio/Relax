@@ -3,7 +3,7 @@
 Raw evidence (full run directories: per-request load logs, event timelines,
 scale histories, charts, TUI screenshots, failed and superseded intermediate
 rounds) is preserved on the
-[`evidence/task4-genrm` branch at commit `c56c821`](https://github.com/shanyulu/Relax/tree/c56c8218ef3fe47757493c806d4b47228d90a6ec/demos/task4_genrm/results)
+[`evidence/task4-genrm` branch at commit `26b1c1e`](https://github.com/shanyulu/Relax/tree/26b1c1e410a81d63a75295a7f8a37cf040d6c851/demos/task4_genrm/results)
 (immutable link; every path below resolves there). The PR itself carries only
 the final machine-verdict summaries and the frozen preregistration documents,
 so the acceptance claims stay verifiable without large artifacts; every
@@ -37,7 +37,7 @@ head (`train_continuity_20260925`, final-head verdict below).
 | Minimal training smoke (B2, real recipe)                     | c78e613 + final-head rerun (`b2_train_smoke_20260925_r3`)                                  | `PASS` (`verdicts.json`)     | native 4×4090 recipe via `ray-job.sh` + training venv runtime-env injection (zero-GPU probe first: megatron/TE/FA2/FA3/apex import on a real Ray worker); dapo-genrm protocol, step 1 trained with full metric set, checkpoints iters 0+1 saved; **GenRM judge call really happened** in the c78e613 run (`judge_response` landed on disk for a parseable answer); weight sync `update_weights_from_distributed` 200 OK ×9; zero errors, graceful shutdown, GPUs back to 4/4 free. Run 1 (512-token budget) truncated every response inside `<think>` and never reached the judge — kept as infra-only evidence; the 2048-token budget in c78e613 is what exercises the judge path. The 0.6B judge's noisy `<think>`-preamble verdicts are model capability, not pipeline defects. **Final-head rerun** (`_r2`, with the expandable-segments allocator fix): SUCCEEDED in 4 m 41 s, step 0 trained with the full metric set, weight sync 200 OK ×9, graceful shutdown; this run's 8 samples all truncated inside `<think>` (`answer_missing`) — whether a given sample reaches the judge is model-capability variance, and the judge invocation path itself is exercised at scale by the reward-consistency run (800 attributed judge calls); the r2 rerun's role is to verify the smoke pipeline on the final head, which it does; r3 re-runs it from the seed-contract head (SUCCEEDED, step 0 full metrics, weight sync 200 OK ×9, graceful shutdown). |
 
 Re-render the charts from the raw summaries (checked out from the evidence
-branch at `c56c821`):
+branch at `26b1c1e`):
 
 ```bash
 python results/autoscaler_run_20260924_v3/plot_timeline.py
