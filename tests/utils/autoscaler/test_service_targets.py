@@ -436,6 +436,107 @@ class TestPatchConfig(unittest.TestCase):
         # parked (gather, not serial); the whole batch then drained.
         self.assertLess(_time.monotonic() - started, 5.0)
 
+    def test_genrm_stall_does_not_starve_rollout_later_rounds(self):
+        """Re-review finding: the former single-cycle barrier let a stalled
+        service starve every later cycle -- with GenRM parked on a 30 s
+        timeout, a healthy rollout could not run its configured interval at
+        all. Per-service loops must keep rollout evaluating across rounds
+        while GenRM is still blocked (bot spec: at least two rollout rounds
+        before the GenRM block lifts)."""
+        import time as _time
+
+        config = AutoscalerConfig()
+        config.service_targets = {"genrm": "http://genrm:8000/genrm"}
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        svc._state.running = True
+        svc._state.enabled = True
+        svc._supervisor_poll_secs = 0.01
+        for runtime in svc._services.values():
+            runtime.config.evaluation_interval_secs = 0.01
+
+        rollout_rounds = []
+        release_genrm = asyncio.Event()
+
+        async def _rollout_eval(runtime):
+            rollout_rounds.append(_time.monotonic())
+
+        async def _stalled_genrm_eval(runtime):
+            await release_genrm.wait()
+
+        svc._evaluate_service = lambda runtime: (
+            _stalled_genrm_eval(runtime) if runtime.name == "genrm" else _rollout_eval(runtime)
+        )
+
+        async def _main():
+            supervisor = asyncio.ensure_future(svc._main_loop())
+            deadline = _time.monotonic() + 5.0
+            # Two rollout rounds while GenRM is still parked.
+            while len(rollout_rounds) < 2:
+                await asyncio.sleep(0.01)
+                if _time.monotonic() > deadline:
+                    raise AssertionError(f"rollout evaluated {len(rollout_rounds)} rounds in 5s")
+            two_rounds_at = len(rollout_rounds)
+            release_genrm.set()
+            supervisor.cancel()
+            try:
+                await asyncio.wait_for(supervisor, timeout=5.0)
+            except asyncio.TimeoutError:
+                supervisor.cancel()
+                raise
+            return two_rounds_at
+
+        rounds = asyncio.run(_main())
+        self.assertGreaterEqual(rounds, 2)
+
+    def test_removed_service_target_stops_its_worker(self):
+        """A service removed by a config PATCH must lose its evaluation
+        worker; rollout keeps evaluating across the removal (supervisor
+        reconciliation)."""
+        config = AutoscalerConfig()
+        config.service_targets = {"genrm": "http://genrm:8000/genrm"}
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        svc._state.running = True
+        svc._state.enabled = True
+        svc._supervisor_poll_secs = 0.01
+        for runtime in svc._services.values():
+            runtime.config.evaluation_interval_secs = 0.01
+
+        calls = []
+
+        async def _record(runtime):
+            calls.append(runtime.name)
+
+        svc._evaluate_service = _record
+
+        async def _main():
+            supervisor = asyncio.ensure_future(svc._main_loop())
+            deadline_seen = False
+            while "genrm" not in calls:
+                await asyncio.sleep(0.01)
+            await svc.update_config(_ConfigUpdateRequest(service_targets={}))
+            genrm_calls_at_removal = [c for c in calls if c == "genrm"]
+            for _ in range(50):  # a few supervisor polls
+                await asyncio.sleep(0.01)
+                if "rollout" in calls[len(genrm_calls_at_removal):]:
+                    deadline_seen = True
+                    break
+            supervisor.cancel()
+            try:
+                await asyncio.wait_for(supervisor, timeout=5.0)
+            except asyncio.TimeoutError:
+                supervisor.cancel()
+                raise
+            return genrm_calls_at_removal, deadline_seen
+
+        genrm_calls_at_removal, rollout_continued = asyncio.run(_main())
+        self.assertGreaterEqual(len(genrm_calls_at_removal), 1)
+        # After removal, genrm must not be evaluated again.
+        self.assertEqual([c for c in calls if c == "genrm"], genrm_calls_at_removal)
+        # Rollout kept its cadence across the removal.
+        self.assertTrue(rollout_continued)
+
 
 if __name__ == "__main__":
     unittest.main()

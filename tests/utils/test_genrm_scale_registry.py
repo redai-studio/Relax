@@ -490,6 +490,40 @@ class TestStrictBounds(unittest.TestCase):
         self.assertNotIn(("scale_out", "dangling"), registry._idempotency)
         self.assertLessEqual(len(registry._idempotency), registry.max_idempotency_records)
 
+    def test_dangling_records_expire_by_ttl(self):
+        """Bot re-review repro: with ``max_history`` smaller than the key
+        count, operations are evicted from history; advancing time past the
+        replay TTL must then remove the orphaned keys too (the first
+        bounded-history pass skipped them forever)."""
+        registry = self._registry()
+        registry.max_history = 2
+        keys = []
+        for i in range(6):
+            decision = registry.submit(
+                "scale_out",
+                model_name="__default__",
+                target=2,
+                timeout_secs=60.0,
+                idempotency_key=f"k-{i}",
+                current=1,
+                ready=1,
+            )
+            registry.finish(decision["request_id"], status="ACTIVE", current=2, ready=2, created=1)
+            keys.append(f"k-{i}")
+        # History is bounded; the four oldest operations were evicted.
+        self.assertLessEqual(len(registry._operations), registry.max_history)
+        # Their replay records are now dangling -- but still evictable.
+        dangling = [k for k in keys if ("scale_out", k) in registry._idempotency
+                    and registry._idempotency[("scale_out", k)].request_id not in registry._operations]
+        self.assertEqual(len(dangling), 4)
+        # Advance every record past the replay window and trigger eviction.
+        for record in registry._idempotency.values():
+            record.created_at -= registry.replay_window_secs + 1
+        registry._evict_bounded_history_locked()
+        self.assertEqual(
+            [k for k in keys if ("scale_out", k) in registry._idempotency], []
+        )
+
     def test_protected_records_survive_the_cap(self):
         """Live and dirty-terminal outcomes are never evicted, even while the
         evictable pool is far beyond the record cap."""

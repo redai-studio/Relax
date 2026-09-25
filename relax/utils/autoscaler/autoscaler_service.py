@@ -372,53 +372,88 @@ class AutoscalerService(Base):
             raise
 
     async def _main_loop(self) -> None:
-        """Main autoscaler loop: collect metrics, evaluate, and scale."""
+        """Supervisor for per-service evaluation loops.
+
+        Each configured service owns an independent evaluation task with its
+        own interval timing: a slow/stalled service (e.g. a GenRM metrics
+        endpoint or pending-request wait hitting the 30 s HTTP timeout) delays
+        only its own next round, never another service's cadence (review
+        finding: the former single-cycle ``asyncio.gather`` barrier let one
+        stalled service starve every later cycle for all services). The
+        supervisor re-reconciles the worker set every ``_supervisor_poll_secs``
+        so services added or removed by a config ``PATCH`` gain or lose their
+        worker without a restart. Per service, evaluation is strictly
+        sequential (evaluate, then sleep) -- no reentrancy.
+        """
         logger.info("Autoscaler main loop started")
-
-        while self._state.running:
-            try:
-                # Only evaluate if enabled
-                if self._state.enabled:
-                    await self._evaluate_and_scale()
-
-                # Wait for next evaluation interval
-                await asyncio.sleep(self.config.evaluation_interval_secs)
-
-            except asyncio.CancelledError:
-                logger.info("Autoscaler main loop cancelled")
-                break
-            except Exception as e:
-                logger.exception(f"Error in autoscaler loop: {e}")
-                self._state.last_error = str(e)
-                await asyncio.sleep(self.config.evaluation_interval_secs)
-
+        workers: Dict[str, asyncio.Task] = {}
+        try:
+            while self._state.running:
+                services = getattr(self, "_services", None)
+                runtimes = list(services.values()) if services is not None else [self._runtime(None)]
+                names = {runtime.name for runtime in runtimes}
+                for runtime in runtimes:
+                    worker = workers.get(runtime.name)
+                    if worker is None or worker.done():
+                        workers[runtime.name] = asyncio.ensure_future(self._service_loop(runtime))
+                for name in [n for n in workers if n not in names]:
+                    workers.pop(name).cancel()
+                await asyncio.sleep(getattr(self, "_supervisor_poll_secs", 1.0))
+        except asyncio.CancelledError:
+            logger.info("Autoscaler main loop cancelled")
+        finally:
+            for worker in workers.values():
+                worker.cancel()
+            for worker in workers.values():
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - shutdown must not abort
+                    pass
         logger.info("Autoscaler main loop exited")
 
-    async def _evaluate_and_scale(self) -> None:
-        """Evaluate each configured service with isolated mutable state.
+    async def _service_loop(self, runtime: "ServiceRuntime") -> None:
+        """Independent evaluation cadence for one service.
 
-        Services are evaluated concurrently within each autoscaler cycle via
-        ``asyncio.gather``; mutable decision state and history are isolated per
-        service. This is not a per-service periodic scheduler: a cycle waits
-        for every service's evaluation, so a persistently slow service can
-        still lengthen the shared cycle for all services (it just cannot block
-        another service *within* the same cycle). Per-service failures are
-        captured on that service's state and never abort the batch.
+        The global ``self._state.running``/``enabled`` flags keep their
+        service-wide meaning (``/enable`` and ``stop()`` toggle them), while
+        the interval comes from the service's effective config.
+        """
+        interval = runtime.config.evaluation_interval_secs
+        while self._state.running:
+            try:
+                if self._state.enabled:
+                    await self._evaluate_service_guarded(runtime)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001 - keep this service alive
+                runtime.state.last_error = str(e)
+                logger.exception(f"Autoscaler loop error for service={runtime.name}: {e}")
+                await asyncio.sleep(interval)
+
+    async def _evaluate_service_guarded(self, runtime: "ServiceRuntime") -> None:
+        try:
+            await self._evaluate_service(runtime)
+        except Exception as exc:  # noqa: BLE001 - isolate per service
+            runtime.state.last_error = str(exc)
+            logger.exception(f"Autoscaler evaluation failed for service={runtime.name}: {exc}")
+
+    async def _evaluate_and_scale(self) -> None:
+        """Evaluate every configured service once, concurrently.
+
+        Compatibility entry point (direct calls and tests): within one call,
+        services are evaluated concurrently via ``asyncio.gather`` and mutable
+        decision state/history stay isolated per service. The continuously
+        running path is the per-service loops in ``_main_loop``.
         """
         services = getattr(self, "_services", None)
         runtimes = list(services.values()) if services is not None else [self._runtime(None)]
-
-        async def _guarded(runtime) -> None:
-            try:
-                await self._evaluate_service(runtime)
-            except Exception as exc:  # noqa: BLE001 - isolate per service
-                runtime.state.last_error = str(exc)
-                logger.exception(f"Autoscaler evaluation failed for service={runtime.name}: {exc}")
-
         if len(runtimes) == 1:
-            await _guarded(runtimes[0])
+            await self._evaluate_service_guarded(runtimes[0])
             return
-        await asyncio.gather(*(_guarded(runtime) for runtime in runtimes))
+        await asyncio.gather(*(self._evaluate_service_guarded(runtime) for runtime in runtimes))
 
     async def _evaluate_service(self, runtime: ServiceRuntime) -> None:
         if getattr(self, "_services", None) is None:
