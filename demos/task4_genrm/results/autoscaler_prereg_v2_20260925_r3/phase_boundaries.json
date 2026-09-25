@@ -1,0 +1,24 @@
+{
+  "phases": {
+    "low_start": 1790316594.532203,
+    "low_end": 1790316614.5322819,
+    "high_start": 1790316614.6020336,
+    "high_end": 1790316675.1477394,
+    "steady_start": 1790316675.1480196,
+    "steady_end": 1790316749.2564619,
+    "low_prime_start": 1790316749.2565327,
+    "run_end": 1790316749.2785618
+  },
+  "history": [
+    {
+      "action": "scale_in",
+      "triggered_at": 1790316731.146308,
+      "completed_at": 1790316736.159641
+    },
+    {
+      "action": "scale_out",
+      "triggered_at": 1790316634.8012922,
+      "completed_at": 1790316675.165494
+    }
+  ]
+}

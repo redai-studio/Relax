@@ -1,0 +1,897 @@
+{
+  "scope": "Deterministic contract simulation; no Ray, SGLang, GPU, HTTP server, or Task 3 integration",
+  "scenarios": {
+    "1→2→1": [
+      {
+        "kind": "BOOT",
+        "message": "Initial replica ready; training PG belongs to its original owner",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "out to absolute target 2",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "IDEMPOTENT_REPLAY",
+        "message": "req-01: returned the original operation",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REJECT_409",
+        "message": "Idempotency key was reused with a different request body",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REJECT_409",
+        "message": "Another lifecycle operation is active or cleanup is unresolved",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PG_ALLOCATED",
+        "message": "genrm-1: manager owns manager-pg-1; two mock workers created",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "HEALTH_CHECKING",
+        "message": "genrm-1: health result pending; route unchanged",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PUBLISHED",
+        "message": "genrm-1: healthy head enters route; no weight sync",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "ACTIVE",
+        "message": "Scale-out finished",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "ADMITTED",
+        "message": "score-17: accepted by genrm-1",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {
+          "genrm-1": [
+            "score-17"
+          ]
+        },
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "in to absolute target 1",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {
+          "genrm-1": [
+            "score-17"
+          ]
+        },
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-02"
+      },
+      {
+        "kind": "DRAINING",
+        "message": "genrm-1: route removed, admission closed; accepted calls retained",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {
+          "genrm-1": [
+            "score-17"
+          ]
+        },
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REJECT_STALE_ROUTE",
+        "message": "stale-dispatch: genrm-1 did not accept request",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {
+          "genrm-1": [
+            "score-17"
+          ]
+        },
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "WAIT_DRAIN",
+        "message": "genrm-1: accepted calls or backend still busy",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {
+          "genrm-1": [
+            "score-17"
+          ]
+        },
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "COMPLETED_CALL",
+        "message": "score-17: accepted call finished",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REMOVING",
+        "message": "genrm-1: backend idle; stopping all mock workers",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "RELEASED",
+        "message": "genrm-1: all workers stopped; manager PG released",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "NOOP",
+        "message": "in target 1 already satisfied",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      }
+    ],
+    "Health failure": [
+      {
+        "kind": "BOOT",
+        "message": "Initial replica ready; training PG belongs to its original owner",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "out to absolute target 2",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "PG_ALLOCATED",
+        "message": "genrm-1: manager owns manager-pg-1; two mock workers created",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "HEALTH_CHECKING",
+        "message": "genrm-1: health result pending; route unchanged",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "ROLLBACK",
+        "message": "genrm-1: candidate and manager PG released",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "LATE_ACK_IGNORED",
+        "message": "genrm-1: stale result cannot publish a route",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "NOT_FOUND",
+        "message": "req-99: request ID is unknown",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      }
+    ],
+    "Backend busy": [
+      {
+        "kind": "BOOT",
+        "message": "Initial replica ready; training PG belongs to its original owner",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "out to absolute target 2",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "PG_ALLOCATED",
+        "message": "genrm-1: manager owns manager-pg-1; two mock workers created",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "HEALTH_CHECKING",
+        "message": "genrm-1: health result pending; route unchanged",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PUBLISHED",
+        "message": "genrm-1: healthy head enters route; no weight sync",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "ACTIVE",
+        "message": "Scale-out finished",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "PENDING",
+        "message": "in to absolute target 1",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-1",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-02"
+      },
+      {
+        "kind": "DRAINING",
+        "message": "genrm-1: route removed, admission closed; accepted calls retained",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "WAIT_DRAIN",
+        "message": "genrm-1: accepted calls or backend still busy",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "DRAIN_FAILED",
+        "message": "genrm-1: retained workers and PG; route remains closed",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": true
+      },
+      {
+        "kind": "RETRY",
+        "message": "req-02: retrying retained drain and cleanup",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REMOVING",
+        "message": "genrm-1: backend idle; stopping all mock workers",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "RELEASED",
+        "message": "genrm-1: all workers stopped; manager PG released",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      }
+    ],
+    "Cleanup failure": [
+      {
+        "kind": "BOOT",
+        "message": "Initial replica ready; training PG belongs to its original owner",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "out to absolute target 2",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-01"
+      },
+      {
+        "kind": "PG_ALLOCATED",
+        "message": "genrm-1: manager owns manager-pg-1; two mock workers created",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "HEALTH_CHECKING",
+        "message": "genrm-1: health result pending; route unchanged",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "CLEANUP_PENDING",
+        "message": "genrm-1: cleanup failed; PG retained",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": true
+      },
+      {
+        "kind": "REJECT_409",
+        "message": "Another lifecycle operation is active or cleanup is unresolved",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-1",
+          "training-pg"
+        ],
+        "paused": true
+      },
+      {
+        "kind": "RECONCILED",
+        "message": "req-01: released 1 retained candidate PG(s)",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "out to absolute target 2",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-02"
+      },
+      {
+        "kind": "PG_ALLOCATED",
+        "message": "genrm-2: manager owns manager-pg-2; two mock workers created",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "HEALTH_CHECKING",
+        "message": "genrm-2: health result pending; route unchanged",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PUBLISHED",
+        "message": "genrm-2: healthy head enters route; no weight sync",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-2",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "ACTIVE",
+        "message": "Scale-out finished",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-2",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-02"
+      },
+      {
+        "kind": "NOOP",
+        "message": "out target 2 already satisfied; response recorded for replay",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-2",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "PENDING",
+        "message": "in to absolute target 1",
+        "current": 2,
+        "ready": 2,
+        "published": [
+          "genrm-2",
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false,
+        "request_id": "req-03"
+      },
+      {
+        "kind": "DRAINING",
+        "message": "genrm-2: route removed, admission closed; accepted calls retained",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "REMOVING",
+        "message": "genrm-2: backend idle; stopping all mock workers",
+        "current": 2,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "manager-pg-2",
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "RELEASED",
+        "message": "genrm-2: all workers stopped; manager PG released",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      },
+      {
+        "kind": "IDEMPOTENT_REPLAY",
+        "message": "NOOP: returned the original response without re-evaluating",
+        "current": 1,
+        "ready": 1,
+        "published": [
+          "initial-0"
+        ],
+        "inflight": {},
+        "live_pgs": [
+          "training-pg"
+        ],
+        "paused": false
+      }
+    ]
+  },
+  "checks": {
+    "inflight_conflict": true,
+    "idempotent_replay": true,
+    "idempotency_key_conflict": true,
+    "late_dispatch_rejected": true,
+    "late_health_ack_ignored": true,
+    "accepted_request_drains": true,
+    "absolute_noop": true,
+    "initial_protected": true,
+    "cleanup_failure_blocks_new_scale": true,
+    "failed_drain_keeps_pg": true,
+    "cleanup_retry_reconciles": true,
+    "drain_retry_completes": true,
+    "keyed_noop_replayed_verbatim": true,
+    "keyed_noop_blocks_new_execution": true,
+    "unknown_request_404": true,
+    "final_capacity": [
+      1,
+      1
+    ],
+    "manager_pg_released": true,
+    "no_weight_sync": true
+  }
+}

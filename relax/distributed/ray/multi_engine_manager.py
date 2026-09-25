@@ -96,6 +96,10 @@ class MultiEngineManager:
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
         self._engine_addr_and_ports: dict[int, dict] = {}
+        # Ranks whose owned placement-group removal failed and whose handle is
+        # retained for retry (Task 4: unconfirmed resource release keeps
+        # blocking new scale operations until reconcile succeeds).
+        self._pending_pg_cleanup: set[int] = set()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
@@ -229,19 +233,56 @@ class MultiEngineManager:
 
         return num_new_engines
 
-    def _remove_owned_pg(self, rank: int) -> None:
-        placement = self._engine_placements.pop(rank, None)
+    def _remove_owned_pg(self, rank: int) -> bool:
+        """Remove the placement group this manager owns for ``rank``.
+
+        Returns True when the slot had no owned PG or removal succeeded. On
+        removal failure the handle is retained (put back into
+        ``_engine_placements``) and the rank is recorded in
+        ``_pending_pg_cleanup`` for reconcile retries, so the resource stays
+        accounted-for instead of silently leaking.
+        """
+        # ``remove_placement_group`` only submits an asynchronous deletion.
+        # Keep ownership until Ray reports REMOVED; treating an accepted RPC as
+        # resource release lets a replacement actor race the old PG.
+        placement = self._engine_placements.get(rank)
         if placement is None:
-            return
+            return True
         pg_tuple, owns_pg = placement
         if not owns_pg:
-            return
+            self._engine_placements.pop(rank, None)
+            return True
         try:
-            from ray.util.placement_group import remove_placement_group
+            from ray.util.placement_group import placement_group_table, remove_placement_group
 
-            remove_placement_group(pg_tuple[0])
+            if rank not in self._pending_pg_cleanup:
+                remove_placement_group(pg_tuple[0])
+                self._pending_pg_cleanup.add(rank)
+            state = placement_group_table(pg_tuple[0]).get("state")
+            if state == "REMOVED":
+                self._engine_placements.pop(rank, None)
+                self._pending_pg_cleanup.discard(rank)
+                return True
+            return False
         except Exception as exc:
             logger.warning(f"{self._log_prefix} remove placement group for rank={rank} failed: {exc}")
+            # Retain the handle and mark the rank for reconcile retries. An
+            # unknown table state is not evidence of resource release.
+            self._pending_pg_cleanup.add(rank)
+            return False
+
+    def retry_pending_pg_cleanup(self) -> list[int]:
+        """Retry PG removal for all failed-cleanup ranks.
+
+        Returns the ranks still failing cleanup after this attempt.
+        """
+        still_failing: list[int] = []
+        for rank in sorted(self._pending_pg_cleanup):
+            if self._remove_owned_pg(rank):
+                self._pending_pg_cleanup.discard(rank)
+            else:
+                still_failing.append(rank)
+        return still_failing
 
     # ------------------------------------------------------------------
     # Health / lifecycle.

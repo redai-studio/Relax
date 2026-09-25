@@ -144,6 +144,39 @@ def test_scaling_decision_non_terminal_pending_blocks():
     assert "pending" in decision.reason.lower()
 
 
+def test_scaling_decision_terminal_dirty_pending_blocks_scale_out():
+    """A terminal request with unresolved cleanup (GenRM terminal-dirty)
+    freezes decisions: the target keeps answering 409 until reconcile clears
+    it, so re-issuing every cycle is pure noise."""
+    engine = _engine()
+    agg = _busy_metrics(coverage=1.0)
+    pending = [{"action": "scale_out", "status": "FAILED", "delta": 2, "cleanup_required": True}]
+    decision = _evaluate(engine, agg, current_engines=4, pending=pending)
+    assert decision.action == ScalingAction.NONE
+    assert "pending" in decision.reason.lower()
+
+
+def test_scaling_decision_terminal_dirty_pending_blocks_scale_in_too():
+    """The dirty gate is direction-agnostic, mirroring the server, which 409s
+    any new scale request for a model with unresolved cleanup."""
+    engine = _engine()
+    agg = _idle_metrics(coverage=1.0)
+    pending = [{"action": "scale_out", "status": "PARTIAL", "delta": 2, "cleanup_required": True}]
+    decision = _evaluate(engine, agg, current_engines=4, pending=pending)
+    assert decision.action == ScalingAction.NONE
+    assert "pending" in decision.reason.lower()
+
+
+def test_scaling_decision_terminal_dirty_pending_unblocks_when_cleared():
+    """Once reconcile clears cleanup_required, the terminal request no longer
+    blocks (it leaves the pending queue on the next status poll)."""
+    engine = _engine()
+    agg = _busy_metrics(coverage=1.0)
+    pending = [{"action": "scale_out", "status": "FAILED", "delta": 2, "cleanup_required": False}]
+    decision = _evaluate(engine, agg, current_engines=4, pending=pending)
+    assert decision.action == ScalingAction.SCALE_OUT
+
+
 def test_is_scale_request_terminal_scale_out():
     for status in ("ACTIVE", "PARTIAL", "FAILED", "CANCELLED"):
         assert is_scale_request_terminal("scale_out", status) is True

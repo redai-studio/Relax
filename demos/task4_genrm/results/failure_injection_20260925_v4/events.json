@@ -1,0 +1,550 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "<qwen3-0.6b-checkpoint>",
+    "out_dir": "demos/task4_genrm/results/failure_injection_20260925_v4"
+  },
+  {
+    "t": 20.279,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 22.031,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 33.607,
+    "event": "serve_run",
+    "url": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 78.576,
+    "event": "baseline_engines",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 78.606,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-c78d2d4d-faf5-467b-9e20-172db357a450"
+  },
+  {
+    "t": 121.175,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 121.19,
+    "event": "s1_engines",
+    "initial": [
+      [
+        "node-0",
+        16000
+      ]
+    ],
+    "elastic": [
+      "node-0",
+      16001
+    ]
+  },
+  {
+    "t": 121.787,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "node-0",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 121.809,
+    "event": "s1_scale_in_submitted",
+    "request_id": "genrm-scale-6e646a1f-5126-4bc3-9c19-3f3868e42fa5"
+  },
+  {
+    "t": 130.935,
+    "event": "s1_done",
+    "scale_in": "COMPLETED",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "node-0:16001",
+        "finish_reason": "length",
+        "len": 11872,
+        "latency": 8.838
+      },
+      {
+        "ok": true,
+        "engine": "node-0:16000",
+        "finish_reason": "length",
+        "len": 13548,
+        "latency": 8.841
+      }
+    ]
+  },
+  {
+    "t": 130.969,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-2d89a0d9-fafb-4579-a40a-bb4cc1300a7c"
+  },
+  {
+    "t": 173.525,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 173.543,
+    "event": "s2_engines",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ],
+      [
+        "node-0",
+        16001
+      ]
+    ],
+    "victim": [
+      "node-0",
+      16001
+    ]
+  },
+  {
+    "t": 174.091,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "node-0",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 174.111,
+    "event": "s2_scale_in_submitted",
+    "request_id": "genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262",
+    "timeout_secs": 5.0
+  },
+  {
+    "t": 239.974,
+    "event": "s2_registry_failed_dirty",
+    "status": "FAILED",
+    "cleanup_required": true
+  },
+  {
+    "t": 239.995,
+    "event": "s2_mutex_check",
+    "held": true
+  },
+  {
+    "t": 240.014,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 250.039,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 260.064,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 270.088,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 280.111,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 290.136,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 300.159,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 310.182,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 320.205,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 330.236,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 340.258,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 350.287,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 360.312,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 370.337,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 380.36,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 390.381,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 400.404,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 410.43,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 420.451,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 430.475,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 440.499,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 450.523,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 460.544,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 470.569,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 480.591,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 490.613,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 500.638,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 510.669,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 520.692,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 530.715,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 540.739,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 550.759,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 560.783,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 570.81,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 580.834,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 590.86,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 600.884,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 610.906,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 620.929,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 630.952,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 640.976,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 651.0,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 661.024,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 671.047,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 681.072,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 691.094,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 701.119,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 711.146,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 721.169,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 731.19,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 741.212,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 751.234,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 761.263,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 771.286,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-31096a80-2fa0-4419-b2b2-3bb57bc3a262/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 781.411,
+    "event": "s2_reconcile_result",
+    "status": "FAILED",
+    "cleanup_required": false,
+    "detail": null
+  },
+  {
+    "t": 781.411,
+    "event": "s2_requests",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "node-0:16001",
+        "finish_reason": "length",
+        "len": 20410,
+        "latency": 19.363
+      },
+      {
+        "ok": true,
+        "engine": "node-0:16000",
+        "finish_reason": "length",
+        "len": 27567,
+        "latency": 19.389
+      }
+    ]
+  },
+  {
+    "t": 781.455,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-fffd59cd-aac1-47e2-86fa-afa7254a88b7"
+  },
+  {
+    "t": 822.989,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 823.003,
+    "event": "s3_engines",
+    "initial": [
+      [
+        "node-0",
+        16000
+      ]
+    ],
+    "victim": [
+      "node-0",
+      16001
+    ]
+  },
+  {
+    "t": 823.554,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "node-0",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 823.575,
+    "event": "s3_scale_in_submitted",
+    "request_id": "genrm-scale-f611f524-0600-4742-ab98-9d509c0b74e7"
+  },
+  {
+    "t": 823.724,
+    "event": "s3_victim_identified",
+    "port": 16001,
+    "pid": 210382,
+    "status": "DRAINING"
+  },
+  {
+    "t": 823.725,
+    "event": "s3_victim_killed",
+    "pid": 210382
+  },
+  {
+    "t": 849.678,
+    "event": "s3_done",
+    "scale_in": "COMPLETED",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "node-0:16000",
+        "finish_reason": "length",
+        "len": 21326,
+        "latency": 26.674
+      },
+      {
+        "ok": true,
+        "engine": "node-0:16000",
+        "finish_reason": "length",
+        "len": 24449,
+        "latency": 25.282
+      }
+    ]
+  },
+  {
+    "t": 849.715,
+    "event": "verdicts",
+    "s1_scale_in_completed": true,
+    "s1_both_long_requests_ok": true,
+    "s1_requests_served_by_both_engines": true,
+    "s1_final_capacity": 1,
+    "s2_deadline_abort_failed_dirty": true,
+    "s2_mutex_held_while_dirty": true,
+    "s2_reconcile_cleared_park": true,
+    "s2_reconcile_terminal_status": true,
+    "s2_abort_to_reconcile_park_s": 607.3,
+    "s2_long_requests_ok": true,
+    "s2_final_capacity": 1,
+    "s3_scale_in_completed_after_crash": true,
+    "s3_all_requests_survived_on_initial_engine": true,
+    "s3_initial_engine_survived": true,
+    "s3_final_capacity": 1,
+    "E2E_PASS": true
+  },
+  {
+    "t": 859.199,
+    "event": "cleanup_result",
+    "cleanup_pass": true,
+    "cleanup_errors": [],
+    "leftover_ray_free_gpus": 3.0
+  },
+  {
+    "t": 859.2,
+    "event": "e2e_done",
+    "functional_pass": true,
+    "cleanup_pass": true
+  }
+]

@@ -388,9 +388,11 @@ def _render_chart(
 
 class AutoscalerApiClient:
     base_url: str
+    service: str
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, service: str = "rollout") -> None:
         self.base_url = _norm_base_url(base_url)
+        self.service = service
         self._session: Union["ClientSession", None] = None
 
     async def start(self) -> None:
@@ -423,10 +425,61 @@ class AutoscalerApiClient:
             return _as_dict(data)
 
     async def fetch_all(self) -> tuple[JsonDict, JsonDict, JsonDict]:
+        # /status is aggregated (per-service state lives under ``services``;
+        # the client projects it via _select_service_view), while
+        # /conditions and /scale_history filter server-side via ``service=``.
         status_task = asyncio.create_task(self._get_json("/status"))
-        conditions_task = asyncio.create_task(self._get_json("/conditions"))
-        history_task = asyncio.create_task(self._get_json("/scale_history?limit=10"))
+        conditions_task = asyncio.create_task(self._get_json(f"/conditions?service={self.service}"))
+        history_task = asyncio.create_task(self._get_json(f"/scale_history?limit=10&service={self.service}"))
         return await asyncio.gather(status_task, conditions_task, history_task)
+
+
+def _select_service_view(status: JsonDict, service: str) -> JsonDict:
+    """Project the aggregated /status payload onto one service's view.
+
+    The autoscaler keeps one runtime per service (rollout plus any configured
+    service targets); /status returns global fields plus a ``services`` map.
+    For a non-rollout service the per-service fields overlay the global ones so
+    every existing renderer keeps working, and per-service policy overrides are
+    resolved onto the top-level policies the same way the backend's
+    ``get_effective_policies`` does. A service absent from ``services`` keeps
+    the payload but is flagged via ``selected_service_missing`` so the UI
+    renders ``unknown`` instead of fabricating zeros or showing the rollout
+    alias.
+    """
+    if service == "rollout":
+        return status
+    services = _as_dict(status.get("services"))
+    svc = _as_dict(services.get(service))
+    if not svc:
+        view = dict(status)
+        view["selected_service_missing"] = service
+        return view
+    view = dict(status)
+    for key in (
+        "current_engines",
+        "min_engines",
+        "max_engines",
+        "pending_requests",
+        "recent_metrics",
+        "total_scale_operations",
+        "last_decision",
+    ):
+        if key in svc:
+            view[key] = svc[key]
+    config = _as_dict(view.get("config"))
+    service_policies = _as_dict(config.get("service_policies"))
+    overrides = _as_dict(service_policies.get(service))
+    if overrides:
+        config = dict(config)
+        for axis in ("scale_out_policy", "scale_in_policy"):
+            override = _as_dict(overrides.get(axis))
+            if override:
+                merged = dict(_as_dict(config.get(axis)))
+                merged.update({k: v for k, v in override.items() if v is not None})
+                config[axis] = merged
+        view["config"] = config
+    return view
 
 
 def _get_prev_val(prev_metrics: JsonDict, key: str, default: float = 0.0) -> Union[float, None]:
@@ -453,6 +506,19 @@ def _build_metrics_rows(
     prev_status = _as_dict(prev.status) if prev else {}
     prev_metrics = _as_dict(prev_status.get("recent_metrics")) if prev_status else {}
     has_prev = bool(prev_metrics)
+
+    # A selected service that the autoscaler does not manage must render
+    # unknown, never zeros or the rollout alias' numbers.
+    missing_service = _as_str(status.get("selected_service_missing"), default="")
+    if missing_service:
+        return [
+            MetricRow("Engines", "[dim]unknown[/dim]", "-", "Engine"),
+            MetricRow("  Min/Max", "[dim]unknown[/dim]", "-", "Engine"),
+            MetricRow("Queue Requests", "[dim]unknown[/dim]", "-", "Requests"),
+            MetricRow("Running Requests", "[dim]unknown[/dim]", "-", "Requests"),
+            MetricRow("Token Usage", "[dim]unknown[/dim]", "-", "Resources"),
+            MetricRow("Throughput", "[dim]unknown[/dim]", "-", "Performance"),
+        ]
 
     cur_engines = _as_int(_coalesce(status.get("current_engines"), metrics.get("num_engines"), default=0))
     prev_engines = _get_prev_int(prev_metrics, "num_engines") if has_prev else None
@@ -561,6 +627,14 @@ def _render_status_panel(snapshot: AutoscalerSnapshot, _prev: Union[AutoscalerSn
         )
 
     status = _as_dict(snapshot.status)
+    missing_service = _as_str(status.get("selected_service_missing"), default="")
+    if missing_service:
+        return (
+            f"[bold red]Service '{missing_service}' not configured[/bold red]\n"
+            "[red]Add it to the autoscaler's service_targets (PATCH /config)"
+            " or run with --service rollout.[/red]\n\n[dim]Press r to retry[/dim]"
+        )
+
     pending_requests = _as_list(status.get("pending_requests"))
 
     enabled = bool(status.get("enabled", False))
@@ -812,11 +886,13 @@ def _history_rows(snapshot: AutoscalerSnapshot) -> list[tuple[str, str, str, str
 
 class AutoscalerMonitorApp:
     base_url: str
+    service: str
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, service: str = "rollout") -> None:
         self.base_url = base_url
+        self.service = service
 
-    def run(self) -> None:
+    def run(self, screenshot: Union[str, None] = None) -> None:
         try:
             from rich.text import Text
             from textual.app import App, ComposeResult
@@ -828,6 +904,7 @@ class AutoscalerMonitorApp:
             raise
 
         base_url = self.base_url
+        service = self.service
         logger_local = logger
 
         class _App(App[None]):
@@ -888,9 +965,10 @@ class AutoscalerMonitorApp:
 
             def __init__(self) -> None:
                 super().__init__()
+                self.title = f"Relax Autoscaler Monitor \u2014 {service}"
                 self.snapshot: AutoscalerSnapshot = AutoscalerSnapshot()
                 self.previous_snapshot: Union[AutoscalerSnapshot, None] = None
-                self._client: AutoscalerApiClient = AutoscalerApiClient(base_url)
+                self._client: AutoscalerApiClient = AutoscalerApiClient(base_url, service)
                 self._poll_task: Union[asyncio.Task[None], None] = None
                 self._history: MetricsHistory = MetricsHistory()
                 self._refresh_interval: float = 5.0
@@ -974,7 +1052,7 @@ class AutoscalerMonitorApp:
                     try:
                         status, conditions, history = await self._client.fetch_all()
                         self.previous_snapshot = self.snapshot.copy()
-                        self.snapshot.status = status
+                        self.snapshot.status = _select_service_view(status, service)
                         self.snapshot.conditions = conditions
                         self.snapshot.history = history
                         self.snapshot.last_refresh_ts = asyncio.get_event_loop().time()
@@ -1093,6 +1171,22 @@ class AutoscalerMonitorApp:
                     )
                 )
 
+        async def _shoot() -> None:
+            # Headless screenshot via Textual's pilot: drive the real app
+            # against the live autoscaler, let one refresh complete, export
+            # SVG. Used for evidence capture where no TTY is available.
+            app = _App()
+            async with app.run_test(size=(120, 42)) as pilot:
+                await pilot.pause(0.5)
+                await pilot.pause(2.5)
+                svg = app.export_screenshot()
+            with open(screenshot, "w") as f:
+                f.write(svg)
+
+        if screenshot:
+            asyncio.run(_shoot())
+            return
+
         _App().run()
 
 
@@ -1104,12 +1198,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="http://localhost:8000/autoscaler",
         help="Base autoscaler URL (default: http://localhost:8000/autoscaler)",
     )
+    parser.add_argument(
+        "--service",
+        type=str,
+        choices=("rollout", "genrm"),
+        default="rollout",
+        help="Which autoscaler-managed service to display (default: rollout)",
+    )
+    parser.add_argument(
+        "--screenshot",
+        type=str,
+        default=None,
+        help="Write one headless SVG screenshot to this path and exit (evidence capture)",
+    )
     return parser
 
 
 def main(argv: Union[list[str], None] = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    AutoscalerMonitorApp(base_url=str(args.url)).run()
+    AutoscalerMonitorApp(base_url=str(args.url), service=str(args.service)).run(screenshot=args.screenshot)
 
 
 if __name__ == "__main__":

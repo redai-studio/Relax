@@ -208,15 +208,23 @@ class ScalingDecisionEngine:
                     metrics_snapshot=aggregated_metrics.to_dict(),
                 )
 
-        # 2. Check for pending scale operations
+        # 2. Check for pending scale operations.  A terminal operation whose
+        # cleanup is still required (GenRM terminal-dirty) stays in the
+        # service's pending queue and keeps the target blocked server-side
+        # (409 on any new request), so it must freeze local decisions too --
+        # re-issuing a doomed request every cycle is pure noise until
+        # reconcile clears it.
         active_pending = [
-            r for r in pending_requests if not is_scale_request_terminal(r.get("action", "scale_out"), r.get("status"))
+            r
+            for r in pending_requests
+            if not is_scale_request_terminal(r.get("action", "scale_out"), r.get("status"))
+            or r.get("cleanup_required")
         ]
         if active_pending:
             return ScalingDecision(
                 action=ScalingAction.NONE,
                 delta=0,
-                reason=f"{len(active_pending)} pending scale operations in progress",
+                reason=f"{len(active_pending)} pending scale operations in progress or awaiting cleanup",
                 confidence=1.0,
                 metrics_snapshot=aggregated_metrics.to_dict(),
             )
@@ -256,6 +264,23 @@ class ScalingDecisionEngine:
                     f"[Autoscaler] Scale-in suppressed: coverage {aggregated_metrics.coverage:.2f} "
                     f"< min_coverage_scale_in {self.config.min_coverage_scale_in}"
                 )
+            elif aggregated_metrics.unknown_engines:
+                # Engines whose scrape answered HTTP 200 but missed a critical
+                # series are "unknown", not idle: their values are already
+                # excluded from the aggregates, yet the engines still hold
+                # capacity we cannot vouch for. Conservative direction:
+                # freeze scale-in rather than risk removing a busy engine.
+                missing = ", ".join(
+                    f"engine {engine_id}: metrics missing" for engine_id in aggregated_metrics.unknown_engines
+                )
+                logger.info(f"[Autoscaler] Scale-in suppressed: {missing}")
+                return ScalingDecision(
+                    action=ScalingAction.NONE,
+                    delta=0,
+                    reason=f"Scale-in suppressed: {missing}",
+                    confidence=1.0,
+                    metrics_snapshot=aggregated_metrics.to_dict(),
+                )
             else:
                 triggered_in = self._evaluate_scale_in_conditions(aggregated_metrics)
 
@@ -287,7 +312,14 @@ class ScalingDecisionEngine:
     def _update_condition_trackers(self, metrics: AggregatedMetrics, now: float) -> None:
         """Advance debounce trackers for one observation."""
         valid_out = (not metrics.is_empty) and metrics.coverage >= self.config.min_coverage_scale_out
-        valid_in = (not metrics.is_empty) and metrics.coverage >= self.config.min_coverage_scale_in
+        # A frame carrying unknown engines is invalid for scale-in debounce:
+        # time during which critical series were missing must not accumulate
+        # toward "sustained idle" (missing metrics are not idleness).
+        valid_in = (
+            (not metrics.is_empty)
+            and metrics.coverage >= self.config.min_coverage_scale_in
+            and not metrics.unknown_engines
+        )
         self._advance_direction("scale_out", self.scale_out_conditions, metrics, valid_out, now)
         self._advance_direction("scale_in", self.scale_in_conditions, metrics, valid_in, now)
 

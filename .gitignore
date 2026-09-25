@@ -54,3 +54,15 @@ tensorboard_log
 # .github
 .github/copilot-instructions.md
 env.sh
+
+# task4 genrm evidence: large raw artifacts live on the evidence/task4-genrm
+# branch only (see demos/task4_genrm/EVIDENCE.md); keep the working tree clean
+demos/task4_genrm/results/**/load_requests.json
+demos/task4_genrm/results/**/timeline.json
+demos/task4_genrm/results/**/tui-*.svg
+demos/task4_genrm/results/**/replies.json
+demos/task4_genrm/results/autoscaler_prereg_20260925_r1/
+demos/task4_genrm/results/failure_injection_20260925_v1_design_flaws/
+demos/task4_genrm/results/failure_injection_20260925_v2_pid_lookup/
+demos/task4_genrm/results/failure_injection_20260925_v3_early_eos/
+demos/task4_genrm/results/reward_consistency_20260925_v1_seed_instability/

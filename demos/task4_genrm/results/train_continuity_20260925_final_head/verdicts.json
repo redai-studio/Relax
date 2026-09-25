@@ -1,0 +1,15 @@
+{
+  "final_engines_from_last_snapshot": true,
+  "scale_out_active": true,
+  "scale_in_completed": true,
+  "elastic_engine_served_rewards": true,
+  "train_events_during_scaling_window": true,
+  "no_train_stall_over_120s": true,
+  "training_finished_after_scale_in": true,
+  "final_capacity_is_initial": true,
+  "rollout_count": 8,
+  "num_rollout_expected": 8,
+  "all_rollouts_landed": true,
+  "E2E_PASS": true,
+  "functional_error": null
+}

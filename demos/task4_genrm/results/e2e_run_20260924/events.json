@@ -1,0 +1,334 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "<qwen3-0.6b-checkpoint>",
+    "repo_root": "<repo-root>",
+    "out_dir": "demos/task4_genrm/results/e2e_run_20260924"
+  },
+  {
+    "t": 19.449,
+    "event": "ray_init",
+    "node_ips": [
+      "node-0"
+    ],
+    "resources": {
+      "GPU": 4.0,
+      "CPU": 64.0
+    }
+  },
+  {
+    "t": 21.063,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 32.334,
+    "event": "serve_run",
+    "url": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 73.649,
+    "event": "phase0_engines",
+    "current": 1,
+    "ready": 1,
+    "engines": [
+      {
+        "host": "node-0",
+        "port": 16000,
+        "inflight": 0,
+        "served": 0
+      }
+    ]
+  },
+  {
+    "t": 73.863,
+    "event": "gpu_snapshot",
+    "tag": "baseline-1-engine",
+    "compute_apps": "580679, 21780",
+    "gpu_mem": "0, 21790\n1, 4\n2, 4\n3, 4",
+    "ray_free_gpus": {
+      "GPU_group_88caa1a51f36c09ec95cfceef8c501000000": 0.8,
+      "GPU": 3.0,
+      "GPU_group_0_88caa1a51f36c09ec95cfceef8c501000000": 0.8
+    }
+  },
+  {
+    "t": 73.864,
+    "event": "baseline_ray_free_gpus",
+    "free": 3.0
+  },
+  {
+    "t": 74.376,
+    "event": "phase0_scores",
+    "scores": {
+      "math-1": "<think>\nOkay, let's see.",
+      "math-2": "<think>\nOkay, so I need to",
+      "math-3": "<think>\nOkay, so the question is",
+      "math-4": "<think>\nOkay, the user is asking",
+      "math-5": "<think>\nOkay, let's see.",
+      "math-6": "<think>\nOkay, so the question is",
+      "math-7": "<think>\nOkay, so the question is",
+      "math-8": "<think>\nOkay, let's see."
+    }
+  },
+  {
+    "t": 74.378,
+    "event": "phase0_initial_engine_ids",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 74.397,
+    "event": "load_started",
+    "workers": 8
+  },
+  {
+    "t": 79.469,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-c40abd95-137d-4f0b-9e1c-21449c613e1a",
+    "status": "PENDING",
+    "current": 1
+  },
+  {
+    "t": 79.506,
+    "event": "scale_out_status",
+    "status": "CREATING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 122.911,
+    "event": "scale_out_status",
+    "status": "HEALTH_CHECKING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 123.932,
+    "event": "scale_out_status",
+    "status": "ACTIVE",
+    "current": 2,
+    "ready": 2
+  },
+  {
+    "t": 123.932,
+    "event": "scale_out_final",
+    "status": "ACTIVE",
+    "current": 2,
+    "ready": 2,
+    "created": 1,
+    "removed": 0,
+    "transitions": [
+      "CREATING",
+      "HEALTH_CHECKING",
+      "ACTIVE"
+    ]
+  },
+  {
+    "t": 123.946,
+    "event": "phase1_engines",
+    "current": 2,
+    "ready": 2,
+    "engines": [
+      {
+        "host": "node-0",
+        "port": 16000,
+        "inflight": 4,
+        "served": 2708
+      },
+      {
+        "host": "node-0",
+        "port": 16001,
+        "inflight": 4,
+        "served": 8
+      }
+    ]
+  },
+  {
+    "t": 124.186,
+    "event": "gpu_snapshot",
+    "tag": "after-scale-out-2-engines",
+    "compute_apps": "580679, 21782\n582786, 21782",
+    "gpu_mem": "0, 21792\n1, 21792\n2, 5\n3, 5",
+    "ray_free_gpus": {
+      "GPU_group_b3794993f27a897e84fba372769101000000": 0.8,
+      "GPU_group_88caa1a51f36c09ec95cfceef8c501000000": 0.8,
+      "GPU_group_0_b3794993f27a897e84fba372769101000000": 0.8,
+      "GPU": 2.0,
+      "GPU_group_0_88caa1a51f36c09ec95cfceef8c501000000": 0.8
+    }
+  },
+  {
+    "t": 124.187,
+    "event": "phase1_elastic_engine_id",
+    "id": [
+      "node-0",
+      16001
+    ],
+    "initial_survived": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 124.187,
+    "event": "phase1_served_counts",
+    "elastic_served": 8
+  },
+  {
+    "t": 125.209,
+    "event": "phase1_scores",
+    "scores": {
+      "math-1": "<think>\nOkay, let's see.",
+      "math-2": "<think>\nOkay, so I need to",
+      "math-3": "<think>\nOkay, so the question is",
+      "math-4": "<think>\nOkay, the user is asking",
+      "math-5": "<think>\nOkay, let's see.",
+      "math-6": "<think>\nOkay, so the question is",
+      "math-7": "<think>\nOkay, so the question is",
+      "math-8": "<think>\nOkay, let's see."
+    }
+  },
+  {
+    "t": 140.243,
+    "event": "phase1_served_counts_mid",
+    "elastic_served": 511,
+    "current": 2,
+    "ready": 2
+  },
+  {
+    "t": 145.289,
+    "event": "scale_in_submitted",
+    "request_id": "genrm-scale-67f0a5d2-000b-4e5b-b63b-54578007d248",
+    "status": "PENDING",
+    "current": 2
+  },
+  {
+    "t": 145.305,
+    "event": "scale_in_status",
+    "status": "DRAINING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 146.322,
+    "event": "scale_in_status",
+    "status": "COMPLETED",
+    "current": 1,
+    "ready": 1
+  },
+  {
+    "t": 146.323,
+    "event": "scale_in_final",
+    "status": "COMPLETED",
+    "current": 1,
+    "ready": 1,
+    "created": 0,
+    "removed": 1,
+    "transitions": [
+      "DRAINING",
+      "COMPLETED"
+    ]
+  },
+  {
+    "t": 146.383,
+    "event": "phase2_engines",
+    "current": 1,
+    "ready": 1,
+    "engines": [
+      {
+        "host": "node-0",
+        "port": 16000,
+        "inflight": 1,
+        "served": 3422
+      }
+    ]
+  },
+  {
+    "t": 146.667,
+    "event": "gpu_snapshot",
+    "tag": "after-scale-in-1-engine",
+    "compute_apps": "580679, 21782",
+    "gpu_mem": "0, 21792\n1, 4\n2, 4\n3, 4",
+    "ray_free_gpus": {
+      "GPU_group_88caa1a51f36c09ec95cfceef8c501000000": 0.8,
+      "GPU": 3.0,
+      "GPU_group_0_88caa1a51f36c09ec95cfceef8c501000000": 0.8
+    }
+  },
+  {
+    "t": 147.959,
+    "event": "phase2_scores",
+    "scores": {
+      "math-1": "<think>\nOkay, let's see.",
+      "math-2": "<think>\nOkay, so I need to",
+      "math-3": "<think>\nOkay, so the question is",
+      "math-4": "<think>\nOkay, the user is asking",
+      "math-5": "<think>\nOkay, let's see.",
+      "math-6": "<think>\nOkay, so the question is",
+      "math-7": "<think>\nOkay, so the question is",
+      "math-8": "<think>\nOkay, let's see."
+    }
+  },
+  {
+    "t": 148.07,
+    "event": "load_stopped",
+    "total": 4163,
+    "failed": 0,
+    "p50": 0.143,
+    "p95": 0.176,
+    "max": 0.708
+  },
+  {
+    "t": 148.118,
+    "event": "verdicts",
+    "scale_out_active": true,
+    "scale_out_transition_chain": [
+      "CREATING",
+      "HEALTH_CHECKING",
+      "ACTIVE"
+    ],
+    "scale_out_added_exactly_one_engine": true,
+    "scale_out_initial_survived": true,
+    "elastic_engine_served_traffic": true,
+    "scale_in_completed": true,
+    "scale_in_transition_chain": [
+      "DRAINING",
+      "COMPLETED"
+    ],
+    "scale_in_removed_exactly_the_elastic_engine": true,
+    "scale_in_initial_survived": true,
+    "scoring_identical_out": true,
+    "scoring_identical_in": true,
+    "load_zero_failures": true,
+    "load_total_requests": 4163,
+    "load_requests_during_scale_out": 2434,
+    "load_requests_during_scale_in": 52,
+    "load_served_during_both_ops": true,
+    "gpu_resources_returned": true,
+    "baseline_free_gpus": 3.0,
+    "free_gpus_after_scale_in": 3.0,
+    "scores_diff_out": [],
+    "scores_diff_in": [],
+    "E2E_PASS": true
+  },
+  {
+    "t": 148.119,
+    "event": "load_stopped",
+    "total": 4163,
+    "failed": 0,
+    "p50": 0.143,
+    "p95": 0.176,
+    "max": 0.708
+  }
+]

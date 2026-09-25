@@ -11,7 +11,7 @@ through the Rollout service API.
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import FastAPI
@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
-from relax.utils.autoscaler.config import AutoscalerConfig
+from relax.utils.autoscaler.config import AutoscalerConfig, ServiceScalingPolicy
 from relax.utils.autoscaler.metrics_collector import MetricsCollector
 from relax.utils.autoscaler.scaling_decision import (
     ScalingAction,
@@ -41,7 +41,7 @@ app = FastAPI()
 class ScaleHistoryItem(BaseModel):
     """Single scale history record."""
 
-    request_id: str
+    request_id: Optional[str] = None
     action: str
     status: str
     triggered_at: float
@@ -81,6 +81,7 @@ class AutoscalerStatusResponse(BaseModel):
     recent_metrics: Optional[Dict[str, Any]] = None
     config: Dict[str, Any] = Field(default_factory=dict)
     total_scale_operations: int = 0
+    services: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ConditionStatusResponse(BaseModel):
@@ -141,6 +142,12 @@ class ConfigUpdateRequest(BaseModel):
         None, gt=0, description="Per-request scale-out timeout in seconds forwarded to the Rollout service"
     )
     rollout_service_url: Optional[str] = Field(None, description="Rollout service URL")
+    service_targets: Optional[Dict[str, str]] = Field(
+        None, description="Per-service target URLs, e.g. {rollout: url, genrm: url}"
+    )
+    service_policies: Optional[Dict[str, ServiceScalingPolicy]] = Field(
+        None, description="Per-service scaling policy overrides"
+    )
     scale_out_policy: Optional[ScaleOutPolicyUpdate] = Field(None, description="Scale-out policy updates")
     scale_in_policy: Optional[ScaleInPolicyUpdate] = Field(None, description="Scale-in policy updates")
 
@@ -170,6 +177,21 @@ class AutoscalerState:
     scale_history: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     total_scale_operations: int = 0
     last_error: Optional[str] = None
+
+
+@dataclass
+class ServiceRuntime:
+    """Independent mutable autoscaling state for one service target."""
+
+    name: str
+    config: AutoscalerConfig
+    metrics_collector: MetricsCollector
+    decision_engine: ScalingDecisionEngine
+    state: AutoscalerState = field(default_factory=AutoscalerState)
+    # GenRM's API is model-scoped.  First release deliberately supports one
+    # instance per service target; a mixed instance response is rejected at
+    # discovery rather than silently scaling an arbitrary "default" model.
+    model_name: Optional[str] = None
 
 
 # ===================== Autoscaler Service =====================
@@ -212,12 +234,14 @@ class AutoscalerService(Base):
         self.role = role
         self.config = autoscaler_config
 
-        # Initialize components
-        self.metrics_collector = MetricsCollector(self.config)
-        self.decision_engine = ScalingDecisionEngine(self.config)
-
-        # Runtime state
-        self._state = AutoscalerState()
+        self._services: Dict[str, ServiceRuntime] = {}
+        self._rebuild_service_runtimes()
+        # Compatibility aliases: external callers and legacy tests still see
+        # the original rollout runtime at these attributes.
+        rollout = self._services["rollout"]
+        self.metrics_collector = rollout.metrics_collector
+        self.decision_engine = rollout.decision_engine
+        self._state = rollout.state
         self._main_task: Optional[asyncio.Task] = None
         self._http_session: Optional[Any] = None  # aiohttp.ClientSession
 
@@ -226,25 +250,72 @@ class AutoscalerService(Base):
             f"max={self.config.max_engines}, enabled={self.config.enabled}"
         )
 
+    def _rebuild_service_runtimes(self) -> None:
+        """Construct independent policy/decision state for every configured
+        target."""
+        names = {"rollout", *self.config.service_targets}
+        previous = getattr(self, "_services", {})
+        runtimes: Dict[str, ServiceRuntime] = {}
+        for name in sorted(names):
+            policy = self.config.get_effective_policies(name)
+            effective = replace(
+                self.config,
+                min_engines=policy.min_engines,
+                max_engines=policy.max_engines,
+                scale_out_policy=policy.scale_out_policy,
+                scale_in_policy=policy.scale_in_policy,
+            )
+            old = previous.get(name)
+            collector = old.metrics_collector if old else MetricsCollector(effective)
+            # Keep collected history across a config PATCH, but make its
+            # subsequent polling cadence use the newly resolved service policy.
+            collector.config = effective
+            runtimes[name] = ServiceRuntime(
+                name=name,
+                config=effective,
+                metrics_collector=collector,
+                decision_engine=ScalingDecisionEngine(effective),
+                state=old.state if old else AutoscalerState(),
+            )
+        self._services = runtimes
+
+    def _runtime(self, runtime: Optional[ServiceRuntime]) -> ServiceRuntime:
+        """Return a runtime, including the lightweight legacy test shape."""
+        if runtime is not None:
+            return runtime
+        services = getattr(self, "_services", None)
+        if services is not None:
+            return services["rollout"]
+        return ServiceRuntime(
+            name="rollout",
+            config=self.config,
+            metrics_collector=getattr(self, "metrics_collector", MetricsCollector(self.config)),
+            decision_engine=getattr(self, "decision_engine", ScalingDecisionEngine(self.config)),
+            state=self._state,
+        )
+
     async def start(self) -> None:
         """Start the autoscaler service."""
         if self._main_task is not None and not self._main_task.done():
             logger.warning("Autoscaler already running")
             return
 
-        await self.metrics_collector.start()
+        for runtime in self._services.values():
+            await runtime.metrics_collector.start()
         self._http_session = await self._create_http_session()
 
-        self._state.enabled = self.config.enabled
-        self._state.running = True
+        for runtime in self._services.values():
+            runtime.state.enabled = self.config.enabled
+            runtime.state.running = True
         self._main_task = asyncio.ensure_future(self._main_loop())
 
         logger.info(f"Autoscaler service started, enabled={self._state.enabled}")
 
     async def stop(self) -> None:
         """Stop the autoscaler service."""
-        self._state.running = False
-        self._state.enabled = False
+        for runtime in self._services.values():
+            runtime.state.running = False
+            runtime.state.enabled = False
 
         if self._main_task is not None and not self._main_task.done():
             self._main_task.cancel()
@@ -253,7 +324,8 @@ class AutoscalerService(Base):
             except asyncio.CancelledError:
                 pass
 
-        await self.metrics_collector.stop()
+        for runtime in self._services.values():
+            await runtime.metrics_collector.stop()
 
         if self._http_session is not None:
             await self._http_session.close()
@@ -297,69 +369,53 @@ class AutoscalerService(Base):
         logger.info("Autoscaler main loop exited")
 
     async def _evaluate_and_scale(self) -> None:
-        """Perform one evaluation cycle: collect metrics, decide, and
-        execute."""
-        # Reconcile requests even when engine discovery fails.
-        await self._update_pending_requests()
+        """Evaluate each configured service with independent mutable state."""
+        services = getattr(self, "_services", None)
+        runtimes = services.values() if services is not None else [self._runtime(None)]
+        for runtime in runtimes:
+            try:
+                await self._evaluate_service(runtime)
+            except Exception as exc:
+                runtime.state.last_error = str(exc)
+                logger.exception(f"Autoscaler evaluation failed for service={runtime.name}: {exc}")
 
-        # 1. Fetch current engine list
-        engines = await self._fetch_engines()
+    async def _evaluate_service(self, runtime: ServiceRuntime) -> None:
+        if getattr(self, "_services", None) is None:
+            # Test-only legacy construction overrides these methods with their
+            # former no-argument shape.
+            await self._update_pending_requests()
+            engines = await self._fetch_engines()
+        else:
+            await self._update_pending_requests(runtime)
+            engines = await self._fetch_engines(runtime.name)
+        if runtime.name == "genrm" and engines:
+            runtime.model_name = engines[0].get("model_name")
         if not engines:
-            logger.warning("No engines found, skipping evaluation")
-            # An unobservable cycle breaks active debounce streaks.
-            self.decision_engine.reset_condition_trackers()
+            logger.warning(f"No {runtime.name} engines found, skipping evaluation")
+            runtime.decision_engine.reset_condition_trackers()
             return
-
-        # 2. Collect metrics from all engines
-        metrics_snapshot = await self.metrics_collector.collect_all(engines)
-        # Bind coverage to this cycle to avoid races with status collection.
-        self.metrics_collector.add_snapshot(metrics_snapshot, num_candidates=len(engines))
-
-        # 3. Compute aggregated metrics
-        aggregated = self.metrics_collector.get_aggregated_metrics()
-
-        logger.info(
-            f"[Autoscaler] Evaluation cycle: engines={aggregated.num_engines}, "
-            f"running_reqs={aggregated.total_running_reqs}, "
-            f"queue_reqs={aggregated.total_queue_reqs}, "
-            f"token_usage={aggregated.avg_token_usage:.2%}, "
-            f"throughput={aggregated.total_throughput:.1f} tok/s"
-        )
-
-        # 5. Calculate effective engine count (active + pending scale-out)
-        pending_scale_out_count = sum(
+        snapshot = await runtime.metrics_collector.collect_all(engines)
+        runtime.metrics_collector.add_snapshot(snapshot, num_candidates=len(engines))
+        aggregated = runtime.metrics_collector.get_aggregated_metrics()
+        pending_out = sum(
             req.get("delta", 0)
-            for req in self._state.pending_requests
+            for req in runtime.state.pending_requests
             if req.get("action") == "scale_out" and not is_scale_request_terminal("scale_out", req.get("status"))
         )
-        effective_engines = len(engines) + pending_scale_out_count
-
-        # 6. Evaluate scaling decision
-        decision = self.decision_engine.evaluate(
+        decision = runtime.decision_engine.evaluate(
             aggregated_metrics=aggregated,
-            current_engines=effective_engines,  # Use effective count to avoid over-scaling
-            last_scale_time=self._state.last_scale_time,
-            last_scale_action=self._state.last_scale_action,
-            pending_requests=self._state.pending_requests,
+            current_engines=len(engines) + pending_out,
+            last_scale_time=runtime.state.last_scale_time,
+            last_scale_action=runtime.state.last_scale_action,
+            pending_requests=runtime.state.pending_requests,
         )
-        self._state.last_decision = decision
-
-        # 7. Execute scaling action if needed
+        runtime.state.last_decision = decision
         if decision.action == ScalingAction.SCALE_OUT:
-            logger.info(
-                f"[Autoscaler] SCALE-OUT triggered: {decision.reason}, "
-                f"delta=+{decision.delta}, triggered_conditions={decision.triggered_conditions}, "
-                f"active_engines={len(engines)}, pending_scale_out={pending_scale_out_count}"
-            )
-            await self._execute_scale_out(decision, len(engines))
+            await self._execute_scale_out(decision, len(engines), runtime)
         elif decision.action == ScalingAction.SCALE_IN:
-            logger.info(
-                f"[Autoscaler] SCALE-IN triggered: {decision.reason}, "
-                f"delta=-{decision.delta}, triggered_conditions={decision.triggered_conditions}"
-            )
-            await self._execute_scale_in(decision, len(engines))
+            await self._execute_scale_in(decision, len(engines), runtime)
 
-    async def _fetch_engines(self) -> List[Dict[str, str]]:
+    async def _fetch_engines(self, service: str = "rollout") -> List[Dict[str, str]]:
         """Fetch active engine list from Rollout service.
 
         Only engines with ``status == "active"`` and a usable URL are returned.
@@ -369,7 +425,7 @@ class AutoscalerService(Base):
         if self._http_session is None:
             return []
 
-        url = f"{self.config.rollout_service_url}/engines"
+        url = f"{self.config.get_service_url(service)}/engines"
 
         try:
             async with self._http_session.get(url) as response:
@@ -380,6 +436,30 @@ class AutoscalerService(Base):
                 data = await response.json()
                 engines = []
 
+                if service == "genrm":
+                    instances = data.get("instances") or {"default": data}
+                    active_models = [
+                        model_name for model_name, instance in instances.items() if instance.get("engines", [])
+                    ]
+                    if len(active_models) > 1:
+                        logger.error(
+                            "GenRM autoscaler target contains multiple model instances; "
+                            "configure one target per model before enabling automatic scaling"
+                        )
+                        return []
+                    for model_name, instance in instances.items():
+                        for engine in instance.get("engines", []):
+                            host, port = engine.get("host"), engine.get("port")
+                            if host and port:
+                                engines.append(
+                                    {
+                                        "id": f"{model_name}:{host}:{port}",
+                                        "url": f"http://{host}:{port}",
+                                        "model_name": model_name,
+                                        "status": "active",
+                                    }
+                                )
+                    return engines
                 for model_name, model_info in data.get("models", {}).items():
                     for engine_group in model_info.get("engine_groups", []):
                         for engine in engine_group.get("engines", []):
@@ -402,18 +482,21 @@ class AutoscalerService(Base):
             logger.warning(f"Error fetching engines: {e}")
             return []
 
-    async def _execute_scale_out(self, decision: ScalingDecision, current_engines: int) -> None:
+    async def _execute_scale_out(
+        self, decision: ScalingDecision, current_engines: int, runtime: Optional[ServiceRuntime] = None
+    ) -> None:
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         target_count = current_engines + decision.delta
-        url = f"{self.config.rollout_service_url}/scale_out"
+        url = f"{self.config.get_service_url(runtime.name)}/scale_out"
         payload: Dict[str, Any] = {
-            "model_name": "default",
+            "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
         }
-        if self.config.scale_out_request_timeout_secs is not None:
-            payload["timeout_secs"] = self.config.scale_out_request_timeout_secs
+        if runtime.config.scale_out_request_timeout_secs is not None:
+            payload["timeout_secs"] = runtime.config.scale_out_request_timeout_secs
 
         logger.info(
             f"[Autoscaler] Executing scale-out: {current_engines} -> {target_count} engines "
@@ -433,7 +516,7 @@ class AutoscalerService(Base):
                             f"[Autoscaler] Scale-out NOOP (idempotent no-op), not tracking as pending: "
                             f"request_id={request_id}"
                         )
-                        self._record_noop("scale_out", decision, data, current_engines, target_count)
+                        self._record_noop("scale_out", decision, data, current_engines, target_count, runtime)
                         return
 
                     if status == "CONFLICT":
@@ -444,7 +527,7 @@ class AutoscalerService(Base):
 
                     logger.info(f"[Autoscaler] Scale-out request accepted: request_id={request_id}, status={status}")
 
-                    self._state.pending_requests.append(
+                    runtime.state.pending_requests.append(
                         {
                             "request_id": request_id,
                             "action": "scale_out",
@@ -458,8 +541,8 @@ class AutoscalerService(Base):
                             "metrics_snapshot": decision.metrics_snapshot,
                         }
                     )
-                    self._state.last_scale_time = time.time()
-                    self._state.last_scale_action = ScalingAction.SCALE_OUT
+                    runtime.state.last_scale_time = time.time()
+                    runtime.state.last_scale_action = ScalingAction.SCALE_OUT
                 else:
                     text = await response.text()
                     logger.warning(f"[Autoscaler] Scale-out request failed: HTTP {response.status} - {text}")
@@ -467,14 +550,17 @@ class AutoscalerService(Base):
         except Exception as e:
             logger.exception(f"[Autoscaler] Error executing scale-out: {e}")
 
-    async def _execute_scale_in(self, decision: ScalingDecision, current_engines: int) -> None:
+    async def _execute_scale_in(
+        self, decision: ScalingDecision, current_engines: int, runtime: Optional[ServiceRuntime] = None
+    ) -> None:
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         target_count = current_engines - decision.delta
-        url = f"{self.config.rollout_service_url}/scale_in"
+        url = f"{self.config.get_service_url(runtime.name)}/scale_in"
         payload = {
-            "model_name": "default",
+            "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
         }
 
@@ -496,7 +582,7 @@ class AutoscalerService(Base):
                             f"[Autoscaler] Scale-in NOOP (idempotent no-op), not tracking as pending: "
                             f"request_id={request_id}"
                         )
-                        self._record_noop("scale_in", decision, data, current_engines, target_count)
+                        self._record_noop("scale_in", decision, data, current_engines, target_count, runtime)
                         return
 
                     if status == "CONFLICT":
@@ -507,7 +593,7 @@ class AutoscalerService(Base):
 
                     logger.info(f"[Autoscaler] Scale-in request accepted: request_id={request_id}, status={status}")
 
-                    self._state.pending_requests.append(
+                    runtime.state.pending_requests.append(
                         {
                             "request_id": request_id,
                             "action": "scale_in",
@@ -521,8 +607,8 @@ class AutoscalerService(Base):
                             "metrics_snapshot": decision.metrics_snapshot,
                         }
                     )
-                    self._state.last_scale_time = time.time()
-                    self._state.last_scale_action = ScalingAction.SCALE_IN
+                    runtime.state.last_scale_time = time.time()
+                    runtime.state.last_scale_action = ScalingAction.SCALE_IN
                 else:
                     text = await response.text()
                     logger.warning(f"[Autoscaler] Scale-in request failed: HTTP {response.status} - {text}")
@@ -537,6 +623,7 @@ class AutoscalerService(Base):
         data: Dict[str, Any],
         from_engines: int,
         to_engines: int,
+        runtime: Optional[ServiceRuntime] = None,
     ) -> None:
         """Record a NOOP response without changing cooldown state."""
         now = time.time()
@@ -553,26 +640,28 @@ class AutoscalerService(Base):
             "triggered_conditions": decision.triggered_conditions,
             "metrics_snapshot": decision.metrics_snapshot,
         }
-        self._state.scale_history.appendleft(record)
-        self._state.total_scale_operations += 1
+        runtime = self._runtime(runtime)
+        runtime.state.scale_history.appendleft(record)
+        runtime.state.total_scale_operations += 1
 
-    async def _update_pending_requests(self) -> None:
+    async def _update_pending_requests(self, runtime: Optional[ServiceRuntime] = None) -> None:
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         completed = []
 
-        for req in self._state.pending_requests:
+        for req in runtime.state.pending_requests:
             action = req.get("action", "scale_out")
 
             status = req.get("status")
-            if is_scale_request_terminal(action, status):
+            if is_scale_request_terminal(action, status) and not req.get("cleanup_required"):
                 completed.append(req)
                 continue
 
             try:
                 endpoint = "scale_out" if action == "scale_out" else "scale_in"
-                url = f"{self.config.rollout_service_url}/{endpoint}/{req['request_id']}"
+                url = f"{self.config.get_service_url(runtime.name)}/{endpoint}/{req['request_id']}"
 
                 async with self._http_session.get(url) as response:
                     if response.status == 200:
@@ -581,8 +670,21 @@ class AutoscalerService(Base):
                         req["status"] = new_status
                         req["error_message"] = data.get("error_message")
                         req["failure_categories"] = data.get("failure_categories") or []
+                        req["actual_current"] = data.get("current")
+                        req["actual_ready"] = data.get("ready")
+                        req["cleanup_required"] = bool(data.get("cleanup_required", False))
 
-                        if is_scale_request_terminal(action, new_status):
+                        if is_scale_request_terminal(action, new_status) and req["cleanup_required"]:
+                            # A terminal dirty operation is still a hard
+                            # per-service gate. Ask the server to reconcile
+                            # the original operation; never issue a new scale
+                            # request while it owns unresolved resources.
+                            reconcile_url = f"{url}/reconcile"
+                            async with self._http_session.post(reconcile_url) as reconcile_response:
+                                if reconcile_response.status == 200:
+                                    reconcile_data = await reconcile_response.json()
+                                    req["cleanup_required"] = bool(reconcile_data.get("cleanup_required", True))
+                        if is_scale_request_terminal(action, new_status) and not req["cleanup_required"]:
                             completed.append(req)
                             req["completed_at"] = time.time()
                             logger.info(
@@ -595,10 +697,10 @@ class AutoscalerService(Base):
                 logger.warning(f"Error checking request {req.get('request_id')}: {e}")
 
         for req in completed:
-            self._state.pending_requests.remove(req)
+            runtime.state.pending_requests.remove(req)
             req["status"] = req.get("status", "UNKNOWN")
-            self._state.scale_history.appendleft(req)
-            self._state.total_scale_operations += 1
+            runtime.state.scale_history.appendleft(req)
+            runtime.state.total_scale_operations += 1
 
     # ===================== HTTP Endpoints =====================
 
@@ -615,6 +717,19 @@ class AutoscalerService(Base):
 
         aggregated = self.metrics_collector.get_aggregated_metrics()
 
+        services = {}
+        for name, runtime in getattr(self, "_services", {}).items():
+            service_engines = engines if name == "rollout" else await self._fetch_engines(name)
+            service_metrics = runtime.metrics_collector.get_aggregated_metrics()
+            services[name] = {
+                "current_engines": len(service_engines),
+                "min_engines": runtime.config.min_engines,
+                "max_engines": runtime.config.max_engines,
+                "last_decision": runtime.state.last_decision.to_dict() if runtime.state.last_decision else None,
+                "pending_requests": list(runtime.state.pending_requests),
+                "recent_metrics": service_metrics.to_dict(),
+                "total_scale_operations": runtime.state.total_scale_operations,
+            }
         return AutoscalerStatusResponse(
             enabled=self._state.enabled,
             running=self._state.running,
@@ -628,6 +743,7 @@ class AutoscalerService(Base):
             recent_metrics=aggregated.to_dict(),
             config=self.config.to_dict(),
             total_scale_operations=self._state.total_scale_operations,
+            services=services,
         )
 
     @app.get("/scale_history", response_model=ScaleHistoryResponse)
@@ -635,8 +751,12 @@ class AutoscalerService(Base):
         self,
         limit: int = 100,
         action: Optional[str] = None,
+        service: str = "rollout",
     ) -> ScaleHistoryResponse:
-        history = list(self._state.scale_history)
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        history = list(runtime.state.scale_history)
 
         if action:
             action = action.lower()
@@ -649,7 +769,7 @@ class AutoscalerService(Base):
 
         return ScaleHistoryResponse(
             history=[ScaleHistoryItem(**h) for h in history],
-            total_count=len(self._state.scale_history),
+            total_count=len(runtime.state.scale_history),
             action_filter=action,
             limit=limit,
         )
@@ -670,10 +790,13 @@ class AutoscalerService(Base):
         }
 
     @app.get("/conditions", response_model=ConditionStatusResponse)
-    async def get_conditions(self) -> ConditionStatusResponse:
-        aggregated = self.metrics_collector.get_aggregated_metrics()
-        conditions = self.decision_engine.get_condition_status(aggregated)
-        observations = self.decision_engine.condition_observation()
+    async def get_conditions(self, service: str = "rollout") -> ConditionStatusResponse:
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        aggregated = runtime.metrics_collector.get_aggregated_metrics()
+        conditions = runtime.decision_engine.get_condition_status(aggregated)
+        observations = runtime.decision_engine.condition_observation()
 
         return ConditionStatusResponse(
             conditions=conditions,
@@ -690,7 +813,7 @@ class AutoscalerService(Base):
         }
 
     @app.get("/metrics_history")
-    async def get_metrics_history(self, limit: int = 10) -> Dict[str, Any]:
+    async def get_metrics_history(self, limit: int = 10, service: str = "rollout") -> Dict[str, Any]:
         """Get metrics history for debugging.
 
         Args:
@@ -699,7 +822,10 @@ class AutoscalerService(Base):
         Returns:
             Recent metrics history.
         """
-        history = self.metrics_collector.get_history()
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        history = runtime.metrics_collector.get_history()
         return {
             "count": len(history),
             "snapshots": [
@@ -713,14 +839,17 @@ class AutoscalerService(Base):
         }
 
     @app.post("/clear_history")
-    async def clear_history(self) -> Dict[str, Any]:
+    async def clear_history(self, service: str = "rollout") -> Dict[str, Any]:
         """Clear metrics history.
 
         Returns:
             Confirmation message.
         """
-        self.metrics_collector.clear_history()
-        return {"status": "ok", "message": "Metrics history cleared"}
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        runtime.metrics_collector.clear_history()
+        return {"status": "ok", "message": f"Metrics history cleared for {service}"}
 
     @app.get("/config")
     async def get_config(self) -> Dict[str, Any]:
@@ -817,6 +946,14 @@ class AutoscalerService(Base):
             self.config.rollout_service_url = request.rollout_service_url
             updates_made.append(f"rollout_service_url={request.rollout_service_url}")
 
+        if request.service_targets is not None:
+            self.config.service_targets = dict(request.service_targets)
+            updates_made.append(f"service_targets={sorted(request.service_targets)}")
+
+        if request.service_policies is not None:
+            self.config.service_policies = dict(request.service_policies)
+            updates_made.append(f"service_policies={sorted(request.service_policies)}")
+
         if request.scale_out_policy is not None:
             policy = request.scale_out_policy
             if policy.token_usage_threshold is not None:
@@ -886,7 +1023,11 @@ class AutoscalerService(Base):
         # Validate cross-field constraints after applying the patch.
         self.config.validate()
 
-        self.decision_engine = ScalingDecisionEngine(self.config)
+        self._rebuild_service_runtimes()
+        rollout = self._services["rollout"]
+        self.metrics_collector = rollout.metrics_collector
+        self.decision_engine = rollout.decision_engine
+        self._state = rollout.state
 
         message = f"Configuration updated: {', '.join(updates_made)}" if updates_made else "No changes applied"
         logger.info(f"[Autoscaler] Config update: {message}")

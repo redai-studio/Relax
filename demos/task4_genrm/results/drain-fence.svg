@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 550" role="img" aria-labelledby="title desc">
+  <title id="title">GenRM 缩容的接收边界与排空条件</title>
+  <desc id="desc">请求 A 在关闭入口前取得租约，继续执行；请求 B 在关闭后被拒绝。只有租约归零并且后端确认任务结束，才能停止 workers 并释放 PG。结果未知时保留隔离状态。</desc>
+  <rect width="1200" height="550" fill="#f8fafc"/>
+  <text x="48" y="56" fill="#142744" font-family="Arial, sans-serif" font-size="30" font-weight="700">缩容的关键边界：何时可以释放 GPU？</text>
+  <text x="48" y="88" fill="#526174" font-family="Arial, sans-serif" font-size="17">Task 3 需要给出入口租约和后端任务的共同排空确认</text>
+
+  <line x1="178" y1="157" x2="1124" y2="157" stroke="#c4cfdb" stroke-width="3"/>
+  <circle cx="235" cy="157" r="7" fill="#2376b7"/>
+  <circle cx="565" cy="157" r="7" fill="#b36b15"/>
+  <circle cx="880" cy="157" r="7" fill="#16836d"/>
+  <text x="48" y="163" fill="#526174" font-family="Arial, sans-serif" font-size="17">时间</text>
+  <text x="194" y="138" fill="#1b639d" font-family="Arial, sans-serif" font-size="16" font-weight="700">已接收</text>
+  <text x="501" y="138" fill="#9b5a10" font-family="Arial, sans-serif" font-size="16" font-weight="700">关闭入口</text>
+  <text x="817" y="138" fill="#126d5c" font-family="Arial, sans-serif" font-size="16" font-weight="700">确认排空</text>
+
+  <rect x="48" y="201" width="520" height="103" rx="12" fill="#e9f3fc" stroke="#8dbce0"/>
+  <text x="72" y="238" fill="#174c78" font-family="Arial, sans-serif" font-size="21" font-weight="700">请求 A · 先取得 lease</text>
+  <text x="72" y="271" fill="#294359" font-family="Arial, sans-serif" font-size="17">继续完成打分；关闭入口不能取消它</text>
+  <path d="M570 251 H846" stroke="#2376b7" stroke-width="3" stroke-dasharray="8 7"/>
+  <path d="M844 245 L856 251 L844 257" fill="none" stroke="#2376b7" stroke-width="3"/>
+
+  <rect x="592" y="318" width="560" height="78" rx="12" fill="#fff1e7" stroke="#e2b28b"/>
+  <text x="616" y="350" fill="#a45624" font-family="Arial, sans-serif" font-size="20" font-weight="700">请求 B · 关闭后到达</text>
+  <text x="616" y="378" fill="#654d3b" font-family="Arial, sans-serif" font-size="17">明确拒绝，可由客户端重试；不转发到旧副本</text>
+
+  <rect x="700" y="420" width="452" height="83" rx="12" fill="#e7f5ef" stroke="#8dc4a9"/>
+  <text x="724" y="454" fill="#126d5c" font-family="Arial, sans-serif" font-size="20" font-weight="700">lease = 0 ＋ 后端确认终态</text>
+  <text x="724" y="482" fill="#294359" font-family="Arial, sans-serif" font-size="17">随后停止全部 workers，确认 PG 释放</text>
+
+  <rect x="48" y="422" width="586" height="81" rx="12" fill="#fff8e7" stroke="#e1c276"/>
+  <text x="72" y="455" fill="#8b6719" font-family="Arial, sans-serif" font-size="19" font-weight="700">超时、断线或后端结果未知</text>
+  <text x="72" y="483" fill="#514c3b" font-family="Arial, sans-serif" font-size="17">副本保持不可路由；保留 PG 和 owner，等待 reconcile</text>
+</svg>

@@ -1,0 +1,122 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "<qwen3-0.6b-checkpoint>",
+    "out_dir": "demos/task4_genrm/results/autoscaler_prereg_20260925_r2"
+  },
+  {
+    "t": 20.043,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 21.765,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 35.328,
+    "event": "deployed",
+    "genrm": "http://127.0.0.1:8000/genrm",
+    "autoscaler": "http://127.0.0.1:8000/autoscaler_genrm"
+  },
+  {
+    "t": 75.319,
+    "event": "autoscaler_started",
+    "started": true
+  },
+  {
+    "t": 75.6,
+    "event": "resource_baseline",
+    "free_gpus": 3.0,
+    "mem_mib": [
+      21790,
+      4,
+      4,
+      4
+    ],
+    "pgs": 1
+  },
+  {
+    "t": 95.677,
+    "event": "phase_low_done",
+    "current": 1
+  },
+  {
+    "t": 158.3,
+    "event": "phase_high_done",
+    "scaled_out": true
+  },
+  {
+    "t": 225.349,
+    "event": "tui_screenshot_captured",
+    "service": "genrm",
+    "file": "tui-genrm.svg"
+  },
+  {
+    "t": 231.882,
+    "event": "tui_screenshot_captured",
+    "service": "rollout",
+    "file": "tui-rollout.svg"
+  },
+  {
+    "t": 231.882,
+    "event": "phase_steady_done",
+    "elastic_served": 438,
+    "screenshots_ok": true
+  },
+  {
+    "t": 231.9,
+    "event": "phase_low_prime_done",
+    "scaled_in": true
+  },
+  {
+    "t": 243.101,
+    "event": "round_a_history",
+    "so": true,
+    "si": true,
+    "si_status": "COMPLETED"
+  },
+  {
+    "t": 249.5,
+    "event": "round_a_resources",
+    "free": "3.0/3.0",
+    "pgs": "2/1",
+    "mem_ok": true
+  },
+  {
+    "t": 295.835,
+    "event": "round_b_scaled_out",
+    "active": true
+  },
+  {
+    "t": 377.561,
+    "event": "round_b_done",
+    "scale_in": true,
+    "final": 1
+  },
+  {
+    "t": 377.576,
+    "event": "verdicts",
+    "A1_no_scale_out_in_low": true,
+    "A2_scale_out_decided_in_high": true,
+    "A3_elastic_served_in_steady": true,
+    "A4_scale_in_decided_outside_high": true,
+    "A5_scale_in_completed_final_is_initial": true,
+    "A6_zero_load_failures": true,
+    "A6_load_total": 3257,
+    "A8_tui_screenshots": true,
+    "A7_resources_returned": false,
+    "B1_manual_scale_out_active": true,
+    "B2_idle_scale_in_within_window": true,
+    "B2_idle_evidence_zero_running": true,
+    "B2_idle_conditions_all_three": true,
+    "B3_final_one_initial_survived": true,
+    "B3_resources_returned": false,
+    "E2E_PASS": false
+  }
+]

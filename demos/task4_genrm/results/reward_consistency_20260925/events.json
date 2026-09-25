@@ -1,0 +1,197 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "<qwen3-0.6b-checkpoint>",
+    "dataset": "<dapo-math-17k-dataset>",
+    "out_dir": "demos/task4_genrm/results/reward_consistency_20260925"
+  },
+  {
+    "t": 14.488,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 16.182,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 27.557,
+    "event": "serve_run",
+    "url": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 70.044,
+    "event": "phase0_engines",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 70.073,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-e870ea64-00b4-4f0f-a69f-5169fc33a5c8",
+    "status": "PENDING"
+  },
+  {
+    "t": 70.086,
+    "event": "scale_out_status",
+    "status": "CREATING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 110.616,
+    "event": "scale_out_status",
+    "status": "HEALTH_CHECKING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 111.629,
+    "event": "scale_out_status",
+    "status": "ACTIVE",
+    "current": 2,
+    "ready": 2
+  },
+  {
+    "t": 111.63,
+    "event": "scale_out_final",
+    "status": "ACTIVE",
+    "current": 2,
+    "transitions": [
+      "CREATING",
+      "HEALTH_CHECKING",
+      "ACTIVE"
+    ]
+  },
+  {
+    "t": 111.645,
+    "event": "phase1_engines",
+    "initial": [
+      [
+        "node-0",
+        16000
+      ]
+    ],
+    "elastic": [
+      "node-0",
+      16001
+    ]
+  },
+  {
+    "t": 111.646,
+    "event": "inputs_loaded",
+    "cases": 50,
+    "positives": 25
+  },
+  {
+    "t": 135.5,
+    "event": "arm_greedy_done",
+    "replies": 400
+  },
+  {
+    "t": 158.509,
+    "event": "arm_official_done",
+    "replies": 400
+  },
+  {
+    "t": 158.558,
+    "event": "verdicts",
+    "attribution_covers_both_engines": true,
+    "attribution_failures": [],
+    "all_replies_complete": true,
+    "no_truncated_replies": true,
+    "truncated_count": 0,
+    "parse_gate_independent": true,
+    "parse_gate_failures": [],
+    "greedy_verdicts_identical_across_engines": true,
+    "greedy_mismatches": [],
+    "official_sampling_instability_rate": 0.04,
+    "official_sampling_unstable_cases": [
+      {
+        "case": "neg-33",
+        "initial": 0,
+        "elastic": "mixed"
+      },
+      {
+        "case": "pos-48",
+        "initial": 1,
+        "elastic": "mixed"
+      }
+    ],
+    "judge_correctness_initial": {
+      "1": 45,
+      "0": 50
+    },
+    "judge_correctness_elastic": {
+      "1": 44,
+      "0": 49
+    },
+    "cases": 50,
+    "replies_total": 800,
+    "initial_engine": "node-0:16000",
+    "elastic_engine": "node-0:16001",
+    "E2E_PASS": true
+  },
+  {
+    "t": 158.582,
+    "event": "scale_in_submitted",
+    "request_id": "genrm-scale-8c91aada-75c0-48c5-935f-522d2391c0f8",
+    "status": "PENDING"
+  },
+  {
+    "t": 158.594,
+    "event": "scale_in_status",
+    "status": "DRAINING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 159.606,
+    "event": "scale_in_status",
+    "status": "COMPLETED",
+    "current": 1,
+    "ready": 1
+  },
+  {
+    "t": 159.606,
+    "event": "scale_in_final",
+    "status": "COMPLETED",
+    "current": 1,
+    "transitions": [
+      "DRAINING",
+      "COMPLETED"
+    ]
+  },
+  {
+    "t": 159.621,
+    "event": "phase2_engines",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 169.1,
+    "event": "cleanup_result",
+    "cleanup_pass": true,
+    "cleanup_errors": [],
+    "leftover_ray_free_gpus": 3.0
+  },
+  {
+    "t": 169.1,
+    "event": "e2e_done",
+    "functional_pass": true,
+    "cleanup_pass": true
+  }
+]

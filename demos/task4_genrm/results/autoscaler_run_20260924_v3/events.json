@@ -1,0 +1,65 @@
+[
+  {
+    "t": 19.393,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 34.477,
+    "event": "deployed",
+    "genrm": "http://127.0.0.1:8000/genrm",
+    "autoscaler": "http://127.0.0.1:8000/autoscaler_genrm"
+  },
+  {
+    "t": 73.939,
+    "event": "initial_engine_up"
+  },
+  {
+    "t": 74.116,
+    "event": "autoscaler_started"
+  },
+  {
+    "t": 74.151,
+    "event": "autoscaler_cooldowns_patched",
+    "scale_in": 60.0,
+    "scale_out": 20.0
+  },
+  {
+    "t": 74.601,
+    "event": "load_started",
+    "workers": 48
+  },
+  {
+    "t": 94.786,
+    "event": "phase_low_done",
+    "current": 1,
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 153.6,
+    "event": "phase_high_result",
+    "scaled_out": true
+  },
+  {
+    "t": 214.163,
+    "event": "phase_steady_done",
+    "elastic_served": 516
+  },
+  {
+    "t": 214.18,
+    "event": "phase_low_prime_result",
+    "scaled_in": true
+  },
+  {
+    "t": 224.703,
+    "event": "load_stopped",
+    "total": 3202,
+    "failed": 0,
+    "failures": []
+  }
+]

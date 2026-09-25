@@ -12,7 +12,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from relax.utils.logging_utils import get_logger
 
@@ -28,6 +28,55 @@ class HistogramQuantile(NamedTuple):
 
     value: float
     overflow: bool
+
+
+@dataclass
+class MetricFieldValidity:
+    """Per-field observation metadata for one engine metrics snapshot.
+
+    A field is *valid* for condition evaluation when it was present in the
+    scraped series and carries at least one sample; gauges report
+    ``sample_count=1`` when present, histogram-derived fields report the
+    histogram's ``_count`` (so an exposed-but-sampleless histogram is invalid,
+    matching "histogram 无样本不参与条件判断"). ``observed_at`` enables
+    staleness checks via ``EngineMetrics.is_field_valid(max_age_secs=...)``.
+    """
+
+    present: bool = False
+    observed_at: Optional[float] = None
+    sample_count: int = 0
+
+
+# EngineMetrics field name -> Prometheus gauge series it is read from.
+_GAUGE_FIELD_SOURCES: Dict[str, str] = {
+    "token_usage": "sglang:token_usage",
+    "num_queue_reqs": "sglang:num_queue_reqs",
+    "num_running_reqs": "sglang:num_running_reqs",
+    "gen_throughput": "sglang:gen_throughput",
+    "max_total_num_tokens": "sglang:max_total_num_tokens",
+    "num_used_tokens": "sglang:num_used_tokens",
+    "num_prefill_prealloc_queue_reqs": "sglang:num_prefill_prealloc_queue_reqs",
+    "num_prefill_inflight_queue_reqs": "sglang:num_prefill_inflight_queue_reqs",
+    "num_decode_prealloc_queue_reqs": "sglang:num_decode_prealloc_queue_reqs",
+    "num_decode_transfer_queue_reqs": "sglang:num_decode_transfer_queue_reqs",
+}
+
+# EngineMetrics field name -> histogram _count series backing its quantile.
+_HISTOGRAM_FIELD_SOURCES: Dict[str, str] = {
+    "queue_time_p95": "sglang:queue_time_seconds_count",
+    "ttft_p95": "sglang:time_to_first_token_seconds_count",
+    "itl_p95": "sglang:inter_token_latency_seconds_count",
+    "e2e_latency_p95": "sglang:e2e_request_latency_seconds_count",
+}
+
+_ALL_VALIDITY_FIELDS = tuple(_GAUGE_FIELD_SOURCES) + tuple(_HISTOGRAM_FIELD_SOURCES)
+
+# Fields whose series are REQUIRED before an engine may be judged idle/low-load
+# by the scale-in decision path: they back avg_token_usage / total_queue_reqs /
+# throughput_variance, the three scale-in conditions. A scrape that answers
+# HTTP 200 but omits any of these series leaves the engine "unknown" -- its
+# zero-filled values are placeholders, never evidence of idleness.
+CRITICAL_METRICS_FIELDS: Tuple[str, ...] = ("token_usage", "num_queue_reqs", "gen_throughput")
 
 
 @dataclass
@@ -89,6 +138,52 @@ class EngineMetrics:
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
 
+    # Per-field observation metadata (Task 4): which fields were actually
+    # present in the scraped series. Empty for legacy constructions, in which
+    # case ``is_field_valid`` conservatively returns True so existing
+    # consumers see unchanged behavior.
+    field_validity: Dict[str, MetricFieldValidity] = field(default_factory=dict)
+
+    def is_field_valid(self, field: str, max_age_secs: Optional[float] = None) -> bool:
+        """Whether ``field`` was observed and may drive condition evaluation.
+
+        A field is invalid when it was missing from the scrape or its
+        histogram carried no samples; with ``max_age_secs`` it is also invalid
+        when observed too long before this snapshot's ``timestamp``. Fields
+        without a validity record (legacy construction) stay valid.
+
+        Args:
+            field: EngineMetrics field name (e.g. "ttft_p95", "token_usage").
+            max_age_secs: Optional staleness bound relative to ``self.timestamp``.
+
+        Returns:
+            True if the field is valid for evaluation.
+        """
+        validity = self.field_validity.get(field)
+        if validity is None:
+            return True
+        if not validity.present or validity.sample_count <= 0:
+            return False
+        if max_age_secs is not None and validity.observed_at is not None:
+            if self.timestamp - validity.observed_at > max_age_secs:
+                return False
+        return True
+
+    def has_critical_metrics(self) -> bool:
+        """Whether every critical field was validly observed for this engine.
+
+        Critical fields (``CRITICAL_METRICS_FIELDS``) are the series the
+        scale-in (idle/low-load) decision path consumes. An engine answering
+        HTTP 200 but missing one of them is "unknown": its zero-filled values
+        must not be read as real idleness. Legacy constructions without
+        ``field_validity`` count as complete so existing consumers keep their
+        behavior.
+
+        Returns:
+            True if all critical fields are valid for condition evaluation.
+        """
+        return all(self.is_field_valid(name) for name in CRITICAL_METRICS_FIELDS)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
@@ -113,6 +208,10 @@ class EngineMetrics:
             "num_prefill_inflight_queue_reqs": self.num_prefill_inflight_queue_reqs,
             "num_decode_prealloc_queue_reqs": self.num_decode_prealloc_queue_reqs,
             "num_decode_transfer_queue_reqs": self.num_decode_transfer_queue_reqs,
+            "field_validity": {
+                name: {"present": v.present, "observed_at": v.observed_at, "sample_count": v.sample_count}
+                for name, v in self.field_validity.items()
+            },
         }
 
 
@@ -139,6 +238,11 @@ class AggregatedMetrics:
         coverage: Fraction of active engines that successfully reported metrics
             (num_reporting / num_active_candidates), in [0.0, 1.0]. Used by the
             decision engine to gate scaling when metrics are only partially available.
+        unknown_engines: Engines that answered HTTP 200 but were missing at
+            least one critical series (token usage / queue depth / throughput).
+            Their zero-filled values are excluded from the load aggregates and
+            the decision engine must treat them as "unknown" -- never as idle --
+            when judging scale-in.
         timestamp: Unix timestamp of aggregation.
     """
 
@@ -160,6 +264,14 @@ class AggregatedMetrics:
     is_empty: bool = False
     coverage: float = 1.0
     timestamp: float = field(default_factory=time.time)
+    # Fraction of reporting engines for which each field was validly observed
+    # (present + sampled). Lets consumers distinguish "field says 0" from
+    # "field was never exposed" without changing the numeric aggregation.
+    field_coverage: Dict[str, float] = field(default_factory=dict)
+    # Engines whose scrape answered HTTP 200 but missed at least one critical
+    # series. Excluded from the load aggregates above; the decision engine
+    # freezes scale-in while this list is non-empty (missing != idle).
+    unknown_engines: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -178,6 +290,8 @@ class AggregatedMetrics:
             "max_itl_p95_overflow": self.max_itl_p95_overflow,
             "is_empty": self.is_empty,
             "coverage": self.coverage,
+            "field_coverage": dict(self.field_coverage),
+            "unknown_engines": list(self.unknown_engines),
             "timestamp": self.timestamp,
         }
 
@@ -418,13 +532,13 @@ class MetricsCollector:
                 raw_metrics = parse_prometheus_metrics(text)
 
                 # Debug log key metrics for troubleshooting
+                token_usage_raw = raw_metrics.get("sglang:token_usage")
+                token_usage_repr = f"{token_usage_raw:.3f}" if token_usage_raw is not None else "N/A"
                 logger.debug(
                     f"Collected metrics from {engine_id}: "
                     f"num_running_reqs={raw_metrics.get('sglang:num_running_reqs', 'N/A')}, "
                     f"num_queue_reqs={raw_metrics.get('sglang:num_queue_reqs', 'N/A')}, "
-                    f"token_usage={raw_metrics.get('sglang:token_usage', 'N/A'):.3f}"
-                    if "sglang:token_usage" in raw_metrics
-                    else "token_usage=N/A"
+                    f"token_usage={token_usage_repr}"
                 )
 
                 # Extract histogram quantiles (structured: value + overflow flag)
@@ -453,10 +567,32 @@ class MetricsCollector:
                     "sglang:e2e_request_latency_seconds_count",
                 )
 
+                # Per-field validity: gauges are valid when their series was
+                # present; histogram quantiles additionally require samples
+                # (count > 0). Values above keep their legacy zero-fill for
+                # backward compatibility; validity tells consumers which
+                # zeros are real.
+                timestamp = time.time()
+                field_validity: Dict[str, MetricFieldValidity] = {
+                    name: MetricFieldValidity(
+                        present=series in raw_metrics,
+                        observed_at=timestamp,
+                        sample_count=1 if series in raw_metrics else 0,
+                    )
+                    for name, series in _GAUGE_FIELD_SOURCES.items()
+                }
+                for name, count_series in _HISTOGRAM_FIELD_SOURCES.items():
+                    count = int(raw_metrics.get(count_series, 0))
+                    field_validity[name] = MetricFieldValidity(
+                        present=count_series in raw_metrics,
+                        observed_at=timestamp,
+                        sample_count=count,
+                    )
+
                 return EngineMetrics(
                     engine_url=engine_url,
                     engine_id=engine_id,
-                    timestamp=time.time(),
+                    timestamp=timestamp,
                     token_usage=raw_metrics.get("sglang:token_usage", 0.0),
                     num_queue_reqs=int(raw_metrics.get("sglang:num_queue_reqs", 0)),
                     num_running_reqs=int(raw_metrics.get("sglang:num_running_reqs", 0)),
@@ -475,6 +611,7 @@ class MetricsCollector:
                     num_prefill_inflight_queue_reqs=int(raw_metrics.get("sglang:num_prefill_inflight_queue_reqs", 0)),
                     num_decode_prealloc_queue_reqs=int(raw_metrics.get("sglang:num_decode_prealloc_queue_reqs", 0)),
                     num_decode_transfer_queue_reqs=int(raw_metrics.get("sglang:num_decode_transfer_queue_reqs", 0)),
+                    field_validity=field_validity,
                 )
 
         except asyncio.TimeoutError:
@@ -553,12 +690,30 @@ class MetricsCollector:
         if not latest:
             return AggregatedMetrics(is_empty=True, coverage=0.0)
 
-        # Aggregate across engines
+        # Aggregate across engines.
         num_engines = len(latest)
-        total_queue = sum(m.num_queue_reqs for m in latest.values())
-        total_running = sum(m.num_running_reqs for m in latest.values())
-        total_throughput = sum(m.gen_throughput for m in latest.values())
-        avg_token_usage = sum(m.token_usage for m in latest.values()) / num_engines if num_engines > 0 else 0.0
+
+        # Engines whose scrape was missing a critical series are "unknown":
+        # their zero-filled token_usage / queue / throughput values are missing
+        # data, not real idleness, so they are excluded from every load
+        # aggregate the scale-in (idle/low-load) decision path consumes.
+        unknown_engines = [engine_id for engine_id, m in latest.items() if not m.has_critical_metrics()]
+        known_metrics = [m for m in latest.values() if m.has_critical_metrics()]
+
+        # Aggregation denominators (capacity-ratio semantics):
+        # - avg_token_usage divides by the number of KNOWN engines only, so a
+        #   missing (zero-filled) series cannot drag the mean down and fake
+        #   "low load". When every engine is known this equals the legacy
+        #   num_engines denominator, so the healthy path is unchanged.
+        # - Load totals (queue/running/throughput) sum KNOWN engines only: an
+        #   unknown engine contributes no evidence in either direction.
+        # - num_engines and coverage keep their legacy meaning (reporting
+        #   engines over active candidates), so scale-out gates such as
+        #   queue_backlog's per-engine denominator are unchanged.
+        total_queue = sum(m.num_queue_reqs for m in known_metrics)
+        total_running = sum(m.num_running_reqs for m in known_metrics)
+        total_throughput = sum(m.gen_throughput for m in known_metrics)
+        avg_token_usage = sum(m.token_usage for m in known_metrics) / len(known_metrics) if known_metrics else 0.0
 
         # Compute max P95 latencies
         all_queue_times = [m.queue_time_p95 for m in latest.values() if m.queue_time_p95 > 0]
@@ -577,7 +732,13 @@ class MetricsCollector:
         # Compute throughput variance over time window
         throughput_variance = 0.0
         if len(self._history) >= 3:
-            throughputs = [sum(m.gen_throughput for m in h["metrics"].values()) for h in list(self._history)[-10:]]
+            # Same known-engine scope as total_throughput: a frame where an
+            # engine's critical series went missing must not inject a fake
+            # 0 tok/s sample into the variance window.
+            throughputs = [
+                sum(m.gen_throughput for m in h["metrics"].values() if m.has_critical_metrics())
+                for h in list(self._history)[-10:]
+            ]
             if throughputs:
                 mean_t = sum(throughputs) / len(throughputs)
                 if mean_t > 0:
@@ -589,6 +750,16 @@ class MetricsCollector:
             coverage = min(1.0, num_engines / num_candidates)
         else:
             coverage = 1.0
+
+        # Per-field coverage: fraction of reporting engines whose field was
+        # validly observed (present + sampled). Numeric aggregation above is
+        # intentionally unchanged; this only annotates which zeros are real.
+        field_coverage: Dict[str, float] = {}
+        if num_engines > 0:
+            field_coverage = {
+                field_name: sum(1 for m in latest.values() if m.is_field_valid(field_name)) / num_engines
+                for field_name in _ALL_VALIDITY_FIELDS
+            }
 
         return AggregatedMetrics(
             num_engines=num_engines,
@@ -605,6 +776,8 @@ class MetricsCollector:
             max_itl_p95_overflow=max_itl_p95_overflow,
             is_empty=False,
             coverage=coverage,
+            field_coverage=field_coverage,
+            unknown_engines=unknown_engines,
             timestamp=time.time(),
         )
 

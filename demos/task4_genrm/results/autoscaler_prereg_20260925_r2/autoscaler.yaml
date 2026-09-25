@@ -1,0 +1,30 @@
+condition_window_secs: 30.0
+enabled: true
+evaluation_interval_secs: 5.0
+max_engines: 2
+metrics_interval_secs: 3.0
+min_coverage_scale_in: 1.0
+min_coverage_scale_out: 0.5
+min_engines: 1
+scale_in_cooldown_secs: 60.0
+scale_out_cooldown_secs: 20.0
+service_policies:
+  genrm:
+    max_engines: 2
+    min_engines: 1
+    scale_in_policy:
+      condition_duration_secs: 45.0
+      max_delta: 1
+      projected_usage_max: 0.9
+      queue_depth_threshold: 0
+      throughput_variance_threshold: 1.0
+      token_usage_threshold: 0.05
+    scale_out_policy:
+      condition_duration_secs: 15.0
+      max_delta: 1
+      queue_depth_per_engine: 4
+      queue_time_p95_threshold: 3.0
+      token_usage_threshold: 0.3
+      ttft_p95_threshold: 3.0
+service_targets:
+  genrm: http://127.0.0.1:8000/genrm

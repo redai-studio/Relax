@@ -1,0 +1,1556 @@
+[
+  {
+    "t": 1790315766.422,
+    "event": "monitor_start",
+    "job_log": "/tmp/ray/session_latest/logs/job-driver-raysubmit_HeLEsxfc5fpGNfLA.log",
+    "genrm": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 1790315766.439,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315768.444,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315770.449,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315772.453,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315774.458,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315776.463,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315778.468,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315780.474,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315782.478,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315784.483,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315786.488,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315788.493,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315790.496,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315792.5,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315794.505,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315796.51,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315798.53,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315800.577,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315802.583,
+    "event": "engines_snapshot_failed",
+    "error": "HTTPError: 404 Client Error: Not Found for url: http://127.0.0.1:8000/genrm/engines"
+  },
+  {
+    "t": 1790315864.643,
+    "event": "engines_snapshot_failed",
+    "error": "ReadTimeout: HTTPConnectionPool(host='127.0.0.1', port=8000): Read timed out. (read timeout=60)"
+  },
+  {
+    "t": 1790315876.025,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315876.03,
+    "event": "baseline_engines",
+    "ids": [
+      [
+        "node-0",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 1790315878.043,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315880.058,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315882.074,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315884.091,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315886.109,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315888.125,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315890.142,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315892.166,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315894.182,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315896.031,
+    "event": "first_step_seen"
+  },
+  {
+    "t": 1790315896.058,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-82e09de5-c0ac-4cc6-8932-fc7e501a826e"
+  },
+  {
+    "t": 1790315896.2,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315898.216,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315900.231,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315902.247,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315904.264,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315906.279,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315908.292,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315910.308,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315912.322,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315914.337,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315916.35,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315918.366,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315920.38,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315922.395,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315924.413,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315926.429,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315928.444,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315930.459,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315932.473,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315934.491,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315936.508,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315938.525,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315940.541,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315942.557,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315944.573,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315946.592,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315948.607,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315950.624,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 0
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315951.742,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 1790315952.641,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315954.657,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315956.676,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315958.692,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315960.709,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315962.73,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315964.745,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315966.764,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315968.784,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315970.811,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315972.828,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315974.846,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315976.864,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315978.881,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315980.898,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315982.912,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315984.93,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315986.947,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315988.964,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 0
+    }
+  },
+  {
+    "t": 1790315990.982,
+    "event": "engines_snapshot",
+    "current": 2,
+    "served": {
+      "node-0:16000": 1,
+      "node-0:16001": 0
+    },
+    "inflight": {
+      "node-0:16000": 0,
+      "node-0:16001": 1
+    }
+  },
+  {
+    "t": 1790315991.862,
+    "event": "elastic_served_check",
+    "served": {
+      "node-0:16001": 1
+    }
+  },
+  {
+    "t": 1790315991.884,
+    "event": "scale_in_submitted",
+    "request_id": "genrm-scale-e5e7eaaa-1c67-472c-bb02-cb6dba015ef9"
+  },
+  {
+    "t": 1790315992.91,
+    "event": "scale_in_final",
+    "status": "COMPLETED"
+  },
+  {
+    "t": 1790315992.998,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315995.016,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315997.031,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790315999.048,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316001.067,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316003.084,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316005.101,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316007.118,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316009.135,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316011.152,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316013.17,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316015.186,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316017.202,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316019.217,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316021.232,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316023.249,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316025.266,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316027.283,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316029.299,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316031.316,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316033.332,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 2
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316035.347,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 3
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316037.364,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 4
+    },
+    "inflight": {
+      "node-0:16000": 2
+    }
+  },
+  {
+    "t": 1790316039.381,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316041.398,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316043.414,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316045.432,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316047.448,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316049.463,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316051.48,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316053.498,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316055.516,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316057.533,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316059.547,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 6
+    },
+    "inflight": {
+      "node-0:16000": 2
+    }
+  },
+  {
+    "t": 1790316061.568,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316063.59,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316065.609,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316067.626,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316069.644,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316071.662,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316073.679,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316075.698,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316077.715,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316079.732,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316081.751,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 8
+    },
+    "inflight": {
+      "node-0:16000": 1
+    }
+  },
+  {
+    "t": 1790316083.769,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316085.785,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316087.802,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316089.819,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316091.837,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316093.856,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316095.875,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316097.892,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316099.91,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316101.927,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316103.943,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316105.96,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316107.976,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316109.996,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316112.013,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316114.029,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316116.047,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316118.067,
+    "event": "engines_snapshot",
+    "current": 1,
+    "served": {
+      "node-0:16000": 9
+    },
+    "inflight": {
+      "node-0:16000": 0
+    }
+  },
+  {
+    "t": 1790316120.07,
+    "event": "engines_snapshot_failed",
+    "error": "ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8000): Max retries exceeded with url: /genrm/engines (Caused "
+  },
+  {
+    "t": 1790316122.072,
+    "event": "engines_snapshot_failed",
+    "error": "ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8000): Max retries exceeded with url: /genrm/engines (Caused "
+  },
+  {
+    "t": 1790316124.075,
+    "event": "engines_snapshot_failed",
+    "error": "ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8000): Max retries exceeded with url: /genrm/engines (Caused "
+  },
+  {
+    "t": 1790316125.922,
+    "event": "final_engines_unavailable",
+    "error": "ConnectionError: HTTPConnectionPool(host='127.0.0.1', port=8000): Max retries exceeded with url: /genrm/engines (Caused "
+  },
+  {
+    "t": 1790316125.923,
+    "event": "verdicts",
+    "final_engines_from_last_snapshot": true,
+    "scale_out_active": true,
+    "scale_in_completed": true,
+    "elastic_engine_served_rewards": true,
+    "train_events_during_scaling_window": true,
+    "no_train_stall_over_120s": true,
+    "training_finished_after_scale_in": true,
+    "final_capacity_is_initial": true,
+    "rollout_count": 16,
+    "num_rollout_expected": 8,
+    "all_rollouts_landed": true,
+    "E2E_PASS": true
+  }
+]
