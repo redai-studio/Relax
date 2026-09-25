@@ -4,12 +4,14 @@
 
 import json
 import socket
+import threading
 import time
 from typing import Any, List
 
 import pytest
 
 import relax.utils.straggler as straggler
+from relax.utils.straggler.collector import TimingCollector
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.identity import RuntimeIdentity
 from relax.utils.straggler.runtime import StragglerRuntime
@@ -178,6 +180,11 @@ def test_status_is_json_serialisable() -> None:
         runtime.close()
 
 
+def run_dir(tmp_path: Any) -> Any:
+    """The run-scoped directory shared by every rank of one run."""
+    return tmp_path / "run_run-1"
+
+
 def test_close_persists_the_runtime_and_collector_counters(tmp_path: Any) -> None:
     """The acceptance protocol reads these counters; close must write them."""
     runtime = StragglerRuntime(make_config(output_dir=str(tmp_path)), identity=identity(0), register_atexit=False)
@@ -185,8 +192,8 @@ def test_close_persists_the_runtime_and_collector_counters(tmp_path: Any) -> Non
     run_intervals(runtime, count=2)
     runtime.close()
 
-    collector_status = json.loads((tmp_path / "collector_status.json").read_text())
-    runtime_status = json.loads((tmp_path / "runtime_status.json").read_text())
+    collector_status = json.loads((run_dir(tmp_path) / "collector_status.json").read_text())
+    runtime_status = json.loads((run_dir(tmp_path) / "runtime_status.json").read_text())
 
     assert collector_status["envelopes"] == 2
     assert runtime_status["collector"]["envelopes"] == 2
@@ -210,11 +217,99 @@ def test_status_files_are_written_without_a_graceful_close(tmp_path: Any) -> Non
     run_intervals(runtime, count=1)
 
     deadline = time.time() + 5.0
-    while time.time() < deadline and not (tmp_path / "collector_status.json").exists():
+    while time.time() < deadline and not (run_dir(tmp_path) / "collector_status.json").exists():
         time.sleep(0.05)
 
-    assert (tmp_path / "collector_status.json").exists()
-    assert (tmp_path / "runtime_status.json").exists()
+    assert (run_dir(tmp_path) / "collector_status.json").exists()
+    assert (run_dir(tmp_path) / "runtime_status.json").exists()
+    runtime.close()
+
+
+def test_periodic_writer_flushes_the_jsonl_without_a_close(tmp_path: Any) -> None:
+    """The buffered envelopes must reach disk while the run is alive.
+
+    A real ON arm held ``envelopes=132`` in the log and left a zero-byte
+    ``straggler_envelopes.jsonl``, because only ``close()`` flushed and Ray
+    SIGTERMs the actor. The writer thread must flush periodically instead.
+    """
+    runtime = StragglerRuntime(
+        make_config(output_dir=str(tmp_path), report_interval_seconds=0.1),
+        identity=identity(0),
+        register_atexit=False,
+    )
+    runtime.start()
+    run_intervals(runtime, count=2)
+
+    envelopes = run_dir(tmp_path) / "straggler_envelopes.jsonl"
+    deadline = time.time() + 5.0
+    while time.time() < deadline and (not envelopes.exists() or envelopes.stat().st_size == 0):
+        time.sleep(0.05)
+
+    lines = [json.loads(line) for line in envelopes.read_text().splitlines() if line.strip()]
+    assert len(lines) >= 2
+    runtime.close()
+
+
+def test_output_paths_are_run_scoped_and_per_rank(tmp_path: Any) -> None:
+    """Four ranks share one output dir, so no two may write the same file."""
+    runtimes = [
+        StragglerRuntime(make_config(output_dir=str(tmp_path)), identity=identity(rank), register_atexit=False)
+        for rank in (0, 1, 2, 3)
+    ]
+    for runtime in runtimes:
+        runtime.start()
+    for runtime in runtimes:
+        runtime.close()
+
+    status_files = sorted(path.name for path in run_dir(tmp_path).glob("runtime_status_*.json"))
+    assert len(status_files) == 4
+    assert len(set(status_files)) == 4
+    # The unsuffixed names analyze_run.py reads exist once and belong to the
+    # only rank that owns a collector.
+    collector = json.loads((run_dir(tmp_path) / "collector_status.json").read_text())
+    assert collector["identity"].startswith("rank0/")
+    # Every rank scoped its own counters under the same run directory.
+    assert len(list(tmp_path.glob("run_run-1/runtime_status_rank*.json"))) == 4
+
+
+def test_status_writer_never_touches_a_file_on_the_training_thread(tmp_path: Any, monkeypatch: Any) -> None:
+    """The flush/write work must stay on the daemon writer thread."""
+    main_ident = threading.get_ident()
+    writers: List[int] = []
+    flushers: List[int] = []
+    original_write = StragglerRuntime._write_status
+    original_flush = TimingCollector.flush
+
+    def spy_write(self: Any) -> None:
+        writers.append(threading.get_ident())
+        original_write(self)
+
+    def spy_flush(self: Any) -> Any:
+        flushers.append(threading.get_ident())
+        return original_flush(self)
+
+    monkeypatch.setattr(StragglerRuntime, "_write_status", spy_write)
+    monkeypatch.setattr(TimingCollector, "flush", spy_flush)
+
+    runtime = StragglerRuntime(
+        make_config(output_dir=str(tmp_path), report_interval_seconds=0.1),
+        identity=identity(0),
+        register_atexit=False,
+    )
+    runtime.start()
+    run_intervals(runtime, count=1)
+    # The training-thread accessors must not persist anything themselves.
+    runtime.summary()
+    runtime.status()
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not writers:
+        time.sleep(0.05)
+
+    assert writers, "the periodic writer never ran"
+    assert flushers, "the periodic writer never flushed"
+    assert main_ident not in writers, "status was written on the training thread"
+    assert main_ident not in flushers, "the collector was flushed on the training thread"
     runtime.close()
 
 
@@ -239,7 +334,7 @@ def test_close_persists_the_sender_side_counters(tmp_path: Any) -> None:
         sender_runtime.close()
         collector_runtime.close()
 
-    runtime_status = json.loads((tmp_path / "runtime_status.json").read_text())
+    runtime_status = json.loads(next(run_dir(tmp_path).glob("runtime_status_rank1*.json")).read_text())
     assert runtime_status["role"] == "sender"
     assert "sender" in runtime_status
     assert runtime_status["observer"]["intervals"] == 2

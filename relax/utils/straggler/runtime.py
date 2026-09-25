@@ -18,8 +18,10 @@ timers and the training backend keeps Megatron's ``config.timers = None``.
 import atexit
 import json
 import os
+import re
 import sys
 import threading
+from dataclasses import replace
 from typing import Any, Callable, Dict, Optional
 
 from relax.utils.logging_utils import get_logger
@@ -37,6 +39,11 @@ logger = get_logger(__name__)
 #: when the process is killed without a graceful ``close()`` (Ray SIGTERMs the
 #: actors at job end, and atexit does not run for a signal death).
 STATUS_WRITE_MAX_INTERVAL_S = 10.0
+
+
+def _sanitise(value: Any) -> str:
+    """Turn a run id or identity label into one safe path component."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_") or "unknown"
 
 
 class StragglerRuntime:
@@ -158,22 +165,47 @@ class StragglerRuntime:
             self._status_thread = None
 
     def _status_writer_loop(self, interval: float) -> None:
-        """Write the status files every ``interval`` seconds until stopped."""
+        """Flush the collector and write the status files every ``interval``.
+
+        Flushing here rather than only in ``close()`` is what makes the JSONL
+        durable while the run is alive: Ray SIGTERMs the actor at job end, so
+        ``close()`` never runs and a completed ON arm kept ``envelopes=132`` in
+        the log while ``straggler_envelopes.jsonl`` stayed at zero bytes. This
+        is a daemon thread, so the I/O stays off the training thread, and the
+        collector's pending buffers are already bounded with counted drops.
+        """
         while not self._status_stop.wait(interval):
             try:
+                if self._collector is not None:
+                    self._collector.flush()
                 self._write_status()
             except Exception:
                 self._errors += 1
+
+    def _run_dir(self) -> str:
+        """Run-scoped output directory shared by every rank of one run.
+
+        The launcher gives each arm its own base directory and the run id (the
+        Ray job id) makes the scope unique even if two arms ever shared a base,
+        so two runs' JSONL streams can never interleave.
+        """
+        return os.path.join(self._config.output_dir, f"run_{_sanitise(self._identity.run_id)}")
+
+    def _collector_config(self) -> StragglerConfig:
+        """Point the collector's persistence at this run's scoped directory."""
+        if not self._config.output_dir:
+            return self._config
+        return replace(self._config, output_dir=self._run_dir())
 
     def _build_sink(self) -> Optional[Callable[[TimingEnvelope], None]]:
         """Return the callable that receives each read-back envelope."""
         address = self._config.collector_addr
         if not address:
-            self._collector = TimingCollector(self._config, self._identity)
+            self._collector = TimingCollector(self._collector_config(), self._identity)
             return self._collector.ingest
         parse_address(address)  # validate early so a typo is reported, not guessed
         if self._identity.rank == 0:
-            self._collector = TimingCollector(self._config, self._identity)
+            self._collector = TimingCollector(self._collector_config(), self._identity)
             self._receiver = EnvelopeReceiver(address, self._ingest_payload)
             self._receiver.start()
             return self._collector.ingest
@@ -235,24 +267,41 @@ class StragglerRuntime:
         return self._collector.drain_verdicts()
 
     def _write_status(self) -> None:
-        """Persist the component counters next to the JSONL streams.
+        """Persist the component counters inside this run's scoped directory.
 
-        The acceptance protocol reads observer/sender/collector counters and
-        ``analyze_run.py`` already expects ``collector_status.json``, but no
-        code wrote either file. Fail-open: a write error is counted, never
-        raised into training. Runs at shutdown (after the readout threads have
-        stopped), never on the training thread.
+        Every rank writes its own ``runtime_status_<label>.json``; the
+        unsuffixed ``collector_status.json`` / ``runtime_status.json`` that
+        ``analyze_run.py`` reads are written only by the collector, because all
+        ranks share one run directory and four writers racing on one filename
+        would leave an arbitrary rank's counters behind. Fail-open: a write
+        error is counted, never raised into training. Called from the status
+        writer thread and from ``close()``, never from the training path.
         """
-        output_dir = self._config.output_dir
-        if not output_dir:
+        if not self._config.output_dir:
             return
-        os.makedirs(output_dir, exist_ok=True)
+        run_dir = self._run_dir()
+        os.makedirs(run_dir, exist_ok=True)
         status = self.status()
-        with open(os.path.join(output_dir, "runtime_status.json"), "w") as handle:
-            json.dump(status, handle, indent=2, sort_keys=True, default=str)
-        if "collector" in status:
-            with open(os.path.join(output_dir, "collector_status.json"), "w") as handle:
-                json.dump(status["collector"], handle, indent=2, sort_keys=True, default=str)
+        label = _sanitise(self._identity.label)
+        self._write_json(run_dir, f"runtime_status_{label}.json", status)
+        # Exactly one writer for the unsuffixed names analyze_run.py reads: the
+        # reference rank. With a collector address that rank owns the shared
+        # collector; in rank-local mode every rank owns one, so gating on rank 0
+        # is what stops four writers racing on one filename.
+        if self._identity.rank == 0:
+            self._write_json(run_dir, "runtime_status.json", status)
+            if "collector" in status:
+                self._write_json(run_dir, f"collector_status_{label}.json", status["collector"])
+                self._write_json(run_dir, "collector_status.json", status["collector"])
+
+    @staticmethod
+    def _write_json(output_dir: str, name: str, payload: Any) -> None:
+        """Atomically enough for evidence: write, then rename into place."""
+        final = os.path.join(output_dir, name)
+        temp = f"{final}.tmp"
+        with open(temp, "w") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+        os.replace(temp, final)
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop reading, flush the windows and close the transport;
