@@ -194,6 +194,10 @@ class GenRMScaleOperation:
             "idempotency_key": self.idempotency_key,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            # Submit-time capacity observation: the honest last-known fallback
+            # when a terminal snapshot has no capacity reading (watcher crash).
+            "observed_current": self.observed_current,
+            "observed_ready": self.observed_ready,
             "current": self.current,
             "ready": self.ready,
             "created": self.created,
@@ -230,6 +234,13 @@ class GenRMScaleRegistry:
         self._operations: Dict[str, GenRMScaleOperation] = {}
         # model_name -> protected lower bound (initial engine count).
         self._initial_capacity: Dict[str, int] = {}
+        # Bounded history for a long-running control plane: clean terminal
+        # operations beyond ``max_history`` (oldest first) and idempotency
+        # records older than ``replay_window_secs`` are evicted. Dirty
+        # terminals (cleanup pending) and live operations are never evicted.
+        self.max_history = 1024
+        self.replay_window_secs = 24 * 3600.0
+        self.history_truncated = 0
 
     # ------------------------------------------------------------------
     # Configuration
@@ -427,7 +438,50 @@ class GenRMScaleRegistry:
                 failed,
                 cleanup_required,
             )
+            self._evict_bounded_history_locked()
             return op.to_dict()
+
+    def _evict_bounded_history_locked(self) -> None:
+        """Bound memory for a long-running control plane (caller holds lock).
+
+        Evicts, oldest first: clean terminal operations beyond ``max_history``
+        and idempotency records whose outcome is a clean terminal operation
+        older than ``replay_window_secs``. Live, PENDING and dirty-terminal
+        (cleanup_required) operations are never evicted; an idempotency key
+        whose operation was evicted replays as a fresh request, matching the
+        documented "records are kept for the process lifetime *of the bounded
+        history*" contract. ``history_truncated`` counts evicted operations.
+        """
+        self.history_truncated += self._evict_old_idempotency_locked()
+        terminal_clean = [
+            op
+            for op in self._operations.values()
+            if _is_status_terminal(op.direction, op.status) and not op.cleanup_required
+        ]
+        excess = len(terminal_clean) - self.max_history
+        if excess <= 0:
+            return
+        for op in sorted(terminal_clean, key=lambda o: o.updated_at)[:excess]:
+            self._operations.pop(op.request_id, None)
+            self.history_truncated += 1
+
+    def _evict_old_idempotency_locked(self) -> int:
+        """Drop replay records whose clean outcome aged out of the window."""
+        now = time.time()
+        evicted = 0
+        for key in list(self._idempotency.keys()):
+            record = self._idempotency[key]
+            request_id = record.request_id
+            if request_id is None:
+                continue  # recorded NOOP: cheap, keep
+            op = self._operations.get(request_id)
+            if op is None:
+                continue
+            if _is_status_terminal(op.direction, op.status) and not op.cleanup_required:
+                if now - op.updated_at > self.replay_window_secs:
+                    del self._idempotency[key]
+                    evicted += 1
+        return evicted
 
     def set_detail(self, request_id: str, detail: Optional[str]) -> None:
         """Attach an execution detail (e.g.

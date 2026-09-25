@@ -416,5 +416,75 @@ class TestReconcileDrainFence(unittest.TestCase):
         self.assertFalse(response.cleanup_required)
 
 
+class TestScaleSubmitCapacityContract(unittest.TestCase):
+    """Review findings: strict integer validation on the mutating request,
+    and fail-closed capacity on the scale path (never let a degraded
+    snapshot impersonate authoritative capacity)."""
+
+    def test_num_replicas_rejects_coercible_non_integers(self):
+        from pydantic import ValidationError
+
+        for bad in (True, "2", 2.0, 2.5):
+            with self.assertRaises(ValidationError):
+                _GenRMScaleRequest(num_replicas=bad)
+        # Plain ints still validate (gt=0).
+        self.assertEqual(_GenRMScaleRequest(num_replicas=3).num_replicas, 3)
+
+    def test_scale_submit_fails_closed_on_capacity_query_failure(self):
+        submits = []
+
+        def _capacity_remote():
+            raise TimeoutError("manager capacity query timed out")
+
+        def _hook_remote(request_id):
+            submits.append(request_id)
+            return None
+
+        manager = _fake_manager(
+            {
+                "get_engine_capacity": _capacity_remote,
+                "begin_scale_op": _hook_remote,
+                "execute_genrm_scale_out": _hook_remote,
+            }
+        )
+        replica = _replica(manager)
+        request = _GenRMScaleRequest(num_replicas=2)
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica._genrm_scale("scale_out", request))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(submits, [])
+
+    def test_readonly_engines_still_degrades_when_capacity_fails(self):
+        def _capacity_remote():
+            raise TimeoutError("manager capacity query timed out")
+
+        manager = _fake_manager({"get_engine_capacity": _capacity_remote})
+        replica = _replica(manager)
+        # Read-only /engines keeps its degraded snapshot, not an error.
+        engines = _run(replica.get_engines())
+        self.assertEqual(engines["current"], 1)
+        self.assertEqual(engines["ready"], 1)
+
+
+class TestWatcherCrashCapacity(unittest.TestCase):
+    """Review finding: a watcher crash must not zero-fill capacity -- the
+    registry keeps the last known snapshot instead of inventing zeros."""
+
+    def test_crash_finish_keeps_last_known_capacity(self):
+        manager = _fake_manager()
+        replica = _replica(manager)
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        # Watcher crashes with an empty progress payload.
+        replica._finish_scale_from_progress("scale_in", request_id, "FAILED", {})
+        status = replica._scale_registry.get_status("scale_in", request_id)
+        self.assertEqual(status["status"], "FAILED")
+        self.assertEqual(status["current"], 2)
+        self.assertEqual(status["ready"], 2)
+        self.assertTrue(status["cleanup_required"])
+
+
 if __name__ == "__main__":
     unittest.main()

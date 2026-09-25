@@ -94,7 +94,12 @@ class GenRMScaleRequest(BaseModel):
     """
 
     model_name: str = Field(default="default", description="GenRM instance (route key) to scale")
-    num_replicas: int = Field(..., gt=0, description="Target absolute total engine count")
+    num_replicas: int = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description='Target absolute total engine count (strict int: JSON true/"2"/2.0 are rejected 422, not coerced)',
+    )
     timeout_secs: Optional[float] = Field(default=None, gt=0, description="Total timeout for the operation")
     idempotency_key: Optional[str] = Field(default=None, description="Idempotency key for safe retries")
 
@@ -626,11 +631,21 @@ class GenRM(Base):
         manager = self.genrm_managers[key]
         return list(ray.get(manager.get_engine_hosts_ports.remote()))
 
-    def _genrm_capacity(self, key: str, ready: int) -> Dict[str, int]:
-        """Read capacity from the real manager while preserving fake
-        support."""
+    def _genrm_capacity(self, key: str, ready: int, strict: bool = False) -> Dict[str, int]:
+        """Capacity snapshot for the instance; see ``get_engine_capacity``.
+
+        Read-only surfaces (``/engines``, ``/metrics``) pass ``strict=False``
+        and degrade to the routable count when the manager cannot be queried.
+        Mutating paths (scale submit) pass ``strict=True``: deciding a scale
+        target on a fallback capacity would misread draining victims and
+        pending cleanup, so an unreadable capacity fails closed instead
+        (review finding: never let ``ready`` impersonate authoritative
+        ``current`` on the control path).
+        """
         manager = self.genrm_managers[key]
         if getattr(manager, "get_engine_capacity", None) is None:
+            # Legacy manager without the capacity hook: the discovery list is
+            # the best available snapshot (same for every caller).
             return {"current": ready, "ready": ready, "occupied": ready, "pending_cleanup": 0}
         try:
             data = ray.get(manager.get_engine_capacity.remote())
@@ -641,6 +656,8 @@ class GenRM(Base):
                 "pending_cleanup": int(data.get("pending_cleanup", 0)),
             }
         except Exception as e:
+            if strict:
+                raise RuntimeError(f"GenRM capacity query failed for '{key}': {e}") from e
             self._logger.warning(f"GenRM capacity query failed for '{key}': {e}")
             return {"current": ready, "ready": ready, "occupied": ready, "pending_cleanup": 0}
 
@@ -648,12 +665,20 @@ class GenRM(Base):
         try:
             key = self._resolve_scale_model(request.model_name)
             engines = self._genrm_engine_list(key)
-            capacity = self._genrm_capacity(key, len(engines))
         except RuntimeError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             self._logger.error(f"GenRM engine discovery failed for model '{request.model_name}': {e}")
             raise HTTPException(status_code=503, detail="GenRM engine discovery failed")
+        # Strict: a scale decision needs the authoritative capacity. If the
+        # manager cannot be queried, fail closed with 503 instead of
+        # submitting against a degraded "ready impersonates current" snapshot
+        # (review finding).
+        try:
+            capacity = self._genrm_capacity(key, len(engines), strict=True)
+        except Exception as e:
+            self._logger.error(f"GenRM capacity query failed for model '{request.model_name}': {e}")
+            raise HTTPException(status_code=503, detail="GenRM capacity query failed; retry later")
 
         decision = self._scale_registry.submit(
             direction,
@@ -852,16 +877,35 @@ class GenRM(Base):
             self._logger.debug(f"GenRM scale advance {request_id} -> {status} skipped: {e}")
 
     def _finish_scale_from_progress(self, direction: str, request_id: str, phase: str, progress: dict) -> None:
+        # Capacity must not be zero-filled from a missing progress snapshot:
+        # a watcher crash or an empty poll leaves the service alive, and
+        # "current=0, ready=0" would be a false capacity reading. Fall back to
+        # the registry's snapshots -- the previous terminal values if any,
+        # else the capacity observed at submit time -- instead of inventing
+        # zeros (review finding: missing != 0).
+        op = self._scale_registry.get_status(direction, request_id) or {}
+
+        def _last_known(field: str, observed_field: str) -> int:
+            if progress.get(field) is not None:
+                return int(progress[field])
+            if op.get(field) is not None:
+                return int(op[field])
+            return int(op.get(observed_field, 0) or 0)
+
         try:
             self._scale_registry.finish(
                 request_id,
                 status=phase,
-                current=int(progress.get("current", 0) or 0),
-                ready=int(progress.get("ready", 0) or 0),
+                current=_last_known("current", "observed_current"),
+                ready=_last_known("ready", "observed_ready"),
                 created=int(progress.get("created", 0) or 0),
                 removed=int(progress.get("removed", 0) or 0),
                 failed=int(progress.get("failed", 0) or 0),
-                cleanup_required=bool(progress.get("cleanup_required", False)),
+                # Fail closed: an entirely empty progress payload (watcher
+                # crash / empty poll) carries no cleanup proof, so the model
+                # mutex stays held until reconcile provides one. A non-empty
+                # legacy snapshot without the key keeps its old meaning.
+                cleanup_required=bool(progress.get("cleanup_required", not progress)),
                 error_message=progress.get("error"),
             )
         except (KeyError, ValueError) as e:

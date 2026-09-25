@@ -298,5 +298,91 @@ class TestListOperations(unittest.TestCase):
         self.assertEqual([op["request_id"] for op in pending], [first["request_id"]])
 
 
+class TestBoundedHistory(unittest.TestCase):
+    """Review finding: the registry is a long-running control plane; clean
+    terminal operations and aged idempotency records must be evicted so
+    months of scale cycles cannot grow memory without bound. Dirty terminals
+    and live operations are never evicted."""
+
+    def _finished_op(
+        self, registry, direction="scale_out", target=2, current=1, dirty=False, key=None, model="__default__"
+    ):
+        decision = registry.submit(
+            direction,
+            model_name=model,
+            target=target,
+            timeout_secs=60.0,
+            idempotency_key=key,
+            current=current,
+            ready=current,
+        )
+        request_id = decision["request_id"]
+        registry.finish(
+            request_id,
+            status="FAILED" if dirty else "ACTIVE" if direction == "scale_out" else "COMPLETED",
+            current=target,
+            ready=target,
+            cleanup_required=dirty,
+        )
+        return request_id
+
+    def test_clean_terminal_history_is_bounded(self):
+        registry = GenRMScaleRegistry()
+        registry.register_initial("__default__", 1)
+        registry.max_history = 4
+        for _ in range(10):
+            self._finished_op(registry, current=1, target=2)
+        clean = [
+            op
+            for op in registry.list_operations("scale_out")
+            if op["status"] == "ACTIVE" and not op["cleanup_required"]
+        ]
+        self.assertEqual(len(clean), registry.max_history)
+        self.assertEqual(registry.history_truncated, 10 - registry.max_history)
+
+    def test_dirty_terminals_are_never_evicted(self):
+        registry = GenRMScaleRegistry()
+        registry.max_history = 1
+        # Dirty terminals hold their model's mutex, so spread them across
+        # models (the eviction invariant must hold regardless).
+        for i in range(5):
+            model = f"model-{i}"
+            registry.register_initial(model, 1)
+            self._finished_op(registry, current=2, target=1, direction="scale_in", dirty=True, model=model)
+        dirty = [op for op in registry.list_operations("scale_in") if op["cleanup_required"]]
+        self.assertEqual(len(dirty), 5)
+
+    def test_aged_idempotency_records_expire(self):
+        registry = GenRMScaleRegistry()
+        registry.register_initial("__default__", 1)
+        request_id = self._finished_op(registry, current=1, target=2, key="replay-me")
+        # Same key + fingerprint replays the original within the window.
+        replay = registry.submit(
+            "scale_out",
+            model_name="__default__",
+            target=2,
+            timeout_secs=60.0,
+            idempotency_key="replay-me",
+            current=2,
+            ready=2,
+        )
+        self.assertEqual(replay.get("request_id"), request_id)
+        self.assertEqual(replay["status"], "ACTIVE")  # verbatim terminal replay
+        # Age the operation beyond the replay window, then trigger eviction.
+        op = registry._operations[request_id]
+        op.updated_at -= registry.replay_window_secs + 1
+        registry._evict_bounded_history_locked()
+        replay_after = registry.submit(
+            "scale_out",
+            model_name="__default__",
+            target=2,
+            timeout_secs=60.0,
+            idempotency_key="replay-me",
+            current=2,
+            ready=2,
+        )
+        self.assertEqual(replay_after["status"], "NOOP")  # treated as fresh
+
+
 if __name__ == "__main__":
     unittest.main()
