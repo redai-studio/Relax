@@ -1,0 +1,186 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "/root/autodl-tmp/hf-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "dataset": "/root/autodl-tmp/hf-cache/hub/datasets--zhuzilin--dapo-math-17k/snapshots/2e65612930298bde4c5d58fd97b3f23a483aaff9/dapo-math-17k.jsonl",
+    "out_dir": "demos/task4_genrm/results/reward_consistency_20260925_r2"
+  },
+  {
+    "t": 14.306,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 15.876,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 26.169,
+    "event": "serve_run",
+    "url": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 68.641,
+    "event": "phase0_engines",
+    "ids": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 68.669,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-b1e56d7a-0dcf-4063-9daf-07efb3184970",
+    "status": "PENDING"
+  },
+  {
+    "t": 68.681,
+    "event": "scale_out_status",
+    "status": "CREATING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 109.21,
+    "event": "scale_out_status",
+    "status": "HEALTH_CHECKING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 110.223,
+    "event": "scale_out_status",
+    "status": "ACTIVE",
+    "current": 2,
+    "ready": 2
+  },
+  {
+    "t": 110.223,
+    "event": "scale_out_final",
+    "status": "ACTIVE",
+    "current": 2,
+    "transitions": [
+      "CREATING",
+      "HEALTH_CHECKING",
+      "ACTIVE"
+    ]
+  },
+  {
+    "t": 110.239,
+    "event": "phase1_engines",
+    "initial": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ],
+    "elastic": [
+      "172.17.0.2",
+      16001
+    ]
+  },
+  {
+    "t": 110.24,
+    "event": "inputs_loaded",
+    "cases": 50,
+    "positives": 25
+  },
+  {
+    "t": 132.829,
+    "event": "arm_greedy_done",
+    "replies": 400
+  },
+  {
+    "t": 155.984,
+    "event": "arm_official_done",
+    "replies": 400
+  },
+  {
+    "t": 156.034,
+    "event": "verdicts",
+    "attribution_covers_both_engines": true,
+    "attribution_failures": [],
+    "all_replies_complete": true,
+    "no_truncated_replies": true,
+    "truncated_count": 0,
+    "parse_gate_independent": true,
+    "parse_gate_failures": [],
+    "greedy_verdicts_identical_across_engines": true,
+    "greedy_mismatches": [],
+    "official_sampling_instability_rate": 0.0,
+    "official_sampling_unstable_cases": [],
+    "judge_correctness_initial": {
+      "1": 45,
+      "0": 50
+    },
+    "judge_correctness_elastic": {
+      "1": 45,
+      "0": 50
+    },
+    "cases": 50,
+    "replies_total": 800,
+    "initial_engine": "172.17.0.2:16000",
+    "elastic_engine": "172.17.0.2:16001",
+    "E2E_PASS": true
+  },
+  {
+    "t": 156.055,
+    "event": "scale_in_submitted",
+    "request_id": "genrm-scale-c82ca030-6983-482b-964b-f8f092c4474e",
+    "status": "PENDING"
+  },
+  {
+    "t": 156.065,
+    "event": "scale_in_status",
+    "status": "DRAINING",
+    "current": null,
+    "ready": null
+  },
+  {
+    "t": 157.078,
+    "event": "scale_in_status",
+    "status": "COMPLETED",
+    "current": 1,
+    "ready": 1
+  },
+  {
+    "t": 157.078,
+    "event": "scale_in_final",
+    "status": "COMPLETED",
+    "current": 1,
+    "transitions": [
+      "DRAINING",
+      "COMPLETED"
+    ]
+  },
+  {
+    "t": 157.094,
+    "event": "phase2_engines",
+    "ids": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 166.874,
+    "event": "cleanup_result",
+    "cleanup_pass": true,
+    "cleanup_errors": [],
+    "leftover_ray_free_gpus": 3.0
+  },
+  {
+    "t": 166.874,
+    "event": "e2e_done",
+    "functional_pass": true,
+    "cleanup_pass": true
+  }
+]

@@ -1,0 +1,34 @@
+{
+  "attribution_covers_both_engines": true,
+  "attribution_failures": [],
+  "all_replies_complete": true,
+  "no_truncated_replies": true,
+  "truncated_count": 0,
+  "parse_gate_independent": true,
+  "parse_gate_failures": [],
+  "greedy_verdicts_identical_across_engines": true,
+  "greedy_mismatches": [],
+  "official_sampling_instability_rate": 0.0,
+  "official_sampling_unstable_cases": [],
+  "judge_correctness_initial": {
+    "1": 45,
+    "0": 50
+  },
+  "judge_correctness_elastic": {
+    "1": 45,
+    "0": 50
+  },
+  "cases": 50,
+  "replies_total": 800,
+  "initial_engine": "172.17.0.2:16000",
+  "elastic_engine": "172.17.0.2:16001",
+  "judge_correctness_is_informational": true,
+  "E2E_PASS": true,
+  "scale_in_removed_exactly_elastic": true,
+  "functional_pass": true,
+  "cleanup_pass": true,
+  "cleanup_errors": [],
+  "leftover_ray_free_gpus": 3.0,
+  "functional_error": null,
+  "PASS": true
+}

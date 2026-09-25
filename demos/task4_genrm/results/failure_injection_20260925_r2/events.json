@@ -1,0 +1,550 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "/root/autodl-tmp/hf-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "out_dir": "demos/task4_genrm/results/failure_injection_20260925_r2"
+  },
+  {
+    "t": 21.283,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 23.198,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 34.681,
+    "event": "serve_run",
+    "url": "http://127.0.0.1:8000/genrm"
+  },
+  {
+    "t": 80.273,
+    "event": "baseline_engines",
+    "ids": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ]
+  },
+  {
+    "t": 80.303,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-60abe584-9e9c-43a9-8675-e20287e42779"
+  },
+  {
+    "t": 124.896,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 124.912,
+    "event": "s1_engines",
+    "initial": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ],
+    "elastic": [
+      "172.17.0.2",
+      16001
+    ]
+  },
+  {
+    "t": 125.455,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "172.17.0.2",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 125.485,
+    "event": "s1_scale_in_submitted",
+    "request_id": "genrm-scale-0f351082-03a0-44e8-9933-c5f758089409"
+  },
+  {
+    "t": 134.619,
+    "event": "s1_done",
+    "scale_in": "COMPLETED",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16000",
+        "finish_reason": "length",
+        "len": 11872,
+        "latency": 8.927
+      },
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16001",
+        "finish_reason": "length",
+        "len": 13548,
+        "latency": 8.889
+      }
+    ]
+  },
+  {
+    "t": 134.648,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-29e3a8ea-cbd7-4e7c-9733-b5f0cc78bc80"
+  },
+  {
+    "t": 177.195,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 177.217,
+    "event": "s2_engines",
+    "ids": [
+      [
+        "172.17.0.2",
+        16000
+      ],
+      [
+        "172.17.0.2",
+        16001
+      ]
+    ],
+    "victim": [
+      "172.17.0.2",
+      16001
+    ]
+  },
+  {
+    "t": 177.768,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "172.17.0.2",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 177.79,
+    "event": "s2_scale_in_submitted",
+    "request_id": "genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d",
+    "timeout_secs": 5.0
+  },
+  {
+    "t": 243.575,
+    "event": "s2_registry_failed_dirty",
+    "status": "FAILED",
+    "cleanup_required": true
+  },
+  {
+    "t": 243.597,
+    "event": "s2_mutex_check",
+    "held": true
+  },
+  {
+    "t": 243.619,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 253.644,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 263.67,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 273.69,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 283.714,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 293.741,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 303.765,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 313.793,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 323.818,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 333.84,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 343.863,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 353.885,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 363.908,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 373.929,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 383.955,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 393.981,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 404.007,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 414.027,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 424.055,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 434.08,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 444.102,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 454.123,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 464.147,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 474.171,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 484.193,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 494.216,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 504.24,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 514.263,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 524.286,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 534.311,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 544.332,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 554.355,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 564.376,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 574.401,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 584.423,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 594.445,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 604.469,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 614.493,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 624.517,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 634.54,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 644.565,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 654.587,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 664.613,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 674.634,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 684.657,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 694.681,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 704.704,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 714.727,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 724.751,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 734.77,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 744.79,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 754.809,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 764.832,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 774.864,
+    "event": "s2_reconcile_retry",
+    "error": "/scale_in/genrm-scale-a6db0e11-896e-4db6-9958-830cd8c80d4d/reconcile -> 409: {\"detail\":\"physical lifecycle is still stop"
+  },
+  {
+    "t": 785.013,
+    "event": "s2_reconcile_result",
+    "status": "FAILED",
+    "cleanup_required": false,
+    "detail": null
+  },
+  {
+    "t": 785.013,
+    "event": "s2_requests",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16001",
+        "finish_reason": "length",
+        "len": 20410,
+        "latency": 19.413
+      },
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16000",
+        "finish_reason": "length",
+        "len": 27567,
+        "latency": 19.465
+      }
+    ]
+  },
+  {
+    "t": 785.086,
+    "event": "scale_out_submitted",
+    "request_id": "genrm-scale-d19837d2-d385-4bc0-a233-5ef38de19640"
+  },
+  {
+    "t": 829.643,
+    "event": "scale_out_final",
+    "status": "ACTIVE"
+  },
+  {
+    "t": 829.659,
+    "event": "s3_engines",
+    "initial": [
+      [
+        "172.17.0.2",
+        16000
+      ]
+    ],
+    "victim": [
+      "172.17.0.2",
+      16001
+    ]
+  },
+  {
+    "t": 830.209,
+    "event": "victim_inflight_confirmed",
+    "victim": [
+      "172.17.0.2",
+      16001
+    ],
+    "inflight": 1
+  },
+  {
+    "t": 830.232,
+    "event": "s3_scale_in_submitted",
+    "request_id": "genrm-scale-574b197c-957b-4d2d-a2a0-6486234fd7ac"
+  },
+  {
+    "t": 830.391,
+    "event": "s3_victim_identified",
+    "port": 16001,
+    "pid": 67088,
+    "status": "DRAINING"
+  },
+  {
+    "t": 830.392,
+    "event": "s3_victim_killed",
+    "pid": 67088
+  },
+  {
+    "t": 856.378,
+    "event": "s3_done",
+    "scale_in": "COMPLETED",
+    "requests": [
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16000",
+        "finish_reason": "length",
+        "len": 23366,
+        "latency": 25.314
+      },
+      {
+        "ok": true,
+        "engine": "172.17.0.2:16000",
+        "finish_reason": "length",
+        "len": 25985,
+        "latency": 26.718
+      }
+    ]
+  },
+  {
+    "t": 856.414,
+    "event": "verdicts",
+    "s1_scale_in_completed": true,
+    "s1_both_long_requests_ok": true,
+    "s1_requests_served_by_both_engines": true,
+    "s1_final_capacity": 1,
+    "s2_deadline_abort_failed_dirty": true,
+    "s2_mutex_held_while_dirty": true,
+    "s2_reconcile_cleared_park": true,
+    "s2_reconcile_terminal_status": true,
+    "s2_abort_to_reconcile_park_s": 607.2,
+    "s2_long_requests_ok": true,
+    "s2_final_capacity": 1,
+    "s3_scale_in_completed_after_crash": true,
+    "s3_all_requests_survived_on_initial_engine": true,
+    "s3_initial_engine_survived": true,
+    "s3_final_capacity": 1,
+    "E2E_PASS": true
+  },
+  {
+    "t": 866.232,
+    "event": "cleanup_result",
+    "cleanup_pass": true,
+    "cleanup_errors": [],
+    "leftover_ray_free_gpus": 3.0
+  },
+  {
+    "t": 866.232,
+    "event": "e2e_done",
+    "functional_pass": true,
+    "cleanup_pass": true
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "source": "b2_train_smoke_20260925_r2",
+  "job": "raysubmit_ZumBkDfMH4FysSKH",
+  "job_status": "SUCCEEDED",
+  "duration_wall_note": "21:00:38 submit -> 21:05:19 SUCCEEDED (4m41s)",
+  "train_step_0_trained_with_full_metrics": true,
+  "weight_sync_200_ok_count": 9,
+  "all_training_steps_finished": true,
+  "dapo_genrm_protocol_rewards_recorded": 4,
+  "parseable_answers_this_run": 0,
+  "judge_invocation_evidence_binding": "c78e613 original run (1 parseable -> judge_response landed) + reward_consistency_20260925_r2 (800 attributed judge calls); this run's 8 samples all answer_missing (model-capability variance)",
+  "graceful_shutdown": true,
+  "errors": [],
+  "PASS": true
+}

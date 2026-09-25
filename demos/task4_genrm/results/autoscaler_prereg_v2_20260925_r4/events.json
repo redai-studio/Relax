@@ -1,0 +1,122 @@
+[
+  {
+    "t": 0.0,
+    "event": "e2e_start",
+    "model_path": "/root/autodl-tmp/hf-cache/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "out_dir": "demos/task4_genrm/results/autoscaler_prereg_v2_20260925_r4"
+  },
+  {
+    "t": 21.576,
+    "event": "ray_init",
+    "gpus": 4.0
+  },
+  {
+    "t": 23.524,
+    "event": "pg_created",
+    "bundles": 1,
+    "gpu_ids": [
+      0
+    ]
+  },
+  {
+    "t": 37.318,
+    "event": "deployed",
+    "genrm": "http://127.0.0.1:8000/genrm",
+    "autoscaler": "http://127.0.0.1:8000/autoscaler_genrm"
+  },
+  {
+    "t": 82.161,
+    "event": "autoscaler_started",
+    "started": true
+  },
+  {
+    "t": 82.422,
+    "event": "resource_baseline",
+    "free_gpus": 3.0,
+    "mem_mib": [
+      21790,
+      5,
+      5,
+      5
+    ],
+    "pgs": 1
+  },
+  {
+    "t": 102.57,
+    "event": "phase_low_done",
+    "current": 1
+  },
+  {
+    "t": 165.3,
+    "event": "phase_high_done",
+    "scaled_out": true
+  },
+  {
+    "t": 232.719,
+    "event": "tui_screenshot_captured",
+    "service": "genrm",
+    "file": "tui-genrm.svg"
+  },
+  {
+    "t": 239.905,
+    "event": "tui_screenshot_captured",
+    "service": "rollout",
+    "file": "tui-rollout.svg"
+  },
+  {
+    "t": 239.905,
+    "event": "phase_steady_done",
+    "elastic_served": 444,
+    "screenshots_ok": true
+  },
+  {
+    "t": 239.923,
+    "event": "phase_low_prime_done",
+    "scaled_in": true
+  },
+  {
+    "t": 250.393,
+    "event": "round_a_history",
+    "so": true,
+    "si": true,
+    "si_status": "COMPLETED"
+  },
+  {
+    "t": 256.766,
+    "event": "round_a_resources",
+    "free": "3.0/3.0",
+    "pgs": "1/1",
+    "mem_ok": true
+  },
+  {
+    "t": 299.082,
+    "event": "round_b_scaled_out",
+    "active": true
+  },
+  {
+    "t": 386.866,
+    "event": "round_b_done",
+    "scale_in": true,
+    "final": 1
+  },
+  {
+    "t": 386.88,
+    "event": "verdicts",
+    "A1_no_scale_out_in_low": true,
+    "A2_scale_out_decided_in_high": true,
+    "A3_elastic_served_in_steady": true,
+    "A4_scale_in_decided_outside_high": true,
+    "A5_scale_in_completed_final_is_initial": true,
+    "A6_zero_load_failures": true,
+    "A6_load_total": 3082,
+    "A8_tui_screenshots": true,
+    "A7_resources_returned": true,
+    "B1_manual_scale_out_active": true,
+    "B2_idle_scale_in_within_window": true,
+    "B2_idle_evidence_zero_running": true,
+    "B2_idle_conditions_all_three": true,
+    "B3_final_one_initial_survived": true,
+    "B3_resources_returned": false,
+    "E2E_PASS": false
+  }
+]
