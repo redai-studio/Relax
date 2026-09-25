@@ -3,7 +3,7 @@
 Raw evidence (full run directories: per-request load logs, event timelines,
 scale histories, charts, TUI screenshots, failed and superseded intermediate
 rounds) is preserved on the
-[`evidence/task4-genrm` branch at commit `c56c821`](https://github.com/shanyulu/Relax/tree/c56c8214c9c7590774e7a91cd15cbbcaee2a4f49/demos/task4_genrm/results)
+[`evidence/task4-genrm` branch at commit `c56c821`](https://github.com/shanyulu/Relax/tree/c56c8218ef3fe47757493c806d4b47228d90a6ec/demos/task4_genrm/results)
 (immutable link; every path below resolves there). The PR itself carries only
 the final machine-verdict summaries and the frozen preregistration documents,
 so the acceptance claims stay verifiable without large artifacts; every

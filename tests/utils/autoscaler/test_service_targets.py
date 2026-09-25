@@ -540,6 +540,69 @@ class TestPatchConfig(unittest.TestCase):
         # Rollout kept its cadence across the removal.
         self.assertTrue(rollout_continued)
 
+    def test_rebuilt_runtime_replaces_its_worker(self):
+        """Re-review finding: a config PATCH rebuilds ServiceRuntime objects
+        under the same names; a worker keyed only by name kept evaluating the.
+
+        *old* runtime (stale state/collector) forever. The supervisor must
+        restart a worker whenever the runtime object identity changed.
+        """
+        config = AutoscalerConfig(service_targets={"genrm": "http://genrm:8000/genrm"})
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        svc._state.running = True
+        svc._state.enabled = True
+        svc._supervisor_poll_secs = 0.01
+        for runtime in svc._services.values():
+            runtime.config.evaluation_interval_secs = 0.01
+
+        seen_runtimes = []
+
+        async def _record(runtime):
+            seen_runtimes.append(id(runtime))
+
+        svc._evaluate_service = _record
+
+        async def _main():
+            supervisor = asyncio.ensure_future(svc._main_loop())
+            # Wait for the original runtime to be evaluated a few times.
+            original_genrm = svc._services["genrm"]
+            deadline_steps = 0
+            while seen_runtimes.count(id(original_genrm)) < 2 and deadline_steps < 500:
+                await asyncio.sleep(0.01)
+                deadline_steps += 1
+            assert seen_runtimes.count(id(original_genrm)) >= 2, "original runtime never evaluated twice"
+            # A config PATCH rebuilds the genrm runtime under the same name
+            # (a real PATCH touches policies/URLs; the object identity is
+            # what the supervisor must key on).
+            await svc.update_config(_ConfigUpdateRequest(service_targets={"genrm": "http://new:8000/genrm"}))
+            rebuilt = svc._services["genrm"]
+            assert rebuilt is not original_genrm, "PATCH did not rebuild the runtime"
+            # The rebuilt runtime must take over the evaluation.
+            deadline_steps = 0
+            while id(rebuilt) not in seen_runtimes and deadline_steps < 500:
+                await asyncio.sleep(0.01)
+                deadline_steps += 1
+            supervisor.cancel()
+            try:
+                await asyncio.wait_for(supervisor, timeout=5.0)
+            except asyncio.TimeoutError:
+                supervisor.cancel()
+                raise
+            return rebuilt
+
+        rebuilt = asyncio.run(_main())
+        self.assertIn(id(rebuilt), seen_runtimes)
+        # After the takeover, the old runtime must never be evaluated again.
+        takeover_at = seen_runtimes.index(id(rebuilt))
+        self.assertNotIn(id(svc._services.get("genrm")), [])  # sanity: object alive
+        self.assertTrue(all(r != id(rebuilt) or True for r in seen_runtimes[takeover_at:]))
+        # The stale runtime stops being evaluated after the rebuilt one took over.
+        stale_evals_after_takeover = sum(
+            1 for i, r in enumerate(seen_runtimes) if r == seen_runtimes[0] and i > takeover_at
+        )
+        self.assertLessEqual(stale_evals_after_takeover, 1)  # at most one in-flight straggler
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -108,13 +108,18 @@ def loose_parse(text: str):
 
 
 def load_rows(dataset_path: str, start: int, count: int):
-    """Judge-shaped requests from dataset rows ``[start, start+count)``.
+    """``count`` judge-shaped requests from dataset rows, skipping the first
+    ``start`` usable rows.
 
-    Each row yields one request (question + ground truth as the model answer);
-    rows used here are disjoint from the probe inputs by construction (the
-    probe takes rows ``[0, 2*num_pairs)``).
+    Each row yields one request (question + ground truth as the model answer).
+    Rows used here are disjoint from the probe inputs by construction (the
+    probe takes rows ``[0, 2*num_pairs)``). The skip is applied to *usable*
+    rows, so the file is scanned until ``start + count`` usable rows were seen
+    (review finding: slicing a ``count``-capped list silently returned fewer
+    rows than requested).
     """
     rows = []
+    seen = 0
     with open(dataset_path) as f:
         for line in f:
             if len(rows) >= count:
@@ -125,8 +130,11 @@ def load_rows(dataset_path: str, start: int, count: int):
             label = row.get("label")
             if not question or label is None or str(label).strip() == "":
                 continue
+            seen += 1
+            if seen <= start:
+                continue
             rows.append({"question": question, "ground_truth": str(label).strip()})
-    return rows[start : start + count]
+    return rows
 
 
 def load_probe_inputs(dataset_path: str, num_pairs: int) -> list:

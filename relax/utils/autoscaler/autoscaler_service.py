@@ -394,8 +394,17 @@ class AutoscalerService(Base):
                 names = {runtime.name for runtime in runtimes}
                 for runtime in runtimes:
                     worker = workers.get(runtime.name)
-                    if worker is None or worker.done():
-                        workers[runtime.name] = asyncio.ensure_future(self._service_loop(runtime))
+                    # A config PATCH rebuilds ServiceRuntime objects under the
+                    # same name; a worker keyed only by name would keep
+                    # evaluating the *old* runtime (stale state/collector)
+                    # forever (re-review finding). Restart the worker whenever
+                    # the runtime object identity changed.
+                    if worker is None or worker.done() or getattr(worker, "runtime", None) is not runtime:
+                        if worker is not None and not worker.done():
+                            worker.cancel()
+                        fresh = asyncio.ensure_future(self._service_loop(runtime))
+                        fresh.runtime = runtime
+                        workers[runtime.name] = fresh
                 for name in [n for n in workers if n not in names]:
                     workers.pop(name).cancel()
                 await asyncio.sleep(getattr(self, "_supervisor_poll_secs", 1.0))
