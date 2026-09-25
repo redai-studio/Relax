@@ -219,6 +219,26 @@ class EventPool:
         return {"size": self._size, "created": self._created, "free": len(self._free), "exhausted": self.exhausted}
 
 
+#: Measurement vocabulary for one interval. ``device`` means a CUDA event was
+#: read back; ``host_only`` means only host timestamps exist.
+MEASUREMENT_DEVICE = "device"
+MEASUREMENT_HOST_ONLY = "host_only"
+MEASUREMENT_UNKNOWN = "unknown"
+
+
+def _measurement_kind(raw: Any, device_ms: Any) -> str:
+    """Return the protocol's measurement classification for one interval.
+
+    A payload that already carries ``device`` or ``host_only`` keeps it;
+    anything else (including ``unknown``) is derived from whether a device
+    duration exists, because every envelope has exactly one clock story. Never
+    raises, so a malformed payload still yields a usable envelope.
+    """
+    if raw in (MEASUREMENT_DEVICE, MEASUREMENT_HOST_ONLY):
+        return str(raw)
+    return MEASUREMENT_HOST_ONLY if device_ms is None else MEASUREMENT_DEVICE
+
+
 @dataclass(frozen=True)
 class TimingEnvelope:
     """One observed interval, ready to ship to the collector."""
@@ -241,11 +261,29 @@ class TimingEnvelope:
     #: timing gap. It rides the wire so a collector can actually see it; only
     #: the declared finite-numeric fields survive :meth:`from_dict`.
     workload: Optional[Dict[str, Any]] = None
+    #: Which clock produced this interval: ``device`` when a CUDA event was
+    #: read back, ``host_only`` when only host timestamps exist. Stamped at
+    #: build time so a reader never has to guess from ``device_ms``.
+    measurement_kind: str = MEASUREMENT_UNKNOWN
 
     @property
     def host_ms(self) -> float:
         """Host-observed interval length in milliseconds."""
         return (self.host_end - self.host_start) * 1000.0
+
+    def __post_init__(self) -> None:
+        """Derive the clock classification when the builder did not set one.
+
+        Every envelope has exactly one clock story: a readable CUDA event
+        (``device``) or host timestamps only (``host_only``). Deriving it here
+        means no construction path can ship an unclassified interval.
+        """
+        if self.measurement_kind == MEASUREMENT_UNKNOWN:
+            object.__setattr__(
+                self,
+                "measurement_kind",
+                _measurement_kind(self.measurement_kind, self.device_ms),
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a flat JSON-friendly mapping."""
@@ -265,6 +303,7 @@ class TimingEnvelope:
             "barrier": self.barrier,
             "reason": self.reason,
             "workload": self.workload,
+            "measurement_kind": self.measurement_kind,
         }
 
     def to_json(self) -> str:
@@ -294,6 +333,7 @@ class TimingEnvelope:
             barrier=bool(payload.get("barrier", False)),
             reason=str(payload.get("reason", "")),
             workload=_bounded_workload(payload.get("workload")),
+            measurement_kind=_measurement_kind(payload.get("measurement_kind"), payload.get("device_ms")),
         )
 
 
@@ -703,6 +743,7 @@ class StragglerObserver:
             device_ms=device_ms,
             barrier=barrier,
             reason=reason,
+            measurement_kind=MEASUREMENT_HOST_ONLY if device_ms is None else MEASUREMENT_DEVICE,
         )
 
     def _deliver(self, envelope: TimingEnvelope) -> None:

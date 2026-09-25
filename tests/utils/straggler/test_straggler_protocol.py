@@ -228,3 +228,43 @@ def test_protocol_constants_document_the_wire() -> None:
     assert WORKLOAD_FIELDS == ("tokens", "sequences", "microbatches")
     assert DEDUP_MAX_ENTRIES == 8192
     assert DEDUP_TTL_S == 120.0
+
+
+def test_envelope_stamps_the_measurement_kind_at_build_time() -> None:
+    """A reader must never have to infer the clock from ``device_ms``.
+
+    The healthy ON smoke carried ``measurement_kind`` as None on all 1155
+    envelopes even though the protocol defines the vocabulary; the stamp makes
+    device and host-only intervals distinguishable on the wire.
+    """
+    common = dict(
+        run_id="run-1",
+        rank=0,
+        cohort="topo0:dense",
+        label="rank0/tp0/pp0",
+        world_size=4,
+        name="forward-compute",
+        log_level=2,
+        seq=1,
+        host_start=0.0,
+        host_end=0.1,
+        barrier=False,
+        reason="observed",
+    )
+    with_device = TimingEnvelope(device_ms=12.5, **common)
+    host_only = TimingEnvelope(device_ms=None, **common)
+
+    assert with_device.to_dict()["measurement_kind"] == "device"
+    assert host_only.to_dict()["measurement_kind"] == "host_only"
+
+    # The stamp survives the wire and validates against the protocol schema.
+    for envelope, expected in ((with_device, "device"), (host_only, "host_only")):
+        payload = dict(envelope.to_dict(), schema_version=SCHEMA_VERSION)
+        ok, error = validate(payload)
+        assert ok, error
+        assert TimingEnvelope.from_dict(json.loads(envelope.to_json())).measurement_kind == expected
+
+    # A payload without the stamp derives it rather than reading as unknown.
+    legacy = dict(common, schema_version=SCHEMA_VERSION, device_ms=None)
+    assert TimingEnvelope.from_dict(legacy).measurement_kind == "host_only"
+    assert MEASUREMENT_KINDS == ("device", "host_only", "unknown")

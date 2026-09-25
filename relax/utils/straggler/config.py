@@ -43,6 +43,14 @@ class StragglerConfig:
             counted rather than silently applied.
         work_tolerance: relative work-difference tolerance the detector uses
             before calling two ranks' windows different amounts of work.
+        min_stage_ms: absolute magnitude floor, in milliseconds. A stage whose
+            observed or peer-fastest magnitude is below this, or whose absolute
+            gap is not above it, is classified ``uncertain`` rather than
+            ``straggler``: below the floor the relative deviation is dominated by
+            host/launch jitter, so the measurement cannot distinguish a slow rank
+            from noise. Measured on the DP4 SFT recipe, metadata stages run
+            0.06-4.0 ms while the real compute stages run ~81 ms
+            (backward-compute) and ~134 ms (forward-compute).
         window_seconds: duration of one aggregation window.
         persist_windows: consecutive anomalous windows required before a rank is
             reported as a straggler.
@@ -60,6 +68,7 @@ class StragglerConfig:
     output_dir: Optional[str] = None
     warmup_windows: int = 2
     work_tolerance: float = 0.05
+    min_stage_ms: float = 5.0
     window_seconds: float = 5.0
     persist_windows: int = 3
     min_cohort_size: int = 2
@@ -107,6 +116,7 @@ class StragglerConfig:
             output_dir=Envs.RELAX_STRAGGLER_OUTPUT_DIR,
             warmup_windows=integer("warmup_windows", Envs.RELAX_STRAGGLER_WARMUP_WINDOWS, 0, 10),
             work_tolerance=real("work_tolerance", Envs.RELAX_STRAGGLER_WORK_TOLERANCE, 0.0, 0.05),
+            min_stage_ms=real("min_stage_ms", Envs.RELAX_STRAGGLER_MIN_STAGE_MS, 0.0, 5.0),
             window_seconds=real("window_seconds", Envs.RELAX_STRAGGLER_WINDOW_S, 0.1, 5.0),
             persist_windows=integer("persist_windows", Envs.RELAX_STRAGGLER_PERSIST_WINDOWS, 1, 3),
             min_cohort_size=integer("min_cohort_size", Envs.RELAX_STRAGGLER_MIN_COHORT, 2, 2),

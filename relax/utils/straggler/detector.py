@@ -132,6 +132,7 @@ REASON_GPU_STREAM_STALL = "gpu_stream_stall"
 REASON_ATTRIBUTION_UNKNOWN = "attribution_unknown"
 REASON_WITHIN_TOLERANCE = "within_tolerance"
 REASON_COHORT_BELOW_MIN_SIZE = "cohort_below_min_size"
+REASON_BELOW_ABSOLUTE_FLOOR = "below_absolute_floor"
 
 #: Which clocks produced a verdict.
 MEASUREMENT_HOST_ONLY = "host_only"
@@ -503,6 +504,7 @@ class StragglerDetector:
             "incomplete_windows": 0,
             "cohort_stage_pairs": 0,
             "uncertain_judgements": 0,
+            "sub_floor_judgements": 0,
             "single_rank_windows": 0,
             "stragglers_reported": 0,
             "recoveries_reported": 0,
@@ -760,8 +762,23 @@ class StragglerDetector:
             label = window.labels.get(rank, f"rank{rank}")
             self._cache_label(key, label)
             slow = deviation > self._config.work_tolerance
-            streak = self._streak.get(key, 0) + 1 if slow else 0
+            absolute_delta = host_medians[rank] - host_reference
+            # Below the absolute floor the relative deviation is dominated by
+            # host/launch jitter: a 2 ms gap on a 0.2 ms metadata stage reads as
+            # 10x and is indistinguishable from noise. Such stages are never
+            # judged as stragglers; they are counted and reported as uncertain.
+            below_floor = (
+                max(host_medians[rank], host_reference) < self._config.min_stage_ms
+                or absolute_delta <= self._config.min_stage_ms
+            )
+            judged_slow = slow and not below_floor
+            streak = self._streak.get(key, 0) + 1 if judged_slow else 0
             self._set_streak(key, streak)
+            if slow and below_floor:
+                self._counters["sub_floor_judgements"] += 1
+                verdicts.append(
+                    build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_BELOW_ABSOLUTE_FLOOR, label)
+                )
             rank_device = device_medians[rank]
             stream_visible = rank_device is not None and device_reference is not None
             device_deviation = (
@@ -769,7 +786,7 @@ class StragglerDetector:
                 if stream_visible and rank_device is not None and device_reference is not None
                 else 0.0
             )
-            host_only = slow and stream_visible and device_deviation <= self._config.work_tolerance
+            host_only = judged_slow and stream_visible and device_deviation <= self._config.work_tolerance
             if streak >= self._config.persist_windows and key not in self._active:
                 _evict_set_to_cap(self._active, MAX_ACTIVE_ENTRIES, self._counters, "active_evictions")
                 self._active.add(key)
@@ -847,6 +864,7 @@ class StragglerDetector:
         stats["streak_entries"] = len(self._streak)
         stats["label_entries"] = len(self._labels)
         stats["work_tolerance"] = self._config.work_tolerance
+        stats["min_stage_ms"] = self._config.min_stage_ms
         stats["persist_windows"] = self._config.persist_windows
         stats["caps"] = {
             "MAX_PENDING_WINDOWS": MAX_PENDING_WINDOWS,

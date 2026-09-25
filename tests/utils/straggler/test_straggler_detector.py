@@ -687,3 +687,85 @@ def test_active_set_and_verdict_deque_stay_bounded() -> None:
     assert stats["active_stragglers"] <= MAX_ACTIVE_ENTRIES
     assert stats["retained_verdicts"] <= stats["caps"]["MAX_VERDICTS"]
     assert stats["streak_entries"] <= MAX_STREAK_ENTRIES
+
+
+def test_sub_millisecond_stage_jitter_is_never_a_straggler() -> None:
+    """The measured healthy-run false positive: 0.2 ms -> 2.1 ms is 10x, not a
+    straggler.
+
+    Below the absolute floor the gap is host/launch jitter, so the stage must
+    be reported ``uncertain``, counted, and never judged.
+    """
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 4, {0: 2.1, 1: 2.2, 2: 0.2, 3: 0.25}, stage="params-all-gather")
+    verdicts.extend(detector.flush())
+
+    assert [v for v in verdicts if v.kind == VERDICT_STRAGGLER] == []
+    uncertain = [v for v in verdicts if v.kind == VERDICT_UNCERTAIN]
+    assert uncertain, "a sub-floor slow rank must still be reported, as uncertain"
+    assert all(v.reason == "below_absolute_floor" for v in uncertain)
+    assert detector.stats()["sub_floor_judgements"] > 0
+    assert detector.stats()["stragglers_reported"] == 0
+
+
+def test_large_stage_delays_and_small_relative_gaps_still_fire() -> None:
+    """The floor must not silently kill detection on a real compute stage.
+
+    ``forward-compute`` measured ~134 ms, so +20 ms, +5% and +10% are all above
+    the floor and must still be reported. Exactly +5% sits on the tolerance
+    boundary and deliberately does not fire, because the comparison is strict.
+    """
+    for observed, expected in ((154.0, True), (141.0, True), (147.4, True), (140.7, False), (134.0, False)):
+        detector = make_detector(persist_windows=1)
+
+        verdicts = feed_equal_windows(
+            detector, 1, {0: observed, 1: 134.0, 2: 134.0, 3: 134.0}, stage="forward-compute"
+        )
+        verdicts.extend(detector.flush())
+
+        got = [v for v in verdicts if v.kind == VERDICT_STRAGGLER]
+        assert bool(got) is expected, f"observed={observed} ms produced {len(got)} straggler verdicts"
+        if expected:
+            assert got[0].facts["absolute_delta_ms"] > StragglerConfig(enabled=True).min_stage_ms
+
+
+def test_the_floor_is_config_driven_not_hardcoded() -> None:
+    """A 10x gap on a metadata stage fires only when the floor is disabled."""
+    unfenced = make_detector(persist_windows=1, min_stage_ms=0.0)
+    verdicts = feed_equal_windows(unfenced, 1, {0: 2.1, 1: 0.2}, stage="params-all-gather")
+    verdicts.extend(unfenced.flush())
+    assert [v for v in verdicts if v.kind == VERDICT_STRAGGLER]
+
+    fenced = make_detector(persist_windows=1, min_stage_ms=5.0)
+    suppressed = feed_equal_windows(fenced, 1, {0: 2.1, 1: 0.2}, stage="params-all-gather")
+    suppressed.extend(fenced.flush())
+    assert [v for v in suppressed if v.kind == VERDICT_STRAGGLER] == []
+    assert fenced.stats()["sub_floor_judgements"] > 0
+
+
+def test_floor_separates_the_measured_metadata_and_compute_stages() -> None:
+    """Report the measured inventory against the chosen floor.
+
+    Inventory measured on the DP4 SFT ON smoke
+    (``gpu_campaign/on-smoke-final``): the metadata stages sit 0.06-4.0 ms, the
+    real compute stages at 81 ms and 134 ms. The default floor must fall in that
+    gap, so it suppresses noise without hiding a genuine compute-stage stall.
+    """
+    measured = {
+        "non-tensor-parallel-grads-all-reduce": 0.060,
+        "embedding-grads-all-reduce": 0.069,
+        "conditional-embedder-grads-all-reduce": 0.130,
+        "params-all-gather": 0.906,
+        "optimizer-inner-step": 1.220,
+        "optimizer-copy-to-main-grad": 1.981,
+        "optimizer-copy-main-to-model-params": 2.414,
+        "all-grads-sync": 3.965,
+        "backward-compute": 81.214,
+        "forward-compute": 133.521,
+    }
+    floor = StragglerConfig(enabled=True).min_stage_ms
+
+    assert floor == 5.0
+    assert [name for name, ms in measured.items() if ms < floor] == list(measured)[:8]
+    assert [name for name, ms in measured.items() if ms >= floor] == ["backward-compute", "forward-compute"]

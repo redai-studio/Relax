@@ -208,6 +208,12 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_STRAGGLER_OUTPUT_DIR = EnvProperty("RELAX_STRAGGLER_OUTPUT_DIR", str, None)
     RELAX_STRAGGLER_WARMUP_WINDOWS = EnvProperty("RELAX_STRAGGLER_WARMUP_WINDOWS", int, 2)
     RELAX_STRAGGLER_WORK_TOLERANCE = EnvProperty("RELAX_STRAGGLER_WORK_TOLERANCE", float, 0.05)
+    # Below this measured stage magnitude (milliseconds) a relative deviation is
+    # dominated by host/launch jitter, so the comparison cannot tell a straggler
+    # from noise and the stage is classified ``uncertain`` instead. Measured on
+    # the DP4 SFT recipe: metadata stages run 0.06-4.0 ms while the real compute
+    # stages run ~81 ms (backward-compute) and ~134 ms (forward-compute).
+    RELAX_STRAGGLER_MIN_STAGE_MS = EnvProperty("RELAX_STRAGGLER_MIN_STAGE_MS", float, 5.0)
     RELAX_STRAGGLER_WINDOW_S = EnvProperty("RELAX_STRAGGLER_WINDOW_S", float, 5.0)
     RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
     RELAX_STRAGGLER_MIN_COHORT = EnvProperty("RELAX_STRAGGLER_MIN_COHORT", int, 2)
