@@ -158,10 +158,12 @@ class TestFieldValidityOnCollection(unittest.TestCase):
 
     def test_missing_throughput_keeps_token_and_queue_pressure(self):
         """Review finding: an engine whose scrape is missing only throughput
-        used to be excluded from every aggregate, erasing its already
-        observed token_usage / queue pressure and disabling scale-out. Fields
-        aggregate per-field validity; the partially observed engine still
-        counts where it was observed."""
+        used to be excluded from every aggregate, erasing its already observed
+        token_usage / queue pressure and disabling scale-out.
+
+        Fields aggregate per-field validity; the partially observed engine
+        still counts where it was observed.
+        """
         collector = MetricsCollector(AutoscalerConfig())
         full = _collect(_FULL_SCRAPE)  # token 0.42, queue 3, throughput 120.5
         partial_scrape = "\n".join(line for line in _FULL_SCRAPE.splitlines() if "gen_throughput" not in line)
