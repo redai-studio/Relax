@@ -1580,6 +1580,18 @@ def _compute_genrm_server_args(
         # below keeps its rank-derived seed (sampling diversity is wanted
         # there, not here).
         "random_seed": args.seed,
+        # Activate SGLang's deterministic-inference mode so per-request
+        # ``sampling_seed`` values (derived in the GenRM component from the
+        # judge model + exact input + effective sampling) actually drive the
+        # sampler: without this flag SGLang silently drops the seed tensor
+        # and samples from the server's global RNG stream, which advances
+        # with every request an engine served -- two replicas with diverged
+        # request histories then disagree on identical inputs (adversarial
+        # finding: 2/50 verdict flips at temperature 0.1 even with a
+        # replica-invariant server seed). Side effects, all acceptable for a
+        # frozen scoring service: sampling backend forced to pytorch, radix
+        # cache disabled (tp_size=1, so no NCCL determinism constraints).
+        "enable_deterministic_inference": True,
         # memory
         "enable_memory_saver": args.offload_rollout,
         # distributed
