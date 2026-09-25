@@ -178,6 +178,62 @@ def test_status_is_json_serialisable() -> None:
         runtime.close()
 
 
+def test_close_persists_the_runtime_and_collector_counters(tmp_path: Any) -> None:
+    """The acceptance protocol reads these counters; close must write them."""
+    runtime = StragglerRuntime(make_config(output_dir=str(tmp_path)), identity=identity(0), register_atexit=False)
+    runtime.start()
+    run_intervals(runtime, count=2)
+    runtime.close()
+
+    collector_status = json.loads((tmp_path / "collector_status.json").read_text())
+    runtime_status = json.loads((tmp_path / "runtime_status.json").read_text())
+
+    assert collector_status["envelopes"] == 2
+    assert runtime_status["collector"]["envelopes"] == 2
+    assert runtime_status["observer"]["intervals"] == 2
+    assert runtime_status["timers"]["intervals"] == 2
+    assert runtime_status["collector"]["caps"]["MAX_VERDICTS"] == 512
+
+
+def test_close_persists_the_sender_side_counters(tmp_path: Any) -> None:
+    """The shipping (non-zero) rank is the arm whose counters §6 reports."""
+    port = free_port()
+    collector_runtime = StragglerRuntime(make_config(f"127.0.0.1:{port}"), identity=identity(0), register_atexit=False)
+    sender_runtime = StragglerRuntime(
+        make_config(f"127.0.0.1:{port}", output_dir=str(tmp_path)),
+        identity=identity(1),
+        register_atexit=False,
+    )
+    collector_runtime.start()
+    if not collector_runtime.status().get("receiver", {}).get("listening", False):
+        collector_runtime.close()
+        sender_runtime.close()
+        pytest.skip("loopback TCP is unavailable in this environment")
+    try:
+        sender_runtime.start()
+        run_intervals(sender_runtime, count=2)
+    finally:
+        sender_runtime.close()
+        collector_runtime.close()
+
+    runtime_status = json.loads((tmp_path / "runtime_status.json").read_text())
+    assert runtime_status["role"] == "sender"
+    assert "sender" in runtime_status
+    assert runtime_status["observer"]["intervals"] == 2
+    assert "collector" not in runtime_status
+
+
+def test_close_without_an_output_dir_is_a_clean_noop(tmp_path: Any) -> None:
+    """No output_dir must not make close fail while persisting counters."""
+    runtime = StragglerRuntime(make_config(), identity=identity(0), register_atexit=False)
+    runtime.start()
+    runtime.close()
+
+    assert runtime.status()["closed"] is True
+    assert runtime.status()["errors"] == 0
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_env_gated_factory_builds_a_local_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RELAX_STRAGGLER_ENABLE", "1")
     straggler.reset_straggler_state_for_tests()

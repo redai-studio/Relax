@@ -16,6 +16,8 @@ timers and the training backend keeps Megatron's ``config.timers = None``.
 """
 
 import atexit
+import json
+import os
 import sys
 from typing import Any, Callable, Dict, Optional
 
@@ -188,6 +190,26 @@ class StragglerRuntime:
             return []
         return self._collector.drain_verdicts()
 
+    def _write_status(self) -> None:
+        """Persist the component counters next to the JSONL streams.
+
+        The acceptance protocol reads observer/sender/collector counters and
+        ``analyze_run.py`` already expects ``collector_status.json``, but no
+        code wrote either file. Fail-open: a write error is counted, never
+        raised into training. Runs at shutdown (after the readout threads have
+        stopped), never on the training thread.
+        """
+        output_dir = self._config.output_dir
+        if not output_dir:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        status = self.status()
+        with open(os.path.join(output_dir, "runtime_status.json"), "w") as handle:
+            json.dump(status, handle, indent=2, sort_keys=True, default=str)
+        if "collector" in status:
+            with open(os.path.join(output_dir, "collector_status.json"), "w") as handle:
+                json.dump(status["collector"], handle, indent=2, sort_keys=True, default=str)
+
     def close(self, timeout: float = 2.0) -> None:
         """Stop reading, flush the windows and close the transport;
         idempotent."""
@@ -214,6 +236,11 @@ class StragglerRuntime:
                     component.close(timeout)
             except Exception:
                 self._errors += 1
+        try:
+            if not sys.is_finalizing():
+                self._write_status()
+        except Exception:
+            self._errors += 1
 
 
 __all__ = ["StragglerRuntime"]
