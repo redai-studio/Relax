@@ -128,11 +128,16 @@ class RuntimeIdentity:
 
         Two ranks may be compared only when they execute the same parallel role
         for the same model chunk under the same topology, so TP, PP, VPP, CP,
-        the chunk index, the topology epoch and the stage schema are all in the
-        key. ``dp`` is deliberately *not* in the key: data-parallel replicas are
-        the axis the comparison runs along. EP/ETP/EDP are carried in
-        :meth:`as_dict` as a schema capability but are not part of the key,
-        because comparing expert-parallel roles is not claimed to be supported.
+        EP, ETP, the chunk index, the topology epoch and the stage schema are
+        all in the key. ``dp`` is deliberately *not* in the key: data-parallel
+        replicas are the axis the comparison runs along. ``edp`` (expert data
+        parallel) is the same axis for an expert-parallel run and is equally
+        excluded, so expert-data-parallel replicas remain comparable. EP and
+        ETP *are* included: two ranks holding different experts (or different
+        expert shards) execute genuinely different work, and comparing them
+        would manufacture a false accusation -- the failure mode this key
+        exists to prevent. The EP/ETP/EDP values are also carried in
+        :meth:`as_dict` for evidence.
         """
         return ":".join(
             str(value)
@@ -144,6 +149,8 @@ class RuntimeIdentity:
                 self.virtual_pipeline_parallel_rank,
                 self.model_chunk_index,
                 self.context_parallel_rank,
+                self.expert_parallel_rank,
+                self.expert_tensor_parallel_rank,
             )
         )
 

@@ -14,26 +14,35 @@ frozen ``StragglerConfig`` and raised
 ``dataclasses.FrozenInstanceError: cannot assign to field 'enabled'`` at step 0
 (job ``mbTivCsZz9YY23ft``).
 
-The regression has three parts, and only the third needs the Megatron checkout:
+The regression has four parts, and only the last needs the Megatron checkout:
 
 1. the shim exposes no instance ``__dict__``, which is what keeps the walk from
    recursing into it at all;
-2. pickling the shim (the broadcast that immediately follows the walk) yields an
-   inert copy that still answers the timer interface;
-3. the real upstream ``remove_non_pickleables`` accepts a real
+2. ``__reduce__`` yields an inert copy that still answers the timer interface;
+3. a **local** walker that mirrors upstream ``remove_non_pickleables``
+   (``copy.copy`` + ``setattr`` over ``vars()``) proves the frozen-config crash
+   happened with the pre-fix shape, and cannot happen with the current
+   slotted shim -- this needs no Megatron stack at all, so the invariant is
+   enforced on the CPU CI where the import guard below silently skips;
+4. the real upstream ``remove_non_pickleables`` accepts a real
    ``TransformerConfig`` with ``get_straggler_timers()`` installed, and the live
    shim still records intervals afterwards.
 
-Part 3 loads the single upstream module by file because the CPU test venv has no
+Part 4 loads the single upstream module by file because the CPU test venv has no
 complete Megatron bridge stack (importing ``megatron.bridge`` pulls
 ``transformer_engine``). It is skipped, with the reason, when no Megatron-LM
 checkout is configured through ``MEGATRON_PATH``/``MEGATRON``.
 """
 
+import copy
+import dataclasses
+import functools
 import importlib.util
 import os
 import pickle
 import sys
+import time
+import types
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -84,6 +93,66 @@ def _load_remove_non_pickleables() -> Optional[Callable[..., Any]]:
     return module.remove_non_pickleables
 
 
+def _local_remove_non_pickleables(obj: Any, max_depth: int = 3, current_depth: int = 0) -> Any:
+    """Faithful, dependency-free copy of upstream ``remove_non_pickleables``.
+
+    Mirrors ``megatron/bridge/models/conversion/utils.py`` (Megatron core
+    0.19.0): depth guard, ``None`` passthrough, ``callable`` removal for
+    functions/methods/partials, then the ``copy.copy`` + ``setattr`` walk over
+    ``vars()`` that triggers the frozen-dataclass crash, followed by list/tuple/
+    dict handling. The ProcessGroup special case is omitted because the test
+    objects cannot reach it.
+    """
+    if current_depth >= max_depth:
+        return obj
+    if obj is None:
+        return obj
+    if callable(obj):
+        if isinstance(obj, type):
+            return obj
+        if isinstance(obj, (types.FunctionType, types.MethodType, functools.partial)) or hasattr(obj, "__self__"):
+            return None
+    if hasattr(obj, "__dict__"):
+        cleaned = copy.copy(obj)
+        for attr_name in list(vars(cleaned).keys()):
+            value = getattr(cleaned, attr_name)
+            setattr(cleaned, attr_name, _local_remove_non_pickleables(value, max_depth, current_depth + 1))
+        return cleaned
+    if isinstance(obj, list):
+        return [_local_remove_non_pickleables(item, max_depth, current_depth + 1) for item in obj]
+    if isinstance(obj, tuple):
+        return tuple(_local_remove_non_pickleables(item, max_depth, current_depth + 1) for item in obj)
+    if isinstance(obj, dict):
+        return {key: _local_remove_non_pickleables(value, max_depth, current_depth + 1) for key, value in obj.items()}
+    return obj
+
+
+class _PreFixTimers:
+    """The shape of ``StragglerTimers`` *before* commit c6d425f: no ``__slots__``.
+
+    It keeps the frozen ``StragglerConfig`` reachable through ``__dict__``,
+    exactly like the object that made the bridge converter raise
+    ``FrozenInstanceError`` at step 0.
+    """
+
+    def __init__(self, config: StragglerConfig) -> None:
+        self._config = config
+        self._timers: dict = {}
+        self._clock = time.perf_counter
+
+    def __call__(self, name: str, log_level: Optional[int] = None) -> Any:
+        return None
+
+
+class _BroadcastConfig:
+    """Minimal stand-in for the ``TransformerConfig`` the walk is applied to."""
+
+    def __init__(self, timers: Any) -> None:
+        self.timers = timers
+        self.some_callable = lambda: None  # noqa: E731 - upstream removes functions
+        self.nested = [1, (2, {"k": 3})]
+
+
 @pytest.fixture(autouse=True)
 def _reset_profiler() -> Any:
     straggler.reset_straggler_state_for_tests()
@@ -115,6 +184,60 @@ def test_pickling_the_shim_yields_an_inert_but_functional_copy() -> None:
     handle.start()
     handle.stop()
     assert restored.stats()["intervals"] == 1
+
+
+def test_reduce_is_explicitly_inert_and_functional() -> None:
+    """``__reduce__`` is the broadcast path and must not carry live state."""
+    timers = StragglerTimers(StragglerConfig(enabled=True), sink=NullTimerSink())
+
+    reconstructor, args = timers.__reduce__()
+    restored = reconstructor(*args)
+
+    assert isinstance(restored, StragglerTimers)
+    assert restored._config.enabled is False
+    assert isinstance(restored._sink, NullTimerSink)
+    assert restored.__reduce__()[0] is reconstructor
+    handle = restored("forward-compute", log_level=2)
+    handle.start()
+    handle.stop()
+    assert restored.stats()["intervals"] == 1
+
+
+def test_local_walker_reproduces_the_pre_fix_frozen_config_crash() -> None:
+    """The original A7 crash is reproduced without any Megatron checkout.
+
+    This is the counterexample that proves the walker is faithful: the pre-fix
+    shape (instance ``__dict__`` holding a frozen ``StragglerConfig``) raises
+    exactly the upstream error, so the passing assertions below are meaningful.
+    """
+    config = _BroadcastConfig(_PreFixTimers(StragglerConfig(enabled=True)))
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        _local_remove_non_pickleables(config, max_depth=3)
+
+
+def test_local_walker_leaves_the_current_shim_usable() -> None:
+    """The current slotted shim is skipped by the walk and survives broadcast."""
+    timers = StragglerTimers(StragglerConfig(enabled=True), sink=NullTimerSink())
+    config = _BroadcastConfig(timers)
+
+    cleaned = _local_remove_non_pickleables(config, max_depth=3)
+
+    # No instance __dict__ -> the walk returns the object untouched instead of
+    # recursing into the frozen config.
+    assert cleaned.timers is timers
+    assert cleaned.some_callable is None  # the walk still does its normal job
+
+    # broadcast_obj_from_pp_rank immediately pickles the cleaned config.
+    restored = pickle.loads(pickle.dumps(cleaned))
+    assert isinstance(restored.timers, StragglerTimers)
+    assert restored.timers._config.enabled is False
+
+    handle = timers("forward-compute", log_level=2)
+    before = timers.stats()["intervals"]
+    handle.start()
+    handle.stop()
+    assert timers.stats()["intervals"] == before + 1
 
 
 def test_remove_non_pickleables_leaves_enabled_timers_usable(monkeypatch: pytest.MonkeyPatch) -> None:

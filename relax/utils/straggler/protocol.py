@@ -60,6 +60,17 @@ DEDUP_MAX_ENTRIES = 8192
 #: its reconnect loop to retry an old packet has already moved on.
 DEDUP_TTL_S = 120.0
 
+#: Hard cap on the length of every free-text field that reaches the collector's
+#: bounded structures. ``DEDUP_MAX_ENTRIES`` bounds the *number* of retained
+#: keys, but each key embeds ``run_id``/``topology_epoch`` and each sample
+#: embeds ``name``; without a per-field cap a single hostile line can be just
+#: under ``MAX_LINE_BYTES`` and multiply the 8192-entry cap into gigabytes.
+#: Real run ids, cohort keys and Megatron timer names are far below this.
+MAX_TEXT_CHARS = 4096
+
+#: Free-text fields checked against :data:`MAX_TEXT_CHARS`.
+_TEXT_FIELDS: Tuple[str, ...] = ("run_id", "topology_epoch", "name", "cohort", "label")
+
 #: Rank and sequence fallbacks, matching ``TimingEnvelope.from_dict`` so a
 #: malformed packet keys the same way however it entered the process.
 _DEFAULT_RANK = -1
@@ -152,6 +163,11 @@ def _validate(payload: Any) -> Tuple[bool, str]:
     kind = _read(payload, "measurement_kind", "")
     if kind not in ("", None) and kind not in MEASUREMENT_KINDS:
         return False, "invalid_measurement_kind"
+
+    for field in _TEXT_FIELDS:
+        value = _read(payload, field, None)
+        if isinstance(value, str) and len(value) > MAX_TEXT_CHARS:
+            return False, "text_field_too_long"
     return True, ""
 
 
@@ -302,6 +318,7 @@ class BoundedDedup:
 __all__ = [
     "DEDUP_MAX_ENTRIES",
     "DEDUP_TTL_S",
+    "MAX_TEXT_CHARS",
     "MEASUREMENT_KINDS",
     "PROTOCOL_NAME",
     "SCHEMA_VERSION",

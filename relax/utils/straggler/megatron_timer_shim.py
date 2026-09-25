@@ -40,6 +40,13 @@ logger = get_logger(__name__)
 #: Highest ``log_level`` Megatron uses; mirrors ``Timers._max_log_level``.
 MAX_LOG_LEVEL = 2
 
+#: Hard cap on distinct timer handles retained. Megatron's names are a fixed,
+#: enumerable set in practice, but the shim promises to be bounded in *every*
+#: structure; a call site that builds names dynamically (``f"stage-{i}"``) must
+#: not be able to grow the table without limit. Names past the cap get the
+#: level-filtered no-op handle and the eviction is counted.
+MAX_TIMER_NAMES = 1024
+
 #: Test-only slow-rank injection. The detector's sensitivity curve cannot be
 #: measured without a controlled slowdown, and an external one (SM carve-out,
 #: NCCL bandwidth limiting) cannot be attributed to one rank precisely. These
@@ -380,6 +387,7 @@ class StragglerTimers:
             "sink_errors": 0,
             "level_mismatch": 0,
             "call_errors": 0,
+            "name_evictions": 0,
         }
 
     @property
@@ -423,6 +431,12 @@ class StragglerTimers:
                 return self._timers[name]
             resolved = MAX_LOG_LEVEL if log_level is None else int(log_level)
             if resolved > MAX_LOG_LEVEL or resolved > self._log_level:
+                return self._noop
+            if len(self._timers) >= MAX_TIMER_NAMES:
+                # Bounded table: refuse a new name rather than grow. The caller
+                # gets the same no-op shape a level-filtered timer gets, so no
+                # ``elapsed`` read can ever be attempted on a real handle.
+                self._counters["name_evictions"] += 1
                 return self._noop
             handle = StragglerTimerHandle(name, resolved, self)
             self._timers[name] = handle
@@ -485,6 +499,7 @@ class StragglerTimers:
 
 __all__ = [
     "MAX_LOG_LEVEL",
+    "MAX_TIMER_NAMES",
     "NullTimerSink",
     "StragglerTimerHandle",
     "StragglerTimers",

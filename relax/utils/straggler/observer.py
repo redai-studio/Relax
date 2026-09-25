@@ -24,6 +24,7 @@ points are cheap counted no-ops: no CUDA event is created and no thread starts.
 """
 
 import json
+import math
 import threading
 import time
 from collections import deque
@@ -33,9 +34,33 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Tuple
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.identity import RuntimeIdentity, discover_identity
+from relax.utils.straggler.protocol import WORKLOAD_FIELDS
 
 
 logger = get_logger(__name__)
+
+
+def _bounded_workload(value: Any) -> Optional[Dict[str, Any]]:
+    """Sanitise a decoded workload mapping; never raises, never unbounded.
+
+    Only the declared fields survive, only finite numeric values count, and the
+    result is a fresh small dict. A hostile packet therefore cannot smuggle an
+    arbitrarily large mapping into a detector sample.
+    """
+    if not isinstance(value, dict):
+        return None
+    workload: Dict[str, Any] = {}
+    for field in WORKLOAD_FIELDS:
+        number = value.get(field)
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            continue
+        try:
+            if not math.isfinite(float(number)):
+                continue
+        except (TypeError, ValueError):
+            continue
+        workload[field] = number
+    return workload or None
 
 
 #: Observer states, in escalation order. ``DISABLED`` is terminal: a profiler
@@ -211,6 +236,11 @@ class TimingEnvelope:
     device_ms: Optional[float]
     barrier: bool
     reason: str
+    #: Optional per-interval workload counters (tokens/sequences/microbatches).
+    #: Advisory: the detector reports the peer-relative difference next to the
+    #: timing gap. It rides the wire so a collector can actually see it; only
+    #: the declared finite-numeric fields survive :meth:`from_dict`.
+    workload: Optional[Dict[str, Any]] = None
 
     @property
     def host_ms(self) -> float:
@@ -234,6 +264,7 @@ class TimingEnvelope:
             "device_ms": self.device_ms,
             "barrier": self.barrier,
             "reason": self.reason,
+            "workload": self.workload,
         }
 
     def to_json(self) -> str:
@@ -262,6 +293,7 @@ class TimingEnvelope:
             device_ms=None if payload.get("device_ms") is None else float(payload["device_ms"]),
             barrier=bool(payload.get("barrier", False)),
             reason=str(payload.get("reason", "")),
+            workload=_bounded_workload(payload.get("workload")),
         )
 
 

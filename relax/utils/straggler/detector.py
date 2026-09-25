@@ -71,6 +71,7 @@ difference exists.
 """
 
 import json
+import math
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
@@ -165,8 +166,9 @@ def _ratio(value: Optional[float], reference: Optional[float]) -> Optional[float
 def _workload_total(workload: Any) -> Optional[float]:
     """Total a workload mapping down to one comparable magnitude.
 
-    Only numeric entries count; a mapping without any numeric entry is treated
-    as "no workload reported".
+    Only finite numeric entries count; a mapping without any finite numeric
+    entry is treated as "no workload reported", and a ``NaN``/``inf`` counter
+    cannot poison the peer median the way it could poison a timing reference.
     """
     if not isinstance(workload, dict):
         return None
@@ -176,7 +178,10 @@ def _workload_total(workload: Any) -> Optional[float]:
         if isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
-            total += float(value)
+            number = float(value)
+            if not math.isfinite(number):
+                continue
+            total += number
             seen = True
     return total if seen else None
 
@@ -407,6 +412,24 @@ class _Window:
             # Largest reported expectation: coverage can only be understated.
             self.cohort_expected = expected if self.cohort_expected is None else max(self.cohort_expected, expected)
 
+        # Sanitise before any structure is touched, so a dropped sample can
+        # never leave an empty rank bucket behind (which used to crash
+        # ``_median`` for the whole window).
+        host_ms = float(envelope.host_ms)
+        if not math.isfinite(host_ms) or host_ms < 0.0:
+            # A NaN/inf/negative host duration is a malformed measurement, not a
+            # fast rank. Keeping it would let one hostile (or backwards-clock)
+            # packet become the ``min`` reference and silently suppress every
+            # verdict in the window; it is dropped and counted instead.
+            self._counters["invalid_samples"] += 1
+            return
+        device_ms = envelope.device_ms
+        if device_ms is not None:
+            device_ms = float(device_ms)
+            if not math.isfinite(device_ms) or device_ms < 0.0:
+                self._counters["invalid_device_samples"] += 1
+                device_ms = None
+
         key = (envelope.cohort, envelope.name)
         per_rank = self.samples.get(key)
         if per_rank is None:
@@ -431,8 +454,8 @@ class _Window:
         workload = getattr(envelope, "workload", None)
         bucket.append(
             (
-                float(envelope.host_ms),
-                envelope.device_ms,
+                host_ms,
+                device_ms,
                 dict(workload) if isinstance(workload, dict) else None,
             )
         )
@@ -474,6 +497,8 @@ class StragglerDetector:
             "pair_evictions": 0,
             "rank_evictions": 0,
             "sample_evictions": 0,
+            "invalid_samples": 0,
+            "invalid_device_samples": 0,
         }
 
     @property

@@ -4,6 +4,7 @@
 transport."""
 
 import json
+import threading
 import time
 from itertools import count
 from pathlib import Path
@@ -463,8 +464,14 @@ class TestBufferedPersistence:
         from relax.utils.straggler.collector import WRITE_BATCH
 
         collector = make_collector(output_dir=str(tmp_path))
-        for _ in range(WRITE_BATCH):
-            collector.ingest(make_envelope(0, 100.0))
+        # Ingest from a non-training thread: the batch bound flushes only off
+        # the training thread (see the red-team regression that a host-only
+        # ingest path must not write files). The batch itself is unchanged.
+        worker = threading.Thread(
+            target=lambda: [collector.ingest(make_envelope(0, 100.0)) for _ in range(WRITE_BATCH)]
+        )
+        worker.start()
+        worker.join()
 
         lines = (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip().splitlines()
         assert len(lines) == WRITE_BATCH

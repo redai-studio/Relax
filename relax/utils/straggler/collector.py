@@ -49,6 +49,12 @@ MAX_LINE_BYTES = 1 << 20
 #: envelope.
 WRITE_BATCH = 256
 
+#: Hard cap on buffered-but-unwritten JSONL lines per file. The training thread
+#: may never perform file I/O, so its ingest path can only append; the cap keeps
+#: that buffer bounded (oldest lines are dropped and counted) until a background
+#: thread or an explicit ``report``/``flush``/``close`` drains it.
+MAX_PENDING_LINES = 65536
+
 #: Bound and TTL of the collector's idempotency tracker. A reconnect can resend
 #: what was already queued, and a slow link can deliver an older sample after a
 #: newer one; both are dropped (and counted) before they can bias a window. The
@@ -88,6 +94,13 @@ class TimingCollector:
         self._verdict_path: Optional[str] = None
         self._writers_ready = False
         self._pending: Dict[str, List[str]] = {}
+        # Serialises the pending buffers and the counter updates they make. The
+        # lock is never held across the file write itself, so a training-thread
+        # caller of ``_append`` can never block on a background thread's I/O.
+        self._write_lock = threading.Lock()
+        #: Thread that constructed the collector (the actor's training thread).
+        #: Ingest from this thread must not write files.
+        self._training_thread_id = threading.get_ident()
         self._counters: Dict[str, int] = {
             "envelopes": 0,
             "judged_packets": 0,
@@ -100,6 +113,7 @@ class TimingCollector:
             "reports": 0,
             "write_errors": 0,
             "verdict_callback_errors": 0,
+            "pending_line_drops": 0,
         }
         if config.output_dir:
             self._open_writers(config.output_dir)
@@ -174,7 +188,15 @@ class TimingCollector:
                     self._counters["verdict_callback_errors"] += 1
 
     def _append(self, path: Optional[str], serialiser: Any) -> None:
-        """Buffer one JSONL line, counting (not raising) a failure."""
+        """Buffer one JSONL line, counting (not raising) a failure.
+
+        Appending is safe from any thread: the pending buffer and its counter
+        updates are guarded by a lock that is released before any file is
+        touched. A batch is only written when the caller is *not* the training
+        thread, so the training path never performs file I/O; lines that pile up
+        there are capped by :data:`MAX_PENDING_LINES` and drained by the
+        background/close paths.
+        """
         if not self._writers_ready or not path or serialiser is None:
             return
         try:
@@ -182,26 +204,49 @@ class TimingCollector:
         except Exception:
             self._counters["write_errors"] += 1
             return
-        pending = self._pending.setdefault(path, [])
-        pending.append(line)
-        if len(pending) >= WRITE_BATCH:
+        with self._write_lock:
+            pending = self._pending.setdefault(path, [])
+            pending.append(line)
+            overflow = len(pending) - MAX_PENDING_LINES
+            if overflow > 0:
+                # Oldest-first eviction keeps memory flat on a run whose
+                # consumer is the training thread (no device backend).
+                del pending[:overflow]
+                self._counters["pending_line_drops"] += overflow
+            batch_ready = len(pending) >= WRITE_BATCH and not self._on_training_thread()
+        if batch_ready:
             self._flush_path(path)
 
+    def _on_training_thread(self) -> bool:
+        """Return whether the caller is the thread that built the collector."""
+        return threading.get_ident() == self._training_thread_id
+
     def _flush_path(self, path: str) -> None:
-        """Write the buffered lines of one file in a single call."""
-        pending = self._pending.get(path)
-        if not pending:
+        """Write the buffered lines of one file in a single call.
+
+        The buffer is swapped out under the lock and written outside it, so two
+        writers can never serialise the same lines twice and a training-thread
+        ``_append`` can never block behind the write.
+        """
+        with self._write_lock:
+            pending = self._pending.get(path)
+            if not pending:
+                return
+            self._pending[path] = []
+        self._write_batch(path, pending)
+
+    def _write_batch(self, path: str, lines: List[str]) -> None:
+        """Append one already-swapped batch to its file, counting failures."""
+        if not lines:
             return
         try:
             with open(path, "a", encoding="utf-8") as handle:
-                handle.write("\n".join(pending) + "\n")
-            self._counters["flushed_lines"] += len(pending)
+                handle.write("\n".join(lines) + "\n")
+            self._counters["flushed_lines"] += len(lines)
         except Exception:
             self._counters["write_errors"] += 1
             if self._counters["write_errors"] > 100:
                 self._writers_ready = False
-        finally:
-            pending.clear()
 
     def _flush_writers(self) -> None:
         """Flush every buffered file."""
@@ -478,6 +523,11 @@ class EnvelopeReceiver:
                 time.sleep(0.05)
                 continue
             with self._lock:
+                # Finished reader threads linger in this list; prune them before
+                # applying the cap, otherwise the cap counts *lifetime*
+                # connections and a long run (or a reconnecting sender) is
+                # refused forever once MAX_CONNECTIONS have ever been accepted.
+                self._connections = [thread for thread in self._connections if thread.is_alive()]
                 if len(self._connections) >= MAX_CONNECTIONS:
                     try:
                         connection.close()
@@ -571,6 +621,7 @@ __all__ = [
     "DEDUP_TTL_S",
     "EnvelopeReceiver",
     "EnvelopeSender",
+    "MAX_PENDING_LINES",
     "TimingCollector",
     "parse_address",
 ]
