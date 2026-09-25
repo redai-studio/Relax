@@ -359,7 +359,7 @@ def test_close_does_not_race_the_status_writer(tmp_path: pathlib.Path, monkeypat
     assert state["max"] == 1, f"close() overlapped the status writer: {state['max']} writers at once"
 
 
-def test_write_json_is_not_safe_for_two_concurrent_writers(
+def test_write_json_is_safe_for_two_concurrent_writers(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The published snapshot must stay valid even with two concurrent
@@ -398,6 +398,7 @@ def test_write_json_is_not_safe_for_two_concurrent_writers(
 
     published = (tmp_path / "snapshot.json").read_text(encoding="utf-8")
     json.loads(published)  # the unique temp path keeps the published snapshot valid
+    assert errors == [], f"a writer lost its own temp file to the other writer: {errors}"
 
 
 def test_output_paths_are_run_scoped(tmp_path: pathlib.Path) -> None:
