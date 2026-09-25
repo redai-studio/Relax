@@ -15,6 +15,12 @@ the very synchronisation the shim removed. So this module owns:
 Nothing here is allowed to block or raise on the training thread: pool
 exhaustion degrades an interval to host timing only, a full queue drops with a
 counted reason, and a failing consumer is counted rather than propagated.
+
+The observer also owns an explicit lifecycle state machine: counted failures
+move it ``active`` -> ``degraded`` -> ``disabled``. ``disabled`` is terminal
+because a profiler that keeps flapping leaves gaps in the evidence that are
+worse than the profiler simply being off. Once disabled, the recording entry
+points are cheap counted no-ops: no CUDA event is created and no thread starts.
 """
 
 import json
@@ -30,6 +36,42 @@ from relax.utils.straggler.identity import RuntimeIdentity, discover_identity
 
 
 logger = get_logger(__name__)
+
+
+#: Observer states, in escalation order. ``DISABLED`` is terminal: a profiler
+#: that flaps between states produces gaps in the evidence that are worse than
+#: no evidence at all, so once disabled it never returns to ``ACTIVE``.
+STATE_ACTIVE = "active"
+STATE_DEGRADED = "degraded"
+STATE_DISABLED = "disabled"
+
+#: Fixed key set of ``StragglerObserver._counters``: every key is created once,
+#: at construction, so no drop reason or failure kind can grow the dict.
+COUNTER_KEYS: Tuple[str, ...] = (
+    "intervals",
+    "device_intervals",
+    "host_only_intervals",
+    "dropped_pending_full",
+    "dropped_output_full",
+    "readout_timeouts",
+    "observer_errors",
+    "consumer_errors",
+    "disabled_skips",
+    "name_evictions",
+)
+
+#: Cumulative failures (full pending buffer, pool exhaustion, readout timeouts,
+#: consumer/observer errors) after which the observer disables itself for good.
+DISABLE_AFTER_FAILURES = 64
+
+#: Hard cap on the transition-history deque: history is diagnostic, so a record
+#: per failure would make the profiler the unbounded leak it watches for.
+STATE_HISTORY_MAX = 64
+
+#: Hard cap on the per-timer-name failure map. Timer names come from Megatron
+#: call sites and are not enumerable, so the oldest name is evicted (and the
+#: eviction counted) once the budget is reached.
+NAME_BUDGET = 128
 
 
 class EventBackend(Protocol):
@@ -235,6 +277,9 @@ class StragglerObserver:
         clock: Callable[[], float] = time.perf_counter,
         readout_timeout_s: float = 30.0,
         poll_interval_s: float = 0.001,
+        disable_after_failures: int = DISABLE_AFTER_FAILURES,
+        state_history_max: int = STATE_HISTORY_MAX,
+        name_budget: int = NAME_BUDGET,
     ) -> None:
         self._config = config
         self._identity = identity if identity is not None else discover_identity()
@@ -253,16 +298,16 @@ class StragglerObserver:
         self._stopping = False
         self._closed = False
         self._seq = 0
-        self._counters: Dict[str, int] = {
-            "intervals": 0,
-            "device_intervals": 0,
-            "host_only_intervals": 0,
-            "dropped_pending_full": 0,
-            "dropped_output_full": 0,
-            "readout_timeouts": 0,
-            "observer_errors": 0,
-            "consumer_errors": 0,
-        }
+        self._disable_after_failures = max(1, int(disable_after_failures))
+        self._state_history_max = max(1, int(state_history_max))
+        self._name_budget = max(1, int(name_budget))
+        self._counters: Dict[str, int] = {key: 0 for key in COUNTER_KEYS}
+        self._name_failures: Dict[str, int] = {}
+        self._state_lock = threading.Lock()
+        self._state = STATE_ACTIVE
+        self._disable_reason: Optional[str] = None
+        self._state_history: Deque[Dict[str, Any]] = deque()
+        self._record_transition(STATE_ACTIVE, "init")
 
     @property
     def identity(self) -> RuntimeIdentity:
@@ -274,31 +319,152 @@ class StragglerObserver:
         """Return whether CUDA events back the intervals."""
         return self._device_enabled
 
+    @property
+    def state(self) -> str:
+        """Current lifecycle state: ``active``, ``degraded`` or
+        ``disabled``."""
+        return self._state
+
+    @property
+    def disable_reason(self) -> Optional[str]:
+        """Reason the observer disabled itself, or ``None`` while it runs."""
+        return self._disable_reason
+
+    def _failure_total(self) -> int:
+        """Return the cumulative count of counted failures."""
+        pool_exhausted = self._pool.exhausted if self._pool is not None else 0
+        return (
+            self._counters["dropped_pending_full"]
+            + self._counters["readout_timeouts"]
+            + self._counters["consumer_errors"]
+            + self._counters["observer_errors"]
+            + pool_exhausted
+        )
+
+    def _note_name_failure(self, name: str) -> None:
+        """Count one failure against a timer name, within a hard budget."""
+        try:
+            key = name or "unknown"
+            failures = self._name_failures
+            if key in failures:
+                failures[key] += 1
+                return
+            if len(failures) >= self._name_budget:
+                # Bounded: evict the oldest name and count the eviction, so the
+                # audit can see that the budget was actually hit.
+                failures.pop(next(iter(failures)))
+                self._counters["name_evictions"] += 1
+            failures[key] = 1
+        except Exception:  # pragma: no cover - defensive, must never escape
+            self._counters["observer_errors"] += 1
+
+    def _note_failure(self, reason: str) -> None:
+        """Advance the state machine after a counted failure; never raises."""
+        try:
+            failures = self._failure_total()
+            if failures <= 0:
+                return
+            with self._state_lock:
+                if self._state == STATE_DISABLED:
+                    return
+                if self._state == STATE_ACTIVE:
+                    self._transition_locked(STATE_DEGRADED, reason)
+                if failures >= self._disable_after_failures:
+                    self._transition_locked(STATE_DISABLED, reason)
+        except Exception:  # pragma: no cover - defensive, must never escape
+            self._counters["observer_errors"] += 1
+
+    def _disable(self, reason: str) -> None:
+        """Force the terminal ``disabled`` state; never raises."""
+        try:
+            with self._state_lock:
+                if self._state == STATE_DISABLED:
+                    return
+                if self._state == STATE_ACTIVE:
+                    self._transition_locked(STATE_DEGRADED, reason)
+                self._transition_locked(STATE_DISABLED, reason)
+        except Exception:  # pragma: no cover - defensive, must never escape
+            self._counters["observer_errors"] += 1
+
+    def _record_transition(self, state: str, reason: str) -> None:
+        """Record one transition under the state lock; never raises."""
+        try:
+            with self._state_lock:
+                self._transition_locked(state, reason)
+        except Exception:  # pragma: no cover - defensive, must never escape
+            self._counters["observer_errors"] += 1
+
+    def _transition_locked(self, state: str, reason: str) -> None:
+        """Apply and record one transition; caller holds ``_state_lock``."""
+        self._state = state
+        if state == STATE_DISABLED and self._disable_reason is None:
+            self._disable_reason = reason
+        self._state_history.append(
+            {
+                "state": state,
+                "reason": reason,
+                "time": float(self._clock()),
+                "failures": self._failure_total(),
+                "counters": dict(self._counters),
+            }
+        )
+        while len(self._state_history) > self._state_history_max:
+            self._state_history.popleft()
+
     def acquire_interval(self, name: str, log_level: int) -> Optional[IntervalToken]:
-        """Record an interval start; returns ``None`` for host-only timing."""
+        """Record an interval start; returns ``None`` for host-only timing.
+
+        In the terminal ``disabled`` state this is a cheap counted no-op: no
+        event is created and no thread is started, and nothing can raise.
+        """
+        if self._state == STATE_DISABLED:
+            self._counters["disabled_skips"] += 1
+            return None
         if not self._device_enabled or self._pool is None:
             return None
         pair: Optional[Tuple[Any, Any]] = None
         token: Optional[IntervalToken] = None
         try:
+            if not self._ensure_thread():
+                if self._state == STATE_DISABLED:
+                    self._counters["disabled_skips"] += 1
+                return None
             pair = self._pool.acquire_pair()
             if pair is None:
                 self._counters["host_only_intervals"] += 1
+                self._note_name_failure(name)
+                self._note_failure("pool_exhausted")
                 return None
-            self._seq += 1
-            token = IntervalToken(pair[0], pair[1], self._seq)
+            token = IntervalToken(pair[0], pair[1], self._next_seq())
             token.name = name
             token.log_level = log_level
             self._backend.record(token.start_event)
-            self._ensure_thread()
             return token
         except Exception:
+            # A broken CUDA context surfaces here (event creation or recording)
+            # and there is no recoverable action: the failure is counted and the
+            # state machine escalates towards DISABLED, but it must not escape.
             self._counters["observer_errors"] += 1
             if token is not None:
                 self._release(token)
             elif pair is not None:
                 self._pool.release(pair[0], pair[1])
+            self._note_failure("acquire_error")
             return None
+
+    def _next_seq(self) -> int:
+        """Hand every interval a distinct sequence number.
+
+        The wire protocol keys idempotency on ``(run_id, topology_epoch, rank,
+        sample_seq)``. Host-only intervals -- the whole no-CUDA path, and any
+        interval whose event acquisition failed -- used to carry ``seq=0``, so
+        every one of them after the first looked like a duplicate of the first
+        and the degraded path silently stopped being judged at all. Only the
+        training thread mutates this counter, so a plain increment is atomic
+        enough and allocates nothing.
+        """
+        self._seq += 1
+        return self._seq
 
     def complete_interval(
         self,
@@ -309,7 +475,16 @@ class StragglerObserver:
         host_end: float,
         barrier: bool,
     ) -> None:
-        """Record an interval end and queue it for off-thread readout."""
+        """Record an interval end and queue it for off-thread readout.
+
+        In the terminal ``disabled`` state this is a cheap counted no-op: a
+        token acquired before disabling is released so its events cannot leak,
+        and nothing here can raise.
+        """
+        if self._state == STATE_DISABLED:
+            self._counters["disabled_skips"] += 1
+            self._release(token)
+            return
         try:
             self._counters["intervals"] += 1
             if token is None:
@@ -318,7 +493,7 @@ class StragglerObserver:
                     self._build_envelope(
                         name=name,
                         log_level=log_level,
-                        seq=0,
+                        seq=self._next_seq(),
                         host_start=host_start,
                         host_end=host_end,
                         device_ms=None,
@@ -334,15 +509,19 @@ class StragglerObserver:
             token.barrier = barrier
             self._backend.record(token.end_event)
             with self._cv:
-                if len(self._pending) >= self._config.queue_max:
-                    self._counters["dropped_pending_full"] += 1
-                    self._release(token)
-                    return
-                self._pending.append(token)
-                self._cv.notify_all()
+                full = len(self._pending) >= self._config.queue_max
+                if not full:
+                    self._pending.append(token)
+                    self._cv.notify_all()
+            if full:
+                self._counters["dropped_pending_full"] += 1
+                self._note_name_failure(name)
+                self._release(token)
+                self._note_failure("pending_full")
         except Exception:
             self._counters["observer_errors"] += 1
             self._release(token)
+            self._note_failure("complete_error")
 
     def _release(self, token: Any) -> None:
         """Return a token's events to the pool."""
@@ -354,19 +533,56 @@ class StragglerObserver:
             token.end_event = None
         except Exception:
             self._counters["observer_errors"] += 1
+            self._note_failure("release_error")
 
-    def _ensure_thread(self) -> None:
-        """Start the readout thread once, on first use."""
-        if self._thread is not None:
-            return
+    def _ensure_thread(self) -> bool:
+        """Start the readout thread once; ``False`` means it is unavailable.
+
+        A thread that cannot be started, or that has died, disables the
+        observer: nothing is left to drain the pending queue, so recording more
+        intervals would only fill it up.
+        """
+        if self._state == STATE_DISABLED:
+            return False
+        thread = self._thread
+        if thread is not None:
+            if thread.is_alive():
+                return True
+            if not self._stopping and not self._closed:
+                self._counters["observer_errors"] += 1
+                self._disable("readout_thread_died")
+            return False
         with self._cv:
             if self._thread is not None:
-                return
-            self._thread = threading.Thread(target=self._readout_loop, name="straggler-readout", daemon=True)
-            self._thread.start()
+                return self._thread.is_alive()
+            if self._stopping or self._closed:
+                return False
+            try:
+                thread = threading.Thread(target=self._readout_loop, name="straggler-readout", daemon=True)
+                thread.start()
+                self._thread = thread
+            except Exception:
+                self._counters["observer_errors"] += 1
+                self._disable("thread_start_failed")
+                return False
+        return True
 
     def _readout_loop(self) -> None:
-        """Poll pending intervals until closed and drained."""
+        """Poll pending intervals, disabling the observer if the poll dies."""
+        try:
+            self._readout_until_stopped()
+        except BaseException:
+            # Any escape from the poll loop -- including a backend raising a
+            # BaseException -- leaves the queue unserviced, so the observer
+            # disables itself rather than accumulate unreadable intervals.
+            try:
+                self._counters["observer_errors"] += 1
+                self._disable("readout_thread_died")
+            except Exception:  # pragma: no cover - defensive, must never escape
+                pass
+
+    def _readout_until_stopped(self) -> None:
+        """Body of the readout thread, separated so its death is observable."""
         while True:
             with self._cv:
                 if not self._pending:
@@ -391,6 +607,9 @@ class StragglerObserver:
 
     def _process(self, token: IntervalToken) -> bool:
         """Read one interval; returns ``True`` when it should be retried."""
+        if self._state == STATE_DISABLED:
+            self._release(token)
+            return False
         try:
             if self._backend.is_complete(token.end_event):
                 device_ms = self._backend.elapsed_ms(token.start_event, token.end_event)
@@ -400,13 +619,16 @@ class StragglerObserver:
                 return False
             if self._clock() - token.host_end > self._readout_timeout_s:
                 self._counters["readout_timeouts"] += 1
+                self._note_name_failure(token.name)
                 self._deliver(self._envelope_from_token(token, None, "readout_timeout"))
                 self._release(token)
+                self._note_failure("readout_timeout")
                 return False
             return True
         except Exception:
             self._counters["observer_errors"] += 1
             self._release(token)
+            self._note_failure("readout_error")
             return False
 
     def _envelope_from_token(self, token: IntervalToken, device_ms: Optional[float], reason: str) -> TimingEnvelope:
@@ -458,9 +680,14 @@ class StragglerObserver:
                 self._consumer(envelope)
             except Exception:
                 self._counters["consumer_errors"] += 1
+                self._note_name_failure(envelope.name)
+                self._note_failure("consumer_error")
             return
         with self._delivered_lock:
             if len(self._delivered) >= self._config.queue_max:
+                # No consumer means the local buffer is the only sink, so a full
+                # buffer is expected back-pressure, not an observer failure: it
+                # is counted but does not move the state machine.
                 self._counters["dropped_output_full"] += 1
                 return
             self._delivered.append(envelope)
@@ -503,7 +730,7 @@ class StragglerObserver:
                 self._release(token)
 
     def stats(self) -> Dict[str, Any]:
-        """Return counters plus pool and identity state."""
+        """Return counters plus lifecycle, pool and identity state."""
         stats: Dict[str, Any] = dict(self._counters)
         stats["device_timing_enabled"] = self._device_enabled
         stats["pending"] = len(self._pending)
@@ -511,13 +738,25 @@ class StragglerObserver:
         stats["readout_thread_alive"] = bool(self._thread is not None and self._thread.is_alive())
         stats["pool"] = self._pool.stats() if self._pool is not None else {}
         stats["identity"] = self._identity.label
+        stats["state"] = self._state
+        stats["disable_reason"] = self._disable_reason
+        with self._state_lock:
+            stats["state_history"] = [dict(record) for record in self._state_history]
+        stats["name_failures"] = dict(self._name_failures)
         return stats
 
 
 __all__ = [
+    "COUNTER_KEYS",
+    "DISABLE_AFTER_FAILURES",
     "EventBackend",
     "EventPool",
     "IntervalToken",
+    "NAME_BUDGET",
+    "STATE_ACTIVE",
+    "STATE_DEGRADED",
+    "STATE_DISABLED",
+    "STATE_HISTORY_MAX",
     "StragglerObserver",
     "TimingEnvelope",
     "TorchCudaEventBackend",

@@ -8,6 +8,7 @@ deterministically.
 """
 
 import json
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -15,7 +16,13 @@ import pytest
 
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.identity import RuntimeIdentity, discover_identity
-from relax.utils.straggler.observer import EventPool, StragglerObserver, TimingEnvelope
+from relax.utils.straggler.observer import (
+    DISABLE_AFTER_FAILURES,
+    STATE_HISTORY_MAX,
+    EventPool,
+    StragglerObserver,
+    TimingEnvelope,
+)
 
 
 class FakeEvent:
@@ -76,6 +83,8 @@ def make_observer(
     consumer: Optional[Any] = None,
     readout_timeout_s: float = 30.0,
     event_pool: int = 8,
+    disable_after_failures: int = DISABLE_AFTER_FAILURES,
+    state_history_max: int = STATE_HISTORY_MAX,
 ) -> StragglerObserver:
     config = StragglerConfig(enabled=True, queue_max=queue_max, event_pool=event_pool)
     return StragglerObserver(
@@ -85,6 +94,8 @@ def make_observer(
         consumer=consumer,
         readout_timeout_s=readout_timeout_s,
         poll_interval_s=0.001,
+        disable_after_failures=disable_after_failures,
+        state_history_max=state_history_max,
     )
 
 
@@ -150,6 +161,45 @@ def test_observer_without_cuda_still_reports_host_timing() -> None:
     assert seen[0].host_ms == pytest.approx(250.0)
     assert observer.stats()["host_only_intervals"] == 1
     assert observer.stats()["readout_thread_alive"] is False
+
+
+def test_two_host_only_intervals_get_distinct_seq_values() -> None:
+    """Regression: every host-only interval must carry its own sequence.
+
+    The wire protocol keys idempotency on
+    ``(run_id, topology_epoch, rank, sample_seq)``. Host-only intervals used to
+    be stamped ``seq=0``, so the second and every later one looked like a
+    re-delivery of the first and the whole no-CUDA/degraded path stopped being
+    judged.
+    """
+    seen: List[TimingEnvelope] = []
+    observer = make_observer(FakeEventBackend(available=False), consumer=seen.append)
+
+    observer.complete_interval(None, "forward-compute", 2, 1.0, 1.25, False)
+    observer.complete_interval(None, "forward-compute", 2, 2.0, 2.25, False)
+
+    assert len(seen) == 2
+    assert all(envelope.device_ms is None for envelope in seen)
+    assert all(envelope.reason == "no_event_pair" for envelope in seen)
+    assert seen[0].seq != seen[1].seq
+    assert min(envelope.seq for envelope in seen) >= 1
+
+
+def test_pool_exhausted_host_only_intervals_get_distinct_seq_values() -> None:
+    """The degraded path (events exhausted) must allocate sequences too."""
+    seen: List[TimingEnvelope] = []
+    # Incomplete events keep the first (device) interval pending, so only the
+    # host-only deliveries are observed synchronously.
+    observer = make_observer(FakeEventBackend(auto_complete=False), consumer=seen.append, event_pool=2)
+
+    assert observer.acquire_interval("forward-backward", 1) is not None
+    for start in (0.0, 0.1, 0.2):
+        token = observer.acquire_interval("forward-compute", 2)
+        assert token is None  # pool exhausted -> host-only
+        observer.complete_interval(token, "forward-compute", 2, start, start + 0.01, False)
+
+    assert len(seen) == 3
+    assert len({envelope.seq for envelope in seen}) == 3
 
 
 def test_event_pool_exhaustion_degrades_to_host_only() -> None:
@@ -280,6 +330,102 @@ def test_envelope_json_is_flat_and_round_trips() -> None:
     assert payload["device_ms"] == pytest.approx(12.5)
     assert payload["seq"] == 7
     assert "\n" not in envelope.to_json()
+
+
+def test_observer_state_starts_active() -> None:
+    observer = make_observer(FakeEventBackend())
+
+    assert observer.state == "active"
+    assert observer.disable_reason is None
+    assert observer.stats()["state"] == "active"
+    assert observer.stats()["disable_reason"] is None
+
+
+def test_observer_pool_exhaustion_reports_degraded() -> None:
+    observer = make_observer(FakeEventBackend(), event_pool=2)
+
+    assert observer.acquire_interval("forward-backward", 1) is not None
+    assert observer.acquire_interval("forward-compute", 2) is None
+
+    assert observer.state == "degraded"
+    assert observer.disable_reason is None
+    assert observer.stats()["pool"]["exhausted"] == 1
+
+
+def test_observer_repeated_failures_disable_and_then_no_op() -> None:
+    backend = FakeEventBackend()
+    observer = make_observer(backend, event_pool=2, disable_after_failures=3)
+
+    assert observer.acquire_interval("forward-backward", 1) is not None
+    for _ in range(4):
+        assert observer.acquire_interval("forward-compute", 2) is None
+
+    assert observer.state == "disabled"
+    assert observer.disable_reason == "pool_exhausted"
+    created_when_disabled = backend.created
+
+    # Every record attempt after disabling is a counted no-op: no event is
+    # created, no thread is started and nothing raises.
+    for _ in range(5):
+        assert observer.acquire_interval("forward-compute", 2) is None
+        observer.complete_interval(None, "forward-compute", 2, 0.0, 0.1, False)
+
+    assert backend.created == created_when_disabled
+    assert observer.stats()["disabled_skips"] >= 5
+
+
+def test_observer_consumer_error_degrades_without_raising() -> None:
+    def explode(envelope: TimingEnvelope) -> None:
+        raise RuntimeError("consumer exploded")
+
+    observer = make_observer(FakeEventBackend(), consumer=explode)
+    token = observer.acquire_interval("forward-compute", 2)
+    observer.complete_interval(token, "forward-compute", 2, 0.0, 0.1, False)
+
+    assert wait_until(lambda: observer.stats()["consumer_errors"] == 1)
+    assert observer.state == "degraded"
+    assert observer.stats()["name_failures"]["forward-compute"] == 1
+
+
+def test_observer_dead_readout_thread_disables() -> None:
+    observer = make_observer(FakeEventBackend())
+
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    observer._thread = dead
+
+    assert observer.acquire_interval("forward-compute", 2) is None
+    assert observer.state == "disabled"
+    assert observer.disable_reason == "readout_thread_died"
+    assert observer.stats()["readout_thread_alive"] is False
+
+
+def test_observer_state_history_is_bounded_and_records_reasons() -> None:
+    observer = make_observer(FakeEventBackend(), event_pool=2, disable_after_failures=2, state_history_max=2)
+
+    assert observer.acquire_interval("forward-backward", 1) is not None
+    for _ in range(3):
+        observer.acquire_interval("forward-compute", 2)
+
+    history = observer.stats()["state_history"]
+
+    assert len(history) == 2  # hard cap: the oldest record was evicted
+    assert history[-1]["state"] == "disabled"
+    assert "pool_exhausted" in {record["reason"] for record in history}
+    assert all({"time", "counters", "failures"} <= set(record) for record in history)
+
+
+def test_observer_stats_are_json_serialisable() -> None:
+    observer = make_observer(FakeEventBackend(), event_pool=2)
+    observer.acquire_interval("forward-backward", 1)
+    observer.acquire_interval("forward-compute", 2)  # pool exhaustion -> degraded
+
+    payload = json.loads(json.dumps(observer.stats()))
+
+    assert payload["state"] == "degraded"
+    assert isinstance(payload["state_history"], list)
+    assert payload["state_history"][-1]["state"] == "degraded"
 
 
 class TestEventPool:

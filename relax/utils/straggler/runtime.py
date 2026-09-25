@@ -163,9 +163,23 @@ class StragglerRuntime:
         return status
 
     def report(self) -> Dict[str, Any]:
-        """Force a collector summary (used by on-demand diagnostics)."""
+        """Force a collector summary (used by on-demand diagnostics).
+
+        Flushes buffered persistence, so it must not be called on the training
+        thread; use :meth:`summary` there instead.
+        """
         if self._collector is not None:
             return self._collector.report()
+        return self.status()
+
+    def summary(self) -> Dict[str, Any]:
+        """Return a non-flushing summary, safe for the training thread.
+
+        The platform metrics path calls this once per rollout to read counters
+        and pending verdicts without performing any file I/O.
+        """
+        if self._collector is not None:
+            return self._collector.summary()
         return self.status()
 
     def drain_verdicts(self) -> list:

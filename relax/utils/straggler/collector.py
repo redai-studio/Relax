@@ -30,6 +30,7 @@ from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.straggler import protocol
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.detector import StragglerDetector, Verdict
 from relax.utils.straggler.identity import RuntimeIdentity
@@ -47,6 +48,13 @@ MAX_LINE_BYTES = 1 << 20
 #: when no device backend is available, so persistence must not open a file per
 #: envelope.
 WRITE_BATCH = 256
+
+#: Bound and TTL of the collector's idempotency tracker. A reconnect can resend
+#: what was already queued, and a slow link can deliver an older sample after a
+#: newer one; both are dropped (and counted) before they can bias a window. The
+#: bound keeps a flooding peer from growing the collector's memory.
+DEDUP_MAX_ENTRIES = protocol.DEDUP_MAX_ENTRIES
+DEDUP_TTL_S = protocol.DEDUP_TTL_S
 
 
 def parse_address(address: str) -> Tuple[str, int]:
@@ -72,6 +80,7 @@ class TimingCollector:
         self._detector = StragglerDetector(config)
         self._on_verdict = on_verdict
         self._clock = clock
+        self._dedup = protocol.BoundedDedup(max_entries=DEDUP_MAX_ENTRIES, ttl_s=DEDUP_TTL_S, clock=clock)
         self._verdicts: Deque[Verdict] = deque(maxlen=256)
         self._started_at = self._clock()
         self._last_report = self._started_at
@@ -81,6 +90,11 @@ class TimingCollector:
         self._pending: Dict[str, List[str]] = {}
         self._counters: Dict[str, int] = {
             "envelopes": 0,
+            "judged_packets": 0,
+            "invalid_packets": 0,
+            "duplicate_packets": 0,
+            "late_packets": 0,
+            "ingest_errors": 0,
             "flushed_lines": 0,
             "verdicts": 0,
             "reports": 0,
@@ -107,12 +121,44 @@ class TimingCollector:
             logger.warning("straggler collector could not open output files", exc_info=True)
 
     def ingest(self, envelope: Any) -> List[Verdict]:
-        """Absorb one envelope, persist it and return any new verdicts."""
+        """Absorb one envelope, persisting and judging it at most once.
+
+        The gates run in a fixed order so a bad packet can never reach the
+        detector: protocol validation first (an invalid packet is counted and
+        dropped), then transport idempotency (a resend or an out-of-order
+        packet is counted and dropped), and only then the detector. The method
+        is the consumer of both the observer thread and the socket reader, so
+        it never raises, whatever the input.
+        """
         self._counters["envelopes"] += 1
+        try:
+            verdicts = self._ingest_checked(envelope)
+        except Exception:
+            self._counters["ingest_errors"] += 1
+            verdicts = []
+        try:
+            self._maybe_report()
+        except Exception:
+            self._counters["ingest_errors"] += 1
+        return verdicts
+
+    def _ingest_checked(self, envelope: Any) -> List[Verdict]:
+        """Run the validation/dedup gates and judge a packet that passes."""
+        ok, _reason = protocol.validate(envelope)
+        if not ok:
+            self._counters["invalid_packets"] += 1
+            return []
+        decision = self._dedup.check(protocol.dedup_key(envelope))
+        if decision == "duplicate":
+            self._counters["duplicate_packets"] += 1
+            return []
+        if decision == "late":
+            self._counters["late_packets"] += 1
+            return []
+        self._counters["judged_packets"] += 1
         self._append(self._envelope_path, getattr(envelope, "to_json", None))
         verdicts = self._detector.observe(envelope)
         self._handle(verdicts)
-        self._maybe_report()
         return verdicts
 
     def _handle(self, verdicts: List[Verdict]) -> None:
@@ -169,17 +215,32 @@ class TimingCollector:
             return
         self._last_report = now
         self._counters["reports"] += 1
-        self.report()
+        # Ingest can run on the training thread (the no-device path), so the
+        # periodic summary must not touch a file; only the explicit/close path
+        # is allowed to flush.
+        self.summary()
 
-    def report(self) -> Dict[str, Any]:
-        """Log and return the current summary."""
-        self._flush_writers()
+    def report(self, flush: bool = True) -> Dict[str, Any]:
+        """Log and return the current summary.
+
+        Args:
+            flush: When ``True`` (the explicit diagnostic and shutdown path)
+                buffered JSONL lines are written first. Callers on the training
+                thread must use :meth:`summary`, which never writes.
+        """
+        if flush:
+            self._flush_writers()
         status = self.status()
         active = status["active_stragglers"]
         logger.info(
-            "straggler[%s]: envelopes=%d windows=%d verdicts=%d stragglers=%d active=%s",
+            "straggler[%s]: envelopes=%d judged=%d invalid=%d duplicate=%d late=%d "
+            "windows=%d verdicts=%d stragglers=%d active=%s",
             "rank0" if self._identity is None else self._identity.label,
             status["envelopes"],
+            status["judged_packets"],
+            status["invalid_packets"],
+            status["duplicate_packets"],
+            status["late_packets"],
             status["windows_closed"],
             status["verdicts"],
             status["stragglers_reported"],
@@ -188,6 +249,16 @@ class TimingCollector:
         for entry in active:
             logger.info("straggler active: %s", entry)
         return status
+
+    def summary(self) -> Dict[str, Any]:
+        """Return the summary without flushing persistence.
+
+        This is the training-thread-safe accessor: it performs no file I/O, so
+        a per-rollout metrics read cannot block the step. The buffered lines
+        stay pending until the batch bound, an explicit :meth:`report` or
+        :meth:`flush`/close.
+        """
+        return self.report(flush=False)
 
     def drain_verdicts(self) -> List[Verdict]:
         """Return and clear verdicts not yet consumed by the caller."""
@@ -208,6 +279,7 @@ class TimingCollector:
         status: Dict[str, Any] = dict(detector_stats)
         status.update(self._counters)
         status["active_stragglers"] = self._detector.active_stragglers()
+        status["dedup"] = self._dedup.stats()
         status["uptime_s"] = self._clock() - self._started_at
         status["pending_lines"] = {path: len(lines) for path, lines in self._pending.items()}
         status["envelope_path"] = self._envelope_path
@@ -237,9 +309,10 @@ class EnvelopeSender:
         self._counters: Dict[str, int] = {"queued": 0, "sent": 0, "dropped_queue_full": 0, "send_errors": 0}
 
     def send(self, envelope: Any) -> None:
-        """Queue one envelope; never blocks the caller."""
+        """Queue one envelope as a versioned packet; never blocks the
+        caller."""
         try:
-            line = envelope.to_json()
+            line = self._encode(envelope)
         except Exception:
             self._counters["send_errors"] += 1
             return
@@ -251,6 +324,27 @@ class EnvelopeSender:
             self._counters["queued"] += 1
             self._ensure_thread()
             self._cv.notify_all()
+
+    @staticmethod
+    def _encode(envelope: Any) -> str:
+        """Serialise one envelope, stamping the protocol version on the wire.
+
+        The receiver rejects a decoded dict that does not declare its schema,
+        so the sender is the one place that must add it: doing it here keeps
+        the observer (which owns the envelope dataclass) unaware of the
+        transport.
+        """
+        to_dict = getattr(envelope, "to_dict", None)
+        if callable(to_dict):
+            payload = to_dict()
+        else:
+            to_json = getattr(envelope, "to_json", None)
+            payload = json.loads(to_json() if callable(to_json) else str(envelope))
+        if not isinstance(payload, dict):
+            raise ValueError("envelope does not serialise to a mapping")
+        payload.setdefault("schema_version", protocol.SCHEMA_VERSION)
+        payload.setdefault("protocol", protocol.PROTOCOL_NAME)
+        return json.dumps(payload, separators=(",", ":"))
 
     def _ensure_thread(self) -> None:
         """Start the sender thread once."""
@@ -350,6 +444,7 @@ class EnvelopeReceiver:
             "connections": 0,
             "lines": 0,
             "parse_errors": 0,
+            "invalid_packets": 0,
             "callback_errors": 0,
             "accept_errors": 0,
         }
@@ -415,13 +510,22 @@ class EnvelopeReceiver:
                 pass
 
     def _handle_line(self, line: bytes) -> None:
-        """Decode and forward one envelope."""
+        """Decode one line, validate it, and forward it to the callback.
+
+        The receiver is transport, not a judge: it counts protocol violations
+        (so a version skew is visible) but still hands the decoded dict on,
+        because the collector owns the gate that decides whether a packet is
+        judged. Neither a parse failure nor an invalid packet may raise here.
+        """
         try:
             payload = json.loads(line.decode("utf-8"))
         except Exception:
             self._counters["parse_errors"] += 1
             return
         self._counters["lines"] += 1
+        ok, _reason = protocol.validate(payload)
+        if not ok:
+            self._counters["invalid_packets"] += 1
         try:
             self._on_envelope(payload)
         except Exception:
@@ -463,6 +567,8 @@ class EnvelopeReceiver:
 
 
 __all__ = [
+    "DEDUP_MAX_ENTRIES",
+    "DEDUP_TTL_S",
     "EnvelopeReceiver",
     "EnvelopeSender",
     "TimingCollector",

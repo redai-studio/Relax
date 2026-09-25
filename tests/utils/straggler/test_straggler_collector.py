@@ -5,12 +5,15 @@ transport."""
 
 import json
 import time
+from itertools import count
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
 
+from relax.utils.straggler import protocol
 from relax.utils.straggler.collector import (
+    DEDUP_MAX_ENTRIES,
     EnvelopeReceiver,
     EnvelopeSender,
     TimingCollector,
@@ -22,6 +25,12 @@ from relax.utils.straggler.identity import RuntimeIdentity
 from relax.utils.straggler.observer import TimingEnvelope
 
 
+#: A real observer stamps a distinct ``seq`` on every interval. The fixture has
+#: to model that now that the collector dedups on ``(run, epoch, rank, seq)``;
+#: otherwise every envelope of one rank would be a legitimate duplicate.
+_SEQ = count(1)
+
+
 def make_envelope(
     rank: int,
     host_ms: float,
@@ -30,6 +39,7 @@ def make_envelope(
     name: str = "forward-compute",
     cohort: str = "0:0:0:0:0",
     world_size: int = 4,
+    seq: Optional[int] = None,
 ) -> TimingEnvelope:
     """Build a realistic envelope whose host interval is ``host_ms`` long."""
     return TimingEnvelope(
@@ -40,7 +50,7 @@ def make_envelope(
         world_size=world_size,
         name=name,
         log_level=2,
-        seq=rank,
+        seq=next(_SEQ) if seq is None else seq,
         host_start=window_start_s + 0.1,
         host_end=window_start_s + 0.1 + host_ms / 1000.0,
         device_ms=device_ms,
@@ -187,7 +197,123 @@ class TestTimingCollector:
         assert rebuilt.host_ms == pytest.approx(original.host_ms)
 
 
+class TestIngestProtocolGates:
+    """Validation and idempotency run before the detector, and never raise."""
+
+    def test_packet_without_schema_version_is_invalid(self) -> None:
+        collector = make_collector()
+
+        verdicts = collector.ingest({"rank": 0, "name": "forward-compute"})
+
+        assert verdicts == []
+        assert collector.status()["invalid_packets"] == 1
+        assert collector.status()["judged_packets"] == 0
+
+    def test_invalid_packet_is_counted_not_judged_or_persisted(self, tmp_path: Path) -> None:
+        collector = make_collector(output_dir=str(tmp_path))
+
+        verdicts = collector.ingest({"schema_version": protocol.SCHEMA_VERSION, "rank": -1, "name": "forward-compute"})
+        collector.flush()
+
+        status = collector.status()
+        assert verdicts == []
+        assert status["invalid_packets"] == 1
+        assert status["judged_packets"] == 0
+        assert (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8") == ""
+
+    def test_ingest_never_raises_on_junk(self) -> None:
+        collector = make_collector()
+
+        for junk in (None, 42, "not-an-envelope", [], object()):
+            assert collector.ingest(junk) == []
+
+        assert collector.status()["envelopes"] == 5
+        assert collector.status()["invalid_packets"] == 5
+
+    def test_duplicate_packet_is_judged_once(self) -> None:
+        collector = make_collector()
+        packet = make_envelope(2, 300.0, seq=41)
+
+        first = collector.ingest(packet)
+        second = collector.ingest(packet)
+
+        status = collector.status()
+        assert first == [] and second == []
+        assert status["envelopes"] == 2
+        assert status["judged_packets"] == 1
+        assert status["duplicate_packets"] == 1
+        assert status["dedup"]["duplicate"] == 1
+
+    def test_two_host_only_intervals_from_the_real_observer_are_both_judged(self) -> None:
+        """Regression for the seq=0 host-only defect, end to end.
+
+        The observer used to give every host-only interval ``seq=0``; under the
+        protocol's dedup key the collector then counted the second (and every
+        later) host-only packet as a duplicate and never judged it. Two real
+        host-only intervals must now both reach the detector.
+        """
+        from tests.utils.straggler.test_straggler_observer import FakeEventBackend, make_observer
+
+        observed: List[TimingEnvelope] = []
+        observer = make_observer(FakeEventBackend(available=False), consumer=observed.append)
+        observer.complete_interval(None, "forward-compute", 2, 1.0, 1.25, False)
+        observer.complete_interval(None, "forward-compute", 2, 2.0, 2.25, False)
+        assert len(observed) == 2
+        assert observed[0].seq != observed[1].seq
+
+        collector = make_collector()
+        collector.ingest(observed[0])
+        collector.ingest(observed[1])
+
+        status = collector.status()
+        assert status["envelopes"] == 2
+        assert status["judged_packets"] == 2
+        assert status["duplicate_packets"] == 0
+        assert status["dedup"]["duplicate"] == 0
+
+    def test_out_of_order_packet_is_counted_late(self) -> None:
+        collector = make_collector()
+
+        collector.ingest(make_envelope(0, 100.0, seq=10))
+        verdicts = collector.ingest(make_envelope(0, 100.0, seq=5))
+
+        status = collector.status()
+        assert verdicts == []
+        assert status["judged_packets"] == 1
+        assert status["late_packets"] == 1
+        assert status["dedup"]["late"] == 1
+
+    def test_duplicate_and_late_counters_survive_a_summary(self) -> None:
+        collector = make_collector(report_interval_seconds=0.0)
+        collector.ingest(make_envelope(0, 100.0, seq=10))
+        collector.ingest(make_envelope(0, 100.0, seq=10))
+        collector.ingest(make_envelope(0, 100.0, seq=5))
+
+        status = collector.report()
+
+        assert status["duplicate_packets"] == 1
+        assert status["late_packets"] == 1
+        assert status["reports"] >= 1
+
+    def test_status_reports_dedup_state_and_is_json_serialisable(self) -> None:
+        collector = make_collector()
+        collector.ingest(make_envelope(0, 100.0, seq=1))
+
+        payload = json.loads(json.dumps(collector.status()))
+
+        assert payload["dedup"]["max_entries"] == DEDUP_MAX_ENTRIES
+        assert payload["dedup"]["entries"] == 1
+        assert payload["dedup"]["new"] == 1
+
+
 class TestTransport:
+    def test_sender_stamps_the_schema_version(self) -> None:
+        payload = json.loads(EnvelopeSender._encode(make_envelope(0, 100.0)))
+
+        assert payload["schema_version"] == protocol.SCHEMA_VERSION
+        assert payload["protocol"] == protocol.PROTOCOL_NAME
+        assert protocol.validate(payload) == (True, "")
+
     def test_round_trip_over_loopback(self) -> None:
         received: List[Dict[str, Any]] = []
         receiver = EnvelopeReceiver("127.0.0.1:0", received.append)
@@ -245,6 +371,27 @@ class TestTransport:
 
         assert receiver.stats()["parse_errors"] == 1
         assert receiver.stats()["lines"] == 1
+
+    def test_receiver_counts_invalid_packets_without_raising(self) -> None:
+        receiver = EnvelopeReceiver("127.0.0.1:0", lambda payload: None)
+
+        receiver._handle_line(b'{"schema_version": 2, "rank": -1, "name": "forward-compute"}\n')
+        receiver._handle_line(b'{"schema_version": 2, "rank": 0, "name": ""}\n')
+        receiver._handle_line(b'{"schema_version": 2, "rank": 0, "name": "ok", "measurement_kind": "bogus"}\n')
+
+        stats = receiver.stats()
+        assert stats["invalid_packets"] == 3
+        assert stats["parse_errors"] == 0
+        assert stats["lines"] == 3
+
+    def test_receiver_forwards_a_versioned_packet(self) -> None:
+        received: List[Any] = []
+        receiver = EnvelopeReceiver("127.0.0.1:0", received.append)
+
+        receiver._handle_line(b'{"schema_version": 2, "rank": 3, "name": "forward-compute"}\n')
+
+        assert receiver.stats()["invalid_packets"] == 0
+        assert received and received[0]["rank"] == 3
 
     def test_receiver_counts_callback_failures(self) -> None:
         def explode(payload: Any) -> None:
@@ -322,3 +469,17 @@ class TestBufferedPersistence:
         lines = (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip().splitlines()
         assert len(lines) == WRITE_BATCH
         assert collector.status()["flushed_lines"] >= WRITE_BATCH
+
+    def test_summary_does_not_flush_but_report_does(self, tmp_path: Path) -> None:
+        collector = make_collector(output_dir=str(tmp_path))
+        envelope_file = tmp_path / "straggler_envelopes.jsonl"
+
+        collector.ingest(make_envelope(0, 100.0))
+        assert envelope_file.read_text(encoding="utf-8") == ""
+
+        collector.summary()
+        assert envelope_file.read_text(encoding="utf-8") == ""
+        assert collector.status()["pending_lines"][str(envelope_file)] == 1
+
+        collector.report()
+        assert envelope_file.read_text(encoding="utf-8").strip()

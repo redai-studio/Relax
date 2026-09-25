@@ -16,7 +16,14 @@ import pytest
 
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.detector import (
+    MAX_ACTIVE_ENTRIES,
+    MAX_ALIGNED_RANKS,
+    MAX_LABEL_ENTRIES,
+    MAX_PAIRS_PER_WINDOW,
     MAX_PENDING_WINDOWS,
+    MAX_RANKS_PER_WINDOW,
+    MAX_SAMPLES_PER_RANK,
+    MAX_STREAK_ENTRIES,
     VERDICT_RECOVERED,
     VERDICT_STRAGGLER,
     VERDICT_UNCERTAIN,
@@ -41,6 +48,7 @@ class FakeEnvelope:
     device_ms: Optional[float]
     host_start: float
     world_size: int = 4
+    workload: Optional[Dict[str, Any]] = None
 
 
 def make_detector(**overrides: Any) -> StragglerDetector:
@@ -64,6 +72,7 @@ def feed_window(
     world_size: int = 4,
     stage: str = STAGE,
     cohort: str = COHORT,
+    workload: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> List[Any]:
     """Feed one window's worth of envelopes and return the verdicts
     produced."""
@@ -78,6 +87,7 @@ def feed_window(
             device_ms=(device_ms or {}).get(rank),
             host_start=index + 0.1,
             world_size=world_size,
+            workload=(workload or {}).get(rank),
         )
         verdicts.extend(detector.observe(envelope))
     return verdicts
@@ -89,12 +99,17 @@ def feed_equal_windows(
     host_ms: Dict[int, float],
     device_ms: Optional[Dict[int, float]] = None,
     start: int = 0,
+    workload: Optional[Dict[int, Dict[str, Any]]] = None,
+    stage: str = STAGE,
+    cohort: str = COHORT,
 ) -> List[Any]:
     """Feed ``count`` windows with the same per-rank timings, from
     ``start``."""
     verdicts: List[Any] = []
     for index in range(start, start + count):
-        verdicts.extend(feed_window(detector, index, host_ms, device_ms=device_ms))
+        verdicts.extend(
+            feed_window(detector, index, host_ms, device_ms=device_ms, workload=workload, stage=stage, cohort=cohort)
+        )
     return verdicts
 
 
@@ -389,3 +404,276 @@ def test_warmup_skip_is_visible_in_the_stats() -> None:
     stats = detector.stats()
     assert stats["warmup_windows_skipped"] == 3
     assert stats["windows_closed"] == 3
+
+
+# --- measured facts vs inferred causes -------------------------------------
+
+
+def test_facts_contain_measured_references_and_sample_counts() -> None:
+    """A 3-rank window records every number a reviewer needs to re-derive
+    it."""
+    detector = make_detector(persist_windows=1)
+
+    # Two intervals per rank inside window 0, then a later window to close it.
+    for _ in range(2):
+        feed_window(detector, 0, {0: 100.0, 1: 110.0, 2: 200.0}, device_ms={0: 10.0, 1: 10.0, 2: 10.0})
+    verdicts = feed_window(detector, 3, {0: 100.0, 1: 110.0, 2: 200.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER and item.rank == 2)
+    facts = verdict.facts
+    assert facts["observed_ms"] == pytest.approx(200.0)
+    assert facts["peer_fastest_ms"] == pytest.approx(100.0)
+    assert facts["peer_median_ms"] == pytest.approx(110.0)
+    assert facts["ratio"] == pytest.approx(2.0)
+    assert facts["absolute_delta_ms"] == pytest.approx(100.0)
+    assert facts["samples_rank"] == 2
+    assert facts["samples_peers"] == {0: 2, 1: 2}
+    assert facts["samples_peers_min"] == 2
+    assert facts["cohort_size"] == 3
+    assert facts["cohort_expected"] == 4  # FakeEnvelope reports a world size of 4
+    assert facts["coverage_ratio"] == pytest.approx(0.75)
+    assert facts["work_tolerance"] == pytest.approx(0.05)
+    assert facts["persistence"] == 1
+    assert facts["device_ms"] == pytest.approx(10.0)
+    assert facts["peer_device_ms"] == pytest.approx(10.0)
+    assert facts["device_available"] is True
+    assert verdict.measurement_kind == "device_and_host"
+
+
+def test_verdict_to_dict_is_flat_json_with_facts_and_causes() -> None:
+    detector = make_detector(persist_windows=1)
+
+    feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0})
+    detector.flush()
+    verdict = detector.drain_verdicts()[0]
+
+    payload = json.loads(verdict.to_json())
+    assert payload["measurement_kind"] == "host_only"
+    assert payload["candidate_causes"] == ["undetermined"]
+    assert payload["facts"]["observed_ms"] == pytest.approx(200.0)
+    assert payload["facts"]["peer_fastest_ms"] == pytest.approx(100.0)
+    assert payload["facts"]["device_available"] is False
+    assert json.dumps(payload)  # round-tripped without a custom encoder
+    assert set(payload["facts"]) >= {
+        "samples_rank",
+        "samples_peers",
+        "observed_ms",
+        "peer_fastest_ms",
+        "peer_median_ms",
+        "ratio",
+        "absolute_delta_ms",
+        "work_tolerance",
+        "persistence",
+        "cohort_size",
+        "cohort_expected",
+        "coverage_ratio",
+        "device_ms",
+        "peer_device_ms",
+        "device_available",
+        "workload_delta",
+    }
+
+
+def test_describe_prints_facts_before_causes() -> None:
+    detector = make_detector(persist_windows=1)
+
+    feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0})
+    detector.flush()
+    verdict = detector.drain_verdicts()[0]
+
+    text = verdict.describe()
+    assert "facts(" in text
+    assert "reason(measurement)=" in text
+    assert text.index("facts(") < text.index("cause:")
+    assert "rank2" in text
+
+
+def test_candidate_causes_default_to_undetermined_without_device_timing() -> None:
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.candidate_causes == ("undetermined",)
+    assert verdict.measurement_kind == "host_only"
+    assert verdict.facts["device_available"] is False
+    assert "cause: undetermined" in verdict.describe()
+
+
+def test_host_side_delay_possible_when_host_moved_and_device_did_not() -> None:
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0}, device_ms={0: 10.0, 1: 10.0, 2: 10.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.candidate_causes == ("host_side_delay_possible",)
+    assert verdict.reason == "host_only_stall"
+    assert verdict.measurement_kind == "device_and_host"
+    assert "candidate causes: host_side_delay_possible" in verdict.describe()
+
+
+def test_device_or_stream_cause_when_both_moved_without_overclaiming() -> None:
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0}, device_ms={0: 10.0, 1: 10.0, 2: 20.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.candidate_causes == ("device_or_stream_visible_delay_possible",)
+    for cause in verdict.candidate_causes:
+        assert "gpu" not in cause.lower()
+        assert "slow" not in cause.lower()
+
+
+def test_communication_stage_deviation_yields_no_network_or_fault_cause() -> None:
+    """A communication-named stage is a label, not evidence."""
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(
+        detector,
+        1,
+        {0: 100.0, 1: 100.0, 2: 400.0},
+        device_ms={0: 10.0, 1: 10.0, 2: 40.0},
+        stage="nccl-allreduce",
+    )
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.candidate_causes == ("device_or_stream_visible_delay_possible",)
+    rendered = " ".join(verdict.candidate_causes).lower()
+    for forbidden in ("network", "fault", "comm", "nccl", "allreduce", "host_side"):
+        assert forbidden not in rendered
+
+    # Without device timing the same stage must fall back to undetermined.
+    host_only = make_detector(persist_windows=1)
+    verdicts = feed_equal_windows(host_only, 1, {0: 100.0, 1: 100.0, 2: 400.0}, stage="nccl-allreduce")
+    verdicts.extend(host_only.flush())
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.candidate_causes == ("undetermined",)
+
+
+# --- workload is reported, never corrected ---------------------------------
+
+
+def test_workload_delta_is_reported_when_both_sides_report_workloads() -> None:
+    detector = make_detector(persist_windows=1)
+
+    workload = {
+        0: {"tokens": 100, "sequences": 10},
+        1: {"tokens": 100, "sequences": 10},
+        2: {"tokens": 220},
+    }
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0}, workload=workload)
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.facts["workload_delta"] == pytest.approx(1.0)
+    assert verdict.facts["workload_rank"] == pytest.approx(220.0)
+    assert verdict.facts["workload_peer_median"] == pytest.approx(110.0)
+    assert verdict.facts["workload_delta_beyond_tolerance"] is True
+    # The workload difference is visible but the verdict is still reported:
+    # C2 reports it rather than normalising the timing away.
+    assert verdict.kind == VERDICT_STRAGGLER
+
+
+def test_workload_delta_is_none_when_workloads_are_unavailable() -> None:
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.facts["workload_delta"] is None
+    assert verdict.facts["workload_peer_median"] is None
+
+    # A rank that reports a workload while its peers do not is still unknown.
+    partially_reported = make_detector(persist_windows=1)
+    verdicts = feed_equal_windows(partially_reported, 1, {0: 100.0, 1: 100.0, 2: 200.0}, workload={2: {"tokens": 200}})
+    verdicts.extend(partially_reported.flush())
+    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    assert verdict.facts["workload_delta"] is None
+
+
+# --- strict bounds ---------------------------------------------------------
+
+
+def test_window_structures_stay_bounded_and_evictions_are_counted() -> None:
+    # Distinct stage names per window are capped.
+    pairs = make_detector(persist_windows=1)
+    for pair in range(MAX_PAIRS_PER_WINDOW + 5):
+        feed_window(pairs, 0, {0: 100.0, 1: 100.0}, stage=f"stage-{pair}")
+    assert pairs.stats()["pair_evictions"] >= 5
+    assert len(pairs._windows[0].samples) <= MAX_PAIRS_PER_WINDOW
+
+    # Distinct ranks per (cohort, stage) are capped.
+    ranks_detector = make_detector(persist_windows=1)
+    many_ranks = {rank: 100.0 for rank in range(MAX_RANKS_PER_WINDOW + 5)}
+    feed_window(ranks_detector, 0, many_ranks)
+    assert ranks_detector.stats()["rank_evictions"] >= 5
+    tracked = next(iter(ranks_detector._windows[0].samples.values()))
+    assert len(tracked) <= MAX_RANKS_PER_WINDOW
+
+    # Intervals retained per rank are capped.
+    samples = make_detector(persist_windows=1)
+    for _ in range(MAX_SAMPLES_PER_RANK + 5):
+        feed_window(samples, 0, {0: 100.0, 1: 100.0})
+    assert samples.stats()["sample_evictions"] >= 5
+    tracked = next(iter(samples._windows[0].samples.values()))
+    assert len(tracked[0]) == MAX_SAMPLES_PER_RANK
+
+
+def test_judgement_state_maps_stay_bounded_and_count_evictions() -> None:
+    detector = make_detector(persist_windows=1)
+
+    # Fixed ranks (so their windows advance) with a fresh stage name per window:
+    # every window contributes new (cohort, stage, rank) streak and label keys.
+    window = 0
+    while detector.stats()["streak_evictions"] == 0 and window < 64:
+        for pair in range(MAX_PAIRS_PER_WINDOW):
+            feed_window(detector, window, {0: 100.0, 1: 200.0}, stage=f"s{window}-{pair}")
+        window += 1
+
+    # The cap has to be reached by genuinely filling it: each window contributes
+    # MAX_PAIRS_PER_WINDOW fresh (cohort, stage, rank) streak keys, so the keys
+    # fed before the first eviction must exceed the documented bound. This
+    # assertion fails if the bound is quietly lowered to satisfy the test.
+    assert window * MAX_PAIRS_PER_WINDOW > MAX_STREAK_ENTRIES
+
+    stats = detector.stats()
+    assert stats["streak_evictions"] > 0
+    assert stats["label_evictions"] > 0
+    assert stats["streak_entries"] <= MAX_STREAK_ENTRIES
+    assert stats["label_entries"] <= MAX_LABEL_ENTRIES
+
+
+def test_aligned_rank_map_stays_bounded_and_counts_evictions() -> None:
+    detector = make_detector(persist_windows=1)
+
+    # A malformed producer could invent a new rank forever: each first sighting
+    # adds an alignment epoch, so that map needs its own cap.
+    for rank in range(MAX_ALIGNED_RANKS + 5):
+        feed_window(detector, 0, {rank: 100.0})
+
+    stats = detector.stats()
+    assert stats["epoch_evictions"] >= 5
+    assert stats["aligned_ranks"] <= MAX_ALIGNED_RANKS
+
+
+def test_active_set_and_verdict_deque_stay_bounded() -> None:
+    detector = make_detector(persist_windows=1)
+
+    # More slow ranks than the active cap, all in one window with one fast peer.
+    ranks = {rank: 400.0 for rank in range(1, MAX_ACTIVE_ENTRIES + 50)}
+    ranks[0] = 100.0
+    feed_window(detector, 0, ranks)
+    detector.flush()
+
+    stats = detector.stats()
+    assert stats["active_evictions"] > 0
+    assert stats["verdict_evictions"] > 0
+    assert stats["active_stragglers"] <= MAX_ACTIVE_ENTRIES
+    assert stats["retained_verdicts"] <= stats["caps"]["MAX_VERDICTS"]
+    assert stats["streak_entries"] <= MAX_STREAK_ENTRIES

@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 from relax.utils import tracking_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.straggler import is_straggler_profiler_enabled
+from relax.utils.straggler.reporter import report_once
 from relax.utils.timer import Timer
 
 
@@ -85,6 +87,14 @@ def log_perf_data_raw(
                 log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
+
+    # Task 11 straggler profiler (default off): merge its platform metrics only
+    # when enabled. Guarded so a profiler failure cannot affect perf metrics.
+    try:
+        if is_straggler_profiler_enabled():
+            log_dict.update(report_once(args, rollout_id))
+    except Exception:
+        logger.debug("straggler metric merge failed", exc_info=True)
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step

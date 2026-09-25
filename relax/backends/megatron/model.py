@@ -45,6 +45,7 @@ from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.straggler import get_straggler_timers
+from relax.utils.straggler.context import record_optimizer_step
 from relax.utils.timer import timer
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
@@ -975,6 +976,7 @@ def train_one_step(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     step_global_batch_size: int,
+    num_steps_per_rollout: int,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -991,6 +993,8 @@ def train_one_step(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
         step_global_batch_size (int): Number of distinct sample indices in this optimizer step.
+        num_steps_per_rollout (int): Number of optimizer steps in this rollout, used to
+            derive a run-wide ``global_step`` for the straggler profiler.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -1001,6 +1005,7 @@ def train_one_step(
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).
     capture_hooks.begin_step_for(args, rollout_id, step_id)
+    record_optimizer_step(rollout_id, step_id, num_steps_per_rollout)
 
     # Set grad to zero.
     for model_chunk in model:
@@ -1475,6 +1480,7 @@ def train(
                 opt_param_scheduler,
                 num_microbatches[step_id],
                 global_batch_sizes[step_id],
+                num_steps_per_rollout,
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)
