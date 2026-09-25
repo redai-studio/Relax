@@ -119,7 +119,7 @@ def test_failed_construction_disables_profiler_without_raising(monkeypatch: pyte
     def explode(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(straggler, "StragglerTimers", explode)
+    monkeypatch.setattr(straggler, "StragglerRuntime", explode)
     straggler.reset_straggler_state_for_tests()
 
     assert straggler.get_straggler_timers() is None

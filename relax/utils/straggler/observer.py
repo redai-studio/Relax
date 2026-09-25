@@ -198,6 +198,30 @@ class TimingEnvelope:
         """Serialise to one JSONL line without a trailing newline."""
         return json.dumps(self.to_dict(), separators=(",", ":"))
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "TimingEnvelope":
+        """Rebuild an envelope received from another rank.
+
+        ``host_ms`` is derived, so it is ignored on the way back in; a
+        malformed payload still yields a usable envelope because every field
+        falls back to a neutral value.
+        """
+        return cls(
+            run_id=str(payload.get("run_id", "")),
+            rank=int(payload.get("rank", -1)),
+            cohort=str(payload.get("cohort", "")),
+            label=str(payload.get("label", "")),
+            world_size=int(payload.get("world_size", 1) or 1),
+            name=str(payload.get("name", "")),
+            log_level=int(payload.get("log_level", 0) or 0),
+            seq=int(payload.get("seq", 0) or 0),
+            host_start=float(payload.get("host_start", 0.0) or 0.0),
+            host_end=float(payload.get("host_end", 0.0) or 0.0),
+            device_ms=None if payload.get("device_ms") is None else float(payload["device_ms"]),
+            barrier=bool(payload.get("barrier", False)),
+            reason=str(payload.get("reason", "")),
+        )
+
 
 class StragglerObserver:
     """Timer sink that reads intervals back without blocking the trainer."""
