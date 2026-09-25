@@ -440,9 +440,12 @@ class TestPatchConfig(unittest.TestCase):
         """Re-review finding: the former single-cycle barrier let a stalled
         service starve every later cycle -- with GenRM parked on a 30 s
         timeout, a healthy rollout could not run its configured interval at
-        all. Per-service loops must keep rollout evaluating across rounds
-        while GenRM is still blocked (bot spec: at least two rollout rounds
-        before the GenRM block lifts)."""
+        all.
+
+        Per-service loops must keep rollout evaluating across rounds while
+        GenRM is still blocked (bot spec: at least two rollout rounds before
+        the GenRM block lifts).
+        """
         import time as _time
 
         config = AutoscalerConfig()
@@ -490,8 +493,8 @@ class TestPatchConfig(unittest.TestCase):
         self.assertGreaterEqual(rounds, 2)
 
     def test_removed_service_target_stops_its_worker(self):
-        """A service removed by a config PATCH must lose its evaluation
-        worker; rollout keeps evaluating across the removal (supervisor
+        """A service removed by a config PATCH must lose its evaluation worker;
+        rollout keeps evaluating across the removal (supervisor
         reconciliation)."""
         config = AutoscalerConfig()
         config.service_targets = {"genrm": "http://genrm:8000/genrm"}
@@ -519,7 +522,7 @@ class TestPatchConfig(unittest.TestCase):
             genrm_calls_at_removal = [c for c in calls if c == "genrm"]
             for _ in range(50):  # a few supervisor polls
                 await asyncio.sleep(0.01)
-                if "rollout" in calls[len(genrm_calls_at_removal):]:
+                if "rollout" in calls[len(genrm_calls_at_removal) :]:
                     deadline_seen = True
                     break
             supervisor.cancel()

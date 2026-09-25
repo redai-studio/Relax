@@ -420,11 +420,13 @@ class TestReconcileDrainFence(unittest.TestCase):
 
     def test_completed_lifecycle_without_victim_reconciles(self):
         """Review finding (re-review): a scale-in that physically completed
-        underneath a watcher which lost its progress RPCs until deadline
-        leaves the registry dirty (FAILED + cleanup_required) with the
-        manager reporting COMPLETED / physical_done / no victim. The
-        reconcile must accept that positive completion proof and release the
-        mutex instead of refusing forever."""
+        underneath a watcher which lost its progress RPCs until deadline leaves
+        the registry dirty (FAILED + cleanup_required) with the manager
+        reporting COMPLETED / physical_done / no victim.
+
+        The reconcile must accept that positive completion proof and release
+        the mutex instead of refusing forever.
+        """
         calls = []
 
         def _progress_remote(request_id, timeout=None):

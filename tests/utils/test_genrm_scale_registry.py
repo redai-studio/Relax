@@ -493,8 +493,8 @@ class TestStrictBounds(unittest.TestCase):
     def test_dangling_records_expire_by_ttl(self):
         """Bot re-review repro: with ``max_history`` smaller than the key
         count, operations are evicted from history; advancing time past the
-        replay TTL must then remove the orphaned keys too (the first
-        bounded-history pass skipped them forever)."""
+        replay TTL must then remove the orphaned keys too (the first bounded-
+        history pass skipped them forever)."""
         registry = self._registry()
         registry.max_history = 2
         keys = []
@@ -513,16 +513,18 @@ class TestStrictBounds(unittest.TestCase):
         # History is bounded; the four oldest operations were evicted.
         self.assertLessEqual(len(registry._operations), registry.max_history)
         # Their replay records are now dangling -- but still evictable.
-        dangling = [k for k in keys if ("scale_out", k) in registry._idempotency
-                    and registry._idempotency[("scale_out", k)].request_id not in registry._operations]
+        dangling = [
+            k
+            for k in keys
+            if ("scale_out", k) in registry._idempotency
+            and registry._idempotency[("scale_out", k)].request_id not in registry._operations
+        ]
         self.assertEqual(len(dangling), 4)
         # Advance every record past the replay window and trigger eviction.
         for record in registry._idempotency.values():
             record.created_at -= registry.replay_window_secs + 1
         registry._evict_bounded_history_locked()
-        self.assertEqual(
-            [k for k in keys if ("scale_out", k) in registry._idempotency], []
-        )
+        self.assertEqual([k for k in keys if ("scale_out", k) in registry._idempotency], [])
 
     def test_protected_records_survive_the_cap(self):
         """Live and dirty-terminal outcomes are never evicted, even while the
