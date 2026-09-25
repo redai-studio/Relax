@@ -1572,7 +1572,14 @@ def _compute_genrm_server_args(
     kwargs = {
         "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
-        "random_seed": args.seed + rank,
+        # Replica-invariant seeding: GenRM is a frozen scoring service, so
+        # every replica must sample identically for an identical request.
+        # Deriving the seed from the engine rank made the elastic replica
+        # disagree with the initial one on borderline inputs under the
+        # official sampling config (measured 2/50 flips); the rollout builder
+        # below keeps its rank-derived seed (sampling diversity is wanted
+        # there, not here).
+        "random_seed": args.seed,
         # memory
         "enable_memory_saver": args.offload_rollout,
         # distributed
