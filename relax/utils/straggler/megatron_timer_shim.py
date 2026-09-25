@@ -318,13 +318,46 @@ class StragglerTimerHandle:
         return self._active_host_time
 
 
+def _inert_straggler_timers() -> "StragglerTimers":
+    """Rebuild a serialised shim as an inert, sinkless instance.
+
+    Reachable only through :meth:`StragglerTimers.__reduce__`. A shim that
+    crosses a process boundary (Megatron's bridge converter broadcasts the
+    cleaned ``config`` to the other pipeline ranks) must not carry the readout
+    thread, the socket, the locks or the CUDA event pool. The rebuilt object
+    still satisfies the timer interface; it simply records nothing.
+    """
+    return StragglerTimers(StragglerConfig(enabled=False), sink=NullTimerSink())
+
+
 class StragglerTimers:
     """Drop-in stand-in for :class:`megatron.core.timers.Timers`.
 
     The object is assigned to ``config.timers`` in the training backend, so it
     must satisfy exactly the interface Megatron exercises there: ``timers(name,
     log_level=...)`` returning a handle with ``start``/``stop``.
+
+    Pickle boundary: Megatron's bridge converter runs
+    ``remove_non_pickleables(config, max_depth=3)`` before broadcasting a config
+    to the pipeline ranks. That walk does ``copy.copy(obj)`` and then
+    ``setattr`` for every attribute in ``vars(obj)``, so an instance whose
+    ``__dict__`` exposes a frozen dataclass makes it raise
+    ``FrozenInstanceError``. The shim therefore keeps no instance ``__dict__``
+    (``__slots__``), which takes it out of that walk, and defines
+    ``__reduce__`` so the config that is then pickled and broadcast carries an
+    inert shim instead of the live thread/socket state.
     """
+
+    __slots__ = (
+        "_config",
+        "_log_level",
+        "_sink",
+        "_clock",
+        "_timers",
+        "_log_levels",
+        "_noop",
+        "_counters",
+    )
 
     def __init__(
         self,
@@ -364,6 +397,15 @@ class StragglerTimers:
         event pool, locks and readout thread are not copyable.
         """
         return self
+
+    def __reduce__(self) -> Any:
+        """Serialise as an inert shim, never as live process state.
+
+        Megatron broadcasts the cleaned config to the other pipeline ranks
+        (``broadcast_obj_from_pp_rank`` in the bridge converter), so the shim
+        would otherwise be pickled together with a readout thread and a socket.
+        """
+        return (_inert_straggler_timers, ())
 
     def clock(self) -> float:
         """Return the monotonic host clock used for interval boundaries."""
