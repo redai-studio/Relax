@@ -20,8 +20,8 @@ unambiguous:
 * RT-06 -- the shim's timer-name table must be bounded;
 * RT-07 -- ranks with different expert-parallel roles must not share a cohort;
 * RT-08 -- workload counters must survive the wire and reach the detector;
-* RT-09 -- (open, xfail) a rank starting three windows late must still be
-  compared; the current per-rank window anchoring never compares it.
+* RT-09 -- a rank starting three windows late must still be compared (fixed by
+  the shared cohort anchor), while its own cold-start windows stay warmup.
 """
 
 import socket
@@ -370,19 +370,17 @@ def test_workload_delta_is_reported_over_the_wire_envelope() -> None:
     assert straggler.facts["workload_delta_beyond_tolerance"] is True
 
 
-# --- RT-09 (open): a rank that starts >= 3 windows late is never compared --------
+# --- RT-09: a rank that starts >= 3 windows late is still compared --------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RT-09: window indices are anchored to each rank's own first observation and "
-        "windows close once the fastest rank advances two ahead, so a rank joining "
-        "three or more windows late is closed out before its first sample and is never "
-        "compared. Needs a shared cohort anchor plus per-rank warmup."
-    ),
-)
 def test_rank_starting_three_windows_late_is_still_compared() -> None:
+    """The straight-line form of the original defect.
+
+    rank 1 starts 15 s (three 5 s windows) after rank 0 and is 3x slow. Windows
+    are anchored to the cohort, so both ranks land in the same wall-clock window
+    once rank 1 is up; before the fix rank 0 closed every shared window before
+    rank 1's first sample and the straggler was never named.
+    """
     detector = StragglerDetector(
         StragglerConfig(enabled=True, window_seconds=5.0, warmup_windows=0, persist_windows=1, work_tolerance=0.05)
     )
@@ -398,3 +396,34 @@ def test_rank_starting_three_windows_late_is_still_compared() -> None:
         t += 0.5
     verdicts += detector.flush()
     assert [v.rank for v in verdicts if v.kind == VERDICT_STRAGGLER] == [1]
+
+
+def test_late_rank_cold_start_is_warmup_not_a_straggler() -> None:
+    """Per-rank warmup: a late rank's own first windows must not be a finding.
+
+    A shared anchor alone would judge rank 1 from its very first window. rank 1
+    starts 20 s in and is 4x slow only for its own first two windows, then
+    matches rank 0 exactly: nothing may be reported, and the excluded samples
+    must be visible in the counters.
+    """
+    detector = StragglerDetector(
+        StragglerConfig(enabled=True, window_seconds=5.0, warmup_windows=2, persist_windows=1, work_tolerance=0.05)
+    )
+    verdicts: List[Any] = []
+    seq = {0: 0, 1: 0}
+    t = 0.0
+    while t < 55.0:
+        seq[0] += 1
+        verdicts += detector.observe(envelope(0, seq[0], host_ms=100.0, start_s=t))
+        if t >= 20.0:
+            seq[1] += 1
+            # Slow for its own first two windows (t in [20, 30)), then normal.
+            host_ms = 400.0 if t < 30.0 else 100.0
+            verdicts += detector.observe(envelope(1, seq[1], host_ms=host_ms, start_s=t))
+        t += 0.5
+    verdicts += detector.flush()
+
+    assert [v.rank for v in verdicts if v.kind == VERDICT_STRAGGLER] == []
+    stats = detector.stats()
+    assert stats["warmup_samples_skipped"] > 0
+    assert stats["warmup_windows_skipped"] >= 1

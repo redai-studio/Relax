@@ -104,6 +104,10 @@ MAX_LABEL_ENTRIES = 4096
 #: otherwise invent a new rank on every observation.
 MAX_ALIGNED_RANKS = 4096
 
+#: Bound on per-cohort window anchors; malformed envelopes could otherwise
+#: invent a new cohort string (and therefore a new anchor) on every observation.
+MAX_COHORT_ANCHORS = 1024
+
 #: Bound on concurrently flagged ``(cohort, stage, rank)`` triples.
 MAX_ACTIVE_ENTRIES = 512
 
@@ -392,7 +396,7 @@ class _Window:
     detector counters instead of being silently dropped.
     """
 
-    __slots__ = ("index", "samples", "labels", "world_size", "cohort_expected", "_counters")
+    __slots__ = ("index", "samples", "labels", "world_size", "cohort_expected", "warmup_samples", "_counters")
 
     def __init__(self, index: int, counters: Dict[str, int]) -> None:
         self.index = index
@@ -402,6 +406,9 @@ class _Window:
         self.labels: Dict[int, str] = {}
         self.world_size = 1
         self.cohort_expected: Optional[int] = None
+        #: Samples excluded by per-rank warmup. Kept so a window that ends up
+        #: with no judged sample is still reported as a warmup window.
+        self.warmup_samples = 0
         self._counters = counters
 
     def add(self, envelope: Any) -> None:
@@ -475,6 +482,7 @@ class StragglerDetector:
         self._verdicts: Deque[Verdict] = deque()
         self._streak: Dict[Tuple[str, str, int], int] = {}
         self._epoch: Dict[int, float] = {}
+        self._cohort_epoch: Dict[str, float] = {}
         self._active: Set[Tuple[str, str, int]] = set()
         self._labels: Dict[Tuple[str, str, int], str] = {}
         self._counters: Dict[str, int] = {
@@ -482,6 +490,7 @@ class StragglerDetector:
             "windows_closed": 0,
             "windows_forced": 0,
             "warmup_windows_skipped": 0,
+            "warmup_samples_skipped": 0,
             "incomplete_windows": 0,
             "cohort_stage_pairs": 0,
             "uncertain_judgements": 0,
@@ -493,6 +502,7 @@ class StragglerDetector:
             "streak_evictions": 0,
             "label_evictions": 0,
             "epoch_evictions": 0,
+            "cohort_epoch_evictions": 0,
             "active_evictions": 0,
             "pair_evictions": 0,
             "rank_evictions": 0,
@@ -512,24 +522,49 @@ class StragglerDetector:
         self._counters["envelopes"] += 1
         try:
             host_start = float(envelope.host_start)
+            if not math.isfinite(host_start):
+                # A non-finite clock would poison both the cohort anchor and the
+                # warmup baseline; it is a malformed packet, not a fast rank.
+                self._counters["invalid_samples"] += 1
+                return []
             rank = int(envelope.rank)
-            epoch = self._epoch.get(rank)
-            if epoch is None:
-                # Evicting an alignment epoch re-bases that rank's windows on its
-                # next observation; the eviction is counted so the reset is
+            cohort = str(envelope.cohort)
+            first = self._epoch.get(rank)
+            if first is None:
+                # Evicting an alignment epoch re-bases that rank's *warmup* on
+                # its next observation; the eviction is counted so the reset is
                 # visible instead of silently changing window membership.
                 _evict_to_cap(self._epoch, MAX_ALIGNED_RANKS, self._counters, "epoch_evictions")
-                epoch = host_start
-                self._epoch[rank] = epoch
+                first = host_start
+                self._epoch[rank] = first
+            anchor = self._cohort_epoch.get(cohort)
+            if anchor is None:
+                # Windows are anchored to the cohort's first observation, not to
+                # each rank's own: a rank that starts later then lands in the
+                # same wall-clock window as its peers instead of falling a fixed
+                # number of windows behind them and never being compared. The
+                # per-rank ``_epoch`` stays as the warmup baseline.
+                _evict_to_cap(self._cohort_epoch, MAX_COHORT_ANCHORS, self._counters, "cohort_epoch_evictions")
+                anchor = host_start
+                self._cohort_epoch[cohort] = anchor
             # Integer microseconds: `(4.1 - 0.1) / 1.0` floors to 3 in binary
             # floating point, which would silently merge two windows.
             window_us = max(1, int(round(self._config.window_seconds * 1e6)))
-            index = int(round(max(0.0, host_start - epoch) * 1e6)) // window_us
+            index = int(round(max(0.0, host_start - anchor) * 1e6)) // window_us
             window = self._windows.get(index)
             if window is None:
                 window = _Window(index, self._counters)
                 self._windows[index] = window
-            window.add(envelope)
+            warmup_span = self._config.warmup_windows * self._config.window_seconds
+            if warmup_span > 0.0 and (host_start - first) < warmup_span:
+                # Startup is not a straggler, and it is per rank: lazy CUDA
+                # allocation and the first data batch make a late-starting rank
+                # look momentarily slow. The window is created (so the skip
+                # stays visible in the stats) but no sample is recorded.
+                window.warmup_samples += 1
+                self._counters["warmup_samples_skipped"] += 1
+            else:
+                window.add(envelope)
         except Exception:
             self._counters["uncertain_judgements"] += 1
             return []
@@ -563,10 +598,11 @@ class StragglerDetector:
         if window is None:
             return []
         self._counters["windows_closed"] += 1
-        if index < self._config.warmup_windows:
-            # Startup is not a straggler: lazy CUDA allocation and the first data
-            # batch make every rank look momentarily slow. Counted, not hidden.
-            self._counters["warmup_windows_skipped"] += 1
+        if not window.samples:
+            # Warmup samples (and malformed ones) never reached a rank bucket, so
+            # there is nothing to judge. Counted, not hidden.
+            if window.warmup_samples:
+                self._counters["warmup_windows_skipped"] += 1
             return []
         verdicts: List[Verdict] = []
         for (cohort, name), per_rank in window.samples.items():
@@ -798,6 +834,7 @@ class StragglerDetector:
         stats["retained_verdicts"] = len(self._verdicts)
         stats["active_stragglers"] = len(self._active)
         stats["aligned_ranks"] = len(self._epoch)
+        stats["aligned_cohorts"] = len(self._cohort_epoch)
         stats["streak_entries"] = len(self._streak)
         stats["label_entries"] = len(self._labels)
         stats["work_tolerance"] = self._config.work_tolerance
@@ -808,6 +845,7 @@ class StragglerDetector:
             "MAX_STREAK_ENTRIES": MAX_STREAK_ENTRIES,
             "MAX_LABEL_ENTRIES": MAX_LABEL_ENTRIES,
             "MAX_ALIGNED_RANKS": MAX_ALIGNED_RANKS,
+            "MAX_COHORT_ANCHORS": MAX_COHORT_ANCHORS,
             "MAX_ACTIVE_ENTRIES": MAX_ACTIVE_ENTRIES,
             "MAX_PAIRS_PER_WINDOW": MAX_PAIRS_PER_WINDOW,
             "MAX_RANKS_PER_WINDOW": MAX_RANKS_PER_WINDOW,
@@ -822,6 +860,7 @@ __all__ = [
     "CANDIDATE_UNDETERMINED",
     "MAX_ACTIVE_ENTRIES",
     "MAX_ALIGNED_RANKS",
+    "MAX_COHORT_ANCHORS",
     "MAX_LABEL_ENTRIES",
     "MAX_PAIRS_PER_WINDOW",
     "MAX_PENDING_WINDOWS",

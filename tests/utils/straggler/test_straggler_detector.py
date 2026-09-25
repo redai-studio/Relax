@@ -344,31 +344,41 @@ def test_malformed_envelope_does_not_raise() -> None:
 def test_staggered_rank_starts_are_aligned_by_relative_time() -> None:
     """A rank that began profiling seconds later must still be comparable.
 
-    Process startup is staggered in practice (imports, actor placement), so
-    absolute-clock windows can leave every rank alone in its own window and
-    turn every judgement into ``uncertain``.
+    Process startup is staggered in practice (imports, actor placement), but the
+    training loop is collective-synchronised afterwards, so every live rank
+    reports the *same wall-clock* window. Windows are anchored to the cohort's
+    first observation, not to each rank's own, so a rank joining three windows
+    in still shares a window with its peers. (The previous form of this test fed
+    each rank's own relative window at a different wall time, which is exactly
+    the non-contemporaneous comparison the cohort anchor removes.)
     """
     detector = make_detector(persist_windows=1)
 
-    verdicts: List[Any] = []
-    for window in range(4):
+    starts = {0: 0.0, 1: 0.5, 2: 3.0}  # rank 2 is three windows "late"
+    flat: List[Any] = []
+    for tick in range(12):
+        wall = tick + 0.1
         for rank, host_ms in ((0, 100.0), (1, 100.0), (2, 400.0)):
-            offset = (window + rank * 7) * 1.0  # rank 2 is 14s "late"
-            envelope = FakeEnvelope(
-                cohort=COHORT,
-                name=STAGE,
-                rank=rank,
-                label=f"rank{rank}/tp0/pp0",
-                host_ms=host_ms,
-                device_ms=None,
-                host_start=offset + 0.1,
-                world_size=4,
+            if wall < starts[rank]:
+                continue
+            flat.extend(
+                detector.observe(
+                    FakeEnvelope(
+                        cohort=COHORT,
+                        name=STAGE,
+                        rank=rank,
+                        label=f"rank{rank}/tp0/pp0",
+                        host_ms=host_ms,
+                        device_ms=None,
+                        host_start=wall,
+                        world_size=4,
+                    )
+                )
             )
-            verdicts.extend(detector.observe(envelope))
 
-    stragglers = [verdict for verdict in verdicts if verdict.kind == VERDICT_STRAGGLER]
+    stragglers = [verdict for verdict in flat if verdict.kind == VERDICT_STRAGGLER]
     assert stragglers and {verdict.rank for verdict in stragglers} == {2}
-    assert not [verdict for verdict in verdicts if verdict.kind == VERDICT_UNCERTAIN]
+    assert not [verdict for verdict in flat if verdict.kind == VERDICT_UNCERTAIN]
     assert detector.stats()["aligned_ranks"] == 3
 
 
