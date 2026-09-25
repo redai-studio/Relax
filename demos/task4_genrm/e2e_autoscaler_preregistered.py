@@ -595,10 +595,16 @@ def main() -> int:
             (e["host"], e["port"]) for e in final_b["engines"]
         }
         mem_b = _mem_stable()
-        verdicts["B3_resources_returned"] = (
-            ray.available_resources().get("GPU", 0) >= baseline_free_gpus
-            and all(abs(a - b) <= 500 for a, b in zip(mem_b, baseline_mem))
-            and pg_count() == baseline_pgs
+        free_b = ray.available_resources().get("GPU", 0)
+        pgs_b = pg_count()
+        mem_ok_b = all(abs(a - b) <= 500 for a, b in zip(mem_b, baseline_mem))
+        verdicts["B3_resources_returned"] = free_b >= baseline_free_gpus and mem_ok_b and pgs_b == baseline_pgs
+        ev.log(
+            "round_b_resources",
+            free=f"{free_b}/{baseline_free_gpus}",
+            pgs=f"{pgs_b}/{baseline_pgs}",
+            mem_ok=mem_ok_b,
+            mem_mib=mem_b,
         )
         ev.log("round_b_done", scale_in=bool(si_b), final=final_b.get("current"))
 
