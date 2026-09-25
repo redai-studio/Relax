@@ -19,6 +19,7 @@ import atexit
 import json
 import os
 import sys
+import threading
 from typing import Any, Callable, Dict, Optional
 
 from relax.utils.logging_utils import get_logger
@@ -30,6 +31,12 @@ from relax.utils.straggler.observer import StragglerObserver, TimingEnvelope
 
 
 logger = get_logger(__name__)
+
+#: Upper bound on the periodic status-writer cadence. The writer runs on its own
+#: daemon thread, so the cap only bounds how stale ``runtime_status.json`` can be
+#: when the process is killed without a graceful ``close()`` (Ray SIGTERMs the
+#: actors at job end, and atexit does not run for a signal death).
+STATUS_WRITE_MAX_INTERVAL_S = 10.0
 
 
 class StragglerRuntime:
@@ -51,6 +58,8 @@ class StragglerRuntime:
         self._started = False
         self._closed = False
         self._errors = 0
+        self._status_thread: Optional[threading.Thread] = None
+        self._status_stop = threading.Event()
         if register_atexit:
             atexit.register(self.close)
 
@@ -119,7 +128,42 @@ class StragglerRuntime:
             self._errors += 1
             self._timers = None
             logger.warning("straggler profiler failed to start; Megatron timers stay disabled", exc_info=True)
+        if self._timers is not None:
+            self._start_status_writer()
         return self
+
+    def _start_status_writer(self) -> None:
+        """Persist the counters periodically, off the training thread.
+
+        ``close()`` writes the status files, but Ray tears the actors down with
+        SIGTERM at job end, so atexit never runs and no status file was
+        produced for a completed arm. This daemon thread bounds that gap: an
+        arm that is killed keeps a status file at most one interval stale.
+        Fail-open and bounded (one thread, a constant interval, errors
+        counted).
+        """
+        if not self._config.output_dir or self._status_thread is not None:
+            return
+        interval = max(0.1, min(self._config.report_interval_seconds, STATUS_WRITE_MAX_INTERVAL_S))
+        try:
+            self._status_thread = threading.Thread(
+                target=self._status_writer_loop,
+                args=(interval,),
+                name="straggler-status-writer",
+                daemon=True,
+            )
+            self._status_thread.start()
+        except Exception:
+            self._errors += 1
+            self._status_thread = None
+
+    def _status_writer_loop(self, interval: float) -> None:
+        """Write the status files every ``interval`` seconds until stopped."""
+        while not self._status_stop.wait(interval):
+            try:
+                self._write_status()
+            except Exception:
+                self._errors += 1
 
     def _build_sink(self) -> Optional[Callable[[TimingEnvelope], None]]:
         """Return the callable that receives each read-back envelope."""
@@ -216,6 +260,13 @@ class StragglerRuntime:
         if self._closed:
             return
         self._closed = True
+        self._status_stop.set()
+        if self._status_thread is not None:
+            try:
+                self._status_thread.join(timeout=1.0)
+            except Exception:
+                self._errors += 1
+            self._status_thread = None
         try:
             if self._observer is not None:
                 self._observer.close(timeout)

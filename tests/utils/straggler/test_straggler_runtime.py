@@ -195,6 +195,29 @@ def test_close_persists_the_runtime_and_collector_counters(tmp_path: Any) -> Non
     assert runtime_status["collector"]["caps"]["MAX_VERDICTS"] == 512
 
 
+def test_status_files_are_written_without_a_graceful_close(tmp_path: Any) -> None:
+    """Ray SIGTERMs the actor at job end, so ``close``/atexit never runs.
+
+    A real ON arm therefore produced JSONL streams but no status file. The
+    periodic writer must leave one behind without any explicit close.
+    """
+    runtime = StragglerRuntime(
+        make_config(output_dir=str(tmp_path), report_interval_seconds=0.1),
+        identity=identity(0),
+        register_atexit=False,
+    )
+    runtime.start()
+    run_intervals(runtime, count=1)
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not (tmp_path / "collector_status.json").exists():
+        time.sleep(0.05)
+
+    assert (tmp_path / "collector_status.json").exists()
+    assert (tmp_path / "runtime_status.json").exists()
+    runtime.close()
+
+
 def test_close_persists_the_sender_side_counters(tmp_path: Any) -> None:
     """The shipping (non-zero) rank is the arm whose counters §6 reports."""
     port = free_port()
