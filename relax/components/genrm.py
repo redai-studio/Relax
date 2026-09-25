@@ -411,7 +411,21 @@ class GenRM(Base):
         }
         if sampling_params:
             effective.update(sampling_params)
-        if effective.get("sampling_seed") is None and float(effective.get("temperature", 0.0) or 0.0) > 0.0:
+        min_p = float(effective.get("min_p", 0.0) or 0.0)
+        temperature = float(effective.get("temperature", 0.0) or 0.0)
+        if min_p > 0.0 and temperature > 0.0:
+            # SGLang's deterministic sampling path (mandatory for GenRM's
+            # replica-invariant verdicts) does not implement min-p on the
+            # pinned engine version; a stochastic request carrying min_p
+            # would crash the sampler (re-review finding). Fail closed at
+            # the contract boundary instead.
+            raise HTTPException(
+                status_code=422,
+                detail="min_p is not supported for GenRM scoring with stochastic sampling "
+                "(temperature > 0): the deterministic sampling path required for "
+                "replica-invariant verdicts does not implement min-p",
+            )
+        if effective.get("sampling_seed") is None and temperature > 0.0:
             effective["sampling_seed"] = self._derive_sampling_seed(
                 model_path=spec["model_path"],
                 input_ids=input_ids,
@@ -493,6 +507,10 @@ class GenRM(Base):
                 resp.raise_for_status()
                 break
             except asyncio.CancelledError:
+                raise
+            except HTTPException:
+                # Contract violations (e.g. the min_p validation in
+                # _effective_sampling) are terminal -- retrying cannot help.
                 raise
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)

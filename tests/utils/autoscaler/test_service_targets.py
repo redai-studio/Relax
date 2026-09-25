@@ -540,6 +540,130 @@ class TestPatchConfig(unittest.TestCase):
         # Rollout kept its cadence across the removal.
         self.assertTrue(rollout_continued)
 
+    def test_submitting_placeholder_blocks_target_removal(self):
+        """Re-review finding: between the scale POST leaving and its acceptance
+        response landing, the remove-target guard must already see the
+        operation -- deleting the target in that window stranded an operation
+        the server accepted while the autoscaler forgot it."""
+
+        class _ParkedSession:
+            def __init__(self):
+                self.release = asyncio.Event()
+
+            def post(self, url, json=None):
+                return self
+
+            async def __aenter__(self):
+                await self.release.wait()
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                return {"request_id": "req-parked", "status": "PENDING"}
+
+        svc = self._svc_with_genrm_runtime()
+        svc._http_session = _ParkedSession()
+
+        async def _main():
+            task = asyncio.ensure_future(
+                svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, svc._services["genrm"])
+            )
+            await asyncio.sleep(0.01)
+            # The POST is parked server-side; the placeholder must already be
+            # registered and block the removal.
+            pending = svc._services["genrm"].state.pending_requests
+            self.assertEqual([p["status"] for p in pending], ["SUBMITTING"])
+            with self.assertRaises(svc_module.HTTPException) as ctx:
+                await svc.update_config(_ConfigUpdateRequest(service_targets={}))
+            self.assertEqual(ctx.exception.status_code, 409)
+            # Let the parked POST land, then drain the executor.
+            svc._http_session.release.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+        asyncio.run(_main())
+        # After acceptance the placeholder carries the real request id.
+        self.assertEqual(
+            [(p["request_id"], p["status"]) for p in svc._services["genrm"].state.pending_requests],
+            [("req-parked", "PENDING")],
+        )
+
+    def test_handover_preserves_inflight_post_response(self):
+        """Re-review finding: cancelling a worker mid-POST lost the acceptance
+        response.
+
+        Graceful handover: the old worker finishes the POST (updating the
+        placeholder in the shared state) and exits; the rebuilt runtime's
+        evaluation continues from there.
+        """
+
+        class _ParkedSession:
+            def __init__(self):
+                self.release = asyncio.Event()
+                self.calls = 0
+
+            def get(self, url):
+                return self
+
+            async def __aenter__(self):
+                await self.release.wait()
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            @property
+            def status(self):
+                return 200
+
+            async def json(self):
+                self.calls += 1
+                return {"request_id": "req-handover", "status": "PENDING"}
+
+        config = AutoscalerConfig(service_targets={"genrm": "http://genrm:8000/genrm"})
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        svc._state.running = True
+        svc._state.enabled = True
+        svc._http_session = _FakePostSession(200, {"request_id": "req-handover", "status": "PENDING"})
+        release = asyncio.Event()
+
+        async def _parked_evaluation(runtime):
+            # Park like a slow metrics/discovery round, then fire a scale POST
+            # whose acceptance response only lands after the handover.
+            await release.wait()
+            await svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, runtime)
+
+        svc._evaluate_service = _parked_evaluation
+
+        async def _main():
+            old_runtime = svc._services["genrm"]
+            worker = asyncio.ensure_future(svc._service_loop(old_runtime))
+            await asyncio.sleep(0.02)
+            # Rebuild the runtime under the same name (any config PATCH).
+            await svc.update_config(_ConfigUpdateRequest(service_targets={"genrm": "http://new:8000/genrm"}))
+            new_runtime = svc._services["genrm"]
+            self.assertIsNot(new_runtime, old_runtime)
+            # The state object is shared across the rebuild.
+            self.assertIs(new_runtime.state, old_runtime.state)
+            # Release: the old worker completes its parked evaluation (scale
+            # POST included), then exits at the next iteration boundary.
+            release.set()
+            await asyncio.wait_for(worker, timeout=5.0)
+            return new_runtime
+
+        new_runtime = asyncio.run(_main())
+        # The in-flight POST result survived the handover in the shared state.
+        self.assertIn(
+            ("req-handover", "PENDING"),
+            [(p["request_id"], p.get("status")) for p in new_runtime.state.pending_requests],
+        )
+
     def test_rebuilt_runtime_replaces_its_worker(self):
         """Re-review finding: a config PATCH rebuilds ServiceRuntime objects
         under the same names; a worker keyed only by name kept evaluating the.

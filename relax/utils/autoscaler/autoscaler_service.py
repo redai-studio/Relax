@@ -395,16 +395,15 @@ class AutoscalerService(Base):
                 for runtime in runtimes:
                     worker = workers.get(runtime.name)
                     # A config PATCH rebuilds ServiceRuntime objects under the
-                    # same name; a worker keyed only by name would keep
-                    # evaluating the *old* runtime (stale state/collector)
-                    # forever (re-review finding). Restart the worker whenever
-                    # the runtime object identity changed.
-                    if worker is None or worker.done() or getattr(worker, "runtime", None) is not runtime:
-                        if worker is not None and not worker.done():
-                            worker.cancel()
-                        fresh = asyncio.ensure_future(self._service_loop(runtime))
-                        fresh.runtime = runtime
-                        workers[runtime.name] = fresh
+                    # same name. The old worker exits *by itself* once its
+                    # current evaluation -- including any in-flight scale POST
+                    # whose acceptance response has not landed -- completes
+                    # (graceful handover, see _service_loop); cancelling it
+                    # here would lose that response and strand a SUBMITTING
+                    # placeholder (re-review finding). Only dead workers are
+                    # replaced eagerly.
+                    if worker is None or worker.done():
+                        workers[runtime.name] = asyncio.ensure_future(self._service_loop(runtime))
                 for name in [n for n in workers if n not in names]:
                     workers.pop(name).cancel()
                 await asyncio.sleep(getattr(self, "_supervisor_poll_secs", 1.0))
@@ -428,9 +427,26 @@ class AutoscalerService(Base):
         The global ``self._state.running``/``enabled`` flags keep their
         service-wide meaning (``/enable`` and ``stop()`` toggle them), while
         the interval comes from the service's effective config.
+
+        Graceful handover: a config PATCH rebuilds the runtime object under
+        the same name; this worker then finishes its CURRENT evaluation --
+        including an in-flight scale POST whose acceptance response would be
+        lost by a cancel -- and exits at the next iteration boundary. The
+        rebuilt runtime shares the same ``state`` object, so a placeholder
+        registered before the POST is updated in place even across the
+        handover (re-review finding: cancelling mid-POST stranded the
+        operation -- the server had accepted it, the autoscaler forgot it).
         """
+        services_ref = self
         interval = runtime.config.evaluation_interval_secs
         while self._state.running:
+            # Re-read the mapping every iteration: a config PATCH replaces the
+            # ``_services`` dict wholesale, so a reference captured at loop
+            # entry would never observe the rebuild.
+            services_now = getattr(services_ref, "_services", None)
+            if services_now is not None and services_now.get(runtime.name) is not runtime:
+                logger.info(f"Autoscaler worker for service={runtime.name}: runtime rebuilt, handing over")
+                return
             try:
                 if self._state.enabled:
                     await self._evaluate_service_guarded(runtime)
@@ -588,6 +604,26 @@ class AutoscalerService(Base):
             f"(+{decision.delta}), reason: {decision.reason}"
         )
 
+        # Register the operation BEFORE the POST leaves: between submit and
+        # response the request must already be visible to the remove-target
+        # guard -- a target deleted in that window would strand an operation
+        # the server accepted while the autoscaler forgets how to track it
+        # (re-review finding). ``SUBMITTING`` is non-terminal, so it blocks
+        # removal; NOOP/CONFLICT/explicit rejection remove it again.
+        placeholder = {
+            "request_id": None,
+            "action": "scale_out",
+            "triggered_at": time.time(),
+            "status": "SUBMITTING",
+            "from_engines": current_engines,
+            "to_engines": target_count,
+            "delta": decision.delta,
+            "reason": decision.reason,
+            "triggered_conditions": decision.triggered_conditions,
+            "metrics_snapshot": decision.metrics_snapshot,
+        }
+        runtime.state.pending_requests.append(placeholder)
+
         try:
             async with self._http_session.post(url, json=payload) as response:
                 if response.status in (200, 201):
@@ -597,6 +633,7 @@ class AutoscalerService(Base):
 
                     # NOOP request IDs are not persisted and must not enter pending.
                     if status == "NOOP":
+                        runtime.state.pending_requests.remove(placeholder)
                         logger.info(
                             f"[Autoscaler] Scale-out NOOP (idempotent no-op), not tracking as pending: "
                             f"request_id={request_id}"
@@ -605,6 +642,7 @@ class AutoscalerService(Base):
                         return
 
                     if status == "CONFLICT":
+                        runtime.state.pending_requests.remove(placeholder)
                         logger.warning(
                             "[Autoscaler] Scale-out reported CONFLICT with 2xx body, not tracking as pending"
                         )
@@ -612,27 +650,22 @@ class AutoscalerService(Base):
 
                     logger.info(f"[Autoscaler] Scale-out request accepted: request_id={request_id}, status={status}")
 
-                    runtime.state.pending_requests.append(
-                        {
-                            "request_id": request_id,
-                            "action": "scale_out",
-                            "triggered_at": time.time(),
-                            "status": status,
-                            "from_engines": current_engines,
-                            "to_engines": target_count,
-                            "delta": decision.delta,
-                            "reason": decision.reason,
-                            "triggered_conditions": decision.triggered_conditions,
-                            "metrics_snapshot": decision.metrics_snapshot,
-                        }
-                    )
+                    placeholder.update(request_id=request_id, status=status)
                     runtime.state.last_scale_time = time.time()
                     runtime.state.last_scale_action = ScalingAction.SCALE_OUT
                 else:
                     text = await response.text()
+                    runtime.state.pending_requests.remove(placeholder)
                     logger.warning(f"[Autoscaler] Scale-out request failed: HTTP {response.status} - {text}")
 
         except Exception as e:
+            # The POST itself failed: the server rejected it or the transport
+            # died before acceptance was knowable; nothing identifiable to
+            # track (same semantics as before the pre-registration).
+            try:
+                runtime.state.pending_requests.remove(placeholder)
+            except ValueError:
+                pass  # already removed on an earlier branch
             logger.exception(f"[Autoscaler] Error executing scale-out: {e}")
 
     async def _execute_scale_in(
@@ -654,6 +687,23 @@ class AutoscalerService(Base):
             f"(-{decision.delta}), reason: {decision.reason}"
         )
 
+        # Pre-POST registration, mirroring _execute_scale_out: the operation
+        # must be visible to the remove-target guard while its acceptance
+        # response is still in flight (re-review finding).
+        placeholder = {
+            "request_id": None,
+            "action": "scale_in",
+            "triggered_at": time.time(),
+            "status": "SUBMITTING",
+            "from_engines": current_engines,
+            "to_engines": target_count,
+            "delta": decision.delta,
+            "reason": decision.reason,
+            "triggered_conditions": decision.triggered_conditions,
+            "metrics_snapshot": decision.metrics_snapshot,
+        }
+        runtime.state.pending_requests.append(placeholder)
+
         try:
             async with self._http_session.post(url, json=payload) as response:
                 if response.status in (200, 201):
@@ -663,6 +713,7 @@ class AutoscalerService(Base):
 
                     # NOOP request IDs are not persisted and must not enter pending.
                     if status == "NOOP":
+                        runtime.state.pending_requests.remove(placeholder)
                         logger.info(
                             f"[Autoscaler] Scale-in NOOP (idempotent no-op), not tracking as pending: "
                             f"request_id={request_id}"
@@ -671,6 +722,7 @@ class AutoscalerService(Base):
                         return
 
                     if status == "CONFLICT":
+                        runtime.state.pending_requests.remove(placeholder)
                         logger.warning(
                             "[Autoscaler] Scale-in reported CONFLICT with 2xx body, not tracking as pending"
                         )
@@ -678,27 +730,19 @@ class AutoscalerService(Base):
 
                     logger.info(f"[Autoscaler] Scale-in request accepted: request_id={request_id}, status={status}")
 
-                    runtime.state.pending_requests.append(
-                        {
-                            "request_id": request_id,
-                            "action": "scale_in",
-                            "triggered_at": time.time(),
-                            "status": status,
-                            "from_engines": current_engines,
-                            "to_engines": target_count,
-                            "delta": decision.delta,
-                            "reason": decision.reason,
-                            "triggered_conditions": decision.triggered_conditions,
-                            "metrics_snapshot": decision.metrics_snapshot,
-                        }
-                    )
+                    placeholder.update(request_id=request_id, status=status)
                     runtime.state.last_scale_time = time.time()
                     runtime.state.last_scale_action = ScalingAction.SCALE_IN
                 else:
                     text = await response.text()
+                    runtime.state.pending_requests.remove(placeholder)
                     logger.warning(f"[Autoscaler] Scale-in request failed: HTTP {response.status} - {text}")
 
         except Exception as e:
+            try:
+                runtime.state.pending_requests.remove(placeholder)
+            except ValueError:
+                pass  # already removed on an earlier branch
             logger.exception(f"[Autoscaler] Error executing scale-in: {e}")
 
     def _record_noop(
@@ -740,6 +784,10 @@ class AutoscalerService(Base):
             action = req.get("action", "scale_out")
 
             status = req.get("status")
+            if status == "SUBMITTING":
+                # The acceptance response is still in flight (pre-POST
+                # registration); its owning worker fills in the request_id.
+                continue
             if is_scale_request_terminal(action, status) and not req.get("cleanup_required"):
                 completed.append(req)
                 continue

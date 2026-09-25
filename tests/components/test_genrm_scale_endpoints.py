@@ -640,6 +640,22 @@ class TestRequestSamplingSeed(unittest.TestCase):
         overridden = replica._effective_sampling(self.SPEC, {"temperature": 0.7}, [1, 2, 3])
         self.assertNotEqual(default["sampling_seed"], overridden["sampling_seed"])
 
+    def test_stochastic_min_p_is_rejected(self):
+        """Re-review finding: SGLang's deterministic sampling path (mandatory
+        for replica-invariant verdicts) does not implement min-p on the pinned
+        engine version; a stochastic request carrying min_p must fail closed at
+        the contract boundary instead of crashing the sampler."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"min_p": 0.1}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_greedy_min_p_is_allowed(self):
+        """Greedy requests never derive a seed (argmax path; min_p unused)."""
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"temperature": 0.0, "min_p": 0.1}, [1, 2, 3])
+        self.assertNotIn("sampling_seed", effective)
+
 
 if __name__ == "__main__":
     unittest.main()
