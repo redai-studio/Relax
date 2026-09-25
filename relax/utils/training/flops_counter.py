@@ -5,6 +5,7 @@
 import inspect
 
 from relax.utils.logging_utils import get_logger
+from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
 
 
 logger = get_logger(__name__)
@@ -496,6 +497,7 @@ def _estimate_fallback_flops(config, tokens_sum, batch_seqlens, delta_time):
 
 
 _ESTIMATE_FUNC = {
+    "kimi_k3": estimate_kimi_k3_flops,
     # Dense transformers (SwiGLU + GQA)
     "qwen2": _estimate_qwen2_flops,
     "qwen3": _estimate_qwen2_flops,
@@ -549,19 +551,40 @@ class FlopsCounter:
                 list(_ESTIMATE_FUNC.keys()),
             )
         self.config = config
+        self._warned_unsupported_trainability = False
 
     def estimate(self, batch_seqlens, delta_time, **kwargs):
         """Return (estimated_tflops, peak_device_tflops).
 
-        ``estimated_tflops`` includes fwd+bwd (6N formula).
+        ``estimated_tflops`` includes fwd+bwd unless ``forward_only=True``. K3
+        honors independent frozen-region flags; other estimators retain their
+        existing 3x-forward training convention.
         """
         tokens_sum = sum(batch_seqlens)
         model_type = getattr(self.config, "model_type", None)
         func = _ESTIMATE_FUNC.get(model_type, _estimate_fallback_flops)
+        forward_only = kwargs.pop("forward_only", False)
+        if func is estimate_kimi_k3_flops:
+            if (
+                kwargs.get("lora_rank", 0) > 0
+                or kwargs.get("freeze_params_name_list")
+                or kwargs.get("only_train_params_name_list")
+            ):
+                if not self._warned_unsupported_trainability:
+                    logger.warning(
+                        "K3 FLOPs/MFU omitted for LoRA or custom parameter masks: "
+                        "HF config cannot determine adapter dimensions and actual trainability. "
+                        "Token throughput and timing remain available."
+                    )
+                    self._warned_unsupported_trainability = True
+                return float("nan"), get_device_peak_flops(unit="T")
+            kwargs["forward_only"] = forward_only
         sig = inspect.signature(func)
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time, **kwargs)
         else:
             estimated_tflops = func(self.config, tokens_sum, batch_seqlens, delta_time)
+        if forward_only and func is not estimate_kimi_k3_flops:
+            estimated_tflops /= 3
         peak_tflops = get_device_peak_flops(unit="T")
         return estimated_tflops, peak_tflops

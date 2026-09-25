@@ -4,6 +4,18 @@ A practical guide to maximizing training throughput in Relax. All parameters men
 
 ---
 
+## Kimi K3 TFLOPS and MFU
+
+`perf/actor_train_tflops` estimates useful model FLOPs per GPU per second. `perf/mfu/actor_train` divides this rate by the device's BF16 dense peak (2250 TFLOPS for B300) and reports a fraction, so 0.4 means 40%. It uses the actor training time, not the total rollout/save wall time. Optimizer and offload time inside training reduce the rate.
+
+K3 counts KDA projections, convolutions and state contractions; MLA low-rank/output-gate projections and causal attention; active latent MoE experts, router and shared experts; the vocabulary output; and MoonViT-V2 plus PatchMergerMLPV2. It uses actual per-sample lengths and original image `(T,H,W)` grids: the vision encoder attends over all frames before temporal pooling. Training GPU count is applied once after gathering sample metadata across DP without CP replicas.
+
+The estimate counts each multiply-add as two FLOPs. Trainable text uses the conventional three-times-forward approximation; vision/projector backward costs honor `--freeze-vision-model`, `--freeze-vision-projection` and required input gradients independently. `--freeze-language-model` still permits gradients into trainable visual inputs. Actor/reference log-prob forward FLOPs are estimated separately rather than dividing frozen-region training FLOPs by three.
+
+This is a dominant-matmul model estimate, not a measurement of executed CUDA instructions. It excludes padding, recomputation, communication, embedding lookups, AttnRes reductions, normalization and elementwise operations. KDA counts three state contractions per token (6 × heads × head_dim² forward FLOPs); it does not count implementation-specific chunk/WY work. Hardware profiler counters use a different scope.
+
+For K3 LoRA or custom `--freeze-params-name-list` / `--only-train-params-name-list`, FLOPs/MFU are omitted with a one-time warning because HF configuration alone cannot determine adapter and parameter trainability. Timing and token throughput remain available. Other model estimators retain their existing conventions.
+
 ## Profiling
 
 Before tuning, identify the bottleneck. Relax provides three complementary profiling tools that cover **inference engine**, **training backend**, and **GPU memory**. All trace files are saved under `traces/<tb_experiment_name>/` by default, separated by subdirectory:
