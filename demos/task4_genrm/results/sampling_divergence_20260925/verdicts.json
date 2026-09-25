@@ -1,0 +1,81 @@
+{
+  "experiment": "sampling-consistency under divergent request histories",
+  "history_divergence_request_count": 300,
+  "sampling": {
+    "temperature": 0.1,
+    "top_p": 1.0,
+    "top_k": -1,
+    "max_response_len": 64,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "seed": 42,
+  "cases": 50,
+  "probe_replies_total": 400,
+  "attribution_covers_both_engines": true,
+  "attribution_failures": [],
+  "parse_gate_independent": true,
+  "parse_gate_failures": [],
+  "no_truncated_replies": true,
+  "truncated_count": 0,
+  "compared_cases": 50,
+  "flip_count": 2,
+  "flip_rate": 0.04,
+  "flips": [
+    {
+      "case": "neg-33",
+      "a_initial": [
+        0,
+        1
+      ],
+      "b_elastic": [
+        0
+      ],
+      "a_texts": [
+        "Judgement: 1",
+        "Judgement: 0",
+        "Judgement: 1",
+        "Judgement: 0"
+      ],
+      "b_texts": [
+        "Judgement: 0",
+        "Judgement: 0",
+        "Judgement: 0",
+        "Judgement: 0"
+      ]
+    },
+    {
+      "case": "pos-36",
+      "a_initial": [
+        1
+      ],
+      "b_elastic": [
+        0,
+        1
+      ],
+      "a_texts": [
+        "Judgement: 1",
+        "Judgement: 1",
+        "Judgement: 1",
+        "Judgement: 1"
+      ],
+      "b_texts": [
+        "Judgement: 0",
+        "Judgement: 1",
+        "Judgement: 1",
+        "Judgement: 1"
+      ]
+    }
+  ],
+  "engine_a": "172.17.0.2:16000",
+  "engine_b": "172.17.0.2:16001",
+  "E2E_PASS": false,
+  "scale_in_removed_exactly_elastic": true,
+  "functional_pass": false,
+  "cleanup_pass": true,
+  "cleanup_errors": [],
+  "leftover_ray_free_gpus": 3.0,
+  "functional_error": null,
+  "PASS": false
+}
