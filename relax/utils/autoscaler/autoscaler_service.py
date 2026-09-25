@@ -256,6 +256,8 @@ class AutoscalerService(Base):
         names = {"rollout", *self.config.service_targets}
         previous = getattr(self, "_services", {})
         runtimes: Dict[str, ServiceRuntime] = {}
+        collectors_to_start: list = []
+        collectors_to_stop: list = []
         for name in sorted(names):
             policy = self.config.get_effective_policies(name)
             effective = replace(
@@ -266,7 +268,16 @@ class AutoscalerService(Base):
                 scale_in_policy=policy.scale_in_policy,
             )
             old = previous.get(name)
-            collector = old.metrics_collector if old else MetricsCollector(effective)
+            if old is None:
+                collector = MetricsCollector(effective)
+                # A freshly constructed collector has no HTTP session until
+                # start(); record it so the (async) config-PATCH path can
+                # start it before publishing the new runtime set (review
+                # finding: without this, a newly added service target never
+                # collects anything).
+                collectors_to_start.append(collector)
+            else:
+                collector = old.metrics_collector
             # Keep collected history across a config PATCH, but make its
             # subsequent polling cadence use the newly resolved service policy.
             collector.config = effective
@@ -277,7 +288,14 @@ class AutoscalerService(Base):
                 decision_engine=ScalingDecisionEngine(effective),
                 state=old.state if old else AutoscalerState(),
             )
+        for name, old in previous.items():
+            if name not in runtimes:
+                # Service target removed by this PATCH: stop its collector so
+                # the HTTP session does not outlive the runtime.
+                collectors_to_stop.append(old.metrics_collector)
         self._services = runtimes
+        self._collectors_to_start = collectors_to_start
+        self._collectors_to_stop = collectors_to_stop
 
     def _runtime(self, runtime: Optional[ServiceRuntime]) -> ServiceRuntime:
         """Return a runtime, including the lightweight legacy test shape."""
@@ -302,6 +320,10 @@ class AutoscalerService(Base):
 
         for runtime in self._services.values():
             await runtime.metrics_collector.start()
+        # start() launched every current collector, including any recorded as
+        # pending by a pre-start config PATCH; clear the pending list so a
+        # later PATCH does not double-start them.
+        self._collectors_to_start = []
         self._http_session = await self._create_http_session()
 
         for runtime in self._services.values():
@@ -326,6 +348,10 @@ class AutoscalerService(Base):
 
         for runtime in self._services.values():
             await runtime.metrics_collector.stop()
+        # Also stop collectors whose runtime was removed by a config PATCH.
+        for collector in getattr(self, "_collectors_to_stop", []):
+            await collector.stop()
+        self._collectors_to_stop = []
 
         if self._http_session is not None:
             await self._http_session.close()
@@ -1024,6 +1050,16 @@ class AutoscalerService(Base):
         self.config.validate()
 
         self._rebuild_service_runtimes()
+        # Hot start/stop for collectors added or removed by this PATCH. The
+        # rebuild itself is sync; the async start/stop happens here, before
+        # the new runtime set serves its first evaluation (review finding: a
+        # newly added target otherwise never collects metrics).
+        for collector in getattr(self, "_collectors_to_start", []):
+            await collector.start()
+        self._collectors_to_start = []
+        for collector in getattr(self, "_collectors_to_stop", []):
+            await collector.stop()
+        self._collectors_to_stop = []
         rollout = self._services["rollout"]
         self.metrics_collector = rollout.metrics_collector
         self.decision_engine = rollout.decision_engine

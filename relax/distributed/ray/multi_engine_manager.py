@@ -100,6 +100,13 @@ class MultiEngineManager:
         # retained for retry (Task 4: unconfirmed resource release keeps
         # blocking new scale operations until reconcile succeeds).
         self._pending_pg_cleanup: set[int] = set()
+        # Ranks for which remove_placement_group() was *accepted* by Ray.
+        # Distinct from _pending_pg_cleanup (which means "release not yet
+        # confirmed REMOVED"): a rank whose deletion submission itself threw
+        # must stay out of this set so the next retry resubmits the deletion
+        # instead of only polling a PG that was never deleted (review finding:
+        # first-attempt exception otherwise strands the PG in CREATED forever).
+        self._pg_remove_submitted: set[int] = set()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
@@ -255,20 +262,29 @@ class MultiEngineManager:
         try:
             from ray.util.placement_group import placement_group_table, remove_placement_group
 
-            if rank not in self._pending_pg_cleanup:
+            if rank not in self._pg_remove_submitted:
                 remove_placement_group(pg_tuple[0])
-                self._pending_pg_cleanup.add(rank)
+                # Ray accepted the (asynchronous) deletion request.
+                self._pg_remove_submitted.add(rank)
+            # Deletion submitted but not yet confirmed REMOVED: the rank is
+            # pending cleanup either way, so reconcile keeps retrying the
+            # confirmation poll.
+            self._pending_pg_cleanup.add(rank)
             state = placement_group_table(pg_tuple[0]).get("state")
             if state == "REMOVED":
                 self._engine_placements.pop(rank, None)
                 self._pending_pg_cleanup.discard(rank)
+                self._pg_remove_submitted.discard(rank)
                 return True
             return False
         except Exception as exc:
             logger.warning(f"{self._log_prefix} remove placement group for rank={rank} failed: {exc}")
-            # Retain the handle and mark the rank for reconcile retries. An
-            # unknown table state is not evidence of resource release.
+            # The deletion may never have reached Ray (the exception can fire
+            # before or during submission). Retain the handle, mark the rank
+            # for reconcile retries, and -- crucially -- leave it out of
+            # _pg_remove_submitted so the next attempt resubmits the deletion.
             self._pending_pg_cleanup.add(rank)
+            self._pg_remove_submitted.discard(rank)
             return False
 
     def retry_pending_pg_cleanup(self) -> list[int]:

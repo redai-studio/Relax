@@ -233,6 +233,64 @@ class TestPatchConfig(unittest.TestCase):
         self.assertEqual(svc.config.get_service_url("rollout"), svc.config.rollout_service_url)
         self.assertIn("service_targets", response.config)
 
+    def test_patch_hot_starts_new_collector(self):
+        """Review finding: a collector constructed for a newly PATCHed-in
+        service target must be started before it serves evaluations."""
+        from unittest.mock import patch
+
+        from relax.utils.autoscaler.metrics_collector import MetricsCollector
+
+        started, stopped = [], []
+        orig_start, orig_stop = MetricsCollector.start, MetricsCollector.stop
+
+        async def _rec_start(self):
+            started.append(self)
+
+        async def _rec_stop(self):
+            stopped.append(self)
+
+        svc = _service(AutoscalerConfig())
+        request = _ConfigUpdateRequest(service_targets={"genrm": "http://genrm:8000/genrm"})
+        with patch.object(MetricsCollector, "start", _rec_start), patch.object(MetricsCollector, "stop", _rec_stop):
+            asyncio.run(svc.update_config(request))
+        genrm_collector = svc._services["genrm"].metrics_collector
+        self.assertIn(genrm_collector, started)
+        # Existing rollout collector was constructed by the rebuild too (the
+        # fixture skips __init__), so it is also started -- but nothing is
+        # stopped while the target remains configured.
+        self.assertEqual(stopped, [])
+        # Restore for teardown cleanliness.
+        MetricsCollector.start, MetricsCollector.stop = orig_start, orig_stop
+
+    def test_patch_hot_stops_removed_collector(self):
+        """Removing a service target must stop its collector so the HTTP
+        session does not outlive the runtime."""
+        from unittest.mock import patch
+
+        from relax.utils.autoscaler.metrics_collector import MetricsCollector
+
+        started, stopped = [], []
+        orig_start, orig_stop = MetricsCollector.start, MetricsCollector.stop
+
+        async def _rec_start(self):
+            started.append(self)
+
+        async def _rec_stop(self):
+            stopped.append(self)
+
+        svc = _service(AutoscalerConfig())
+        svc.config.service_targets = {"genrm": "http://genrm:8000/genrm"}
+        # First PATCH: bring the genrm runtime in.
+        with patch.object(MetricsCollector, "start", _rec_start), patch.object(MetricsCollector, "stop", _rec_stop):
+            asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+            genrm_collector = svc._services["genrm"].metrics_collector
+            # Second PATCH: drop the genrm target.
+            svc.config.service_targets = {}
+            asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        self.assertNotIn("genrm", svc._services)
+        self.assertIn(genrm_collector, stopped)
+        MetricsCollector.start, MetricsCollector.stop = orig_start, orig_stop
+
 
 if __name__ == "__main__":
     unittest.main()
