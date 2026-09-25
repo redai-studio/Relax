@@ -31,7 +31,10 @@ LOG_PATH = None
 TAIL_STOP = threading.Event()
 
 STEP_RE = re.compile(
-    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?\b(step \d+:|rollout \d+:|All rollouts finished|All training steps finished)"
+    # no \b before the group: log-formatter color codes abut the keyword
+    # directly (…\x1b[1;37mrollout 0:), and "m"/"r" are both word chars, so a
+    # word boundary never holds there (r3 defect: rollouts never matched).
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?(step \d+:|rollout \d+:|All rollouts finished|All training steps finished)"
 )
 
 
