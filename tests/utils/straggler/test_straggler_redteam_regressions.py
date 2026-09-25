@@ -41,7 +41,7 @@ from relax.utils.straggler import megatron_timer_shim as shim_module
 from relax.utils.straggler import protocol
 from relax.utils.straggler.collector import EnvelopeReceiver, TimingCollector
 from relax.utils.straggler.config import StragglerConfig
-from relax.utils.straggler.detector import VERDICT_STRAGGLER, StragglerDetector
+from relax.utils.straggler.detector import VERDICT_STRAGGLER, VERDICT_UNCERTAIN, StragglerDetector
 from relax.utils.straggler.identity import RuntimeIdentity
 from relax.utils.straggler.megatron_timer_shim import StragglerTimers
 from relax.utils.straggler.observer import StragglerObserver, TimingEnvelope
@@ -370,9 +370,16 @@ def test_workload_delta_is_reported_over_the_wire_envelope() -> None:
         verdicts += detector.observe(TimingEnvelope.from_dict(tagged.to_dict()))
     verdicts += detector.flush()
 
-    straggler = next(v for v in verdicts if v.kind == VERDICT_STRAGGLER and v.rank == 2)
-    assert straggler.facts["workload_delta"] == pytest.approx(1.0)
-    assert straggler.facts["workload_delta_beyond_tolerance"] is True
+    # RT-08's invariant (``workload_delta`` survives the wire) is unchanged; with
+    # the comparability gate an over-tolerance work delta makes the window NOT
+    # COMPARABLE, so this window is reported as uncertain instead of as a
+    # straggler, and its counter is visible.
+    flagged = next(v for v in verdicts if v.reason == "workload_incomparable" and v.rank == 2)
+    assert flagged.kind == VERDICT_UNCERTAIN
+    assert flagged.facts["workload_delta"] == pytest.approx(1.0)
+    assert flagged.facts["workload_delta_beyond_tolerance"] is True
+    assert detector.stats()["workload_incomparable_windows"] == 1
+    assert detector.stats()["stragglers_reported"] == 0
 
 
 # --- RT-09: a rank that starts >= 3 windows late is still compared --------------

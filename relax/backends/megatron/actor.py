@@ -1336,6 +1336,21 @@ class MegatronTrainRayActor(TrainRayActor):
         max_tokens = self.args.max_tokens_per_gpu * cp_size
         k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
         micro_batch_indices = get_seqlen_balanced_partitions(samples, k_local, equal_size=False)
+        # Task 11 straggler profiler: publish this rank's LOCAL per-step work so
+        # the detector can distinguish "this rank does more work" from "this
+        # rank is slow". Pure Python over the lists already in hand: no
+        # tensor-to-Python conversion, no device synchronisation, no collective,
+        # no schedule change. Measurement only; failures are swallowed inside
+        # the profiler.
+        try:
+            from relax.utils.straggler.context import publish_step_workload
+
+            publish_step_workload(
+                rollout_id,
+                [(sum(samples[index] for index in indices), len(indices), 1) for indices in micro_batch_indices],
+            )
+        except Exception:
+            pass
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices

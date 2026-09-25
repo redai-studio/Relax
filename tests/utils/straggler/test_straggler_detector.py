@@ -579,14 +579,18 @@ def test_workload_delta_is_reported_when_both_sides_report_workloads() -> None:
     verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0}, workload=workload)
     verdicts.extend(detector.flush())
 
-    verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
+    verdict = next(item for item in verdicts if item.reason == "workload_incomparable")
     assert verdict.facts["workload_delta"] == pytest.approx(1.0)
     assert verdict.facts["workload_rank"] == pytest.approx(220.0)
     assert verdict.facts["workload_peer_median"] == pytest.approx(110.0)
     assert verdict.facts["workload_delta_beyond_tolerance"] is True
-    # The workload difference is visible but the verdict is still reported:
-    # C2 reports it rather than normalising the timing away.
-    assert verdict.kind == VERDICT_STRAGGLER
+    # RT-08's point survives: the workload difference is visible on the wire.
+    # With the comparability gate, an over-tolerance work delta makes the window
+    # NOT COMPARABLE, so it is reported as uncertain rather than as a straggler:
+    # "rank 2 does more work" is a finding, not slowness.
+    assert verdict.kind == VERDICT_UNCERTAIN
+    assert detector.stats()["workload_incomparable_windows"] == 1
+    assert detector.stats()["stragglers_reported"] == 0
 
 
 def test_workload_delta_is_none_when_workloads_are_unavailable() -> None:
@@ -769,3 +773,63 @@ def test_floor_separates_the_measured_metadata_and_compute_stages() -> None:
     assert floor == 5.0
     assert [name for name, ms in measured.items() if ms < floor] == list(measured)[:8]
     assert [name for name, ms in measured.items() if ms >= floor] == ["backward-compute", "forward-compute"]
+
+
+def test_over_tolerance_workload_makes_a_window_not_comparable() -> None:
+    """A cohort whose local work differs by >5% must not judge slowness.
+
+    This is the rank3 case from the healthy ON smoke: the detector structurally
+    cannot tell "rank 2 does more work" from "rank 2 is slow", so the window is
+    reported as incomparable and counted, never as a straggler.
+    """
+    detector = make_detector(persist_windows=1)
+    workload = {0: {"tokens": 100.0}, 1: {"tokens": 100.0}, 2: {"tokens": 220.0}}
+
+    verdicts = feed_equal_windows(detector, 4, {0: 134.0, 1: 134.0, 2: 146.0}, workload=workload)
+    verdicts.extend(detector.flush())
+
+    assert [v for v in verdicts if v.kind == VERDICT_STRAGGLER] == []
+    assert detector.stats()["stragglers_reported"] == 0
+    assert detector.stats()["workload_incomparable_windows"] == 4
+    assert all(v.reason == "workload_incomparable" for v in verdicts if v.kind == VERDICT_UNCERTAIN)
+
+
+def test_within_tolerance_workload_still_judges_normally() -> None:
+    """A balanced cohort keeps the original detection behaviour."""
+    detector = make_detector(persist_windows=1)
+    workload = {0: {"tokens": 100.0}, 1: {"tokens": 100.0}, 2: {"tokens": 104.0}}
+
+    verdicts = feed_equal_windows(detector, 1, {0: 134.0, 1: 134.0, 2: 154.0}, workload=workload)
+    verdicts.extend(detector.flush())
+
+    stragglers = [v for v in verdicts if v.kind == VERDICT_STRAGGLER]
+    assert len(stragglers) == 1 and stragglers[0].rank == 2
+    assert detector.stats()["workload_incomparable_windows"] == 0
+
+
+def test_published_workload_is_per_rank_and_differs_under_unequal_batches() -> None:
+    """The producer must publish LOCAL counts, never a rank-invariant
+    figure."""
+    from relax.utils.straggler.context import (
+        publish_step_workload,
+        reset_training_context_for_tests,
+        set_training_context,
+        snapshot,
+    )
+
+    reset_training_context_for_tests()
+    # Two ranks of one rollout with deliberately unequal local batches.
+    publish_step_workload(7, [(1000, 8, 1), (700, 6, 1)])
+    publish_step_workload(8, [(5, 1, 1)])
+
+    set_training_context(7, 0, num_steps_per_rollout=2)
+    assert snapshot()["tokens"] == 1000 and snapshot()["sequences"] == 8
+    set_training_context(7, 1, num_steps_per_rollout=2)
+    assert snapshot()["tokens"] == 700 and snapshot()["sequences"] == 6
+    # Another rollout's numbers never leak into this one, and an unpublished
+    # step reads as absent rather than as the neighbour's work.
+    set_training_context(8, 0, num_steps_per_rollout=1)
+    assert snapshot()["tokens"] == 5
+    set_training_context(7, 5, num_steps_per_rollout=2)
+    assert "tokens" not in snapshot()
+    reset_training_context_for_tests()

@@ -744,7 +744,25 @@ class StragglerObserver:
             barrier=barrier,
             reason=reason,
             measurement_kind=MEASUREMENT_HOST_ONLY if device_ms is None else MEASUREMENT_DEVICE,
+            workload=self._workload_from_context(),
         )
+
+    @staticmethod
+    def _workload_from_context() -> Optional[Dict[str, Any]]:
+        """Read this rank's published local work for the current step.
+
+        Runs on the straggler-readout thread, never the training thread. A
+        missing or malformed context yields ``None`` rather than guessing, so a
+        vehicle whose data path does not publish still ships valid envelopes.
+        """
+        try:
+            from relax.utils.straggler.context import snapshot
+
+            current = snapshot()
+        except Exception:
+            return None
+        workload = {field: current.get(field) for field in WORKLOAD_FIELDS if isinstance(current.get(field), int)}
+        return workload or None
 
     def _deliver(self, envelope: TimingEnvelope) -> None:
         """Hand an envelope to the consumer, or buffer it locally."""

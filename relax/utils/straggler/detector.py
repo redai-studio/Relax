@@ -133,6 +133,7 @@ REASON_ATTRIBUTION_UNKNOWN = "attribution_unknown"
 REASON_WITHIN_TOLERANCE = "within_tolerance"
 REASON_COHORT_BELOW_MIN_SIZE = "cohort_below_min_size"
 REASON_BELOW_ABSOLUTE_FLOOR = "below_absolute_floor"
+REASON_WORKLOAD_INCOMPARABLE = "workload_incomparable"
 
 #: Which clocks produced a verdict.
 MEASUREMENT_HOST_ONLY = "host_only"
@@ -505,6 +506,7 @@ class StragglerDetector:
             "cohort_stage_pairs": 0,
             "uncertain_judgements": 0,
             "sub_floor_judgements": 0,
+            "workload_incomparable_windows": 0,
             "single_rank_windows": 0,
             "stragglers_reported": 0,
             "recoveries_reported": 0,
@@ -657,6 +659,28 @@ class StragglerDetector:
         device_values = [value for value in device_medians.values() if value is not None]
         device_reference = min(device_values) if device_values else None
 
+        # Workload comparability: when the cohort's own local work differs by more
+        # than the tolerance, a timing gap cannot be attributed to slowness. The
+        # window is still reported, because an unequal-work cohort is itself the
+        # finding; it just cannot produce a straggler verdict.
+        workload_incomparable = False
+        for rank in ranks:
+            rank_work = workload_totals[rank]
+            peer_work = [
+                workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None
+            ]
+            if rank_work is None or not peer_work:
+                continue
+            peer_work_median = float(statistics.median(peer_work))
+            if (
+                peer_work_median > 0.0
+                and abs(rank_work - peer_work_median) / peer_work_median > self._config.work_tolerance
+            ):
+                workload_incomparable = True
+                break
+        if workload_incomparable:
+            self._counters["workload_incomparable_windows"] += 1
+
         def build(
             rank: int,
             kind: str,
@@ -771,10 +795,14 @@ class StragglerDetector:
                 max(host_medians[rank], host_reference) < self._config.min_stage_ms
                 or absolute_delta <= self._config.min_stage_ms
             )
-            judged_slow = slow and not below_floor
+            judged_slow = slow and not below_floor and not workload_incomparable
             streak = self._streak.get(key, 0) + 1 if judged_slow else 0
             self._set_streak(key, streak)
-            if slow and below_floor:
+            if slow and workload_incomparable:
+                verdicts.append(
+                    build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_WORKLOAD_INCOMPARABLE, label)
+                )
+            elif slow and below_floor:
                 self._counters["sub_floor_judgements"] += 1
                 verdicts.append(
                     build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_BELOW_ABSOLUTE_FLOOR, label)

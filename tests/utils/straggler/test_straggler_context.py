@@ -136,3 +136,53 @@ def test_many_updates_do_not_grow_the_module_state() -> None:
     assert stats["updates"] == 10_000
     assert stats["failures"] == 0
     assert stats["stored"] == 1
+
+
+def test_the_producer_does_no_io_and_no_socket_on_the_training_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invariant A, demonstrated: publication adds no file or socket work.
+
+    ``publish_step_workload`` runs on the training thread, so the whole path is
+    exercised here with ``open`` and ``socket.socket`` spied; neither may fire.
+    """
+    import builtins
+    import socket
+
+    events: list = []
+    real_open = builtins.open
+
+    def spy_open(*args, **kwargs):
+        events.append("open")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+    monkeypatch.setattr(socket, "socket", lambda *args, **kwargs: events.append("socket"))
+
+    context.publish_step_workload(42, [(10, 2, 1)])
+    context.set_training_context(42, 0, num_steps_per_rollout=1)
+
+    assert context.snapshot()["tokens"] == 10
+    assert context.snapshot()["sequences"] == 2
+    assert events == [], f"the producer touched I/O on the training thread: {events}"
+
+
+def test_the_producer_source_has_no_device_sync_or_collective() -> None:
+    """Invariant A, source-level: no sync primitive can hide in this module.
+
+    ``context.py`` is the only training-thread file the producer adds, so a
+    token scan over its source is a complete check for the forbidden calls.
+    """
+    import pathlib
+
+    source = pathlib.Path(context.__file__).read_text(encoding="utf-8")
+    for token in ("all_reduce", "all_gather", "broadcast(", "synchronize", ".item()", ".cpu()", "torch.", "dist."):
+        assert token not in source, f"{token} must not appear in the training-thread producer path"
+
+
+def test_publication_is_bounded_and_evicts_old_rollouts() -> None:
+    """A prefetch that runs far ahead cannot grow memory here."""
+    for rollout_id in range(context.MAX_ROLLOUT_WORKLOADS + 5):
+        context.publish_step_workload(rollout_id, [(rollout_id, 1, 1)])
+
+    stats = context.training_context_stats()
+    assert stats["workload_rollouts"] == context.MAX_ROLLOUT_WORKLOADS
+    assert stats["workload_evictions"] == 5
