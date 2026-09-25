@@ -15,6 +15,7 @@ is the job of the observer/detector/collector layers, which run off the training
 thread.
 """
 
+import os
 from typing import Optional
 
 from relax.utils.logging_utils import get_logger
@@ -24,6 +25,14 @@ from relax.utils.straggler.runtime import StragglerRuntime
 
 
 logger = get_logger(__name__)
+
+#: Provenance guard (Task 11 acceptance): every process that imports the
+#: profiler -- the Ray driver and every Megatron actor -- records which ``relax``
+#: package it resolved. A run whose driver or actor resolves another worktree
+#: (e.g. task4-pr) is invalid, and this is the line a manifest records to prove
+#: it. Exactly one line per process at import time; no I/O beyond the logger's.
+_RELAX_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+logger.info("straggler provenance: relax_root=%s module=%s", _RELAX_ROOT, __file__)
 
 _TIMERS: Optional[StragglerTimers] = None
 _RUNTIME: Optional[StragglerRuntime] = None
