@@ -53,6 +53,7 @@ def make_collector(output_dir: Optional[str] = None, **overrides: Any) -> Timing
     settings: Dict[str, Any] = {
         "enabled": True,
         "window_seconds": 1.0,
+        "warmup_windows": 0,
         "work_tolerance": 0.05,
         "persist_windows": 1,
         "min_cohort_size": 2,
@@ -90,7 +91,7 @@ class TestTimingCollector:
 
     def test_verdict_callback_receives_every_verdict(self) -> None:
         seen: List[Any] = []
-        config = StragglerConfig(enabled=True, window_seconds=1.0, persist_windows=1)
+        config = StragglerConfig(enabled=True, window_seconds=1.0, warmup_windows=0, persist_windows=1)
         collector = TimingCollector(config, identity=None, on_verdict=seen.append)
 
         for window in range(3):
@@ -104,7 +105,7 @@ class TestTimingCollector:
         def explode(verdict: Any) -> None:
             raise RuntimeError("callback exploded")
 
-        config = StragglerConfig(enabled=True, window_seconds=1.0, persist_windows=1)
+        config = StragglerConfig(enabled=True, window_seconds=1.0, warmup_windows=0, persist_windows=1)
         collector = TimingCollector(config, identity=None, on_verdict=explode)
 
         for window in range(3):
@@ -284,3 +285,40 @@ def _wait_until(predicate: Any, timeout: float = 3.0, interval: float = 0.01) ->
             return True
         time.sleep(interval)
     return predicate()
+
+
+class TestBufferedPersistence:
+    """The consumer can run on the training thread, so writes are batched."""
+
+    def test_lines_stay_buffered_until_flush(self, tmp_path: Path) -> None:
+        collector = make_collector(output_dir=str(tmp_path))
+
+        collector.ingest(make_envelope(0, 100.0))
+
+        envelope_file = tmp_path / "straggler_envelopes.jsonl"
+        assert envelope_file.read_text(encoding="utf-8") == ""
+        assert collector.status()["pending_lines"][str(envelope_file)] == 1
+
+        collector.flush()
+
+        assert envelope_file.read_text(encoding="utf-8").strip()
+        assert collector.status()["pending_lines"][str(envelope_file)] == 0
+
+    def test_report_flushes_buffered_lines(self, tmp_path: Path) -> None:
+        collector = make_collector(output_dir=str(tmp_path))
+
+        collector.ingest(make_envelope(0, 100.0))
+        collector.report()
+
+        assert (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip()
+
+    def test_batch_bound_triggers_a_write(self, tmp_path: Path) -> None:
+        from relax.utils.straggler.collector import WRITE_BATCH
+
+        collector = make_collector(output_dir=str(tmp_path))
+        for _ in range(WRITE_BATCH):
+            collector.ingest(make_envelope(0, 100.0))
+
+        lines = (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == WRITE_BATCH
+        assert collector.status()["flushed_lines"] >= WRITE_BATCH

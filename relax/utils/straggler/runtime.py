@@ -78,6 +78,16 @@ class StragglerRuntime:
         return self._observer
 
     @property
+    def sender(self) -> Optional[EnvelopeSender]:
+        """The transport used when this rank only ships envelopes."""
+        return self._sender
+
+    @property
+    def receiver(self) -> Optional[EnvelopeReceiver]:
+        """The transport used when this rank hosts the collector."""
+        return self._receiver
+
+    @property
     def role(self) -> str:
         """``collector``, ``sender`` or ``local``, for the log and the
         evidence."""

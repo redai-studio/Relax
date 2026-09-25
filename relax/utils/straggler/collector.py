@@ -43,6 +43,11 @@ MAX_CONNECTIONS = 64
 #: Read buffer for a single JSONL line.
 MAX_LINE_BYTES = 1 << 20
 
+#: Lines buffered before a single write. The consumer runs on the training thread
+#: when no device backend is available, so persistence must not open a file per
+#: envelope.
+WRITE_BATCH = 256
+
 
 def parse_address(address: str) -> Tuple[str, int]:
     """Split a ``host:port`` string; raises ``ValueError`` when malformed."""
@@ -73,8 +78,10 @@ class TimingCollector:
         self._envelope_path: Optional[str] = None
         self._verdict_path: Optional[str] = None
         self._writers_ready = False
+        self._pending: Dict[str, List[str]] = {}
         self._counters: Dict[str, int] = {
             "envelopes": 0,
+            "flushed_lines": 0,
             "verdicts": 0,
             "reports": 0,
             "write_errors": 0,
@@ -121,17 +128,39 @@ class TimingCollector:
                     self._counters["verdict_callback_errors"] += 1
 
     def _append(self, path: Optional[str], serialiser: Any) -> None:
-        """Append one JSONL line, counting (not raising) a failure."""
+        """Buffer one JSONL line, counting (not raising) a failure."""
         if not self._writers_ready or not path or serialiser is None:
             return
         try:
             line = serialiser() if callable(serialiser) else str(serialiser)
+        except Exception:
+            self._counters["write_errors"] += 1
+            return
+        pending = self._pending.setdefault(path, [])
+        pending.append(line)
+        if len(pending) >= WRITE_BATCH:
+            self._flush_path(path)
+
+    def _flush_path(self, path: str) -> None:
+        """Write the buffered lines of one file in a single call."""
+        pending = self._pending.get(path)
+        if not pending:
+            return
+        try:
             with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+                handle.write("\n".join(pending) + "\n")
+            self._counters["flushed_lines"] += len(pending)
         except Exception:
             self._counters["write_errors"] += 1
             if self._counters["write_errors"] > 100:
                 self._writers_ready = False
+        finally:
+            pending.clear()
+
+    def _flush_writers(self) -> None:
+        """Flush every buffered file."""
+        for path in list(self._pending):
+            self._flush_path(path)
 
     def _maybe_report(self) -> None:
         """Emit the periodic summary line when the interval has elapsed."""
@@ -144,6 +173,7 @@ class TimingCollector:
 
     def report(self) -> Dict[str, Any]:
         """Log and return the current summary."""
+        self._flush_writers()
         status = self.status()
         active = status["active_stragglers"]
         logger.info(
@@ -166,9 +196,10 @@ class TimingCollector:
         return verdicts
 
     def flush(self) -> List[Verdict]:
-        """Close open windows and handle the resulting verdicts."""
+        """Close open windows, handle the verdicts and persist everything."""
         verdicts = self._detector.flush()
         self._handle(verdicts)
+        self._flush_writers()
         return verdicts
 
     def status(self) -> Dict[str, Any]:
@@ -178,6 +209,7 @@ class TimingCollector:
         status.update(self._counters)
         status["active_stragglers"] = self._detector.active_stragglers()
         status["uptime_s"] = self._clock() - self._started_at
+        status["pending_lines"] = {path: len(lines) for path, lines in self._pending.items()}
         status["envelope_path"] = self._envelope_path
         status["verdict_path"] = self._verdict_path
         status["identity"] = None if self._identity is None else self._identity.label

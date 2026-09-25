@@ -97,7 +97,8 @@ def test_profiler_timers_are_assigned_after_config_construction() -> None:
 
 
 def test_timers_are_never_passed_into_a_config_constructor() -> None:
-    """A constructor argument would reach the deepcopied attention/MoE configs."""
+    """A constructor argument would reach the deepcopied attention/MoE
+    configs."""
     tree = parse_model()
 
     offenders = [

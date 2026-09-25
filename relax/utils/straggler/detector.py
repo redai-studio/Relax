@@ -17,11 +17,29 @@ one:
 * a cohort smaller than ``min_cohort_size`` yields ``uncertain`` instead of a
   guess, and a single-rank run yields nothing at all.
 
-Host and device intervals are compared separately. A rank whose host interval
-grew while its device interval did not is stalled on the host (data loading,
-Python, waiting on a peer); one whose device interval grew is genuinely slow on
-the GPU. That distinction is carried in the verdict so the report can point at a
-cause instead of only naming a victim.
+Window membership is computed from each rank's *own* first observation, not from
+an absolute clock: two ranks that began profiling seconds apart (a slow import, a
+late actor start) still compare their first window against each other instead of
+landing in windows that never overlap. On a real run where every rank starts
+stepping together the two definitions coincide; when they do not, the relative
+one is the one that compares like with like.
+
+Host and device intervals are compared separately, and the verdict says which of
+the two moved:
+
+* ``host_only_stall`` — the host interval grew while the GPU-timeline interval did
+  not, so the extra time is demonstrably outside the stream (host work, waiting);
+* ``gpu_stream_stall`` — both grew, so the extra time is inside the GPU timeline.
+  This is *not* proof of slow hardware: CUDA events measure elapsed time on the
+  stream, so a host stall that leaves the stream idle is indistinguishable from
+  slow kernels. Kernel-level attribution needs per-kernel data, which C2
+  deliberately does not collect;
+* ``attribution_unknown`` — the device interval is unavailable (no CUDA events).
+
+Coverage gaps are counted, never guessed: a window holding a single rank of a
+multi-rank cohort increments ``incomplete_windows`` instead of producing a
+verdict, so a real finding is never buried under thousands of "I could not
+compare" lines.
 """
 
 import json
@@ -80,7 +98,7 @@ class Verdict:
     reference_host_ms: float
     rank_device_ms: Optional[float]
     reference_device_ms: Optional[float]
-    host_dominated: bool
+    host_only: bool
     cohort_size: int
     reason: str
 
@@ -99,7 +117,7 @@ class Verdict:
             "reference_host_ms": self.reference_host_ms,
             "rank_device_ms": self.rank_device_ms,
             "reference_device_ms": self.reference_device_ms,
-            "host_dominated": self.host_dominated,
+            "host_only": self.host_only,
             "cohort_size": self.cohort_size,
             "reason": self.reason,
         }
@@ -120,7 +138,7 @@ class Verdict:
             f"{self.kind}: {self.label} stage={self.name} window={self.window_index} "
             f"{self.rank_host_ms:.2f}ms vs fastest {self.reference_host_ms:.2f}ms "
             f"({self.deviation:+.1%}, {change} for {self.consecutive_windows} window(s), "
-            f"{'host-side' if self.host_dominated else 'device-side'})"
+            f"{'host-only' if self.host_only else 'stream-visible'})"
         )
 
 
@@ -154,12 +172,15 @@ class StragglerDetector:
         self._windows: Dict[int, _Window] = {}
         self._verdicts: Deque[Verdict] = deque(maxlen=MAX_VERDICTS)
         self._streak: Dict[Tuple[str, str, int], int] = {}
+        self._epoch: Dict[int, float] = {}
         self._active: Set[Tuple[str, str, int]] = set()
         self._labels: Dict[Tuple[str, str, int], str] = {}
         self._counters: Dict[str, int] = {
             "envelopes": 0,
             "windows_closed": 0,
             "windows_forced": 0,
+            "warmup_windows_skipped": 0,
+            "incomplete_windows": 0,
             "cohort_stage_pairs": 0,
             "uncertain_judgements": 0,
             "single_rank_windows": 0,
@@ -177,7 +198,15 @@ class StragglerDetector:
         produced."""
         self._counters["envelopes"] += 1
         try:
-            index = int(float(envelope.host_start) / self._config.window_seconds)
+            host_start = float(envelope.host_start)
+            epoch = self._epoch.get(int(envelope.rank))
+            if epoch is None:
+                epoch = host_start
+                self._epoch[int(envelope.rank)] = epoch
+            # Integer microseconds: `(4.1 - 0.1) / 1.0` floors to 3 in binary
+            # floating point, which would silently merge two windows.
+            window_us = max(1, int(round(self._config.window_seconds * 1e6)))
+            index = int(round(max(0.0, host_start - epoch) * 1e6)) // window_us
             window = self._windows.get(index)
             if window is None:
                 window = _Window(index)
@@ -216,6 +245,11 @@ class StragglerDetector:
         if window is None:
             return []
         self._counters["windows_closed"] += 1
+        if index < self._config.warmup_windows:
+            # Startup is not a straggler: lazy CUDA allocation and the first data
+            # batch make every rank look momentarily slow. Counted, not hidden.
+            self._counters["warmup_windows_skipped"] += 1
+            return []
         verdicts: List[Verdict] = []
         for (cohort, name), per_rank in window.samples.items():
             verdicts.extend(self._judge(cohort, name, window, per_rank))
@@ -240,32 +274,14 @@ class StragglerDetector:
 
         cohort_size = len(ranks)
         if cohort_size < 2:
-            # A single reporting rank cannot be compared against anything. If the
-            # run really is single-rank that is expected, not a finding.
+            # A single reporting rank cannot be compared against anything: the
+            # fast ranks are idle waiting for the straggler, so their envelopes
+            # are simply elsewhere. Counting is honest; guessing is not.
             if window.world_size <= 1:
                 self._counters["single_rank_windows"] += 1
-                return []
-            self._counters["uncertain_judgements"] += 1
-            only = ranks[0]
-            return [
-                self._verdict(
-                    kind=VERDICT_UNCERTAIN,
-                    cohort=cohort,
-                    name=name,
-                    rank=only,
-                    label=window.labels.get(only, f"rank{only}"),
-                    window_index=window.index,
-                    deviation=0.0,
-                    consecutive_windows=0,
-                    rank_host_ms=host_medians[only],
-                    reference_host_ms=host_medians[only],
-                    rank_device_ms=device_medians[only],
-                    reference_device_ms=device_medians[only],
-                    host_dominated=False,
-                    cohort_size=cohort_size,
-                    reason="cohort_incomplete",
-                )
-            ]
+            else:
+                self._counters["incomplete_windows"] += 1
+            return []
         if cohort_size < self._config.min_cohort_size:
             self._counters["uncertain_judgements"] += 1
             return [
@@ -284,7 +300,7 @@ class StragglerDetector:
                     reference_device_ms=min(
                         (value for value in device_medians.values() if value is not None), default=None
                     ),
-                    host_dominated=False,
+                    host_only=False,
                     cohort_size=cohort_size,
                     reason="cohort_below_min_size",
                 )
@@ -308,9 +324,8 @@ class StragglerDetector:
                 if device_medians[rank] is not None and device_reference is not None
                 else 0.0
             )
-            host_dominated = (
-                deviation > self._config.work_tolerance and device_deviation <= self._config.work_tolerance
-            )
+            stream_visible = device_medians[rank] is not None and device_reference is not None
+            host_only = slow and stream_visible and device_deviation <= self._config.work_tolerance
             if streak >= self._config.persist_windows and key not in self._active:
                 self._active.add(key)
                 self._counters["stragglers_reported"] += 1
@@ -328,9 +343,13 @@ class StragglerDetector:
                         reference_host_ms=host_reference,
                         rank_device_ms=device_medians[rank],
                         reference_device_ms=device_reference,
-                        host_dominated=host_dominated,
+                        host_only=host_only,
                         cohort_size=cohort_size,
-                        reason="host_stall" if host_dominated else "device_slowdown",
+                        reason=(
+                            "host_only_stall"
+                            if host_only
+                            else ("gpu_stream_stall" if stream_visible else "attribution_unknown")
+                        ),
                     )
                 )
             elif streak == 0 and key in self._active:
@@ -350,7 +369,7 @@ class StragglerDetector:
                         reference_host_ms=host_reference,
                         rank_device_ms=device_medians[rank],
                         reference_device_ms=device_reference,
-                        host_dominated=False,
+                        host_only=False,
                         cohort_size=cohort_size,
                         reason="within_tolerance",
                     )
@@ -389,6 +408,7 @@ class StragglerDetector:
         stats["open_windows"] = len(self._windows)
         stats["retained_verdicts"] = len(self._verdicts)
         stats["active_stragglers"] = len(self._active)
+        stats["aligned_ranks"] = len(self._epoch)
         stats["work_tolerance"] = self._config.work_tolerance
         stats["persist_windows"] = self._config.persist_windows
         return stats

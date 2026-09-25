@@ -26,6 +26,7 @@ def make_config(collector_addr: str | None = None, **overrides: Any) -> Straggle
     settings: dict = {
         "enabled": True,
         "window_seconds": 1.0,
+        "warmup_windows": 0,
         "persist_windows": 1,
         "report_interval_seconds": 3600.0,
         "collector_addr": collector_addr,
@@ -215,7 +216,9 @@ def test_collector_runtime_judges_shipments_from_two_ranks() -> None:
     port = free_port()
     address = f"127.0.0.1:{port}"
     collector_runtime = StragglerRuntime(
-        make_config(address, work_tolerance=0.05, persist_windows=1), identity=identity(0), register_atexit=False
+        make_config(address, work_tolerance=0.05, persist_windows=1, warmup_windows=0),
+        identity=identity(0),
+        register_atexit=False,
     )
     fast_runtime = StragglerRuntime(make_config(address), identity=identity(1), register_atexit=False)
     slow_runtime = StragglerRuntime(make_config(address), identity=identity(2), register_atexit=False)

@@ -47,6 +47,7 @@ def make_detector(**overrides: Any) -> StragglerDetector:
     settings: Dict[str, Any] = {
         "enabled": True,
         "window_seconds": 1.0,
+        "warmup_windows": 0,
         "work_tolerance": 0.05,
         "persist_windows": 3,
         "min_cohort_size": 2,
@@ -168,13 +169,13 @@ def test_slow_rank_is_reported_only_once_while_it_stays_slow() -> None:
     assert detector.active_stragglers()[0]["rank"] == 2
 
 
-def test_host_stall_is_distinguished_from_device_slowdown() -> None:
+def test_host_stall_is_distinguished_from_stream_visible_slowness() -> None:
     host_stall = make_detector(persist_windows=1)
     verdicts = feed_equal_windows(host_stall, 1, {0: 100.0, 1: 100.0, 2: 200.0}, device_ms={0: 10.0, 1: 10.0, 2: 10.0})
     verdicts.extend(host_stall.flush())
     verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
-    assert verdict.host_dominated is True
-    assert verdict.reason == "host_stall"
+    assert verdict.host_only is True
+    assert verdict.reason == "host_only_stall"
 
     device_slow = make_detector(persist_windows=1)
     verdicts = feed_equal_windows(
@@ -182,8 +183,8 @@ def test_host_stall_is_distinguished_from_device_slowdown() -> None:
     )
     verdicts.extend(device_slow.flush())
     verdict = next(item for item in verdicts if item.kind == VERDICT_STRAGGLER)
-    assert verdict.host_dominated is False
-    assert verdict.reason == "device_slowdown"
+    assert verdict.host_only is False
+    assert verdict.reason == "gpu_stream_stall"
 
 
 def test_single_rank_run_produces_no_verdict() -> None:
@@ -208,17 +209,17 @@ def test_one_rank_alone_is_not_judged() -> None:
     assert detector.stats()["single_rank_windows"] > 0
 
 
-def test_incomplete_cohort_is_uncertain() -> None:
+def test_incomplete_cohort_is_counted_not_guessed() -> None:
+    """A lone rank of a multi-rank cohort is a coverage gap, not a verdict."""
     detector = make_detector(persist_windows=1)
 
     verdicts: List[Any] = []
     verdicts.extend(feed_window(detector, 0, {0: 100.0}, world_size=8))
     verdicts.extend(feed_window(detector, 2, {0: 100.0}, world_size=8))  # closes window 0
 
-    uncertain = [verdict for verdict in verdicts if verdict.kind == VERDICT_UNCERTAIN]
-    assert len(uncertain) == 1
-    assert uncertain[0].reason == "cohort_incomplete"
-    assert uncertain[0].cohort_size == 1
+    assert [verdict for verdict in verdicts if verdict.kind == VERDICT_UNCERTAIN] == []
+    assert detector.stats()["incomplete_windows"] == 1
+    assert detector.stats()["single_rank_windows"] == 0
 
 
 def test_cohort_below_min_size_is_uncertain() -> None:
@@ -323,3 +324,68 @@ def test_malformed_envelope_does_not_raise() -> None:
             raise RuntimeError("boom")
 
     assert detector.observe(Broken()) == []
+
+
+def test_staggered_rank_starts_are_aligned_by_relative_time() -> None:
+    """A rank that began profiling seconds later must still be comparable.
+
+    Process startup is staggered in practice (imports, actor placement), so
+    absolute-clock windows can leave every rank alone in its own window and
+    turn every judgement into ``uncertain``.
+    """
+    detector = make_detector(persist_windows=1)
+
+    verdicts: List[Any] = []
+    for window in range(4):
+        for rank, host_ms in ((0, 100.0), (1, 100.0), (2, 400.0)):
+            offset = (window + rank * 7) * 1.0  # rank 2 is 14s "late"
+            envelope = FakeEnvelope(
+                cohort=COHORT,
+                name=STAGE,
+                rank=rank,
+                label=f"rank{rank}/tp0/pp0",
+                host_ms=host_ms,
+                device_ms=None,
+                host_start=offset + 0.1,
+                world_size=4,
+            )
+            verdicts.extend(detector.observe(envelope))
+
+    stragglers = [verdict for verdict in verdicts if verdict.kind == VERDICT_STRAGGLER]
+    assert stragglers and {verdict.rank for verdict in stragglers} == {2}
+    assert not [verdict for verdict in verdicts if verdict.kind == VERDICT_UNCERTAIN]
+    assert detector.stats()["aligned_ranks"] == 3
+
+
+def test_warmup_windows_are_never_judged() -> None:
+    """A first-window outlier must not be reported as a straggler.
+
+    Measured on real processes: an otherwise identical rank showed +23% in its
+    second window purely from lazy CUDA event allocation.
+    """
+    detector = make_detector(persist_windows=1, warmup_windows=2)
+
+    early: List[Any] = []
+    for index in range(3):
+        early.extend(feed_window(detector, index, {0: 100.0, 1: 100.0, 2: 400.0}))
+
+    assert [verdict for verdict in early if verdict.kind == VERDICT_STRAGGLER] == []
+    assert detector.stats()["warmup_windows_skipped"] >= 1
+
+    later: List[Any] = []
+    for index in range(3, 6):
+        later.extend(feed_window(detector, index, {0: 100.0, 1: 100.0, 2: 400.0}))
+
+    stragglers = [verdict for verdict in later if verdict.kind == VERDICT_STRAGGLER]
+    assert stragglers and {verdict.rank for verdict in stragglers} == {2}
+    assert stragglers[0].window_index >= 2
+
+
+def test_warmup_skip_is_visible_in_the_stats() -> None:
+    detector = make_detector(persist_windows=1, warmup_windows=3)
+
+    feed_equal_windows(detector, 5, {0: 100.0, 1: 100.0})
+
+    stats = detector.stats()
+    assert stats["warmup_windows_skipped"] == 3
+    assert stats["windows_closed"] == 3

@@ -35,6 +35,12 @@ class StragglerConfig:
             thread and the sender.
         output_dir: directory for per-rank JSONL streams; ``None`` keeps the data
             in memory only (still counted and summarised).
+        warmup_windows: windows at the start of a run that are never judged.
+            The first intervals carry lazy CUDA context/event allocation, the
+            first data batch and allocator growth, which look like a slow rank;
+            measured startup outliers reached +23% on an otherwise identical
+            rank, so the opening windows are excluded and the exclusion is
+            counted rather than silently applied.
         work_tolerance: relative work-difference tolerance the detector uses
             before calling two ranks' windows different amounts of work.
         window_seconds: duration of one aggregation window.
@@ -52,6 +58,7 @@ class StragglerConfig:
     event_pool: int = 512
     queue_max: int = 4096
     output_dir: Optional[str] = None
+    warmup_windows: int = 2
     work_tolerance: float = 0.05
     window_seconds: float = 5.0
     persist_windows: int = 3
@@ -98,6 +105,7 @@ class StragglerConfig:
             event_pool=integer("event_pool", Envs.RELAX_STRAGGLER_EVENT_POOL, 2, 512),
             queue_max=integer("queue_max", Envs.RELAX_STRAGGLER_QUEUE_MAX, 1, 4096),
             output_dir=Envs.RELAX_STRAGGLER_OUTPUT_DIR,
+            warmup_windows=integer("warmup_windows", Envs.RELAX_STRAGGLER_WARMUP_WINDOWS, 0, 10),
             work_tolerance=real("work_tolerance", Envs.RELAX_STRAGGLER_WORK_TOLERANCE, 0.0, 0.05),
             window_seconds=real("window_seconds", Envs.RELAX_STRAGGLER_WINDOW_S, 0.1, 5.0),
             persist_windows=integer("persist_windows", Envs.RELAX_STRAGGLER_PERSIST_WINDOWS, 1, 3),
