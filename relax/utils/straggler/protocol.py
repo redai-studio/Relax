@@ -25,6 +25,7 @@ both before and after the observer grows a ``schema_version`` (or any other)
 attribute.
 """
 
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Tuple
@@ -204,6 +205,14 @@ class BoundedDedup:
 
     Both structures are bounded, so a peer that floods the collector with
     distinct keys evicts old entries (counted) instead of growing memory.
+
+    The tracker is **not** safe to call from several threads on its own: the
+    expiry/eviction walks are read-modify-write over ``OrderedDict``s, and an
+    unguarded concurrent call raises ``RuntimeError: OrderedDict mutated during
+    iteration`` (which :meth:`check` used to swallow, returning ``"new"``
+    without recording the key and therefore losing idempotency). ``check`` and
+    ``stats`` are serialised by an internal lock so the class is self-contained
+    for direct callers.
     """
 
     def __init__(
@@ -218,6 +227,7 @@ class BoundedDedup:
         self._seen: "OrderedDict[Tuple[Any, Any, Any, int], float]" = OrderedDict()
         self._newest: "OrderedDict[Tuple[Any, Any, Any], int]" = OrderedDict()
         self._counters: Dict[str, int] = {"new": 0, "duplicate": 0, "late": 0, "expired": 0, "evicted": 0}
+        self._lock = threading.Lock()
 
     def check(self, key: Tuple[Any, Any, Any, int]) -> str:
         """Classify one key as ``"new"``, ``"duplicate"`` or ``"late"``.
@@ -236,10 +246,11 @@ class BoundedDedup:
             internal failure degrades to ``"new"`` so evidence is kept rather
             than silently suppressed.
         """
-        try:
-            return self._check(key)
-        except Exception:
-            return "new"
+        with self._lock:
+            try:
+                return self._check(key)
+            except Exception:
+                return "new"
 
     def _check(self, key: Any) -> str:
         """Implementation of :meth:`check`; may raise."""
@@ -306,13 +317,14 @@ class BoundedDedup:
 
     def stats(self) -> Dict[str, Any]:
         """Return a JSON-friendly snapshot of occupancy and decisions."""
-        return {
-            "max_entries": self._max_entries,
-            "ttl_s": self._ttl_s,
-            "entries": len(self._seen),
-            "newest_ranks": len(self._newest),
-            **self._counters,
-        }
+        with self._lock:
+            return {
+                "max_entries": self._max_entries,
+                "ttl_s": self._ttl_s,
+                "entries": len(self._seen),
+                "newest_ranks": len(self._newest),
+                **self._counters,
+            }
 
 
 __all__ = [

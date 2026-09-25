@@ -21,10 +21,14 @@ unambiguous:
 * RT-07 -- ranks with different expert-parallel roles must not share a cohort;
 * RT-08 -- workload counters must survive the wire and reach the detector;
 * RT-09 -- a rank starting three windows late must still be compared (fixed by
-  the shared cohort anchor), while its own cold-start windows stay warmup.
+  the shared cohort anchor), while its own cold-start windows stay warmup;
+* RT-10 -- concurrent ingest must conserve every tally exactly: an unsynchronised
+  ``BoundedDedup`` expiry walk and a window close racing ``_Window.add`` both
+  used to lose evidence silently.
 """
 
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -427,3 +431,77 @@ def test_late_rank_cold_start_is_warmup_not_a_straggler() -> None:
     stats = detector.stats()
     assert stats["warmup_samples_skipped"] > 0
     assert stats["warmup_windows_skipped"] >= 1
+
+
+# --- RT-10: every shared tally is conserved under concurrent ingest -------------
+
+
+def test_concurrent_ingest_conserves_every_tally(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hammer the real ingest path from several threads and require exact tallies.
+
+    The collector is fed by one thread per accepted connection plus the observer
+    readout thread, and its state used to be lock-free. Two silent losses were
+    reproducible under a 1 us interpreter switch interval: ``BoundedDedup``
+    raised ``OrderedDict mutated during iteration`` inside its expiry walk and
+    swallowed it (13-15 keys per run were never recorded, so a resend of those
+    keys could be judged twice), and a window close racing a concurrent
+    ``_Window.add`` raised ``StatisticsError: no median for empty data`` and
+    dropped that window's verdicts with only a log line. Neither showed up in
+    the counters, so the test asserts conservation rather than "did not crash".
+    """
+    monkeypatch.setattr(collector_module, "WRITE_BATCH", 8)
+    collector = make_collector(tmp_path, output_dir=str(tmp_path), window_seconds=0.1)
+    writer_threads = 8
+    per_thread = 250
+    expected = writer_threads * per_thread
+    errors: List[str] = []
+    stop = threading.Event()
+
+    def writer(rank: int) -> None:
+        try:
+            for seq in range(per_thread):
+                # One window per sequence index, so windows keep closing while
+                # other threads are still adding samples to them.
+                collector.ingest(envelope(rank, seq + 1, host_ms=100.0, start_s=seq * 0.1 + 0.05))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(f"writer {type(exc).__name__}: {exc}")
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                collector.status()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(f"reader {type(exc).__name__}: {exc}")
+                return
+
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        writers = [threading.Thread(target=writer, args=(rank,)) for rank in range(writer_threads)]
+        observer = threading.Thread(target=reader)
+        observer.start()
+        for thread in writers:
+            thread.start()
+        for thread in writers:
+            thread.join()
+        stop.set()
+        observer.join(timeout=5.0)
+    finally:
+        stop.set()
+        sys.setswitchinterval(previous_interval)
+
+    collector.flush()
+    status = collector.status()
+    assert errors == []
+    assert status["envelopes"] == expected
+    assert status["judged_packets"] == expected
+    assert status["invalid_packets"] == 0
+    assert status["duplicate_packets"] == 0
+    assert status["late_packets"] == 0
+    assert status["ingest_errors"] == 0
+    assert status["dedup"]["new"] == expected
+    assert status["dedup"]["entries"] == expected
+    assert status["windows_closed"] > 0
+    assert status["flushed_lines"] == expected
+    lines = (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == expected

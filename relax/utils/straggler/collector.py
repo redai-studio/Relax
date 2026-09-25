@@ -98,6 +98,14 @@ class TimingCollector:
         # lock is never held across the file write itself, so a training-thread
         # caller of ``_append`` can never block on a background thread's I/O.
         self._write_lock = threading.Lock()
+        # Serialises every mutation of the detector, the dedup tracker, the
+        # collector counters and the retained verdicts. ``ingest`` runs on the
+        # observer's readout thread *and* on one thread per accepted connection,
+        # so without this the detector's window close could race a concurrent
+        # ``_Window.add`` (dropping a window's verdicts with only a log line)
+        # and the dedup tracker's expiry walk could raise and silently forget a
+        # key. Re-entrant because ``_maybe_report`` re-enters ``status``.
+        self._state_lock = threading.RLock()
         #: Thread that constructed the collector (the actor's training thread).
         #: Ingest from this thread must not write files.
         self._training_thread_id = threading.get_ident()
@@ -144,16 +152,17 @@ class TimingCollector:
         is the consumer of both the observer thread and the socket reader, so
         it never raises, whatever the input.
         """
-        self._counters["envelopes"] += 1
-        try:
-            verdicts = self._ingest_checked(envelope)
-        except Exception:
-            self._counters["ingest_errors"] += 1
-            verdicts = []
-        try:
-            self._maybe_report()
-        except Exception:
-            self._counters["ingest_errors"] += 1
+        with self._state_lock:
+            self._counters["envelopes"] += 1
+            try:
+                verdicts = self._ingest_checked(envelope)
+            except Exception:
+                self._counters["ingest_errors"] += 1
+                verdicts = []
+            try:
+                self._maybe_report()
+            except Exception:
+                self._counters["ingest_errors"] += 1
         return verdicts
 
     def _ingest_checked(self, envelope: Any) -> List[Verdict]:
@@ -202,7 +211,8 @@ class TimingCollector:
         try:
             line = serialiser() if callable(serialiser) else str(serialiser)
         except Exception:
-            self._counters["write_errors"] += 1
+            with self._write_lock:
+                self._counters["write_errors"] += 1
             return
         with self._write_lock:
             pending = self._pending.setdefault(path, [])
@@ -239,14 +249,21 @@ class TimingCollector:
         """Append one already-swapped batch to its file, counting failures."""
         if not lines:
             return
+        written = False
         try:
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
-            self._counters["flushed_lines"] += len(lines)
+            written = True
         except Exception:
-            self._counters["write_errors"] += 1
-            if self._counters["write_errors"] > 100:
-                self._writers_ready = False
+            with self._write_lock:
+                self._counters["write_errors"] += 1
+                if self._counters["write_errors"] > 100:
+                    self._writers_ready = False
+        if written:
+            # Two concurrent flushes would otherwise lose a ``+=`` here even
+            # though every line reached the file.
+            with self._write_lock:
+                self._counters["flushed_lines"] += len(lines)
 
     def _flush_writers(self) -> None:
         """Flush every buffered file."""
@@ -307,29 +324,35 @@ class TimingCollector:
 
     def drain_verdicts(self) -> List[Verdict]:
         """Return and clear verdicts not yet consumed by the caller."""
-        verdicts = list(self._verdicts)
-        self._verdicts.clear()
+        with self._state_lock:
+            verdicts = list(self._verdicts)
+            self._verdicts.clear()
         return verdicts
 
     def flush(self) -> List[Verdict]:
         """Close open windows, handle the verdicts and persist everything."""
-        verdicts = self._detector.flush()
-        self._handle(verdicts)
+        with self._state_lock:
+            verdicts = self._detector.flush()
+            self._handle(verdicts)
+        # The file write stays outside the state lock: a training-thread ingest
+        # must never wait behind background I/O.
         self._flush_writers()
         return verdicts
 
     def status(self) -> Dict[str, Any]:
         """Return a JSON-friendly snapshot for logs, TUI or metrics."""
-        detector_stats = self._detector.stats()
-        status: Dict[str, Any] = dict(detector_stats)
-        status.update(self._counters)
-        status["active_stragglers"] = self._detector.active_stragglers()
-        status["dedup"] = self._dedup.stats()
-        status["uptime_s"] = self._clock() - self._started_at
-        status["pending_lines"] = {path: len(lines) for path, lines in self._pending.items()}
-        status["envelope_path"] = self._envelope_path
-        status["verdict_path"] = self._verdict_path
-        status["identity"] = None if self._identity is None else self._identity.label
+        with self._state_lock:
+            detector_stats = self._detector.stats()
+            status: Dict[str, Any] = dict(detector_stats)
+            status.update(self._counters)
+            status["active_stragglers"] = self._detector.active_stragglers()
+            status["dedup"] = self._dedup.stats()
+            status["uptime_s"] = self._clock() - self._started_at
+            with self._write_lock:
+                status["pending_lines"] = {path: len(lines) for path, lines in self._pending.items()}
+            status["envelope_path"] = self._envelope_path
+            status["verdict_path"] = self._verdict_path
+            status["identity"] = None if self._identity is None else self._identity.label
         return status
 
 

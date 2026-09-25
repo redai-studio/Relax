@@ -474,7 +474,16 @@ class _Window:
 
 
 class StragglerDetector:
-    """Accumulates envelopes into windows and reports persistent outliers."""
+    """Accumulates envelopes into windows and reports persistent outliers.
+
+    Not internally synchronised: ``observe``/``flush``/``stats``/
+    ``active_stragglers`` mutate or read the same window/streak/active
+    structures, and a reader racing a writer can drop a whole window's verdicts
+    (the empty-bucket ``StatisticsError``). The only production caller is
+    :class:`~relax.utils.straggler.collector.TimingCollector`, which serialises
+    every one of those calls under its ``_state_lock``; a second lock here would
+    only duplicate that. Direct callers must provide the same serialisation.
+    """
 
     def __init__(self, config: StragglerConfig) -> None:
         self._config = config
