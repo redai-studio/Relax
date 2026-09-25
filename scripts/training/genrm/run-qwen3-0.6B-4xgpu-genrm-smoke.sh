@@ -58,6 +58,9 @@ runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env_vars = runtime_env.setdefault("env_vars", {})
 existing = env_vars.get("PYTHONPATH", "")
 env_vars["PYTHONPATH"] = f"{os.environ['TRAIN_SITE']}:{existing}" if existing else os.environ["TRAIN_SITE"]
+# 0.6B actor runs near the 24 GiB edge; fragmented reserved-but-unallocated
+# segments (1.7 GiB observed) push the first train step into OOM.
+env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 print(json.dumps(runtime_env, separators=(",", ":")))
 PY
 )"
