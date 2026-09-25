@@ -749,7 +749,19 @@ class GenRM(Base):
                     if victim:
                         self._close_victim_admission(model, victim)
                         if self._victim_inflight_zero(model, victim):
-                            await asyncio.to_thread(ray.get, manager.confirm_scale_drained.remote(request_id))
+                            # Bind the confirmation to the victim this poll
+                            # observed: a multi-victim scale-in reuses the
+                            # request id and swaps the drain event per victim,
+                            # so a delayed duplicate confirm for the previous
+                            # victim must not release the next one.
+                            await asyncio.to_thread(
+                                ray.get,
+                                manager.confirm_scale_drained.remote(
+                                    request_id,
+                                    victim=victim,
+                                    victim_rank=progress.get("victim_rank"),
+                                ),
+                            )
 
                 # A manager terminal phase is only a *reported* result until
                 # its lifecycle thread has stopped.  In particular, aborting
@@ -916,16 +928,24 @@ class GenRM(Base):
         if direction == "scale_in":
             # The manager retires the *fixed* victim only once the component
             # proves its in-flight count is zero. Refuse rather than break the
-            # drain contract (and never pick a different victim).
+            # drain contract (and never pick a different victim). The proof is
+            # only valid when the victim is positively identified: a failed
+            # progress query returns {} and must NOT fall through to reconcile
+            # -- the manager would retire its recorded victim on the caller's
+            # (missing) drain proof alone (review finding: fail closed).
             progress = await asyncio.to_thread(self._manager_progress, manager, request_id)
             victim = progress.get("victim")
-            if victim and not self._victim_inflight_zero(model, victim):
+            if not progress or victim is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="cannot read manager progress to identify the victim; retry reconcile",
+                )
+            if not self._victim_inflight_zero(model, victim):
                 raise HTTPException(
                     status_code=409,
                     detail="victim still has in-flight requests; retry reconcile after drain",
                 )
-            if victim:
-                self._close_victim_admission(model, victim)
+            self._close_victim_admission(model, victim)
         result = await asyncio.to_thread(ray.get, reconcile.remote(request_id))
         if not result.get("known"):
             raise HTTPException(status_code=503, detail="manager lost lifecycle state; cleanup remains blocked")

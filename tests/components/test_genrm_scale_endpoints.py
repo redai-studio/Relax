@@ -312,5 +312,109 @@ class TestGenerateEngineAttribution(unittest.TestCase):
         self.assertIsNone(response.completion_tokens)
 
 
+class TestReconcileDrainFence(unittest.TestCase):
+    """Review finding: a failed progress query must not fall through to
+    reconcile. The manager retires its recorded victim on the caller's drain
+    proof alone, so an unidentified victim (progress {} or victim None) is
+    not a proof and reconcile must fail closed instead."""
+
+    def _dirty_scale_in(self, replica, manager):
+        """Register a terminal-dirty scale-in the reconcile path targets."""
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        replica._scale_registry.set_detail(request_id, "drain timed out")
+        # Force the dirty terminal state reconcile requires.
+        replica._scale_registry.finish(
+            request_id,
+            status="FAILED",
+            current=2,
+            ready=2,
+            failed=1,
+            cleanup_required=True,
+            error_message="drain timed out",
+        )
+        return request_id
+
+    def test_progress_query_failure_fails_closed(self):
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            raise TimeoutError("manager unreachable")
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        # The manager's reconcile must never run without a drain proof.
+        self.assertEqual(calls, [])
+
+    def test_unknown_victim_fails_closed(self):
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            # Reachable but the snapshot carries no victim identity.
+            return {"phase": "FAILED", "physical_done": True, "victim": None, "victim_rank": None}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(calls, [])
+
+    def test_identified_drained_victim_still_reconciles(self):
+        """Positive control: with a known victim at zero in-flight the
+        reconcile proceeds (regression guard for the fail-closed change)."""
+        victim = ("192.0.2.1", 16001)
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "FAILED", "physical_done": True, "victim": list(victim), "victim_rank": 1}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False, "victim_cleared": True}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+        # Victim has zero in-flight (no key recorded -> not counted).
+        replica._engine_inflight = {}
+
+        response = _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(calls, [request_id])
+        self.assertFalse(response.cleanup_required)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,8 @@ def _manager(num_slots: int = 1):
     manager._engine_placements = {}
     manager._engine_addr_and_ports = {}
     manager._pending_pg_cleanup = set()
+    manager._pg_remove_submitted = set()
+    manager._log_prefix = "test-genrm-manager"
     manager.num_gpu_per_engine = 1
     manager.nodes_per_engine = 1
     manager.args = type(
@@ -380,6 +382,124 @@ class TestCreateScalePgOwnershipFence(unittest.TestCase):
         self.assertNotIn(1, manager._scale_placements)
         self.assertNotIn(1, manager._unreleased_candidate_ranks)
         self.assertFalse(manager.get_scale_progress("req-1")["cleanup_required"])
+
+
+class TestVictimBoundDrainConfirm(unittest.TestCase):
+    """Review finding: a multi-victim scale-in reuses the request id and
+    swaps the drain event per victim. A delayed duplicate confirmation for
+    the previous victim must not release the current one."""
+
+    def _manager(self):
+        manager = _manager(num_slots=4)
+        manager._scale_op_params["req-1"] = {"target": 1, "direction": "scale_in"}
+        return manager
+
+    def _install_victim(self, manager, rank, host="10.0.0.1", port=16001):
+        event = threading.Event()
+        with manager._scale_lock:
+            manager._scale_drain_confirmed["req-1"] = event
+            manager._draining_ranks.add(rank)
+        manager._scale_progress["req-1"] = manager._new_progress("DRAINING")
+        manager._scale_progress["req-1"].update(victim=[host, port], victim_rank=rank)
+        return event
+
+    def test_confirm_bound_to_current_victim(self):
+        manager = self._manager()
+        event = self._install_victim(manager, rank=3)
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        self.assertTrue(event.is_set())
+
+    def test_stale_confirm_for_previous_victim_is_ignored(self):
+        manager = self._manager()
+        # Victim A (rank 3) was confirmed and retired; the lifecycle moved on
+        # to victim B (rank 2) with a fresh event.
+        event_a = self._install_victim(manager, rank=3, port=16001)
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        self.assertTrue(event_a.is_set())
+        event_b = self._install_victim(manager, rank=2, port=16002)
+        # The delayed duplicate confirm for A arrives while B owns the op.
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        self.assertFalse(event_b.is_set())
+        # A fresh, correctly-bound confirm still releases B.
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16002], victim_rank=2)
+        self.assertTrue(event_b.is_set())
+
+    def test_stale_confirm_between_victims_is_ignored(self):
+        manager = self._manager()
+        event_a = self._install_victim(manager, rank=3)
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        # Lifecycle retired A; progress momentarily carries no victim.
+        manager._scale_progress["req-1"].update(victim=None, victim_rank=None)
+        event_b = self._install_victim(manager, rank=2, port=16002)
+        manager.confirm_scale_drained("req-1", victim=["10.0.0.1", 16001], victim_rank=3)
+        self.assertFalse(event_b.is_set())
+
+    def test_legacy_confirm_without_victim_still_works(self):
+        manager = self._manager()
+        event = self._install_victim(manager, rank=3)
+        manager.confirm_scale_drained("req-1")
+        self.assertTrue(event.is_set())
+
+
+class TestPgRemoveResubmission(unittest.TestCase):
+    """Review finding: an exception from remove_placement_group() on the
+    first attempt used to put the rank into _pending_pg_cleanup, which then
+    suppressed every resubmission -- the PG stayed CREATED forever. The fix
+    separates "deletion submitted" from "release unconfirmed"."""
+
+    def _manager_with_pg(self):
+        manager = _manager(num_slots=2)
+        pg = MagicMock()
+        manager._engine_placements[1] = ((pg, [0], [1]), True)
+        return manager, pg
+
+    def test_first_submit_failure_resubmits_on_retry(self):
+        manager, pg = self._manager_with_pg()
+        submits = []
+        state = {"calls": 0}
+
+        def _remove(pg_arg):
+            submits.append(pg_arg)
+            if len(submits) == 1:
+                raise RuntimeError("submission failed before reaching Ray")
+            # Second submission accepted.
+
+        def _table(pg_arg):
+            state["calls"] += 1
+            return {"state": "REMOVED" if len(submits) >= 2 else "CREATED"}
+
+        with (
+            patch.object(_ray_pg_module, "remove_placement_group", _remove, create=True),
+            patch.object(_ray_pg_module, "placement_group_table", _table, create=True),
+        ):
+            self.assertFalse(manager._remove_owned_pg(1))
+            self.assertIn(1, manager._pending_pg_cleanup)
+            # The failed submission must NOT be recorded as submitted.
+            self.assertNotIn(1, manager._pg_remove_submitted)
+            # Retry: deletion is resubmitted, then confirmed REMOVED.
+            self.assertTrue(manager._remove_owned_pg(1))
+        self.assertEqual(len(submits), 2)
+        self.assertNotIn(1, manager._pending_pg_cleanup)
+        self.assertNotIn(1, manager._engine_placements)
+
+    def test_accepted_submission_is_not_resubmitted(self):
+        manager, pg = self._manager_with_pg()
+        submits = []
+
+        def _remove(pg_arg):
+            submits.append(pg_arg)
+
+        def _table(pg_arg):
+            return {"state": "CREATED"}  # deletion accepted, not yet confirmed
+
+        with (
+            patch.object(_ray_pg_module, "remove_placement_group", _remove, create=True),
+            patch.object(_ray_pg_module, "placement_group_table", _table, create=True),
+        ):
+            self.assertFalse(manager._remove_owned_pg(1))  # pending, not REMOVED
+            self.assertFalse(manager._remove_owned_pg(1))  # confirmation poll only
+        self.assertEqual(len(submits), 1)  # never resubmitted an accepted delete
+        self.assertIn(1, manager._pending_pg_cleanup)
 
 
 if __name__ == "__main__":

@@ -93,8 +93,8 @@ class _ScriptedManager:
     def execute_genrm_scale_in(self, request_id):
         self.hook_calls.append(("scale_in", request_id))
 
-    def confirm_scale_drained(self, request_id):
-        self.confirms.append(request_id)
+    def confirm_scale_drained(self, request_id, victim=None, victim_rank=None):
+        self.confirms.append((request_id, tuple(victim) if victim else None, victim_rank))
         self.drained = True
 
     def abort_scale_op(self, request_id):
@@ -443,7 +443,9 @@ class TestScaleInWatcher(unittest.TestCase):
         with _FastSleep():
             _run(scenario())
 
-        self.assertEqual(manager.confirms, [request_id])
+        self.assertEqual([c[0] for c in manager.confirms], [request_id])
+        # The confirmation must carry the victim identity it proved drained.
+        self.assertEqual([c[1] for c in manager.confirms], [tuple(self._victim())])
         result = replica._scale_registry.get_status("scale_in", request_id)
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(result["removed"], 1)

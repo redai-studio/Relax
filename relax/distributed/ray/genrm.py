@@ -10,6 +10,7 @@ onload/offload) with GenRM-specific placement and engine wiring.
 import logging
 import threading
 import time
+from typing import Optional
 
 import ray
 
@@ -187,10 +188,30 @@ class GenRMManager(MultiEngineManager):
         with self._scale_lock:
             return dict(self._scale_progress.get(request_id) or {})
 
-    def confirm_scale_drained(self, request_id: str) -> None:
-        """Component-side drain proof: no in-flight request targets the current
-        victim any more."""
+    def confirm_scale_drained(
+        self, request_id: str, victim: Optional[list] = None, victim_rank: Optional[int] = None
+    ) -> None:
+        """Component-side drain proof: no in-flight request targets the
+        current victim any more.
+
+        The proof is bound to the victim the caller observed in its progress
+        snapshot. A multi-victim scale-in reuses the request id and swaps the
+        drain event per victim, so a delayed duplicate confirmation for a
+        previous victim must be ignored instead of releasing the next one
+        (whose in-flight count was never proven zero). Legacy callers that
+        omit both identifiers keep the old behavior.
+        """
         with self._scale_lock:
+            progress = self._scale_progress.get(request_id) or {}
+            if victim_rank is not None and progress.get("victim_rank") != victim_rank:
+                logger.info(
+                    f"GenRM drain confirm for {request_id} ignored: stale victim "
+                    f"rank={victim_rank}, current={progress.get('victim_rank')}"
+                )
+                return
+            if victim is not None and [str(v) for v in (progress.get("victim") or [])] != [str(v) for v in victim]:
+                logger.info(f"GenRM drain confirm for {request_id} ignored: stale victim address")
+                return
             event = self._scale_drain_confirmed.get(request_id)
         if event is not None:
             event.set()
