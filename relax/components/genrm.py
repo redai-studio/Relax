@@ -984,18 +984,39 @@ class GenRM(Base):
             # -- the manager would retire its recorded victim on the caller's
             # (missing) drain proof alone (review finding: fail closed).
             progress = await asyncio.to_thread(self._manager_progress, manager, request_id)
-            victim = progress.get("victim")
-            if not progress or victim is None:
+            if not progress:
                 raise HTTPException(
                     status_code=503,
                     detail="cannot read manager progress to identify the victim; retry reconcile",
                 )
-            if not self._victim_inflight_zero(model, victim):
+            victim = progress.get("victim")
+            if victim is not None:
+                if not self._victim_inflight_zero(model, victim):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="victim still has in-flight requests; retry reconcile after drain",
+                    )
+                self._close_victim_admission(model, victim)
+            elif progress.get("phase") == "COMPLETED" and progress.get("physical_done") is True:
+                # Positive completion proof: the physical lifecycle finished
+                # and the manager no longer holds a victim (a watcher that
+                # lost its progress RPCs until deadline left the registry
+                # dirty even though the scale-in completed underneath).
+                # COMPLETED only: a FAILED victim-less snapshot keeps the
+                # fail-closed refusal (the lifecycle ended abnormally; only
+                # an identified, drained victim or a clean completion may
+                # release the mutex). Fall through to the authoritative
+                # manager reconcile; the drain proof is meaningless once
+                # nothing is draining. Any other victim-less snapshot
+                # (unknown/lost state, live lifecycle) stays refused below
+                # (review finding: distinguish "no drain proof" from
+                # "confirmed physical completion").
+                pass
+            else:
                 raise HTTPException(
-                    status_code=409,
-                    detail="victim still has in-flight requests; retry reconcile after drain",
+                    status_code=503,
+                    detail="cannot read manager progress to identify the victim; retry reconcile",
                 )
-            self._close_victim_admission(model, victim)
         result = await asyncio.to_thread(ray.get, reconcile.remote(request_id))
         if not result.get("known"):
             raise HTTPException(status_code=503, detail="manager lost lifecycle state; cleanup remains blocked")

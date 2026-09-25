@@ -418,6 +418,65 @@ class TestReconcileDrainFence(unittest.TestCase):
         self.assertEqual(calls, [request_id])
         self.assertFalse(response.cleanup_required)
 
+    def test_completed_lifecycle_without_victim_reconciles(self):
+        """Review finding (re-review): a scale-in that physically completed
+        underneath a watcher which lost its progress RPCs until deadline
+        leaves the registry dirty (FAILED + cleanup_required) with the
+        manager reporting COMPLETED / physical_done / no victim. The
+        reconcile must accept that positive completion proof and release the
+        mutex instead of refusing forever."""
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "COMPLETED", "physical_done": True, "victim": None, "victim_rank": None}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False, "victim_cleared": True}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        response = _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(calls, [request_id])
+        self.assertFalse(response.cleanup_required)
+        # The model mutex actually released.
+        self.assertFalse(replica._scale_registry.get_status("scale_in", request_id)["cleanup_required"])
+
+    def test_completed_without_physical_done_still_fails_closed(self):
+        """COMPLETED alone is not enough: the physical lifecycle fence must
+        also be confirmed before a victim-less snapshot may release."""
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "COMPLETED", "physical_done": False, "victim": None, "victim_rank": None}
+
+        calls = []
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(calls, [])
+        self.assertTrue(replica._scale_registry.get_status("scale_in", request_id)["cleanup_required"])
+
 
 class TestScaleSubmitCapacityContract(unittest.TestCase):
     """Review findings: strict integer validation on the mutating request, and
