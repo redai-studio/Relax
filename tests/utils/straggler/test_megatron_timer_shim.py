@@ -15,6 +15,7 @@ import pytest
 import torch
 
 import relax.utils.straggler as straggler
+from relax.utils.straggler import megatron_timer_shim as shim_mod
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.megatron_timer_shim import (
     MAX_LOG_LEVEL,
@@ -74,6 +75,20 @@ class RecordingSink:
 
     def stats(self) -> Dict[str, int]:
         return {"outstanding": self.outstanding}
+
+
+class _OwnerStub:
+    """Stands in for StragglerTimers, which reaches the rank through its sink."""
+
+    def __init__(self, rank: int) -> None:
+        self.identity = _IdentityStub(rank)
+
+
+class _IdentityStub:
+    """Minimal stand-in for RuntimeIdentity, which only needs `.rank` here."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
 
 
 def make_timers(
@@ -399,3 +414,48 @@ def test_timers_survive_megatron_style_deepcopy_and_asdict() -> None:
 
     assert copy.deepcopy(config).timers is timers
     assert dataclasses.asdict(config)["timers"] is timers
+
+
+def _set_injection(monkeypatch: pytest.MonkeyPatch, delay_ms: float, rank: int, stage: str) -> None:
+    """Point the test-only injection knobs at fixed values."""
+    monkeypatch.setattr(shim_mod, "_debug_settings", (delay_ms, rank, stage))
+
+
+def test_injection_is_inert_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_injection(monkeypatch, 0.0, -1, "")
+    timers, _ = make_timers()
+    handle = timers("forward-compute")
+
+    assert shim_mod._injected_delay_s(handle._owner, "forward-compute") == 0.0
+
+
+def test_injection_targets_only_the_named_rank_and_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_injection(monkeypatch, 12.0, 1, "")
+    assert shim_mod._injected_delay_s(_OwnerStub(rank=1), "forward-compute") == pytest.approx(0.012)
+
+    _set_injection(monkeypatch, 12.0, 0, "")
+    assert shim_mod._injected_delay_s(_OwnerStub(rank=1), "forward-compute") == 0.0
+
+    _set_injection(monkeypatch, 12.0, 1, "backward-compute")
+    assert shim_mod._injected_delay_s(_OwnerStub(rank=1), "forward-compute") == 0.0
+
+    _set_injection(monkeypatch, 12.0, -1, "")
+    assert shim_mod._injected_delay_s(None, "forward-compute") == pytest.approx(0.012)
+
+
+def test_injection_delay_is_applied_inside_the_measured_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sleep must happen between the two clock reads, like a real slow stage."""
+    slept: list = []
+    monkeypatch.setattr(shim_mod.time, "sleep", lambda seconds: slept.append(seconds))
+    sink = RecordingSink()
+    sink.identity = _IdentityStub(rank=0)
+    timers, clock = make_timers(sink=sink)
+    handle = timers("forward-compute")
+    _set_injection(monkeypatch, 25.0, 0, "forward-compute")
+
+    handle.start()
+    clock.now += 0.5
+    handle.stop()
+
+    assert slept == [pytest.approx(0.025)]
+    assert sink.intervals[0]["host_end"] - sink.intervals[0]["host_start"] == pytest.approx(0.5)

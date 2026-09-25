@@ -108,21 +108,42 @@ class RuntimeIdentity:
     virtual_pipeline_parallel_rank: int = UNKNOWN_RANK
     context_parallel_rank: int = UNKNOWN_RANK
     expert_parallel_rank: int = UNKNOWN_RANK
+    expert_tensor_parallel_rank: int = UNKNOWN_RANK
+    expert_data_parallel_rank: int = UNKNOWN_RANK
     data_parallel_rank: int = UNKNOWN_RANK
     data_parallel_world_size: Optional[int] = None
+    #: Identifies one topology layout. A re-shard (elastic scale, parallelism
+    #: change) invalidates every comparison, so it is part of the cohort key.
+    topology_epoch: str = ""
+    #: ``dense`` for the first phase; a learned/EP schema would be a different
+    #: value and can therefore never share a window with a dense run.
+    stage_schema: str = "dense"
+    #: Model chunk (virtual pipeline stage) the timers in this process belong to.
+    model_chunk_index: int = UNKNOWN_RANK
 
     @property
     def cohort(self) -> str:
         """Key shared by ranks that differ only in the data-parallel
-        dimension."""
+        dimension.
+
+        Two ranks may be compared only when they execute the same parallel role
+        for the same model chunk under the same topology, so TP, PP, VPP, CP,
+        the chunk index, the topology epoch and the stage schema are all in the
+        key. ``dp`` is deliberately *not* in the key: data-parallel replicas are
+        the axis the comparison runs along. EP/ETP/EDP are carried in
+        :meth:`as_dict` as a schema capability but are not part of the key,
+        because comparing expert-parallel roles is not claimed to be supported.
+        """
         return ":".join(
             str(value)
             for value in (
+                self.topology_epoch or "topo0",
+                self.stage_schema,
                 self.tensor_parallel_rank,
                 self.pipeline_parallel_rank,
                 self.virtual_pipeline_parallel_rank,
+                self.model_chunk_index,
                 self.context_parallel_rank,
-                self.expert_parallel_rank,
             )
         )
 
@@ -133,6 +154,7 @@ class RuntimeIdentity:
             f"rank{self.rank}/tp{self.tensor_parallel_rank}/pp{self.pipeline_parallel_rank}"
             f"/vpp{self.virtual_pipeline_parallel_rank}/cp{self.context_parallel_rank}"
             f"/ep{self.expert_parallel_rank}/dp{self.data_parallel_rank}"
+            f"/chunk{self.model_chunk_index}"
         )
 
     def as_dict(self) -> dict:
@@ -143,22 +165,45 @@ class RuntimeIdentity:
             "world_size": self.world_size,
             "cohort": self.cohort,
             "label": self.label,
+            "topology_epoch": self.topology_epoch,
+            "stage_schema": self.stage_schema,
             "topology": {
                 "tp": self.tensor_parallel_rank,
                 "pp": self.pipeline_parallel_rank,
                 "vpp": self.virtual_pipeline_parallel_rank,
+                "chunk": self.model_chunk_index,
                 "cp": self.context_parallel_rank,
                 "ep": self.expert_parallel_rank,
+                "etp": self.expert_tensor_parallel_rank,
+                "edp": self.expert_data_parallel_rank,
                 "dp": self.data_parallel_rank,
             },
             "data_parallel_world_size": self.data_parallel_world_size,
         }
 
 
+def _env_str(name: str, fallback: str) -> str:
+    """Read a declared env knob without importing the framework at module load."""
+    try:
+        from relax.utils.env import Envs
+
+        value = getattr(Envs, name)
+        return fallback if value is None else str(value)
+    except Exception:
+        return fallback
+
+
 def discover_identity() -> RuntimeIdentity:
     """Probe the current rank's position; never raises."""
     rank, world_size = _distributed_rank_and_world_size()
     tp, pp, vpp, cp, ep, dp, dp_world_size = _parallel_ranks()
+    try:
+        from megatron.core import parallel_state
+
+        etp = _probe(parallel_state.get_expert_tensor_parallel_rank)
+        edp = _probe(parallel_state.get_expert_data_parallel_rank)
+    except Exception:
+        etp = edp = UNKNOWN_RANK
     if dp == UNKNOWN_RANK and world_size > 1:
         # No Megatron parallel state (e.g. a mock trainer): fall back to a flat
         # data-parallel view so peers are still comparable, and keep the cohort
@@ -175,8 +220,12 @@ def discover_identity() -> RuntimeIdentity:
         virtual_pipeline_parallel_rank=vpp,
         context_parallel_rank=cp,
         expert_parallel_rank=ep,
+        expert_tensor_parallel_rank=etp if dp != UNKNOWN_RANK else UNKNOWN_RANK,
+        expert_data_parallel_rank=edp if dp != UNKNOWN_RANK else UNKNOWN_RANK,
         data_parallel_rank=dp,
         data_parallel_world_size=dp_world_size,
+        topology_epoch=_env_str("RELAX_STRAGGLER_TOPOLOGY_EPOCH", ""),
+        model_chunk_index=vpp if dp != UNKNOWN_RANK else UNKNOWN_RANK,
     )
 
 

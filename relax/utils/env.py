@@ -213,6 +213,13 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_STRAGGLER_MIN_COHORT = EnvProperty("RELAX_STRAGGLER_MIN_COHORT", int, 2)
     RELAX_STRAGGLER_REPORT_INTERVAL_S = EnvProperty("RELAX_STRAGGLER_REPORT_INTERVAL_S", float, 10.0)
     RELAX_STRAGGLER_COLLECTOR_ADDR = EnvProperty("RELAX_STRAGGLER_COLLECTOR_ADDR", str, None)
+    # Identifies one parallel layout; a re-shard invalidates every comparison.
+    RELAX_STRAGGLER_TOPOLOGY_EPOCH = EnvProperty("RELAX_STRAGGLER_TOPOLOGY_EPOCH", str, "")
+    # Test-only slow-rank injection, used to measure detector sensitivity. All
+    # three default to inert, and the delay is the only behaviour they change.
+    RELAX_STRAGGLER_DEBUG_HOST_DELAY_MS = EnvProperty("RELAX_STRAGGLER_DEBUG_HOST_DELAY_MS", float, 0.0)
+    RELAX_STRAGGLER_DEBUG_RANK = EnvProperty("RELAX_STRAGGLER_DEBUG_RANK", int, -1)
+    RELAX_STRAGGLER_DEBUG_STAGE = EnvProperty("RELAX_STRAGGLER_DEBUG_STAGE", str, "")
 
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PREEXPANDED_PATCH = EnvProperty("RELAX_OPD_PREEXPANDED_PATCH", bool, False)

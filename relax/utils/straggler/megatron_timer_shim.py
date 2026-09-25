@@ -29,7 +29,7 @@ Design rules, in priority order:
 """
 
 import time
-from typing import Any, Callable, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.straggler.config import StragglerConfig
@@ -39,6 +39,68 @@ logger = get_logger(__name__)
 
 #: Highest ``log_level`` Megatron uses; mirrors ``Timers._max_log_level``.
 MAX_LOG_LEVEL = 2
+
+#: Test-only slow-rank injection. The detector's sensitivity curve cannot be
+#: measured without a controlled slowdown, and an external one (SM carve-out,
+#: NCCL bandwidth limiting) cannot be attributed to one rank precisely. These
+#: knobs are inert unless a delay is set, change nothing except the sleep, and
+#: the delay lands *inside* the measured interval, exactly like a real slow
+#: stage. ``RELAX_STRAGGLER_DEBUG_RANK=-1`` means every rank, and an empty
+#: ``RELAX_STRAGGLER_DEBUG_STAGE`` means every stage.
+_DEBUG_DELAY_MS_ENV = "RELAX_STRAGGLER_DEBUG_HOST_DELAY_MS"
+_DEBUG_RANK_ENV = "RELAX_STRAGGLER_DEBUG_RANK"
+_DEBUG_STAGE_ENV = "RELAX_STRAGGLER_DEBUG_STAGE"
+_debug_settings: Optional[Tuple[float, int, str]] = None
+
+
+def _debug_injection() -> Tuple[float, int, str]:
+    """Resolve the test-only injection knobs once per process."""
+    global _debug_settings
+    if _debug_settings is None:
+        try:
+            from relax.utils.env import Envs
+
+            delay_ms = float(getattr(Envs, _DEBUG_DELAY_MS_ENV) or 0.0)
+            rank = int(getattr(Envs, _DEBUG_RANK_ENV) if getattr(Envs, _DEBUG_RANK_ENV) is not None else -1)
+            stage = str(getattr(Envs, _DEBUG_STAGE_ENV) or "")
+        except Exception:
+            delay_ms, rank, stage = 0.0, -1, ""
+        _debug_settings = (max(0.0, delay_ms), rank, stage)
+    return _debug_settings
+
+
+def _local_rank(owner: Any) -> Optional[int]:
+    """Find this process's rank through whichever object carries it.
+
+    Timer handles are owned by ``StragglerTimers``, which does not itself know
+    the rank; the sink it forwards to (the observer) does.
+    """
+    seen = []
+    for candidate in (owner, getattr(owner, "_sink", None)):
+        if candidate is not None and candidate not in seen:
+            seen.append(candidate)
+    for candidate in list(seen):
+        seen.append(getattr(candidate, "identity", None))
+    for candidate in seen:
+        rank = getattr(candidate, "rank", None)
+        if rank is not None:
+            try:
+                return int(rank)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _injected_delay_s(owner: Any, name: str) -> float:
+    """Return the delay to apply inside this interval, or 0 when inert."""
+    delay_ms, target_rank, target_stage = _debug_injection()
+    if delay_ms <= 0.0:
+        return 0.0
+    if target_stage and target_stage != name:
+        return 0.0
+    if target_rank >= 0 and _local_rank(owner) != target_rank:
+        return 0.0
+    return delay_ms / 1000.0
 
 
 class TimerSink(Protocol):
@@ -193,6 +255,9 @@ class StragglerTimerHandle:
                 return
             if barrier:
                 owner.note_ignored_barrier()
+            delay = _injected_delay_s(owner, self._name)
+            if delay > 0.0:
+                time.sleep(delay)
             host_end = owner.clock()
             host_start = self._host_start
             token = self._token
