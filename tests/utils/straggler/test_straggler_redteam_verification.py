@@ -118,7 +118,8 @@ class _SmallEvent:
 
 
 class _SmallPoolBackend:
-    """Event backend that is available but never completes, so the pool drains."""
+    """Event backend that is available but never completes, so the pool
+    drains."""
 
     def available(self) -> bool:
         return True
@@ -215,7 +216,8 @@ def test_abrupt_death_loses_at_most_one_flush_interval(tmp_path: pathlib.Path, s
 
     The child delivers one interval every ``CADENCE_S`` and never calls
     ``close()``. It is killed as soon as the parent sees a fresh delivery, so
-    whatever is missing can only be what one periodic flush had not yet written.
+    whatever is missing can only be what one periodic flush had not yet
+    written.
     """
     delivered = _run_until_delivered(tmp_path, delivery=120, sig=sig)
     assert delivered >= 120, f"child only delivered {delivered} intervals"
@@ -230,7 +232,8 @@ def test_abrupt_death_loses_at_most_one_flush_interval(tmp_path: pathlib.Path, s
 
 
 def test_kill_during_a_status_write_leaves_only_valid_json(tmp_path: pathlib.Path) -> None:
-    """``_write_json`` must be rename-atomic: a kill mid-write cannot corrupt it."""
+    """``_write_json`` must be rename-atomic: a kill mid-write cannot corrupt
+    it."""
     child = textwrap.dedent(
         """
         import sys, time
@@ -295,7 +298,8 @@ def test_four_ranks_write_unique_status_paths_and_one_unsuffixed_writer(tmp_path
 
 
 def test_a_concurrent_reader_never_observes_partial_status_json(tmp_path: pathlib.Path) -> None:
-    """Poll the published file while the writer loops: every read must parse."""
+    """Poll the published file while the writer loops: every read must
+    parse."""
     runtime = _runtime(tmp_path, run_id="atomic2")
     runtime.start()
     run_dir = tmp_path / "run_atomic2"
@@ -329,18 +333,9 @@ def test_a_concurrent_reader_never_observes_partial_status_json(tmp_path: pathli
     assert failures == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VERIFY-01: close() joins the status writer with timeout=1.0 s and then calls "
-        "_write_status() itself. When one writer iteration (collector.flush() + status "
-        "serialisation) exceeds the join -- e.g. a large pending JSONL backlog on a slow "
-        "filesystem -- both threads write the same run_dir files at once. Fault injection "
-        "below reproduces two concurrent _write_status entries."
-    ),
-)
 def test_close_does_not_race_the_status_writer(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """close() must not overlap the periodic status writer on the same files."""
+    """close() must not overlap the periodic status writer on the same
+    files."""
     state = {"active": 0, "max": 0}
     guard = threading.Lock()
     original = StragglerRuntime._write_status
@@ -364,19 +359,11 @@ def test_close_does_not_race_the_status_writer(tmp_path: pathlib.Path, monkeypat
     assert state["max"] == 1, f"close() overlapped the status writer: {state['max']} writers at once"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "VERIFY-02: _write_json passes a fixed '<final>.tmp' path, so two concurrent "
-        "writers tear it before os.replace publishes the result. The window is widened "
-        "here (two half-writes around a barrier); with differing payloads the published "
-        "snapshot is invalid JSON. A unique temp path (e.g. tempfile.mkstemp) is the fix."
-    ),
-)
 def test_write_json_is_not_safe_for_two_concurrent_writers(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The published snapshot must stay valid even with two concurrent writers."""
+    """The published snapshot must stay valid even with two concurrent
+    writers."""
     original_dumps = json.dumps
     barrier = threading.Barrier(2, timeout=5.0)
 
@@ -410,7 +397,7 @@ def test_write_json_is_not_safe_for_two_concurrent_writers(
         thread.join(timeout=10.0)
 
     published = (tmp_path / "snapshot.json").read_text(encoding="utf-8")
-    json.loads(published)  # fails today: the two writers tear the shared temp file
+    json.loads(published)  # the unique temp path keeps the published snapshot valid
 
 
 def test_output_paths_are_run_scoped(tmp_path: pathlib.Path) -> None:
@@ -598,7 +585,8 @@ def test_dedup_evictions_are_counted_and_conserved(monkeypatch: pytest.MonkeyPat
 
 
 def test_rt09_staggered_start_is_compared_on_the_current_tip() -> None:
-    """Independent re-run of the RT-09 scenario (rank 1 joins 3 windows late)."""
+    """Independent re-run of the RT-09 scenario (rank 1 joins 3 windows
+    late)."""
     detector = StragglerDetector(
         StragglerConfig(enabled=True, window_seconds=5.0, warmup_windows=0, persist_windows=1, work_tolerance=0.05)
     )
@@ -623,7 +611,8 @@ def _local_remove_non_pickleables(obj: Any, max_depth: int = 3, current_depth: i
     """Dependency-free copy of upstream ``remove_non_pickleables``.
 
     ``copy.copy`` + ``setattr`` over ``vars()`` is what turned the pre-fix
-    slotted-less shim into a ``FrozenInstanceError`` on a ``TransformerConfig``.
+    slotted-less shim into a ``FrozenInstanceError`` on a
+    ``TransformerConfig``.
     """
     if current_depth >= max_depth:
         return obj
@@ -650,7 +639,8 @@ def test_a7_local_walker_still_reproduces_the_pre_fix_crash() -> None:
     """The A7 invariant must remain enforced without a Megatron checkout."""
 
     class _PreFixTimers:
-        """The pre-fix shape: an instance ``__dict__`` holding a frozen config."""
+        """The pre-fix shape: an instance ``__dict__`` holding a frozen
+        config."""
 
         def __init__(self) -> None:
             self.__dict__["_config"] = StragglerConfig(enabled=True)

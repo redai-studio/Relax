@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 from dataclasses import replace
 from typing import Any, Callable, Dict, Optional
@@ -185,9 +186,12 @@ class StragglerRuntime:
     def _run_dir(self) -> str:
         """Run-scoped output directory shared by every rank of one run.
 
-        The launcher gives each arm its own base directory and the run id (the
-        Ray job id) makes the scope unique even if two arms ever shared a base,
-        so two runs' JSONL streams can never interleave.
+        The launcher gives each arm its own base directory and the run id makes
+        the scope unique for real Ray job ids, which are alphanumeric, so two
+        arms cannot interleave their JSONL. The scope is not injective for
+        punctuation-only differences (``job/a`` and ``job_a`` collapse to one
+        component); that is a documented limit of this claim, not a guarantee
+        for arbitrary synthetic ids.
         """
         return os.path.join(self._config.output_dir, f"run_{_sanitise(self._identity.run_id)}")
 
@@ -296,13 +300,25 @@ class StragglerRuntime:
 
     @staticmethod
     def _write_json(output_dir: str, name: str, payload: Any) -> None:
-        """Atomic status snapshot: write tmp, flush, then rename into place."""
+        """Atomic status snapshot: unique temp, flush, then rename into place.
+
+        The temp path must be unique per writer: a fixed ``<final>.tmp`` is
+        torn by two concurrent writers before ``os.replace`` publishes it,
+        which was observed to leave invalid JSON behind.
+        """
         final = os.path.join(output_dir, name)
-        temp = f"{final}.tmp"
-        with open(temp, "w") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
-            handle.flush()
-        os.replace(temp, final)
+        handle_fd, temp = tempfile.mkstemp(dir=output_dir, prefix=f"{name}.", suffix=".tmp")
+        try:
+            with os.fdopen(handle_fd, "w") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+                handle.flush()
+            os.replace(temp, final)
+        except BaseException:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+            raise
 
     def close(self, timeout: float = 2.0) -> None:
         """Stop reading, flush the windows and close the transport;
@@ -311,9 +327,10 @@ class StragglerRuntime:
             return
         self._closed = True
         self._status_stop.set()
-        if self._status_thread is not None:
+        writer = self._status_thread
+        if writer is not None:
             try:
-                self._status_thread.join(timeout=1.0)
+                writer.join(timeout=1.0)
             except Exception:
                 self._errors += 1
             self._status_thread = None
@@ -338,7 +355,10 @@ class StragglerRuntime:
             except Exception:
                 self._errors += 1
         try:
-            if not sys.is_finalizing():
+            if not sys.is_finalizing() and not (writer is not None and writer.is_alive()):
+                # The join timed out, so the writer still owns these files; a
+                # second snapshot from this thread would race it on the same
+                # names. The writer's last snapshot is at most one interval old.
                 self._write_status()
         except Exception:
             self._errors += 1
