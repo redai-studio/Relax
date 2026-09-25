@@ -584,8 +584,36 @@ class Rollout(Base):
 
         return await handle_predict(self, train_step)
 
+    async def _lora_control(self, action: str, payload: dict | None = None) -> dict:
+        result = await self.rollout_manager.lora_control.remote(action, payload)
+        if result.get("error_code"):
+            raise HTTPException(result.get("status_code", 409), detail=result)
+        return result
+
+    @app.post("/lora/publications", status_code=202)
+    async def publish_lora(self, payload: dict) -> dict:
+        return await self._lora_control("publish", payload)
+
+    @app.get("/lora/publications/{operation_id}")
+    async def lora_publication_status(self, operation_id: str) -> dict:
+        return await self._lora_control("status", {"operation_id": operation_id})
+
+    @app.post("/lora/publications/{operation_id}/cancel")
+    async def cancel_lora_publication(self, operation_id: str) -> dict:
+        return await self._lora_control("cancel", {"operation_id": operation_id})
+
+    @app.get("/lora/versions")
+    async def lora_versions(self) -> dict:
+        return await self._lora_control("status")
+
+    @app.post("/lora/collect")
+    async def collect_lora_versions(self) -> dict:
+        return await self._lora_control("collect")
+
     @app.get("/can_do_update_weight_for_async")
     async def can_do_update_weight_for_async(self):
+        if getattr(self.config, "lora_publication_config", None):
+            raise HTTPException(409, "MANAGED_OPERATION_FORBIDDEN")
         self._logger.debug("Handling can_do_update_weight_for_async request")
         step = self.step
         can_update = await self._async_check_production_for_update_weight(step)

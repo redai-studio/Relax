@@ -1,0 +1,15 @@
+# Copy and fill paths before starting the dedicated Relax deployment.
+artifact_store: /ABSOLUTE/SHARED_ADAPTER_STORE
+target_model: default
+capacity: 2
+# For two independent TP=1 engines on one GPU, set 2 and configure
+# --rollout-num-gpus 1 --rollout-num-gpus-per-engine 1 plus an explicit
+# --sglang-mem-fraction-static below 0.5 per engine (model must fit).
+engines_per_gpu: 1
+bootstrap_version_id: A
+export_every_n_steps: null
+auto_publish: false
+prepare_timeout_seconds: 120
+cleanup_timeout_seconds: 120
+artifact_max_bytes: 8589934592
+max_lifecycle_records: 100000
