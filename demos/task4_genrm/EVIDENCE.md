@@ -130,6 +130,8 @@ python results/train_continuity_20260925/plot_continuity.py
 
 ## SHA256 (first 16 hex)
 
+Note: `train_continuity_20260925_r4` and `_r5` verdict blobs are byte-identical — the verdict schema carries only the boolean assertion matrix and counts, and both independent runs produced the same 12/12-green, `rollout_count: 8`, capacity-1 outcome after `node-0` normalization. The runs are distinguishable by their event timelines on the evidence branch (`26b1c1e`).
+
 | File                                             | sha256             |
 | ------------------------------------------------ | ------------------ |
 | `autoscaler_prereg_v2_20260925_r5/verdicts.json` | `959e39a033da00db` |
@@ -138,12 +140,11 @@ python results/train_continuity_20260925/plot_continuity.py
 | `autoscaler_run_20260924_v3/verdicts.json`       | `1303b57a9bef0cd1` |
 | `b2_train_smoke_20260925/verdicts.json`          | `8d5b2944510ccf3b` |
 | `b2_train_smoke_20260925_r2/verdicts.json`       | `9bbb5a84055dc40a` |
+| `b2_train_smoke_20260925_r3/verdicts.json`       | `283315b3f4ea5366` |
 | `e2e_run_20260924/verdicts.json`                 | `c87ebec5df05ee7d` |
 | `failure_injection_20260925_r2/verdicts.json`    | `c1c34ccdb0c13b5c` |
 | `reward_consistency_20260925_r2/verdicts.json`   | `f639c6bc8edab47d` |
-| `sampling_divergence_20260925/verdicts.json`     | `cf05dd4ee1b763fb` |
-| `sampling_divergence_20260925_r3/verdicts.json`  | `f381369f5e126032` |
+| `reward_consistency_20260925_r3/verdicts.json`   | `422034dbdd8ce083` |
+| `sampling_divergence_20260925_r3/verdicts.json`  | `593740d3d2c205d2` |
 | `train_continuity_20260925_r4/verdicts.json`     | `c407c34266600439` |
-| `reward_consistency_20260925_r3/verdicts.json`   | `1f5bf8aa3c7c9443` |
-| `b2_train_smoke_20260925_r3/verdicts.json`       | `edb03b50cee4c44d` |
-| `train_continuity_20260925_r5/verdicts.json`     | `3f5e128a1457f527` |
+| `train_continuity_20260925_r5/verdicts.json`     | `c407c34266600439` |
