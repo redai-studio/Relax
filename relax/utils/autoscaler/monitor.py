@@ -464,6 +464,10 @@ def _select_service_view(status: JsonDict, service: str) -> JsonDict:
         "recent_metrics",
         "total_scale_operations",
         "last_decision",
+        # Per-service scale history: without the overlay the status panel
+        # would show the rollout runtime's last action for every service.
+        "last_scale_action",
+        "last_scale_time",
     ):
         if key in svc:
             view[key] = svc[key]

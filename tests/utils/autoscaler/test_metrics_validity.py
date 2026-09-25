@@ -156,6 +156,34 @@ class TestFieldValidityOnCollection(unittest.TestCase):
         self.assertEqual(as_dict["field_validity"]["ttft_p95"]["sample_count"], 5)
         self.assertTrue(as_dict["field_validity"]["ttft_p95"]["present"])
 
+    def test_missing_throughput_keeps_token_and_queue_pressure(self):
+        """Review finding: an engine whose scrape is missing only throughput
+        used to be excluded from every aggregate, erasing its already
+        observed token_usage / queue pressure and disabling scale-out. Fields
+        aggregate per-field validity; the partially observed engine still
+        counts where it was observed."""
+        collector = MetricsCollector(AutoscalerConfig())
+        full = _collect(_FULL_SCRAPE)  # token 0.42, queue 3, throughput 120.5
+        partial_scrape = "\n".join(line for line in _FULL_SCRAPE.splitlines() if "gen_throughput" not in line)
+        partial = _collect(partial_scrape)  # valid token/queue, invalid throughput
+        self.assertTrue(partial.is_field_valid("token_usage"))
+        self.assertTrue(partial.is_field_valid("num_queue_reqs"))
+        self.assertFalse(partial.is_field_valid("gen_throughput"))
+        self.assertFalse(partial.has_critical_metrics())  # still "unknown" for scale-in
+
+        collector.add_snapshot({"full": full, "partial": partial}, num_candidates=2)
+        agg = collector.get_aggregated_metrics()
+        # token_usage mean over BOTH engines (per-field validity), not just
+        # the fully-scraped one.
+        self.assertAlmostEqual(agg.avg_token_usage, (0.42 + 0.42) / 2, places=6)
+        # Queue totals include the partial engine's queue depth.
+        self.assertEqual(agg.total_queue_reqs, 6)
+        # Throughput sums only the engine that reported it.
+        self.assertAlmostEqual(agg.total_throughput, 120.5, places=6)
+        # The conservative scale-in gate is untouched: the partial engine is
+        # still listed as unknown.
+        self.assertEqual(agg.unknown_engines, ["partial"])
+
 
 class TestLegacyCompatibility(unittest.TestCase):
     def test_legacy_construction_without_validity_stays_valid(self):

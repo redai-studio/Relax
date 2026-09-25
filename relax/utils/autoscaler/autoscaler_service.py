@@ -395,15 +395,28 @@ class AutoscalerService(Base):
         logger.info("Autoscaler main loop exited")
 
     async def _evaluate_and_scale(self) -> None:
-        """Evaluate each configured service with independent mutable state."""
+        """Evaluate each configured service with independent mutable state.
+
+        Services are evaluated concurrently: one slow/stalled service (e.g. a
+        GenRM metrics endpoint hanging) must not delay another service's
+        evaluation cadence or scaling decisions. Per-service failures are
+        captured on that service's state and never abort the batch (review
+        finding: cross-service interference).
+        """
         services = getattr(self, "_services", None)
-        runtimes = services.values() if services is not None else [self._runtime(None)]
-        for runtime in runtimes:
+        runtimes = list(services.values()) if services is not None else [self._runtime(None)]
+
+        async def _guarded(runtime) -> None:
             try:
                 await self._evaluate_service(runtime)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate per service
                 runtime.state.last_error = str(exc)
                 logger.exception(f"Autoscaler evaluation failed for service={runtime.name}: {exc}")
+
+        if len(runtimes) == 1:
+            await _guarded(runtimes[0])
+            return
+        await asyncio.gather(*(_guarded(runtime) for runtime in runtimes))
 
     async def _evaluate_service(self, runtime: ServiceRuntime) -> None:
         if getattr(self, "_services", None) is None:
@@ -751,6 +764,13 @@ class AutoscalerService(Base):
                 "current_engines": len(service_engines),
                 "min_engines": runtime.config.min_engines,
                 "max_engines": runtime.config.max_engines,
+                # Per-service scale history: without these the monitor's
+                # service view would display the rollout runtime's last
+                # action for every service (review finding).
+                "last_scale_time": runtime.state.last_scale_time,
+                "last_scale_action": (
+                    runtime.state.last_scale_action.value if runtime.state.last_scale_action else None
+                ),
                 "last_decision": runtime.state.last_decision.to_dict() if runtime.state.last_decision else None,
                 "pending_requests": list(runtime.state.pending_requests),
                 "recent_metrics": service_metrics.to_dict(),
@@ -970,10 +990,20 @@ class AutoscalerService(Base):
 
         if request.rollout_service_url is not None:
             self.config.rollout_service_url = request.rollout_service_url
+            # Keep the per-service map in sync: ``from_yaml`` seeds
+            # ``service_targets["rollout"]`` from this field, so a legacy PATCH
+            # that only updated the field left the map shadowing it with the
+            # startup value -- the new URL silently never took effect (review
+            # finding).
+            self.config.service_targets["rollout"] = request.rollout_service_url
             updates_made.append(f"rollout_service_url={request.rollout_service_url}")
 
         if request.service_targets is not None:
             self.config.service_targets = dict(request.service_targets)
+            # Mirror a rollout target back into the legacy field for the same
+            # reason: the two spellings must never disagree.
+            if request.service_targets.get("rollout"):
+                self.config.rollout_service_url = request.service_targets["rollout"]
             updates_made.append(f"service_targets={sorted(request.service_targets)}")
 
         if request.service_policies is not None:

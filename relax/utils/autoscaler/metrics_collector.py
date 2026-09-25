@@ -698,22 +698,25 @@ class MetricsCollector:
         # data, not real idleness, so they are excluded from every load
         # aggregate the scale-in (idle/low-load) decision path consumes.
         unknown_engines = [engine_id for engine_id, m in latest.items() if not m.has_critical_metrics()]
-        known_metrics = [m for m in latest.values() if m.has_critical_metrics()]
 
-        # Aggregation denominators (capacity-ratio semantics):
-        # - avg_token_usage divides by the number of KNOWN engines only, so a
-        #   missing (zero-filled) series cannot drag the mean down and fake
-        #   "low load". When every engine is known this equals the legacy
-        #   num_engines denominator, so the healthy path is unchanged.
-        # - Load totals (queue/running/throughput) sum KNOWN engines only: an
-        #   unknown engine contributes no evidence in either direction.
-        # - num_engines and coverage keep their legacy meaning (reporting
-        #   engines over active candidates), so scale-out gates such as
-        #   queue_backlog's per-engine denominator are unchanged.
-        total_queue = sum(m.num_queue_reqs for m in known_metrics)
-        total_running = sum(m.num_running_reqs for m in known_metrics)
-        total_throughput = sum(m.gen_throughput for m in known_metrics)
-        avg_token_usage = sum(m.token_usage for m in known_metrics) / len(known_metrics) if known_metrics else 0.0
+        # Aggregation denominators (capacity-ratio semantics), per field:
+        # - Scale-out signals aggregate the engines that validly observed
+        #   *that specific field*: an engine missing only its throughput
+        #   series still contributes its token_usage and queue depth, so a
+        #   scrape gap cannot erase already-observed scale-out pressure
+        #   (review finding). When every engine is complete this equals the
+        #   previous whole-engine split, so the healthy path is unchanged.
+        # - unknown_engines (any critical series missing) keeps its role as
+        #   the conservative scale-in gate: a partially observed engine is
+        #   never evidence of idleness.
+        known_token = [m for m in latest.values() if m.is_field_valid("token_usage")]
+        known_queue = [m for m in latest.values() if m.is_field_valid("num_queue_reqs")]
+        known_running = [m for m in latest.values() if m.is_field_valid("num_running_reqs")]
+        known_throughput = [m for m in latest.values() if m.is_field_valid("gen_throughput")]
+        total_queue = sum(m.num_queue_reqs for m in known_queue)
+        total_running = sum(m.num_running_reqs for m in known_running)
+        total_throughput = sum(m.gen_throughput for m in known_throughput)
+        avg_token_usage = sum(m.token_usage for m in known_token) / len(known_token) if known_token else 0.0
 
         # Compute max P95 latencies
         all_queue_times = [m.queue_time_p95 for m in latest.values() if m.queue_time_p95 > 0]

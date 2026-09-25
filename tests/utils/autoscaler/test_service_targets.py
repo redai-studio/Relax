@@ -291,6 +291,97 @@ class TestPatchConfig(unittest.TestCase):
         self.assertIn(genrm_collector, stopped)
         MetricsCollector.start, MetricsCollector.stop = orig_start, orig_stop
 
+    def test_legacy_rollout_url_patch_is_not_shadowed(self):
+        """Review finding: ``from_yaml`` seeds service_targets["rollout"] from
+        the startup ``rollout_service_url``; a later legacy PATCH updated only
+        the field, so the stale map entry kept serving the old URL. The two
+        spellings must stay in sync."""
+        config = AutoscalerConfig()
+        # Simulate the startup override (controller passes get_serve_url).
+        config.rollout_service_url = "http://old:8000/rollout"
+        config.service_targets["rollout"] = "http://old:8000/rollout"
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest(rollout_service_url="http://new:8000/rollout")))
+        self.assertEqual(svc.config.get_service_url("rollout"), "http://new:8000/rollout")
+        self.assertEqual(svc.config.service_targets["rollout"], "http://new:8000/rollout")
+
+    def test_service_targets_patch_mirrors_into_legacy_field(self):
+        config = AutoscalerConfig()
+        config.rollout_service_url = "http://old:8000/rollout"
+        config.service_targets["rollout"] = "http://old:8000/rollout"
+        svc = _service(config)
+        asyncio.run(
+            svc.update_config(
+                _ConfigUpdateRequest(service_targets={"rollout": "http://new:8000/rollout", "genrm": "http://g:1"})
+            )
+        )
+        self.assertEqual(svc.config.rollout_service_url, "http://new:8000/rollout")
+        self.assertEqual(svc.config.get_service_url("rollout"), "http://new:8000/rollout")
+
+    def test_status_reports_per_service_scale_history(self):
+        """Review finding: the per-service status lacked last_scale_action /
+        last_scale_time, so the monitor's --service genrm view displayed the
+        rollout runtime's last action."""
+        from relax.utils.autoscaler.autoscaler_service import ScalingAction
+
+        config = AutoscalerConfig()
+        config.service_targets = {"genrm": "http://genrm:8000/genrm"}
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+        # Simulate divergent per-service histories.
+        svc._services["rollout"].state.last_scale_action = ScalingAction.SCALE_OUT
+        svc._services["rollout"].state.last_scale_time = 100.0
+        svc._services["genrm"].state.last_scale_action = ScalingAction.SCALE_IN
+        svc._services["genrm"].state.last_scale_time = 200.0
+
+        async def _fake_fetch(service="rollout"):
+            return []
+
+        svc._fetch_engines = _fake_fetch
+        status = asyncio.run(svc.get_autoscaler_status())
+        services = status.services if hasattr(status, "services") else status
+        if not isinstance(services, dict):
+            services = getattr(services, "__dict__", {}) or {}
+        rollout = services["rollout"] if isinstance(services, dict) else None
+        genrm = services["genrm"] if isinstance(services, dict) else None
+        self.assertEqual(rollout["last_scale_action"], "scale_out")
+        self.assertEqual(genrm["last_scale_action"], "scale_in")
+        self.assertEqual(genrm["last_scale_time"], 200.0)
+
+    def test_genrm_evaluation_stall_does_not_block_rollout(self):
+        """Review finding: per-service evaluation must run concurrently -- a
+        hung GenRM evaluation must not stall the rollout service's cadence."""
+        import time as _time
+
+        config = AutoscalerConfig()
+        config.service_targets = {"genrm": "http://genrm:8000/genrm"}
+        svc = _service(config)
+        asyncio.run(svc.update_config(_ConfigUpdateRequest()))
+
+        rollout_done = asyncio.Event()
+        release_genrm = asyncio.Event()
+
+        async def _rollout_eval(runtime):
+            rollout_done.set()
+
+        async def _stalled_genrm_eval(runtime):
+            await release_genrm.wait()
+
+        async def _main():
+            task = asyncio.ensure_future(svc._evaluate_and_scale())
+            await asyncio.wait_for(rollout_done.wait(), timeout=5.0)
+            release_genrm.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+        svc._evaluate_service = lambda runtime: (
+            _stalled_genrm_eval(runtime) if runtime.name == "genrm" else _rollout_eval(runtime)
+        )
+        started = _time.monotonic()
+        asyncio.run(_main())
+        # The rollout evaluation completed while the GenRM service was still
+        # parked (gather, not serial); the whole batch then drained.
+        self.assertLess(_time.monotonic() - started, 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()
