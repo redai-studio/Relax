@@ -296,11 +296,12 @@ class StragglerRuntime:
 
     @staticmethod
     def _write_json(output_dir: str, name: str, payload: Any) -> None:
-        """Atomically enough for evidence: write, then rename into place."""
+        """Atomic status snapshot: write tmp, flush, then rename into place."""
         final = os.path.join(output_dir, name)
         temp = f"{final}.tmp"
         with open(temp, "w") as handle:
             json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+            handle.flush()
         os.replace(temp, final)
 
     def close(self, timeout: float = 2.0) -> None:

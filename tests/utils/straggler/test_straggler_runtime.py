@@ -3,7 +3,12 @@
 """Unit tests for the process wiring: who collects, who ships, who judges."""
 
 import json
+import os
+import pathlib
 import socket
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from typing import Any, List
@@ -311,6 +316,64 @@ def test_status_writer_never_touches_a_file_on_the_training_thread(tmp_path: Any
     assert main_ident not in writers, "status was written on the training thread"
     assert main_ident not in flushers, "the collector was flushed on the training thread"
     runtime.close()
+
+
+def test_a_sigterm_loses_at_most_one_flush_interval(tmp_path: Any) -> None:
+    """Ray kills the actor with SIGTERM; the run's evidence must survive.
+
+    This is the deliberate termination experiment: the child delivers six
+    intervals, waits for at least one periodic flush, then is SIGTERMed without
+    any ``close()``. The whole run's JSONL used to be lost; now at most the last
+    flush interval may be missing.
+    """
+    child = textwrap.dedent(
+        """
+        import sys, time
+        from relax.utils.straggler.config import StragglerConfig
+        from relax.utils.straggler.identity import RuntimeIdentity
+        from relax.utils.straggler.runtime import StragglerRuntime
+
+        cfg = StragglerConfig(
+            enabled=True,
+            output_dir=sys.argv[1],
+            window_seconds=1.0,
+            warmup_windows=0,
+            persist_windows=1,
+            report_interval_seconds=0.1,
+        )
+        ident = RuntimeIdentity(run_id="sigterm-run", rank=0, world_size=4, data_parallel_rank=0)
+        runtime = StragglerRuntime(cfg, identity=ident, register_atexit=False).start()
+        for _ in range(6):
+            handle = runtime.timers("forward-compute", log_level=2)
+            handle.start()
+            time.sleep(0.02)
+            handle.stop()
+        time.sleep(0.5)  # leave time for at least one periodic flush
+        print("ready", flush=True)
+        time.sleep(60)
+        """
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(pathlib.Path(__file__).resolve().parents[3]) + os.pathsep + env.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, "-c", child, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        assert process.stdout is not None
+        assert "ready" in process.stdout.readline()
+    finally:
+        process.terminate()  # SIGTERM, exactly like Ray's actor teardown
+        process.wait(timeout=15)
+
+    run = tmp_path / "run_sigterm-run"
+    envelopes = run / "straggler_envelopes.jsonl"
+    lines = [json.loads(line) for line in envelopes.read_text().splitlines() if line.strip()]
+    assert len(lines) >= 2, "a SIGTERM lost the whole run's evidence"
+    assert (run / "collector_status.json").exists()
 
 
 def test_close_persists_the_sender_side_counters(tmp_path: Any) -> None:
