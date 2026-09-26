@@ -13,6 +13,7 @@ from pathlib import Path
 
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 
+
 ACTOR = Path(__file__).resolve().parents[3] / "relax" / "backends" / "megatron" / "actor.py"
 
 
