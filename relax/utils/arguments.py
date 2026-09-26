@@ -35,6 +35,11 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
+# Default soft bucket cap for Agentic staged LoRA publication (see
+# --lora-publication-bucket-size). Deliberately far below the base-weight buffer default so a
+# ~180 MiB adapter is published in several buckets instead of one long transfer.
+LORA_PUBLICATION_BUCKET_SIZE_DEFAULT = 64 * 1024**2
+
 # Minimum required TransferQueue version and the command to upgrade to it.
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
@@ -989,6 +994,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--lora-publication-bucket-size",
+                type=int,
+                default=LORA_PUBLICATION_BUCKET_SIZE_DEFAULT,
+                help=(
+                    "Soft bucket cap in bytes for Agentic staged LoRA publication. Used only by the "
+                    "versioned Agentic publication path (min'ed with --update-weight-buffer-size), so "
+                    "the adapter is sent in several buckets instead of one long transfer."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,
@@ -1751,6 +1766,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "(rollouts select it via lora_path). Saves per-step full-weight-sync bandwidth. "
                     "Requires --enable-lora (auto-set by the engine) and sglang_dp_size == 1. "
                     "Supported in colocate and fully-async modes. Mutually exclusive with --lora-merge-mode."
+                ),
+            )
+            parser.add_argument(
+                "--enable-versioned-lora-publication",
+                action="store_true",
+                default=False,
+                help=(
+                    "Publish each synced adapter as an immutable LoRA version (Task 7) instead of "
+                    "overwriting a fixed adapter name. Requires --lora-adapter-mode --fully-async "
+                    "--use-agentic-rollout: Sessions bind the published version at their first "
+                    "generation, and the previous version is reclaimed only once no Session uses it."
                 ),
             )
             reset_arg(parser, "--load", type=str, default=None)
@@ -3829,6 +3855,33 @@ def slime_validate_args(args):
                 args.lora_rank,
             )
             args.lora_merge_mode = True
+
+    if getattr(args, "lora_publication_bucket_size", LORA_PUBLICATION_BUCKET_SIZE_DEFAULT) <= 0:
+        raise ValueError("--lora-publication-bucket-size must be > 0.")
+
+    if getattr(args, "enable_versioned_lora_publication", False):
+        if not (
+            getattr(args, "lora_adapter_mode", False)
+            and getattr(args, "fully_async", False)
+            and getattr(args, "use_agentic_rollout", False)
+        ):
+            raise ValueError(
+                "--enable-versioned-lora-publication requires --lora-adapter-mode --fully-async "
+                "--use-agentic-rollout: immutable versions are bound by Agentic Sessions, so the flag "
+                "is meaningless (and would silently do nothing) without them."
+            )
+        if getattr(args, "use_slime_router", False) and "RadixTreeMiddleware" in (
+            getattr(args, "slime_router_middleware_paths", None) or []
+        ):
+            # The middleware caches rollout logprobs per prompt prefix and only GCs them by the
+            # base serving weight_version, which an adapter-only publication deliberately does not
+            # advance. A request on LoRA version B would then deterministically reuse A's cached
+            # logprobs for the same prefix — wrong policy data, not just stale routing.
+            raise ValueError(
+                "RadixTreeMiddleware cannot be combined with --enable-versioned-lora-publication: its "
+                "logprob cache is not LoRA-version aware and would reuse the previous version's "
+                "logprobs across a publication. Drop the middleware for this run."
+            )
 
     # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
     # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does
