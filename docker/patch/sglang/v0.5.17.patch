@@ -1428,7 +1428,7 @@ index 87b2a334..7c70342c 100644
  
          self.experts_shared_outer_loras: bool = False
 diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
-index c3a74a5..a1be875 100644
+index c3a74a5..bb91e19 100644
 --- a/python/sglang/srt/lora/utils.py
 +++ b/python/sglang/srt/lora/utils.py
 @@ -1,6 +1,7 @@
@@ -1450,10 +1450,28 @@ index c3a74a5..a1be875 100644
  @dataclass
  class MoELoRABatchInfo:
      # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
-@@ -610,3 +614,49 @@ def build_lm_head_pass_segments(
+@@ -610,3 +614,57 @@ def build_lm_head_pass_segments(
          result.append((seg_wi, seg_lens))
  
      return result
++
++
++def lora_tensor_checksum(tensor: torch.Tensor) -> str:
++    """``SHA256(dtype + shape + contiguous bytes)`` -- RFC 9.4 wire manifest entry.
++
++    The dtype and shape are part of the digest, not decoration: bytes alone would
++    let a wrongly-shaped or re-cast tensor pass as identical (a bf16 payload is
++    byte-compatible with a truncated fp16 one), and the sender in Relax hashes
++    exactly these three fields.
++    """
++    import hashlib
++
++    frozen = tensor.detach().cpu().contiguous()
++    hasher = hashlib.sha256()
++    hasher.update(str(frozen.dtype).replace("torch.", "").encode())
++    hasher.update(str(list(frozen.shape)).encode())
++    hasher.update(frozen.view(torch.uint8).numpy().tobytes())
++    return hasher.hexdigest()
 +
 +
 +def verify_lora_tensor_checksums(
@@ -1466,27 +1484,17 @@ index c3a74a5..a1be875 100644
 +    Value-level authority of the staged publication protocol: the sender announces
 +    one digest per tensor name, so a wrong payload, a dropped bucket or a stale
 +    attempt is *provable* before anything is loaded -- while the engine can still
-+    refuse cleanly instead of having to claim an unknown state. Raises
++    refuse cleanly instead of having to claim an unknown state. The digest format
++    is the RFC's, so the sender's manifest is verifiable here verbatim. Raises
 +    ``RuntimeError`` on any drift; the caller decides what that means for the
 +    candidate (the staged path discards it and stays absent).
 +    """
-+    import hashlib
-+
 +    mismatch, missing = [], []
 +    for name, want in expected_checksums.items():
 +        if name not in tensors:
 +            missing.append(name)
 +            continue
-+        got = hashlib.sha256(
-+            tensors[name]
-+            .detach()
-+            .cpu()
-+            .contiguous()
-+            .flatten()
-+            .view(torch.uint8)
-+            .numpy()
-+            .tobytes()
-+        ).hexdigest()
++        got = lora_tensor_checksum(tensors[name])
 +        if got != want:
 +            mismatch.append(name)
 +    extra = [name for name in tensors if name not in expected_checksums]

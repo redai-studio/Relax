@@ -36,12 +36,18 @@ ADAPTER_CONFIG = {"target_modules": ["q_proj"], "r": 8, "lora_alpha": 16}
 
 
 def _checksums(tensors):
-    return {
-        name: hashlib.sha256(
-            tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
-        for name, tensor in tensors.items()
-    }
+    """RFC 9.4 manifest entry, written out literally so the test is an
+    independent statement of the format rather than a call into the code under
+    test."""
+    out = {}
+    for name, tensor in tensors.items():
+        frozen = tensor.detach().cpu().contiguous()
+        hasher = hashlib.sha256()
+        hasher.update(str(frozen.dtype).replace("torch.", "").encode())
+        hasher.update(str(list(frozen.shape)).encode())
+        hasher.update(frozen.view(torch.uint8).numpy().tobytes())
+        out[name] = hasher.hexdigest()
+    return out
 
 
 class _FakeLoRAManager:
@@ -148,6 +154,17 @@ class TestChecksumVerification(unittest.TestCase):
     def test_accepts_a_matching_manifest(self):
         tensors = self._tensors()
         verify_lora_tensor_checksums(tensors, _checksums(tensors))
+
+    def test_relax_sender_manifest_is_accepted_verbatim(self):
+        # Regression: the engine hashed the bytes alone while Relax hashed
+        # dtype+shape+bytes, so every real publication was rejected as a value
+        # mismatch even though each side's own tests passed.
+        from relax.distributed.checkpoint_service.lora_publication import tensor_manifest_hash
+
+        tensors = self._tensors()
+        manifest = {name: tensor_manifest_hash(t) for name, t in tensors.items()}
+        self.assertEqual(manifest, _checksums(tensors))
+        verify_lora_tensor_checksums(tensors, manifest)
 
     def test_value_drift_is_detected(self):
         tensors = self._tensors()
