@@ -78,6 +78,18 @@ def test_every_observed_name_has_an_explicit_group_entry() -> None:
         assert STAGE_GROUPS[name] == OBSERVED_TO_GROUP[name]
 
 
+def test_every_taxonomy_value_is_a_measured_group() -> None:
+    """No stray value may leak into the taxonomy: every group a name can map to
+    must be a measured group, and ``other`` is only the fallback."""
+    assert set(STAGE_GROUPS.values()) <= set(MEASURED_GROUPS)
+    assert GROUP_OTHER not in STAGE_GROUPS.values()
+
+
+def test_group_of_tolerates_surrounding_whitespace() -> None:
+    assert group_of("  forward-compute  ") == GROUP_FORWARD
+    assert group_of("\tbackward-compute\n") == GROUP_BACKWARD
+
+
 @pytest.mark.parametrize(("name", "expected"), sorted(OBSERVED_TO_GROUP.items()))
 def test_known_timer_names_map_to_their_group(name: str, expected: str) -> None:
     assert group_of(name) == expected
