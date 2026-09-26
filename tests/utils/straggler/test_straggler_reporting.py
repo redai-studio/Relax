@@ -179,9 +179,7 @@ def test_build_metrics_surfaces_the_workload_counters() -> None:
     context.count_workload_publish_skipped()
     context.count_workload_publish_error()
 
-    metrics = reporter.build_metrics(
-        StubRuntime({"workload_incomparable_windows": 3, "workload_missing_windows": 2})
-    )
+    metrics = reporter.build_metrics(StubRuntime({"workload_incomparable_windows": 3, "workload_missing_windows": 2}))
 
     assert metrics[_prefixed("workload_publish_skipped")] == 2
     assert metrics[_prefixed("workload_publish_errors")] == 1
