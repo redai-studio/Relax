@@ -175,7 +175,8 @@ else
     echo "=== GPU lock acquired: ${RELAX_GPU_LOCK_FILE} (pid $$, project ${RELAX_GPU_LOCK_PROJECT:-${_RAY_JOB_RUN_SCRIPT:-source-mode}}) ==="
     # Held for the rest of this shell's life and across `exec`. NOTE: `exec`
     # discards these traps, but the inherited fd still holds the flock, so the
-    # lock is released by the kernel when the exec'd job tree exits.
+    # kernel releases it when the exec'd submitting process tree exits (it does
+    # NOT cover a raylet-spawned Ray job — see KNOWN LIMITATION above).
     trap '_relax_gpu_lock_release' EXIT
     trap '_relax_gpu_lock_release; trap - EXIT; exit 130' INT
     trap '_relax_gpu_lock_release; trap - EXIT; exit 143' TERM

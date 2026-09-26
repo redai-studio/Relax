@@ -11,6 +11,7 @@ import pytest
 
 from relax.utils.straggler.workload import step_workloads
 
+
 SAMPLES = [10, 10, 60, 90, 5, 5]
 K_LOCAL = 1
 MAX_K = 3
@@ -49,9 +50,10 @@ def test_multi_step_window_splits_the_real_partition_across_steps():
 def test_equal_totals_report_equal_tokens_regardless_of_grouping():
     """The false-suppression mechanism: a first group is not a rank's workload.
 
-    ``[97,1,1,1]`` and ``[25,25,25,25]`` both total 100; publishing per-group made
-    their first groups 97 and 25, a gap far beyond the 5% tolerance, so the gate
-    suppressed verdicts for equally-loaded ranks. The step total makes them equal.
+    ``[97,1,1,1]`` and ``[25,25,25,25]`` both total 100; publishing per-group
+    made their first groups 97 and 25, a gap far beyond the 5% tolerance, so
+    the gate suppressed verdicts for equally-loaded ranks. The step total makes
+    them equal.
     """
     flat = step_workloads([97, 1, 1, 1], MAX_K, 1)
     even = step_workloads([25, 25, 25, 25], MAX_K, 1)

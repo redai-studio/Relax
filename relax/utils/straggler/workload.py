@@ -8,6 +8,7 @@ environment. It holds no state and performs no I/O.
 
 from typing import List, Sequence, Tuple
 
+
 __all__ = ["step_workloads"]
 
 
@@ -16,7 +17,8 @@ def step_workloads(
     k_partitions: int,
     num_steps_per_rollout: int,
 ) -> List[Tuple[int, int, int]]:
-    """Return one ``(tokens, sequences, microbatches)`` entry per optimizer step.
+    """Return one ``(tokens, sequences, microbatches)`` entry per optimizer
+    step.
 
     The length of the returned list is exactly ``num_steps_per_rollout``, because
     the consumer reads it by step index: ``context._step_workload`` returns the
@@ -84,6 +86,7 @@ def step_workloads(
 
 
 def _split_evenly(total: int, parts: int) -> List[int]:
-    """Split ``total`` items into ``parts`` contiguous counts differing by <= 1."""
+    """Split ``total`` items into ``parts`` contiguous counts differing by <=
+    1."""
     base, remainder = divmod(total, parts)
     return [base + (1 if index < remainder else 0) for index in range(parts)]

@@ -1,18 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 """Runtime regression test for the P0-1 workload publish ordering.
 
-This drives the REAL ``_get_prefetched_sft_window`` on a stub ``self`` and forces
-the branch the source-order test cannot reach: a rank whose local partition
-yields ONE micro-batch while the DP-wide maximum is THREE. Under the old publish
-order the metadata described the discarded local partition, so the published
-``microbatches`` would be 1; the executed step runs 3. The assertion is therefore
-on the executed K, not on the text of the file.
+This drives the REAL ``_get_prefetched_sft_window`` on a stub ``self`` and
+forces the branch the source-order test cannot reach: a rank whose local
+partition yields ONE micro-batch while the DP-wide maximum is THREE. Under the
+old publish order the metadata described the discarded local partition, so the
+published ``microbatches`` would be 1; the executed step runs 3. The assertion
+is therefore on the executed K, not on the text of the file.
 """
 
 import types
 
 import pytest
 import torch
+
 
 # This harness drives the real Megatron actor path, so it needs the training
 # stack. The CPU venv has neither `transfer_queue` nor `megatron`, where the
@@ -26,6 +27,7 @@ from relax.backends.megatron import actor as actor_mod
 from relax.backends.megatron.actor import MegatronTrainRayActor
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.straggler import context as ctx
+
 
 SAMPLES = [10, 10, 60, 90, 5, 5]
 K_LOCAL = 1
@@ -143,13 +145,13 @@ def _patched(monkeypatch):
 def test_repack_branch_publishes_the_executed_step_total_not_one_group(_patched):
     """local_k=1 < max_k=3: the single optimizer step carries the STEP TOTALS.
 
-    One optimizer step consumes the whole window (the caller passes a
-    single-element ``prepared_num_microbatches``), and ``_step_workload`` reads
+    One optimizer step consumes the whole window (the caller passes a single-
+    element ``prepared_num_microbatches``), and ``_step_workload`` reads
     exactly one entry, so the published list must have exactly one entry whose
     values are the totals: tokens ``sum(samples)``, sequences ``len(samples)``,
-    microbatches ``max_k``. Publishing one tuple per micro-batch made the detector
-    read only the first group, which under-reports the step and lets two ranks
-    with identical totals disagree.
+    microbatches ``max_k``. Publishing one tuple per micro-batch made the
+    detector read only the first group, which under-reports the step and lets
+    two ranks with identical totals disagree.
     """
     rollout_id = 7
     window = _window(rollout_id)
@@ -179,12 +181,13 @@ def test_repack_branch_publishes_the_executed_step_total_not_one_group(_patched)
 
 
 def test_two_ranks_with_equal_totals_report_equal_tokens(_patched):
-    """The false-suppression mechanism: a rank's first group is not its workload.
+    """The false-suppression mechanism: a rank's first group is not its
+    workload.
 
-    ``[97,1,1,1]`` and ``[25,25,25,25]`` both total 100 but their first groups are
-    97 and 25, so publishing per-group made two equally-loaded ranks disagree by
-    more than the 5% tolerance and suppressed the verdict. Publishing the step
-    total makes them equal.
+    ``[97,1,1,1]`` and ``[25,25,25,25]`` both total 100 but their first groups
+    are 97 and 25, so publishing per-group made two equally-loaded ranks
+    disagree by more than the 5% tolerance and suppressed the verdict.
+    Publishing the step total makes them equal.
     """
     for samples in ([97, 1, 1, 1], [25, 25, 25, 25]):
         ctx.reset_training_context_for_tests()
@@ -232,7 +235,8 @@ def test_the_published_grouping_is_the_executed_grouping(_patched):
 
 
 def test_disabled_profiler_does_no_partition_work(monkeypatch):
-    """The gate: with the profiler off the training path pays no partition cost."""
+    """The gate: with the profiler off the training path pays no partition
+    cost."""
     monkeypatch.setattr(actor_mod, "_STRAGGLER_PUBLISH_ENABLED", False)
     calls = {"n": 0}
 
