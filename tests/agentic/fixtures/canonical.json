@@ -1,0 +1,385 @@
+{
+  "text_only": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "non_ascii_text": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "请解释：量子纠缠 🌀"
+      },
+      {
+        "role": "assistant",
+        "content": "两个粒子共享一个态。"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "system_merge_two_chunks": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are terse.\n\nAnswer in one line."
+      },
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "assistant_text_only": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "hello"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "assistant_tool_call_single": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Run it"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "run",
+              "arguments": "{\"a\":\"b\",\"c\":\"d\"}"
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "assistant_parallel_tool_calls": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Run both"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "run",
+              "arguments": "{\"n\":1}"
+            }
+          },
+          {
+            "id": "call-2",
+            "type": "function",
+            "function": {
+              "name": "run",
+              "arguments": "{\"n\":2}"
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "tool_result_empty_output": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Run it"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "run",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "",
+        "tool_call_id": "call-1"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "assistant_reasoning_only": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "thinking"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "reasoning_with_text": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      },
+      {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "because"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "image_http_url": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Describe the chart."
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.invalid/chart.png"
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "image_base64_data_url": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgo="
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "image_with_multiple_text_blocks": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Part one."
+          },
+          {
+            "type": "text",
+            "text": "Part two."
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.invalid/chart.png"
+            }
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {}
+  },
+  "tools_with_description": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          },
+          "description": "Return the weather."
+        }
+      }
+    ],
+    "chat_template_kwargs": {}
+  },
+  "tools_without_description": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {}
+  },
+  "enable_thinking_true": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": true
+    }
+  },
+  "enable_thinking_false": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "full_multiturn_conversation": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "Use tools."
+      },
+      {
+        "role": "user",
+        "content": "Weather in Paris and Berlin?"
+      },
+      {
+        "role": "assistant",
+        "content": "Checking both cities.",
+        "reasoning_content": "Two lookups are independent.",
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Paris\",\"unit\":\"celsius\"}"
+            }
+          },
+          {
+            "id": "call-2",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Berlin\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "17C",
+        "tool_call_id": "call-1"
+      },
+      {
+        "role": "tool",
+        "content": "21C",
+        "tool_call_id": "call-2"
+      },
+      {
+        "role": "assistant",
+        "content": "Paris 17C, Berlin 21C."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          },
+          "description": "Return the weather."
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": true
+    }
+  }
+}

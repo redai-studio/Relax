@@ -1,0 +1,433 @@
+{
+  "protocol": "chat_completions",
+  "normalizer": "_normalized_chat_request",
+  "cases": [
+    {
+      "case_id": "text_only",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2+2?"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "non_ascii_text",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "请解释：量子纠缠 🌀"
+          },
+          {
+            "role": "assistant",
+            "content": "两个粒子共享一个态。"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "system_merge_two_chunks",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are terse."
+          },
+          {
+            "role": "system",
+            "content": "Answer in one line."
+          },
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_text_only",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "hello"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_tool_call_single",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                  "name": "run",
+                  "arguments": "{\"c\":\"d\",\"a\":\"b\"}"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_parallel_tool_calls",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run both"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                  "name": "run",
+                  "arguments": "{\"n\":1}"
+                }
+              },
+              {
+                "id": "call-2",
+                "type": "function",
+                "function": {
+                  "name": "run",
+                  "arguments": "{\"n\":2}"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tool_result_empty_output",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                  "name": "run",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": ""
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_reasoning_only",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "thinking"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "reasoning_with_text",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "because"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_http_url",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe the chart."
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://example.invalid/chart.png"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_base64_data_url",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "data:image/png;base64,iVBORw0KGgo="
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_with_multiple_text_blocks",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Part one."
+              },
+              {
+                "type": "text",
+                "text": "Part two."
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://example.invalid/chart.png"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_with_description",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Return the weather.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_without_description",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "enable_thinking_true",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        }
+      }
+    },
+    {
+      "case_id": "enable_thinking_false",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      }
+    },
+    {
+      "case_id": "full_multiturn_conversation",
+      "payload": {
+        "model": "relax-test",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Use tools."
+          },
+          {
+            "role": "user",
+            "content": "Weather in Paris and Berlin?"
+          },
+          {
+            "role": "assistant",
+            "content": "Checking both cities.",
+            "reasoning_content": "Two lookups are independent.",
+            "tool_calls": [
+              {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"unit\":\"celsius\",\"city\":\"Paris\"}"
+                }
+              },
+              {
+                "id": "call-2",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"city\":\"Berlin\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "17C"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call-2",
+            "content": "21C"
+          },
+          {
+            "role": "assistant",
+            "content": "Paris 17C, Berlin 21C."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Return the weather.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {
+                    "type": "string"
+                  },
+                  "unit": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "city"
+                ]
+              }
+            }
+          }
+        ],
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,419 @@
+{
+  "protocol": "responses",
+  "normalizer": "_normalized_responses_request",
+  "cases": [
+    {
+      "case_id": "text_only",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "What is 2+2?"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "non_ascii_text",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "请解释：量子纠缠 🌀"
+          },
+          {
+            "role": "assistant",
+            "content": "两个粒子共享一个态。"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "system_merge_two_chunks",
+      "payload": {
+        "model": "relax-test",
+        "instructions": "You are terse.\n\nAnswer in one line.",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_text_only",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "hello"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_tool_call_single",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "run",
+            "arguments": "{\"a\":\"b\",\"c\":\"d\"}"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_parallel_tool_calls",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "Run both"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "run",
+            "arguments": "{\"n\":1}"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-2",
+            "name": "run",
+            "arguments": "{\"n\":2}"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tool_result_empty_output",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "run",
+            "arguments": "{}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": ""
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_reasoning_only",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "type": "reasoning",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "thinking"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "reasoning_with_text",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "type": "reasoning",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "because"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "answer"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_http_url",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Describe the chart."
+              },
+              {
+                "type": "input_image",
+                "image_url": "https://example.invalid/chart.png"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_base64_data_url",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,iVBORw0KGgo="
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_with_multiple_text_blocks",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Part one."
+              },
+              {
+                "type": "input_text",
+                "text": "Part two."
+              },
+              {
+                "type": "input_image",
+                "image_url": "https://example.invalid/chart.png"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_with_description",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Return the weather.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_without_description",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "enable_thinking_true",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning": {
+          "effort": "high"
+        }
+      }
+    },
+    {
+      "case_id": "enable_thinking_false",
+      "payload": {
+        "model": "relax-test",
+        "input": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "reasoning": {
+          "effort": "none"
+        }
+      }
+    },
+    {
+      "case_id": "full_multiturn_conversation",
+      "payload": {
+        "model": "relax-test",
+        "instructions": "Use tools.",
+        "input": [
+          {
+            "role": "user",
+            "content": "Weather in Paris and Berlin?"
+          },
+          {
+            "type": "reasoning",
+            "summary": [
+              {
+                "type": "summary_text",
+                "text": "Two lookups are independent."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Checking both cities."
+              }
+            ]
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\",\"unit\":\"celsius\"}"
+          },
+          {
+            "type": "function_call",
+            "call_id": "call-2",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Berlin\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "17C"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "call-2",
+            "output": "21C"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Paris 17C, Berlin 21C."
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Return the weather.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        ],
+        "reasoning": {
+          "effort": "medium"
+        }
+      }
+    }
+  ]
+}

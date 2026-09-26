@@ -1,0 +1,481 @@
+{
+  "protocol": "anthropic_messages",
+  "normalizer": "_normalized_anthropic_request",
+  "cases": [
+    {
+      "case_id": "text_only",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is 2+2?"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "non_ascii_text",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "请解释：量子纠缠 🌀"
+          },
+          {
+            "role": "assistant",
+            "content": "两个粒子共享一个态。"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "system_merge_two_chunks",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "system": [
+          {
+            "type": "text",
+            "text": "You are terse."
+          },
+          {
+            "type": "text",
+            "text": "Answer in one line."
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_text_only",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "hello"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_tool_call_single",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "run",
+                "input": {
+                  "c": "d",
+                  "a": "b"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_parallel_tool_calls",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run both"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "run",
+                "input": {
+                  "n": 1
+                }
+              },
+              {
+                "type": "tool_use",
+                "id": "call-2",
+                "name": "run",
+                "input": {
+                  "n": 2
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tool_result_empty_output",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Run it"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "run",
+                "input": {}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": ""
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "assistant_reasoning_only",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "thinking",
+                "signature": "sig"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "reasoning_with_text",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "because"
+              },
+              {
+                "type": "text",
+                "text": "answer"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_http_url",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Describe the chart."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "url",
+                  "url": "https://example.invalid/chart.png"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_base64_data_url",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgo="
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "image_with_multiple_text_blocks",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Part one."
+              },
+              {
+                "type": "text",
+                "text": "Part two."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "url",
+                  "url": "https://example.invalid/chart.png"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_with_description",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Return the weather.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "tools_without_description",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "enable_thinking_true",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 64
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "enable_thinking_false",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "thinking": {
+          "type": "disabled"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "full_multiturn_conversation",
+      "payload": {
+        "model": "relax-test",
+        "max_tokens": 128,
+        "system": "Use tools.",
+        "thinking": {
+          "type": "enabled"
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "Weather in Paris and Berlin?"
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "thinking",
+                "thinking": "Two lookups are independent."
+              },
+              {
+                "type": "text",
+                "text": "Checking both cities."
+              },
+              {
+                "type": "tool_use",
+                "id": "call-1",
+                "name": "get_weather",
+                "input": {
+                  "unit": "celsius",
+                  "city": "Paris"
+                }
+              },
+              {
+                "type": "tool_use",
+                "id": "call-2",
+                "name": "get_weather",
+                "input": {
+                  "city": "Berlin"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-1",
+                "content": "17C"
+              },
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-2",
+                "content": "21C"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Paris 17C, Berlin 21C."
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Return the weather.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "unit": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
