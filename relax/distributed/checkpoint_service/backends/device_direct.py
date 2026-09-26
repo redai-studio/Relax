@@ -990,32 +990,49 @@ class DeviceDirectBackend(CommBackend):
 
         A remote lock is acquired to avoid NCCL deadlocks during concurrent
         broadcasts. This function blocks until all broadcasts and remote
-        updates complete.
+        updates complete. The independent fully-async topology uses SGLang's
+        flattened bucket protocol so one cross-node update is one collective
+        per bucket instead of hundreds of queued collectives. SGLang stores the
+        bucket as bytes, so the sender must use the same byte-level layout;
+        this also preserves mixed-dtype buckets.
         """
 
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
-        # Prepare payload for weight update
-        weight_payload = {
-            "names": [name for name, _ in converted_named_tensors],
-            "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
-            "shapes": [param.shape for _, param in converted_named_tensors],
-            "group_name": self._group_name,
-            "weight_version": str(self.weight_version),
-            "flush_cache": False,
-        }
-        # Send weight update to all rollout nodes via Ray actors
-        futures = self._batch_request("/update_weights_from_distributed", weight_payload)
+        try:
+            # Prepare payload for weight update
+            weight_payload = {
+                "names": [name for name, _ in converted_named_tensors],
+                "dtypes": [str(param.dtype).replace("torch.", "") for _, param in converted_named_tensors],
+                "shapes": [param.shape for _, param in converted_named_tensors],
+                "group_name": self._group_name,
+                "weight_version": str(self.weight_version),
+                "flush_cache": False,
+            }
+            use_flattened_bucket = bool(getattr(self.args, "fully_async", False)) and bool(converted_named_tensors)
+            flattened = None
+            if use_flattened_bucket:
+                weight_payload["load_format"] = "flattened_bucket"
+                flattened = torch.cat(
+                    [param.flatten().view(torch.uint8) for _, param in converted_named_tensors], dim=0
+                )
+            # Send weight update to all rollout nodes via Ray actors
+            futures = self._batch_request("/update_weights_from_distributed", weight_payload)
 
-        # Broadcast weights via PyTorch distributed
-        handles = []
-        for _, param in converted_named_tensors:
-            handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
-        for handle in handles:
-            handle.wait()
-        ray.get(futures)  # Ensure remote update completes
-
-        ray.get(self.lock.release.remote())
+            # Broadcast weights via PyTorch distributed
+            if flattened is not None:
+                dist.broadcast(flattened, 0, group=self._model_update_groups)
+            else:
+                handles = []
+                for _, param in converted_named_tensors:
+                    handles.append(dist.broadcast(param.data, 0, group=self._model_update_groups, async_op=True))
+                for handle in handles:
+                    handle.wait()
+            ray.get(futures)  # Ensure remote update completes
+        finally:
+            # A failed NCCL or HTTP update must not strand the shared lock and
+            # prevent the recovery path from retrying the next weight version.
+            ray.get(self.lock.release.remote())
         if pbar is not None:
             pbar.update(1)
 

@@ -197,6 +197,7 @@ def make_rollout_server(
     router_ip="127.0.0.1",
     router_port=3000,
     model_name="default",
+    model_path=None,
 ):
     """Create a ``RolloutServer`` with the given (or default) engine groups."""
     if engine_groups is None:
@@ -206,6 +207,7 @@ def make_rollout_server(
         router_ip=router_ip,
         router_port=router_port,
         model_name=model_name,
+        model_path=model_path,
     )
 
 

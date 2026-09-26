@@ -9,9 +9,12 @@ Refactored: the old module-level helpers (``_extract_teacher_topk_pair``,
 carried as sglang base64 fields, decoded into numpy arrays.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pybase64
 
+from relax.engine.rollout.on_policy_distillation import OpdManager
 from relax.utils.opd.opd_main_worker import LogprobResponse, TopkWorker
 
 
@@ -102,3 +105,37 @@ def test_build_transfer_channels_union_merges_and_pads() -> None:
         np.array([[-0.1, -0.2, -2.1], [-0.5, -0.6, 0.0]], dtype=np.float32),
     )
     np.testing.assert_array_equal(channels[TopkWorker.TRANSFER_K_LENGTHS], np.array([3, 2], dtype=np.int32))
+
+
+def test_deferred_union_transfer_is_strict_and_serializable() -> None:
+    worker = TopkWorker("union", top_k=2, opd_kl_coef=1.0, opd_loss_coef=0.0)
+    manager = OpdManager.__new__(OpdManager)
+    manager.topk_worker = worker
+    manager.sampled_worker = None
+
+    samples = []
+    for offset in (0, 10):
+        student_ids = np.array([[offset + 1, offset + 2], [offset + 3, offset + 4]], dtype=np.int32)
+        student_lps = np.full((2, 2), -0.1 - offset, dtype=np.float32)
+        teacher_ids = np.array([[offset + 2, offset + 5], [offset + 3, offset + 6]], dtype=np.int32)
+        teacher_lps = np.full((2, 2), -0.3 - offset, dtype=np.float32)
+        sample = SimpleNamespace(
+            index=offset,
+            response_length=2,
+            student_topk_token_ids=student_ids,
+            student_topk_log_probs=student_lps,
+            teacher_topk_token_ids=teacher_ids,
+            teacher_topk_log_probs=teacher_lps,
+            teacher_at_student_topk_log_probs=np.full((2, 2), -0.5 - offset, dtype=np.float32),
+            student_at_teacher_topk_log_probs=np.full((2, 2), -0.7 - offset, dtype=np.float32),
+        )
+        samples.append(sample)
+
+    manager.finish_prefill(samples, strict=True)
+    train_data = {}
+    manager.produce_opd_transfer_data(samples, train_data)
+
+    assert all(len(row) == 6 for row in train_data[TopkWorker.TRANSFER_TOKEN_IDS])
+    assert all(len(row) == 6 for row in train_data[TopkWorker.TRANSFER_TEACHER_LOG_PROBS])
+    assert all(len(row) == 6 for row in train_data[TopkWorker.TRANSFER_STUDENT_LOG_PROBS])
+    assert train_data[TopkWorker.TRANSFER_K_LENGTHS] == [[3, 3], [3, 3]]

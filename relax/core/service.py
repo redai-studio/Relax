@@ -96,7 +96,7 @@ class Service:
         """
         ray_actor_options = with_control_plane_affinity(
             self.config,
-            {"runtime_env": self.runtime_env},
+            {"runtime_env": self.runtime_env, "num_gpus": 0},
         )
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
@@ -209,12 +209,14 @@ class Service:
 
     async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False):
         """Trigger a fully asynchronous weight update for Actor service."""
-        return self.handle.update_weights_fully_async.remote(rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+        return await self.handle.update_weights_fully_async.remote(
+            rollout_only=rollout_only, actor_fwd_only=actor_fwd_only
+        )
 
     async def recv_weight_fully_async(self):
         """Trigger a fully asynchronous weight receive for Actor FWD
         service."""
-        return self.handle.recv_weight_fully_async.remote()
+        return await self.handle.recv_weight_fully_async.remote()
 
     def restart(self) -> None:
         """Restart this service in-place: reuse placement groups and dynamic
@@ -362,23 +364,31 @@ def create_placement_group(num_gpus, node_group_affinity=True):
     bundles = [dict(base_bundle) for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
-    ray.get(pg.ready())
     # use info actor to get the GPU id
     info_actors = []
     accelerator_kwargs = get_ray_accelerator_kwargs(1)
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-                **accelerator_kwargs,
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
+    try:
+        ray.get(pg.ready(), timeout=900)
+        for i in range(num_bundles):
+            info_actors.append(
+                InfoActor.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
+                    ),
+                    **accelerator_kwargs,
+                ).remote()
+            )
+        gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors], timeout=60)
+    except BaseException:
+        ray.util.remove_placement_group(pg)
+        raise
+    finally:
+        for actor in info_actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                logger.exception("Failed to clean up placement probe actor")
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)

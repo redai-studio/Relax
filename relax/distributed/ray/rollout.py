@@ -25,6 +25,10 @@ from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
+from relax.inference.lifecycle import LifecycleCoordinator
+from relax.inference.manager import InferenceManager
+from relax.inference.placement import validate_pg_span
+from relax.inference.routing import engine_record
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -142,6 +146,7 @@ class ModelConfig:
         # source compressed-tensors directory while training-side consumers
         # keep using the auto-cast `args.hf_checkpoint` (BF16 cache).
         default_model_path = self.model_path or args.sglang_hf_checkpoint or args.hf_checkpoint
+        self.model_path = default_model_path
         for g in self.engine_groups:
             if g.num_gpus_per_engine is None:
                 g.num_gpus_per_engine = default_gpus_per_engine
@@ -372,6 +377,7 @@ class ScaleInRequest:
     request_id: str
     status: ScaleInStatus
     model_name: str = "default"
+    model_path: str | None = None
     num_replicas: int = 0
     engine_urls: list[str] = dataclasses.field(default_factory=list)
     timeout_secs: float = 120.0
@@ -498,12 +504,15 @@ class EngineGroup:
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
+        if getattr(self.args, "_inference_placement", None):
+            for i in range(len(self.all_engines)):
+                validate_pg_span(self.pg, self.gpu_offset + i * num_gpu_per_engine, num_gpu_per_engine)
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = getattr(self.args, "_inference_ray_gpu_fraction", 0.2)
             num_cpus = num_gpus
 
             # Get the base GPU ID from placement group using gpu_offset.
@@ -573,7 +582,9 @@ class EngineGroup:
                 rank=global_rank,
                 worker_type=self.worker_type,
                 base_gpu_id=base_gpu_id,
-                sglang_overrides=self.sglang_overrides,
+                # Engine groups can have different widths. The global rank
+                # identifies the actor; SGLang's node rank is group-local.
+                sglang_overrides={**self.sglang_overrides, "node_rank": i % self.nodes_per_engine},
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
             )
@@ -710,6 +721,7 @@ class RolloutServer:
     router_ip: str | None = None
     router_port: int | None = None
     model_name: str = "default"
+    model_path: str | None = None
 
     @property
     def engines(self):
@@ -943,6 +955,14 @@ class RolloutManager(ReloadableMixin):
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
         self.status = None
+        self.inference = InferenceManager("rollout", self.servers)
+        self.lifecycle_coordinator = LifecycleCoordinator()
+        self._deferred_execution_lock = asyncio.Lock()
+        self._policy_weights_ready = {
+            name: self.args.debug_rollout_only or index > 0 or "actor" not in getattr(args, "resource", {})
+            for index, name in enumerate(self.servers)
+        }
+        self._inference_genrm_managers = []
 
         # In-process singleton so user code running inside this actor (notably
         # custom_reward_post_process_func loaded and invoked on the rollout
@@ -1019,6 +1039,9 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        self.inference.transition("shutdown", self._dispose)
+
+    def _dispose(self):
         self._stop_eviction_monitor()
         for monitor in self._health_monitors:
             monitor.stop()
@@ -1124,6 +1147,12 @@ class RolloutManager(ReloadableMixin):
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
     async def generate(self, rollout_id):
+        if getattr(self.args, "opd_teacher_defer", False) or getattr(self.args, "defer_reward_to_post_process", False):
+            async with self._deferred_execution_lock:
+                return await self._generate(rollout_id)
+        return await self._generate(rollout_id)
+
+    async def _generate(self, rollout_id):
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -1143,6 +1172,12 @@ class RolloutManager(ReloadableMixin):
             )
 
     async def eval(self, rollout_id):
+        if getattr(self.args, "opd_teacher_defer", False) or getattr(self.args, "defer_reward_to_post_process", False):
+            async with self._deferred_execution_lock:
+                return await self._eval(rollout_id)
+        return await self._eval(rollout_id)
+
+    async def _eval(self, rollout_id):
         self.health_monitoring_resume()
 
         # TODO: add fault tolerance to eval
@@ -1255,11 +1290,11 @@ class RolloutManager(ReloadableMixin):
         self._offload_local()
 
     def _offload_local(self):
+        self.inference.transition("deactivate", self._offload_pools)
+
+    def _offload_pools(self):
         """Sync body of offload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
-        if self.status == "offload":
-            logger.info("Rollout already offloaded; skipping")
-            return
         self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.offload()
@@ -1269,6 +1304,9 @@ class RolloutManager(ReloadableMixin):
         self._onload_local(tags)
 
     def _onload_local(self, tags: list[str] | None = None):
+        self.inference.transition("activate", lambda: self._onload_pools(tags), tags)
+
+    def _onload_pools(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
         for srv in self.servers.values():
@@ -1277,6 +1315,8 @@ class RolloutManager(ReloadableMixin):
         # dedicated wrappers below (onload_weights / onload_kv).
         if tags is None:
             self.status = "onload"
+        else:
+            self.status = "onloading"
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
@@ -1285,8 +1325,62 @@ class RolloutManager(ReloadableMixin):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
         self.status = "onload"
 
+    def set_inference_genrm_managers(self, managers: list) -> None:
+        self._inference_genrm_managers = managers
+
     def get_status(self):
         return self.status
+
+    @ray.method(concurrency_group="scale_out")
+    def get_inference_snapshot(self) -> dict:
+        models = {}
+        for name, server in self.inference.pools.items():
+            engines = []
+            live_types = set()
+            for group in list(server.engine_groups):
+                if group.worker_type == "placeholder":
+                    continue
+                for rank in range(0, len(group.all_engines), group.nodes_per_engine):
+                    head = group.all_engines[rank]
+                    complete = all(
+                        group.all_engines[i] is not None for i in range(rank, rank + group.nodes_per_engine)
+                    )
+                    ready = (
+                        complete
+                        and group.lifecycle_status == EngineGroupLifecycle.ACTIVE
+                        and not self._is_weight_updating
+                        and self._policy_weights_ready.get(name, False)
+                    )
+                    url = None
+                    if head is not None:
+                        try:
+                            url = ray.get(head.get_url.remote(), timeout=5)
+                        except Exception:
+                            ready = False
+                    if ready:
+                        live_types.add(group.worker_type)
+                    engines.append(
+                        engine_record(
+                            f"{name}/{group.rank_offset + rank}",
+                            url,
+                            "ready" if ready else "dead",
+                            direct=group.worker_type == "regular",
+                        )
+                    )
+            router = f"http://{_wrap_ipv6(server.router_ip)}:{server.router_port}"
+            usable = "regular" in live_types or {"prefill", "decode"} <= live_types
+            model_path = getattr(server, "model_path", None)
+            aliases = [model_path] if model_path and model_path != name else []
+            models[name] = {
+                "router_url": router,
+                "engines": engines,
+                "state": "ready" if usable else "unavailable",
+                "model_aliases": aliases,
+            }
+        return self.inference.snapshot(
+            models,
+            default_model="default" if "default" in models else (next(iter(models)) if len(models) == 1 else None),
+        )
 
     @ray.method(concurrency_group="recover_rollout_engines")
     def recover_rollout_engines(self, model_name: str | None = None):
@@ -1301,6 +1395,8 @@ class RolloutManager(ReloadableMixin):
             return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
 
         srv.recover()
+        if srv.num_new_engines:
+            self._policy_weights_ready[srv.model_name] = False
         return (
             srv.engines,
             self.rollout_engine_lock,
@@ -1314,6 +1410,11 @@ class RolloutManager(ReloadableMixin):
         srv = self._get_server(model_name)
         if srv:
             srv.num_new_engines = 0
+
+    def set_policy_weights_ready(self, ready: bool, model_name: str | None = None) -> None:
+        srv = self._get_server(model_name)
+        if srv is not None:
+            self._policy_weights_ready[srv.model_name] = ready
 
     @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_pause(self) -> None:
@@ -3292,7 +3393,11 @@ class RolloutManager(ReloadableMixin):
                 }
 
                 # Batch-fetch URLs and pid/node_id for all live engines in this group via remote calls
-                live_indices = [j for j, e in enumerate(group.all_engines) if e is not None]
+                live_indices = [
+                    j
+                    for j in range(0, len(group.all_engines), group.nodes_per_engine)
+                    if group.all_engines[j] is not None
+                ]
                 engine_urls = {}
                 engine_pids = {}
                 engine_node_ids = {}
@@ -3308,7 +3413,8 @@ class RolloutManager(ReloadableMixin):
                     except Exception:
                         logger.debug("Failed to batch-fetch engine URLs/pids, skipping URL info")
 
-                for j, engine in enumerate(group.all_engines):
+                for j in range(0, len(group.all_engines), group.nodes_per_engine):
+                    engine = group.all_engines[j]
                     engine_info = {
                         "rank": group.rank_offset + j,
                         "status": "active" if engine is not None else "dead",
@@ -3322,11 +3428,23 @@ class RolloutManager(ReloadableMixin):
                     group_info["engines"].append(engine_info)
 
                 model_info["engine_groups"].append(group_info)
-                model_info["total_engines"] += len(group.all_engines)
+                model_info["total_engines"] += len(group.engines)
 
             result["models"][name] = model_info
             result["total_engines"] += model_info["total_engines"]
 
+        # Keep the legacy manager-only construction path usable.  Some callers
+        # (including older reloaded actors and lightweight test managers) expose
+        # ``servers`` without the unified InferenceManager; in that case the
+        # legacy engine-info payload is still complete and must not require the
+        # new discovery state.
+        inference = getattr(self, "inference", None)
+        if inference is not None:
+            snapshot = self.get_inference_snapshot()
+            for name, info in result["models"].items():
+                if name in snapshot["models"]:
+                    info.update(snapshot["models"][name])
+            result.update({key: value for key, value in snapshot.items() if key != "models"})
         return result
 
     @ray.method(concurrency_group="scale_out")
@@ -4405,6 +4523,18 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     base_port=15000,
 ):
+    if getattr(args, "_inference_placement", None):
+        from relax.distributed.ray.inference_ports import allocate_inference_ports
+
+        width = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+        return allocate_inference_ports(
+            rollout_engines,
+            nodes_per_engine=max(1, width // args.num_gpus_per_node),
+            base_port=base_port,
+            dp_size=args.sglang_dp_size,
+            rank_offset=rank_offset,
+            worker_type=worker_type,
+        )
     # get ports
     # there are 4 ports we need to allocate
     # 1. server port
@@ -4570,7 +4700,7 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
 
 
-def stop_launched_routers() -> int:
+def stop_launched_routers(processes: list | None = None) -> int:
     """Terminate every router process launched in this Controller lifetime.
 
     Returns the number of processes that were alive and successfully killed —
@@ -4580,6 +4710,9 @@ def stop_launched_routers() -> int:
     killed = 0
     survivors: list[multiprocessing.Process] = []
     for proc in _LAUNCHED_ROUTER_PROCESSES:
+        if processes is not None and proc not in processes:
+            survivors.append(proc)
+            continue
         try:
             if not proc.is_alive():
                 continue
@@ -4653,6 +4786,20 @@ def _wait_engine_init_with_progress(
 
 
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    started_groups = []
+    router_count = len(_LAUNCHED_ROUTER_PROCESSES)
+    previous_router = (args.sglang_router_ip, args.sglang_router_port)
+    try:
+        return _start_rollout_servers(args, pg, started_groups)
+    except BaseException:
+        for group in reversed(started_groups):
+            group.shutdown_engines(set(range(len(group.all_engines))))
+        stop_launched_routers(_LAUNCHED_ROUTER_PROCESSES[router_count:])
+        args.sglang_router_ip, args.sglang_router_port = previous_router
+        raise
+
+
+def _start_rollout_servers(args, pg, started_groups: list) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -4704,6 +4851,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 router_ip=router_ip,
                 router_port=router_port,
             )
+            started_groups.append(group)
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
             engine_groups.append(group)
@@ -4724,6 +4872,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             router_ip=router_ip,
             router_port=router_port,
             model_name=model_cfg.name,
+            model_path=model_cfg.model_path,
         )
 
     return servers

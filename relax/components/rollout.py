@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.components.inference_gateway import InferenceGateway
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
 from relax.utils.env import Envs
@@ -360,6 +361,16 @@ class Rollout(Base):
         # waking SGLang for round N+1. Stays ``None`` in fully_async.
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
+        self.gateway = InferenceGateway("rollout", {"default": self.rollout_manager})
+
+    @app.post("/generate")
+    async def http_generate(self, request: Request):
+        return await self.gateway.forward(request, "generate")
+
+    @app.get("/health")
+    async def inference_health(self) -> dict:
+        return await self.gateway.health()
+
     def _should_eval(self, local_step):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
@@ -666,6 +677,7 @@ class Rollout(Base):
         await self._weight_update_ready.wait()
 
         self.status = "running"
+        await self.rollout_manager.set_policy_weights_ready.remote(True)
         await self.rollout_manager.set_weight_updating.remote(False)
 
     @app.get("/recover_rollout_engines")
@@ -918,20 +930,10 @@ class Rollout(Base):
         base = await self._ensure_sglang_base_url()
         return f"{base}{path}"
 
+    @app.post("/chat/completions")
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
-        body = await request.body()
-        try:
-            payload = ChatCompletionRequest.model_validate_json(body)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
-
-        sglang_url = await self._get_sglang_url("/v1/chat/completions")
-        client = self._get_proxy_client()
-
-        if payload.stream:
-            return await self._stream_chat_completions(client, sglang_url, body, dict(request.headers))
-        return await self._non_stream_chat_completions(client, sglang_url, body, dict(request.headers))
+        return await self.gateway.forward(request, "v1/chat/completions")
 
     async def _non_stream_chat_completions(
         self,
@@ -993,17 +995,7 @@ class Rollout(Base):
 
     @app.get("/v1/models", response_model=ModelListResponse)
     async def list_models(self):
-        sglang_url = await self._get_sglang_url("/v1/models")
-        client = self._get_proxy_client()
-        try:
-            response = await client.get(sglang_url)
-            response.raise_for_status()
-            return ModelListResponse(**response.json())
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            self._logger.error(f"Failed to proxy model list to SGLang: {e}")
-            raise HTTPException(status_code=502, detail=f"Failed to connect to SGLang router: {e}")
+        return await self.gateway.models()
 
 
 def _make_error_chunk(status_code: int, message: str) -> str:

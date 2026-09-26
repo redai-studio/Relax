@@ -2420,6 +2420,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if dist.get_rank(get_gloo_group()) == 0:
+            ray.get(self.rollout_manager.set_policy_weights_ready.remote(False))
+
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
             # completed sleep() (and released GPU memory via tms.pause()) before
@@ -2464,8 +2467,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 engine_gpu_offsets=engine_gpu_offsets,
             )
             dist.barrier(group=get_gloo_group())
-            if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
@@ -2511,6 +2512,11 @@ class MegatronTrainRayActor(TrainRayActor):
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
+
+        dist.barrier(group=get_gloo_group())
+        if dist.get_rank(get_gloo_group()) == 0:
+            ray.get(self.rollout_manager.clear_num_new_engines.remote())
+            ray.get(self.rollout_manager.set_policy_weights_ready.remote(True))
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

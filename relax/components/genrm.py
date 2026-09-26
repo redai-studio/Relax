@@ -19,12 +19,13 @@ from typing import Any, List, Optional, Union
 
 import httpx
 import ray
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
+from relax.components.inference_gateway import InferenceGateway
 from relax.distributed.ray.placement_group import create_genrm_managers
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
@@ -171,6 +172,27 @@ class GenRM(Base):
             for key, spec in self.instance_specs.items()
         }
 
+        self.gateway = InferenceGateway(
+            "genrm", self.genrm_managers, tokenizers=self.tokenizers, instance_specs=self.instance_specs
+        )
+
+    @app.post("/generate")
+    async def http_generate(self, request: Request):
+        return await self.gateway.forward(request, "generate")
+
+    @app.post("/chat/completions")
+    @app.post("/v1/chat/completions")
+    async def chat_completions(self, request: Request):
+        return await self.gateway.forward(request, "v1/chat/completions")
+
+    @app.get("/engines")
+    async def engines(self) -> dict:
+        return await self.gateway.discovery()
+
+    @app.get("/v1/models")
+    async def models(self) -> dict:
+        return await self.gateway.models()
+
     def run(self):
         """GenRM is a passive HTTP service, no background loop needed.
 
@@ -180,7 +202,6 @@ class GenRM(Base):
         """
         return None
 
-    @app.post("/generate")
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         """Generate response for given chat messages.
 
@@ -326,21 +347,25 @@ class GenRM(Base):
     @app.get("/health")
     async def health(self) -> dict:
         """Health check endpoint; reports per-instance status."""
+        snapshot = await self.gateway.discovery()
         instances = {}
         for key, manager in self.genrm_managers.items():
             try:
-                is_healthy = ray.get(manager.health_check.remote())
-                instances[key] = {"status": "healthy" if is_healthy else "unhealthy"}
+                state = snapshot["models"][key]["state"]
+                is_healthy = state in {"sleeping", "draining", "onloading"}
+                if state == "ready":
+                    is_healthy = await manager.health_check.remote()
+                instances[key] = {"status": "healthy" if is_healthy else "unhealthy", "state": state}
             except Exception as e:
                 self._logger.error(f"GenRM health check failed for instance '{key}': {e}")
                 instances[key] = {"status": "unhealthy", "error": str(e)}
         overall = "healthy" if all(v["status"] == "healthy" for v in instances.values()) else "unhealthy"
         if list(instances) == [_DEFAULT_INSTANCE_KEY]:
-            result = {"status": overall, "service": "genrm"}
+            result = {"status": overall, "service": "genrm", "models": snapshot["models"]}
             if "error" in instances[_DEFAULT_INSTANCE_KEY]:
                 result["error"] = instances[_DEFAULT_INSTANCE_KEY]["error"]
             return result
-        return {"status": overall, "service": "genrm", "instances": instances}
+        return {"status": overall, "service": "genrm", "instances": instances, "models": snapshot["models"]}
 
     @app.get("/metrics")
     async def metrics(self) -> dict:

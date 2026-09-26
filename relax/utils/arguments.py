@@ -21,7 +21,6 @@ from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
     teacher_sglang_parse_args,
-    validate_managed_opd_teacher_colocate_args,
     validate_opd_args,
 )
 from relax.utils.training.eval_config import (
@@ -4242,58 +4241,22 @@ def slime_validate_args(args):
             args.offload_rollout = False
         # Mark that actor should compute advantages and ref/actor_fwd internally
         args.compute_advantages_and_returns = True
-    elif args.colocate and managed_opd_teacher_enabled:
-        validate_managed_opd_teacher_colocate_args(args)
-    elif args.colocate and not genrm_enabled:
+    elif args.colocate and (managed_opd_teacher_enabled or genrm_enabled):
         if args.offload_train is None:
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
-        if args.rollout_num_gpus != args.actor_num_gpus_per_node * args.actor_num_nodes:
-            logger.info(
-                f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "
-                f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
-            )
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-    elif args.colocate and genrm_enabled:
-        if args.offload_train is None:
-            args.offload_train = True
-        if args.offload_rollout is None:
-            args.offload_rollout = True
-        # When genRM is enabled, allow split GPU allocation
-        # Check that rollout + genRM GPUs don't exceed actor GPUs
         if args.rollout_num_gpus is None:
-            raise ValueError(
-                "When genRM is enabled in colocated mode, --rollout-num-gpus must be explicitly set. "
-                "For example: --rollout-num-gpus 4 --genrm-num-gpus 4 on an 8-GPU machine."
-            )
+            args.rollout_num_gpus = args.resource["rollout"][1]
+        from relax.inference.placement import PlacementPlanner
 
-        actor_total_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        if args.use_critic:
-            actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
-
-        rollout_g = args.rollout_num_gpus
-        genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
-        if rollout_g + genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = False
-            logger.info(
-                f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, "
-                f"actor total={actor_total_gpus}."
-            )
-        elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
-            args._genrm_colocate_with_rollout = True
-            logger.info(
-                f"GenRM colocate (shared bundles with rollout): rollout=genrm={actor_total_gpus} GPUs. "
-                f"Set per-engine SGLang mem_fraction_static via --sglang-config (rollout) and "
-                f"--genrm-engine-config '{{\"mem_fraction_static\": <float>}}' (genrm)."
-            )
-        else:
-            raise ValueError(
-                "In colocated mode with genRM enabled, GPU allocation must satisfy one of:\n"
-                f"  (1) split: --rollout-num-gpus + --genrm-num-gpus == actor total ({actor_total_gpus}), or\n"
-                f"  (2) shared: --rollout-num-gpus == --genrm-num-gpus == actor total ({actor_total_gpus}).\n"
-                f"Got rollout={rollout_g}, genrm={genrm_g}, actor total={actor_total_gpus}."
-            )
+        PlacementPlanner.apply(args)
+    elif args.colocate:
+        if args.offload_train is None:
+            args.offload_train = True
+        if args.offload_rollout is None:
+            args.offload_rollout = True
+        args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
 
     if args.offload_train is None:
         args.offload_train = False

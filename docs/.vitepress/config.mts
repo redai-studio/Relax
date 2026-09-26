@@ -324,6 +324,7 @@ export default defineConfig({
                 { text: 'Actor', link: '/en/api/actor' },
                 { text: 'Rollout', link: '/en/api/rollout' },
                 { text: 'GenRM', link: '/en/api/genrm' },
+                { text: 'Unified Inference', link: '/en/api/inference' },
                 { text: 'ActorFwd', link: '/en/api/actor-fwd' }
               ]
             }
@@ -444,6 +445,7 @@ export default defineConfig({
                 { text: 'Actor', link: '/zh/api/actor' },
                 { text: 'Rollout', link: '/zh/api/rollout' },
                 { text: 'GenRM', link: '/zh/api/genrm' },
+                { text: '统一推理服务', link: '/zh/api/inference' },
                 { text: 'ActorFwd', link: '/zh/api/actor-fwd' }
               ]
             }

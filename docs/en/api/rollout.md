@@ -33,6 +33,8 @@ In fully-async mode, the Rollout service coordinates with the Actor for weight u
 3. Actor pushes new weights
 4. Actor calls `/end_update_weight` to resume rollout
 
+See [Unified inference service](./inference.md) for shared routing, discovery, and lifecycle behavior.
+
 ## HTTP Endpoints
 
 <SwaggerUI specUrl="/Relax/openapi/rollout.json" />

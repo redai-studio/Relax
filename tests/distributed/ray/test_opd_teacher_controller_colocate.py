@@ -33,6 +33,7 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         return "teacher-manager-handle", ["http://teacher/generate"]
 
     monkeypatch.setattr(opd_utils, "create_managed_opd_teacher_manager", fake_create_teacher_manager)
+    monkeypatch.setattr(opd_utils, "_publish_teacher_gateway", lambda args, managers: None)
 
     config = Namespace(
         use_opd=True,

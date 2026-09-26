@@ -37,6 +37,8 @@ GenRM（生成式奖励模型）服务提供基于 LLM 的响应评估。它以 
 - **Split**（`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用不重叠的 bundle。
 - **Shared**（`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`）：GenRM 与 Rollout 占用相同的 bundle，通过 SGLang 的 `mem_fraction_static` 切分每张 GPU 的显存。GenRM 的 `mem_fraction_static` 从 `--genrm-engine-config` 读取。GenRM 不会从 Actor 同步权重，onload 仅恢复 KV cache 和 CUDA graph。
 
+共享 API、Placement 和 defer 模式见[统一推理服务](./inference.md)。
+
 完整配置参见 [GenRM 示例](/zh/examples/generative-reward-model)。
 
 ### 多实例（`route_key`）

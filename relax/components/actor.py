@@ -104,10 +104,14 @@ class Actor(Base):
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
-    def set_rollout_manager(self, rollout_manager: Any) -> None:
-        """Set the rollout manager and initialize weights."""
+    async def set_rollout_manager(self, rollout_manager: Any) -> None:
+        """Set the rollout manager and initialize weights.
+
+        The initial sync can include a cross-node NCCL/DCS transaction.  Keep
+        that blocking work off the Serve event loop so the replica remains
+        probeable while the controller waits for the update to finish.
+        """
         self.rollout_manager = rollout_manager
-        self.actor_model.set_rollout_manager(self.rollout_manager)
 
         # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
         # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
@@ -118,8 +122,14 @@ class Actor(Base):
         # the first predict-step `onload_weights` to crash on a non-idempotent
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
-        if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
-            self.actor_model.update_weights()
+        loop = asyncio.get_running_loop()
+
+        def _bind_and_sync() -> None:
+            self.actor_model.set_rollout_manager(self.rollout_manager)
+            if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
+                self.actor_model.update_weights()
+
+        await loop.run_in_executor(None, _bind_and_sync)
 
     def set_barriers(
         self,
@@ -148,8 +158,24 @@ class Actor(Base):
         set_managed_opd_teacher_on_train_group(self.actor_model, teacher_manager)
         self._logger.info("Teacher manager set on Actor for coordinated offload/onload")
 
-    def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
-        self.actor_model.update_weights_fully_async(0, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
+    async def update_weights_fully_async(self, rollout_only: bool = False, actor_fwd_only: bool = False) -> None:
+        """Publish initial fully-async weights without blocking Serve
+        probes."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self.actor_model.update_weights_fully_async,
+            0,
+            rollout_only,
+            actor_fwd_only,
+        )
+        # The async DCS path does not call the synchronous update_weights
+        # readiness hook.  Publish readiness only after the transfer has
+        # completed successfully so the initial rollout can accept requests
+        # before the first training step.  An actor_fwd-only update must not
+        # make the rollout ingress ready.
+        if not actor_fwd_only and getattr(self, "rollout_manager", None) is not None:
+            await self.rollout_manager.set_policy_weights_ready.remote(True)
 
     async def run(self) -> None:
         """Start the training loop in a background thread and async-wait until

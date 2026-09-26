@@ -3,6 +3,7 @@
 import threading
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import transfer_queue
@@ -18,6 +19,29 @@ if not hasattr(transfer_queue, "StreamingTokenBudgetSampler"):
 
 controller = load_controller_with_stubbed_dependencies("_test_controller_s3_model_cleanup_controller")
 ROLES = controller.ROLES
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_invalid_rollout_budget_fails_before_teacher_or_pg_creation(monkeypatch, hybrid):
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(
+        advantage_estimator="grpo",
+        resource={"actor": [1, 4], "rollout": [1, 4]},
+        colocate=hybrid,
+        hybrid=hybrid,
+        rollout_num_gpus=8,
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=4,
+    )
+    boundaries = []
+    for name in ("maybe_start_managed_opd_teacher", "create_placement_group", "create_data_source_actor"):
+        spy = Mock(side_effect=AssertionError(f"Invalid layout reached {name}"))
+        monkeypatch.setattr(controller, name, spy)
+        boundaries.append(spy)
+    with pytest.raises(ValueError, match="independent resource budget"):
+        instance.register_all_serve()
+    for spy in boundaries:
+        spy.assert_not_called()
 
 
 def test_train_start_config_attaches_remote_model_config_without_mutating_args(monkeypatch):
@@ -329,6 +353,7 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
 def test_controller_service_phase_preserves_fully_async_concurrency():
     instance = controller.Controller.__new__(controller.Controller)
     instance.config = SimpleNamespace(fully_async=True)
+    instance.serve_dict = {}
     barrier = threading.Barrier(2)
 
     def task(role):
@@ -343,6 +368,20 @@ def test_controller_service_phase_preserves_fully_async_concurrency():
         "actor": "service-actor",
         "rollout": "service-rollout",
     }
+
+
+def test_failed_service_phase_retains_all_handles_for_rollback():
+    instance = controller.Controller.__new__(controller.Controller)
+    instance.config = SimpleNamespace(fully_async=False)
+    instance.serve_dict = {}
+    success, failed = object(), object()
+
+    def task(role):
+        return (role, success, None) if role == "rollout" else (role, failed, "engine init failed")
+
+    with pytest.raises(RuntimeError, match="engine init failed"):
+        instance._run_service_phase(controller.ServiceStartupPhase.DEPLOY, task, [("rollout",), ("genrm",)])
+    assert instance.serve_dict == {"rollout": success, "genrm": failed}
 
 
 @pytest.mark.parametrize(
@@ -430,7 +469,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         async def set_rollout_manager(self, _manager):
             events.append("set_rollout_manager")
 
-        def update_weights_fully_async(self):
+        def update_weights_fully_async(self, rollout_only=False, actor_fwd_only=False):
             async def update():
                 events.append("update_weights")
 
@@ -469,6 +508,7 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
+    instance._metrics_service_enabled = False
     monkeypatch.setattr(controller, "set_managed_opd_teacher_on_actor_service", lambda *_args: _async_noop())
     monkeypatch.setattr(instance, "_cleanup_s3_model_weights_after_init", lambda: events.append("cleanup"))
 
