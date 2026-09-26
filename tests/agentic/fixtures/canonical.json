@@ -1,0 +1,184 @@
+{
+  "text": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "你好"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello."
+      },
+      {
+        "role": "user",
+        "content": "Use tools when needed."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search",
+          "parameters": {
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "text_blocks": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2 + 3?"
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "tool_round_trip": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather and time in 北京?"
+      },
+      {
+        "role": "assistant",
+        "content": "I'll check both.",
+        "tool_calls": [
+          {
+            "id": "call_weather",
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "arguments": "{\"city\":\"北京\",\"unit\":\"celsius\"}"
+            }
+          },
+          {
+            "id": "call_time",
+            "type": "function",
+            "function": {
+              "name": "clock",
+              "arguments": "{\"city\":\"北京\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "content": "18°C",
+        "tool_call_id": "call_weather"
+      },
+      {
+        "role": "tool",
+        "content": "09:30",
+        "tool_call_id": "call_time"
+      },
+      {
+        "role": "assistant",
+        "content": "It is 18°C at 09:30."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "unit": {
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          },
+          "description": "Get weather"
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "clock",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "images": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Compare "
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://example.com/one.png"
+            }
+          },
+          {
+            "type": "text",
+            "text": " with "
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,aGVsbG8="
+            }
+          },
+          {
+            "type": "text",
+            "text": "."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }
+}
