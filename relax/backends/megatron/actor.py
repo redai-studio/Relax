@@ -2468,9 +2468,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
         with self._train_state_offloader.disable_during_update():
+            if dist.get_rank(get_gloo_group()) == 0:
+                ray.get(self.rollout_manager.mark_inference_weights_updating.remote())
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights", clear_before_print=not device_utils.is_npu_available)
+            if dist.get_rank(get_gloo_group()) == 0:
+                ray.get(self.rollout_manager.mark_inference_weights_ready.remote())
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -2506,7 +2510,11 @@ class MegatronTrainRayActor(TrainRayActor):
             post_sync_handles = []
             if self._per_step_rollout:
                 post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+            if (
+                self.genrm_manager is not None
+                and not getattr(self.args, "defer_reward_to_post_process", False)
+                and "genrm" not in (getattr(self.args, "inference_defer_roles", None) or [])
+            ):
                 # A list of one or more GenRM manager handles (one per instance).
                 post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
             if post_sync_handles:
@@ -2662,7 +2670,13 @@ class MegatronTrainRayActor(TrainRayActor):
         try:
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
+            rollout_manager = getattr(self, "rollout_manager", None)
+            if not actor_fwd_only and rollout_manager is not None and dist.get_rank(get_gloo_group()) == 0:
+                ray.get(rollout_manager.mark_inference_weights_updating.remote())
             run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            if not actor_fwd_only and dist.get_rank(get_gloo_group()) == 0:
+                if rollout_manager is not None:
+                    ray.get(rollout_manager.mark_inference_weights_ready.remote())
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())

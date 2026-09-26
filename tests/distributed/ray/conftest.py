@@ -264,19 +264,22 @@ def mock_args():
 
 @pytest.fixture
 def patch_ray_get():
-    """Replace ``ray.get`` directly on the module to unwrap
-    :class:`AwaitableValue`.
+    """Replace Ray result and actor cleanup boundaries for mock handles.
 
     Using ``patch("ray.get", ...)`` is unreliable when Ray is initialised
     because Ray may wrap the function internally.  Directly replacing the
     attribute on the module object is the safest approach.
     """
-    _original = ray.get
+    _original_get = ray.get
+    _original_kill = ray.kill
+    killed = []
     ray.get = mock_ray_get
+    ray.kill = killed.append
     try:
-        yield
+        yield killed
     finally:
-        ray.get = _original
+        ray.get = _original_get
+        ray.kill = _original_kill
 
 
 @pytest.fixture

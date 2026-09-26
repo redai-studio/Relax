@@ -15,6 +15,7 @@ from relax.components.base import Base
 from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import sft_partition_id
+from relax.inference.defer import wait_inference_commit
 from relax.utils.async_utils import run
 
 
@@ -110,6 +111,8 @@ class Critic(Base):
         round N). SGLang offload is gated by :class:`RolloutOffloadBarrier`
         when co-hosted with rollout on the same GPUs.
         """
+
+        run(wait_inference_commit(self.config, self.step))
         partition_id = sft_partition_id(self.config, self.step)
         while True:
             partition_list = run(self.data_system_client.async_get_partition_list())

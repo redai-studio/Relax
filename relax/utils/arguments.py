@@ -2455,6 +2455,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--inference-defer-roles",
+                nargs="+",
+                choices=["genrm", "teacher"],
+                default=None,
+                help="Run managed scorers after generation on shared GPUs and commit training data afterward.",
+            )
+            parser.add_argument(
                 "--custom-convert-samples-to-train-data-path",
                 type=str,
                 default=None,
@@ -4269,18 +4276,22 @@ def slime_validate_args(args):
             )
 
         actor_total_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-        if args.use_critic:
-            actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
         rollout_g = args.rollout_num_gpus
         genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
-        if rollout_g + genrm_g == actor_total_gpus:
+        if rollout_g + genrm_g <= actor_total_gpus:
             args._genrm_colocate_with_rollout = False
             logger.info(
                 f"GenRM colocate (split bundles): rollout={rollout_g}, genrm={genrm_g}, "
                 f"actor total={actor_total_gpus}."
             )
         elif rollout_g == actor_total_gpus and genrm_g == actor_total_gpus:
+            if not getattr(args, "defer_reward_to_post_process", False) and "genrm" not in (
+                getattr(args, "inference_defer_roles", None) or []
+            ):
+                raise ValueError(
+                    "Same-GPU co-resident inference is unsupported. Use disjoint split GPUs or explicit GenRM defer."
+                )
             args._genrm_colocate_with_rollout = True
             logger.info(
                 f"GenRM colocate (shared bundles with rollout): rollout=genrm={actor_total_gpus} GPUs. "

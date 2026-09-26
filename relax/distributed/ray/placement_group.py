@@ -220,6 +220,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
 
     def _build_genrm_manager_args(base_args, key, spec):
         instance_args = copy.copy(base_args)
+        instance_args._inference_model_id = key
         instance_args.genrm_model_path = spec["model_path"]
         instance_args.genrm_num_gpus = spec["num_gpus"]
         instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]

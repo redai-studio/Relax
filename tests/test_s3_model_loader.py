@@ -123,6 +123,7 @@ def sglang_engine_module(monkeypatch):
     http_utils = ModuleType("relax.utils.http_utils")
     http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
     http_utils.router_worker_base_url = lambda host, port, worker_id: f"http://{host}:{port}/workers/{worker_id}"
+    http_utils.find_available_port = lambda port: port
     monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
 
     logging_utils = ModuleType("relax.utils.logging_utils")

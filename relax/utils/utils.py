@@ -541,6 +541,10 @@ async def transfer_batch_to_data_system(
             so the data system can detect streaming end-of-stream without a preset
             global batch size. See the is_last bookkeeping in generate_rollout.
     """
+    from relax.inference.defer import capture_deferred_transfer
+
+    if capture_deferred_transfer(args, batch_samples, rollout_id):
+        return
     try:
         # Guard against empty batch_samples
         if not batch_samples:

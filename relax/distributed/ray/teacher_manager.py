@@ -1,17 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 
+from dataclasses import replace
+
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.core.service import create_placement_group
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.core.service import create_placement_group, get_placement_group_topology
+from relax.distributed.ray.inference_manager import InferenceManager
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+from relax.inference.engine_spec import InferenceEngineSpec, build_static_engine_config
+from relax.inference.placement import model_placement, validate_bound_placement
 from relax.utils.env import Envs
 from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
-from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
+from relax.utils.opd.opd_utils import build_teacher_overrides
 
 
 logger = get_logger(__name__)
@@ -56,7 +60,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
 
 
 @ray.remote
-class TeacherManager(MultiEngineManager):
+class TeacherManager(InferenceManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
     def __init__(
@@ -74,6 +78,11 @@ class TeacherManager(MultiEngineManager):
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
             required = int(args.rollout_num_gpus) + bundle_offset + gpus_per_replica * num_replicas
+            if getattr(args, "_inference_placement_plan", None) is not None:
+                placement = model_placement(args, "teacher", getattr(args, "_inference_model_id", "__default__"))
+                if placement is None:
+                    raise ValueError("Teacher is absent from the validated placement plan")
+                required = placement.bundle_stop
             assert len(bundle_indices) >= required and len(gpu_ids) >= required, (
                 f"shared teacher PG too small: bundles={len(bundle_indices)}, "
                 f"gpu_ids={len(gpu_ids)}, required={required} (rollout_num_gpus={args.rollout_num_gpus} + "
@@ -84,10 +93,31 @@ class TeacherManager(MultiEngineManager):
         self._shared_pg = shared_pg
         self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
+        self._dedicated_replica_pgs = {}
+        self._num_replicas = num_replicas
+        local_gpus = min(gpus_per_replica, args.num_gpus_per_node)
+        if gpus_per_replica > args.num_gpus_per_node and gpus_per_replica % args.num_gpus_per_node:
+            raise ValueError("Multi-node Teacher replica must use complete local GPU groups")
+        nodes_per_replica = max(1, gpus_per_replica // args.num_gpus_per_node)
+        self._local_gpus_per_worker = local_gpus
+        self._planned_placement = None
 
         overrides = build_teacher_overrides(args, colocate_sync=shared_pg)
+        self._engine_spec = InferenceEngineSpec("teacher")
+        self._teacher_args, overrides = build_static_engine_config(args, "teacher", overrides)
         self._overrides = overrides
-        self._teacher_args = build_teacher_engine_args(args, overrides)
+        self._inference_role = "teacher"
+        self._inference_model_id = getattr(args, "_inference_model_id", "__default__")
+        if getattr(args, "_inference_placement_plan", None) is not None:
+            self._planned_placement = model_placement(args, "teacher", self._inference_model_id)
+            if self._planned_placement is None:
+                raise ValueError("Teacher model missing from validated placement plan")
+            if shared_pg:
+                validate_bound_placement(
+                    self._planned_placement, get_placement_group_topology(pg), bundle_indices=pg[1]
+                )
+        self._inference_served_model_name = overrides.get("served_model_name") or overrides.get("model_path")
+        self._inference_preserves_weights = overrides.get("enable_weights_cpu_backup") is True
         logger.info(
             f"[OPD teacher] launching {num_replicas} replica(s), "
             f"TP={gpus_per_replica}, model={overrides['model_path']}, "
@@ -96,8 +126,8 @@ class TeacherManager(MultiEngineManager):
 
         super().__init__(
             args,
-            num_slots=num_replicas,
-            nodes_per_engine=1,
+            num_slots=num_replicas * nodes_per_replica,
+            nodes_per_engine=nodes_per_replica,
             engine_actor_cls=SGLangEngine,
             log_prefix="[OPD teacher]",
         )
@@ -126,14 +156,19 @@ class TeacherManager(MultiEngineManager):
         return super().recover()
 
     # ------------------------------------------------------------------
-    # MultiEngineManager hooks.
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank: int):
-        replica = rank
+        replica, node_rank = divmod(rank, self.nodes_per_engine)
         if self._shared_pg:
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
+            if getattr(self, "_planned_placement", None) is not None:
+                return (
+                    self._shared_pg_tuple,
+                    False,
+                    self._planned_placement.bundle_start + rank * self._local_gpus_per_worker,
+                )
             gpu_index = _resolve_teacher_gpu_index(
                 args=self.args,
                 replica=replica,
@@ -141,20 +176,26 @@ class TeacherManager(MultiEngineManager):
                 shared_pg=True,
                 bundle_offset=self._bundle_offset,
             )
-            return self._shared_pg_tuple, False, gpu_index
+            return self._shared_pg_tuple, False, gpu_index + node_rank * self._local_gpus_per_worker
 
         # Dedicated: this replica creates and owns its own placement group.
-        pg_tuple = create_placement_group(
-            num_gpus=self.gpus_per_replica,
-            node_group_affinity=getattr(self.args, "enable_affinity", True),
-        )
-        gpu_index = _resolve_teacher_gpu_index(
-            args=self.args,
-            replica=replica,
-            gpus_per_replica=self.gpus_per_replica,
-            shared_pg=False,
-        )
-        return pg_tuple, True, gpu_index
+        if replica not in self._dedicated_replica_pgs:
+            pg_tuple = create_placement_group(
+                num_gpus=self.gpus_per_replica,
+                node_group_affinity=getattr(self.args, "enable_affinity", True),
+            )
+            try:
+                if self._planned_placement is not None:
+                    validate_bound_placement(
+                        replace(self._planned_placement, bundle_start=0, num_gpus=self.gpus_per_replica),
+                        get_placement_group_topology(pg_tuple),
+                        bundle_indices=pg_tuple[1],
+                    )
+            except Exception:
+                ray.util.remove_placement_group(pg_tuple[0])
+                raise
+            self._dedicated_replica_pgs[replica] = pg_tuple
+        return self._dedicated_replica_pgs[replica], True, node_rank * self._local_gpus_per_worker
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
         return {"num_cpus": 0.2, "num_gpus": 0.2}
@@ -170,6 +211,7 @@ class TeacherManager(MultiEngineManager):
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
             "register_sigterm_handler": False,
+            "engine_spec": self._engine_spec,
         }
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:
@@ -184,6 +226,18 @@ class TeacherManager(MultiEngineManager):
         }
 
     def _allocate_engine_addr_and_ports(self, *, new_engines: list[tuple]) -> dict[int, dict]:
+        if getattr(self, "nodes_per_engine", 1) > 1:
+            if self._shared_pg and all(rank in self._engine_addr_and_ports for rank, _ in new_engines):
+                return {rank: dict(self._engine_addr_and_ports[rank]) for rank, _ in new_engines}
+            ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+                args=self._teacher_args,
+                rollout_engines=new_engines,
+                worker_type="regular",
+                num_gpus_per_engine=self.gpus_per_replica,
+                rank_offset=0,
+                base_port=find_available_port(15000),
+            )
+            return ports
         addr_and_ports: dict[int, dict] = {}
         for rank, engine in new_engines:
             # OPD consumers receive teacher URLs once during startup. Preserve

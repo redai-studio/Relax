@@ -18,11 +18,17 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.inference.compat import public_legacy_discovery
+from relax.inference.gateway import InferenceGatewayHandler
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
 
 app = FastAPI()
+
+
+def use_legacy_rollout_chat(config: Namespace) -> bool:
+    return bool(getattr(config, "rollout_external", False) or getattr(config, "debug_rollout_only", False))
 
 
 # ===================== Scale-Out API Models =====================
@@ -819,9 +825,18 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
+    async def get_engines(self, model_name: Optional[str] = None, schema: int = 2):
+        if schema == 2:
+            result = await self.rollout_manager.get_inference_snapshot.remote()
+            if model_name is not None:
+                if model_name not in result["models"]:
+                    raise HTTPException(status_code=404, detail="Unknown inference model")
+            return result
+        if schema != 1:
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema")
         result = await self.rollout_manager.get_engines_info.remote(model_name)
-        return result
+
+        return public_legacy_discovery(result)
 
     @app.post("/scale_in", response_model=ScaleInResponse)
     async def scale_in(self, request: ScaleInAPIRequest):
@@ -892,6 +907,32 @@ class Rollout(Base):
 
     # --- OpenAI-compatible Chat Completion API (proxied to SGLang router) ---
 
+    def _get_inference_gateway(self):
+        if not hasattr(self, "_inference_gateway"):
+
+            async def snapshot():
+                return await self.rollout_manager.get_inference_snapshot.remote()
+
+            self._inference_gateway = InferenceGatewayHandler(
+                "rollout",
+                snapshot,
+                http_client=self._get_proxy_client(),
+                timeout=float(getattr(self.config, "rollout_http_timeout", 1800.0)),
+            )
+        return self._inference_gateway
+
+    @app.post("/generate")
+    async def inference_generate(self, request: Request):
+        return await self._get_inference_gateway().handle_generate(request)
+
+    @app.get("/health")
+    async def inference_health(self) -> dict:
+        return await self._get_inference_gateway().health()
+
+    @app.post("/chat/completions")
+    async def chat_completions_alias(self, request: Request):
+        return await self._handle_chat_completions(request)
+
     def _get_proxy_client(self) -> httpx.AsyncClient:
         if self._proxy_client is None:
             self._proxy_client = httpx.AsyncClient(
@@ -920,18 +961,22 @@ class Rollout(Base):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
+        return await self._handle_chat_completions(request)
+
+    async def _handle_chat_completions(self, request: Request):
+        if not use_legacy_rollout_chat(self.config):
+            return await self._get_inference_gateway().handle_chat(request)
+
         body = await request.body()
         try:
             payload = ChatCompletionRequest.model_validate_json(body)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
-
-        sglang_url = await self._get_sglang_url("/v1/chat/completions")
         client = self._get_proxy_client()
-
+        url = await self._get_sglang_url("/v1/chat/completions")
         if payload.stream:
-            return await self._stream_chat_completions(client, sglang_url, body, dict(request.headers))
-        return await self._non_stream_chat_completions(client, sglang_url, body, dict(request.headers))
+            return await self._stream_chat_completions(client, url, body, dict(request.headers))
+        return await self._non_stream_chat_completions(client, url, body, dict(request.headers))
 
     async def _non_stream_chat_completions(
         self,
@@ -993,17 +1038,7 @@ class Rollout(Base):
 
     @app.get("/v1/models", response_model=ModelListResponse)
     async def list_models(self):
-        sglang_url = await self._get_sglang_url("/v1/models")
-        client = self._get_proxy_client()
-        try:
-            response = await client.get(sglang_url)
-            response.raise_for_status()
-            return ModelListResponse(**response.json())
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            self._logger.error(f"Failed to proxy model list to SGLang: {e}")
-            raise HTTPException(status_code=502, detail=f"Failed to connect to SGLang router: {e}")
+        return await self._get_inference_gateway().models()
 
 
 def _make_error_chunk(status_code: int, message: str) -> str:

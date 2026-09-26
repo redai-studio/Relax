@@ -36,6 +36,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
+from relax.inference.client import generate_with_discovery
 from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
@@ -609,7 +610,22 @@ class SGLangBackendAdapter:
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            discovery_url = getattr(self._args, "_inference_rollout_discovery_url", None)
+            if discovery_url:
+                output = await generate_with_discovery(
+                    discovery_url,
+                    payload,
+                    model=getattr(self._args, "_inference_rollout_model", None),
+                    headers=headers,
+                    timeout=float(getattr(self._args, "rollout_http_timeout", 1800.0)),
+                    max_connections=(
+                        self._args.sglang_server_concurrency
+                        * self._args.rollout_num_gpus
+                        // self._args.rollout_num_gpus_per_engine
+                    ),
+                )
+            else:
+                output = await post(f"{self._router_url}/generate", payload, headers=headers)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error

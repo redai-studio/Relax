@@ -95,7 +95,8 @@ class _FakeClock:
 
 
 def _make_engine():
-    engine = m.GenRMEngine.__new__(m.GenRMEngine)
+    engine = m.SGLangEngine.__new__(m.SGLangEngine)
+    engine.engine_spec = m.InferenceEngineSpec("genrm")
     engine.node_rank = 0
     engine.server_host = "127.0.0.1"
     engine.server_port = 30000
@@ -147,31 +148,31 @@ def test_release_raises_timeout_and_skips_release_when_never_idle(patched):
     assert "release_memory_occupation" not in fake_requests.calls
 
 
-def test_release_tolerates_abort_failure(patched):
-    # A flaky /abort_request must not abort the offload; drain still completes.
+def test_release_rejects_abort_failure(patched):
     import requests as _real_requests
 
     fake_requests, _ = patched(
         flush_statuses=[200],
         post_raises={"abort_request": _real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
+    with pytest.raises(_real_requests.exceptions.ConnectionError):
+        _make_engine().release_memory_occupation()
 
-    assert fake_requests.calls.count("release_memory_occupation") == 1
+    assert "release_memory_occupation" not in fake_requests.calls
 
 
-def test_release_tolerates_pause_failure_and_still_drains(patched):
-    # If pause does not take, per-retry abort still drains and release proceeds.
+def test_release_rejects_pause_failure(patched):
     import requests as _real_requests
 
     fake_requests, _ = patched(
         flush_statuses=[200],
         post_raises={"pause_generation": _real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
+    with pytest.raises(_real_requests.exceptions.ConnectionError):
+        _make_engine().release_memory_occupation()
 
-    assert "abort_request" in fake_requests.calls
-    assert fake_requests.calls.count("release_memory_occupation") == 1
+    assert "abort_request" not in fake_requests.calls
+    assert "release_memory_occupation" not in fake_requests.calls
 
 
 def test_full_resume_reopens_admission(patched):

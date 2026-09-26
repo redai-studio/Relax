@@ -12,6 +12,8 @@ from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
+from relax.inference.defer import wait_inference_commit
+from relax.utils.async_utils import run
 
 
 app = FastAPI()
@@ -81,6 +83,8 @@ class ActorFwd(Base):
                 if local_step >= self.config.num_rollout:
                     self._logger.info(f"All {self.role} steps finished")
                     break
+
+                run(wait_inference_commit(self.config, local_step))
 
                 self._logger.info(
                     f"{self.role} model computing log prob for step {local_step}/{self.config.num_rollout}"

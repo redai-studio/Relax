@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import traceback
+import uuid
 from argparse import Namespace
 from enum import Enum, IntEnum
 from functools import partial
@@ -13,6 +14,7 @@ from typing import Any, Optional
 
 import ray
 import transfer_queue as tq
+import yaml
 from omegaconf import OmegaConf
 from ray import serve
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
@@ -24,13 +26,17 @@ from relax.agentic.session.service import (
     shutdown_agentic_chat_api_services,
 )
 from relax.algorithms import algorithm_needs_critic
+from relax.components.inference_gateway import InferenceGateway
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
-from relax.core.service import Service, create_placement_group
+from relax.core.service import Service, create_placement_group, get_placement_group_topology
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_lifecycle import InferenceLifecycleCoordinator
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
+from relax.inference.defer import validate_deferred_workload
+from relax.inference.placement import plan_inference_placement, validate_bound_placement
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
@@ -39,6 +45,7 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
+    managed_opd_teacher_managers_by_model,
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
@@ -51,7 +58,7 @@ from relax.utils.s3_model_loader import (
     remove_stale_s3_model_caches,
 )
 from relax.utils.training.ppo_utils import validate_ppo_config
-from relax.utils.utils import compute_dp_size, recovery_load_path
+from relax.utils.utils import compute_dp_size, get_serve_url, recovery_load_path
 
 
 def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
@@ -166,6 +173,11 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._teacher_gateway = None
+        self._teacher_gateway_owned = False
+        self._owned_actor_inference_pg = None
+        self._genrm_shutdown_managers: dict[str, Any] = {}
+        self._genrm_shutdown_complete: set[str] = set()
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -212,15 +224,11 @@ class Controller:
         if self._metrics_service_enabled:
             self._deploy_metrics_service()
 
-        if self.config.use_agentic_rollout and not self.config.debug_train_only:
-            deploy_agentic_chat_api_services(
-                config=self.config,
-                runtime_env=self.runtime_env,
-            )
         self._autoscaler_config = None
         try:
             self.register_all_serve()
         except Exception as e:
+            self._shutdown_teacher_gateway()
             self._report_error_to_metrics_service(e)
             raise
 
@@ -369,6 +377,46 @@ class Controller:
         )
         serve.run(deployment, name="metrics", route_prefix="/metrics")
         logger.info("MetricsService deployed at /metrics")
+
+    def _deploy_teacher_gateway(self) -> None:
+        if getattr(self, "_teacher_gateway_owned", False):
+            return
+        managers = managed_opd_teacher_managers_by_model(self.config, getattr(self, "_teacher_manager", None))
+        if not managers:
+            return
+        if any(str(role) == "teacher" for role in self.serve_dict):
+            raise RuntimeError("Teacher inference already has a role application")
+
+        deployment = InferenceGateway.options(
+            ray_actor_options=with_control_plane_affinity(
+                self.config,
+                {
+                    "num_cpus": 1,
+                    "num_gpus": 0,
+                    "runtime_env": getattr(self, "runtime_env", None),
+                },
+            )
+        ).bind(role="teacher", managers=managers)
+        self._teacher_gateway_owned = True
+        try:
+            self._teacher_gateway = serve.run(deployment, name="teacher", route_prefix="/teacher")
+        except Exception:
+            self._shutdown_teacher_gateway()
+            raise
+        logger.info("Teacher InferenceGateway deployed at /teacher")
+
+        self.config._inference_teacher_discovery_url = get_serve_url("/teacher")
+
+    def _shutdown_teacher_gateway(self) -> None:
+        if not getattr(self, "_teacher_gateway_owned", False):
+            return
+        try:
+            serve.delete("teacher")
+        except Exception as exc:
+            logger.warning(f"Failed to delete Teacher InferenceGateway: {exc}")
+            return
+        self._teacher_gateway = None
+        self._teacher_gateway_owned = False
 
     def _deploy_autoscaler_service(self):
         """Deploy the AutoscalerService as a lightweight Ray Serve deployment.
@@ -726,11 +774,17 @@ class Controller:
 
     def register_all_serve(self):
         validate_ppo_config(self.config)
+        self._preflight_inference_placement()
 
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
             runtime_env=self.runtime_env,
         )
+        if actor_rollout_pgs is not None:
+            self._owned_actor_inference_pg = actor_rollout_pgs
+        self._deploy_teacher_gateway()
+        if self.config.use_agentic_rollout and not self.config.debug_train_only:
+            deploy_agentic_chat_api_services(config=self.config, runtime_env=self.runtime_env)
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -788,6 +842,13 @@ class Controller:
                     num_gpus=num_gpus,
                     node_group_affinity=self.config.enable_affinity,
                 )
+                self._owned_actor_inference_pg = actor_rollout_pgs
+                try:
+                    self._validate_actor_inference_binding(actor_rollout_pgs)
+                except Exception:
+                    ray.util.remove_placement_group(actor_rollout_pgs[0])
+                    self._owned_actor_inference_pg = None
+                    raise
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
@@ -813,6 +874,56 @@ class Controller:
             logger.info(f"S3 model prefetch completed on {len(model_prefetch_refs)} consumer nodes")
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
+
+    def _preflight_inference_placement(self) -> None:
+
+        rollout_config = getattr(self.config, "sglang_config", None)
+        if isinstance(rollout_config, (str, os.PathLike)):
+            with open(rollout_config) as config_file:
+                self.config._inference_rollout_config = yaml.safe_load(config_file)
+        else:
+            self.config._inference_rollout_config = rollout_config
+        plan = plan_inference_placement(self.config)
+        if plan.mode == "defer":
+            if not getattr(self.config, "inference_defer_roles", None):
+                raise ValueError(
+                    "Use --inference-defer-roles with a framework scoring adapter; legacy hooks cannot own this plan"
+                )
+            validate_deferred_workload(self.config)
+            self.config._inference_strict_admission = True
+            self.config._inference_preserve_rollout_weights = True
+        accelerator = device_utils.get_ray_accelerator_name()
+        available = int(ray.cluster_resources().get(accelerator, 0))
+        if plan.total_required_gpus > available:
+            raise RuntimeError(
+                f"Insufficient GPU resources: inference placement plan requires {plan.total_required_gpus} "
+                f"GPUs but the cluster has {available}"
+            )
+        self.config._inference_placement_plan = plan.to_dict()
+        if (
+            not getattr(self.config, "rollout_engine_class_path", None)
+            and not getattr(self.config, "rollout_external", False)
+            and not getattr(self.config, "debug_rollout_only", False)
+        ):
+            self.config._inference_rollout_discovery_url = get_serve_url("/rollout")
+            rollout_models = plan.for_role("rollout")
+            if rollout_models:
+                self.config._inference_rollout_model = rollout_models[0].model_id
+        if plan.mode == "defer":
+            self.config._inference_run_id = str(uuid.uuid4())
+            self.config._inference_coordinator = InferenceLifecycleCoordinator.options(
+                **with_control_plane_affinity(self.config)
+            ).remote()
+        logger.info(
+            f"Inference placement preflight succeeded: required={plan.total_required_gpus}, available={available}"
+        )
+
+    def _validate_actor_inference_binding(self, pgs: tuple) -> None:
+
+        topology = get_placement_group_topology(pgs)
+        for placement in self.config._inference_placement_plan["placements"]:
+            if placement["pool"] == "actor":
+                validate_bound_placement(placement, topology, bundle_indices=pgs[1])
 
     def _report_error_to_metrics_service(self, error: Exception):
         """Report error to metrics service for Apprise notification.
@@ -862,6 +973,9 @@ class Controller:
                         await genrm_service.get_genrm_manager(route_key)
                         for route_key in self.config._genrm_instances_resolved
                     ]
+                    self._genrm_shutdown_managers = dict(
+                        zip(self.config._genrm_instances_resolved, genrm_managers, strict=True)
+                    )
                     await self.serve_dict[ROLES.actor].set_genrm_manager(genrm_managers)
 
                 await set_managed_opd_teacher_on_actor_service(
@@ -874,6 +988,18 @@ class Controller:
                 # (needed for scaled-out engine weight sync in fully_async mode)
                 if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
                     rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
+                    coordinator = getattr(self.config, "_inference_coordinator", None)
+                    if coordinator is not None:
+                        for role in self.config.inference_defer_roles:
+                            if role == "teacher":
+                                managers = (
+                                    self._teacher_manager
+                                    if isinstance(self._teacher_manager, list)
+                                    else [self._teacher_manager]
+                                )
+                            else:
+                                managers = genrm_managers
+                            await coordinator.register.remote(role, managers)
                     await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
 
                     # Colocate wiring topology:
@@ -982,6 +1108,53 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _shutdown_genrm_managers(self) -> None:
+        service = self.serve_dict.get(GENRM_ROLE)
+        managers = getattr(self, "_genrm_shutdown_managers", None)
+        if managers is None:
+            managers = self._genrm_shutdown_managers = {}
+        completed = getattr(self, "_genrm_shutdown_complete", None)
+        if completed is None:
+            completed = self._genrm_shutdown_complete = set()
+        keys = tuple((getattr(self.config, "_genrm_instances_resolved", None) or {}).keys())
+        for key in keys:
+            if key in completed:
+                continue
+            manager = managers.get(key)
+            if manager is None and service is not None:
+
+                async def fetch(route_key: str = key):
+                    return await asyncio.wait_for(service.get_genrm_manager(route_key), timeout=30.0)
+
+                try:
+                    manager = managers[key] = run(fetch())
+                except Exception as exc:
+                    logger.warning(f"Unable to discover GenRM manager {key!r} during shutdown: {exc}")
+                    continue
+            if manager is None:
+                continue
+            try:
+                result = ray.get(manager.shutdown.remote(), timeout=180.0)
+                if result is False:
+                    raise RuntimeError("GenRM manager rejected shutdown")
+                ray.kill(manager)
+            except Exception as exc:
+                logger.warning(f"GenRM manager {key!r} cleanup remains unconfirmed: {exc}")
+                continue
+            completed.add(key)
+            managers.pop(key, None)
+
+    def _shutdown_inference_coordinator(self) -> None:
+        coordinator = getattr(self.config, "_inference_coordinator", None)
+        if coordinator is None:
+            return
+        try:
+            ray.kill(coordinator)
+        except Exception as exc:
+            logger.warning(f"Inference coordinator cleanup remains unconfirmed: {exc}")
+            return
+        self.config._inference_coordinator = None
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1002,7 +1175,10 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
+        self._shutdown_teacher_gateway()
         shutdown_managed_opd_teacher(self._teacher_manager)
+        self._shutdown_genrm_managers()
+        self._shutdown_inference_coordinator()
 
         self._shutdown_agentic_rollout_services()
 
@@ -1226,6 +1402,10 @@ class Controller:
         # the workers.  Without this, the main thread stays blocked on stale
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
+        self._shutdown_teacher_gateway()
+        shutdown_managed_opd_teacher(getattr(self, "_teacher_manager", None))
+        self._shutdown_genrm_managers()
+        self._shutdown_inference_coordinator()
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
@@ -1321,6 +1501,7 @@ class Controller:
 
         try:
             ray.shutdown()
+            self._owned_actor_inference_pg = None
             logger.info("[Global Restart] Ray shutdown completed")
         except Exception as e:
             logger.warning(f"[Global Restart] Failed to shutdown Ray: {e}")

@@ -72,12 +72,14 @@ def start_multi_instance_managers(
         per_instance_args = build_manager_args(args, key, spec)
         manager = spawn_manager(key, per_instance_args, bundle_offset, spec)
         managers[key] = manager
+        if getattr(args, "inference_defer_roles", None) and getattr(args, "offload_rollout", False):
+            ray.get(manager.offload.remote(), timeout=900.0)
         logger.info(f"Launched instance '{key}': bundle_offset={bundle_offset}, num_gpus={spec['num_gpus']}")
         # Prefix sum, not idx * num_gpus: instances may have unequal GPU
         # budgets, so each region must start where the previous one ended.
         bundle_offset += spec["num_gpus"]
 
-    if getattr(args, "offload_rollout", False):
+    if getattr(args, "offload_rollout", False) and not getattr(args, "inference_defer_roles", None):
         ray.get([m.offload.remote() for m in managers.values()])
 
     return managers

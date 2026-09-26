@@ -19,13 +19,15 @@ from typing import Any, List, Optional, Union
 
 import httpx
 import ray
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.inference.compat import RoleDiscovery
+from relax.inference.gateway import InferenceGatewayHandler
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -181,7 +183,7 @@ class GenRM(Base):
         return None
 
     @app.post("/generate")
-    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+    async def generate(self, request: Request):
         """Generate response for given chat messages.
 
         Takes OpenAI-style messages as input, sends to SGLang engine,
@@ -196,14 +198,29 @@ class GenRM(Base):
         Returns:
             GenerateResponse containing raw model response text
         """
-        try:
-            output = await self._call_engine(request.route_key, request.messages, request.sampling_params)
-            response = output.get("text", "").strip()
-            return GenerateResponse(response=response)
+        if isinstance(request, GenerateRequest):
+            result = await self._get_inference_gateway().generate(request.model_dump())
+            return GenerateResponse(**result)
+        return await self._get_inference_gateway().handle_generate(request)
 
-        except Exception as e:
-            self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
-            raise
+    def _get_inference_gateway(self):
+        if not hasattr(self, "_inference_gateway"):
+            self._inference_gateway = InferenceGatewayHandler(
+                "genrm", self.get_engines, http_client=self._http_client, genrm_render=self._render_inference_payload
+            )
+        return self._inference_gateway
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(self, request: Request):
+        return await self._get_inference_gateway().handle_chat(request)
+
+    @app.post("/chat/completions")
+    async def chat_completions_alias(self, request: Request):
+        return await self._get_inference_gateway().handle_chat(request)
+
+    @app.get("/v1/models")
+    async def list_models(self) -> dict:
+        return await self._get_inference_gateway().models()
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
         if route_key is None and len(self.genrm_managers) == 1:
@@ -214,6 +231,14 @@ class GenRM(Base):
                 f"No GenRM instance registered for route_key={key!r}; available={list(self.genrm_managers)}"
             )
         return key
+
+    @app.get("/engines")
+    async def get_engines(self, schema: int = 2) -> dict:
+        if schema != 2:
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema")
+        if not hasattr(self, "_inference_discovery"):
+            self._inference_discovery = RoleDiscovery("genrm", lambda: self.genrm_managers)
+        return await self._inference_discovery.snapshot()
 
     def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
         """Round-robin one live engine of the instance selected by
@@ -252,6 +277,12 @@ class GenRM(Base):
             Dict containing at least {"text": str} from the SGLang server.
         """
         key, idx, host, port = self._pick_engine(route_key)
+        payload = await self._render_inference_payload(key, messages, sampling_params)
+        return await self._call_legacy_payload(route_key, key, host, port, payload)
+
+    async def _render_inference_payload(
+        self, key: str, messages: list, sampling_params: Optional[dict] = None
+    ) -> dict:
         spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
@@ -294,6 +325,9 @@ class GenRM(Base):
             "input_ids": input_ids,
             "sampling_params": default_sampling,
         }
+        return payload
+
+    async def _call_legacy_payload(self, route_key, key, host, port, payload) -> dict:
 
         # Retry transient resets (transport-level or 5xx) with short backoff so
         # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
@@ -324,8 +358,12 @@ class GenRM(Base):
         return resp.json()
 
     @app.get("/health")
-    async def health(self) -> dict:
+    async def health(self, schema: int = 1) -> dict:
         """Health check endpoint; reports per-instance status."""
+        if schema == 2:
+            return await self._get_inference_gateway().health()
+        if schema != 1:
+            raise HTTPException(status_code=400, detail="Unsupported health schema")
         instances = {}
         for key, manager in self.genrm_managers.items():
             try:

@@ -1,46 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import importlib
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _cleanup_teacher_manager_module():
-    yield
-    sys.modules.pop("relax.distributed.ray.teacher_manager", None)
+pytest.importorskip("sglang")
 
-
-def _install_teacher_manager_stubs(monkeypatch):
-    sglang_engine = ModuleType("relax.backends.sglang.sglang_engine")
-    sglang_engine.SGLangEngine = object
-
-    service = ModuleType("relax.core.service")
-    service.create_placement_group = MagicMock()
-
-    rollout = ModuleType("relax.distributed.ray.rollout")
-    rollout._allocate_rollout_engine_addr_and_ports_normal = MagicMock()
-
-    ray_utils = ModuleType("relax.distributed.ray.utils")
-    ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
-
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.find_available_port = MagicMock(return_value=15000)
-
-    monkeypatch.setitem(sys.modules, "relax.backends.sglang.sglang_engine", sglang_engine)
-    monkeypatch.setitem(sys.modules, "relax.core.service", service)
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout)
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.utils", ray_utils)
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
+from relax.distributed.ray import teacher_manager as teacher_manager_module
 
 
 def _import_teacher_manager(monkeypatch):
-    _install_teacher_manager_stubs(monkeypatch)
-    sys.modules.pop("relax.distributed.ray.teacher_manager", None)
-    return importlib.import_module("relax.distributed.ray.teacher_manager")
+    monkeypatch.setattr(teacher_manager_module, "create_placement_group", MagicMock())
+    monkeypatch.setattr(teacher_manager_module, "_allocate_rollout_engine_addr_and_ports_normal", MagicMock())
+    monkeypatch.setattr(teacher_manager_module, "find_available_port", MagicMock(return_value=15000))
+    return teacher_manager_module
 
 
 def test_teacher_gpu_index_uses_rollout_offset_for_shared_pg(monkeypatch):
@@ -111,9 +86,11 @@ def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
 
 def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
+    from relax.distributed.ray.inference_manager import InferenceManager
 
     assert hasattr(teacher_manager.TeacherManager, "remote")
     assert hasattr(teacher_manager.TeacherManager, "options")
+    assert issubclass(teacher_manager.TeacherManager.__ray_metadata__.modified_class, InferenceManager)
 
 
 def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
@@ -133,8 +110,8 @@ def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
 
     assert result == {0: original}
     assert result[0] is not original
-    sys.modules["relax.utils.http_utils"].find_available_port.assert_not_called()
-    sys.modules["relax.distributed.ray.rollout"]._allocate_rollout_engine_addr_and_ports_normal.assert_not_called()
+    teacher_manager.find_available_port.assert_not_called()
+    teacher_manager._allocate_rollout_engine_addr_and_ports_normal.assert_not_called()
 
 
 def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
