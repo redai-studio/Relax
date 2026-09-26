@@ -248,6 +248,37 @@ def test_bridge_critic_provider_registers_value_head_before_ddp(monkeypatch):
     assert all("relax_hf_output_layer" not in name for name, _ in model.named_parameters())
 
 
+def test_bridge_reward_model_provider_registers_biasless_scalar_head_and_restores_on_error(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    args = _bridge_args(loss_type="sft", sft_objective="reward_model")
+    model = module.get_model_provider_func(args, role="actor")(post_process=True)
+    reward_head = model.output_layer
+    parameter_ids = tuple(id(parameter) for parameter in reward_head.parameters())
+
+    assert isinstance(reward_head, ppo_utils.LinearForLastLayer)
+    assert tuple(reward_head.weight.shape) == (1, 4)
+    assert reward_head.bias is None
+    assert list(model.state_dict()) == ["output_layer.weight"]
+
+    with pytest.raises(RuntimeError, match="bridge failed"):
+        with ppo_utils.use_critic_lm_head_for_hf_load([model]):
+            assert model.output_layer.out_features == 8
+            raise RuntimeError("bridge failed")
+
+    assert model.output_layer is reward_head
+    assert tuple(id(parameter) for parameter in reward_head.parameters()) == parameter_ids
+    assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+    reward_head.weight.main_grad = torch.zeros_like(reward_head.weight)
+    assert ppo_utils.validate_reward_model_head_registration([model], object()) == parameter_ids
+
+
 def test_hf_load_context_restores_same_value_head(monkeypatch):
     class _FakeBridgeModel(torch.nn.Module):
         def __init__(self):

@@ -45,6 +45,7 @@ from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
+    install_reward_model_head_in_provider,
     install_sequence_classification_head_in_provider,
 )
 
@@ -270,6 +271,8 @@ def get_model_provider_func(
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_reward_model_head_in_provider(model, args, role, post_process)
+
             install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
@@ -428,6 +431,8 @@ def get_model_provider_func(
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+
             install_sequence_classification_head_in_provider(
                 model,
                 args,
@@ -550,6 +555,8 @@ def get_model_provider_func(
 
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_reward_model_head_in_provider(model, args, role, post_process)
+
         install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)

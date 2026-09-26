@@ -482,8 +482,9 @@ async def test_sft_remote_step_produces_eval_before_advancing_step(monkeypatch):
     sft._stop_event = MagicMock()
     sft._stop_event.is_set = MagicMock(return_value=False)
 
-    async def _maybe_produce_eval():
+    async def _maybe_produce_eval(completed_steps):
         assert sft.step == 0
+        assert completed_steps == 1
 
     sft._maybe_produce_eval = AsyncMock(side_effect=_maybe_produce_eval)
 
@@ -544,6 +545,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
+    args.eval_prompt_data = "/fake/eval.jsonl"
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -560,7 +562,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        await sft._maybe_produce_eval(completed_steps=1)
 
     fake_client.async_put.assert_not_awaited()
 
@@ -587,6 +589,8 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
         eval_interval=1,
         global_batch_size=4,
         task_type="seq_cls",
@@ -599,14 +603,14 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     sft._build_eval_batches = MagicMock(return_value=samples)
     sft._wait_for_partition_drained = AsyncMock(return_value=True)
 
-    await sft._maybe_produce_eval()
+    await sft._maybe_produce_eval(completed_steps=1)
 
     expected_chunks = (n_real + 3) // 4
     assert fake_client.async_put.await_count == expected_chunks
     weights = torch.cat([call.kwargs["data"]["sample_weights"] for call in fake_client.async_put.call_args_list])
     assert weights.tolist() == [1.0] * n_real + [0.0] * (expected_chunks * 4 - n_real)
     partition_ids = [call.kwargs["partition_id"] for call in fake_client.async_put.call_args_list]
-    assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+    assert partition_ids == [f"sft_eval_1_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
 
 
 @pytest.mark.asyncio

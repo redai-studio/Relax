@@ -7,6 +7,8 @@ These are the bits previously duplicated as ``_sft_*`` private functions in
 here keeps the dispatchers in those files to one-line calls.
 """
 
+import math
+import re
 from argparse import Namespace
 
 import numpy as np
@@ -65,6 +67,103 @@ def is_sft_mode(args: Namespace) -> bool:
     controller wiring, components, and the Megatron backend.
     """
     return getattr(args, "loss_type", None) == "sft"
+
+
+def sft_objective(args: Namespace) -> str:
+    """Return the offline objective while preserving causal-LM defaults."""
+    return getattr(args, "sft_objective", "causal_lm")
+
+
+def is_preference_mode(args: Namespace) -> bool:
+    return is_sft_mode(args) and sft_objective(args) in {"dpo", "reward_model"}
+
+
+def validate_preference_args(args: Namespace) -> None:
+    """Reject unsupported preference configurations before Serve starts."""
+    if not is_preference_mode(args):
+        return
+    objective = sft_objective(args)
+    if objective == "reward_model" and getattr(args, "save_hf", None) is not None:
+        raise ValueError(
+            "reward_model v1 does not support --save-hf; use native Megatron checkpoints for RM persistence"
+        )
+
+    if getattr(args, "sft_async_prepack", False):
+        raise ValueError("preference objectives v1 do not support --sft-async-prepack")
+    if getattr(args, "task_type", "causal_lm") != "causal_lm":
+        raise ValueError("preference objectives require --task-type causal_lm")
+    if getattr(args, "mtp_only_training", False):
+        raise ValueError("preference objectives v1 do not support MTP-only training")
+    if getattr(args, "custom_dataset_class_path", None):
+        raise ValueError("preference objectives do not support --custom-dataset-class")
+    if getattr(args, "multimodal_keys", None) is not None:
+        raise ValueError("preference objectives v1 support pure text only")
+    if int(getattr(args, "n_samples_per_prompt", 1)) != 1:
+        raise ValueError("preference objectives require --n-samples-per-prompt 1")
+    topology = {
+        "tensor_model_parallel_size": int(getattr(args, "tensor_model_parallel_size", 1) or 1),
+        "pipeline_model_parallel_size": int(getattr(args, "pipeline_model_parallel_size", 1) or 1),
+        "context_parallel_size": int(getattr(args, "context_parallel_size", 1) or 1),
+    }
+    invalid = {name: size for name, size in topology.items() if size != 1}
+    if invalid:
+        raise ValueError(f"preference objectives v1 require TP=CP=PP=1, got {invalid}")
+    if getattr(args, "dynamic_context_parallel", False):
+        raise ValueError("preference objectives v1 do not support dynamic context parallelism")
+    if getattr(args, "qkv_format", "thd") != "thd":
+        raise ValueError("preference objectives v1 require --qkv-format thd")
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError("preference objectives v1 support synchronous SFT topology only")
+    if not getattr(args, "use_gloo_process_groups", False):
+        raise ValueError("preference objectives require --use-gloo-process-groups for DP iterator control data")
+    if getattr(args, "sft_chunked_logits", False) or getattr(args, "enable_mtp_training", False):
+        raise ValueError("preference objectives v1 do not support SFT chunked logits or MTP")
+    if getattr(args, "calculate_per_token_loss", False):
+        raise ValueError("preference objectives use pair reduction and reject --calculate-per-token-loss")
+    if int(getattr(args, "lora_rank", 0) or 0) > 0:
+        raise ValueError("preference objectives v1 do not support LoRA")
+    if (
+        float(getattr(args, "hidden_dropout", 0.0) or 0.0) != 0.0
+        or float(getattr(args, "attention_dropout", 0.0) or 0.0) != 0.0
+    ):
+        raise ValueError("preference objectives require hidden and attention dropout to be 0.0")
+    if getattr(args, "sft_predict_interval", None) is not None:
+        raise ValueError("preference objectives do not use SFT generation prediction")
+    max_length = int(getattr(args, "preference_max_length", 0) or 0)
+    max_completion_length = int(getattr(args, "preference_max_completion_length", 0) or 0)
+    if max_length <= 0 or max_completion_length <= 0:
+        raise ValueError("preference length limits must be positive")
+    if max_completion_length > max_length:
+        raise ValueError("--preference-max-completion-length must not exceed --preference-max-length")
+    seq_length = int(getattr(args, "seq_length", max_length) or max_length)
+    if max_length > seq_length:
+        raise ValueError("--preference-max-length must not exceed --seq-length")
+    if objective != "dpo" and getattr(args, "dpo_reference_free", False):
+        raise ValueError("--dpo-reference-free is valid only with --sft-objective dpo")
+    if objective == "dpo":
+        beta = float(getattr(args, "dpo_beta", 0.1))
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
+        likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
+        if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
+            raise ValueError(
+                "DPO requires --rollout-temperature 1.0 so sampling temperature does not scale "
+                "policy/reference likelihood logits"
+            )
+        if getattr(args, "ref_load", None) is not None:
+            raise ValueError(
+                "DPO objectives do not use --ref-load: standard DPO snapshots the frozen reference "
+                "from the pinned --dpo-reference-repository/--dpo-reference-revision snapshot"
+            )
+        if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
+            raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
+        if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
+            raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
+        if not getattr(args, "dpo_reference_free", False):
+            if not getattr(args, "dpo_reference_repository", None) or not getattr(
+                args, "dpo_reference_revision", None
+            ):
+                raise ValueError("standard DPO requires --dpo-reference-repository and --dpo-reference-revision")
 
 
 def should_skip_mtp_only_weight_management(
@@ -142,8 +241,14 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
     return "train"
 
 
-def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
-    """SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
+def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
+    """Return whether eval is due after ``completed_steps`` optimizer steps.
+
+    Preference objectives additionally evaluate at the true pre-training
+    baseline (0) and at the final completed step, independent of whether the
+    periodic interval happens to divide the run length.
+
+    SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
     when an eval source is configured (either ``--eval-prompt-data`` or
     ``--eval-size``, mutually exclusive — see ``utils/arguments.py``).
 
@@ -157,11 +262,28 @@ def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    if is_preference_mode(args) and completed_steps in {0, int(getattr(args, "num_rollout", 0) or 0)}:
+        return True
+    return completed_steps > 0 and completed_steps % interval == 0
 
 
-def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
-    """SFT periodic predict triggers every ``--sft-predict-interval`` steps.
+def actor_training_input_ready(args: Namespace, step: int, partition_ids: list[str] | None) -> bool:
+    """Allow the backend to enter step 0 when its preference baseline is ready.
+
+    In colocate mode the Actor service normally waits for the train partition
+    before calling the backend. Preference producers intentionally publish and
+    drain the step-0 eval partition first, so that baseline partition is the
+    backend's first input and must also release the service-level wait.
+    """
+    if not partition_ids:
+        return False
+    if step == 0 and is_preference_mode(args) and should_run_sft_eval(args, completed_steps=0):
+        return any(re.fullmatch(r"sft_eval_0_n\d+_0", partition_id) for partition_id in partition_ids)
+    return all(partition_id in partition_ids for partition_id in sft_partition_ids(args, step))
+
+
+def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
+    """SFT periodic predict triggers after each completed interval.
 
     Argparse already validated ``--loss-type sft``, ``--save``, and the eval
     data source, so we only need the interval check here.
@@ -169,4 +291,9 @@ def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "sft_predict_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    return completed_steps > 0 and completed_steps % interval == 0
+
+
+def evaluation_step_for_rollout(args: Namespace, rollout_id: int) -> int:
+    """Map a zero-based training rollout to the evaluation step namespace."""
+    return rollout_id + 1 if is_sft_mode(args) else rollout_id

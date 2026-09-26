@@ -14,7 +14,13 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
+from relax.engine.sft.runtime import (
+    actor_training_input_ready,
+    is_preference_mode,
+    is_sft_mode,
+    sft_partition_ids,
+    sft_task_name,
+)
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
@@ -78,7 +84,11 @@ class Actor(Base):
             self.actor_model.async_init(
                 config,
                 role=self.role,
-                with_ref=config.kl_coef != 0 or config.use_kl_loss,
+                with_ref=(
+                    config.kl_coef != 0
+                    or config.use_kl_loss
+                    or (is_preference_mode(config) and config.sft_objective == "dpo" and not config.dpo_reference_free)
+                ),
                 with_opd_teacher=self.config.opd_teacher_load,
             )
         )
@@ -248,9 +258,8 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
-        partition_ids = sft_partition_ids(self.config, self.step)
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if partition_list is None or any(partition_id not in partition_list for partition_id in partition_ids):
+        if not actor_training_input_ready(self.config, self.step, partition_list):
             time.sleep(1)
             return False
 

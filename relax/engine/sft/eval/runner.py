@@ -96,6 +96,12 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     Under CP > 1 each callback emits CP-local sufficient statistics, and the
     final all-reduce includes the CP group so each sample is counted once.
     """
+    from relax.engine.sft.runtime import is_preference_mode
+
+    if is_preference_mode(actor.args):
+        _run_preference_eval(actor, rollout_id)
+        return
+
     # Lazy imports: keep this module importable without Megatron initialized.
     from relax.backends.megatron.data import get_data_iterator
     from relax.backends.megatron.initialize import is_megatron_main_rank
@@ -209,3 +215,209 @@ def run_sft_eval(actor, rollout_id: int) -> None:
         # step) and never reach ClearML/W&B/TB.
         tracking_utils.flush_metrics(args, step)
         logger.info(f"SFT eval @ rollout_id={rollout_id}: {metrics}")
+
+
+def _run_preference_eval(actor, rollout_id: int) -> None:
+    """Evaluate DPO or RM on pair rows using the same TQ packing as
+    training."""
+    from relax.backends.megatron.data import expand_preference_rollout_data, get_data_iterator
+    from relax.backends.megatron.initialize import is_megatron_main_rank
+    from relax.backends.megatron.model import forward_only
+    from relax.engine.sft.eval.acceptance import (
+        PREFERENCE_PROBE_PAIR_COUNT,
+        preference_eval_chunk_sizes,
+        preference_eval_local_batch_sizes,
+    )
+    from relax.engine.sft.eval.preference import (
+        compute_reward_model_eval_step,
+        extract_preference_eval_pair_ids,
+        finalize_pair_metrics,
+        pair_metric_sums,
+    )
+    from relax.utils.training.preference_utils import dpo_pair_loss, reward_model_pair_loss
+
+    args = actor.args
+    task_name = "sft_eval"
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    data_fields = [
+        "pair_ids",
+        "chosen_tokens",
+        "rejected_tokens",
+        "chosen_loss_masks",
+        "rejected_loss_masks",
+        "chosen_total_lengths",
+        "rejected_total_lengths",
+        "chosen_score_positions",
+        "rejected_score_positions",
+    ]
+    n_chunks = _wait_for_eval_chunk_count(actor, rollout_id)
+    chunk_sizes = preference_eval_chunk_sizes(PREFERENCE_PROBE_PAIR_COUNT, args.global_batch_size)
+    local_batch_sizes = preference_eval_local_batch_sizes(PREFERENCE_PROBE_PAIR_COUNT, args.global_batch_size, dp_size)
+    if len(chunk_sizes) != n_chunks:
+        raise RuntimeError(f"preference eval chunk plan mismatch: producer={n_chunks}, consumer={len(chunk_sizes)}")
+    local = torch.zeros(7, device=device_utils.make_current_torch_device(), dtype=torch.float64)
+    local_rows: list[dict] = []
+    local_plan: list[dict] = []
+    started = time.monotonic()
+    with timer("preference_eval"):
+        for chunk_idx, (global_chunk_size, batch_size) in enumerate(zip(chunk_sizes, local_batch_sizes, strict=True)):
+            partition_id = f"sft_eval_{rollout_id}_n{n_chunks}_{chunk_idx}"
+            _wait_for_eval_partition_present(actor, partition_id)
+            batch_index = 0
+            while not actor.all_consumed(task_name, rollout_id, partition_id=partition_id):
+                pair_rows, _batch_meta = actor._get_data_from_transfer_queue(
+                    task_name, rollout_id, data_fields, batch_size, batch_index, partition_id=partition_id
+                )
+                if pair_rows is None:
+                    continue
+                batch_index += 1
+                rollout_data = expand_preference_rollout_data(pair_rows)
+                rollout_data["dynamic_global_batch_size"] = global_chunk_size
+                data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
+                for microbatch_index, branch_indices in enumerate(data_iterator[0].micro_batch_indices):
+                    encoded_ids = []
+                    for branch_index in branch_indices:
+                        pair_id = int(rollout_data["preference_branch_pair_ids"][branch_index])
+                        if not encoded_ids or encoded_ids[-1] != pair_id:
+                            encoded_ids.append(pair_id)
+                    local_plan.append(
+                        {
+                            "rank": dist.get_rank(),
+                            "chunk": chunk_idx,
+                            "batch": batch_index - 1,
+                            "microbatch": microbatch_index,
+                            "encoded_pair_ids": encoded_ids,
+                        }
+                    )
+                encoded_pair_ids = extract_preference_eval_pair_ids(rollout_data)
+                if args.sft_objective == "dpo":
+                    if args.dpo_reference_free:
+                        reference_sums = None
+                    else:
+                        actor._switch_model("ref")
+                        reference = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")[
+                            "ref_log_probs"
+                        ]
+                        reference_sums = _masked_sequence_sums(reference, rollout_data["loss_masks"], local.device)
+                    actor._switch_model("actor")
+                    policy = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="")["log_probs"]
+                    policy_sums = _masked_sequence_sums(policy, rollout_data["loss_masks"], local.device)
+                    policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
+                    if reference_sums is None:
+                        reference_chosen = reference_rejected = None
+                        chosen_values = args.dpo_beta * policy_chosen
+                        rejected_values = args.dpo_beta * policy_rejected
+                    else:
+                        reference_chosen, reference_rejected = reference_sums[0::2], reference_sums[1::2]
+                        chosen_values = args.dpo_beta * (policy_chosen - reference_chosen)
+                        rejected_values = args.dpo_beta * (policy_rejected - reference_rejected)
+                    losses = dpo_pair_loss(
+                        policy_chosen,
+                        policy_rejected,
+                        reference_chosen=reference_chosen,
+                        reference_rejected=reference_rejected,
+                        beta=args.dpo_beta,
+                        reference_free=args.dpo_reference_free,
+                    )
+                    local += pair_metric_sums(chosen_values, rejected_values, losses)
+                    policy_chosen_values = policy_chosen.detach().cpu().tolist()
+                    policy_rejected_values = policy_rejected.detach().cpu().tolist()
+                    reference_chosen_values = (
+                        [0.0] * len(encoded_pair_ids)
+                        if reference_chosen is None
+                        else reference_chosen.detach().cpu().tolist()
+                    )
+                    reference_rejected_values = (
+                        [0.0] * len(encoded_pair_ids)
+                        if reference_rejected is None
+                        else reference_rejected.detach().cpu().tolist()
+                    )
+                    chosen_reward_values = chosen_values.detach().cpu().tolist()
+                    rejected_reward_values = rejected_values.detach().cpu().tolist()
+                    loss_values = losses.detach().cpu().tolist()
+                    for index, encoded_pair_id in enumerate(encoded_pair_ids):
+                        margin = chosen_reward_values[index] - rejected_reward_values[index]
+                        local_rows.append(
+                            {
+                                "encoded_pair_id": encoded_pair_id,
+                                "policy_chosen_logp": policy_chosen_values[index],
+                                "policy_rejected_logp": policy_rejected_values[index],
+                                "reference_chosen_logp": reference_chosen_values[index],
+                                "reference_rejected_logp": reference_rejected_values[index],
+                                "chosen_implicit_reward": chosen_reward_values[index],
+                                "rejected_implicit_reward": rejected_reward_values[index],
+                                "reward_margin": margin,
+                                "pair_loss": loss_values[index],
+                            }
+                        )
+                else:
+                    outputs = forward_only(
+                        compute_reward_model_eval_step,
+                        args,
+                        actor.model,
+                        data_iterator,
+                        num_microbatches,
+                        store_prefix="",
+                    )
+                    if mpu.is_pipeline_last_stage():
+                        scores = torch.stack(outputs["scores"]).to(local.device)
+                        chosen_scores, rejected_scores = scores[0::2], scores[1::2]
+                        losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+                        local += pair_metric_sums(chosen_scores, rejected_scores, losses, epsilon=0.0)
+                        chosen_values = chosen_scores.detach().cpu().tolist()
+                        rejected_values = rejected_scores.detach().cpu().tolist()
+                        loss_values = losses.detach().cpu().tolist()
+                        for index, encoded_pair_id in enumerate(encoded_pair_ids):
+                            local_rows.append(
+                                {
+                                    "encoded_pair_id": encoded_pair_id,
+                                    "chosen_score": chosen_values[index],
+                                    "rejected_score": rejected_values[index],
+                                    "pair_loss": loss_values[index],
+                                }
+                            )
+            dist.barrier(group=get_gloo_group())
+            if dist.get_rank() == 0:
+                run(actor.data_system_client.async_clear_partition(partition_id=partition_id))
+
+    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
+    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    metrics = finalize_pair_metrics(local, prefix="dpo" if args.sft_objective == "dpo" else "rm")
+    metrics["perf/preference_eval_time"] = time.monotonic() - started
+    gloo_group = get_gloo_group()
+    gathered_rows = [None] * dist.get_world_size(group=gloo_group)
+    gathered_plans = [None] * dist.get_world_size(group=gloo_group)
+    dist.all_gather_object(gathered_rows, local_rows, group=gloo_group)
+    dist.all_gather_object(gathered_plans, local_plan, group=gloo_group)
+    if is_megatron_main_rank():
+        from relax.engine.sft.eval.acceptance import write_pair_artifacts
+
+        summary = write_pair_artifacts(
+            getattr(args, "save", None),
+            args.sft_objective,
+            rollout_id,
+            [row for rank_rows in gathered_rows for row in rank_rows],
+            [entry for rank_plan in gathered_plans for entry in rank_plan],
+        )
+        if summary is not None:
+            metrics[f"eval/{'dpo' if args.sft_objective == 'dpo' else 'rm'}_bootstrap_lower_95"] = summary[
+                "bootstrap"
+            ]["lower_95"]
+        step = compute_rollout_step(args, rollout_id)
+        metrics["rollout/step"] = step
+        tracking_utils.log(args, metrics, step_key="rollout/step")
+        tracking_utils.flush_metrics(args, step)
+        logger.info(f"Preference eval @ rollout_id={rollout_id}: {metrics}")
+
+
+def _masked_sequence_sums(values, masks, device: torch.device) -> torch.Tensor:
+    if len(values) != len(masks):
+        raise ValueError("preference eval values/masks are not branch aligned")
+    sums = []
+    for value, mask in zip(values, masks, strict=True):
+        value = torch.as_tensor(value, device=device)
+        mask = torch.as_tensor(mask, device=device, dtype=value.dtype)
+        if value.shape != mask.shape:
+            raise ValueError(f"preference eval value/mask shape mismatch: {value.shape} vs {mask.shape}")
+        sums.append((value * mask).sum())
+    return torch.stack(sums)

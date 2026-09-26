@@ -44,6 +44,33 @@ def test_actor_helpers_emit_train_partition_under_rl():
     assert sft_task_name(rl_cfg, component="actor") == "train_actor"
 
 
+def test_colocate_preference_step_zero_starts_when_baseline_partition_is_ready():
+    from relax.engine.sft.runtime import actor_training_input_ready
+
+    cfg = _mk_actor_config(loss_type="sft")
+    cfg.sft_objective = "reward_model"
+    cfg.eval_prompt_data = ["task31", "heldout.parquet"]
+    cfg.eval_size = None
+    cfg.eval_interval = 200
+
+    assert actor_training_input_ready(cfg, 0, ["sft_eval_0_n2_0"])
+    assert not actor_training_input_ready(cfg, 0, [])
+    assert not actor_training_input_ready(cfg, 0, ["sft_0"])
+    assert not actor_training_input_ready(cfg, 0, ["sft_eval_0_n2_1"])
+    assert not actor_training_input_ready(cfg, 1, ["sft_eval_1_n2_0"])
+    assert actor_training_input_ready(cfg, 1, ["sft_1"])
+
+
+def test_actor_training_partition_remains_the_normal_readiness_signal():
+    from relax.engine.sft.runtime import actor_training_input_ready
+
+    cfg = _mk_actor_config(loss_type="sft")
+    cfg.sft_objective = "causal_lm"
+
+    assert actor_training_input_ready(cfg, 0, ["sft_0"])
+    assert not actor_training_input_ready(cfg, 0, ["sft_eval_0_n2_0"])
+
+
 def test_actor_resume_uses_backend_step_over_auto_cold_start():
     from relax.components.actor import _resolve_start_rollout_id
 

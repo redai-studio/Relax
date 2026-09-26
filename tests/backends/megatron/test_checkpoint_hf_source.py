@@ -49,4 +49,5 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
 
     monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", fail_hf_load)
 
-    assert checkpoint.load_checkpoint(None, None, None, {}, False) == expected
+    model = [SimpleNamespace(role="actor")]
+    assert checkpoint.load_checkpoint(model, None, None, {}, False) == expected

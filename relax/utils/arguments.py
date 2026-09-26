@@ -576,6 +576,28 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
             # ---- SFT / Predict ----
             parser.add_argument(
+                "--sft-objective",
+                choices=["causal_lm", "dpo", "reward_model"],
+                default="causal_lm",
+                help="Offline objective under --loss-type sft. Defaults to the existing causal-LM behavior.",
+            )
+            parser.add_argument("--preference-chosen-key", type=str, default="chosen")
+            parser.add_argument("--preference-rejected-key", type=str, default="rejected")
+            parser.add_argument("--preference-pair-id-key", type=str, default="prompt_id")
+            parser.add_argument("--preference-max-length", type=int, default=1024)
+            parser.add_argument("--preference-max-completion-length", type=int, default=512)
+            parser.add_argument("--preference-chat-template-sha256", type=str, default=None)
+            parser.add_argument("--preference-require-no-generation-marker", action="store_true", default=False)
+            parser.add_argument("--dpo-beta", type=float, default=0.1)
+            parser.add_argument("--dpo-reference-repository", type=str, default=None)
+            parser.add_argument("--dpo-reference-revision", type=str, default=None)
+            parser.add_argument(
+                "--dpo-reference-free",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Use explicit reference-free logistic DPO instead of a frozen reference checkpoint.",
+            )
+            parser.add_argument(
                 "--custom-dataset-class",
                 "--custom-dataset-class-path",
                 dest="custom_dataset_class_path",
@@ -4123,6 +4145,10 @@ def slime_validate_args(args):
         if not args.balance_data:
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
+        from relax.engine.sft.runtime import validate_preference_args
+
+        validate_preference_args(args)
+
     elif getattr(args, "sft_async_prepack", False):
         raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
