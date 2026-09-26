@@ -696,6 +696,23 @@ class TestRequestSamplingSeed(unittest.TestCase):
             )
         self.assertEqual(posts, [])
 
+    def test_seed_semantics_is_content_deterministic(self):
+        """Product semantics, stated explicitly: the derived seed is a pure
+        function of (judge model, model-facing input, effective sampling).
+
+        Two independent stochastic requests with identical content draw the
+        same random stream on any replica -- content-deterministic stochastic
+        scoring, not merely replica-invariant retry.
+        """
+        replica = self._replica()
+        first = replica._effective_sampling(self.SPEC, None, [9, 9, 9])
+        second = replica._effective_sampling(self.SPEC, None, [9, 9, 9])
+        self.assertEqual(first["sampling_seed"], second["sampling_seed"])
+        # Different content draws a different stream (the function is not
+        # constant).
+        third = replica._effective_sampling(self.SPEC, None, [9, 9, 8])
+        self.assertNotEqual(first["sampling_seed"], third["sampling_seed"])
+
 
 if __name__ == "__main__":
     unittest.main()

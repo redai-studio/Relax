@@ -391,16 +391,22 @@ class GenRM(Base):
         """Effective per-request sampling params (defaults merged with the
         caller's override) plus the request-level sampling seed.
 
-        Seed contract (product semantics): a stochastic scoring request
-        (``temperature > 0``) draws its random stream from a seed derived from
-        the judge identity, the exact model-facing input and the effective
-        sampling config -- never from a replica's RNG-consumption history.
-        Identical scoring requests therefore produce identical verdicts on
-        every replica (adversarial finding: server-level ``args.seed`` seeding
-        alone flips verdicts across replicas whose request histories diverged;
-        2/50 on Qwen3-0.6B, temp 0.1). Greedy requests (``temperature == 0``)
-        are already deterministic and get no seed; an explicit caller-provided
-        ``sampling_seed`` is respected.
+        Seed contract (product semantics -- content-deterministic stochastic
+        scoring): a stochastic scoring request (``temperature > 0``) draws its
+        random stream from a seed derived from the judge identity, the exact
+        model-facing input and the effective sampling config -- never from a
+        replica's RNG-consumption history. The consequence is stronger than
+        replica-invariance: identical scoring content produces identical
+        verdicts on every replica **and across repeated independent calls**.
+        This is the semantics required by "new engines score identically to
+        initial ones" under arbitrary request histories (adversarial finding:
+        server-level ``args.seed`` seeding alone flips verdicts across
+        replicas whose request histories diverged; 2/50 on Qwen3-0.6B, temp
+        0.1). If a future product wants per-request stochastic diversity
+        instead, the seed must additionally incorporate a request/scoring
+        identity -- a deliberate contract change, not a bug fix. Greedy
+        requests (``temperature == 0``) are already deterministic and get no
+        seed; an explicit caller-provided ``sampling_seed`` is respected.
         """
         sampling_config = spec["sampling_config"]
         effective = {

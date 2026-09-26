@@ -84,6 +84,48 @@ class _ParkedResp:
         return json.dumps(self._payload)
 
 
+class _LostResponse:
+    """A response that dies mid-flight (server already accepted)."""
+
+    async def __aenter__(self):
+        raise ConnectionError("connection reset while reading the response")
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _IdempotentScaleServer:
+    """aiohttp-like session speaking the GenRM idempotency contract.
+
+    Operations are keyed by idempotency_key server-side: the first POST with a
+    key admits an operation; any later POST with the same key replays the same
+    request_id (exactly one operation ever exists per key). Responses can be
+    configured to be "lost" (transport error after acceptance).
+    """
+
+    def __init__(self, lose_responses=0):
+        self.operations = {}
+        self.posts = []
+        self.get_calls = []
+        self._lose = lose_responses
+        self._seq = 0
+
+    def post(self, url, json=None):
+        self.posts.append((url, json))
+        key = (json or {}).get("idempotency_key")
+        if key not in self.operations:
+            self._seq += 1
+            self.operations[key] = f"req-{self._seq}"
+        if self._lose > 0:
+            self._lose -= 1
+            return _LostResponse()
+        return _FakeResp(200, {"request_id": self.operations[key], "status": "PENDING"})
+
+    def get(self, url):
+        self.get_calls.append(url)
+        return _FakeResp(200, {"status": "ACTIVE", "current": 2, "ready": 2})
+
+
 class _ParkedPostSession:
     """aiohttp-like session that parks POST responses and records GET URLs."""
 
@@ -781,6 +823,103 @@ class TestPatchConfig(unittest.TestCase):
             1 for i, r in enumerate(seen_runtimes) if r == seen_runtimes[0] and i > takeover_at
         )
         self.assertLessEqual(stale_evals_after_takeover, 1)  # at most one in-flight straggler
+
+    def test_accepted_but_response_lost_recovers_ownership(self):
+        """Final control-plane finding: the server accepts the POST (registry
+        admits the operation, lifecycle starts) and the response dies mid-
+        flight.
+
+        The placeholder must survive as SUBMIT_UNKNOWN, the bounded retry
+        replays the SAME idempotency key, the server returns the original
+        request_id, and exactly one operation exists -- no orphaned ownership,
+        no duplicate scale.
+        """
+        svc = self._svc_with_genrm_runtime()
+        server = _IdempotentScaleServer(lose_responses=1)
+        svc._http_session = server
+        svc._submit_retry_attempts = 2
+        svc._submit_retry_backoff_secs = 0.0
+
+        asyncio.run(svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, svc._services["genrm"]))
+        pending = svc._services["genrm"].state.pending_requests
+        # Ownership recovered inline via the idempotent replay.
+        self.assertEqual([(p["request_id"], p["status"]) for p in pending], [("req-1", "PENDING")])
+        # Exactly one server-side operation despite two POSTs.
+        self.assertEqual(len(server.operations), 1)
+        keys = {body.get("idempotency_key") for _, body in server.posts}
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(len(server.posts), 2)
+        # Status polling then tracks the recovered operation at its address.
+        asyncio.run(svc._update_pending_requests(svc._services["genrm"]))
+        self.assertEqual(server.get_calls, ["http://genrm:8000/genrm/scale_out/req-1"])
+
+    def test_true_connect_failure_stays_unknown_then_recovers(self):
+        """Every attempt loses the response (the server may or may not have
+        seen the request): the placeholder stays SUBMIT_UNKNOWN -- never
+        deleted -- keeps blocking target removal, and a later working cycle
+        recovers ownership via the same key with exactly one operation."""
+        svc = self._svc_with_genrm_runtime()
+        server = _IdempotentScaleServer(lose_responses=99)
+        svc._http_session = server
+        svc._submit_retry_attempts = 2
+        svc._submit_retry_backoff_secs = 0.0
+
+        asyncio.run(svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, svc._services["genrm"]))
+        pending = svc._services["genrm"].state.pending_requests
+        self.assertEqual([(p["request_id"], p["status"]) for p in pending], [(None, "SUBMIT_UNKNOWN")])
+        # Fail-closed: the unknown operation blocks target removal.
+        with self.assertRaises(svc_module.HTTPException) as ctx:
+            asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertEqual(ctx.exception.status_code, 409)
+        # The transport recovers; the next evaluation cycle replays the key.
+        server._lose = 0
+        asyncio.run(svc._update_pending_requests(svc._services["genrm"]))
+        pending = svc._services["genrm"].state.pending_requests
+        self.assertEqual([(p["request_id"], p["status"]) for p in pending], [("req-1", "PENDING")])
+        # One operation per key across every attempt, inline and recovery.
+        self.assertEqual(len(server.operations), 1)
+        replay_keys = {body.get("idempotency_key") for _, body in server.posts}
+        self.assertEqual(len(replay_keys), 1)
+
+    def test_failed_patch_is_atomic(self):
+        """Final control-plane finding: a PATCH whose target removal is
+        rejected (409) must leave ZERO partial mutation -- a 409 raised after
+        earlier field mutations used to leave max_engines already applied."""
+        svc = self._svc_with_genrm_runtime()
+        svc._services["genrm"].state.pending_requests.append(
+            {"action": "scale_out", "request_id": "req-u", "status": "PENDING", "delta": 1}
+        )
+        runtime_before = svc._services["genrm"]
+        collector_before = runtime_before.metrics_collector
+        config_before = svc.config
+
+        with self.assertRaises(svc_module.HTTPException):
+            asyncio.run(
+                svc.update_config(
+                    _ConfigUpdateRequest(
+                        max_engines=8,
+                        service_targets={"rollout": "http://rollout:8000/rollout"},
+                    )
+                )
+            )
+        # Nothing changed: numbers, targets, runtime identity, collector,
+        # worker ownership, pending operation.
+        self.assertEqual(svc.config.max_engines, config_before.max_engines)
+        self.assertIn("genrm", svc.config.service_targets)
+        self.assertIs(svc.config, config_before)
+        self.assertIs(svc._services["genrm"], runtime_before)
+        self.assertIs(svc._services["genrm"].metrics_collector, collector_before)
+        self.assertEqual(len(svc._services["genrm"].state.pending_requests), 1)
+
+    def test_valid_patch_applies_all_fields_together(self):
+        """A fully valid PATCH commits every field in one shot."""
+        svc = self._svc_with_genrm_runtime()
+        asyncio.run(
+            svc.update_config(_ConfigUpdateRequest(max_engines=8, rollout_service_url="http://new:8000/rollout"))
+        )
+        self.assertEqual(svc.config.max_engines, 8)
+        self.assertEqual(svc.config.get_service_url("rollout"), "http://new:8000/rollout")
+        self.assertEqual(svc.config.service_targets["rollout"], "http://new:8000/rollout")
 
 
 if __name__ == "__main__":
