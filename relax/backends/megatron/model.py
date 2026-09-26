@@ -387,14 +387,6 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    # Relax the Megatron GDN head-vs-(tp*cp) config gate down to (tp) BEFORE the model
-    # provider finalizes the TransformerConfig (get_model_provider_func below triggers
-    # __post_init__), so high-CP GDN configs (e.g. TP2/CP16) validate. The matching
-    # forward all-gather path is installed by _patch_gdn_for_dynamic_cp after the model
-    # is built; see both functions for why % tp suffices (GDN weights are TP-only).
-    if getattr(args, "dynamic_context_parallel", False) or getattr(args, "context_parallel_size", 1) > 1:
-        _relax_gdn_cp_config_assert()
-
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args),
         ModelType.encoder_or_decoder,
@@ -421,6 +413,16 @@ def setup_model_and_optimizer(
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
         # roles that still run forward.
         _patch_gdn_for_dynamic_cp()
+        model_config = get_model_config(model[0])
+        if getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net" and (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
+        ):
+            logger.info(
+                f"[GDN CP] role={role} linear_cp_mode={getattr(model_config, 'linear_cp_mode', None)} "
+                f"TP={model_config.tensor_model_parallel_size} max_CP={model_config.context_parallel_size} "
+                f"key_heads={model_config.linear_num_key_heads} value_heads={model_config.linear_num_value_heads}"
+            )
 
     if args.only_load_weight:
         return model, None, None
@@ -440,19 +442,24 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
-def _resolve_gdn_cp(self, packed_seq_params):
+def _resolve_gdn_cp(self, packed_seq_params, pg_collection=None):
     """Resolve (cp_size, cp_group, cp_rank) for a GDN forward.
 
     Prefers the per-micro-batch dynamic CP group carried on
     ``packed_seq_params`` (set in ``data.py``); falls back to the module's
     static CP group.
     """
-    if packed_seq_params is not None and getattr(packed_seq_params, "local_cp_size", None) is not None:
-        cp_group = packed_seq_params.cp_group
-        cp_size = packed_seq_params.local_cp_size
-    else:
-        cp_group = self.pg_collection.cp
-        cp_size = cp_group.size()
+    cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+    if packed_seq_params is not None:
+        dynamic_group = getattr(packed_seq_params, "cp_group", None)
+        local_cp_size = getattr(packed_seq_params, "local_cp_size", None)
+        if (dynamic_group is None) != (local_cp_size is None):
+            raise ValueError("PackedSeqParams.cp_group and local_cp_size must both be set or both be None.")
+        if dynamic_group is not None:
+            if local_cp_size != dynamic_group.size():
+                raise ValueError("PackedSeqParams.local_cp_size does not match cp_group.size().")
+            cp_group = dynamic_group
+    cp_size = cp_group.size() if cp_group is not None else 1
     cp_rank = cp_group.rank() if cp_size > 1 else 0
     return cp_size, cp_group, cp_rank
 
@@ -462,9 +469,9 @@ def _assert_gdn_full_recompute() -> None:
 
     The all-gather path below runs the recurrent scan on the *full* sequence
     duplicated on every CP rank, so the GDN activation scales with the full
-    context length. Only ``--recompute-granularity full`` (whole-layer
-    checkpointing) keeps that a per-layer transient; ``selective`` does not
-    cover GDN (its module list has no gdn/mamba entry) and silently OOMs.
+    context length. ``--recompute-granularity full`` (whole-layer checkpointing)
+    keeps that a per-layer transient. The fallback bypasses native GDN forward,
+    including its selective recompute wrapper.
 
     Only relevant to training forwards that build a graph (and thus retain
     activations): skipped when grad is disabled (weight-only / inference roles
@@ -477,11 +484,11 @@ def _assert_gdn_full_recompute() -> None:
     args = get_args()
     if getattr(args, "recompute_granularity", None) != "full":
         raise ValueError(
-            "GatedDeltaNet context-parallel (cp>1) requires whole-layer activation recompute: "
+            "GatedDeltaNet all_gather context-parallel (cp>1) requires whole-layer activation recompute: "
             "pass `--recompute-granularity full --recompute-method uniform --recompute-num-layers 1`. "
             f"Got recompute_granularity={getattr(args, 'recompute_granularity', None)!r}. "
-            "`selective` recompute does not cover GDN and will OOM (its full-sequence duplicated scan "
-            "activation stays resident)."
+            "The Relax all_gather fallback bypasses native GDN selective recompute; "
+            "its full-sequence duplicated scan activation would stay resident."
         )
     _assert_gdn_full_recompute._checked = True
 
@@ -495,84 +502,13 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
 
-def _relax_gdn_cp_config_assert() -> None:
-    """Relax Megatron's GDN config gate ``linear_num_{key,value}_heads %
-    (tp*cp) == 0`` down to ``% tp`` so high-CP GDN configs (e.g. TP2/CP16)
-    finalize.
-
-    Megatron's ``TransformerConfig.__post_init__`` enforces the *native* cp2hp
-    (split-sequence -> split-head) divisibility ``heads % (tp * cp)``.
-    ``_patch_gdn_for_dynamic_cp`` replaces that forward with an all-gather + duplicated
-    scan whose weights stay **TP-only** (``qk_dim_local_tp = qk_dim // tp``, etc.), so
-    only ``heads % tp`` is actually required. Without relaxing this config gate, TP2/CP16
-    (16 % 32 != 0) aborts at config finalize (``get_model_provider_func`` -> ``finalize``
-    -> ``__post_init__``) *before* the forward patch is installed.
-
-    Only intervenes when the native check would reject but the relaxed ``% tp`` check
-    passes: it temporarily scales the two GDN head counts by ``cp`` (which preserves
-    ``value % key`` and makes ``heads % (tp*cp)`` hold), runs the original
-    ``__post_init__``, then restores them. Those head counts are validation-only in
-    ``__post_init__`` (no stored value is derived from them -- verified against Megatron
-    core), and ``GatedDeltaNet.__init__`` reads the restored config later, so nothing
-    downstream sees the temporary values. Idempotent; monkey-patch only (no upstream
-    edit), matching ``_patch_gdn_for_dynamic_cp``.
-    """
-    try:
-        from megatron.core.transformer.transformer_config import TransformerConfig
-    except ImportError:
-        return
-
-    if getattr(TransformerConfig, "_gdn_cp_relaxed", False):
-        return
-
-    _orig_post_init = TransformerConfig.__post_init__
-
-    def _relaxed_post_init(self, *post_init_args, **post_init_kwargs):
-        if getattr(self, "experimental_attention_variant", None) == "gated_delta_net":
-            tp = self.tensor_model_parallel_size
-            cp = self.context_parallel_size
-            key = self.linear_num_key_heads or 0
-            val = self.linear_num_value_heads or 0
-            native_bad = cp > 1 and ((key % (tp * cp)) != 0 or (val % (tp * cp)) != 0)
-            relaxed_ok = tp > 0 and (key % tp) == 0 and (val % tp) == 0
-            if native_bad and relaxed_ok:
-                # key%tp==0 => (key*cp)%(tp*cp)==0, and (val*cp)%(key*cp)==(val%key) so the
-                # value%key assert is preserved. Restored in `finally` before anything else
-                # (incl. GatedDeltaNet.__init__) reads the config.
-                self.linear_num_key_heads = key * cp
-                self.linear_num_value_heads = val * cp
-                try:
-                    _orig_post_init(self, *post_init_args, **post_init_kwargs)
-                finally:
-                    self.linear_num_key_heads = key
-                    self.linear_num_value_heads = val
-                return
-        _orig_post_init(self, *post_init_args, **post_init_kwargs)
-
-    TransformerConfig.__post_init__ = _relaxed_post_init
-    TransformerConfig._gdn_cp_relaxed = True
-
-
 def _patch_gdn_for_dynamic_cp() -> None:
-    """Monkey-patch GatedDeltaNet.forward for CP via all-gather + duplicated
-    scan.
+    """Patch GDN forward for dynamic CP and Relax's all-gather mode.
 
-    Megatron's native GDN forward implements CP by converting "split sequence"
-    into "split head" (``cp2hp`` all-to-all, ``num_value_heads // tp // cp``),
-    which forces ``num_heads % (tp * cp) == 0`` and breaks at high CP for
-    head-light models (e.g. Qwen3.5). This patch keeps that efficient native path
-    whenever the heads still divide ``tp * cp`` (``native_ok``), and only when
-    native would break does it fall back to all-gathering the full sequence across
-    CP, running the recurrent scan duplicated on each rank while keeping relax's
-    **TP** head-split intact, then re-slicing this rank's shard. The effective
-    constraint drops to ``num_heads % tp == 0`` (CP16 works), and weight
-    conversion / DCS sync / checkpoint (all TP-only) are untouched.
-
-    Dynamic CP: size/group are read per micro-batch from ``packed_seq_params``
-    (set in get_batch), falling back to the static CP group. The ``cp == 1``,
-    non-thd, and ``native_ok`` cases keep upstream behavior (swap the dynamic CP
-    group, call the original forward). Idempotent; avoids editing upstream
-    Megatron source.
+    CP=1 and MCore-native headwise/chunkwise modes call the patched MCore
+    forward directly. Only static ``linear_cp_mode='all_gather'`` with CP>1
+    executes Relax's existing fallback. No shared module/config state is
+    modified.
     """
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -584,23 +520,6 @@ def _patch_gdn_for_dynamic_cp() -> None:
 
     _orig_forward = GatedDeltaNet.forward
 
-    def _call_orig_with_dynamic_cp(
-        self, cp_size, cp_group, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
-    ):
-        # cp == 1 or non-thd: preserve upstream behavior; just point the module at
-        # the (possibly dynamic) CP group for the original forward.
-        _orig_cp_size = self.cp_size
-        _orig_cp_group = self.pg_collection.cp
-        self.cp_size = cp_size
-        self.pg_collection.cp = cp_group
-        try:
-            return _orig_forward(
-                self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
-            )
-        finally:
-            self.cp_size = _orig_cp_size
-            self.pg_collection.cp = _orig_cp_group
-
     def _dcp_gdn_forward(
         self, hidden_states, attention_mask, inference_context=None, packed_seq_params=None, *args, **kwargs
     ):
@@ -609,27 +528,17 @@ def _patch_gdn_for_dynamic_cp() -> None:
 
         from .cp_utils import gdn_cp_slice
 
-        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params)
-        is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
-        # Native cp2hp (head-split) is exact and cheaper (no duplicated scan, GDN
-        # activation sharded by CP) whenever the heads divide tp*cp. Only fall back
-        # to the all-gather path when native would break the head split — i.e. when
-        # num_key_heads is not divisible by tp*cp (covers tp*cp > num_key_heads).
-        # num_value_heads is a multiple of num_key_heads, so this one check suffices.
-        native_ok = self.num_key_heads % (self.tp_size * cp_size) == 0
-        if cp_size == 1 or not is_thd or native_ok:
-            return _call_orig_with_dynamic_cp(
-                self,
-                cp_size,
-                cp_group,
-                hidden_states,
-                attention_mask,
-                inference_context,
-                packed_seq_params,
-                *args,
-                **kwargs,
+        cp_size, cp_group, cp_rank = _resolve_gdn_cp(self, packed_seq_params, kwargs.get("pg_collection"))
+        if cp_size == 1 or self.config.linear_cp_mode != "all_gather":
+            return _orig_forward(
+                self, hidden_states, attention_mask, inference_context, packed_seq_params, *args, **kwargs
             )
 
+        is_thd = packed_seq_params is not None and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        assert is_thd, (
+            "GDN linear_cp_mode='all_gather' with cp_size>1 only supports packed (thd) sequences; "
+            "use linear_cp_mode='headwise' or 'chunkwise' for SBHD/static-batch inputs."
+        )
         assert inference_context is None, "GDN all-gather CP path does not support inference."
         # Packed (thd) + deterministic is unsupported: a single conv/scan over the
         # concatenated samples would bleed state across cu_seqlens boundaries, and
@@ -642,14 +551,19 @@ def _patch_gdn_for_dynamic_cp() -> None:
         )
         _assert_gdn_full_recompute()
 
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        cu_seqlens, _ = self._resolve_thd_cu_seqlens(
+            packed_seq_params, hidden_states.shape[0] * self.sp_size * cp_size, cp_size
+        )
         # Precompute the host-side boundary list once per micro-batch (cached on the
         # shared packed_seq_params object) so the gather/slice below don't force a
         # per-GDN-layer .tolist() device sync — repeated under full recompute.
-        cu_seqlens_cpu = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
-        if cu_seqlens_cpu is None:
+        cached = getattr(packed_seq_params, "_gdn_cu_seqlens_cpu", None)
+        version = None if cu_seqlens.is_inference() else cu_seqlens._version
+        if cached is not None and version is not None and cached[0] is cu_seqlens and cached[1] == version:
+            cu_seqlens_cpu = cached[2]
+        else:
             cu_seqlens_cpu = cu_seqlens.tolist()
-            packed_seq_params._gdn_cu_seqlens_cpu = cu_seqlens_cpu
+            packed_seq_params._gdn_cu_seqlens_cpu = (cu_seqlens, version, cu_seqlens_cpu)
         _, batch, _ = hidden_states.shape
 
         # Input projection on the CP-sharded (and SP-sharded) sequence.
@@ -689,19 +603,14 @@ def _patch_gdn_for_dynamic_cp() -> None:
         )
 
         # Reuse the module's own prep (split/l2norm/GQA-expand) with CP disabled so
-        # its internal `// self.cp_size` becomes a no-op. Wrap in the dynamo-disable
+        # its internal `// cp_size_headwise` becomes a no-op. Wrap in the dynamo-disable
         # guard added by docker/patch/megatron/20260506-85bced0ae.patch (Qwen3.6 GDN
         # torch.compile failure); calling _prepare_qkv_for_gated_delta_rule directly
         # would re-trigger that compile failure.
-        _saved_cp = self.cp_size
-        self.cp_size = 1
-        try:
-            with torch._dynamo.config.patch(disable=True):
-                query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len
-                )
-        finally:
-            self.cp_size = _saved_cp
+        with torch._dynamo.config.patch(disable=True):
+            query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
+                qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=1
+            )
 
         # g/beta from the full (un-CP-sliced) A_log / dt_bias.
         g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)
