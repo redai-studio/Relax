@@ -8,13 +8,13 @@ Thank you for your interest in contributing to Relax! This document provides gui
 
 - [Code of Conduct](#code-of-conduct)
 - [How Can I Contribute?](#how-can-i-contribute)
-- [Development Setup](#development-setup)
-- [Development Workflow](#development-workflow)
+- [Developing](#developing)
 - [Code Style](#code-style)
 - [Commit Conventions](#commit-conventions)
 - [Pull Request Process](#pull-request-process)
 - [Reporting Bugs](#reporting-bugs)
 - [Requesting Features](#requesting-features)
+- [Community](#community)
 - [License](#license)
 
 ## Code of Conduct
@@ -38,58 +38,17 @@ This project follows a standard code of conduct. Please be respectful, inclusive
 - **Examples** — Add new training examples or tutorials
 - **Testing** — Improve test coverage and add integration tests
 
-## Development Setup
+## Developing
 
-```bash
-# Clone the repository
-git clone https://github.com/redai-studio/Relax.git
-cd Relax
+Follow the [development workflow](docs/en/guide/how-to-contribute.md#developing) for step-by-step commands:
 
-# Create virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install in development mode
-pip install -e .
-```
-
-## Development Workflow
-
-### 1. Create a Branch
-
-```bash
-# Feature
-git checkout -b feature/your-feature-name
-
-# Bug fix
-git checkout -b fix/your-bug-fix
-
-# Documentation
-git checkout -b docs/your-doc-change
-```
-
-### 2. Make Changes
-
-- Follow existing code patterns and conventions
-- Add or update tests for your changes
-- Update documentation if applicable (both English and Chinese)
-
-### 3. Validate
-
-```bash
-# Run pre-commit checks (lint + format)
-pre-commit run --all-files
-
-# Run tests
-pytest tests/
-```
-
-### 4. Submit a Pull Request
-
-Push your branch and open a PR against `main`. Fill out the PR template completely.
+1. Fork and clone the repository, add `upstream`, and sync your local `main`.
+2. Set up the development environment and install Relax in editable mode.
+3. Run the [DeepEyes example](docs/en/examples/deepeyes.md) to verify the training environment.
+4. Create a working branch and install Git hooks with pre-commit.
+5. Make your changes, add or update tests, and run the relevant unit tests. Update both language versions of the documentation when needed.
+6. Review, stage, and commit your changes using [Conventional Commits](#commit-conventions). Git hooks run automatically on commit; review any fixes and stage them again before retrying.
+7. Push your working branch to your fork and open a PR targeting `redai-studio/Relax`'s `main` branch. Fill out the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
 ## Code Style
 
@@ -133,11 +92,11 @@ feat(rollout): add streaming data consumption for async mode
 
 ### Before Submitting
 
-- [ ] Code compiles and runs without errors
-- [ ] `pre-commit run --all-files` passes
-- [ ] Tests pass (`pytest tests/`)
+- [ ] Relevant tests pass locally
+- [ ] Git hooks pass and code is formatted
 - [ ] Documentation updated (if applicable)
 - [ ] Commit messages follow Conventional Commits
+- [ ] Branch is up to date with `main`
 
 ### PR Review
 
@@ -149,7 +108,7 @@ feat(rollout): add streaming data consumption for async mode
 ### Tips for a Good PR
 
 - Keep PRs focused and reasonably sized
-- Provide a clear description of **what**, **why**, and **how**
+- Provide a clear description of **what**, **why**, **how**, and **testing**
 - Link related issues (e.g., `Fixes #123`)
 - Add screenshots or logs for UI or behavior changes
 
