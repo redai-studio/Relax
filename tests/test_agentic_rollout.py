@@ -703,6 +703,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
     )
+    shard._lora_registry = None
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
     shard._notify_state_change = lambda group=None: None
@@ -941,3 +942,229 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
         }
     ]
     assert client.releases == ["lease-1"]
+
+
+# ---------------------------------------------------------------------------
+# Immutable LoRA version binding (Task 7)
+# ---------------------------------------------------------------------------
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+class _RemoteCall:
+    """Awaitable mimicking a Ray ObjectRef: awaiting it runs the call at most
+    once."""
+
+    def __init__(self, fn, args) -> None:
+        self._fn = fn
+        self._args = args
+        self._task: Any = None
+
+    def __await__(self) -> Any:
+        if self._task is None:
+            self._task = asyncio.ensure_future(self._fn(*self._args))
+        return self._task.__await__()
+
+
+class _RegistryCall:
+    """One registry actor method, with the ``.remote()``-returns-awaitable
+    shape."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def remote(self, *args: Any) -> Any:
+        return _RemoteCall(self._fn, args)
+
+
+class _FakeLoraRegistry:
+    """Ray actor handle stand-in backed by a real (in-process) registry."""
+
+    def __init__(self, core: Any) -> None:
+        self.core = core
+        self.bind_calls: list[str] = []
+        self.releases: list[str] = []
+        self.delay_s = 0.0
+        self.bind_latest = _RegistryCall(self._bind)
+        self.release = _RegistryCall(self._release)
+
+    async def _bind(self, session_id: str) -> Any:
+        self.bind_calls.append(session_id)
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self.core.bind_latest(session_id)
+
+    async def _release(self, session_id: str) -> Any:
+        self.releases.append(session_id)
+        return self.core.release(session_id)
+
+
+def _published_registry(digest: str = _DIGEST_A, epoch: str = "epoch0") -> Any:
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+
+    core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch=epoch)
+    publication = core.allocate(digest)
+    core.mark_published(publication.version_id, publication.attempt_id)
+    return core
+
+
+def _binding_shard(registry: Any) -> Any:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._lora_registry = registry
+    shard._versioned_lora = True
+    return shard
+
+
+def _binding_session(session_id: str = "session-1") -> _SessionRecord:
+    result_cell = _SessionResultCell()
+    group = ResidentGroup(
+        rollout_mode="train",
+        group_id="group-1",
+        result_cells={session_id: result_cell},
+        sessions=[],
+    )
+    return _SessionRecord(
+        group=group,
+        session_id=session_id,
+        session_sampling_params={},
+        result_cell=result_cell,
+    )
+
+
+async def test_generate_carries_the_bound_lora_path(monkeypatch: Any) -> None:
+    payloads: list[dict[str, Any]] = []
+
+    async def fake_post(url, payload, headers=None):
+        del url, headers
+        payloads.append(dict(payload))
+        return {
+            "output_ids": [4],
+            "meta_info": {"output_token_logprobs": [], "finish_reason": {"type": "stop"}},
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    await adapter.generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="session-1",
+        request_id="request-1:0",
+        lora_path="relax_policy_lora@epoch0-1-aaaa",
+    )
+    assert payloads[-1]["lora_path"] == "relax_policy_lora@epoch0-1-aaaa"
+
+    await adapter.generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="session-1",
+        request_id="request-2:0",
+    )
+    assert "lora_path" not in payloads[-1]
+
+
+async def test_first_bind_is_shared_and_keeps_the_version() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    bindings = await asyncio.gather(
+        shard._ensure_session_policy_binding(session),
+        shard._ensure_session_policy_binding(session),
+    )
+    assert registry.bind_calls == ["session-1"]
+    assert bindings[0].lora_name == bindings[1].lora_name
+    assert session.bound_lora_name == bindings[0].lora_name
+    assert session.binding_task is None
+
+    # A later publication must not move an already-bound Session.
+    second = core.allocate(_DIGEST_B)
+    core.mark_published(second.version_id, second.attempt_id)
+    again = await shard._ensure_session_policy_binding(session)
+    assert again.lora_name == bindings[0].lora_name
+
+
+async def test_cancelling_one_waiter_does_not_cancel_the_shared_bind() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.05
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    first = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    second = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    binding = await second
+    assert registry.bind_calls == ["session-1"]
+    assert session.bound_lora_name == binding.lora_name
+
+
+async def test_failed_bind_is_retried_by_the_next_turn() -> None:
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+
+    core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch="epoch0")
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    with pytest.raises(AgenticChatRequestError) as error:
+        await shard._ensure_session_policy_binding(session)
+    assert error.value.code == "no_published_version"
+    assert session.binding_task is None
+
+    publication = core.allocate(_DIGEST_A)
+    core.mark_published(publication.version_id, publication.attempt_id)
+    binding = await shard._ensure_session_policy_binding(session)
+    assert binding.lora_name == publication.lora_name
+    assert registry.bind_calls == ["session-1", "session-1"]
+
+
+async def test_bind_completing_after_finalize_releases_the_ref() -> None:
+    from relax.agentic.session.service import SessionPhase
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.02
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    session.phase = SessionPhase.FINALIZING
+
+    with pytest.raises(AgenticChatRequestError) as error:
+        await shard._ensure_session_policy_binding(session)
+    assert error.value.code == "session_discarded"
+    assert registry.releases == ["session-1"]
+    assert session.bound_lora_name is None
+    assert core.status().session_bindings == {}
+
+
+async def test_finished_session_releases_its_version_ref_once() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._lora_registry = registry
+    shard._versioned_lora = True
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(return_value=True),
+    )
+    shard._lifecycle_close_count = 0
+    shard._lifecycle_close_failure_count = 0
+    shard._notify_state_change = lambda group=None: None
+
+    session = _binding_session()
+    session.group.sessions.append(session)
+    shard._session_records = {session.session_id: session}
+    await shard._ensure_session_policy_binding(session)
+
+    assert await shard_cls._finish_session(shard, session, None) is None
+    assert await shard_cls._finish_session(shard, session, None) is None
+    assert registry.releases == ["session-1"]
+    assert core.status().session_bindings == {}

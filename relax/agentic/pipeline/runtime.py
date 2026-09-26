@@ -581,6 +581,7 @@ class SGLangBackendAdapter:
         sampling_params: dict[str, Any],
         session_id: str | None,
         request_id: str,
+        lora_path: str | None = None,
         image_data: list[str] | None = None,
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
@@ -592,6 +593,10 @@ class SGLangBackendAdapter:
             "rid": request_id,
             "return_logprob": return_logprob,
         }
+        if lora_path:
+            # The exact immutable version this Session is bound to. SGLang resolves
+            # it to its own engine-local lora_id (and thus its own KV namespace).
+            payload["lora_path"] = lora_path
         if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
