@@ -103,6 +103,21 @@ def _canonical_tool_arguments(arguments: Any, *, field: str) -> str:
     return canonical
 
 
+def _canonical_image_block(block: dict[str, Any], *, field: str) -> dict[str, Any]:
+    # One canonical spelling for every protocol's image input; keys like OpenAI's
+    # ``detail`` ride on the request, not on the session state identity.
+    image_url = block.get("image_url")
+    if isinstance(image_url, str):
+        url, url_field = image_url, f"{field}.image_url"
+    elif isinstance(image_url, dict):
+        url, url_field = image_url.get("url"), f"{field}.image_url.url"
+    else:
+        raise TypeError(f"{field}.image_url must be a string or a dict, got {type(image_url)}")
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"{url_field} must be a non-empty string")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> list[dict[str, Any]]:
     tool_calls = message.get("tool_calls")
     if tool_calls is None:
@@ -116,7 +131,7 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}] must be a dict, got {type(tool_call)}"
             )
         call_id = tool_call.get("id")
-        if call_id is not None and (not isinstance(call_id, str) or not call_id):
+        if not isinstance(call_id, str) or not call_id:
             raise ValueError(f"messages[{message_index}].tool_calls[{call_index}].id must be a non-empty string")
         function = tool_call.get("function")
         if not isinstance(function, dict):
@@ -181,11 +196,19 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
         elif isinstance(content, list):
             if not content:
                 raise ValueError(f"messages[{index}].content must not be empty")
+            normalized_content = []
             for item_index, item in enumerate(content):
                 if not isinstance(item, dict):
                     raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
+                if item.get("type") == "image_url":
+                    normalized_content.append(
+                        _canonical_image_block(item, field=f"messages[{index}].content[{item_index}]")
+                    )
+                    continue
                 if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
                     raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
+                normalized_content.append(item)
+            content = normalized_content
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
         if role == "system":
