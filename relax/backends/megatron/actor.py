@@ -327,6 +327,27 @@ class _SFTPrepackedDeviceIterator:
         self._next_ready_event = None
 
 
+_STRAGGLER_PUBLISH_ENABLED: "bool | None" = None
+
+
+def _straggler_publish_enabled() -> bool:
+    """Whether the straggler workload publisher is active, read once.
+
+    Cached because the answer cannot change within a training process while the
+    point of the cache is that a DISABLED profiler costs a boolean check on the
+    training path instead of a partition computation.
+    """
+    global _STRAGGLER_PUBLISH_ENABLED
+    if _STRAGGLER_PUBLISH_ENABLED is None:
+        try:
+            from relax.utils.straggler import is_straggler_profiler_enabled
+
+            _STRAGGLER_PUBLISH_ENABLED = bool(is_straggler_profiler_enabled())
+        except Exception:
+            _STRAGGLER_PUBLISH_ENABLED = False
+    return _STRAGGLER_PUBLISH_ENABLED
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @property
     def _per_step_rollout(self) -> bool:
@@ -1207,22 +1228,36 @@ class MegatronTrainRayActor(TrainRayActor):
         # described the rank-local k partition, but training executes the
         # DP-wide max_k partition and REPACKS when local_k < max_k, so that
         # metadata could describe a partition that was thrown away. The partition
-        # is re-derived here with the same pure function and the same inputs, and
-        # is published only when it is self-consistent with the executed K and
-        # the local sample count. Pure Python; no tensor conversion, no
-        # collective, no schedule change; failures are swallowed.
-        try:
-            from relax.utils.straggler.context import publish_step_workload
-
-            samples = window.rollout_data["total_lengths"]
-            final_indices = get_seqlen_balanced_partitions(samples, max_k, equal_size=False)
-            if len(final_indices) == max_k and sum(len(group) for group in final_indices) == len(samples):
-                publish_step_workload(
-                    rollout_id,
-                    [(sum(samples[index] for index in group), len(group), 1) for group in final_indices],
+        # is re-derived here with the same pure function and the same inputs.
+        #
+        # The whole block is gated on a CACHED enablement read. Without the gate
+        # this partition work would run on the training path of every step even
+        # when the profiler is off, so an OFF arm would pay it too, an OFF/ON
+        # paired delta could not measure it, and the feature's "zero cost when
+        # disabled" property would be false. Disabled => this costs one cached
+        # boolean.
+        if _straggler_publish_enabled():
+            try:
+                from relax.utils.straggler.context import (
+                    count_workload_publish_error,
+                    count_workload_publish_skipped,
+                    publish_step_workload,
                 )
-        except Exception:
-            pass
+
+                samples = window.rollout_data["total_lengths"]
+                final_indices = get_seqlen_balanced_partitions(samples, max_k, equal_size=False)
+                if len(final_indices) == max_k and sum(len(group) for group in final_indices) == len(samples):
+                    publish_step_workload(
+                        rollout_id,
+                        [(sum(samples[index] for index in group), len(group), 1) for group in final_indices],
+                    )
+                else:
+                    # The guard rejected the partition: the step runs with no
+                    # workload published. Count it, because the detector would
+                    # otherwise treat a missing workload as comparable.
+                    count_workload_publish_skipped()
+            except Exception:
+                count_workload_publish_error()
 
         next_rollout_id = rollout_id + 1
         should_pause_lookahead = _should_pause_sft_lookahead(self.args, rollout_id)

@@ -61,6 +61,11 @@ _FAILURES = 0
 _STEP_WORKLOADS: "OrderedDict[int, Tuple[Tuple[int, int, int], ...]]" = OrderedDict()
 MAX_ROLLOUT_WORKLOADS = 8
 _WORKLOAD_EVICTIONS = 0
+#: A publish the self-consistency guard rejected, and one that raised. Both mean
+#: the envelope carries no workload for that step while the health counters
+#: otherwise look fine, so they are counted instead of silently swallowed.
+_WORKLOAD_PUBLISH_SKIPPED = 0
+_WORKLOAD_PUBLISH_ERRORS = 0
 
 
 def _count_failure() -> None:
@@ -68,6 +73,20 @@ def _count_failure() -> None:
     global _FAILURES
     with _CONTEXT_LOCK:
         _FAILURES += 1
+
+
+def count_workload_publish_skipped() -> None:
+    """Count one publish withheld by the caller's self-consistency guard."""
+    global _WORKLOAD_PUBLISH_SKIPPED
+    with _CONTEXT_LOCK:
+        _WORKLOAD_PUBLISH_SKIPPED += 1
+
+
+def count_workload_publish_error() -> None:
+    """Count one publish attempt that raised on the training path."""
+    global _WORKLOAD_PUBLISH_ERRORS
+    with _CONTEXT_LOCK:
+        _WORKLOAD_PUBLISH_ERRORS += 1
 
 
 def publish_step_workload(rollout_id: int, steps: Sequence[Sequence[int]]) -> None:
@@ -240,22 +259,29 @@ def training_context_stats() -> Dict[str, int]:
             "stored": 0 if _CURRENT is None else 1,
             "workload_rollouts": len(_STEP_WORKLOADS),
             "workload_evictions": _WORKLOAD_EVICTIONS,
+            "workload_publish_skipped": _WORKLOAD_PUBLISH_SKIPPED,
+            "workload_publish_errors": _WORKLOAD_PUBLISH_ERRORS,
         }
 
 
 def reset_training_context_for_tests() -> None:
     """Drop the stored context and zero the counters."""
     global _CURRENT, _UPDATES, _FAILURES, _WORKLOAD_EVICTIONS
+    global _WORKLOAD_PUBLISH_SKIPPED, _WORKLOAD_PUBLISH_ERRORS
     with _CONTEXT_LOCK:
         _CURRENT = None
         _UPDATES = 0
         _FAILURES = 0
         _STEP_WORKLOADS.clear()
         _WORKLOAD_EVICTIONS = 0
+        _WORKLOAD_PUBLISH_SKIPPED = 0
+        _WORKLOAD_PUBLISH_ERRORS = 0
 
 
 __all__ = [
     "MAX_ROLLOUT_WORKLOADS",
+    "count_workload_publish_error",
+    "count_workload_publish_skipped",
     "TrainingContext",
     "get_training_context",
     "publish_step_workload",
