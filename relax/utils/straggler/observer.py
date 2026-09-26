@@ -693,8 +693,20 @@ class StragglerObserver:
                 self._release(token)
                 continue
             if self._process(token):
+                # Retry at the *head*, never the tail. ``_pending`` is filled in
+                # completion order and ``seq`` is stamped there, so the queue is
+                # in sequence order; re-queueing a not-yet-readable interval at
+                # the tail would ship it after later, higher-sequence intervals
+                # and the collector's deduplicator would discard it as ``late``.
+                # On a real 4-GPU run that cost 18 of 48 ``forward-backward``
+                # intervals -- the longest one, so the one most likely to need a
+                # retry -- while the short intervals lost none. Ordering here is
+                # safe to insist on because ``_process`` already bounds the wait:
+                # past ``_readout_timeout_s`` it ships the interval as
+                # ``readout_timeout`` and returns ``False``, so the head cannot
+                # block the queue indefinitely.
                 with self._cv:
-                    self._pending.append(token)
+                    self._pending.appendleft(token)
                     self._cv.notify_all()
                 if self._poll_interval_s > 0:
                     time.sleep(self._poll_interval_s)
