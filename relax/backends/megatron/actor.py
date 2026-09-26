@@ -1202,6 +1202,28 @@ class MegatronTrainRayActor(TrainRayActor):
         )
         local_k = max_k
 
+        # Task 11 straggler profiler: publish this rank's LOCAL per-step work from
+        # the FINAL partition. Publishing earlier (inside the prefetch worker)
+        # described the rank-local k partition, but training executes the
+        # DP-wide max_k partition and REPACKS when local_k < max_k, so that
+        # metadata could describe a partition that was thrown away. The partition
+        # is re-derived here with the same pure function and the same inputs, and
+        # is published only when it is self-consistent with the executed K and
+        # the local sample count. Pure Python; no tensor conversion, no
+        # collective, no schedule change; failures are swallowed.
+        try:
+            from relax.utils.straggler.context import publish_step_workload
+
+            samples = window.rollout_data["total_lengths"]
+            final_indices = get_seqlen_balanced_partitions(samples, max_k, equal_size=False)
+            if len(final_indices) == max_k and sum(len(group) for group in final_indices) == len(samples):
+                publish_step_workload(
+                    rollout_id,
+                    [(sum(samples[index] for index in group), len(group), 1) for group in final_indices],
+                )
+        except Exception:
+            pass
+
         next_rollout_id = rollout_id + 1
         should_pause_lookahead = _should_pause_sft_lookahead(self.args, rollout_id)
         if next_rollout_id < self.args.num_rollout and self.args.max_staleness >= 1 and not should_pause_lookahead:
@@ -1336,21 +1358,6 @@ class MegatronTrainRayActor(TrainRayActor):
         max_tokens = self.args.max_tokens_per_gpu * cp_size
         k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
         micro_batch_indices = get_seqlen_balanced_partitions(samples, k_local, equal_size=False)
-        # Task 11 straggler profiler: publish this rank's LOCAL per-step work so
-        # the detector can distinguish "this rank does more work" from "this
-        # rank is slow". Pure Python over the lists already in hand: no
-        # tensor-to-Python conversion, no device synchronisation, no collective,
-        # no schedule change. Measurement only; failures are swallowed inside
-        # the profiler.
-        try:
-            from relax.utils.straggler.context import publish_step_workload
-
-            publish_step_workload(
-                rollout_id,
-                [(sum(samples[index] for index in indices), len(indices), 1) for indices in micro_batch_indices],
-            )
-        except Exception:
-            pass
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices

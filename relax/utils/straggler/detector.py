@@ -169,27 +169,43 @@ def _ratio(value: Optional[float], reference: Optional[float]) -> Optional[float
     return value / reference
 
 
-def _workload_total(workload: Any) -> Optional[float]:
-    """Total a workload mapping down to one comparable magnitude.
+def _field_delta(
+    per_rank: Dict[int, List[Tuple[float, Optional[float], Optional[Dict[str, Any]]]]],
+    rank: int,
+    ranks: List[int],
+    field: str,
+) -> Optional[float]:
+    """Peer-relative delta for an evidence-only workload field."""
+    values = [value for _, _, workload in per_rank[rank] if (value := _workload_metric(workload, field)) is not None]
+    peers = [
+        value
+        for other in ranks
+        if other != rank
+        for _, _, workload in per_rank[other]
+        if (value := _workload_metric(workload, field)) is not None
+    ]
+    if not values or not peers:
+        return None
+    median = float(statistics.median(peers))
+    return (values[-1] - median) / median if median > 0.0 else None
 
-    Only finite numeric entries count; a mapping without any finite numeric
-    entry is treated as "no workload reported", and a ``NaN``/``inf`` counter
-    cannot poison the peer median the way it could poison a timing reference.
+
+def _workload_metric(workload: Any, field: str) -> Optional[float]:
+    """Read ONE workload field as a finite number, or ``None``.
+
+    Scoring a workload by summing tokens + sequences + microbatches mixed
+    incompatible units: a 2 % token difference could be cancelled by a 100 %
+    sequence difference and the window would look comparable. Fields are kept
+    separate now, and ``tokens`` is the primary measure because tokens dominate
+    compute; sequences and microbatches are reported as evidence only.
     """
     if not isinstance(workload, dict):
         return None
-    total = 0.0
-    seen = False
-    for value in workload.values():
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)):
-            number = float(value)
-            if not math.isfinite(number):
-                continue
-            total += number
-            seen = True
-    return total if seen else None
+    value = workload.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _expected_cohort_size(envelope: Any) -> Optional[int]:
@@ -640,8 +656,12 @@ class StragglerDetector:
         for rank in ranks:
             devices = [device for _, device, _ in per_rank[rank] if device is not None]
             device_medians[rank] = _median(devices) if devices else None
-            totals = [total for _, _, workload in per_rank[rank] if (total := _workload_total(workload)) is not None]
-            workload_totals[rank] = totals[-1] if totals else None
+            tokens = [
+                value
+                for _, _, workload in per_rank[rank]
+                if (value := _workload_metric(workload, "tokens")) is not None
+            ]
+            workload_totals[rank] = tokens[-1] if tokens else None
 
         cohort_size = len(ranks)
         if cohort_size < 2:
@@ -738,6 +758,12 @@ class StragglerDetector:
                 # until this number is read.
                 "workload_delta": workload_delta,
                 "workload_rank": rank_workload,
+                "workload_rank_tokens": rank_workload,
+                "workload_peer_tokens": peer_workload_median,
+                "tokens_delta": workload_delta,
+                "sequences_delta": _field_delta(per_rank, rank, ranks, "sequences"),
+                "microbatches_delta": _field_delta(per_rank, rank, ranks, "microbatches"),
+                "workload_comparable": not workload_incomparable,
                 "workload_peer_median": peer_workload_median,
                 "workload_delta_beyond_tolerance": (
                     None if workload_delta is None else workload_delta > self._config.work_tolerance

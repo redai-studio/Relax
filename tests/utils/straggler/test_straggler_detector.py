@@ -580,9 +580,14 @@ def test_workload_delta_is_reported_when_both_sides_report_workloads() -> None:
     verdicts.extend(detector.flush())
 
     verdict = next(item for item in verdicts if item.reason == "workload_incomparable")
-    assert verdict.facts["workload_delta"] == pytest.approx(1.0)
-    assert verdict.facts["workload_rank"] == pytest.approx(220.0)
-    assert verdict.facts["workload_peer_median"] == pytest.approx(110.0)
+    # Comparability is driven by TOKENS alone (P0-2): summing tokens + sequences
+    # + microbatches mixed units and could cancel a large token gap. Peers report
+    # 100 tokens each, so the rank-2 token delta is (220-100)/100.
+    assert verdict.facts["tokens_delta"] == pytest.approx(1.2)
+    assert verdict.facts["workload_rank_tokens"] == pytest.approx(220.0)
+    assert verdict.facts["workload_peer_tokens"] == pytest.approx(100.0)
+    assert verdict.facts["workload_delta"] == pytest.approx(1.2)
+    assert verdict.facts["workload_comparable"] is False
     assert verdict.facts["workload_delta_beyond_tolerance"] is True
     # RT-08's point survives: the workload difference is visible on the wire.
     # With the comparability gate, an over-tolerance work delta makes the window
