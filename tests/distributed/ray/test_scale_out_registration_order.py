@@ -17,7 +17,7 @@ try:
 except ImportError:
     HAS_DEPS = False
 
-from conftest import AwaitableValue, create_test_manager, make_mock_engine, make_rollout_server
+from conftest import AwaitableValue, create_test_manager, make_mock_args, make_mock_engine, make_rollout_server
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -82,6 +82,58 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     assert result.success is False
     assert result.reason is not None and result.reason.category is ScaleOutFailureCategory.WEIGHT_SYNC_FAILED
     manager._rollback_engines.assert_awaited_once_with(group)
+
+
+@pytest.mark.asyncio
+async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
+    args = make_mock_args(num_gpus_per_node=8, rollout_num_gpus_per_engine=16)
+    manager = create_test_manager(args=args)
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    engines = [make_mock_engine(), make_mock_engine()]
+    group = SimpleNamespace(
+        engines=engines,
+        start_engines=MagicMock(return_value=([AwaitableValue(None)] * 2, {})),
+    )
+    captured = {}
+
+    def capture_group(**kwargs):
+        captured.update(kwargs)
+        return group
+
+    manager._finalize_engine_group_registration = AsyncMock(return_value=EngineFinalizeResult(True, group=group))
+
+    info_actor = MagicMock()
+    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=capture_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=16,
+            gpus_per_engine=16,
+            engine_offset=2,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is True
+    assert captured["all_engines"] == [None, None]
+    manager._finalize_engine_group_registration.assert_awaited_once_with(
+        request=request,
+        srv=server,
+        engines=engines,
+        engine_group=group,
+        replica_idx=0,
+        log_prefix="[ScaleOut]",
+    )
 
 
 @pytest.mark.asyncio

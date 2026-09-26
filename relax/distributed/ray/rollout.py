@@ -2012,10 +2012,11 @@ class RolloutManager(ReloadableMixin):
             )
 
             # Step 2: Create EngineGroup (skip router registration during init)
+            actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
             new_group = EngineGroup(
                 args=self.args,
                 pg=pg_tuple,
-                all_engines=[None],  # Single engine per replica
+                all_engines=[None] * actors_per_replica,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
                 worker_type="regular",
