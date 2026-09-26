@@ -1,18 +1,12 @@
 # ML/PyTorch Checklist (Relax Project)
 
+Contents: [Tensors](#tensor-operations), [gradients](#gradient-issues), [memory](#memory-management), [distributed training](#distributed-training), [numerics](#numerical-stability), [Relax patterns](#relax-specific-patterns), [questions](#review-questions).
+
 ## Tensor Operations
 
 ### Shape / Dtype / Device Mismatches
 
-```python
-# Bad: implicit assumptions
-def compute_loss(logits, labels):
-    return F.cross_entropy(logits, labels)
-
-# Good: validate shapes
-assert logits.dim() == 2 and labels.dim() == 1
-assert logits.size(0) == labels.size(0)
-```
+Trace shape, dtype, and device contracts from producers through transforms to consumers. Report a mismatch reachable in a supported mode; established internal contracts do not need repeated assertions at every function. Validate genuinely external data at its boundary.
 
 - `squeeze()` without specifying dim — removes ALL size-1 dims
 - `view()` vs `reshape()` — view requires contiguous memory
@@ -24,30 +18,28 @@ ______________________________________________________________________
 
 ### Key Anti-patterns
 
-- **Missing `.detach()`** when storing tensors for later use (buffers, logging, target networks)
-- **In-place ops** on `requires_grad` tensors (`x.add_(1)`)
+- **Retained graphs** in metrics or buffers that do not need gradients; verify whether later differentiation is intended before recommending `.detach()`
+- **In-place ops** that violate autograd or shared ownership; owned buffers can be mutated when their contracts permit it
 - **Using `.data`** (deprecated, breaks autograd)
-- **Missing `@torch.no_grad()`** during inference
-- **`loss.item()` vs `loss`** — accumulating `loss` (not `.item()`) holds the computation graph
+- **Unnecessary graph construction** in inference-only work; check whether an enclosing context already disables gradients
+- **Metric accumulation** that retains computation graphs; avoid fixing it by introducing GPU-CPU synchronization in a hot path
 
 ______________________________________________________________________
 
 ## Memory Management
 
 ```python
-# Bad: holds computation graphs
-losses = []
-for batch in dataloader:
-    loss = compute_loss(model(batch))
-    losses.append(loss)  # graph retained!
+# Retains the computation graph for each collected loss
+losses.append(loss)
 
-# Good: detach to scalar
-losses.append(loss.item())
+# Instead, drop the graph when metrics do not need gradients
+losses.append(loss.detach())
 ```
 
-- Large tensors not explicitly `del`-ed after use
-- GPU memory fragmentation — `torch.cuda.empty_cache()` when needed
-- Consider gradient checkpointing for memory-intensive models
+Detached tensors still occupy memory and share storage: bound or aggregate metric retention, consume it at an explicit logging boundary, and account for later mutation. Do not add `.item()`, `.tolist()`, or tensor printing to training hot paths.
+
+- References that retain large tensors beyond their useful lifetime; lack of an explicit `del` alone is not a leak
+- Investigate actual live allocations and memory pressure before proposing cache clearing or gradient checkpointing
 
 ______________________________________________________________________
 
@@ -55,7 +47,7 @@ ______________________________________________________________________
 
 ### Collective Operation Ordering
 
-All ranks **must** call collectives (all_reduce, all_gather, broadcast) in the same order.
+All required members of the selected process group **must** participate in compatible collective calls in the same order.
 
 ```python
 # Bad: conditional collective → hang
@@ -76,18 +68,16 @@ dist.all_reduce(tensor)
 dist.all_reduce(tensor, group=self.data_parallel_group)
 ```
 
-- Verify tensor shapes are identical across ranks before collectives
-- Check `param.grad is not None` before gradient all-reduce
+- Verify shapes, dtypes, and devices meet the particular collective's contract across participating ranks
+- Missing gradients must not make only some ranks skip a collective; verify group-wide participation rather than adding rank-local guards
 
 ______________________________________________________________________
 
 ## Numerical Stability
 
-- Division by zero → add `eps` or `clamp(min=eps)`
-- `torch.log(prob)` with zero prob → use `log_softmax` or `clamp(min=1e-8)`
-- Gradient clipping: `clip_grad_norm_` to prevent explosion
-- Check for NaN/Inf gradients in training loop
-- Mixed precision: use `GradScaler` properly
+- Establish whether zero denominators or empty masks are supported cases, invalid inputs, or broken invariants. Add a defined numerical treatment only when it preserves the algorithm; arbitrary epsilon/clamping can hide corrupt data or change the estimator
+- Check stability of probability/log-probability calculations and NaN/Inf propagation; prefer a mathematically equivalent stable formulation where applicable
+- Verify clipping and mixed-precision loss scaling against the configured training backend and algorithm; do not add clipping or a scaler simply because precision is reduced
 
 ______________________________________________________________________
 
@@ -95,7 +85,7 @@ ______________________________________________________________________
 
 ### RolloutBatch
 
-- Check for required keys before access
+- Trace required keys to the producer's contract; report supported paths that fail to populate them
 - Handle optional keys (`batch.get("values")` for non-PPO)
 - Be deliberate about in-place mutation of batch dicts
 
@@ -116,6 +106,6 @@ ______________________________________________________________________
 |------|----------|
 | Shapes | "What are the expected shapes here?" |
 | Gradients | "Should this be detached?" |
-| Distributed | "Is this collective called by all ranks?" |
+| Distributed | "Do the required members of this process group participate compatibly?" |
 | Memory | "Could this accumulate tensors?" |
 | Numerical | "Could this overflow / divide by zero?" |

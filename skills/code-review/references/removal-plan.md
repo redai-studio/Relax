@@ -1,10 +1,10 @@
 # Removal & Iteration Plan (Relax Project)
 
-## Priority Levels
+## Scope and Evidence
 
-- **P0**: Immediate (security risk, blocking other work)
-- **P1**: Current sprint
-- **P2**: Backlog / next iteration
+- Limit removal proposals to code made obsolete by the reviewed change or needed to solve its concrete problem.
+- Use the severity definitions in `SKILL.md`; scheduling a cleanup does not make it P0/P1.
+- A disabled feature, absent direct caller, or passing test suite does not establish that a public API has no consumers. Respect repository approval requirements for deleting or renaming public APIs.
 
 ______________________________________________________________________
 
@@ -18,7 +18,7 @@ ______________________________________________________________________
 | **Type** | Unused function / Dead class / Deprecated module / Feature flag |
 | **Rationale** | Why remove |
 | **Impact** | None / Low — no active consumers |
-| **Steps** | 1. Remove code 2. Remove tests 3. Remove config |
+| **Steps** | Minimal removal and any required migration; retain tests for behavior that still exists |
 
 ### Defer Removal
 
