@@ -17,7 +17,7 @@ from relax.utils.model_source import ModelSource
 try:
     from relax.distributed.ray.rollout import (
         EngineGroupLifecycle,
-        RolloutManager,
+        RolloutEnginePool,
         ScaleOutRequest,
         ScaleOutStatus,
     )
@@ -76,22 +76,22 @@ def _capture_engine_runtime_env(monkeypatch, args, sglang_overrides):
 
 class TestNormalizeEngineAddr:
     def test_strip_http(self):
-        assert RolloutManager._normalize_engine_addr("http://10.0.0.1:30000") == "10.0.0.1:30000"
+        assert RolloutEnginePool._normalize_engine_addr("http://10.0.0.1:30000") == "10.0.0.1:30000"
 
     def test_strip_https(self):
-        assert RolloutManager._normalize_engine_addr("https://10.0.0.1:30000") == "10.0.0.1:30000"
+        assert RolloutEnginePool._normalize_engine_addr("https://10.0.0.1:30000") == "10.0.0.1:30000"
 
     def test_bare_addr_unchanged(self):
-        assert RolloutManager._normalize_engine_addr("10.0.0.1:30000") == "10.0.0.1:30000"
+        assert RolloutEnginePool._normalize_engine_addr("10.0.0.1:30000") == "10.0.0.1:30000"
 
     def test_ipv6_with_scheme(self):
-        assert RolloutManager._normalize_engine_addr("http://[::1]:30000") == "[::1]:30000"
+        assert RolloutEnginePool._normalize_engine_addr("http://[::1]:30000") == "[::1]:30000"
 
     def test_empty_string(self):
-        assert RolloutManager._normalize_engine_addr("") == ""
+        assert RolloutEnginePool._normalize_engine_addr("") == ""
 
     def test_hostname(self):
-        assert RolloutManager._normalize_engine_addr("http://myhost:8080") == "myhost:8080"
+        assert RolloutEnginePool._normalize_engine_addr("http://myhost:8080") == "myhost:8080"
 
 
 # ======================== _parse_host_port =================================
@@ -99,43 +99,43 @@ class TestNormalizeEngineAddr:
 
 class TestParseHostPort:
     def test_ipv4_basic(self):
-        host, port = RolloutManager._parse_host_port("10.0.0.1:8000")
+        host, port = RolloutEnginePool._parse_host_port("10.0.0.1:8000")
         assert host == "10.0.0.1"
         assert port == 8000
 
     def test_ipv6_bracket(self):
-        host, port = RolloutManager._parse_host_port("[::1]:8000")
+        host, port = RolloutEnginePool._parse_host_port("[::1]:8000")
         assert host == "::1"
         assert port == 8000
 
     def test_with_http_scheme(self):
-        host, port = RolloutManager._parse_host_port("http://10.0.0.1:8000")
+        host, port = RolloutEnginePool._parse_host_port("http://10.0.0.1:8000")
         assert host == "10.0.0.1"
         assert port == 8000
 
     def test_with_https_scheme(self):
-        host, port = RolloutManager._parse_host_port("https://host:9000")
+        host, port = RolloutEnginePool._parse_host_port("https://host:9000")
         assert host == "host"
         assert port == 9000
 
     def test_invalid_format_too_many_colons(self):
         with pytest.raises(ValueError, match="Invalid address format"):
-            RolloutManager._parse_host_port("a:b:c")
+            RolloutEnginePool._parse_host_port("a:b:c")
 
     def test_invalid_port_not_integer(self):
         with pytest.raises(ValueError, match="not a valid integer"):
-            RolloutManager._parse_host_port("host:abc")
+            RolloutEnginePool._parse_host_port("host:abc")
 
     def test_invalid_ipv6_no_bracket_close(self):
         with pytest.raises(ValueError, match="Invalid IPv6"):
-            RolloutManager._parse_host_port("[::1:8000")
+            RolloutEnginePool._parse_host_port("[::1:8000")
 
     def test_ipv6_bracket_no_port(self):
         with pytest.raises(ValueError, match="Invalid IPv6"):
-            RolloutManager._parse_host_port("[::1]")
+            RolloutEnginePool._parse_host_port("[::1]")
 
     def test_localhost(self):
-        host, port = RolloutManager._parse_host_port("localhost:5000")
+        host, port = RolloutEnginePool._parse_host_port("localhost:5000")
         assert host == "localhost"
         assert port == 5000
 

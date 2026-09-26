@@ -32,7 +32,7 @@ teacher 请求还不受 student 那个 inference 信号量限流（信号量只�
 
 | 方法 | 怎么做 | 注意 |
 |---|---|---|
-| **GPU 占用直采** | 训练跑起来后连续 `nvidia-smi` 采样，比 rollout bundle（GPU `0..rollout_num_gpus-1`）与 teacher bundle（紧随其后）的利用率 | 最直接。bundle 布局由 `teacher_manager.py` 的 `_resolve_teacher_gpu_index` 决定 |
+| **GPU 占用直采** | 训练跑起来后连续 `nvidia-smi` 采样，比 rollout bundle（GPU `0..rollout_num_gpus-1`）与 teacher bundle（紧随其后）的利用率 | 最直接。bundle 布局由 `opd_utils.py` 的 `teacher_region_offset`（经 `relax/engine/inference/config_adapters.py` 的 `teacher_role_model`）决定；shared 布局下 teacher 与 rollout 同 bundle，要按时间段而不是按卡区分 |
 | **engine 日志时间窗** | 以 `Starting rollout step N` 为统一起点，取各 engine `Prefill batch` / `Decode batch` 行时间戳的**首末**作为活动窗口 | ⚠ Ray 会把大量日志行折叠成 `[repeated Nx]`，**按行求和的任何指标都不可信**；只用首末时间戳，或设 `RAY_DEDUP_LOGS=0` |
 | **`perf/wait_time_ratio`** | = `perf/train_wait_time / perf/step_time`（`relax/utils/training/train_metric_utils.py`） | colocate 下 actor 在 rollout 期间睡着，所以这个比值 ≈ rollout 阶段占整步的比例。是**整体**信号，区分不出是 student 还是 teacher 拖的 |
 
@@ -62,6 +62,9 @@ MOPD 还有 `rollout/by_source/<source>/{logp_gap,rkl_approx,accuracy}`
   rollout_num_gpus + teacher_gpus == actor_total_gpus
   ```
 
+  这是 split 布局（两侧并发）的约束，本节的分卡公式只针对它；
+  校验同时接受 shared 布局（`rollout == actor`、`teacher <= actor`），见 R-B03。
+
   再叠加两侧的整除要求：`rollout_gpus % rollout-num-gpus-per-engine == 0`，
   `teacher_gpus / num_teachers % teacher-num-gpus-per-engine == 0`。
   **可达点通常很稀疏** —— 上例在 8 卡上落不到 2.6:5.4，只能在 2:6 / 3:5 / 4:4 里挑。
@@ -84,45 +87,36 @@ MOPD 还有 `rollout/by_source/<source>/{logp_gap,rkl_approx,accuracy}`
 因为瓶颈在 engine 内部，Relax 侧早点做完只是让请求更快堆在 engine 门口。
 先问「这在关键路径上吗」，再问「这浪费了多少」。
 
-## 4. R-B03 — 「student 跑完就地 offload、原地起 teacher」
+## 4. R-B03 — 「student 跑完就地 offload、原地起 teacher」（shared 布局）
 
-**判断这个之前先自己复核一遍**，下面是写这份文档时的状态：**没有实现**。
-不是部分实现，是不存在。原语齐了，但没有任何东西把它们接起来。
+**已实现**，入口是分卡方式本身，没有单独的开关：`--rollout-num-gpus` 等于 actor GPU 数、
+且 `resource["teacher"][1] <= actor GPU 数` 时，teacher 与 rollout 共用同一批 bundle
+（`opd_utils.py` 的 `teacher_shares_rollout_bundles`），`deferred_opd_enabled` 为真，
+teacher 打分被推迟到 student 生成结束之后。R-B01 的 split 布局（`rollout + teacher == actor`）
+不受影响，teacher 仍在 rollout 期间常驻、inline prefill。两种布局都由
+`check_teacher_colocate_layout` 校验，其余组合直接报错。
 
-现有的 offload 是 **train ↔ rollout 的 step 级** lock-step，teacher 和 student rollout
-在整个 rollout 阶段**同时驻留**在各自的 bundle 上：
+shared 布局下一个 rollout step 的顺序（用 grep 复核符号仍然存在）：
 
 | 时机 | 动作 | 位置 |
 |---|---|---|
-| 启动、actor init 前 | teacher `offload()` | `opd_utils.py` 的 `maybe_start_managed_opd_teacher` / `_start_managed_multi_teacher` |
-| `train()` 开头（rank 0） | teacher `offload()`，在 actor `wake_up()` **之前** | `relax/backends/megatron/actor.py`，经 `append_managed_opd_teacher_offload_handle` |
-| 紧接着 | gloo `barrier` 把所有 rank 挡在 rank-0 的 offload 之后，防 `cuMemCreate` OOM | 同上 |
-| `update_weights()` 里（rank 0） | teacher `onload()` 全量恢复，与 rollout 的 `onload_weights()` 同批 | 同上，经 `append_managed_opd_teacher_onload_handle` |
+| student 生成期间 | 每个 batch 只暂存、不发布 | `relax/engine/rollout/deferred_opd.py` 的 `DeferredOpdSession.transfer` |
+| 生成结束后 flush | 进入 teacher 阶段：`LifecycleCoordinator` 关准入、drain、释放 student 显存，再加载 teacher | `DeferredOpdSession._score_batch` → `relax/engine/rollout/scoring_phase.py` 的 `async_scoring_phase(PHASE_TEACHER)` |
+| teacher 打分后 | 需要 student 二次 prefill 的 selection 先把 student 唤醒 | `OpdManager.needs_student_prefill` → `async_reactivate_generation` |
+| `update_weights()`（rank 0） | **不**随 student 一起 `activate` teacher | `opd_utils.py` 的 `append_managed_opd_teacher_onload_handle` |
+| `train()` 开头（rank 0） | teacher `deactivate()` + gloo barrier，与 split 布局相同 | `relax/backends/megatron/actor.py`，经 `append_managed_opd_teacher_offload_handle` |
 
-缺的东西（用 grep 复核这四条是否仍然成立）：
+调优前要知道的代价：
 
-- **rollout 阶段内没有「学生全部跑完」这个相位边界**可挂钩子 ——
-  rollout 的屏障是一个 `asyncio.gather`，每个 task 自带尾部的 teacher prefill。
-- **rollout 路径里没有任何 `teacher_manager.offload/onload` 调用**
-  （grep `teacher_manager` 的 offload/onload 调用点，应当只在上表那几处）。
-- **teacher 没有分阶段 resume**：`TeacherManager.onload(tags)` 支持 tags，
-  但所有调用方都传空；没有 student 那样的 `onload_weights` / `onload_kv` 包装
-  （对照 `relax/distributed/ray/rollout.py`）。
-- **卡的分区是结构性写死的**：`_resolve_teacher_gpu_index` 把 teacher 放在
-  rollout 之后，两处校验硬要求 `rollout + teacher == actor`。
-  做成时分复用必须把它放宽成 `max(rollout, teacher) <= actor`。
-
-如果要提这个方案，必须一并说清四个拦路石：
-
-1. 上面那条分区校验要改（两处）。
-2. `SGLangEngine.release_memory_occupation` 会先 `flush_cache()` ——
-   rollout 中途 offload student 会**摧毁 student 的 radix cache**，
-   只对单轮 rollout 安全，多轮 / agentic 会付出重新 prefill 的代价。
-3. teacher 的 `mem_fraction_static` 现在是按「共存」调的。
-   时分复用之后 teacher 可以独占整张卡 —— **真正的收益在这里**，不在回收那点空闲。
-4. 那个 gloo barrier 的存在本身说明「teacher 驻留 + actor 唤醒」并发会 `cuMemCreate` OOM。
-   per-rollout 的切换需要同样的 barrier 纪律，但 rollout 跑在单个 Ray actor 的
-   asyncio loop 里，**目前没有可挂的集合通信**。
+1. **student 的 radix cache 会被清空**：释放 student 显存走 `release_memory_occupation`，
+   它先 `flush_cache()`。单轮 rollout 无所谓；多轮 / agentic 再唤醒 student 时要重新 prefill。
+2. **阶段是串行的**：step 时间 ≈ student 生成 + 阶段切换 + teacher 打分（+ 可选 student 二次 prefill），
+   两侧不再重叠。只有 teacher 能因此拿到整张卡（调大 `mem_fraction_static`、更多卡）
+   换来的提速超过切换开销时，shared 才比 split 快 —— **收益在 teacher 独占整卡，不在回收空闲**。
+3. teacher 的 `mem_fraction_static` 若沿用 split 布局「共存」时的取值，shared 下就白白浪费了显存，
+   要单独按独占重新调。
+4. 判断是否划算：分别跑 split 最优分卡点和 shared，各 5 步以上对比 `perf/rollout_time`；
+   shared 下 GPU 占用直采要按时间段看（前段是 student，后段是 teacher），不能按卡区分。
 
 ## 5. R-B04 — fully-async
 

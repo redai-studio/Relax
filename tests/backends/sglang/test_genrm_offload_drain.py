@@ -95,10 +95,13 @@ class _FakeClock:
 
 
 def _make_engine():
-    engine = m.GenRMEngine.__new__(m.GenRMEngine)
+    engine = m.SGLangEngine.__new__(m.SGLangEngine)
+    engine.role = m.Role.GENRM
     engine.node_rank = 0
     engine.server_host = "127.0.0.1"
     engine.server_port = 30000
+    engine.unregister_from_router = lambda **kwargs: True
+    engine.register_to_router = lambda: True
     return engine
 
 
@@ -135,6 +138,68 @@ def test_release_closes_admission_before_touching_engine(patched):
     assert "pause_generation" in fake_requests.calls
     assert fake_requests.calls.index("pause_generation") < fake_requests.calls.index("flush_cache")
     assert fake_requests.calls.index("pause_generation") < fake_requests.calls.index("release_memory_occupation")
+
+
+def test_teacher_release_closes_raw_generation_and_full_resume_reopens_it(patched):
+    fake_requests, _ = patched(flush_statuses=[200])
+    engine = _make_engine()
+    engine.role = m.Role.TEACHER
+    events = []
+    engine.pause_generation = lambda **kwargs: events.append(("pause", kwargs))
+    engine.unregister_from_router = lambda **kwargs: events.append(("unregister", kwargs)) or True
+    engine.register_to_router = lambda: events.append(("register", {})) or True
+
+    engine.release_memory_occupation()
+    assert [name for name, _ in events] == ["pause", "unregister", "pause"]
+    assert events[1] == ("unregister", {"wait_for_removal": True})
+    assert fake_requests.calls.index("flush_cache") < fake_requests.calls.index("release_memory_occupation")
+
+    engine.resume_memory_occupation(tags=["weights"])
+    assert "continue_generation" not in fake_requests.calls
+    assert all(name != "register" for name, _ in events)
+    engine.resume_memory_occupation(tags=None)
+    assert fake_requests.calls.index("resume_memory_occupation") < fake_requests.calls.index("continue_generation")
+    assert events[-1] == ("register", {})
+
+
+@pytest.mark.parametrize("role", [m.Role.TEACHER, m.Role.GENRM])
+def test_release_refuses_to_offload_while_router_worker_is_registered(patched, role):
+    fake_requests, _ = patched()
+    engine = _make_engine()
+    engine.role = role
+    engine.unregister_from_router = lambda **kwargs: False
+
+    with pytest.raises(RuntimeError, match="Router worker is still registered"):
+        engine.release_memory_occupation()
+
+    assert "release_memory_occupation" not in fake_requests.calls
+
+
+def test_full_resume_does_not_register_if_continue_generation_fails(patched):
+    import requests as _real_requests
+
+    fake_requests, _ = patched(post_raises={"continue_generation": _real_requests.exceptions.ConnectionError("down")})
+    engine = _make_engine()
+    calls = []
+    engine.register_to_router = lambda: calls.append("registered") or True
+
+    with pytest.raises(_real_requests.exceptions.ConnectionError, match="down"):
+        engine.resume_memory_occupation(tags=None)
+
+    assert calls == []
+    assert "continue_generation" in fake_requests.calls
+
+
+def test_full_resume_fails_if_router_registration_fails(patched):
+    fake_requests, _ = patched()
+    engine = _make_engine()
+    engine.register_to_router = lambda: False
+
+    with pytest.raises(RuntimeError, match="Cannot register resumed genrm"):
+        engine.resume_memory_occupation(tags=None)
+
+    assert "continue_generation" in fake_requests.calls
+    assert fake_requests.calls.index("continue_generation") < fake_requests.calls.index("pause_generation")
 
 
 def test_release_raises_timeout_and_skips_release_when_never_idle(patched):

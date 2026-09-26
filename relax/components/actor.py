@@ -104,10 +104,11 @@ class Actor(Base):
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
         self._peer_barrier: Optional[PeerStepBarrier] = None
 
-    def set_rollout_manager(self, rollout_manager: Any) -> None:
-        """Set the rollout manager and initialize weights."""
-        self.rollout_manager = rollout_manager
-        self.actor_model.set_rollout_manager(self.rollout_manager)
+    def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any) -> None:
+        """Wire the workload and inference owner, then initialize weights."""
+        self.rollout_worker = rollout_worker
+        self.inference_manager = inference_manager
+        self.actor_model.set_rollout_handles(self.rollout_worker, inference_manager)
 
         # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
         # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
@@ -287,7 +288,7 @@ class Actor(Base):
         """
         # Skip training during critic-only phase.
         # But we still must trigger actor.update_weights: it is the only path
-        # that calls rollout_manager.onload_weights / onload_kv on SGLang.
+        # that asks InferenceManager to onload SGLang weights / KV.
         # Without it, SGLang's resume_memory_occupation only remaps the weight
         # region — the contents are uninitialized, so the next rollout's
         # generate produces garbage tokens. The NCCL broadcast inside

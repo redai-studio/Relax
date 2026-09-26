@@ -941,3 +941,218 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
         }
     ]
     assert client.releases == ["lease-1"]
+
+
+def _deferred_opd_args(**overrides: Any) -> Namespace:
+    args = _transfer_args(
+        rollout_batch_size=2,
+        over_sampling_batch_size=2,
+        global_batch_size=4,
+        num_iters_per_train_update=1,
+        use_opd=True,
+        opd_type="sglang",
+        use_agentic_rollout=True,
+        hybrid=False,
+        teacher_hf_checkpoint="/ckpt",
+        opd_teacher_routes=None,
+        opd_token_selection="student_topk",
+        opd_teacher_key="data_source",
+        rollout_num_gpus=8,
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]},
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _scorable_group(group_index: int) -> GroupExport:
+    # Every export of one Session keeps that Session's training index, as a
+    # multi-context SessionForest export does.
+    exports = tuple(
+        SampleExport(
+            name=f"group-{group_index}/context-{context}",
+            sample=Sample(
+                index=group_index,
+                group_index=group_index,
+                tokens=[1, 2, 3, 4],
+                response_length=2,
+                loss_mask=[1, 1],
+                metadata={"data_source": "math"},
+            ),
+        )
+        for context in range(2)
+    )
+    return GroupExport(group_id=f"group-{group_index}", sessions=(SessionExport(exports=exports),))
+
+
+class _FakeOpdManager:
+    def __init__(self, calls: list[str], *, fail: bool = False) -> None:
+        self.calls = calls
+        self.fail = fail
+        self.needs_student_prefill = False
+        self.scoring_started = asyncio.Event()
+        self.release_scoring: asyncio.Event | None = None
+
+    def schema_opd_transfer_data(self) -> tuple[str, ...]:
+        return ("teacher_log_probs",)
+
+    async def prepare_teacher_inputs(self, samples: list[Sample]) -> None:
+        pass
+
+    async def score_teacher(self, samples: list[Sample]) -> list[bool]:
+        self.calls.append("score_teacher")
+        self.scoring_started.set()
+        if self.release_scoring is not None:
+            await self.release_scoring.wait()
+        if self.fail:
+            return [False] * len(samples)
+        for sample in samples:
+            sample.teacher_log_probs = [0.0] * sample.response_length
+        return [True] * len(samples)
+
+    def assemble_transfer(self, samples: list[Sample]) -> None:
+        pass
+
+    async def prefill(self, samples: Any, encode: Any = None) -> None:
+        raise AssertionError("deferred OPD must not prefill inline")
+
+
+def _deferred_pipeline(monkeypatch, *, fail: bool = False):
+    from relax.agentic import rollout as rollout_mod
+    from relax.engine.rollout import deferred_opd, scoring_phase
+
+    calls: list[str] = []
+    published: list[tuple[int, int, bool]] = []
+    args = _deferred_opd_args()
+
+    async def record_publish(*, args, batch_samples, rollout_id, data_system_client, is_last=False):
+        calls.append("publish")
+        published.append((rollout_id, sum(len(group) for group in batch_samples), is_last))
+
+    monkeypatch.setattr(rollout_mod, "_transfer_batch_to_data_system", record_publish)
+    monkeypatch.setattr(scoring_phase, "_transition", lambda action, phase_id: calls.append(f"{action}:{phase_id}"))
+
+    pipeline = object.__new__(AgenticResidentPipeline)
+    pipeline.args = args
+    pipeline._opd_manager = _FakeOpdManager(calls, fail=fail)
+    pipeline._defer_opd = True
+    pipeline._data_system_client = object()
+    pipeline._changed = asyncio.Event()
+    pipeline._finalized_groups = deque()
+    pipeline._active_group_tasks = []
+    pipeline.prepare_domain = MagicMock(shutdown=AsyncMock())
+    pipeline.transfer_domain = TransferDomain(args=args)
+    pipeline.runtime_domain = SimpleNamespace(
+        pause_generation=AsyncMock(side_effect=lambda: calls.append("pause")),
+        trim_memory=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    context = _StepContext(rollout_id=0, final_backfill=False)
+    context.deferred_session = deferred_opd.DeferredOpdSession(
+        args,
+        0,
+        pipeline._data_system_client,
+        pipeline._opd_manager,
+        publish=rollout_mod._publish_scored_batch,
+    )
+    pipeline.transfer_domain.open_partition(0, args.rollout_batch_size)
+    return pipeline, context, calls, published
+
+
+@pytest.mark.asyncio
+async def test_agentic_rollout_deferred_opd_stages_until_close(monkeypatch) -> None:
+    pipeline, context, calls, published = _deferred_pipeline(monkeypatch)
+    for group_index in range(2):
+        pipeline._finalized_groups.append(_scorable_group(group_index))
+
+    pipeline._collect_step_progress(context)
+
+    assert context.tq_put_tasks == []
+    assert len(context.staged_batches) == 1
+    assert published == []
+
+    await pipeline._close_rollout_step(context)
+
+    assert published == [(0, 4, False)]
+    assert context.staged_batches == []
+    assert all(sample.teacher_log_probs for group in context.output_groups for sample in group)
+
+
+@pytest.mark.asyncio
+async def test_agentic_rollout_deferred_opd_pauses_before_scoring(monkeypatch) -> None:
+    pipeline, context, calls, _ = _deferred_pipeline(monkeypatch)
+    for group_index in range(2):
+        pipeline._finalized_groups.append(_scorable_group(group_index))
+    pipeline._collect_step_progress(context)
+
+    await pipeline._close_rollout_step(context)
+
+    assert calls == ["pause", "enter:teacher", "score_teacher", "leave:teacher", "publish"]
+
+
+@pytest.mark.asyncio
+async def test_agentic_rollout_deferred_opd_failure_blocks_publish(monkeypatch) -> None:
+    pipeline, context, _, published = _deferred_pipeline(monkeypatch, fail=True)
+    for group_index in range(2):
+        pipeline._finalized_groups.append(_scorable_group(group_index))
+    pipeline._collect_step_progress(context)
+
+    with pytest.raises(RuntimeError, match="did not publish"):
+        await pipeline._close_rollout_step(context)
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_agentic_rollout_deferred_opd_cancelled_close_never_publishes_after_shutdown(monkeypatch) -> None:
+    pipeline, context, calls, published = _deferred_pipeline(monkeypatch)
+    pipeline._opd_manager.release_scoring = asyncio.Event()
+    pipeline._active_step = context
+    for group_index in range(2):
+        pipeline._finalized_groups.append(_scorable_group(group_index))
+    pipeline._collect_step_progress(context)
+
+    close_task = asyncio.create_task(pipeline._close_rollout_step(context))
+    await pipeline._opd_manager.scoring_started.wait()
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    await pipeline._shutdown()
+
+    pipeline._opd_manager.release_scoring.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert published == []
+    # The teacher was released before shutdown returned.
+    assert calls[-1] == "leave:teacher"
+
+
+@pytest.mark.asyncio
+async def test_scoring_phase_cancelled_enter_still_releases_the_teacher(monkeypatch) -> None:
+    import threading
+
+    from relax.engine.rollout import scoring_phase
+
+    transitions: list[str] = []
+    entering = threading.Event()
+    finish_enter = threading.Event()
+
+    def blocking_transition(action, phase_id):
+        if action == "enter":
+            entering.set()
+            finish_enter.wait(timeout=5)
+        transitions.append(f"{action}:{phase_id}")
+
+    monkeypatch.setattr(scoring_phase, "_transition", blocking_transition)
+    args = _deferred_opd_args()
+
+    async def enter_phase() -> None:
+        async with scoring_phase.async_scoring_phase(args, "teacher"):
+            raise AssertionError("the phase body must not run")
+
+    task = asyncio.create_task(enter_phase())
+    await asyncio.to_thread(entering.wait, 5)
+    task.cancel()
+    finish_enter.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert transitions == ["enter:teacher", "leave:teacher"]

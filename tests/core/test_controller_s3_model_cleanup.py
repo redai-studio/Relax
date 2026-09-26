@@ -308,6 +308,9 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
     instance.config = SimpleNamespace()
     instance.runtime_env = None
     instance._health_manager = SimpleNamespace(status=object())
+    # Services are handed the task-level inference owner; register_all_serve
+    # creates it before any service, and __init__ seeds it as None.
+    instance._inference_manager_handle = None
     monkeypatch.setattr(controller, "Service", FakeService)
 
     role, service, error = instance._create_service_task(
@@ -424,19 +427,23 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         def __init__(self, role):
             self.role = role
 
-        async def get_rollout_manager(self):
+        async def get_rollout_worker(self):
             return object()
 
-        async def set_rollout_manager(self, _manager):
-            events.append("set_rollout_manager")
+        async def set_rollout_handles(self, _worker, _manager):
+            events.append("set_rollout_handles")
 
-        def update_weights_fully_async(self):
+        async def update_weights_fully_async(self):
+            events.append("schedule_update_weights")
+
             async def update():
                 events.append("update_weights")
 
             return update()
 
-        def recv_weight_fully_async(self):
+        async def recv_weight_fully_async(self):
+            events.append(f"schedule_receive_{self.role.value}")
+
             async def receive():
                 events.append(f"receive_{self.role.value}")
 
@@ -466,6 +473,21 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         ROLES.reference: Service(ROLES.reference),
     }
     instance._teacher_manager = None
+
+    # Hand-assembled Controller: keep the fields training_loop reads in step.
+    async def publish_rollout(method):
+        assert method == "complete_inference_weight_update"
+        events.append("publish_rollout")
+
+    async def snapshot(_role):
+        events.append("snapshot_rollout")
+        return SimpleNamespace(
+            models=[SimpleNamespace(model_id="default", state=controller.LifecycleState.READY, admission=True)]
+        )
+
+    instance._inference_manager_handle = SimpleNamespace(
+        rollout_operation=SimpleNamespace(remote=publish_rollout), snapshot=SimpleNamespace(remote=snapshot)
+    )
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
@@ -475,6 +497,10 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance.training_loop()
 
     cleanup_index = events.index("cleanup")
+    assert events.index("update_weights") < events.index("publish_rollout") < cleanup_index
+    assert events.index("publish_rollout") < events.index("snapshot_rollout") < cleanup_index
+    assert events.index("receive_actor_fwd") < events.index("publish_rollout")
+    assert events.index("receive_reference") < events.index("publish_rollout")
     assert events.index("update_weights") < cleanup_index
     assert events.index("set_step_actor") < cleanup_index
     assert cleanup_index < events.index("run_actor")

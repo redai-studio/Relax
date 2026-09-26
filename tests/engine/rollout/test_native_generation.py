@@ -656,3 +656,38 @@ def test_prune_stale_artifacts_can_be_disabled_and_tolerates_a_missing_root(tmp_
         ),
         rollout_id=7,
     )
+
+
+def test_native_generation_get_engines_asks_the_local_inference_manager(monkeypatch):
+    """Inside a RolloutWorker, engines come from the task InferenceManager.
+
+    The worker itself has no ``get_rollout_engines_and_lock``; calling it on
+    ``current_actor`` raised AttributeError on the first diffusion generate.
+    """
+    import ray
+
+    from relax.distributed.ray import rollout_worker
+
+    calls = []
+
+    class _Operation:
+        def remote(self, method, *args, **kwargs):
+            calls.append(method)
+            return _FakeRef((["engine-0", "engine-1"], None, 0, [], []))
+
+    manager = SimpleNamespace(rollout_operation=_Operation())
+    monkeypatch.setattr(rollout_worker, "_LOCAL_INFERENCE_MANAGER", manager)
+    monkeypatch.setattr(ray, "get", lambda ref: ref.value)
+
+    assert ng._get_engines(SimpleNamespace(), None) == ["engine-0", "engine-1"]
+    assert calls == ["get_rollout_engines_and_lock"]
+
+
+def test_native_generation_get_engines_falls_back_outside_a_rollout_worker(monkeypatch):
+    from relax.distributed.ray import rollout_worker
+
+    monkeypatch.setattr(rollout_worker, "_LOCAL_INFERENCE_MANAGER", None)
+    client = SimpleNamespace(get_generation_engines=lambda: ("engine-a",))
+
+    assert ng._get_engines(SimpleNamespace(), client) == ["engine-a"]
+    assert ng._get_engines(SimpleNamespace(), None) == []

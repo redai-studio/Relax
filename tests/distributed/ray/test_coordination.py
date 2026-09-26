@@ -34,6 +34,13 @@ from conftest import (
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
+@pytest.fixture(autouse=True)
+def mock_placement_group_removal():
+    # All placement groups in this module are mocks, not live Ray resources.
+    with patch("ray.util.remove_placement_group"):
+        yield
+
+
 # ==================== _find_active_scale_request ===========================
 
 
@@ -596,6 +603,28 @@ class TestGetEnginesInfo:
         assert engines[0]["status"] == "active"
         assert engines[1]["status"] == "dead"
 
+    @pytest.mark.parametrize(
+        "status_filter,expected_ranks,expected_total",
+        [("active", [0], 1), ("dead", [1], 1)],
+    )
+    def test_status_filter_limits_engine_inventory(self, patch_ray_get, status_filter, expected_ranks, expected_total):
+        group = make_engine_group(engines=[make_mock_engine(), None])
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+
+        info = manager.get_engines_info(status_filter=status_filter)
+        model = info["models"]["default"]
+        engines = model["engine_groups"][0]["engines"]
+
+        assert [engine["rank"] for engine in engines] == expected_ranks
+        assert model["total_engines"] == expected_total
+        assert info["total_engines"] == expected_total
+
+    def test_status_filter_rejects_unknown_value(self):
+        manager = create_test_manager(servers={"default": make_rollout_server()})
+
+        with pytest.raises(ValueError, match="active, dead"):
+            manager.get_engines_info(status_filter="starting")
+
     def test_filter_by_model(self, patch_ray_get):
         e1 = make_mock_engine()
         g1 = make_engine_group(engines=[e1])
@@ -662,3 +691,71 @@ class TestSetWeightUpdating:
 
         # Should not raise
         manager.set_weight_updating(True)
+
+
+class TestLegacyDiscoveryContract:
+    def test_rollout_discovery_counts_node_slots_including_dead(self, patch_ray_get):
+        from conftest import make_mock_args
+
+        head = make_mock_engine(url="http://head:30000", healthy=False)
+        worker = make_mock_engine(url=None)
+        group = make_engine_group(
+            args=make_mock_args(num_gpus_per_node=4),
+            engines=[head, worker, None, None],
+            num_gpus_per_engine=8,
+            rank_offset=4,
+        )
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+        info = manager.get_engines_info()
+        engines = info["models"]["default"]["engine_groups"][0]["engines"]
+        assert info["total_engines"] == 4
+        assert len(group.engines) == 2
+        assert [e["rank"] for e in engines] == [4, 5, 6, 7]
+        assert [e["status"] for e in engines] == ["active", "active", "dead", "dead"]
+        assert engines[0]["url"] == "http://head:30000"
+        assert "url" not in engines[1]
+        head.health_generate.remote.assert_not_called()
+
+    def test_rollout_discovery_unknown_model_is_empty(self):
+        manager = create_test_manager(servers={"default": make_rollout_server()})
+        assert manager.get_engines_info("missing") == {"models": {}, "total_engines": 0}
+
+    def test_rollout_discovery_topology_revision_increments_on_slot_change(self, patch_ray_get):
+        from relax.engine.inference.types import Role
+
+        # The revision tracks the addressable endpoint set, so the recovered
+        # slot has to report an observation -- a bare handle publishes no
+        # address and is not a topology change.
+        def _observed_engine(url):
+            engine = make_mock_engine(url=url)
+            engine.get_inference_observation.remote.return_value = {
+                "healthy": True,
+                "router_registered": True,
+                "weight_version": "policy-v1",
+                "base_url": url,
+            }
+            return engine
+
+        group = make_engine_group(engines=[_observed_engine("http://node-a:30000"), None])
+        manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+
+        def snapshot():
+            return manager.inference_manager.snapshot(Role.ROLLOUT)
+
+        manager.refresh_inference_state()
+        initial = snapshot()
+        group.all_engines[1] = _observed_engine("http://node-b:30000")
+        assert snapshot() == initial
+        manager.refresh_inference_state()
+        updated = snapshot()
+
+        assert updated.topology_revision > initial.topology_revision
+
+    def test_rollout_discovery_rpc_failure_still_reports_active(self, patch_ray_get):
+        engine = make_mock_engine()
+        engine.get_url.remote.side_effect = RuntimeError("unreachable")
+        manager = create_test_manager(
+            servers={"default": make_rollout_server(engine_groups=[make_engine_group(engines=[engine])])}
+        )
+        result = manager.get_engines_info()
+        assert result["models"]["default"]["engine_groups"][0]["engines"] == [{"rank": 0, "status": "active"}]

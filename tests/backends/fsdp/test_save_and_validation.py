@@ -101,8 +101,8 @@ def test_final_checkpoint_failure_is_propagated():
 
 
 class _SyncSaveSpy:
-    def __init__(self, *, rollout_manager=True, offload_engine=True):
-        self.rollout_manager = object() if rollout_manager else None
+    def __init__(self, *, rollout_worker=True, offload_engine=True):
+        self.rollout_worker = object() if rollout_worker else None
         self.offload_engine = offload_engine
         self.events: list = []
 
@@ -123,8 +123,8 @@ def test_sync_save_and_release_keeps_checkpoint_before_actor_sleep():
     assert spy.events == [("sync", False), ("save", 19), ("release", True)]
 
 
-def test_sync_save_and_release_saves_without_rollout_manager():
-    spy = _SyncSaveSpy(rollout_manager=False)
+def test_sync_save_and_release_saves_without_rollout_worker():
+    spy = _SyncSaveSpy(rollout_worker=False)
     FSDPTrainRayActor._sync_save_and_release(spy, 19)
     assert spy.events == [("save", 19), ("release", False)]
 
@@ -235,7 +235,7 @@ def _eval_shell(**over):
     args.update(over)
     shell = object.__new__(FSDPTrainRayActor)
     shell._rank = 0
-    shell.rollout_manager = object()
+    shell.rollout_worker = object()
     shell.args = SimpleNamespace(**args)
     return shell
 

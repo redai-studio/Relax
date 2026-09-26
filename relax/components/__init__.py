@@ -26,10 +26,13 @@ from relax.components.base import (
     ServiceState,
     ServiceStatus,
 )
+from relax.components.inference_gateway import InferenceGateway, InferenceGatewayDeployment
 
 
 __all__ = [
     "Base",
     "ServiceState",
     "ServiceStatus",
+    "InferenceGateway",
+    "InferenceGatewayDeployment",
 ]

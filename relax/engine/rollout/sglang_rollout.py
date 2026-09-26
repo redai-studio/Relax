@@ -24,6 +24,7 @@ from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.deferred_opd import DeferredOpdSession, deferred_opd_active
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
@@ -84,6 +85,9 @@ class GenerateState(metaclass=SingletonMeta):
 
         # OPD manager (singleton — one OpdManager per GenerateState)
         self.opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+        # Deferred scoring moves teacher prefill out of generation into its own
+        # stage, so the inline calls below must not also run it.
+        self.defer_opd_scoring = deferred_opd_active(args)
 
         # Media-encoding thread pool for this rollout worker process, sized by
         # --encode-max-workers (falls back to $RELAX_ENCODE_MAX_WORKERS, then an
@@ -586,7 +590,7 @@ async def generate_and_rm(
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not state.defer_opd_scoring:
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
@@ -597,7 +601,7 @@ async def generate_and_rm(
         if sample.reward is None:
             sample.reward = await async_rm(args, sample)
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not state.defer_opd_scoring:
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
@@ -677,7 +681,7 @@ async def generate_and_rm_group(
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not state.defer_opd_scoring:
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -782,6 +786,22 @@ async def generate_rollout_async(
     assert args.rollout_global_dataset
 
     state = GenerateState(args)
+
+    # Deferred scoring stages every batch instead of publishing it, and flushes
+    # after abort() below: the student cannot be offloaded for the teacher while
+    # generation still has requests in flight. Rebinding the helper keeps the
+    # step's publication points unaware of which mode is active.
+    deferred_session = DeferredOpdSession.maybe_create(
+        args,
+        rollout_id,
+        data_system_client,
+        state.opd_manager,
+        publish=transfer_batch_to_data_system,
+        encode_multimodal_inputs=_encode_multimodal_inputs,
+    )
+    # Publication goes through one local reference so the step does not have to
+    # know which mode is active.
+    publish_batch = transfer_batch_to_data_system if deferred_session is None else deferred_session.transfer
 
     # Start SGLang profiling if enabled
     await start_sglang_profile(args, rollout_id)
@@ -939,7 +959,7 @@ async def generate_rollout_async(
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
+                    publish_batch(
                         args,
                         batch_to_transfer,
                         n,
@@ -960,7 +980,7 @@ async def generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish_batch(
                             args,
                             batch_to_transfer[:cutoff_batch],
                             n_prev,
@@ -981,7 +1001,7 @@ async def generate_rollout_async(
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish_batch(
                             args,
                             batch_to_transfer,
                             n,
@@ -1002,7 +1022,7 @@ async def generate_rollout_async(
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                publish_batch(
                     args,
                     batch_to_transfer,
                     n,
@@ -1019,7 +1039,7 @@ async def generate_rollout_async(
             # Tail flush to the current partition: last only if it completes this step's target.
             curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                publish_batch(
                     args,
                     batch_to_transfer,
                     n,
@@ -1111,8 +1131,14 @@ async def generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                await publish_batch(args, accepted, len(accepted), rollout_id, data_system_client)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
+
+    if deferred_session is not None:
+        # Generation for this step is finished, so the student can be drained and
+        # offloaded for the teacher. A batch that cannot be scored fails the step
+        # rather than publishing rows whose distillation targets are missing.
+        await deferred_session.flush()
 
     global CURRENT_ROLLOUT_BATCH
     if CURRENT_ROLLOUT_BATCH:
@@ -1324,7 +1350,19 @@ def generate_rollout(
     # prefetched generation is almost always aborted by the next step's pause_generation and its
     # truncated samples would pollute the next rollout. Other modes keep the optimization.
     _lora_adapter_mode = getattr(args, "lora_rank", 0) > 0 and getattr(args, "lora_adapter_mode", False)
-    if not args.fully_async and not _lora_adapter_mode:
+    # A prefetched batch advances the data-source cursor but lives only in this
+    # process. Keep checkpoint boundaries free of these unpersisted samples.
+    save_interval = getattr(args, "save_interval", None)
+    checkpoint_step = (
+        getattr(args, "save", None) is not None
+        and save_interval is not None
+        and (
+            getattr(args, "rotate_ckpt", False)
+            or (rollout_id + 1) % save_interval == 0
+            or rollout_id + 1 == args.num_rollout
+        )
+    )
+    if not args.fully_async and not _lora_adapter_mode and not checkpoint_step:
         state = GenerateState(args)
         state.prefetched_samples_ref = data_buffer.get_samples.remote(args.over_sampling_batch_size)
         logger.info(f"Rollout step {rollout_id}: pre-submitted data fetch for next step")

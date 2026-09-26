@@ -12,6 +12,7 @@ import pytest
 try:
     from relax.distributed.ray.rollout import (
         EngineGroupLifecycle,
+        PlacementOwner,
         ScaleInRequest,
         ScaleInStatus,
         ScaleOutRequest,
@@ -771,6 +772,7 @@ async def manager_remove_engine(g, idx):
 # ===================== _cleanup_engine_groups ==============================
 
 
+@pytest.mark.usefixtures("patch_ray_get")
 class TestCleanupEngineGroups:
     def test_removes_empty_groups(self):
         g_live = make_engine_group(engines=[make_mock_engine()])
@@ -814,6 +816,75 @@ class TestCleanupEngineGroups:
         with patch("ray.util.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_called_once_with(mock_pg)
+
+    def test_does_not_remove_controller_owned_placement_group(self):
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=False)
+        g_empty.pg = (mock_pg, [], [])
+        g_empty.pg_owner = PlacementOwner.CONTROLLER
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_not_called()
+
+    def test_releases_the_ledger_slice_and_removes_its_own_group(self):
+        from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
+
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=True)
+        g_empty.pg = (mock_pg, [0], [0])
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+        view = PlacementGroupView((0,), (0,), PlacementOwner.MANAGER, identity=mock_pg)
+        (g_empty.placement,) = manager._plan_placement(
+            (
+                PlacementRequest(
+                    group_id="scale-out/replica-0",
+                    worker_type="regular",
+                    num_gpus=1,
+                    num_gpus_per_engine=1,
+                    num_gpus_per_node=8,
+                ),
+            ),
+            view,
+        )
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_called_once_with(mock_pg)
+        assert manager._planner.allocations(view) == ()
+
+    def test_ledger_ownership_overrides_a_stale_group_owner(self):
+        from relax.engine.inference.placement import PlacementGroupView, PlacementRequest
+
+        mock_pg = MagicMock()
+        g_empty = make_engine_group(engines=[None], is_scaled_out=True)
+        g_empty.pg = (mock_pg, [0], [0])
+        # The group claims ownership, but the ledger recorded a borrowed
+        # placement group, which is what decides.
+        g_empty.pg_owner = PlacementOwner.MANAGER
+        srv = make_rollout_server(engine_groups=[g_empty])
+        manager = create_test_manager(servers={"default": srv})
+        view = PlacementGroupView((0,), (0,), PlacementOwner.CONTROLLER, identity=mock_pg)
+        (g_empty.placement,) = manager._plan_placement(
+            (
+                PlacementRequest(
+                    group_id="default/group-0",
+                    worker_type="regular",
+                    num_gpus=1,
+                    num_gpus_per_engine=1,
+                    num_gpus_per_node=8,
+                ),
+            ),
+            view,
+        )
+
+        with patch("ray.util.remove_placement_group") as mock_remove:
+            manager._cleanup_engine_groups(srv)
+            mock_remove.assert_not_called()
+        assert manager._planner.allocations(view) == ()
 
 
 # ===================== Scale-in status queries =============================
@@ -879,3 +950,103 @@ class TestScaleInStatusQueries:
         manager = create_test_manager()
         with pytest.raises(ValueError, match="Invalid status"):
             manager.list_all_scale_in_requests(status_filter="BOGUS")
+
+
+# ================= failure boundaries of scaled-out engines ================
+
+
+@pytest.mark.asyncio
+async def test_scale_in_stops_an_engine_added_by_scale_out():
+    """The topology callback of a scaled-out group reports to the manager."""
+    from relax.engine.inference.types import LifecycleState, Role
+
+    server = make_rollout_server(engine_groups=[make_engine_group(engines=[make_mock_engine()])])
+    manager = create_test_manager(servers={"default": server})
+    manager.refresh_inference_state = MagicMock()
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    engine = make_mock_engine()
+    group = make_engine_group(engines=[engine], rank_offset=2, is_scaled_out=True)
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING, model_name="default")
+
+    with patch("relax.distributed.ray.rollout.RolloutHealthMonitor"):
+        result = await manager._finalize_engine_group_registration(
+            request=request, srv=server, engines=[engine], engine_group=group
+        )
+    assert result.success
+
+    stopped = await manager._shutdown_engine_actors(group, "group_2_engine_0", [(0, engine)], shutdown_timeout=1)
+
+    assert stopped and group.all_engines[0] is None
+    assert manager.inference_manager.snapshot(Role.ROLLOUT).models[0].state == LifecycleState.STARTING
+
+
+@pytest.mark.asyncio
+async def test_scale_in_keeps_an_engine_it_could_not_stop(patch_ray_get):
+    engine = make_mock_engine()
+    engine.shutdown.remote.side_effect = RuntimeError("timeout")
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    group.pg = (MagicMock(), [], [])
+    server = make_rollout_server(engine_groups=[group])
+    manager = create_test_manager(servers={"default": server})
+
+    with (
+        patch("relax.distributed.ray.rollout.asyncio.sleep", AsyncMock()),
+        patch("relax.distributed.ray.rollout.ray.kill", side_effect=RuntimeError("kill failed")),
+        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg,
+    ):
+        removed, failed = await manager._remove_live_engines(
+            server, [(group, 0)], drain_timeout=1, shutdown_timeout=1, force=False
+        )
+
+    # Not reported removed: the handle, group and placement stay for a retry.
+    assert (removed, failed) == ([], ["group_0_engine_0"])
+    assert group.all_engines[0] is engine and server.engine_groups == [group]
+    remove_pg.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scale_in_treats_a_dead_engine_as_stopped(patch_ray_get):
+    import ray
+
+    engine = make_mock_engine()
+    engine.shutdown.remote.side_effect = ray.exceptions.RayActorError()
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    manager = create_test_manager()
+    manager.refresh_inference_state = MagicMock()
+
+    with patch("relax.distributed.ray.rollout.ray.kill") as kill:
+        stopped = await manager._shutdown_engine_actors(group, "group_0_engine_0", [(0, engine)], shutdown_timeout=1)
+
+    assert stopped and group.all_engines[0] is None
+    kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scale_in_retry_skips_the_router_for_an_engine_it_already_removed(patch_ray_get):
+    engine = make_mock_engine()
+    engine.shutdown.remote.side_effect = RuntimeError("timeout")
+    group = make_engine_group(engines=[engine], is_scaled_out=True)
+    group.pg = (MagicMock(), [], [])
+    server = make_rollout_server(engine_groups=[group])
+    manager = create_test_manager(servers={"default": server})
+
+    async def remove():
+        return await manager._remove_live_engines(
+            server, [(group, 0)], drain_timeout=1, shutdown_timeout=1, force=False
+        )
+
+    with (
+        patch("relax.distributed.ray.rollout.asyncio.sleep", AsyncMock()),
+        patch("relax.distributed.ray.rollout.ray.kill", side_effect=RuntimeError("kill failed")),
+        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group"),
+    ):
+        assert await remove() == ([], ["group_0_engine_0"])
+        # The engine no longer answers the Router call, but can now be stopped.
+        engine.unregister_from_router.remote.side_effect = RuntimeError("unresponsive")
+        engine.shutdown.remote.side_effect = None
+        engine.shutdown.remote.return_value = AwaitableValue(None)
+        assert await remove() == (["group_0_engine_0"], [])
+
+    engine.unregister_from_router.remote.assert_called_once()
+    assert group.all_engines[0] is None and group.router_removed == {}

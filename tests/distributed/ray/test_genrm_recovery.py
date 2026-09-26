@@ -9,7 +9,7 @@ pointless ~1.5 min engine rebuild; too narrow and a dead engine escalates to the
 global restart the whole recovery path exists to avoid.
 
 The subtle case is the resume path. ``resume_memory_occupation`` goes through
-``GenRMEngine._make_request``, which uses ``requests`` -- and
+``SGLangEngine._make_request``, which uses ``requests`` -- and
 ``requests.exceptions.ConnectionError`` is an ``OSError`` subclass but *not* a
 builtin ``ConnectionError``, so it has to be listed explicitly.
 """
@@ -23,7 +23,7 @@ import requests
 try:
     import ray
 
-    from relax.distributed.ray.genrm import _is_engine_dead
+    from relax.distributed.ray.rollout import _is_engine_dead
 
     HAS_DEPS = True
 except ImportError:
@@ -49,9 +49,9 @@ def _ray_task_error(cause: BaseException) -> BaseException:
 
 
 def test_drain_connection_error_is_dead():
-    """``GenRMEngine.release_memory_occupation`` raises builtin ConnectionError
-    from its dead-server fast-fail; it must survive the trip through
-    ray.get."""
+    """A GenRM ``SGLangEngine.release_memory_occupation`` raises builtin
+    ConnectionError from its dead-server fast-fail; it must survive the trip
+    through ray.get."""
     cause = ConnectionError(
         "GenRM engine unreachable while draining before release "
         "(3 consecutive connection errors) — the server process is most likely dead."

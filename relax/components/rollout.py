@@ -16,8 +16,10 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.components.inference_gateway import GATEWAY_REQUEST_HEADER
 from relax.distributed.coordination import PeerStepBarrier
-from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.distributed.ray.placement_group import create_rollout_worker
+from relax.engine.inference.types import Role
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
@@ -331,15 +333,21 @@ class Rollout(Base):
         config: Namespace,
         data_source: Optional[Any] = None,
         runtime_env: Optional[dict] = None,  # pyright: ignore[reportMissingTypeArgument]
+        inference_manager_handle: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.healthy = healthy
+        self.inference_manager = inference_manager_handle
 
         tq.init(self.config.tq_config)
         self.data_system_client = tq.get_client()
-        self.rollout_manager, self.num_rollout_per_epoch = create_rollout_manager(
-            config, pg, data_source=data_source, runtime_env=runtime_env
+        self.rollout_worker, self.num_rollout_per_epoch = create_rollout_worker(
+            config,
+            pg,
+            data_source=data_source,
+            runtime_env=runtime_env,
+            inference_manager_handle=inference_manager_handle,
         )
         self.step = 0
         self.data_source = data_source
@@ -378,15 +386,23 @@ class Rollout(Base):
             return
         if self.config.rollout_global_dataset:
             try:
-                await self.rollout_manager.load.remote(self.step - 1)
+                await self.rollout_worker.load.remote(self.step - 1)
             except Exception as e:
                 self._logger.exception(f"Failed to load global dataset: {e}")
 
         self._run_task = asyncio.ensure_future(self._async_run())
         await self._run_task
 
-    def get_rollout_manager(self) -> Any:
-        return self.rollout_manager
+    def get_rollout_worker(self) -> Any:
+        return self.rollout_worker
+
+    @staticmethod
+    def _require_gateway_request(request: Request) -> None:
+        if request.headers.get(GATEWAY_REQUEST_HEADER) != "1":
+            raise HTTPException(
+                status_code=403,
+                detail="Rollout inference must be accessed through the role Gateway",
+            )
 
     def set_barriers(
         self,
@@ -398,7 +414,7 @@ class Rollout(Base):
         self._peer_barrier = peers
 
     async def _run_eval_with_mark(self, rollout_id: int) -> None:
-        await self.rollout_manager.eval.remote(rollout_id=rollout_id)
+        await self.rollout_worker.eval.remote(rollout_id=rollout_id)
 
     async def _async_run(self) -> None:
         from relax.engine.sft.runtime import is_sft_mode
@@ -443,9 +459,9 @@ class Rollout(Base):
 
                 self._logger.info(f"Start rollout {local_step}/{self.config.num_rollout}")
                 try:
-                    await self.rollout_manager.generate.remote(rollout_id=local_step)
+                    await self.rollout_worker.generate.remote(rollout_id=local_step)
                     if self.config.offload_rollout:
-                        await self.rollout_manager.offload.remote()
+                        await self.inference_manager.deactivate.remote(Role.ROLLOUT)
                 except Exception as e:
                     error_msg = f"Rollout generation failed at step {local_step}: {type(e).__name__}: {str(e)}"
                     self._logger.exception(error_msg)
@@ -593,14 +609,14 @@ class Rollout(Base):
             self._weight_update_ready.clear()
             self.status = "paused"
             try:
-                prepared = await self.rollout_manager.set_weight_updating.remote(True)
+                prepared = await self.inference_manager.rollout_operation.remote("set_weight_updating", True)
                 if prepared is False:
                     raise HTTPException(status_code=503, detail="Elastic scale-in is draining")
-                await self.rollout_manager.health_monitoring_pause.remote()
+                await self.inference_manager.rollout_operation.remote("health_monitoring_pause")
             except Exception:
                 rollback_succeeded = False
                 try:
-                    await self.rollout_manager.set_weight_updating.remote(False)
+                    await self.inference_manager.rollout_operation.remote("set_weight_updating", False)
                     rollback_succeeded = True
                 except Exception as rollback_error:
                     self._logger.warning(
@@ -666,12 +682,16 @@ class Rollout(Base):
         await self._weight_update_ready.wait()
 
         self.status = "running"
-        await self.rollout_manager.set_weight_updating.remote(False)
+        await self.inference_manager.rollout_operation.remote("set_weight_updating", False)
+
+        # The update lease alone is not evidence of ready weights. Re-observe
+        # health, Router registration and engine-reported versions afterwards.
+        await self.inference_manager.rollout_operation.remote("refresh_inference_state")
 
     @app.get("/recover_rollout_engines")
     async def recover_rollout_engines(self):
         self._logger.info("Recovering rollout engines")
-        await self.rollout_manager.recover_rollout_engines.remote()
+        await self.inference_manager.rollout_operation.remote("recover_rollout_engines")
         return {"status": "ok"}
 
     @app.post("/scale_out", response_model=ScaleOutResponse)
@@ -687,7 +707,8 @@ class Rollout(Base):
         #   - ray_native: computes effective delta from (num_replicas - current)
         #   - external: filters out addresses already active or in-flight
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
-        result = await self.rollout_manager.create_scale_out_request.remote(
+        result = await self.inference_manager.rollout_operation.remote(
+            "create_scale_out_request",
             model_name=request.model_name,
             num_replicas=request.num_replicas,
             engine_urls=request.engine_urls,
@@ -704,7 +725,7 @@ class Rollout(Base):
                 message=result.get("message", "Already at or above target engine count; no scale-out needed"),
             )
         # Step 3: Fire-and-forget execution (non-blocking)
-        self.rollout_manager.execute_scale_out.remote(result["request_id"])
+        self.inference_manager.rollout_operation.remote("execute_scale_out", result["request_id"])
         return ScaleOutResponse(
             request_id=result["request_id"],
             status=result["status"],
@@ -728,8 +749,8 @@ class Rollout(Base):
         self._logger.info(f"Listing scale-out requests: model_name={model_name}, status={status}")
 
         try:
-            requests = await self.rollout_manager.list_all_scale_out_requests.remote(
-                model_name=model_name, status_filter=status
+            requests = await self.inference_manager.rollout_operation.remote(
+                "list_all_scale_out_requests", model_name=model_name, status_filter=status
             )
 
             return ListScaleOutRequestsResponse(
@@ -782,8 +803,11 @@ class Rollout(Base):
         )
 
         try:
-            result = await self.rollout_manager.cancel_all_scale_out_requests.remote(
-                model_name=request.model_name, status_filter=request.status_filter, dry_run=request.dry_run
+            result = await self.inference_manager.rollout_operation.remote(
+                "cancel_all_scale_out_requests",
+                model_name=request.model_name,
+                status_filter=request.status_filter,
+                dry_run=request.dry_run,
             )
 
             return CancelAllScaleOutRequestsResponse(**result)
@@ -798,14 +822,14 @@ class Rollout(Base):
 
     @app.get("/scale_out/{request_id}", response_model=ScaleOutStatusResponse)
     async def get_scale_out_status(self, request_id: str):
-        result = await self.rollout_manager.get_scale_out_status.remote(request_id)
+        result = await self.inference_manager.rollout_operation.remote("get_scale_out_status", request_id)
         if result is None:
             raise HTTPException(status_code=404, detail=f"Scale-out request {request_id} not found")
         return ScaleOutStatusResponse(**result)
 
     @app.post("/scale_out/{request_id}/cancel", response_model=CancelResponse)
     async def cancel_scale_out(self, request_id: str):
-        result = await self.rollout_manager.cancel_scale_out.remote(request_id)
+        result = await self.inference_manager.rollout_operation.remote("cancel_scale_out", request_id)
         if result is None:
             raise HTTPException(
                 status_code=404, detail=f"Scale-out request {request_id} not found or cannot be cancelled"
@@ -819,8 +843,8 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
-        result = await self.rollout_manager.get_engines_info.remote(model_name)
+    async def get_engines(self, model_name: Optional[str] = None, status_filter: Optional[str] = None):
+        result = await self.inference_manager.rollout_operation.remote("get_engines_info", model_name, status_filter)
         return result
 
     @app.post("/scale_in", response_model=ScaleInResponse)
@@ -833,7 +857,8 @@ class Rollout(Base):
                 "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
             )
         try:
-            result = await self.rollout_manager.create_scale_in_request.remote(
+            result = await self.inference_manager.rollout_operation.remote(
+                "create_scale_in_request",
                 model_name=request.model_name,
                 num_replicas=request.num_replicas,
                 engine_urls=request.engine_urls,
@@ -854,7 +879,7 @@ class Rollout(Base):
                 message=result.get("message", "No engines available for scale-in"),
             )
         # Fire-and-forget: execute_scale_in runs asynchronously
-        self.rollout_manager.execute_scale_in.remote(result["request_id"])
+        self.inference_manager.rollout_operation.remote("execute_scale_in", result["request_id"])
         return ScaleInResponse(
             request_id=result["request_id"],
             status=result["status"],
@@ -867,8 +892,8 @@ class Rollout(Base):
         self._logger.info(f"Listing scale-in requests: model_name={model_name}, status={status}")
 
         try:
-            requests = await self.rollout_manager.list_all_scale_in_requests.remote(
-                model_name=model_name, status_filter=status
+            requests = await self.inference_manager.rollout_operation.remote(
+                "list_all_scale_in_requests", model_name=model_name, status_filter=status
             )
 
             return ListScaleInRequestsResponse(
@@ -885,7 +910,7 @@ class Rollout(Base):
 
     @app.get("/scale_in/{request_id}", response_model=ScaleInStatusResponse)
     async def get_scale_in_status(self, request_id: str):
-        result = await self.rollout_manager.get_scale_in_status.remote(request_id)
+        result = await self.inference_manager.rollout_operation.remote("get_scale_in_status", request_id)
         if result is None:
             raise HTTPException(status_code=404, detail=f"Scale-in request {request_id} not found")
         return ScaleInStatusResponse(**result)
@@ -903,12 +928,12 @@ class Rollout(Base):
     async def _ensure_sglang_base_url(self) -> str:
         if self._sglang_base_url is not None:
             return self._sglang_base_url
-        addr = await self.rollout_manager.get_router_address.remote()
+        addr = await self.inference_manager.rollout_operation.remote("get_router_address")
         router_ip, router_port = addr.get("router_ip"), addr.get("router_port")
         if not router_ip or not router_port:
             raise HTTPException(
                 status_code=503,
-                detail="SGLang router is not available. No router_ip/router_port found on RolloutManager.",
+                detail="SGLang router is not available. No router_ip/router_port found on RolloutWorker.",
             )
         self._sglang_base_url = f"http://{_wrap_ipv6(router_ip)}:{router_port}"
         self._logger.info(f"Resolved SGLang router URL: {self._sglang_base_url}")
@@ -920,6 +945,7 @@ class Rollout(Base):
 
     @app.post("/v1/chat/completions")
     async def chat_completions(self, request: Request):
+        self._require_gateway_request(request)
         body = await request.body()
         try:
             payload = ChatCompletionRequest.model_validate_json(body)
@@ -992,7 +1018,8 @@ class Rollout(Base):
         return {k: v for k, v in original_headers.items() if k.lower() not in hop_by_hop}
 
     @app.get("/v1/models", response_model=ModelListResponse)
-    async def list_models(self):
+    async def list_models(self, request: Request):
+        self._require_gateway_request(request)
         sglang_url = await self._get_sglang_url("/v1/models")
         client = self._get_proxy_client()
         try:

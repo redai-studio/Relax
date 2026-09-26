@@ -74,7 +74,7 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
 
     shell = _shell()
     shell.args = Namespace(rollout_http_timeout=17.0)
-    shell.rollout_manager = object()  # non-None -> has_rollout
+    shell.rollout_worker = object()  # non-None -> has_rollout
 
     shell._run_step_evaluation(3, end_update_weight=True)
 
@@ -109,7 +109,7 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
 
     shell = _shell()
-    shell.rollout_manager = object()  # non-None -> has_rollout
+    shell.rollout_worker = object()  # non-None -> has_rollout
 
     shell._run_step_evaluation(3, end_update_weight=True)
 
@@ -128,7 +128,7 @@ def test_run_step_evaluation_swallows_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
 
     shell = _shell()
-    shell.rollout_manager = object()
+    shell.rollout_worker = object()
 
     # Timeout must be swallowed (existing ``except Exception``) -> no raise.
     shell._run_step_evaluation(3, end_update_weight=True)

@@ -508,8 +508,8 @@ class SGLangNativeGenerationEngine(RayActor):
         sources.
 
         The colocate framework injects ``sglang_overrides["model_path"]`` from
-        ``args.hf_checkpoint`` (ModelConfig.resolve), which is None for a
-        diffusion run — the DiT path uses ``args.model_path``, not
+        ``args.hf_checkpoint`` (InferenceModelSpec.resolve), which is None for
+        a diffusion run — the DiT path uses ``args.model_path``, not
         hf_checkpoint. Fall through a precedence chain so a None override never
         clobbers the real path.
         """
