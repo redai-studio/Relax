@@ -785,9 +785,8 @@ class DeviceDirectBackend(CommBackend):
                 elif self._lora_sync.base_sync_done:
                     self._publish_lora_adapter_versioned()
                 else:
-                    # §11.1: the first Agentic sync still uses the legacy one-shot wire, but from
-                    # an immutable snapshot and under the immutable v1 name, so the Registry has a
-                    # PUBLISHED version before the first Session can bind.
+                    # Base synchronization is paused during bootstrap; publication still
+                    # uses the same staged identity and READY checks as later versions.
                     self._bootstrap_lora_adapter_versioned()
             except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
                 logger.exception("LoRA adapter push failed; resuming generation before aborting")
@@ -1430,33 +1429,9 @@ class DeviceDirectBackend(CommBackend):
         )
 
     def _bootstrap_lora_adapter_versioned(self) -> None:
-        """§11.1: first Agentic sync — immutable v1 identity over the legacy one-shot wire."""
-
-        snapshot = self._materialize_adapter_snapshot()
-        if snapshot is None:
-            return
-        bucket_cap = self._lora_publication_bucket_cap()
-        publisher = self._new_lora_publisher(snapshot, bucket_cap)
-        while not ray.get(self.lock.acquire.remote()):
-            time.sleep(0.1)
-        try:
-            outcome = publisher.publish_oneshot(
-                snapshot,
-                transport=lambda lora_name: self._broadcast_adapter_oneshot(
-                    snapshot.tensors,
-                    lora_name=lora_name,
-                    pinned=True,
-                    bucket_cap=bucket_cap,
-                ),
-            )
-        finally:
-            ray.get(self.lock.release.remote())
-        logger.info(
-            "[lora-version] sync v=%d bootstrap %s: version=%s",
-            self.weight_version,
-            outcome.status,
-            outcome.lora_name,
-        )
+        """Use the same verified staged protocol for the first immutable
+        version."""
+        self._publish_lora_adapter_versioned()
 
 
 class _StagedEngineFanout:
@@ -1471,7 +1446,9 @@ class _StagedEngineFanout:
     """
 
     def __init__(self, engines: Dict[int, Any], timeout_seconds: float) -> None:
-        self._engines = engines
+        if set(engines) != {0, 1}:
+            raise ValueError("versioned LoRA publication requires the fixed rollout engine fleet {0, 1}")
+        self._engines = dict(engines)
         self._timeout = timeout_seconds
 
     def fire(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:

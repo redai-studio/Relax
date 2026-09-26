@@ -1537,10 +1537,9 @@ index c462494..3e4ae7c 100644
          """
          Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 928348e..bc06ed1 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
-@@ -1862,6 +1862,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
+@@ -1862,6 +1862,16 @@
      pass
  
  
@@ -1557,7 +1556,7 @@ index 928348e..bc06ed1 100644
  class CheckWeightsReqInput(BaseReq, kw_only=True):
      action: str = "checksum"
      allow_quant_error: bool = False
-@@ -2166,15 +2176,83 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+@@ -2166,15 +2176,88 @@
          )
  
  
@@ -1583,7 +1582,11 @@ index 928348e..bc06ed1 100644
 +    because each op carries only the subset it needs.
 +    """
 +
-+    op: Literal["legacy", "begin", "bucket", "end", "unload"] = "legacy"
++    op: Literal["legacy", "begin", "bucket", "end", "status", "unload"] = "legacy"
++    protocol_version: int = 1
++    version_id: Optional[int] = None
++    digest: Optional[str] = None
++    engine_incarnations: Optional[List[str]] = None
 +    lora_name: str
 +    config_dict: Optional[Dict[str, Any]] = None
 +    names: Optional[List[str]] = None
@@ -1633,6 +1636,7 @@ index 928348e..bc06ed1 100644
 +    # engine as clean. Only the staged protocol sets this; the HTTP layer reports a
 +    # failure without a proof as 400 and one with ``clean=False`` as 500.
 +    clean: Optional[bool] = None
++    publication_receipt: Optional[Dict[str, Any]] = None
  
  
  LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
@@ -1798,18 +1802,19 @@ index 653b28c4..d30ce9f9 100644
          """Reject freeing/restoring model weights while the CUDA IPC weight
          cache is active: the weights are shared with the daemon via CUDA IPC, so
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index 7cfd98b..6d398e3 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -1,6 +1,7 @@
+@@ -1,7 +1,9 @@
  from __future__ import annotations
  
  import asyncio
 +import dataclasses
  import hashlib
++import json
  import logging
  import time
-@@ -48,6 +49,8 @@ from sglang.srt.managers.io_struct import (
+ import uuid
+@@ -48,6 +50,8 @@
      LoadLoRAAdapterReqOutput,
      LoRAUpdateOutput,
      OpenSessionReqInput,
@@ -1818,7 +1823,7 @@ index 7cfd98b..6d398e3 100644
      ProfileReq,
      ProfileReqOutput,
      ProfileReqType,
-@@ -66,6 +69,8 @@ from sglang.srt.managers.io_struct import (
+@@ -66,6 +70,8 @@
      SlowDownReqOutput,
      UnloadLoRAAdapterReqInput,
      UnloadLoRAAdapterReqOutput,
@@ -1827,7 +1832,7 @@ index 7cfd98b..6d398e3 100644
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromDistributedReqOutput,
      UpdateWeightsFromIPCReqInput,
-@@ -101,6 +106,7 @@ _COMMUNICATOR_SPECS = [
+@@ -101,6 +107,7 @@
      ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
      ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
      ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
@@ -1835,7 +1840,7 @@ index 7cfd98b..6d398e3 100644
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
      ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
-@@ -141,9 +147,29 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
+@@ -141,7 +148,31 @@
          success=False,
          error_message=" | ".join(error_messages),
          loaded_adapters=failed[0].loaded_adapters,
@@ -1843,8 +1848,8 @@ index 7cfd98b..6d398e3 100644
 +        # caller may only treat the engine as clean when every rank proved it.
 +        clean=False if any(r.clean is False for r in failed) else None,
      )
- 
- 
++
++
 +@dataclasses.dataclass
 +class StagedLoRAPublication:
 +    """Tokenizer-side record of one in-flight staged adapter publication.
@@ -1860,12 +1865,14 @@ index 7cfd98b..6d398e3 100644
 +    attempt_id: int
 +    lora_ref: LoRARef
 +    config_dict: Dict
-+
-+
++    request: UpdateLoRAFromDistributedReqInput
++    state: str = "PREPARED"
++    buckets: Dict[int, LoRAUpdateOutput] = dataclasses.field(default_factory=dict)
++    result: Optional[LoRAUpdateOutput] = None
+ 
+ 
  class TokenizerControlMixin:
-     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
-     profile, internal state, etc.) -- everything that talks to the scheduler via
-@@ -456,6 +482,9 @@ class TokenizerControlMixin:
+@@ -456,6 +487,9 @@
                  results = await self.update_weights_from_distributed_communicator(obj)
  
          if not is_paused:
@@ -1875,7 +1882,7 @@ index 7cfd98b..6d398e3 100644
              async with self.model_update_lock.writer_lock:
                  results = await self.update_weights_from_distributed_communicator(obj)
  
-@@ -517,6 +546,9 @@ class TokenizerControlMixin:
+@@ -517,6 +551,9 @@
                  results = await self.update_weights_from_tensor_communicator(obj)
  
          if not is_paused:
@@ -1885,7 +1892,7 @@ index 7cfd98b..6d398e3 100644
              async with self.model_update_lock.writer_lock:
                  results = await self.update_weights_from_tensor_communicator(obj)
  
-@@ -548,6 +580,9 @@ class TokenizerControlMixin:
+@@ -548,6 +585,9 @@
                      success, message = result.success, result.message
  
              if not is_paused:
@@ -1895,7 +1902,70 @@ index 7cfd98b..6d398e3 100644
                  async with self.model_update_lock.writer_lock:
                      result = (await self.update_weights_from_ipc_communicator(obj))[0]
                      success, message = result.success, result.message
-@@ -738,6 +773,332 @@ class TokenizerControlMixin:
+@@ -566,10 +606,14 @@
+         self: TokenizerManager,
+         obj: UnloadLoRAAdapterReqInput,
+     ) -> UnloadLoRAAdapterReqOutput:
+-        assert (
+-            self.lora_update_lock.locked()
+-        ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+-
++        assert self.lora_update_lock.locked(), (
++            "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
++        )
++
++        if (obj.lora_name or "").startswith("relax_policy_lora@"):
++            raise ValueError(
++                "managed versions may only be unloaded by their publication owner"
++            )
+         # Unregister the LoRA adapter from the registry to stop new requests for this adapter
+         # from being started.
+         lora_id = await self.lora_registry.unregister(obj.lora_name)
+@@ -592,6 +636,10 @@
+         self.auto_create_handle_loop()
+ 
+         try:
++            if (obj.lora_name or "").startswith("relax_policy_lora@"):
++                raise ValueError(
++                    "managed versions require the staged publication protocol"
++                )
+             if not self.server_args.enable_lora:
+                 raise ValueError(
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+@@ -599,7 +647,9 @@
+ 
+             assert (
+                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            ), (
++                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            )
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -670,6 +720,10 @@
+         self.auto_create_handle_loop()
+ 
+         try:
++            if (obj.lora_name or "").startswith("relax_policy_lora@"):
++                raise ValueError(
++                    "managed versions require the staged publication protocol"
++                )
+             if not self.server_args.enable_lora:
+                 raise ValueError(
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+@@ -677,7 +731,9 @@
+ 
+             assert (
+                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+-            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            ), (
++                "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
++            )
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -738,6 +794,498 @@
                  error_message=str(e),
              )
  
@@ -1912,9 +1982,9 @@ index 7cfd98b..6d398e3 100644
 +                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
 +                )
 +
-+            assert (
-+                self.server_args.dp_size == 1
-+            ), "dp_size must be 1 for dynamic lora loading"
++            assert self.server_args.dp_size == 1, (
++                "dp_size must be 1 for dynamic lora loading"
++            )
 +            logger.info(
 +                "Start update Lora adapter from distributed. Lora name=%s op=%s",
 +                obj.lora_name,
@@ -1922,17 +1992,50 @@ index 7cfd98b..6d398e3 100644
 +            )
 +
 +            op = obj.op or "legacy"
++            self._ensure_lora_publication_state()
++            if op in (
++                "bucket",
++                "end",
++                "status",
++            ) and self.lora_engine_incarnation not in (obj.engine_incarnations or []):
++                return UpdateLoRAFromDistributedReqOutput(
++                    success=False,
++                    error_message="engine incarnation changed",
++                    clean=False,
++                )
++            if op == "status":
++                async with self.lora_update_lock:
++                    record = self.lora_publications.get((obj.lora_name, obj.attempt_id))
++                    if (
++                        record is None
++                        or record.state != "READY_LOCAL"
++                        or obj.lora_name not in self.lora_registry.get_all_adapters()
++                    ):
++                        return UpdateLoRAFromDistributedReqOutput(
++                            success=False, error_message="version is not READY_LOCAL"
++                        )
++                    return self._publication_result(record)
 +            if op == "begin":
-+                return await self._update_lora_from_distributed_begin(obj)
++                return await self._run_publication_control(
++                    obj, self._update_lora_from_distributed_begin
++                )
 +            if op == "bucket":
-+                return await self._update_lora_from_distributed_bucket(obj)
++                return await self._run_publication_control(
++                    obj, self._update_lora_from_distributed_bucket
++                )
 +            if op == "end":
-+                return await self._update_lora_from_distributed_end(obj)
++                return await self._run_publication_control(
++                    obj, self._update_lora_from_distributed_end
++                )
 +            if op == "unload":
 +                return await self._update_lora_from_distributed_unload(obj)
 +            if op != "legacy":
 +                return UpdateLoRAFromDistributedReqOutput(
 +                    success=False, error_message=f"unknown staged LoRA op {op!r}"
++                )
++            if (obj.lora_name or "").startswith("relax_policy_lora@"):
++                raise ValueError(
++                    "managed versions require the staged publication protocol"
 +                )
 +            if not obj.names or obj.config_dict is None:
 +                raise ValueError(
@@ -2029,209 +2132,343 @@ index 7cfd98b..6d398e3 100644
 +    # across requests: the guard is the `staged_lora_publication` record itself.
 +    # ------------------------------------------------------------------
 +
-+    def _reject_if_staged_lora_pending(
-+        self: TokenizerManager, what: str
-+    ) -> Optional[str]:
-+        """Fail fast on a destructive update while a candidate is in flight.
-+
-+        A staged candidate's tensors were verified against the model the sender
-+        broadcast them for; running a base/full-weight update in the middle of that
-+        transaction would silently invalidate the payload the candidate is about to
-+        be loaded from.
-+        """
++    def _reject_if_staged_lora_pending(self, what):
 +        staged = getattr(self, "staged_lora_publication", None)
-+        if staged is None:
-+            return None
-+        return (
-+            f"refusing {what} while staged LoRA publication '{staged.lora_name}' "
-+            f"(attempt {staged.attempt_id}) is in flight"
++        managed = (
++            any(
++                name.startswith("relax_policy_lora@")
++                for name in self.lora_registry.get_all_adapters()
++            )
++            if hasattr(self, "lora_registry")
++            else False
++        )
++        if staged is not None:
++            return f"refusing {what} while staged LoRA {staged.lora_name} attempt {staged.attempt_id} owns the base"
++        if managed:
++            return f"refusing {what} while managed LoRA versions own the fixed base"
++        return None
++
++    def _ensure_lora_publication_state(self):
++        if not hasattr(self, "lora_publications"):
++            self.lora_publications = {}
++            self.lora_publication_closed = set()
++            self.lora_publication_unloads = {}
++            self.lora_publication_controls = {}
++            self.lora_engine_incarnation = uuid.uuid4().hex
++
++    async def _run_publication_control(self, obj, handler):
++        if obj.op == "begin" and (
++            obj.protocol_version != 2
++            or not (obj.lora_name or "").startswith("relax_policy_lora@")
++        ):
++            return UpdateLoRAFromDistributedReqOutput(
++                success=False, error_message="managed publication protocol 2 required"
++            )
++        key = (
++            obj.lora_name,
++            obj.attempt_id,
++            obj.op,
++            obj.bucket_index if obj.op == "bucket" else None,
++        )
++        if (obj.lora_name, obj.attempt_id) in self.lora_publication_closed:
++            return UpdateLoRAFromDistributedReqOutput(
++                success=False, error_message="attempt is ABORTED"
++            )
++        fields = (
++            "protocol_version",
++            "version_id",
++            "digest",
++            "config_dict",
++            "expected_checksums",
++            "names",
++            "dtypes",
++            "shapes",
++            "bucket_sizes",
++            "group_name",
++            "pinned",
++            "added_tokens_config",
++            "engine_incarnations",
++        )
++        signature = json.dumps(
++            {field: getattr(obj, field) for field in fields},
++            sort_keys=True,
++            default=str,
++        )
++        existing = self.lora_publication_controls.get(key)
++        if existing is None:
++            task = asyncio.create_task(handler(obj))
++            self.lora_publication_controls[key] = (signature, task)
++        else:
++            previous_signature, task = existing
++            if signature != previous_signature:
++                return UpdateLoRAFromDistributedReqOutput(
++                    success=False, error_message="control identity conflict"
++                )
++        # The engine owns an accepted operation. Cancelling one HTTP waiter
++        # cannot cancel its receive/load or allow another control delivery to
++        # start a second collective while the first is still in flight.
++        return await asyncio.shield(task)
++
++    def _publication_result(self, record):
++        return UpdateLoRAFromDistributedReqOutput(
++            success=True,
++            publication_receipt={
++                "lora_name": record.lora_name,
++                "version_id": record.request.version_id,
++                "digest": record.request.digest,
++                "attempt_id": record.attempt_id,
++                "engine_incarnation": self.lora_engine_incarnation,
++                "state": record.state,
++            },
 +        )
 +
-+    async def _update_lora_from_distributed_begin(
-+        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
-+    ) -> UpdateLoRAFromDistributedReqOutput:
-+        """``op=begin``: open the staged slot and hand out the candidate identity.
-+
-+        Runs before any collective, so every refusal here is provably clean: no
-+        worker has received anything and the name stays unresolvable.
-+        """
-+
-+        if obj.attempt_id is None:
++    async def _update_lora_from_distributed_begin(self, obj):
++        # Protocol 2 senders claim one transport owner before Begin. Protocol 1
++        # senders can replay broadcasts, so they must be refused before any data.
++        if obj.protocol_version != 2 or obj.attempt_id is None:
 +            return UpdateLoRAFromDistributedReqOutput(
-+                success=False, error_message="op=begin requires attempt_id"
++                success=False, error_message="publication protocol 2 required"
 +            )
-+        attempt = (obj.lora_name, int(obj.attempt_id))
++        self._ensure_lora_publication_state()
++        key = (obj.lora_name, int(obj.attempt_id))
 +        async with self.model_update_lock.reader_lock:
 +            async with self.lora_update_lock:
-+                staged = self.staged_lora_publication
-+                if staged is not None and (
-+                    staged.lora_name,
-+                    staged.attempt_id,
-+                ) != attempt:
++                if key in self.lora_publication_closed:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="attempt is ABORTED"
++                    )
++                latest = self.lora_publication_attempts.get(obj.lora_name, -1)
++                if obj.attempt_id < latest:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="stale attempt"
++                    )
++                existing = self.lora_publications.get(key)
++                if existing is not None:
++                    identity_fields = (
++                        "version_id",
++                        "digest",
++                        "config_dict",
++                        "expected_checksums",
++                        "names",
++                        "dtypes",
++                        "shapes",
++                        "bucket_sizes",
++                        "group_name",
++                        "pinned",
++                        "added_tokens_config",
++                        "protocol_version",
++                    )
++                    if any(
++                        getattr(existing.request, field) != getattr(obj, field)
++                        for field in identity_fields
++                    ):
++                        return UpdateLoRAFromDistributedReqOutput(
++                            success=False, error_message="Begin identity conflict"
++                        )
++                    return self._publication_result(existing)
++                if (
++                    self.staged_lora_publication is not None
++                    or obj.lora_name in self.lora_registry.get_all_adapters()
++                ):
 +                    return UpdateLoRAFromDistributedReqOutput(
 +                        success=False,
-+                        error_message=(
-+                            "another staged LoRA publication is in flight: "
-+                            f"('{staged.lora_name}', {staged.attempt_id})"
-+                        ),
++                        error_message="publication slot or name is occupied",
 +                    )
-+                if obj.lora_name in self.lora_registry.get_all_adapters():
++                if (
++                    not obj.version_id
++                    or not obj.digest
++                    or not obj.expected_checksums
++                    or not obj.names
++                    or not obj.bucket_sizes
++                ):
 +                    return UpdateLoRAFromDistributedReqOutput(
 +                        success=False,
-+                        error_message=(
-+                            f"LoRA '{obj.lora_name}' is already registered; a staged "
-+                            "publication must use a fresh immutable name"
-+                        ),
++                        error_message="missing frozen publication manifest",
 +                    )
-+                if staged is None:
-+                    staged = StagedLoRAPublication(
++                if (
++                    set(obj.names) != set(obj.expected_checksums)
++                    or len(obj.names) != len(set(obj.names))
++                    or len(obj.names) != len(obj.dtypes or [])
++                    or len(obj.names) != len(obj.shapes or [])
++                    or any(count <= 0 for count in obj.bucket_sizes)
++                    or sum(obj.bucket_sizes) != len(obj.names)
++                ):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="invalid bucket plan"
++                    )
++                digest = hashlib.sha256()
++                digest.update(
++                    json.dumps(
++                        dict(obj.config_dict or {}),
++                        sort_keys=True,
++                        separators=(",", ":"),
++                        default=str,
++                    ).encode()
++                )
++                for name in sorted(obj.expected_checksums):
++                    digest.update(name.encode())
++                    digest.update(obj.expected_checksums[name].encode())
++                if digest.hexdigest() != obj.digest:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="publication digest conflict"
++                    )
++                record = StagedLoRAPublication(
++                    lora_name=obj.lora_name,
++                    attempt_id=obj.attempt_id,
++                    lora_ref=LoRARef(
 +                        lora_name=obj.lora_name,
-+                        attempt_id=int(obj.attempt_id),
-+                        lora_ref=LoRARef(
-+                            lora_name=obj.lora_name,
-+                            lora_path="__distributed__",
-+                            pinned=bool(obj.pinned),
-+                        ),
-+                        config_dict=dict(obj.config_dict or {}),
-+                    )
-+                    self.staged_lora_publication = staged
-+                # Record the attempt so that a late unload of a superseded one can be
-+                # told apart from the cleanup of this very candidate (see unload).
-+                self.lora_publication_attempts[obj.lora_name] = int(obj.attempt_id)
-+                # A retransmitted Begin of the same attempt is idempotent and keeps the
-+                # candidate's identity (and its lora_id) stable; the workers keep any
-+                # buckets that already arrived.
-+                obj.lora_id = staged.lora_ref.lora_id
++                        lora_path="__distributed__",
++                        pinned=True,
++                    ),
++                    config_dict=dict(obj.config_dict or {}),
++                    request=obj,
++                )
++                self.lora_publication_attempts[obj.lora_name] = obj.attempt_id
++                obj.lora_id = record.lora_ref.lora_id
++                obj.pinned = True
 +                result = _merge_lora_update_results(
 +                    await self.update_lora_adapter_communicator(obj)
 +                )
 +                if not result.success:
-+                    # Nothing was broadcast yet, so reject the whole attempt and free the
-+                    # slot; the publisher may retry with a new attempt_id.
-+                    self.staged_lora_publication = None
-+                return result
++                    self.lora_publication_closed.add(key)
++                    return result
++                self.lora_publications[key] = record
++                self.staged_lora_publication = record
++                return self._publication_result(record)
 +
-+    async def _update_lora_from_distributed_bucket(
-+        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
-+    ) -> UpdateLoRAFromDistributedReqOutput:
-+        """``op=bucket``: relay one collective.
-+
-+        Deliberately unconditional: the sender is already inside the collective when
-+        this call arrives, so the payload is always received and any semantic verdict
-+        (new bucket, duplicate, stale attempt) is reached by the workers *after* the
-+        transfer. The tokenizer keeps no per-bucket state, which is what makes a
-+        refused attempt callable without a session to revive.
-+        """
-+
-+        async with self.model_update_lock.reader_lock:
-+            return _merge_lora_update_results(
-+                await self.update_lora_adapter_communicator(obj)
-+            )
-+
-+    async def _update_lora_from_distributed_end(
-+        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
-+    ) -> UpdateLoRAFromDistributedReqOutput:
-+        """``op=end``: load the verified candidate and register it locally.
-+
-+        Registering here makes the version resolvable by generation, but it stays
-+        *invisible to sessions* until the publisher commits it fleet-wide in the
-+        LoRA version registry -- the engine has no say in which version is current.
-+        """
-+
++    async def _update_lora_from_distributed_bucket(self, obj):
++        self._ensure_lora_publication_state()
 +        async with self.model_update_lock.reader_lock:
 +            async with self.lora_update_lock:
-+                staged = self.staged_lora_publication
-+                if staged is None or (
-+                    staged.lora_name,
-+                    staged.attempt_id,
-+                ) != (obj.lora_name, int(obj.attempt_id or -1)):
++                key = (obj.lora_name, obj.attempt_id)
++                record = self.lora_publications.get(key)
++                if key in self.lora_publication_closed or record is None:
 +                    return UpdateLoRAFromDistributedReqOutput(
-+                        success=False,
-+                        error_message=(
-+                            "no staged LoRA publication for "
-+                            f"('{obj.lora_name}', {obj.attempt_id})"
-+                        ),
++                        success=False, error_message="unknown or closed attempt"
 +                    )
-+                obj.lora_id = staged.lora_ref.lora_id
-+                obj.config_dict = staged.config_dict
++                # All concurrent duplicates wait for the first call under this lock.
++                # Protocol 2 guarantees they do not carry another source broadcast.
++                duplicate = obj.bucket_index in record.buckets
++                if not duplicate and (
++                    record.state != "PREPARED"
++                    or obj.bucket_index != len(record.buckets)
++                ):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="unexpected bucket"
++                    )
++                plan = record.request
++                index = obj.bucket_index
++                if index >= len(plan.bucket_sizes):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="bucket out of range"
++                    )
++                start = sum(plan.bucket_sizes[:index])
++                end = start + plan.bucket_sizes[index]
++                if (
++                    obj.names != plan.names[start:end]
++                    or obj.dtypes != plan.dtypes[start:end]
++                    or obj.shapes != plan.shapes[start:end]
++                    or obj.bucket_sizes != [end - start]
++                    or obj.group_name != plan.group_name
++                ):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="bucket plan conflict"
++                    )
++                if duplicate:
++                    return record.buckets[index]
 +                result = _merge_lora_update_results(
 +                    await self.update_lora_adapter_communicator(obj)
 +                )
-+                # Either way the attempt is over: on success the version lives in the
-+                # registry under this exact lora_id, on failure the publisher cleans the
-+                # unpublished leftovers up by name (never by reviving this candidate).
-+                self.staged_lora_publication = None
-+                if result.success:
-+                    await self.lora_registry.register(staged.lora_ref)
-+                    logger.info(
-+                        "Staged LoRA publication ('%s', %d) is READY_LOCAL as %s",
-+                        staged.lora_name,
-+                        staged.attempt_id,
-+                        staged.lora_ref.lora_id,
-+                    )
++                record.buckets[index] = result
++                if not result.success:
++                    record.state = "FAILED"
 +                return result
 +
-+    async def _update_lora_from_distributed_unload(
-+        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
-+    ) -> UpdateLoRAFromDistributedReqOutput:
-+        """``op=unload``: idempotent, name-scoped cleanup and reclamation.
++    async def _update_lora_from_distributed_end(self, obj):
++        self._ensure_lora_publication_state()
++        async with self.model_update_lock.reader_lock:
++            async with self.lora_update_lock:
++                key = (obj.lora_name, obj.attempt_id)
++                record = self.lora_publications.get(key)
++                if key in self.lora_publication_closed or record is None:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="unknown or closed attempt"
++                    )
++                if obj.expected_checksums != record.request.expected_checksums:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="manifest conflict"
++                    )
++                if record.state == "READY_LOCAL":
++                    return self._publication_result(record)
++                if record.result is not None:
++                    return record.result
++                if record.state != "PREPARED" or len(record.buckets) != len(
++                    record.request.bucket_sizes
++                ):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False, error_message="incomplete publication"
++                    )
++                obj.lora_id = record.lora_ref.lora_id
++                obj.config_dict = record.config_dict
++                obj.pinned = True
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
++                record.result = result
++                self.staged_lora_publication = None
++                if not result.success:
++                    record.state = "FAILED"
++                    return result
++                await self.lora_registry.register(record.lora_ref)
++                record.state = "READY_LOCAL"
++                return self._publication_result(record)
 +
-+        Covers both situations a publisher needs: a candidate that never became
-+        visible (drop the staged record, discard whatever the workers stashed or half
-+        loaded) and a version that is registered here but must go away (unregister ->
-+        drain in-flight users -> physical unload). An absent name is success, which is
-+        what lets the publisher clean up after a failed attempt without knowing how
-+        far the attempt got on each engine.
++    async def _update_lora_from_distributed_unload(self, obj):
++        self._ensure_lora_publication_state()
++        key = (obj.lora_name, obj.attempt_id)
++        task = self.lora_publication_unloads.get(key)
++        if task is None:
++            task = asyncio.create_task(self._unload_publication_once(obj))
++            self.lora_publication_unloads[key] = task
++        # A disconnected control caller must not cancel wait_for_unload after
++        # unregister, letting a duplicate request skip the native refcount wait.
++        return await asyncio.shield(task)
 +
-+        The name alone is not a safe fence: a retry of the same version reuses it, so an
-+        attempt-scoped unload whose attempt has been superseded here is ignored instead
-+        of unregistering (or asking the workers to drop) the instance that newer attempt
-+        loaded. Reclaim does not carry an attempt_id because a version can only be
-+        reclaimed after it is published, and a published version never gets a new attempt.
-+        """
-+
++    async def _unload_publication_once(self, obj):
 +        async with self.lora_update_lock:
-+            attempt_id = None if obj.attempt_id is None else int(obj.attempt_id)
++            attempt_id = obj.attempt_id
 +            latest = self.lora_publication_attempts.get(obj.lora_name)
 +            if attempt_id is not None and latest is not None and attempt_id < latest:
-+                logger.warning(
-+                    "Ignoring stale LoRA unload (attempt %d) for '%s': attempt %d owns "
-+                    "the name now (%s)",
-+                    attempt_id,
-+                    obj.lora_name,
-+                    latest,
-+                    obj.reason or "cleanup",
-+                )
 +                return UpdateLoRAFromDistributedReqOutput(success=True)
++            if attempt_id is None:
++                attempt_id = latest
++            if attempt_id is not None:
++                key = (obj.lora_name, attempt_id)
++                # Keep the fence even when cleanup arrives before Begin. Do not
++                # mistake a tombstone for physical-unload completion on retries.
++                self.lora_publication_closed.add(key)
++                self.lora_publication_attempts[obj.lora_name] = max(
++                    attempt_id, latest or attempt_id
++                )
 +            staged = self.staged_lora_publication
 +            if staged is not None and staged.lora_name == obj.lora_name:
 +                self.staged_lora_publication = None
-+                logger.info(
-+                    "Dropping staged LoRA candidate ('%s', %d): %s",
-+                    staged.lora_name,
-+                    staged.attempt_id,
-+                    obj.reason or "cleanup",
-+                )
 +            if obj.lora_name in self.lora_registry.get_all_adapters():
-+                # Stop new requests from resolving the name, then wait for the ones
-+                # already holding a reference before touching the weights.
 +                lora_id = await self.lora_registry.unregister(obj.lora_name)
 +                await self.lora_registry.wait_for_unload(lora_id)
 +            result = _merge_lora_update_results(
 +                await self.update_lora_adapter_communicator(obj)
 +            )
-+            if result.success:
-+                # The name is gone for good: nothing can be fenced against it any more.
-+                self.lora_publication_attempts.pop(obj.lora_name, None)
 +            return result
 +
      async def unload_lora_adapter(
          self: TokenizerManager,
          obj: UnloadLoRAAdapterReqInput,
-@@ -797,6 +1158,19 @@ class TokenizerControlMixin:
+@@ -796,6 +1344,19 @@
+     ):
          self.auto_create_handle_loop()
          await self.resume_memory_occupation_communicator(obj)
- 
++
 +    async def post_process_weights(
 +        self: TokenizerManager,
 +        obj: PostProcessWeightsReqInput,
@@ -2244,10 +2481,9 @@ index 7cfd98b..6d398e3 100644
 +        async with self.model_update_lock.writer_lock:
 +            results = await self.post_process_weights_communicator(obj)
 +        return FanOutCommunicator.merge_results(results)
-+
+ 
      async def check_weights(
          self: TokenizerManager,
-         obj: CheckWeightsReqInput,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
 index 80351f3..965a603 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
@@ -2573,10 +2809,9 @@ index 2916f8c6..32b81c49 100644
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8e957f6..48aa9a3 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -376,9 +376,10 @@ class ModelRunner:
+@@ -376,9 +376,10 @@
          self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
  
          # CPU offload
@@ -2590,7 +2825,7 @@ index 8e957f6..48aa9a3 100644
  
          self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
  
-@@ -1183,10 +1184,400 @@ class ModelRunner:
+@@ -1183,9 +1184,389 @@
              lora_ref, tensors, config_dict, added_tokens_config
          )
  
@@ -2598,8 +2833,8 @@ index 8e957f6..48aa9a3 100644
 +        """Collectively receive the announced adapter tensors, bucket by bucket.
 +
 +        Every participant must issue exactly the same broadcasts as the source, so
-+        callers that turn out to be uninterested in the payload (a stale attempt, a
-+        duplicate bucket) still call this and drop the result afterwards. Each
++        staged callers validate the attempt and suppress duplicate control calls
++        before invoking this helper. Each
 +        bucket is staged on device, received, then moved to host memory and
 +        released, so peak device memory is ONE bucket instead of the whole adapter:
 +        a MoE adapter runs to several GB, and allocating that on top of the KV cache
@@ -2694,7 +2929,7 @@ index 8e957f6..48aa9a3 100644
      def unload_lora_adapter(self, lora_ref: LoRARef):
          """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
          return self.lora_manager.unload_lora_adapter(lora_ref)
- 
++
 +    # ------------------------------------------------------------------
 +    # Staged LoRA publication (one candidate at a time)
 +    #
@@ -2716,6 +2951,9 @@ index 8e957f6..48aa9a3 100644
 +            # never revives it, so a late bucket is drained and reported rather than
 +            # mistaken for a brand new session.
 +            self.staged_lora_terminal: Optional[Tuple[str, int, str]] = None
++            self.staged_lora_terminals = {}
++            self.staged_lora_attempts = {}
++            self.staged_lora_unloaded = set()
 +
 +    def _discard_staged_lora(self, state: Optional[str] = None) -> None:
 +        self._ensure_staged_lora_state()
@@ -2725,6 +2963,7 @@ index 8e957f6..48aa9a3 100644
 +                self.staged_lora_key[1],
 +                state or "ABORTED",
 +            )
++            self.staged_lora_terminals[self.staged_lora_key] = state or "ABORTED"
 +        self.staged_lora_key = None
 +        self.staged_lora_buckets.clear()
 +
@@ -2732,12 +2971,12 @@ index 8e957f6..48aa9a3 100644
 +        """Answer an RPC that belongs to an already finished attempt."""
 +        from sglang.srt.managers.io_struct import LoRAUpdateOutput
 +
-+        ready = self.staged_lora_terminal[2] == "READY_LOCAL"
++        ready = self.staged_lora_terminals[attempt] == "READY_LOCAL"
 +        return LoRAUpdateOutput(
 +            success=ready,
 +            error_message=None
 +            if ready
-+            else f"staged LoRA attempt {attempt} is {self.staged_lora_terminal[2]}; {what}",
++            else f"staged LoRA attempt {attempt} is {self.staged_lora_terminals[attempt]}; {what}",
 +        )
 +
 +    def stage_lora_begin(self, recv_req):
@@ -2752,13 +2991,16 @@ index 8e957f6..48aa9a3 100644
 +
 +        self._ensure_staged_lora_state()
 +        attempt = (recv_req.lora_name, int(recv_req.attempt_id))
-+        if (
-+            self.staged_lora_terminal is not None
-+            and self.staged_lora_terminal[:2] == attempt
-+        ):
++        if attempt in self.staged_lora_terminals:
 +            # Retransmitted Begin of a finished attempt: report the terminal state
 +            # instead of reviving it (a full retry uses a new attempt_id).
 +            return self._staged_terminal_reply(attempt, recv_req.lora_name, "begin")
++        if recv_req.protocol_version != 2:
++            return LoRAUpdateOutput(
++                success=False, error_message="publication protocol 2 required"
++            )
++        if attempt[1] < self.staged_lora_attempts.get(attempt[0], -1):
++            return LoRAUpdateOutput(success=False, error_message="stale attempt")
 +        if self.staged_lora_key is not None and self.staged_lora_key != attempt:
 +            return LoRAUpdateOutput(
 +                success=False,
@@ -2779,6 +3021,7 @@ index 8e957f6..48aa9a3 100644
 +            # A new attempt starts from an empty stash; the same attempt's duplicate
 +            # Begin keeps whatever buckets already arrived.
 +            self.staged_lora_key = attempt
++            self.staged_lora_attempts[attempt[0]] = attempt[1]
 +            self.staged_lora_buckets.clear()
 +        logger.info(
 +            f"Staged LoRA publication {attempt} accepted: "
@@ -2787,14 +3030,7 @@ index 8e957f6..48aa9a3 100644
 +        return LoRAUpdateOutput(success=True)
 +
 +    def stage_lora_bucket(self, recv_req):
-+        """``op=bucket``: participate in the broadcast, then classify what it was for.
-+
-+        Participation is unconditional and comes first: the sender is already
-+        inside the collective when this call arrives, so a receiver that skipped it
-+        would desync the whole group and wedge every later publication. Only once
-+        the tensors are in does the handler decide whether they belong to the
-+        candidate (stash), are a duplicate (drain), or are stale (drain and report).
-+        """
++        """Receive each claimed protocol-2 bucket once; replay only its result."""
 +        from sglang.srt.managers.io_struct import LoRAUpdateOutput
 +
 +        self._ensure_staged_lora_state()
@@ -2802,6 +3038,20 @@ index 8e957f6..48aa9a3 100644
 +        index = int(recv_req.bucket_index)
 +        active = self.staged_lora_key == attempt
 +        duplicate = active and index in self.staged_lora_buckets
++        # Protocol 2 forbids a second source broadcast for the same attempt/bucket.
++        # Duplicate control delivery must therefore never re-enter NCCL.
++        if not active:
++            if attempt in self.staged_lora_terminals:
++                return self._staged_terminal_reply(
++                    attempt, recv_req.lora_name, "bucket replay"
++                )
++            return LoRAUpdateOutput(
++                success=False, error_message="unknown staged attempt"
++            )
++        if duplicate:
++            return LoRAUpdateOutput(success=True)
++        if index != len(self.staged_lora_buckets):
++            return LoRAUpdateOutput(success=False, error_message="out-of-order bucket")
 +        try:
 +            tensors = self._receive_lora_buckets(
 +                recv_req.names,
@@ -2816,6 +3066,7 @@ index 8e957f6..48aa9a3 100644
 +            # simply retry as if nothing had crossed the wire. Logged with the
 +            # traceback: this verdict fails the publication closed and the caller
 +            # only ever sees the one-line message.
++            self._discard_staged_lora(state="FAILED")
 +            logger.error(
 +                f"Staged LoRA bucket {index} of {attempt} failed to receive: {e}",
 +                exc_info=True,
@@ -2825,25 +3076,8 @@ index 8e957f6..48aa9a3 100644
 +                error_message=f"staged LoRA bucket {index} receive failed: {e}",
 +                clean=False,
 +            )
-+        if active:
-+            if duplicate:
-+                logger.warning(
-+                    f"Staged LoRA publication {attempt}: duplicate bucket {index} drained"
-+                )
-+                return LoRAUpdateOutput(success=True)
-+            self.staged_lora_buckets[index] = tensors
-+            return LoRAUpdateOutput(success=True)
-+        if (
-+            self.staged_lora_terminal is not None
-+            and self.staged_lora_terminal[:2] == attempt
-+        ):
-+            return self._staged_terminal_reply(
-+                attempt, recv_req.lora_name, f"bucket {index} drained"
-+            )
-+        return LoRAUpdateOutput(
-+            success=False,
-+            error_message=f"no staged LoRA publication for {attempt}; bucket {index} drained",
-+        )
++        self.staged_lora_buckets[index] = tensors
++        return LoRAUpdateOutput(success=True)
 +
 +    def stage_lora_end(self, recv_req):
 +        """``op=end``: verify the stash, then load it locally.
@@ -2859,13 +3093,8 @@ index 8e957f6..48aa9a3 100644
 +        self._ensure_staged_lora_state()
 +        attempt = (recv_req.lora_name, int(recv_req.attempt_id))
 +        if self.staged_lora_key != attempt:
-+            if (
-+                self.staged_lora_terminal is not None
-+                and self.staged_lora_terminal[:2] == attempt
-+            ):
-+                return self._staged_terminal_reply(
-+                    attempt, recv_req.lora_name, "end"
-+                )
++            if attempt in self.staged_lora_terminals:
++                return self._staged_terminal_reply(attempt, recv_req.lora_name, "end")
 +            return LoRAUpdateOutput(
 +                success=False, error_message=f"no staged LoRA publication for {attempt}"
 +            )
@@ -2892,7 +3121,10 @@ index 8e957f6..48aa9a3 100644
 +                success=False, error_message=f"staged LoRA manifest rejected: {e}"
 +            )
 +        result = self.lora_manager.load_lora_adapter_from_tensors(
-+            recv_req.to_ref(), tensors, recv_req.config_dict, recv_req.added_tokens_config
++            recv_req.to_ref(),
++            tensors,
++            recv_req.config_dict,
++            recv_req.added_tokens_config,
 +        )
 +        if not result.success:
 +            # The load may have written configs/backend state before failing, and v1 has
@@ -2903,7 +3135,15 @@ index 8e957f6..48aa9a3 100644
 +                f"{self.ps.tp_rank}: {result.error_message}"
 +            )
 +            result.clean = False
++            self._discard_staged_lora(state="FAILED")
 +            return result
++        try:
++            self._prepare_staged_lora(recv_req.lora_id)
++        except Exception as error:
++            self._discard_staged_lora(state="FAILED")
++            return LoRAUpdateOutput(
++                success=False, error_message=str(error), clean=False
++            )
 +        self._discard_staged_lora(state="READY_LOCAL")
 +        # No LRU eviction here: the staged protocol's own capacity accounting keeps the
 +        # number of registered versions within `max_loaded_loras`, and every version it
@@ -2911,49 +3151,34 @@ index 8e957f6..48aa9a3 100644
 +        logger.info(f"Staged LoRA publication {attempt} loaded locally (READY_LOCAL).")
 +        return result
 +
++    def _prepare_staged_lora(self, lora_id):
++        # Materialize the pinned adapter's GPU slot before acknowledging READY.
++        self.lora_manager.fetch_new_loras({lora_id})
++        torch.get_device_module(self.device).synchronize()
++
 +    def unload_lora_from_distributed(self, recv_req):
-+        """``op=unload``: idempotent, name-scoped cleanup.
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
 +
-+        Covers both branches a publisher needs after a failed attempt: a staged
-+        candidate (discarded, along with any half-loaded orphan) and a version that
-+        loaded locally but was never fleet-published. Absent is success, so the
-+        caller can retry from a clean slate.
-+
-+        A name-scoped request needs an attempt fence: a retry of the same immutable
-+        name is a *new* attempt, so a late/duplicated cleanup of an older one must not
-+        discard the newer stash nor unload the instance the newer attempt loaded. The
-+        newest attempt this rank knows about for the name is the newer of the in-flight
-+        stash key and the terminal marker of the last finished attempt; an older
-+        attempt_id is reported as success (its candidate was already discarded when the
-+        newer attempt began) without touching anything.
-+        """
 +        self._ensure_staged_lora_state()
-+        attempt_id = None if recv_req.attempt_id is None else int(recv_req.attempt_id)
-+        staged = self.staged_lora_key
++        name = recv_req.lora_name
++        latest = self.staged_lora_attempts.get(name)
++        attempt_id = recv_req.attempt_id if recv_req.attempt_id is not None else latest
++        if attempt_id is not None and latest is not None and attempt_id < latest:
++            return LoRAUpdateOutput(success=True)
++        key = (name, attempt_id)
++        if key in self.staged_lora_unloaded:
++            return LoRAUpdateOutput(success=True)
++        # This must also run when cleanup overtakes Begin, and after READY_LOCAL.
 +        if attempt_id is not None:
-+            latest = None
-+            if staged is not None and staged[0] == recv_req.lora_name:
-+                latest = staged[1]
-+            terminal = self.staged_lora_terminal
-+            if (
-+                terminal is not None
-+                and terminal[0] == recv_req.lora_name
-+                and (latest is None or terminal[1] > latest)
-+            ):
-+                latest = terminal[1]
-+            if latest is not None and attempt_id < latest:
-+                logger.warning(
-+                    f"Ignoring stale staged LoRA unload for {recv_req.lora_name}: "
-+                    f"attempt {attempt_id} < {latest} ({recv_req.reason or 'cleanup'})"
-+                )
-+                from sglang.srt.managers.io_struct import LoRAUpdateOutput
-+
-+                return LoRAUpdateOutput(success=True)
-+        if staged is not None and staged[0] == recv_req.lora_name and (
-+            attempt_id is None or staged[1] == attempt_id
-+        ):
++            self.staged_lora_attempts[name] = max(attempt_id, latest or attempt_id)
++            self.staged_lora_terminals[key] = "ABORTED"
++            self.staged_lora_terminal = (name, attempt_id, "ABORTED")
++        if self.staged_lora_key is not None and self.staged_lora_key[0] == name:
 +            self._discard_staged_lora()
-+        return self.lora_manager.unload_lora_adapter_by_name(recv_req.lora_name)
++        result = self.lora_manager.unload_lora_adapter_by_name(name)
++        if result.success:
++            self.staged_lora_unloaded.add(key)
++        return result
 +
 +    def post_process_weights(
 +        self,
@@ -2987,11 +3212,10 @@ index 8e957f6..48aa9a3 100644
 +                        quant_method.process_weights_after_loading(module)
 +
 +        return True, "Success"
-+
+ 
      @property
      def effective_max_total_num_tokens(self):
-         """Return the max token pool size considering hybrid swa settings."""
-@@ -1441,6 +1832,12 @@ class ModelRunner:
+@@ -1441,6 +1822,12 @@
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -3004,7 +3228,7 @@ index 8e957f6..48aa9a3 100644
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1448,7 +1845,7 @@ class ModelRunner:
+@@ -1448,7 +1835,7 @@
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -3013,7 +3237,7 @@ index 8e957f6..48aa9a3 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -1456,7 +1853,7 @@ class ModelRunner:
+@@ -1456,7 +1843,7 @@
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,

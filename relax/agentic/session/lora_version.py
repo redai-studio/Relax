@@ -68,6 +68,7 @@ CAPACITY_OWNING_STATES = frozenset(
         VersionState.PUBLISHED,
         VersionState.RETIRED,
         VersionState.RECLAIMING,
+        VersionState.FAILED_FATAL,
     }
 )
 
@@ -95,6 +96,10 @@ class VersionEntry:
     #: A reclaim whose outcome could not be confirmed; the version stays RECLAIMING
     #: (capacity NOT released) and the run fails closed.
     reclaim_fatal: bool = False
+    driven: bool = False
+    expected_default_revision: int = 0
+    prepared_incarnations: Dict[str, str] = field(default_factory=dict)
+    ready_incarnations: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,7 @@ class LoRAVersionRegistry:
         self.default_version: Optional[int] = None
         self.default_revision = 0
         self.next_version_id = 1
+        self.target_engines = frozenset({"engine0", "engine1"})
 
     # ------------------------------------------------------------------
     # Internals
@@ -175,6 +181,10 @@ class LoRAVersionRegistry:
 
     def _capacity_owning(self) -> int:
         return sum(1 for entry in self.versions.values() if entry.state in CAPACITY_OWNING_STATES)
+
+    def _require_known_fleet(self) -> None:
+        if any(entry.state is VersionState.FAILED_FATAL or entry.reclaim_fatal for entry in self.versions.values()):
+            raise LoRAVersionError("PUBLICATION_BLOCKED", "unconfirmed engine state requires deployment recovery")
 
     def _admit_capacity(self) -> None:
         if self._capacity_owning() >= self.logical_capacity:
@@ -228,6 +238,7 @@ class LoRAVersionRegistry:
         transport is attempted.
         """
 
+        self._require_known_fleet()
         live = self._version_by_digest(digest)
 
         if live is not None and live.state is VersionState.PUBLISHED:
@@ -248,10 +259,13 @@ class LoRAVersionRegistry:
             raise LoRAVersionError("VERSION_FATAL", f"version {live.version_id} failed fatally for this content")
 
         self._admit_capacity()
+        if any(entry.state is VersionState.LOADING for entry in self.versions.values()):
+            raise LoRAVersionError("PUBLICATION_IN_PROGRESS", "another publication attempt is unresolved")
         entry = VersionEntry(
             version_id=self.next_version_id,
             digest=digest,
             lora_name=self._make_name(self.next_version_id, digest),
+            expected_default_revision=self.default_revision,
         )
         self.next_version_id += 1
         self.versions[entry.version_id] = entry
@@ -287,10 +301,71 @@ class LoRAVersionRegistry:
                 "INVALID_STATE",
                 f"version {version_id} is {entry.state.value}; only FAILED_RETRYABLE may retry",
             )
+        self._require_known_fleet()
         self._admit_capacity()
+        if any(other.state is VersionState.LOADING for other in self.versions.values()):
+            raise LoRAVersionError("PUBLICATION_IN_PROGRESS", "another publication attempt is unresolved")
         entry.current_attempt_id += 1
         entry.state = VersionState.LOADING
+        entry.driven = False
+        entry.expected_default_revision = self.default_revision
+        entry.prepared_incarnations.clear()
+        entry.ready_incarnations.clear()
         return self._publication(entry)
+
+    def claim_publication(self, version_id: int, attempt_id: int) -> None:
+        """Grant exactly one caller permission to send this attempt's
+        collectives.
+
+        Losing the reply or the publisher never grants another driver
+        permission to replay it. Recovery requires a confirmed cleanup and a
+        fresh attempt.
+        """
+        entry = self._entry(version_id)
+        self._require_attempt(entry, attempt_id)
+        self._require_known_fleet()
+        if entry.state is not VersionState.LOADING or entry.driven:
+            raise LoRAVersionError("PUBLICATION_IN_PROGRESS", "this attempt already has a transport owner")
+        entry.driven = True
+
+    def _receipt_incarnations(self, entry: VersionEntry, receipts: Dict[str, dict], state: str) -> Dict[str, str]:
+        if set(receipts) != self.target_engines:
+            raise LoRAVersionError("FLEET_MISMATCH", "both fixed target engines must acknowledge publication")
+        identity = {
+            "lora_name": entry.lora_name,
+            "version_id": entry.version_id,
+            "digest": entry.digest,
+            "attempt_id": entry.current_attempt_id,
+        }
+        incarnations = {}
+        for engine, receipt in receipts.items():
+            if any(receipt.get(key) != value for key, value in identity.items()) or receipt.get("state") != state:
+                raise LoRAVersionError("READY_MISMATCH", f"{engine} acknowledged a different publication")
+            incarnation = receipt.get("engine_incarnation")
+            if not isinstance(incarnation, str) or not incarnation:
+                raise LoRAVersionError("READY_MISMATCH", f"{engine} omitted its incarnation")
+            incarnations[engine] = incarnation
+        return incarnations
+
+    def record_prepared(self, version_id: int, attempt_id: int, receipts: Dict[str, dict]) -> None:
+        entry = self._entry(version_id)
+        self._require_attempt(entry, attempt_id)
+        if entry.state is not VersionState.LOADING or not entry.driven:
+            raise LoRAVersionError("INVALID_STATE", "publication transport has not been claimed")
+        incarnations = self._receipt_incarnations(entry, receipts, "PREPARED")
+        if entry.prepared_incarnations and entry.prepared_incarnations != incarnations:
+            raise LoRAVersionError("ENGINE_RESTARTED", "prepared engine incarnation changed")
+        entry.prepared_incarnations = incarnations
+
+    def record_ready(self, version_id: int, attempt_id: int, receipts: Dict[str, dict]) -> None:
+        entry = self._entry(version_id)
+        self._require_attempt(entry, attempt_id)
+        if entry.state is not VersionState.LOADING:
+            raise LoRAVersionError("INVALID_STATE", "only a loading publication can become ready")
+        incarnations = self._receipt_incarnations(entry, receipts, "READY_LOCAL")
+        if incarnations != entry.prepared_incarnations:
+            raise LoRAVersionError("ENGINE_RESTARTED", "READY belongs to a different engine incarnation")
+        entry.ready_incarnations = incarnations
 
     def mark_published(self, version_id: int, attempt_id: int) -> Publication:
         """Fleet commit: the linearization point for "new Sessions use B".
@@ -311,6 +386,11 @@ class LoRAVersionRegistry:
             raise LoRAVersionError("INVALID_STATE", f"version {version_id} is {entry.state.value}")
         self._require_attempt(entry, attempt_id)
 
+        self._require_known_fleet()
+        if set(entry.ready_incarnations) != self.target_engines:
+            raise LoRAVersionError("NOT_READY", "both engines must be ready before commit")
+        if entry.expected_default_revision != self.default_revision:
+            raise LoRAVersionError("REVISION_CONFLICT", "default changed since publication reservation")
         previous = self.default_version
         entry.state = VersionState.PUBLISHED
         self.default_version = version_id

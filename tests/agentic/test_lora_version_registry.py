@@ -15,6 +15,7 @@ from relax.agentic.session.lora_version import (
     LoRAVersionRegistry,
     VersionState,
 )
+from tests.agentic.lora_helpers import commit_ready
 
 
 DIGEST_A = "a" * 64
@@ -31,7 +32,7 @@ def publish(registry: LoRAVersionRegistry, digest: str):
     """Reserve + commit a version, the way the publisher does."""
 
     publication = registry.allocate(digest)
-    registry.mark_published(publication.version_id, publication.attempt_id)
+    commit_ready(registry, publication.version_id, publication.attempt_id)
     return publication
 
 
@@ -85,7 +86,7 @@ class TestFleetCommit:
         assert registry.bind_latest("s_mid").lora_name == a.lora_name
         assert registry.status().default_version == a.version_id
 
-        registry.mark_published(b.version_id, b.attempt_id)
+        commit_ready(registry, b.version_id, b.attempt_id)
         assert registry.bind_latest("s_new").lora_name == b.lora_name
         assert registry.status().versions[a.version_id]["state"] == VersionState.RETIRED.value
         assert registry.bind_latest("s_old").lora_name == a.lora_name
@@ -93,9 +94,9 @@ class TestFleetCommit:
     def test_commit_replay_is_idempotent(self, registry):
         a = publish(registry, DIGEST_A)
         b = registry.allocate(DIGEST_B)
-        registry.mark_published(b.version_id, b.attempt_id)
+        commit_ready(registry, b.version_id, b.attempt_id)
         revision = registry.status().default_revision
-        again = registry.mark_published(b.version_id, b.attempt_id)
+        again = commit_ready(registry, b.version_id, b.attempt_id)
         assert again.version_id == b.version_id
         assert registry.status().default_revision == revision
         assert registry.status().versions[a.version_id]["state"] == VersionState.RETIRED.value
@@ -103,7 +104,7 @@ class TestFleetCommit:
     def test_late_commit_of_a_retired_version_never_makes_it_default_again(self, registry):
         a = publish(registry, DIGEST_A)
         publish(registry, DIGEST_B)
-        late = registry.mark_published(a.version_id, a.attempt_id)
+        late = commit_ready(registry, a.version_id, a.attempt_id)
         assert late.version_id == a.version_id
         assert registry.status().default_version != a.version_id
 
@@ -114,7 +115,7 @@ class TestFleetCommit:
         registry.mark_retryable_failure(a.version_id, a.attempt_id)
         registry.retry_publication(a.version_id, DIGEST_A)  # attempt 2 is now current
         with pytest.raises(LoRAVersionError) as error:
-            registry.mark_published(a.version_id, a.attempt_id)
+            commit_ready(registry, a.version_id, a.attempt_id)
         assert error.value.code == "ATTEMPT_CONFLICT"
         with pytest.raises(LoRAVersionError) as error:
             registry.mark_retryable_failure(a.version_id, a.attempt_id)
@@ -256,3 +257,53 @@ class TestReclaim:
     def test_no_reclaim_for_a_default_that_is_still_published(self, registry):
         publish(registry, DIGEST_A)
         assert registry.claim_reclaimable() is None
+
+
+class TestPublicationSafety:
+    def test_fatal_candidate_keeps_capacity_and_blocks_new_publication(self, registry):
+        publish(registry, DIGEST_A)
+        b = registry.allocate(DIGEST_B)
+        registry.mark_fatal_failure(b.version_id, b.attempt_id)
+        assert registry.status().capacity_owning == 2
+        with pytest.raises(LoRAVersionError, match="unconfirmed"):
+            registry.allocate(DIGEST_C)
+
+    def test_only_one_driver_can_claim_an_attempt(self, registry):
+        p = registry.allocate(DIGEST_A)
+        registry.claim_publication(p.version_id, p.attempt_id)
+        replay = registry.allocate(DIGEST_A)
+        with pytest.raises(LoRAVersionError) as error:
+            registry.claim_publication(replay.version_id, replay.attempt_id)
+        assert error.value.code == "PUBLICATION_IN_PROGRESS"
+
+    def test_commit_requires_both_ready_receipts(self, registry):
+        p = registry.allocate(DIGEST_A)
+        with pytest.raises(LoRAVersionError) as error:
+            registry.mark_published(p.version_id, p.attempt_id)
+        assert error.value.code == "NOT_READY"
+        assert registry.default_version is None
+
+    def test_ready_cannot_change_engine_incarnation_or_digest(self, registry):
+        from tests.agentic.lora_helpers import fleet_receipts
+
+        p = registry.allocate(DIGEST_A)
+        entry = registry.versions[p.version_id]
+        registry.claim_publication(p.version_id, p.attempt_id)
+        registry.record_prepared(p.version_id, p.attempt_id, fleet_receipts(entry))
+        for field, value in (("engine_incarnation", "restarted"), ("digest", DIGEST_B)):
+            receipts = fleet_receipts(entry, "READY_LOCAL")
+            receipts["engine1"][field] = value
+            with pytest.raises(LoRAVersionError):
+                registry.record_ready(p.version_id, p.attempt_id, receipts)
+        assert registry.default_version is None
+
+
+def test_direct_retry_cannot_bypass_unconfirmed_other_version(registry):
+    a = registry.allocate(DIGEST_A)
+    registry.mark_retryable_failure(a.version_id, a.attempt_id)
+    b = registry.allocate(DIGEST_B)
+    registry.mark_fatal_failure(b.version_id, b.attempt_id)
+    with pytest.raises(LoRAVersionError) as error:
+        registry.retry_publication(a.version_id, DIGEST_A)
+    assert error.value.code == "PUBLICATION_BLOCKED"
+    assert registry.versions[a.version_id].current_attempt_id == 1

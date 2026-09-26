@@ -614,7 +614,10 @@ class SGLangBackendAdapter:
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            # A lost response does not prove the engine rejected this generation.
+            # Versioned requests may only be retried by the IR lifecycle owner.
+            request_options = {"max_retries": 1} if lora_path is not None else {}
+            output = await post(f"{self._router_url}/generate", payload, headers=headers, **request_options)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error

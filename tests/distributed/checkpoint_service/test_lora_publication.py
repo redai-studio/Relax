@@ -26,6 +26,7 @@ from relax.distributed.checkpoint_service.lora_publication import (
     classify_engine_response,
     materialize_adapter_snapshot,
 )
+from tests.agentic.lora_helpers import commit_ready
 
 
 DIGEST_A = "a" * 64
@@ -57,6 +58,7 @@ class _FakeEngines:
         self.engine_ids = list(engine_ids)
         self.events: List[Tuple[str, str, Any]] = []
         self.replies: Dict[Tuple[str, str], EngineReply] = {}
+        self.identities = {}
         self.silent: set = set()  # engines that never answer
 
     def fail(self, op: str, engine_id: str, ambiguous: bool = False, message: str = "nope") -> None:
@@ -65,6 +67,8 @@ class _FakeEngines:
     def fire(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         op = payload.get("op", "legacy")
         for engine_id in self.engine_ids:
+            if op == "begin":
+                self.identities[engine_id] = dict(payload)
             self.events.append(("fire", f"{engine_id}:{op}", payload))
         return {engine_id: (engine_id, op) for engine_id in self.engine_ids}
 
@@ -77,7 +81,12 @@ class _FakeEngines:
             self.events.append(("collect", f"{engine_id}:{op}", None))
             if engine_id in self.silent:
                 continue
-            replies[engine_id] = self.replies.get((engine_id, op), EngineReply(True))
+            identity = self.identities.get(engine_id, {})
+            receipt = {key: identity.get(key) for key in ("version_id", "digest", "lora_name", "attempt_id")}
+            receipt.update(
+                engine_incarnation=f"{engine_id}-boot1", state="PREPARED" if op == "begin" else "READY_LOCAL"
+            )
+            replies[engine_id] = self.replies.get((engine_id, op), EngineReply(True, receipt=receipt))
         return replies
 
     # -- assertions helpers --
@@ -114,7 +123,7 @@ def _publisher(
 
 def _publish_a(registry: LoRAVersionRegistry) -> int:
     publication = registry.allocate(DIGEST_A)
-    registry.mark_published(publication.version_id, publication.attempt_id)
+    commit_ready(registry, publication.version_id, publication.attempt_id)
     return publication.version_id
 
 
@@ -184,6 +193,8 @@ class TestPublication:
             "engine1:bucket",
             "engine0:end",
             "engine1:end",
+            "engine0:status",
+            "engine1:status",
         ]
         assert [event[1] for event in engines.events if event[0] == "broadcast"] == ["0", "1"]
         assert outcome.status == "PUBLISHED" and outcome.bucket_count == 2
@@ -218,9 +229,9 @@ class TestPublication:
 
         engines = _FakeEngines()
         a = registry.allocate(DIGEST_A)
-        registry.mark_published(a.version_id, a.attempt_id)
+        commit_ready(registry, a.version_id, a.attempt_id)
         b = registry.allocate(DIGEST_B)
-        registry.mark_published(b.version_id, b.attempt_id)
+        commit_ready(registry, b.version_id, b.attempt_id)
 
         outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
         assert outcome.status == "PUBLISHED"
@@ -356,10 +367,10 @@ class TestReclaim:
         engines = _FakeEngines()
         publisher = _publisher(engines, registry)
         a = registry.allocate(DIGEST_A)
-        registry.mark_published(a.version_id, a.attempt_id)
+        commit_ready(registry, a.version_id, a.attempt_id)
         registry.bind_latest("s_old")
         b = registry.allocate(DIGEST_B)
-        registry.mark_published(b.version_id, b.attempt_id)
+        commit_ready(registry, b.version_id, b.attempt_id)
 
         assert publisher.reclaim_once() is False
         assert "engine0:unload" not in engines.ops()
@@ -379,9 +390,9 @@ class TestReclaim:
         engines = _FakeEngines()
         publisher = _publisher(engines, registry)
         a = registry.allocate(DIGEST_A)
-        registry.mark_published(a.version_id, a.attempt_id)
+        commit_ready(registry, a.version_id, a.attempt_id)
         b = registry.allocate(DIGEST_B)
-        registry.mark_published(b.version_id, b.attempt_id)
+        commit_ready(registry, b.version_id, b.attempt_id)
 
         engines.fail("unload", "engine1", ambiguous=True, message="timeout")
         with pytest.raises(LoRAPublicationError) as error:
@@ -404,33 +415,80 @@ class TestFleetContract:
         assert registry.status().default_version is None
 
 
-class TestOneShotBootstrap:
-    def test_first_sync_loads_under_the_immutable_v1_name(self, registry):
-        """F21: the legacy wire carries the immutable name and establishes the first PUBLISHED."""
-
+class TestBootstrap:
+    def test_first_sync_uses_the_same_staged_protocol(self, registry):
         engines = _FakeEngines()
-        snapshot = _snapshot()
-        seen: Dict[str, Any] = {}
-
-        def _transport(lora_name: str) -> None:
-            seen["lora_name"] = lora_name
-
-        outcome = _publisher(engines, registry).publish_oneshot(snapshot, _transport)
+        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
         assert outcome.status == "PUBLISHED"
-        assert seen["lora_name"] == outcome.lora_name
-        assert outcome.lora_name.startswith("relax_policy_lora@epoch0-1-")
-        assert registry.status().default_version == outcome.version_id
+        assert engines.ops()[:2] == ["engine0:begin", "engine1:begin"]
+        assert engines.ops()[-2:] == ["engine0:status", "engine1:status"]
         assert registry.bind_latest("s1").lora_name == outcome.lora_name
 
-    def test_failed_first_sync_cleans_up_and_stays_retryable(self, registry):
+
+class TestReplaySafety:
+    def test_reentrant_publish_cannot_rebroadcast_loading_attempt(self, registry):
         engines = _FakeEngines()
+        snapshot = _snapshot()
+        publisher = _publisher(engines, registry)
+        original = publisher._broadcast
 
-        def _boom(_lora_name: str) -> None:
-            raise RuntimeError("engine rejected the one-shot load")
+        def broadcast(names, index):
+            before = list(engines.events)
+            with pytest.raises(LoRAVersionError) as error:
+                _publisher(engines, registry).publish(snapshot, [1, 1])
+            assert error.value.code == "PUBLICATION_IN_PROGRESS"
+            assert engines.events == before
+            original(names, index)
 
+        publisher._broadcast = broadcast
+        assert publisher.publish(snapshot, [1, 1]).status == "PUBLISHED"
+        assert sum(event[0] == "broadcast" for event in engines.events) == 2
+
+    def test_ambiguous_bucket_cannot_become_retryable_after_cleanup(self, registry):
+        engines = _FakeEngines()
+        engines.fail("bucket", "engine1", ambiguous=True, message="collective completion unknown")
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish_oneshot(_snapshot(), _boom)
-        assert error.value.kind == "RETRYABLE"
-        assert "engine0:unload" in engines.ops()
-        assert registry.status().default_version is None
-        assert registry.status().versions[1]["state"] == VersionState.FAILED_RETRYABLE.value
+            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        assert error.value.kind == "FATAL"
+        assert registry.status().capacity_owning == 1
+        assert registry.versions[1].state is VersionState.FAILED_FATAL
+        assert "engine0:unload" not in engines.ops()
+
+    def test_missing_bucket_reply_is_not_success(self, registry):
+        engines = _FakeEngines()
+        collect = engines.collect
+
+        def lose_bucket_reply(pending):
+            replies = collect(pending)
+            if next(iter(pending.values()))[1] == "bucket":
+                replies.pop("engine1")
+            return replies
+
+        engines.collect = lose_bucket_reply
+        with pytest.raises(LoRAPublicationError):
+            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        assert registry.default_version is None
+        assert registry.versions[1].state is VersionState.FAILED_FATAL
+
+    def test_single_engine_cannot_publish(self, registry):
+        engines = _FakeEngines(engine_ids=("engine0",))
+        with pytest.raises(LoRAPublicationError):
+            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        assert registry.default_version is None
+        assert not any(event[0] == "broadcast" for event in engines.events)
+
+    def test_restart_between_end_and_commit_blocks_default_switch(self, registry):
+        engines = _FakeEngines()
+        collect = engines.collect
+
+        def restarted(pending):
+            replies = collect(pending)
+            if next(iter(pending.values()))[1] == "status":
+                replies["engine1"].receipt["engine_incarnation"] = "restarted"
+            return replies
+
+        engines.collect = restarted
+        with pytest.raises(LoRAPublicationError):
+            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        assert registry.default_version is None
+        assert registry.versions[1].state is VersionState.FAILED_FATAL

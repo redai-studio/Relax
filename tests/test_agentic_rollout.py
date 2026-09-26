@@ -43,6 +43,7 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.agentic.lora_helpers import commit_ready
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -1005,7 +1006,7 @@ def _published_registry(digest: str = _DIGEST_A, epoch: str = "epoch0") -> Any:
 
     core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch=epoch)
     publication = core.allocate(digest)
-    core.mark_published(publication.version_id, publication.attempt_id)
+    commit_ready(core, publication.version_id, publication.attempt_id)
     return core
 
 
@@ -1035,8 +1036,10 @@ def _binding_session(session_id: str = "session-1") -> _SessionRecord:
 
 async def test_generate_carries_the_bound_lora_path(monkeypatch: Any) -> None:
     payloads: list[dict[str, Any]] = []
+    retry_options = []
 
-    async def fake_post(url, payload, headers=None):
+    async def fake_post(url, payload, headers=None, **kwargs):
+        retry_options.append(kwargs)
         del url, headers
         payloads.append(dict(payload))
         return {
@@ -1062,6 +1065,7 @@ async def test_generate_carries_the_bound_lora_path(monkeypatch: Any) -> None:
         request_id="request-2:0",
     )
     assert "lora_path" not in payloads[-1]
+    assert retry_options == [{"max_retries": 1}, {}]
 
 
 async def test_first_bind_is_shared_and_keeps_the_version() -> None:
@@ -1081,7 +1085,7 @@ async def test_first_bind_is_shared_and_keeps_the_version() -> None:
 
     # A later publication must not move an already-bound Session.
     second = core.allocate(_DIGEST_B)
-    core.mark_published(second.version_id, second.attempt_id)
+    commit_ready(core, second.version_id, second.attempt_id)
     again = await shard._ensure_session_policy_binding(session)
     assert again.lora_name == bindings[0].lora_name
 
@@ -1119,7 +1123,7 @@ async def test_failed_bind_is_retried_by_the_next_turn() -> None:
     assert session.binding_task is None
 
     publication = core.allocate(_DIGEST_A)
-    core.mark_published(publication.version_id, publication.attempt_id)
+    commit_ready(core, publication.version_id, publication.attempt_id)
     binding = await shard._ensure_session_policy_binding(session)
     assert binding.lora_name == publication.lora_name
     assert registry.bind_calls == ["session-1", "session-1"]
@@ -1168,3 +1172,52 @@ async def test_finished_session_releases_its_version_ref_once() -> None:
     assert await shard_cls._finish_session(shard, session, None) is None
     assert registry.releases == ["session-1"]
     assert core.status().session_bindings == {}
+
+
+async def test_cancelled_only_waiter_retains_binding_for_next_ir_and_close() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.05
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    waiter = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    await asyncio.sleep(0)
+    owned_task = session.binding_task
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert session.binding_task is owned_task
+    assert owned_task is not None and not owned_task.cancelled()
+    binding = await shard._ensure_session_policy_binding(session)
+    assert registry.bind_calls == [session.session_id]
+    assert binding.lora_name == session.bound_lora_name
+    await shard._release_session_lora_ref(session)
+    assert core.status().session_bindings == {}
+
+
+async def test_versioned_generation_does_not_retry_lost_http_response(monkeypatch) -> None:
+    import httpx
+
+    from relax.utils.http_utils import _post
+
+    calls = []
+
+    class LostResponseClient:
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            raise httpx.ReadTimeout("backend may have accepted this request")
+
+    async def real_retry_policy(url, payload, **kwargs):
+        return await _post(LostResponseClient(), url, payload, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "post", real_retry_policy)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    with pytest.raises(httpx.ReadTimeout):
+        await adapter.generate(
+            input_ids=[1],
+            sampling_params={"max_new_tokens": 1},
+            session_id="s",
+            request_id="r",
+            lora_path="relax_policy_lora@epoch-1-digest",
+        )
+    assert len(calls) == 1

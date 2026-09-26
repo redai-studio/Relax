@@ -2472,6 +2472,10 @@ class AgenticSessionShard:
 
         try:
             binding: VersionBinding = await asyncio.shield(binding_task)
+        except asyncio.CancelledError:
+            # The Session owns this task, including after an IR waiter is cancelled.
+            # Keep it available to the next waiter and terminal Session cleanup.
+            raise
         except BaseException as error:
             async with session.lock:
                 # Only the owner clears it: a retry of the same Session must be able

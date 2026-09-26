@@ -80,6 +80,7 @@ class EngineReply:
     #: engine refusal (4xx): only the latter leaves the engine in a state the publisher
     #: can act on, so only the latter may end in FAILED_RETRYABLE.
     ambiguous: bool = False
+    receipt: Optional[Dict[str, Any]] = None
 
 
 def classify_engine_response(status: int, body: Any) -> EngineReply:
@@ -95,7 +96,7 @@ def classify_engine_response(status: int, body: Any) -> EngineReply:
     payload = body if isinstance(body, dict) else {}
     detail = payload.get("error_message") or payload.get("message")
     if 200 <= status < 300 and payload.get("success") is True:
-        return EngineReply(True, str(detail or ""))
+        return EngineReply(True, str(detail or ""), receipt=payload.get("publication_receipt"))
     if 400 <= status < 500:
         return EngineReply(False, f"HTTP {status}: {detail or body}")
     return EngineReply(False, f"HTTP {status}: {detail or body}", ambiguous=True)
@@ -193,6 +194,15 @@ class RayLoRAVersionRegistryClient:
     def allocate(self, digest: str) -> Publication:
         return ray.get(self._handle.allocate.remote(digest))
 
+    def claim_publication(self, version_id: int, attempt_id: int) -> None:
+        ray.get(self._handle.claim_publication.remote(version_id, attempt_id))
+
+    def record_prepared(self, version_id: int, attempt_id: int, receipts: Dict[str, dict]) -> None:
+        ray.get(self._handle.record_prepared.remote(version_id, attempt_id, receipts))
+
+    def record_ready(self, version_id: int, attempt_id: int, receipts: Dict[str, dict]) -> None:
+        ray.get(self._handle.record_ready.remote(version_id, attempt_id, receipts))
+
     def mark_published(self, version_id: int, attempt_id: int) -> Publication:
         return ray.get(self._handle.mark_published.remote(version_id, attempt_id))
 
@@ -255,6 +265,7 @@ class LoRAPublisher:
         self._registry = registry
         self._bucket_cap_bytes = bucket_cap_bytes
         self._group_name = group_name
+        self._engine_incarnations: List[str] = []
 
     # ------------------------------------------------------------------
     # Entry points
@@ -288,6 +299,9 @@ class LoRAPublisher:
                 bucket_cap_bytes=self._bucket_cap_bytes,
             )
 
+        # allocate() is an idempotent lookup, not permission to replay NCCL.
+        # Exactly one caller may drive each attempt, even after a lost reply.
+        self._registry.claim_publication(publication.version_id, publication.attempt_id)
         tensor_bytes = adapter_tensor_bytes(snapshot)
         total_bytes = sum(tensor_bytes)
         bucket_bytes = _bucket_byte_sizes(tensor_bytes, bucket_sizes)
@@ -315,7 +329,7 @@ class LoRAPublisher:
                 total_bytes / 1024**2,
             )
 
-        self._begin(snapshot, publication)
+        self._begin(snapshot, publication, bucket_sizes)
         self._send_buckets(snapshot, publication, bucket_sizes)
         self._end(snapshot, publication)
 
@@ -333,44 +347,6 @@ class LoRAPublisher:
             lora_name=publication.lora_name,
             bucket_count=bucket_count,
             max_bucket_bytes=max_bucket_bytes,
-            bucket_cap_bytes=self._bucket_cap_bytes,
-        )
-
-    def publish_oneshot(self, snapshot: AdapterSnapshot, transport: Callable[[str], None]) -> PublicationOutcome:
-        """First Agentic sync (§11.1): immutable v1 identity over the legacy
-        one-shot wire.
-
-        ``transport(lora_name)`` performs the existing single-request fan-out +
-        broadcast and must raise on any failure. The snapshot is the same
-        frozen object the digest came from, so "legacy wire" never means
-        "export the live adapter twice".
-        """
-
-        publication = self._registry.allocate(snapshot.digest)
-        if publication.no_op:
-            return PublicationOutcome(
-                status="NO_OP",
-                version_id=publication.version_id,
-                lora_name=publication.lora_name,
-                bucket_cap_bytes=self._bucket_cap_bytes,
-            )
-        try:
-            transport(publication.lora_name)
-        except BaseException as exc:  # noqa: BLE001 - classified into RETRYABLE/FATAL below
-            logger.exception("[lora-version] one-shot load of %s failed", publication.lora_name)
-            clean = self._cleanup_unpublished(publication)
-            self._fail(publication, clean, f"one-shot load of {publication.lora_name} failed: {exc!r}")
-        self._registry.mark_published(publication.version_id, publication.attempt_id)
-        logger.info(
-            "[lora-version] first Agentic sync published immutable version %d (%s)",
-            publication.version_id,
-            publication.lora_name,
-        )
-        self.reclaim_once()
-        return PublicationOutcome(
-            status="PUBLISHED",
-            version_id=publication.version_id,
-            lora_name=publication.lora_name,
             bucket_cap_bytes=self._bucket_cap_bytes,
         )
 
@@ -405,13 +381,21 @@ class LoRAPublisher:
     # Phases
     # ------------------------------------------------------------------
 
-    def _begin(self, snapshot: AdapterSnapshot, publication: Publication) -> None:
+    def _begin(self, snapshot: AdapterSnapshot, publication: Publication, bucket_sizes: Sequence[int]) -> None:
         """§12 Phase 1: build the candidate on every engine before any
         collective."""
 
         replies = self._fan_out(
             {
                 "op": "begin",
+                "protocol_version": 2,
+                "version_id": publication.version_id,
+                "digest": publication.digest,
+                "expected_checksums": snapshot.manifest,
+                "names": list(snapshot.tensors),
+                "dtypes": [tensor_dtype_name(tensor) for tensor in snapshot.tensors.values()],
+                "shapes": [list(tensor.shape) for tensor in snapshot.tensors.values()],
+                "bucket_sizes": list(bucket_sizes),
                 "lora_name": publication.lora_name,
                 "attempt_id": publication.attempt_id,
                 "config_dict": snapshot.config,
@@ -422,6 +406,12 @@ class LoRAPublisher:
         )
         bad = {engine_id: reply for engine_id, reply in replies.items() if not reply.success}
         if not bad:
+            try:
+                receipts = {engine: reply.receipt or {} for engine, reply in replies.items()}
+                self._registry.record_prepared(publication.version_id, publication.attempt_id, receipts)
+                self._engine_incarnations = [receipt["engine_incarnation"] for receipt in receipts.values()]
+            except Exception as exc:
+                raise self._fatal(publication, f"invalid PREPARED receipts: {exc}") from exc
             return
         logger.error(
             "[lora-version] Begin failed on %s for version %d attempt %d",
@@ -457,6 +447,7 @@ class LoRAPublisher:
             chunk = list(names[offset : offset + count])
             payload = {
                 "op": "bucket",
+                "engine_incarnations": self._engine_incarnations,
                 "lora_name": publication.lora_name,
                 "attempt_id": publication.attempt_id,
                 "bucket_index": index,
@@ -475,7 +466,10 @@ class LoRAPublisher:
                     publication,
                     f"bucket {index} collective did not complete ({exc!r}); refusing to retransmit",
                 ) from exc
-            replies = self._collect(pending)
+            replies = self._collect_fleet(pending, f"bucket {index}")
+            unknown = {engine for engine, reply in replies.items() if reply.ambiguous}
+            if unknown:
+                raise self._fatal(publication, f"bucket {index} completion is unknown on {sorted(unknown)}")
             bad = {engine_id: reply for engine_id, reply in replies.items() if not reply.success}
             if bad:
                 logger.error(
@@ -505,6 +499,7 @@ class LoRAPublisher:
         replies = self._fan_out(
             {
                 "op": "end",
+                "engine_incarnations": self._engine_incarnations,
                 "lora_name": publication.lora_name,
                 "attempt_id": publication.attempt_id,
                 "expected_checksums": snapshot.manifest,
@@ -540,6 +535,34 @@ class LoRAPublisher:
                 f"End failed on {sorted(bad)}: "
                 + "; ".join(f"{engine_id}: {reply.message}" for engine_id, reply in sorted(bad.items())),
             )
+
+        # Re-check exact local identity after End. A restarted/missing engine must
+        # not inherit its predecessor's READY. The Registry also validates the CAS
+        # revision and both receipts before changing the default.
+        try:
+            self._registry.record_ready(
+                publication.version_id,
+                publication.attempt_id,
+                {engine: reply.receipt or {} for engine, reply in replies.items()},
+            )
+            confirmed = self._fan_out(
+                {
+                    "op": "status",
+                    "lora_name": publication.lora_name,
+                    "attempt_id": publication.attempt_id,
+                    "engine_incarnations": self._engine_incarnations,
+                },
+                "ready confirmation",
+            )
+            if any(not reply.success for reply in confirmed.values()):
+                raise LoRAPublicationError("FATAL", "READY was invalidated before commit")
+            self._registry.record_ready(
+                publication.version_id,
+                publication.attempt_id,
+                {engine: reply.receipt or {} for engine, reply in confirmed.items()},
+            )
+        except Exception as exc:
+            raise self._fatal(publication, f"READY confirmation failed: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Failure paths
@@ -602,12 +625,17 @@ class LoRAPublisher:
         would make the version look fleet-ready without a single engine holding it, so fail hard.
         """
 
-        if not pending:
-            raise LoRAPublicationError("FATAL", f"{phase}: no rollout engine accepted the request")
+        if set(pending) != {"engine0", "engine1"}:
+            raise LoRAPublicationError(
+                "FATAL", f"{phase}: expected fixed engines engine0/engine1, got {sorted(pending)}"
+            )
 
     def _fan_out(self, payload: Dict[str, Any], phase: str) -> Dict[str, EngineReply]:
         pending = self._fire(UPDATE_LORA_ENDPOINT, payload)
         self._require_fleet(pending, phase)
+        return self._collect_fleet(pending, phase)
+
+    def _collect_fleet(self, pending: Dict[str, Any], phase: str) -> Dict[str, EngineReply]:
         replies = self._collect(pending)
         missing = set(pending) - set(replies)
         if missing:
