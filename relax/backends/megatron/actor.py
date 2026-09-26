@@ -1257,6 +1257,16 @@ class MegatronTrainRayActor(TrainRayActor):
                 # which returns one entry per OPTIMIZER STEP -- one step consumes
                 # this whole window, so the entry carries the step totals.
                 if len(samples) >= max_k:
+                    # The literal 1 is the number of OPTIMIZER STEPS that consume
+                    # this window. It is 1 because `_get_prefetched_sft_window`
+                    # has exactly one caller, which passes
+                    # `prepared_num_microbatches=[num_microbatches]` -- a
+                    # single-element list -- and `train()` derives
+                    # `num_steps_per_rollout = len(num_microbatches)` in
+                    # model.py. A second caller, or a window consumed by several
+                    # optimizer steps, would make this literal wrong: the argument
+                    # must then be that real per-rollout step count, which is why
+                    # `step_workloads` already takes it as a parameter.
                     publish_step_workload(rollout_id, step_workloads(samples, max_k, 1))
                 else:
                     # Cheap defence only: `step_workloads` would raise here and

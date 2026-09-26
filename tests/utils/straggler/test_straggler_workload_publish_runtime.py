@@ -234,21 +234,26 @@ def test_the_published_grouping_is_the_executed_grouping(_patched):
     assert stats["workload_publish_errors"] == 0
 
 
-def test_disabled_profiler_does_no_partition_work(monkeypatch):
-    """The gate: with the profiler off the training path pays no partition
-    cost."""
+def test_disabled_profiler_derives_no_workload(monkeypatch, _patched):
+    """The gate: with the profiler off the training path derives nothing.
+
+    Counts the calls into the pure derivation and asserts the disabled path
+    makes none, so a disabled profiler really costs only the cached boolean.
+    """
     monkeypatch.setattr(actor_mod, "_STRAGGLER_PUBLISH_ENABLED", False)
-    calls = {"n": 0}
-
-    def _boom(*a, **k):
-        calls["n"] += 1
-        raise AssertionError("the partition must not be computed when the profiler is disabled")
-
-    monkeypatch.setattr(actor_mod, "get_seqlen_balanced_partitions", _boom)
     assert actor_mod._straggler_publish_enabled() is False
 
+    calls = {"n": 0}
+
+    def _count(*args, **kwargs):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(actor_mod, "step_workloads", _count)
+
     rollout_id = 9
-    window = _window(rollout_id)
-    stub = _stub_self(window)
-    # The block is skipped entirely, so the partition helper is never reached.
-    assert calls["n"] == 0
+    stub = _stub_self(_window(rollout_id))
+    MegatronTrainRayActor._get_prefetched_sft_window(stub, "task", rollout_id, ["fields"])
+
+    assert calls["n"] == 0, "a disabled profiler must not derive a workload"
+    assert ctx._step_workload(rollout_id, 0) == (None, None, None)
