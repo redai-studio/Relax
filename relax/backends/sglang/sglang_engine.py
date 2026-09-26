@@ -1615,20 +1615,6 @@ def _compute_genrm_server_args(
         # replica-invariant server seed). Side effect: sampling backend
         # forced to pytorch (tp_size=1, so no NCCL determinism constraints).
         "enable_deterministic_inference": True,
-        # SGLang's deterministic matrix keeps the radix cache only with the
-        # fa3/triton attention backends. The generic flashinfer default is
-        # chosen *before* the deterministic handler runs, so without an
-        # explicit choice it preempts SGLang's own deterministic fallback
-        # (fa3 on pre-Blackwell GPUs) and force-disables the radix cache --
-        # and without prefix reuse, a 48-way concurrent scoring load
-        # re-prefills every long shared prompt until the scheduler wedges
-        # (reproduced on the final-code autoscaler acceptance run: engine
-        # stopped completing requests mid-load, while the identical frozen
-        # protocol passed on the pre-deterministic code). Select the backend
-        # SGLang itself recommends for deterministic inference on this
-        # architecture so the radix cache stays available. Per-instance
-        # ``--genrm-engine-config`` overrides still take priority.
-        "attention_backend": _genrm_deterministic_attention_backend(),
         # memory
         "enable_memory_saver": args.offload_rollout,
         # distributed
@@ -1662,6 +1648,28 @@ def _compute_genrm_server_args(
         # load real weights unless its own engine config explicitly overrides it.
         "load_format": "auto",
     }
+    # SGLang's deterministic matrix keeps the radix cache only with the
+    # fa3/triton attention backends. The generic flashinfer default is
+    # chosen *before* the deterministic handler runs, so without an explicit
+    # choice it preempts SGLang's own deterministic fallback (fa3 on
+    # pre-Blackwell GPUs) and force-disables the radix cache -- and without
+    # prefix reuse, a 48-way concurrent scoring load re-prefills every long
+    # shared prompt until the scheduler wedges (reproduced on the final-code
+    # autoscaler acceptance run: engine stopped completing requests
+    # mid-load, while the identical frozen protocol passed on the
+    # pre-deterministic code). Pin the backend SGLang itself recommends for
+    # deterministic inference on this architecture so the radix cache stays
+    # available -- but only when the user has not chosen one globally: the
+    # sglang_* inheritance loop below backfills only fields absent from
+    # ``kwargs``, so an unconditional key -- including the probe's ``None``
+    # -- silently disabled an explicit ``--sglang-attention-backend``
+    # (re-review finding). A failed probe defers to SGLang's default instead
+    # of pinning ``None`` over it; per-instance ``--genrm-engine-config``
+    # overrides still take priority over both (applied after the loop).
+    if getattr(args, "sglang_attention_backend", None) is None:
+        _deterministic_attention_backend = _genrm_deterministic_attention_backend()
+        if _deterministic_attention_backend is not None:
+            kwargs["attention_backend"] = _deterministic_attention_backend
     # Allow per-genrm SGLang mem_fraction_static via --genrm-engine-config; this overrides
     # the global --sglang-mem-fraction-static below so rollout and genrm can share GPUs.
     if "mem_fraction_static" in args.genrm_engine_config:

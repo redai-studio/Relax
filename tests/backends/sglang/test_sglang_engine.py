@@ -110,6 +110,54 @@ def test_genrm_attention_backend_engine_config_still_overrides(monkeypatch):
     assert kwargs["enable_deterministic_inference"] is True
 
 
+def test_genrm_attention_backend_respects_global_user_choice(monkeypatch):
+    """Re-review finding: an explicit ``--sglang-attention-backend`` must keep
+    winning over the deterministic probe.
+
+    The sglang_* inheritance loop backfills only fields absent from ``kwargs``,
+    so pinning the probe result unconditionally (including the probe's
+    ``None``) silently disabled the user's global choice.
+    """
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    from relax.backends.sglang import sglang_engine as se
+
+    _skip_if_server_args_stubbed(se)
+
+    args = _genrm_server_args_namespace()
+    args.sglang_attention_backend = "triton"  # the user's explicit global choice
+    monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: "fa3")
+
+    kwargs, _ = se._compute_genrm_server_args(args, 0, "tcp://127.0.0.1:1", 16001, "127.0.0.1", 16000)
+
+    assert kwargs["attention_backend"] == "triton"
+    assert kwargs["enable_deterministic_inference"] is True
+
+
+def test_genrm_attention_backend_probe_failure_defers_to_global_and_default(monkeypatch):
+    """A failed probe must not pin ``None`` over the inheritance: nothing is
+    pinned (SGLang's default applies) and the user's global choice still flows
+    through the sglang_* loop."""
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    from relax.backends.sglang import sglang_engine as se
+
+    _skip_if_server_args_stubbed(se)
+
+    monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: None)
+
+    # No user global and a failed probe: nothing is pinned.
+    args = _genrm_server_args_namespace()
+    kwargs, _ = se._compute_genrm_server_args(args, 0, "tcp://127.0.0.1:1", 16001, "127.0.0.1", 16000)
+    assert "attention_backend" not in kwargs
+
+    # The user's global choice survives the failed probe via the loop.
+    args_user = _genrm_server_args_namespace()
+    args_user.sglang_attention_backend = "flashinfer"
+    kwargs_user, _ = se._compute_genrm_server_args(args_user, 0, "tcp://127.0.0.1:1", 16001, "127.0.0.1", 16000)
+    assert kwargs_user["attention_backend"] == "flashinfer"
+
+
 def test_genrm_deterministic_attention_backend_arch_table(monkeypatch):
     """The arch probe maps Blackwell+ to flashinfer (SGLang's own deterministic
     choice there) and everything else to fa3; a failed probe defers to SGLang's
