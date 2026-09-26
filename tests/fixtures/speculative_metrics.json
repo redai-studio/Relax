@@ -1,0 +1,13 @@
+{
+  "spec/generation_count": 3,
+  "spec/sample_block_count": 0,
+  "spec/legacy_sample_count": 0,
+  "spec/accepted_tokens": 12,
+  "spec/proposed_tokens": 16,
+  "spec/acceptance_observed_count": 3,
+  "spec_accept_rate": 0.75,
+  "spec/completion_tokens": 15,
+  "spec/verify_count": 4,
+  "spec/length_observed_count": 3,
+  "spec_accept_length": 3.75
+}

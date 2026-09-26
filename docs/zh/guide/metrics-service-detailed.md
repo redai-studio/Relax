@@ -259,3 +259,39 @@ client.report_step(step=100)
 3. **易于维护**：集中管理所有 metrics 上报逻辑
 4. **向后兼容**：现有代码无需修改即可迁移
 5. **扩展性**：易于添加新的 metrics 后端
+
+## 投机解码指标
+
+启用投机解码后，`rollout/spec_accept_rate` 为 accepted 总量除以 proposed 总量，`rollout/spec_accept_length` 为 backend completion token 总量除以 verify 总量，替代原来的样本比例算术平均。评估复用相同计算，沿用数据集指标前缀。
+
+Agentic 导出在 `Sample.spec_generations` 中携带已提交请求的 session ID、request ID 和四项计数。每个日志批次按 `(session_id, request_id)` 去重，只统计导出轨迹上的状态，不包含未选择分支和始终未提交的请求。中断续跑的多个 backend attempt 在同一个逻辑请求内累计，终态提交后才导出。相同文本的独立请求各自计数。现有导出选择 canonical 消息状态，因此包含该状态上保留的全部独立请求记录，不支持从相同状态中单独选择某个请求。去重集合不跨日志批次保留。
+
+后端别名按 `spec_num_correct_drafts` / `spec_num_proposed_drafts`、`spec_accepted_drafts` / `spec_proposed_drafts`、`spec_accept_token_num` / `spec_draft_token_num` 的顺序选择首个出现的字段组，不跨组拼接。另两项来自 `spec_verify_ct` 和 `completion_tokens`。completion 采用 backend 计数，不以导出 response_length、工具文本或 loss mask 重建。
+
+每个比值仅使用所有 attempt 中分子和分母都完整的记录。显式零是有效观测，缺失、null 或非法计数不可用。总分母为零时省略比值键，不输出伪造的 0% 或 NaN；accepted=0、proposed>0 时仍输出真实零接受率。
+
+以下新指标沿用 `rollout/` 或既有 eval 前缀：
+
+| 指标 | 含义 |
+| --- | --- |
+| `spec/accepted_tokens`、`spec/proposed_tokens` | 接受率配对完整记录的总量 |
+| `spec/completion_tokens`、`spec/verify_count` | length 配对完整记录的总量 |
+| `spec/generation_count` | 去重后的已提交生成身份数量 |
+| `spec/sample_block_count` | 新版普通生成样本累计块数量，也参与主指标 |
+| `spec/acceptance_observed_count`、`spec/length_observed_count` | 各比值的完整记录数；与 generation_count + sample_block_count 比较可判断覆盖 |
+| `spec/legacy_sample_count` | 缺少生成记录和字段可用性信息的旧样本数 |
+
+`Sample.spec_info` 保留原计数字段名，新增 `missing_fields`。旧序列化数据仍可读取，但旧零值不能证明覆盖，旧共享前缀无法可靠去重，因此不混入新指标，只报告 `spec/legacy_sample_count`；只有旧样本时不输出比值。新版普通生成样本由 `SpecInfo.add` 保存覆盖信息，即使与 Agentic 样本混合也参与主指标。无需新增 CLI 参数。
+
+### 可复现 CPU 样例
+
+| 生成 | Accepted | Proposed | Verify | Completion |
+| --- | ---: | ---: | ---: | ---: |
+| A | 1 | 2 | 1 | 2 |
+| B | 9 | 10 | 2 | 10 |
+| C | 2 | 4 | 1 | 3 |
+| D（未导出） | 100 | 100 | 1 | 100 |
+
+仅 A、B 两个独立请求：接受率 **10/12 ≈ 83.33%**，length **12/3 = 4**。导出 A→B、A→C：去重后为 A、B、C，接受率 **12/16 = 0.75**，length **15/4 = 3.75**，覆盖完整。D 不计入，重复导出不会改变结果。
+
+`tests/test_agentic_speculative_metrics.py` 贯通 backend 结果累计、终态提交、显式轨迹导出、transport 和 JSON 往返，再将生产聚合结果与 `tests/fixtures/speculative_metrics.json` 对照。运行：`python -m pytest tests/utils/test_speculative_metrics.py tests/test_agentic_speculative_metrics.py -q`。测试使用本地 tokenizer 和可控 backend 结果，不需要 GPU、模型权重或运行中的 Ray 集群，不证明真实推理加速。

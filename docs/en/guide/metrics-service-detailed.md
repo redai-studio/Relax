@@ -259,3 +259,39 @@ The new Metrics Service provides:
 3. **Easy Maintenance**: Centralized management of all metrics reporting logic
 4. **Backward Compatible**: Existing code can migrate without modification
 5. **Extensibility**: Easy to add new metrics backends
+
+## Speculative decoding metrics
+
+When speculative decoding is enabled, `rollout/spec_accept_rate` is the sum of accepted draft tokens divided by the sum of proposed draft tokens. `rollout/spec_accept_length` is the sum of backend completion tokens divided by the sum of verification steps. These replace the previous mean of sample ratios. Evaluation uses the same computation under its existing dataset prefix.
+
+Agentic exports carry `Sample.spec_generations`: committed request IDs, session IDs and four counters. Shared generations are counted once per logging batch by `(session_id, request_id)`. Only states on exported trajectories contribute; unselected branches and requests that never commit do not. Resumed backend attempts accumulate into their logical request before it commits. A state may represent several independent requests with identical text: all their records are retained. Exports select canonical message states, not an individual request within such a state. Deduplication does not persist between logging batches.
+
+The backend aliases `spec_num_correct_drafts` / `spec_num_proposed_drafts`, `spec_accepted_drafts` / `spec_proposed_drafts`, and `spec_accept_token_num` / `spec_draft_token_num` are recognized in that order. The first represented pair is used without mixing versions. `spec_verify_ct` and `completion_tokens` supply the other two counters. Completion is backend accounting, not the exported response length or the number of unmasked tokens.
+
+Each ratio uses only records with both counters available across every attempt. Zero is an observation; missing, null or invalid counters are unavailable. If a ratio's total denominator is zero, its key is omitted, not logged as 0% or NaN. Accepted=0 with proposed>0 is a genuine zero acceptance rate.
+
+Additional keys below have the `rollout/` prefix (or the existing eval prefix):
+
+| Key | Meaning |
+| --- | --- |
+| `spec/accepted_tokens`, `spec/proposed_tokens` | Totals for acceptance-complete records |
+| `spec/completion_tokens`, `spec/verify_count` | Totals for length-complete records |
+| `spec/generation_count` | Unique committed generation identities |
+| `spec/sample_block_count` | New ordinary-generation sample accumulators, also included in the ratios |
+| `spec/acceptance_observed_count`, `spec/length_observed_count` | Complete records for each ratio; compare with generation_count + sample_block_count to assess coverage |
+| `spec/legacy_sample_count` | Samples without generation records or field-availability information |
+
+`Sample.spec_info` retains its existing counter names and gains `missing_fields`. Old serialized samples remain readable. Their zero-filled counters cannot prove coverage, and their shared prefixes cannot be deduplicated. They are excluded from the new ratios and counted under `spec/legacy_sample_count`; when only old samples are available, no ratio is emitted. New ordinary-generation samples retain coverage through `SpecInfo.add` and participate in the main ratios even in a mixed Agentic batch. No new CLI option is needed.
+
+### Reproducible CPU example
+
+| Generation | Accepted | Proposed | Verify | Completion |
+| --- | ---: | ---: | ---: | ---: |
+| A | 1 | 2 | 1 | 2 |
+| B | 9 | 10 | 2 | 10 |
+| C | 2 | 4 | 1 | 3 |
+| D (not exported) | 100 | 100 | 1 | 100 |
+
+Two independent requests A and B give acceptance **10/12**, approximately 83.33%, and length **12/3 = 4**. Exporting A→B and A→C gives three unique generations: acceptance **12/16 = 0.75**, length **15/4 = 3.75**, with full coverage. D does not contribute. Duplicating an export leaves these values unchanged.
+
+`tests/test_agentic_speculative_metrics.py` exercises backend result accumulation, terminal commit, explicit export, transport and JSON round trips, then compares the production aggregation result to `tests/fixtures/speculative_metrics.json`. Run it with `python -m pytest tests/utils/test_speculative_metrics.py tests/test_agentic_speculative_metrics.py -q`. The test uses a local tokenizer and backend results; it needs no GPU, model weights or running Ray cluster and makes no claim about decoding speedup.

@@ -352,7 +352,8 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
-    spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    spec_delta: dict[str, Any] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    spec_generations: dict[str, Sample.SpecInfo] = field(default_factory=dict)
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -384,7 +385,7 @@ class InflightRequest:
     pending_token_delta: list[int] = field(default_factory=list)
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
-    pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    pending_spec_info: Sample.SpecInfo = field(default_factory=Sample.SpecInfo)
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
@@ -624,7 +625,7 @@ class SessionForest:
         token_delta: list[int],
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
-        spec_delta: dict[str, int] | None = None,
+        spec_delta: dict[str, Any] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
@@ -638,7 +639,7 @@ class SessionForest:
             tools=None,
             chat_template_kwargs=None,
         )
-        return self._register_node(
+        node = self._register_node(
             MsgNode(
                 kind="resp",
                 state_hash=state_hash,
@@ -661,6 +662,11 @@ class SessionForest:
                 export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
             )
         )
+
+        request_id = (export_metadata_patch or {}).get("request_id")
+        if request_id is not None:
+            node.spec_generations[request_id] = Sample.SpecInfo.from_dict(spec_delta or {})
+        return node
 
     @staticmethod
     def _agentic_trace_turn_from_node(node: MsgNode, turn_idx: int) -> dict[str, Any]:
@@ -703,7 +709,8 @@ class SessionForest:
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
-        spec_info = dict(_EMPTY_SPEC_DELTA)
+        spec_info = Sample.SpecInfo()
+        spec_generations = []
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
@@ -727,7 +734,14 @@ class SessionForest:
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
-                spec_info = _sum_counter_dict(spec_info, node.spec_delta)
+                if node.spec_generations:
+                    for request_id, counts in node.spec_generations.items():
+                        spec_info.merge(counts)
+                        spec_generations.append(
+                            {"session_id": self.session_id, "request_id": request_id, **counts.observed_counts()}
+                        )
+                else:
+                    spec_info.merge(Sample.SpecInfo.from_dict(node.spec_delta))
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
             if idx == 0 or first_response_node is None:
@@ -789,6 +803,7 @@ class SessionForest:
             session_id=self.session_id,
             non_generation_time=wall_elapsed_s - generation_elapsed_s,
         )
-        sample.spec_info = Sample.SpecInfo.from_dict(spec_info)
+        sample.spec_info = spec_info
+        sample.spec_generations = spec_generations
         sample.prefix_cache_info = Sample.PrefixCacheInfo.from_dict(prefix_cache_info)
         return sample

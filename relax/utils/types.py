@@ -23,6 +23,28 @@ def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
     return 0, 0
 
 
+_SPEC_FIELDS = ("spec_accept_token_num", "spec_draft_token_num", "spec_verify_ct", "completion_token_num")
+
+
+def get_spec_counts(meta_info: dict[str, Any]) -> dict[str, int | None]:
+    """Read counters without confusing missing observations with zero."""
+    accept_key, draft_key = _SPEC_TOKEN_COUNT_KEYS[0]
+    for keys in _SPEC_TOKEN_COUNT_KEYS:
+        if any(key in meta_info for key in keys):
+            accept_key, draft_key = keys
+            break
+    values = (
+        meta_info.get(accept_key),
+        meta_info.get(draft_key),
+        meta_info.get("spec_verify_ct"),
+        meta_info.get("completion_tokens"),
+    )
+    return {
+        key: value if type(value) is int and value >= 0 else None
+        for key, value in zip(_SPEC_FIELDS, values, strict=True)
+    }
+
+
 @dataclass
 class Sample:
     """The sample generated."""
@@ -97,6 +119,8 @@ class Sample:
         spec_draft_token_num: int = 0
         spec_verify_ct: int = 0
         completion_token_num: int = 0
+        missing_fields: list[str] | None = None
+        _legacy: bool = field(default=False, init=False, repr=False)
 
         @property
         def spec_accept_rate(self) -> float:
@@ -106,31 +130,58 @@ class Sample:
         def spec_accept_length(self) -> float:
             return self.completion_token_num / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
-        def add(self, meta_info: dict):
-            spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-            self.spec_accept_token_num += spec_accept_token_num
-            self.spec_draft_token_num += spec_draft_token_num
-            self.spec_verify_ct += meta_info.get("spec_verify_ct", 0)
-            self.completion_token_num += meta_info.get("completion_tokens", 0)
+        def add(self, meta_info: dict) -> None:
+            """Accumulate one backend attempt, retaining incomplete fields."""
+            counts = get_spec_counts(meta_info)
+            missing = set(self.missing_fields or ())
+            if self._legacy:
+                missing.update(_SPEC_FIELDS)
+            for key, value in counts.items():
+                if value is None:
+                    missing.add(key)
+                else:
+                    setattr(self, key, getattr(self, key) + value)
+            self.missing_fields = sorted(missing)
 
-        def to_dict(self):
-            return {
-                "spec_accept_token_num": self.spec_accept_token_num,
-                "spec_draft_token_num": self.spec_draft_token_num,
-                "spec_verify_ct": self.spec_verify_ct,
-                "completion_token_num": self.completion_token_num,
-            }
+        def merge(self, other: "Sample.SpecInfo") -> None:
+            """Merge accumulated counts without promoting partial sums to
+            observations."""
+            missing = set(self.missing_fields or ())
+            if self._legacy:
+                missing.update(_SPEC_FIELDS)
+            missing.update(_SPEC_FIELDS if other.missing_fields is None else other.missing_fields)
+            for key in _SPEC_FIELDS:
+                setattr(self, key, getattr(self, key) + getattr(other, key))
+            self.missing_fields = sorted(missing)
+
+        def observed_counts(self) -> dict[str, int | None]:
+            """Return complete counters; None denotes unknown or partial
+            values."""
+            missing = _SPEC_FIELDS if self.missing_fields is None else self.missing_fields
+            return {key: None if key in missing else getattr(self, key) for key in _SPEC_FIELDS}
+
+        def to_dict(self) -> dict[str, Any]:
+            data = {key: getattr(self, key) for key in _SPEC_FIELDS}
+            if self.missing_fields is not None:
+                data["missing_fields"] = list(self.missing_fields)
+            return data
 
         @staticmethod
-        def from_dict(data: dict):
+        def from_dict(data: dict) -> "Sample.SpecInfo":
             info = Sample.SpecInfo()
-            info.spec_accept_token_num = data.get("spec_accept_token_num", 0)
-            info.spec_draft_token_num = data.get("spec_draft_token_num", 0)
-            info.spec_verify_ct = data.get("spec_verify_ct", 0)
-            info.completion_token_num = data.get("completion_token_num", 0)
+            missing = data.get("missing_fields")
+            for key in _SPEC_FIELDS:
+                value = data.get(key)
+                if type(value) is int and value >= 0:
+                    setattr(info, key, value)
+                elif missing is not None:
+                    missing = [*missing, key]
+            info.missing_fields = sorted(set(missing)) if missing is not None else None
+            info._legacy = missing is None
             return info
 
     spec_info: SpecInfo = field(default_factory=SpecInfo)
+    spec_generations: list[dict[str, Any]] | None = None
 
     @dataclass
     class PrefixCacheInfo:
