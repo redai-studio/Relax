@@ -84,6 +84,13 @@ class ScaleOutStatusResponse(BaseModel):
     # Must be declared or FastAPI's response_model strips it from every scale-out
     # HTTP surface (and the autoscaler poll-back that reads it).
     failure_categories: List[str] = Field(default_factory=list)
+    # Terminal rollout scale-out owns its cleanup before reporting: engines
+    # either serve (ACTIVE/PARTIAL) or were rolled back (FAILED/CANCELLED),
+    # leaving no deferred physical cleanup for a caller to await. Declared
+    # explicitly because the shared autoscaler treats a missing flag as
+    # UNKNOWN (missing != clean) and would keep a terminal request pending
+    # forever.
+    cleanup_required: bool = False
 
 
 class EnginesInfoResponse(BaseModel):
@@ -176,6 +183,10 @@ class ScaleInStatusResponse(BaseModel):
     removed_engines: List[str]
     failed_engines: List[str]
     error_message: Optional[str]
+    # Same terminal-is-clean contract as scale-out: COMPLETED reports the
+    # engines removed and FAILED reports the removal rolled back, so no
+    # unresolved physical cleanup hides behind either terminal status.
+    cleanup_required: bool = False
 
 
 class ListScaleInRequestsResponse(BaseModel):

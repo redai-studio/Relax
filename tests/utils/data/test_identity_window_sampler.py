@@ -3,11 +3,16 @@
 import pytest
 
 
-pytest.importorskip("transfer_queue")
+_tq = pytest.importorskip("transfer_queue")
+# Attribute guard, not just module presence: test infrastructure may install
+# an import-only transfer_queue stub (tests/utils/_dep_stubs.py) that makes
+# the module name resolve while carrying none of its real symbols.
+if not hasattr(_tq, "StreamingTokenBudgetSampler"):
+    pytest.skip("transfer_queue lacks StreamingTokenBudgetSampler", allow_module_level=True)
 
-from transfer_queue import StreamingTokenBudgetSampler
+from transfer_queue import StreamingTokenBudgetSampler  # noqa: E402 — guarded above
 
-from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+from relax.utils.data.identity_window_sampler import IdentityWindowSampler  # noqa: E402 — guarded above
 
 
 pytestmark = pytest.mark.skipif(

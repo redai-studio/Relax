@@ -1543,6 +1543,30 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     return speculative_algorithm is not None
 
 
+def _genrm_deterministic_attention_backend() -> Optional[str]:
+    """SGLang's arch-appropriate attention backend for deterministic GenRM
+    engines.
+
+    Mirrors ``ServerArgs._handle_deterministic_inference``'s own fallback
+    table: fa3 for pre-Blackwell GPUs (the radix-cache-capable deterministic
+    backend there), flashinfer for Blackwell+. The generic non-deterministic
+    default (flashinfer on pre-Blackwell when available) is applied before
+    the deterministic handler, so an explicit choice is required to keep the
+    radix cache -- see the comment on ``attention_backend`` in
+    ``_compute_genrm_server_args``. Returns ``None`` when the architecture
+    probe is unavailable, leaving SGLang's default in place.
+    """
+    try:
+        from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+
+        if is_sm100_supported() or is_sm120_supported():
+            return "flashinfer"
+        return "fa3"
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"GenRM deterministic attention-backend probe failed ({e}); using SGLang default")
+        return None
+
+
 def _compute_genrm_server_args(
     args,
     rank,
@@ -1572,7 +1596,25 @@ def _compute_genrm_server_args(
     kwargs = {
         "model_path": hf_model_path if is_s3_uri(hf_model_path) else os.path.normpath(hf_model_path),
         "trust_remote_code": True,
-        "random_seed": args.seed + rank,
+        # Replica-invariant seeding: GenRM is a frozen scoring service, so
+        # every replica must sample identically for an identical request.
+        # Deriving the seed from the engine rank made the elastic replica
+        # disagree with the initial one on borderline inputs under the
+        # official sampling config (measured 2/50 flips); the rollout builder
+        # below keeps its rank-derived seed (sampling diversity is wanted
+        # there, not here).
+        "random_seed": args.seed,
+        # Activate SGLang's deterministic-inference mode so per-request
+        # ``sampling_seed`` values (derived in the GenRM component from the
+        # judge model + exact input + effective sampling) actually drive the
+        # sampler: without this flag SGLang silently drops the seed tensor
+        # and samples from the server's global RNG stream, which advances
+        # with every request an engine served -- two replicas with diverged
+        # request histories then disagree on identical inputs (adversarial
+        # finding: 2/50 verdict flips at temperature 0.1 even with a
+        # replica-invariant server seed). Side effect: sampling backend
+        # forced to pytorch (tp_size=1, so no NCCL determinism constraints).
+        "enable_deterministic_inference": True,
         # memory
         "enable_memory_saver": args.offload_rollout,
         # distributed
@@ -1606,6 +1648,28 @@ def _compute_genrm_server_args(
         # load real weights unless its own engine config explicitly overrides it.
         "load_format": "auto",
     }
+    # SGLang's deterministic matrix keeps the radix cache only with the
+    # fa3/triton attention backends. The generic flashinfer default is
+    # chosen *before* the deterministic handler runs, so without an explicit
+    # choice it preempts SGLang's own deterministic fallback (fa3 on
+    # pre-Blackwell GPUs) and force-disables the radix cache -- and without
+    # prefix reuse, a 48-way concurrent scoring load re-prefills every long
+    # shared prompt until the scheduler wedges (reproduced on the final-code
+    # autoscaler acceptance run: engine stopped completing requests
+    # mid-load, while the identical frozen protocol passed on the
+    # pre-deterministic code). Pin the backend SGLang itself recommends for
+    # deterministic inference on this architecture so the radix cache stays
+    # available -- but only when the user has not chosen one globally: the
+    # sglang_* inheritance loop below backfills only fields absent from
+    # ``kwargs``, so an unconditional key -- including the probe's ``None``
+    # -- silently disabled an explicit ``--sglang-attention-backend``
+    # (re-review finding). A failed probe defers to SGLang's default instead
+    # of pinning ``None`` over it; per-instance ``--genrm-engine-config``
+    # overrides still take priority over both (applied after the loop).
+    if getattr(args, "sglang_attention_backend", None) is None:
+        _deterministic_attention_backend = _genrm_deterministic_attention_backend()
+        if _deterministic_attention_backend is not None:
+            kwargs["attention_backend"] = _deterministic_attention_backend
     # Allow per-genrm SGLang mem_fraction_static via --genrm-engine-config; this overrides
     # the global --sglang-mem-fraction-static below so rollout and genrm can share GPUs.
     if "mem_fraction_static" in args.genrm_engine_config:

@@ -1,0 +1,13 @@
+{
+  "source": "b2_train_smoke_20260925_r3",
+  "job": "raysubmit_knWTPeZhH6gEAfkn",
+  "job_status": "SUCCEEDED",
+  "head": "945741e (request-level sampling seed + deterministic sampling active)",
+  "train_step_0_trained_with_full_metrics": true,
+  "weight_sync_200_ok_count": 9,
+  "all_training_steps_finished": true,
+  "dapo_genrm_reward_gate_seen": 4,
+  "graceful_shutdown": true,
+  "errors": [],
+  "PASS": true
+}
