@@ -44,7 +44,18 @@ TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
+_DEEPEYES_ENV_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_ENV_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+if [ "${_DEEPEYES_ENV_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_ENV_RESTORE_XTRACE
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
@@ -136,20 +147,40 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
 # Sandbox env vars propagated into every Ray worker so the per-session
-# agent process can find apptainer / search cache.
+# agent process can find apptainer / search backends.
 # SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
 # to find the apptainer backend YAML config (image path, bind paths, etc).
+_DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 EXTRA_ENV_VARS_JSON="\"SANDBOX_BACKEND\": \"apptainer_jupyter\",
     \"SANDBOX_CONFIG_PATH\": \"${SCRIPT_DIR}/apptainer_env/apptainer_config.yaml\",
     \"APPTAINER_IMAGE_PATH\": \"${APPTAINER_IMAGE_PATH}\",
     \"DEEPEYES_V2_APP_PYTHON\": \"${DEEPEYES_V2_APP_PYTHON}\",
     \"DEEPEYES_V2_SEARCH_CACHE_PATHS\": \"${DEEPEYES_V2_SEARCH_CACHE_PATHS:-}\",
+    \"DEEPEYES_V2_SEARCH_BACKEND\": \"${DEEPEYES_V2_SEARCH_BACKEND:-}\",
+    \"DEEPEYES_V2_SEARCH_RETRIEVER_URL\": \"${DEEPEYES_V2_SEARCH_RETRIEVER_URL:-}\",
+    \"DEEPEYES_V2_SEARCH_TOPK\": \"${DEEPEYES_V2_SEARCH_TOPK:-}\",
+    \"DEEPEYES_V2_SEARCH_BRAVE_API_KEY\": \"${DEEPEYES_V2_SEARCH_BRAVE_API_KEY:-}\",
+    \"DEEPEYES_V2_SEARCH_BRAVE_ENDPOINT\": \"${DEEPEYES_V2_SEARCH_BRAVE_ENDPOINT:-}\",
+    \"DEEPEYES_V2_SEARCH_TRUST_ENV\": \"${DEEPEYES_V2_SEARCH_TRUST_ENV:-}\",
+    \"DEEPEYES_V2_SEARCH_TIMEOUT\": \"${DEEPEYES_V2_SEARCH_TIMEOUT:-}\",
+    \"DEEPEYES_V2_SEARCH_MAX_RETRIES\": \"${DEEPEYES_V2_SEARCH_MAX_RETRIES:-}\",
+    \"DEEPEYES_V2_SEARCH_RETRY_BUDGET\": \"${DEEPEYES_V2_SEARCH_RETRY_BUDGET:-}\",
     \"DEEPEYES_JUDGE_BASE_URL\": \"${DEEPEYES_JUDGE_BASE_URL:-}\",
     \"DEEPEYES_JUDGE_MODELS\": \"${DEEPEYES_JUDGE_MODELS:-}\",
     \"DEEPEYES_JUDGE_API_KEY\": \"${DEEPEYES_JUDGE_API_KEY:-}\",
     \"XMLIR_ENABLE_H2D_SSE_COPY\": \"${XMLIR_ENABLE_H2D_SSE_COPY:-1}\",
     \"USE_CAST_FC_FUSION\": \"${USE_CAST_FC_FUSION:-1}\""
 source "${SCRIPT_DIR}/../../scripts/entrypoint/runtime-env-klx.sh"
+if [ "${_DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -312,7 +343,13 @@ mkdir -p logs
 # xtrace off for the submit command: --runtime-env-json embeds EXTRA_ENV_VARS_JSON
 # (may carry DEEPEYES_JUDGE_API_KEY etc.) and, after the merge below, WANDB_API_KEY;
 # the whole line would otherwise be echoed by `set -x` into logs/${EXP_NAME}.log.
-set +x
+_DEEPEYES_SUBMIT_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_SUBMIT_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 # Merge WANDB_API_KEY into the job runtime_env. `ray job submit` runs the entrypoint
 # on the (possibly pre-existing) cluster, whose workers do NOT inherit this submit
 # shell's exports — so wandb online init can't authenticate unless the key travels
@@ -346,4 +383,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MEGATRON_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     2>&1 | tee logs/${EXP_NAME}.log
-set -x
+if [ "${_DEEPEYES_SUBMIT_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_SUBMIT_RESTORE_XTRACE
