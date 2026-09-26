@@ -2565,7 +2565,7 @@ index 2916f8c6..32b81c49 100644
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8e957f6..1849f5f 100644
+index 8e957f6..48aa9a3 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -376,9 +376,10 @@ class ModelRunner:
@@ -2582,7 +2582,7 @@ index 8e957f6..1849f5f 100644
  
          self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
  
-@@ -1183,10 +1184,394 @@ class ModelRunner:
+@@ -1183,10 +1184,400 @@ class ModelRunner:
              lora_ref, tensors, config_dict, added_tokens_config
          )
  
@@ -2805,7 +2805,13 @@ index 8e957f6..1849f5f 100644
 +        except Exception as e:
 +            # The collective itself broke: the group may be unusable for every
 +            # participant, so this must not look like a refusal the publisher could
-+            # simply retry as if nothing had crossed the wire.
++            # simply retry as if nothing had crossed the wire. Logged with the
++            # traceback: this verdict fails the publication closed and the caller
++            # only ever sees the one-line message.
++            logger.error(
++                f"Staged LoRA bucket {index} of {attempt} failed to receive: {e}",
++                exc_info=True,
++            )
 +            return LoRAUpdateOutput(
 +                success=False,
 +                error_message=f"staged LoRA bucket {index} receive failed: {e}",
@@ -2977,7 +2983,7 @@ index 8e957f6..1849f5f 100644
      @property
      def effective_max_total_num_tokens(self):
          """Return the max token pool size considering hybrid swa settings."""
-@@ -1441,6 +1826,12 @@ class ModelRunner:
+@@ -1441,6 +1832,12 @@ class ModelRunner:
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -2990,7 +2996,7 @@ index 8e957f6..1849f5f 100644
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1448,7 +1839,7 @@ class ModelRunner:
+@@ -1448,7 +1845,7 @@ class ModelRunner:
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -2999,7 +3005,7 @@ index 8e957f6..1849f5f 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -1456,7 +1847,7 @@ class ModelRunner:
+@@ -1456,7 +1853,7 @@ class ModelRunner:
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
