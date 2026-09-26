@@ -1,8 +1,21 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
+
+
+def _skip_if_server_args_stubbed(se):
+    """Skip under the dependency-stub environment: suite-wide stub tests can
+    replace ``sglang.srt.server_args`` while ``sglang_engine`` is imported,
+    leaving its module-level ``ServerArgs`` bound to a non-dataclass stub that
+    ``_compute_genrm_server_args`` cannot iterate.
+
+    Check what the engine module actually sees, not a fresh import.
+    """
+    if not dataclasses.is_dataclass(getattr(se, "ServerArgs", None)):
+        pytest.skip("sglang_engine.ServerArgs is stubbed in this suite run")
 
 
 @pytest.mark.parametrize(
@@ -67,6 +80,8 @@ def test_genrm_deterministic_attention_backend_keeps_radix_capable_fa3(monkeypat
 
     from relax.backends.sglang import sglang_engine as se
 
+    _skip_if_server_args_stubbed(se)
+
     args = _genrm_server_args_namespace()
     monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: "fa3")
 
@@ -83,6 +98,8 @@ def test_genrm_attention_backend_engine_config_still_overrides(monkeypatch):
     pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
 
     from relax.backends.sglang import sglang_engine as se
+
+    _skip_if_server_args_stubbed(se)
 
     args = _genrm_server_args_namespace(engine_config={"attention_backend": "triton"})
     monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: "fa3")
