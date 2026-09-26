@@ -976,7 +976,6 @@ def train_one_step(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     step_global_batch_size: int,
-    num_steps_per_rollout: int,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -993,8 +992,6 @@ def train_one_step(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
         step_global_batch_size (int): Number of distinct sample indices in this optimizer step.
-        num_steps_per_rollout (int): Number of optimizer steps in this rollout, used to
-            derive a run-wide ``global_step`` for the straggler profiler.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -1005,7 +1002,6 @@ def train_one_step(
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).
     capture_hooks.begin_step_for(args, rollout_id, step_id)
-    record_optimizer_step(rollout_id, step_id, num_steps_per_rollout)
 
     # Set grad to zero.
     for model_chunk in model:
@@ -1467,6 +1463,12 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        # Task 11 straggler profiler: record the step context here rather than
+        # inside train_one_step, so the profiler does not widen the low-level
+        # training API with a parameter it alone needs. `global_step` mirrors the
+        # platform identity this function already derives as
+        # `accumulated_step_id`; the profiler never replaces it.
+        record_optimizer_step(rollout_id, step_id, num_steps_per_rollout)
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):
@@ -1480,7 +1482,6 @@ def train(
                 opt_param_scheduler,
                 num_microbatches[step_id],
                 global_batch_sizes[step_id],
-                num_steps_per_rollout,
             )
         if keep_forward_pre_hook_disabled:
             force_param_sync(model)

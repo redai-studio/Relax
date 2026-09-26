@@ -62,12 +62,20 @@ transfer times, per-kernel durations), so the verdict reports the observable
 gap and stops.
 
 Workload is reported, never corrected. When an envelope carries a ``workload``
-mapping the detector records the relative difference between the rank's workload
-and its peers' median in ``facts["workload_delta"]``; a rank that legitimately
-did more tokens/sequences/microbatches therefore shows it next to the timing gap
-instead of silently reading as a straggler. C2 is a *reporter*: it does not
-normalise timings by workload and does not suppress a verdict because a workload
-difference exists.
+mapping the detector records the rank's own and the peer-median ``tokens`` in
+``facts``, together with ``tokens_delta``, ``sequences_delta`` and
+``microbatches_delta``; comparability is decided by ``tokens`` ALONE, because
+summing tokens + sequences + microbatches mixed incompatible units. A rank that
+legitimately did more tokens therefore shows it next to the timing gap instead
+of silently reading as a straggler.
+
+C2 still never *normalises* timings by workload, but it does withhold the
+straggler verdict: when a rank's token workload exceeds ``work_tolerance`` past
+its peers' median, the window is reported as ``uncertain`` with reason
+``workload_incomparable`` (``facts["workload_comparable"]`` is ``False``) rather
+than as a straggler. That is a deliberate, documented suppression --- an
+unexplained +100% timing gap on a rank doing +100% of the tokens is not evidence
+of a straggler.
 """
 
 import json
