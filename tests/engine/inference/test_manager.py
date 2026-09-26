@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -151,7 +152,11 @@ def test_lifecycle_switch_offloads_outgoing_before_onloading_incoming() -> None:
     assert manager.snapshot(Role.TEACHER).models[0].state == LifecycleState.READY
 
 
-def test_manager_role_shutdown_unregisters_the_role() -> None:
+def test_manager_role_shutdown_unregisters_the_role(monkeypatch) -> None:
+    # The last role's shutdown stops the Routers; the real module needs sglang.
+    rollout = ModuleType("relax.distributed.ray.rollout")
+    rollout.stop_launched_routers = lambda: None
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout)
     pool = FakePool("judge")
     manager = _manager(genrm={"judge": pool})
     manager.shutdown(Role.GENRM)

@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from relax.distributed.coordination import RolloutOffloadBarrier
@@ -25,6 +26,16 @@ def test_rollout_worker_binds_workload_and_local_scoring_to_same_owner(monkeypat
     monkeypatch.setattr(rollout_worker.tq, "init", Mock())
     monkeypatch.setattr(rollout_worker.tq, "get_client", lambda: client)
     monkeypatch.setattr(rollout_worker, "_LOCAL_INFERENCE_MANAGER", None)
+    try:
+        import sglang.srt.constants  # noqa: F401
+    except ImportError:
+        # onload_kv reads the memory tags from sglang, which CPU CI does not install.
+        constants = ModuleType("sglang.srt.constants")
+        constants.GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+        constants.GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+        for name in ("sglang", "sglang.srt"):
+            monkeypatch.setitem(sys.modules, name, ModuleType(name))
+        monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
     worker = rollout_worker.RolloutWorker.__ray_metadata__.modified_class(args, source, owner)
     assert constructor.call_args.args[:3] == (args, source, client)
     assert rollout_worker.get_local_inference_manager() is owner

@@ -56,7 +56,7 @@ ray job submit
       → create placement groups (ray.util.placement_group)
       → deploy Ray Serve services (serve.run)
       → inside each service:
-        → spawn ray.remote actors (TrainRayActor, RolloutManager, etc.)
+        → spawn ray.remote actors (TrainRayActor, RolloutWorker, etc.)
         → actors use dist.init_process_group for PyTorch DDP/FSDP/Megatron
 ```
 
@@ -196,27 +196,29 @@ The sort key orders by node IP then GPU ID, ensuring deterministic rank assignme
 | Strategy                           | When to use                                | Example in Relax                 |
 | ---------------------------------- | ------------------------------------------ | -------------------------------- |
 | `PlacementGroupSchedulingStrategy` | Pin actor to a specific bundle within a PG | Training actors, rollout engines |
-| `NodeAffinitySchedulingStrategy`   | Pin actor to a specific node (by node ID)  | RolloutManager → head node       |
+| `NodeAffinitySchedulingStrategy`   | Pin actor to a specific node (by node ID)  | InferenceManager → head node     |
 | `PACK` (PG strategy)               | Colocate bundles on fewest nodes           | Default for all PGs              |
 | `SPREAD` (PG strategy)             | Distribute bundles across nodes            | Not currently used               |
 
-### RolloutManager: Head Node Affinity
+### InferenceManager / RolloutWorker: Head Node Affinity
 
 ```python
-# relax/distributed/ray/placement_group.py
-head_node_id = _get_head_node_id()
-
-rollout_manager = RolloutManager.options(
+# relax/distributed/ray/inference_manager.py::create_inference_manager
+InferenceManagerActor.options(
     num_cpus=1,
     num_gpus=0,
-    scheduling_strategy=NodeAffinitySchedulingStrategy(
-        node_id=head_node_id,
-        soft=False,  # Hard constraint
-    ),
-).remote(args, pg, data_source=data_source)
+    max_concurrency=_MANAGER_CONCURRENCY,
+    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
+).remote()
+
+# relax/distributed/ray/placement_group.py::create_rollout_worker
+RolloutWorker.options(
+    num_cpus=1,
+    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=False),
+).remote(args, data_source=data_source, inference_manager_handle=inference_manager_handle)
 ```
 
-The RolloutManager must run on the head node because the Router binds to `SLIME_HOST_IP_ENV`.
+The InferenceManager must run on the head node because the Routers start in its process and the rest of the job resolves a Router by the head node's address.
 
 ## Ray Serve
 
@@ -234,6 +236,8 @@ class Service:
         self.handle = serve.run(self.service, name=role, route_prefix=f"/{role}")
 ```
 
+Inference roles (`rollout`, `genrm`, `teacher`) are the exception: the service deploys as `<role>_backend` at `/<role>/backend`, and `deploy_gateway` (`relax/components/inference_gateway.py`) puts a CPU `InferenceGateway` at `/<role>` that serves `GET /engines` (v2 discovery by default) and forwards other paths to the backend.
+
 **Key rules:**
 
 - Each service has a unique `name` and `route_prefix`
@@ -246,7 +250,7 @@ class Service:
 ```python
 # Async calls via handle
 await self.handle.run.remote()
-await self.handle.set_rollout_manager.remote(rollout_manager)
+await self.handle.set_rollout_handles.remote(rollout_worker, inference_manager)
 step = await self.handle.get_step.remote()
 ```
 
@@ -370,19 +374,17 @@ This enables the sleep/wake-up mechanism where training actors offload GPU memor
 
 ## Concurrency Groups
 
-RolloutManager uses concurrency groups to isolate health monitoring from main operations:
+InferenceManager uses a concurrency group to keep long-running rollout pool operations from blocking lifecycle and discovery RPCs:
 
 ```python
-@ray.remote(concurrency_groups={"health_monitoring": 1})
-class RolloutManager(ReloadableMixin):
-    ...
+# relax/distributed/ray/inference_manager.py
+InferenceManagerActor = ray.remote(num_cpus=1, num_gpus=0, concurrency_groups={"rollout": 8})(InferenceManager)
 
-    @ray.method(concurrency_group="health_monitoring")
-    def set_force_unhealthy(self, engine_id: int) -> None:
+class InferenceManager:
+    @ray.method(concurrency_group="rollout")
+    def rollout_operation(self, method: str, /, *args, **kwargs):
         ...
 ```
-
-This prevents health check RPCs from being blocked by long-running rollout operations.
 
 ## Troubleshooting
 

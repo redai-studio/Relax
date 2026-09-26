@@ -142,6 +142,9 @@ def test_task_inference_manager_keeps_head_affinity_and_requests_stable_cpu(monk
             return cls
 
     monkeypatch.setattr(inference_manager, "InferenceManagerActor", FakeManagerActor)
+    # Layout preflight imports the sglang-backed rollout module; this test only
+    # checks the actor options, and CPU CI runs without sglang.
+    monkeypatch.setattr(inference_manager, "validate_task_layout", lambda args: None)
     monkeypatch.setattr(placement_group_module, "_get_head_node_id", lambda: node_id)
     monkeypatch.setattr(
         placement_group_module.ray,
