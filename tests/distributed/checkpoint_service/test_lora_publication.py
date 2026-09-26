@@ -334,6 +334,10 @@ class TestFailureSemantics:
         snapshot = _snapshot()
         with pytest.raises(LoRAPublicationError):
             _publisher(engines, registry).publish(snapshot, [1, 1])
+        # The retry reuses the immutable name, so the cleanup must say *which* attempt
+        # it is undoing; otherwise a late duplicate could strip the retry's instance.
+        unloads = [payload for kind, op, payload in engines.events if kind == "fire" and op == "engine0:unload"]
+        assert unloads and all(payload["attempt_id"] == 1 for payload in unloads)
 
         engines.replies.clear()
         engines.events.clear()
@@ -364,6 +368,10 @@ class TestReclaim:
         assert publisher.reclaim_once() is True
         assert engines.ops().count("engine0:unload") == 1
         assert registry.status().versions[a.version_id]["state"] == VersionState.RECLAIMED.value
+        # Reclaim stays name-scoped on purpose: a published version never gets a new
+        # attempt, so there is nothing an attempt_id could fence against.
+        reclaim = [payload for kind, op, payload in engines.events if kind == "fire" and op == "engine0:unload"][0]
+        assert reclaim.get("attempt_id") is None
 
     def test_unconfirmed_unload_is_never_retried(self, registry):
         """F36/§17.3: ambiguous unload keeps the slot and fails the run closed."""

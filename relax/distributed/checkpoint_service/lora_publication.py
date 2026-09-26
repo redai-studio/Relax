@@ -551,13 +551,16 @@ class LoRAPublisher:
 
         ``op=unload`` is name-scoped and idempotent on every local state (staged candidate,
         registered-but-unpublished, or never existed), so one fan-out covers the whole
-        cleanup and its verdict is exactly "all engines ABSENT".
+        cleanup and its verdict is exactly "all engines ABSENT". The attempt_id is sent so
+        a retry of the same version (same name, new attempt) is never stripped by a late
+        or duplicated cleanup of this attempt.
         """
 
         replies = self._fan_out(
             {
                 "op": "unload",
                 "lora_name": publication.lora_name,
+                "attempt_id": publication.attempt_id,
                 "reason": "cleanup_unpublished",
             },
             "cleanup",
@@ -580,7 +583,12 @@ class LoRAPublisher:
 
     def _best_effort_cleanup(self, publication: Publication) -> None:
         replies = self._fan_out(
-            {"op": "unload", "lora_name": publication.lora_name, "reason": "best_effort_cleanup"},
+            {
+                "op": "unload",
+                "lora_name": publication.lora_name,
+                "attempt_id": publication.attempt_id,
+                "reason": "best_effort_cleanup",
+            },
             "cleanup",
         )
         bad = sorted(engine_id for engine_id, reply in replies.items() if not reply.success)
