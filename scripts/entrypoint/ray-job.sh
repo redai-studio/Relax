@@ -173,6 +173,21 @@ else
     } > "${RELAX_GPU_LOCK_HOLDER_FILE}"
     export RELAX_GPU_LOCK_HELD="$$"
     echo "=== GPU lock acquired: ${RELAX_GPU_LOCK_FILE} (pid $$, project ${RELAX_GPU_LOCK_PROJECT:-${_RAY_JOB_RUN_SCRIPT:-source-mode}}) ==="
+    # A free lock does NOT prove an idle cluster (see KNOWN LIMITATION above): a
+    # SIGKILLed submitter drops the flock while its raylet-spawned job keeps
+    # RUNNING. Surface that loudly BEFORE the cleanup below stops anything. This
+    # is warn-only: a missing/failing/slow Ray CLI can never block submission,
+    # and the `relax.entrypoints.train` filter cannot match this launcher's own
+    # `bash ray-job.sh` driver entrypoint.
+    _live_relax_jobs="$(ray job list 2>/dev/null \
+        | grep RUNNING \
+        | grep -F 'relax.entrypoints.train' \
+        | grep -oP "submission_id='\K[^']+" || true)"
+    if [ -n "${_live_relax_jobs}" ]; then
+        echo "WARNING: the GPU lock was free but these relax training jobs are still RUNNING:" >&2
+        printf '%s\n' "${_live_relax_jobs}" | sed 's/^/  /' >&2
+        echo "  a SIGKILLed submitter releases the lock while its Ray job survives; the cleanup below may stop them." >&2
+    fi
     # Held for the rest of this shell's life and across `exec`. NOTE: `exec`
     # discards these traps, but the inherited fd still holds the flock, so the
     # kernel releases it when the exec'd submitting process tree exits (it does
