@@ -28,3 +28,104 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     )
 
     assert _enable_draft_weights_cpu_backup(args, overrides) is expected
+
+
+def _genrm_server_args_namespace(engine_config=None):
+    """Minimal args shape for _compute_genrm_server_args (single-GPU
+    engine)."""
+    return SimpleNamespace(
+        genrm_model_path="/tmp/fake/Qwen3-0.6B",
+        genrm_num_gpus=1,
+        genrm_num_gpus_per_engine=1,
+        genrm_engine_config=engine_config or {},
+        num_gpus_per_node=4,
+        rollout_num_gpus=0,
+        rollout_num_gpus_per_engine=1,
+        seed=42,
+        offload_rollout=False,
+        colocate=False,
+        debug_rollout_only=True,
+        actor_num_gpus_per_node=0,
+        actor_num_nodes=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+    )
+
+
+def test_genrm_deterministic_attention_backend_keeps_radix_capable_fa3(monkeypatch, tmp_path):
+    """Regression (final-code autoscaler acceptance): deterministic inference
+    must not land on the generic flashinfer default on pre-Blackwell GPUs.
+
+    SGLang applies the flashinfer default *before* its deterministic handler,
+    which then force-disables the radix cache (flashinfer is not in SGLang's
+    radix-supported deterministic set). Without prefix reuse, a 48-way
+    concurrent scoring load re-prefills every long shared prompt until the
+    scheduler wedges. The fix mirrors SGLang's own deterministic fallback: fa3
+    on pre-Blackwell (radix stays available), flashinfer on Blackwell+.
+    """
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    from relax.backends.sglang import sglang_engine as se
+
+    args = _genrm_server_args_namespace()
+    monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: "fa3")
+
+    kwargs, _ = se._compute_genrm_server_args(args, 0, "tcp://127.0.0.1:1", 16001, "127.0.0.1", 16000)
+
+    assert kwargs["enable_deterministic_inference"] is True
+    assert kwargs["attention_backend"] == "fa3"
+    assert kwargs["random_seed"] == 42
+
+
+def test_genrm_attention_backend_engine_config_still_overrides(monkeypatch):
+    """The per-instance --genrm-engine-config override keeps the highest
+    priority: an operator can still pin a different attention backend."""
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    from relax.backends.sglang import sglang_engine as se
+
+    args = _genrm_server_args_namespace(engine_config={"attention_backend": "triton"})
+    monkeypatch.setattr(se, "_genrm_deterministic_attention_backend", lambda: "fa3")
+
+    kwargs, _ = se._compute_genrm_server_args(args, 0, "tcp://127.0.0.1:1", 16001, "127.0.0.1", 16000)
+
+    assert kwargs["attention_backend"] == "triton"
+    assert kwargs["enable_deterministic_inference"] is True
+
+
+def test_genrm_deterministic_attention_backend_arch_table(monkeypatch):
+    """The arch probe maps Blackwell+ to flashinfer (SGLang's own deterministic
+    choice there) and everything else to fa3; a failed probe defers to SGLang's
+    default (None)."""
+    pytest.importorskip("sglang.srt.utils", exc_type=ImportError)
+
+    from relax.backends.sglang import sglang_engine as se
+
+    def _probe(sm100, sm120, expected):
+        monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: sm100)
+        monkeypatch.setattr("sglang.srt.utils.is_sm120_supported", lambda: sm120)
+        assert se._genrm_deterministic_attention_backend() == expected
+
+    _probe(True, False, "flashinfer")
+    _probe(False, True, "flashinfer")
+    _probe(False, False, "fa3")
+
+
+def test_genrm_deterministic_attention_backend_probe_failure_defers(monkeypatch):
+    """When the architecture probe cannot run, the helper defers to SGLang's
+    default instead of guessing."""
+    pytest.importorskip("sglang.srt.server_args", exc_type=ImportError)
+
+    import builtins
+
+    from relax.backends.sglang import sglang_engine as se
+
+    real_import = builtins.__import__
+
+    def _boom(name, *a, **k):
+        if name == "sglang.srt.utils":
+            raise ImportError("probe unavailable")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _boom)
+    assert se._genrm_deterministic_attention_backend() is None
