@@ -93,6 +93,7 @@ from relax.utils.straggler.context import (
     count_workload_publish_skipped,
     publish_step_workload,
 )
+from relax.utils.straggler.workload import step_workloads
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
@@ -1250,27 +1251,18 @@ class MegatronTrainRayActor(TrainRayActor):
         if _straggler_publish_enabled():
             try:
                 samples = window.rollout_data["total_lengths"]
-                final_indices = get_seqlen_balanced_partitions(samples, max_k, equal_size=False)
-                if len(final_indices) == max_k and sum(len(group) for group in final_indices) == len(samples):
-                    # ONE entry per OPTIMIZER STEP, not one per micro-batch. This
-                    # path hands the caller a single-element
-                    # `prepared_num_microbatches=[num_microbatches]`, so
-                    # `num_steps_per_rollout == 1` and the step consumes ALL
-                    # `max_k` micro-batches of this window. Publishing one tuple
-                    # per micro-batch made `_step_workload(rollout_id, 0)` return
-                    # only the FIRST group's work (-50% tokens, -83% sequences,
-                    # -75% microbatches on the red team's example), and because a
-                    # first group's size is distribution-dependent, two ranks with
-                    # identical totals reported different tokens and the
-                    # comparability gate suppressed verdicts for equal work.
-                    publish_step_workload(
-                        rollout_id,
-                        [(sum(samples), len(samples), len(final_indices))],
-                    )
+                # The executed K is `max_k`: `local_k = max_k` above normalises
+                # both branches, so this is never the rank-local k. The payload
+                # itself is derived by the pure, megatron-free `step_workloads`,
+                # which returns one entry per OPTIMIZER STEP -- one step consumes
+                # this whole window, so the entry carries the step totals.
+                if len(samples) >= max_k:
+                    publish_step_workload(rollout_id, step_workloads(samples, max_k, 1))
                 else:
-                    # The guard rejected the partition: the step runs with no
-                    # workload published. Count it, because the detector would
-                    # otherwise treat a missing workload as comparable.
+                    # Cheap defence only: `step_workloads` would raise here and
+                    # the balancing helper asserts the same condition. This is
+                    # not observability of the P0 -- that is the detector-side
+                    # missing-workload counter.
                     count_workload_publish_skipped()
             except Exception:
                 count_workload_publish_error()

@@ -59,23 +59,26 @@ def test_published_workload_matches_the_executed_max_k_partition():
     assert _workload(samples, max_k) == executed
 
 
-def test_the_only_publish_site_runs_after_the_dp_wide_k_is_final():
-    """Source guard: the publish must not run before ``local_k = max_k``.
+def test_the_publish_passes_the_executed_k_and_lives_in_the_training_path():
+    """Coupling guard: the derivation must get the EXECUTED max_k.
 
-    Reintroducing an early publish is the whole defect, so it is pinned by
-    position rather than by intent.
+    The previous guard asserted only a line-number ordering, which passes on
+    revert because the removed worker site had a HIGHER line number than the
+    final-K line. This anchors on the argument that actually changes when the
+    publish moves back into the prefetch worker: reverting would pass
+    ``k_local`` (or derive from the rank-local partition) instead of ``max_k``.
     """
     source = ACTOR.read_text()
-    publish_sites = [m.start() for m in re.finditer(r"publish_step_workload\(", source)]
-    assert len(publish_sites) == 1, f"expected exactly one publish site, found {len(publish_sites)}"
 
-    final_k = source.index("local_k = max_k")
-    assert publish_sites[0] > final_k, "the workload is published before the DP-wide K is final"
-
-    # And it must live in the training-thread path (_get_prefetched_sft_window),
-    # not in the prefetch worker that builds the rank-local k partition.
+    assert source.count("step_workloads(") == 1, "the derivation must have exactly one call site"
+    assert re.search(r"step_workloads\(\s*samples,\s*max_k\s*,", source), "the publish must pass the EXECUTED max_k"
+    assert not re.search(r"step_workloads\(\s*samples,\s*k_local\s*,", source), (
+        "the publish must never derive from the rank-local k"
+    )
+    # And it must sit in the training-thread path, not the prefetch worker.
     training_path = source.index("def _get_prefetched_sft_window")
     prefetch_worker = source.index("def _pack_sft_prepack_window")
-    assert training_path < publish_sites[0] < prefetch_worker, (
-        "the publish must sit between the training-thread path and the prefetch worker"
-    )
+    call = source.index("step_workloads(")
+    assert training_path < call < prefetch_worker
+    # Gated, so a disabled profiler does no derivation at all.
+    assert "_straggler_publish_enabled()" in source[:call]

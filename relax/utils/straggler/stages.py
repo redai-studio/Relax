@@ -29,9 +29,18 @@ send/recv or all-reduce timer measures the *observable interval*. With compute
 and communication streams overlapping it is **not** the NCCL kernel execution
 time, so the group is named ``communication`` and its intervals are reported as
 ``collective_interval`` rather than as communication cost.
+
+Classification is closed and explicit: :func:`group_of` reads
+:data:`STAGE_GROUPS` and nothing else, so an unrecognised name returns
+``other`` instead of being guessed into a plausible-looking group from its
+spelling. The 23 names Relax's core path actually emits are listed in
+:data:`OBSERVED_TIMER_NAMES`; every one of them has an explicit entry. The
+coarse group reaches a reader through the platform reporter, which logs the raw
+timer name and its group together (see ``reporter.py``) without widening the
+wire envelope.
 """
 
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 
 GROUP_FORWARD = "forward"
@@ -60,6 +69,41 @@ MEASURED_GROUPS = (
 #: deep hook would be required and is deliberately out of the first phase.
 SCHEMA_ONLY_GROUPS = ("attention", "moe")
 
+#: Every timer name Relax's core training path passes to Megatron's
+#: ``config.timers``, in the order the audit reported them. This is the set the
+#: observer can actually record, so it is also the set
+#: :func:`group_of` must classify; a name added here without an explicit
+#: :data:`STAGE_GROUPS` entry fails the taxonomy test instead of silently
+#: falling to ``other`` at runtime.
+OBSERVED_TIMER_NAMES: Tuple[str, ...] = (
+    "forward-backward",
+    "forward-compute",
+    "backward-compute",
+    "forward-send",
+    "forward-recv",
+    "backward-send",
+    "backward-recv",
+    "forward-send-forward-recv",
+    "forward-send-backward-recv",
+    "backward-send-forward-recv",
+    "backward-send-backward-recv",
+    "forward-backward-send-forward-backward-recv",
+    "all-grads-sync",
+    "non-tensor-parallel-grads-all-reduce",
+    "embedding-grads-all-reduce",
+    "conditional-embedder-grads-all-reduce",
+    "params-all-gather",
+    "optimizer-inner-step",
+    "optimizer-copy-to-main-grad",
+    "optimizer-unscale-and-check-inf",
+    "optimizer-copy-main-to-model-params",
+    "optimizer-clip-main-grad",
+    "optimizer-count-zeros",
+)
+
+#: The one place a timer name becomes a group. Only exact matches here are
+#: honoured; there are deliberately no suffix/prefix rules, because a name that
+#: merely *looks* like communication or optimizer is not evidence that it is.
 STAGE_GROUPS: Dict[str, str] = {
     # Phase timers.
     "forward-backward": GROUP_FORWARD,
@@ -104,26 +148,38 @@ STAGE_GROUPS: Dict[str, str] = {
     "interval-time": GROUP_EVAL,
 }
 
-_COMMUNICATION_SUFFIXES = ("-send", "-recv", "-all-reduce", "-all-gather", "-reduce-scatter", "-all-sync")
-
 
 def group_of(name: str) -> str:
     """Return the coarse group of one Megatron timer name.
 
-    Unknown names fall back to ``other`` instead of being guessed into a group:
-    a wrong group is worse than an unclassified one.
+    Only names explicitly listed in :data:`STAGE_GROUPS` are classified. Any
+    unrecognised name - however plausible its spelling - returns ``other`` and
+    is never guessed into a measured group: a wrong stage label is worse than
+    an unclassified one. The function never raises, whatever the input.
     """
+    if not isinstance(name, str):
+        return GROUP_OTHER
     stripped = name.strip()
     if not stripped:
         return GROUP_OTHER
-    if stripped in STAGE_GROUPS:
-        return STAGE_GROUPS[stripped]
-    lowered = stripped.lower()
-    if any(lowered.endswith(suffix) for suffix in _COMMUNICATION_SUFFIXES):
-        return GROUP_COMMUNICATION
-    if lowered.startswith("optimizer"):
-        return GROUP_OPTIMIZER
-    return GROUP_OTHER
+    return STAGE_GROUPS.get(stripped, GROUP_OTHER)
+
+
+def with_stage_group(facts: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return ``facts`` with a coarse ``stage_group`` next to ``stage``.
+
+    A straggler verdict already carries the raw Megatron timer name under
+    ``facts["stage"]``. A consumer that wants to localise a measurement can
+    pass those facts here and read the raw name and its coarse group together;
+    the mapping is derived, so nothing has to travel on the wire. Facts without
+    a string ``stage`` are copied through unchanged, and a name that is not in
+    the taxonomy is labelled ``other`` rather than guessed.
+    """
+    annotated = dict(facts)
+    stage = annotated.get("stage")
+    if isinstance(stage, str) and stage:
+        annotated["stage_group"] = group_of(stage)
+    return annotated
 
 
 def group_names(names: Iterable[str]) -> Dict[str, List[str]]:
@@ -135,10 +191,13 @@ def group_names(names: Iterable[str]) -> Dict[str, List[str]]:
 
 
 def coverage(names: Iterable[str]) -> Dict[str, object]:
-    """Describe what the instrumented name set can and cannot show.
+    """Describe what a given instrumented name set can and cannot show.
 
-    Published alongside every measurement so a reader can see which of the
-    requested coarse stages were actually observed and which were not.
+    This is an offline audit helper, not a runtime publisher: the runtime
+    reporter does not call it and it never travels on the wire. Tests and
+    diagnostic tooling use it to check that every observed timer name maps to a
+    measured group, that the schema-only groups stay unmeasured, and that
+    nothing ends up unclassified.
     """
     buckets = group_names(names)
     return {
@@ -160,9 +219,11 @@ __all__ = [
     "GROUP_OTHER",
     "GROUP_SETUP",
     "MEASURED_GROUPS",
+    "OBSERVED_TIMER_NAMES",
     "SCHEMA_ONLY_GROUPS",
     "STAGE_GROUPS",
     "coverage",
     "group_names",
     "group_of",
+    "with_stage_group",
 ]

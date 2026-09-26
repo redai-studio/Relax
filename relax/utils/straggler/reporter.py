@@ -16,9 +16,21 @@ The emitted keys are fixed by :data:`STRAGGLER_METRIC_KEYS`, all under
 :data:`STRAGGLER_METRIC_PREFIX`, and every value is a scalar. A value that
 cannot be measured is omitted rather than reported as zero, so a missing key
 reads as "not measured" and never as a false "none observed".
+
+The drained verdicts are also logged, one line each, with the raw Megatron
+timer name and its coarse stage group next to each other. The group is derived
+from the stage the verdict already carries, so a reader can localise a
+measurement without the wire envelope growing a field and without any metrics
+backend having to accept a non-numeric value.
 """
 
 from typing import Any, Dict, Mapping, Optional, Tuple
+
+from relax.utils.logging_utils import get_logger
+from relax.utils.straggler.stages import with_stage_group
+
+
+logger = get_logger(__name__)
 
 
 STRAGGLER_METRIC_PREFIX = "perf/straggler/"
@@ -158,6 +170,46 @@ def _worst_verdict(verdicts: Any) -> Tuple[Optional[float], Optional[float]]:
     return worst_deviation, worst_rank
 
 
+def _stage_name(verdict: Any) -> Optional[str]:
+    """Return the raw timer name a verdict was judged on, or ``None``.
+
+    ``facts["stage"]`` is the canonical location; the legacy top-level ``name``
+    field is the fallback, so a stub or an older verdict still labels.
+    """
+    facts = _mapping(_verdict_field(verdict, "facts"))
+    stage = facts.get("stage")
+    if isinstance(stage, str) and stage:
+        return stage
+    name = _verdict_field(verdict, "name")
+    return name if isinstance(name, str) and name else None
+
+
+def _stage_facts(verdict: Any) -> Mapping[str, Any]:
+    """Return a verdict's facts with the raw ``stage`` guaranteed present."""
+    facts = _mapping(_verdict_field(verdict, "facts"))
+    stage = _stage_name(verdict)
+    if stage is None:
+        return {}
+    if facts.get("stage") != stage:
+        return {**facts, "stage": stage}
+    return facts
+
+
+def _log_stage_groups(verdicts: Any) -> None:
+    """Log every verdict's raw stage next to its coarse group.
+
+    Presentation only: the detector's decision is already made, and the group
+    is derived from the same facts that carry the raw stage, so a reader can
+    localise a measurement without the wire envelope growing a field. A name
+    outside the taxonomy is logged as ``other`` rather than guessed.
+    """
+    for verdict in verdicts:
+        labelled = with_stage_group(_stage_facts(verdict))
+        if "stage" not in labelled:
+            continue
+        logger.info("straggler stage: name=%s coarse_stage=%s", labelled["stage"], labelled["stage_group"])
+
+
 def _training_context() -> Mapping[str, Any]:
     """Read the published training context; empty when unavailable."""
     try:
@@ -227,6 +279,11 @@ def build_metrics(runtime: Any) -> Dict[str, float]:
     except Exception:
         _count_failure()
         return {}
+    try:
+        _log_stage_groups(verdicts)
+    except Exception:
+        # A logging failure must not cost the caller its metrics.
+        _count_failure()
     return metrics
 
 
