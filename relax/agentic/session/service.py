@@ -68,7 +68,7 @@ from relax.agentic.session.state import (
     normalize_tools,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import get_spec_token_counts
+from relax.utils.types import get_spec_metric_coverage, get_spec_token_counts
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -454,28 +454,22 @@ def _project_function_tools(tools: Any, *, protocol: str) -> list[dict[str, Any]
         raise AgenticChatRequestError("tools must be a list", param="tools")
     parameters_key, allowed_types = _FUNCTION_TOOL_FIELDS[protocol]
     canonical = []
-    for tool in tools:
+    for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
-            continue
+            raise AgenticChatRequestError(f"tools[{index}] must be a JSON object", param="tools")
         if tool.get("type") not in allowed_types:
-            continue
-        name = _required_nonempty_string(tool.get("name"), field="tools.name", param="tools")
-        parameters = tool.get(parameters_key)
+            raise AgenticChatRequestError(f"tools[{index}].type is unsupported", param="tools")
+        name = _required_nonempty_string(tool.get("name"), field=f"tools[{index}].name", param="tools")
+        parameters = tool.get(parameters_key, {})
         if not isinstance(parameters, dict):
             raise AgenticChatRequestError(
-                f"tools.{parameters_key} must be a JSON object",
+                f"tools[{index}].{parameters_key} must be a JSON object",
                 param="tools",
             )
-        canonical.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "parameters": parameters,
-                    "description": tool.get("description"),
-                },
-            }
-        )
+        function = {"name": name, "parameters": parameters}
+        if tool.get("description") is not None:
+            function["description"] = tool["description"]
+        canonical.append({"type": "function", "function": function})
     return canonical
 
 
@@ -492,10 +486,16 @@ def _normalized_generation_request(
 ) -> dict[str, Any]:
     try:
         messages = check_messages(messages)
-        tools = normalize_tools(tools)
-        chat_template_kwargs = normalize_template_kwargs(chat_template_kwargs)
     except (TypeError, ValueError) as error:
         raise AgenticChatRequestError(str(error), param=messages_param) from error
+    try:
+        tools = normalize_tools(tools)
+    except (TypeError, ValueError) as error:
+        raise AgenticChatRequestError(str(error), param="tools") from error
+    try:
+        chat_template_kwargs = normalize_template_kwargs(chat_template_kwargs)
+    except (TypeError, ValueError) as error:
+        raise AgenticChatRequestError(str(error), param="chat_template_kwargs") from error
     if not messages:
         raise AgenticChatRequestError(
             f"{messages_param} projected to zero supported messages",
@@ -549,7 +549,7 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
         for index, part in enumerate(content):
             part_field = f"{field}[{index}]"
             if not isinstance(part, dict):
-                continue
+                raise AgenticChatRequestError(f"{part_field} must be a JSON object", param="input")
             part_type = part.get("type")
             if part_type in {"input_text", "output_text"}:
                 text = part.get("text")
@@ -565,6 +565,8 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
                     )
                 canonical_parts.append({"type": "image_url", "image_url": {"url": image_url}})
                 has_image = True
+            else:
+                raise AgenticChatRequestError(f"{part_field}.type is unsupported", param="input")
         if not canonical_parts:
             return ""
         if not has_image:
@@ -625,10 +627,12 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
     for index, item in enumerate(items):
         field = f"input[{index}]"
         if not isinstance(item, dict):
-            continue
+            raise AgenticChatRequestError(f"{field} must be a JSON object", param="input")
         item_type = item.get("type")
         role = item.get("role")
-        if item_type in (None, "message") and role in {"user", "assistant", "system", "developer"}:
+        if item_type in (None, "message"):
+            if role not in {"user", "assistant", "system", "developer"}:
+                raise AgenticChatRequestError(f"{field}.role is unsupported", param="input")
             canonical_role = "system" if role == "developer" else cast(str, role)
             if canonical_role != "assistant":
                 flush_assistant()
@@ -716,10 +720,10 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
     for message_index, raw_message in enumerate(raw_messages):
         field = f"messages[{message_index}]"
         if not isinstance(raw_message, dict):
-            continue
+            raise AgenticChatRequestError(f"{field} must be a JSON object", param="messages")
         role = raw_message.get("role")
         if role not in {"user", "assistant"}:
-            continue
+            raise AgenticChatRequestError(f"{field}.role is unsupported", param="messages")
         content = raw_message.get("content")
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
@@ -733,7 +737,7 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
             for block_index, block in enumerate(content):
                 block_field = f"{field}.content[{block_index}]"
                 if not isinstance(block, dict):
-                    continue
+                    raise AgenticChatRequestError(f"{block_field} must be a JSON object", param="messages")
                 block_type = block.get("type")
                 if block_type == "text":
                     text = block.get("text")
@@ -759,6 +763,8 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                             param="messages",
                         )
                     tool_calls.append(_function_tool_call(tool_id, name, arguments))
+                else:
+                    raise AgenticChatRequestError(f"{block_field}.type is unsupported", param="messages")
             assistant: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
             if reasoning_parts:
                 assistant["reasoning_content"] = "\n\n".join(reasoning_parts)
@@ -783,7 +789,7 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
         for block_index, block in enumerate(content):
             block_field = f"{field}.content[{block_index}]"
             if not isinstance(block, dict):
-                continue
+                raise AgenticChatRequestError(f"{block_field} must be a JSON object", param="messages")
             block_type = block.get("type")
             if block_type == "text":
                 text = block.get("text")
@@ -812,6 +818,8 @@ def _anthropic_input_messages(raw_messages: Any, system: Any) -> list[dict[str, 
                         ),
                     }
                 )
+            else:
+                raise AgenticChatRequestError(f"{block_field}.type is unsupported", param="messages")
         flush_user()
         if len(messages) == message_start:
             raise AgenticChatRequestError(
@@ -1643,6 +1651,9 @@ class AgenticSessionShard:
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
         spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
+        acceptance_present, length_present = get_spec_metric_coverage(meta_info)
+        request.pending_spec_coverage["acceptance"] |= acceptance_present
+        request.pending_spec_coverage["length"] |= length_present
         request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
         request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
         request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
@@ -2594,6 +2605,16 @@ class AgenticSessionShard:
                 "request_id": ir.request_id,
                 "request_kind": ir.kind.value,
                 "base_state_hash": ir.parent_state_hash,
+                "spec_generation": {
+                    "session_id": session.session_id,
+                    "request_id": ir.request_id,
+                    "accepted": int(ir.pending_spec_delta["spec_accept_token_num"]),
+                    "proposed": int(ir.pending_spec_delta["spec_draft_token_num"]),
+                    "verify": int(ir.pending_spec_delta["spec_verify_ct"]),
+                    "completion": int(ir.pending_spec_delta["completion_token_num"]),
+                    "acceptance_present": bool(ir.pending_spec_coverage["acceptance"]),
+                    "length_present": bool(ir.pending_spec_coverage["length"]),
+                },
             }
         )
         forest = cast(SessionForest, session.forest)

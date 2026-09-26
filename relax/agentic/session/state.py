@@ -37,6 +37,10 @@ _EMPTY_SPEC_DELTA = {
     "spec_verify_ct": 0,
     "completion_token_num": 0,
 }
+_EMPTY_SPEC_COVERAGE = {
+    "acceptance": False,
+    "length": False,
+}
 # Zero-valued prefix-cache accounting shape accumulated across resumptions.
 _EMPTY_PREFIX_CACHE_DELTA = {
     "cached_tokens": 0,
@@ -116,7 +120,7 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}] must be a dict, got {type(tool_call)}"
             )
         call_id = tool_call.get("id")
-        if call_id is not None and (not isinstance(call_id, str) or not call_id):
+        if not isinstance(call_id, str) or not call_id:
             raise ValueError(f"messages[{message_index}].tool_calls[{call_index}].id must be a non-empty string")
         function = tool_call.get("function")
         if not isinstance(function, dict):
@@ -124,10 +128,9 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}].function must be a dict, got {type(function)}"
             )
         function_name = function.get("name")
-        if function_name is not None and not isinstance(function_name, str):
+        if not isinstance(function_name, str) or not function_name:
             raise TypeError(
-                f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
-                f"got {type(function_name)}"
+                f"messages[{message_index}].tool_calls[{call_index}].function.name must be a non-empty string"
             )
         arguments_field = f"messages[{message_index}].tool_calls[{call_index}].function.arguments"
         arguments = function.get("arguments")
@@ -184,8 +187,22 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
             for item_index, item in enumerate(content):
                 if not isinstance(item, dict):
                     raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
-                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
-                    raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
+                block_field = f"messages[{index}].content[{item_index}]"
+                block_type = item.get("type")
+                if block_type == "text":
+                    if not isinstance(item.get("text"), str):
+                        raise TypeError(f"{block_field}.text must be a string")
+                    if not item["text"]:
+                        raise ValueError(f"{block_field}.text must not be empty")
+                elif block_type == "image_url":
+                    image = item.get("image_url")
+                    if not isinstance(image, dict):
+                        raise TypeError(f"{block_field}.image_url must be a dict")
+                    url = image.get("url")
+                    if not isinstance(url, str) or not url:
+                        raise ValueError(f"{block_field}.image_url.url must be a non-empty string")
+                else:
+                    raise ValueError(f"{block_field}.type is unsupported")
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
         if role == "system":
@@ -219,9 +236,10 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         function = tool.get("function")
         if tool.get("type") != "function" or not isinstance(function, dict):
             continue
+        parameters = function.get("parameters")
         normalized_function = {
             "name": function.get("name"),
-            "parameters": function.get("parameters"),
+            "parameters": {} if parameters is None else parameters,
         }
         if function.get("description") is not None:
             normalized_function["description"] = function["description"]
@@ -385,6 +403,7 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    pending_spec_coverage: dict[str, bool] = field(default_factory=lambda: dict(_EMPTY_SPEC_COVERAGE))
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
@@ -704,6 +723,7 @@ class SessionForest:
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
+        spec_generation_nodes: list[dict[str, Any]] = []
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
@@ -728,6 +748,11 @@ class SessionForest:
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
+                spec_record = node.export_metadata_patch.get("spec_generation")
+                if isinstance(spec_record, dict):
+                    exported_spec_record = copy.deepcopy(spec_record)
+                    exported_spec_record.setdefault("generation_node_id", node.state_hash)
+                    spec_generation_nodes.append(exported_spec_record)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
             if idx == 0 or first_response_node is None:
@@ -766,6 +791,8 @@ class SessionForest:
         # path) see a single source of truth without having to know about
         # ``agentic_trace``.
         merged_metadata["rollout_turns"] = len(turns)
+        if spec_generation_nodes:
+            merged_metadata["spec_generation_nodes"] = spec_generation_nodes
         sample = Sample(
             group_index=self.group_index,
             index=self.index,

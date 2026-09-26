@@ -48,6 +48,7 @@ from relax.utils.metrics.metric_utils import (
     dict_add_prefix,
     has_repetition,
 )
+from relax.utils.metrics.speculative import aggregate_speculative_metrics
 from relax.utils.misc import group_by, load_function
 from relax.utils.multimodal.stats import get_sample_multimodal_stats
 from relax.utils.opd.opd_utils import compute_mopd_metrics
@@ -4939,11 +4940,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
 def _compute_spec_metrics(args, all_samples: list[Sample]):
     if getattr(args, "sglang_speculative_algorithm", None) is None:
         return {}
-    num_samples = len(all_samples)
-    metrics = {}
-    metrics["spec_accept_rate"] = sum(sample.spec_info.spec_accept_rate for sample in all_samples) / num_samples
-    metrics["spec_accept_length"] = sum(sample.spec_info.spec_accept_length for sample in all_samples) / num_samples
-    return metrics
+    return aggregate_speculative_metrics(all_samples)
 
 
 def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):

@@ -15,6 +15,21 @@ _SPEC_TOKEN_COUNT_KEYS = (
 )
 
 
+def get_spec_metric_coverage(meta_info: dict[str, Any]) -> tuple[bool, bool]:
+    """Return whether backend metadata contains speculative metric groups.
+
+    The first flag covers accepted/proposed draft tokens.  The second covers
+    verify/completion counts.  Presence is tracked separately from the value
+    so an explicitly reported zero remains distinguishable from missing data.
+    """
+    token_counts_present = any(
+        accept_key in meta_info and draft_key in meta_info
+        for accept_key, draft_key in _SPEC_TOKEN_COUNT_KEYS
+    )
+    verify_present = "spec_verify_ct" in meta_info and "completion_tokens" in meta_info
+    return token_counts_present, verify_present
+
+
 def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
     """Extract speculative decoding counts across SGLang metadata versions."""
     for accept_key, draft_key in _SPEC_TOKEN_COUNT_KEYS:
