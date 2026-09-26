@@ -1,0 +1,18 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello"
+        },
+        {
+          "type": "text",
+          "text": ", world!"
+        }
+      ]
+    }
+  ],
+  "max_tokens": 32
+}
