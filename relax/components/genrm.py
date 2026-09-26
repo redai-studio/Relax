@@ -412,7 +412,20 @@ class GenRM(Base):
         if sampling_params:
             effective.update(sampling_params)
         min_p = float(effective.get("min_p", 0.0) or 0.0)
-        temperature = float(effective.get("temperature", 0.0) or 0.0)
+        temperature = effective.get("temperature")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+            # ``null`` temperature delegates to the model default on the
+            # engine side (the pinned SGLang normalizes it to 1.0 --
+            # stochastic), so it is not a value this contract can bind the
+            # seed or the greedy/stochastic split to; reject it explicitly
+            # instead of silently treating it as greedy (re-review finding).
+            raise HTTPException(
+                status_code=422,
+                detail="temperature must be an explicit number for GenRM scoring: null delegates "
+                "to the model default (stochastic) and cannot be bound to the "
+                "replica-invariant sampling-seed contract",
+            )
+        temperature = float(temperature)
         if min_p > 0.0 and temperature > 0.0:
             # SGLang's deterministic sampling path (mandatory for GenRM's
             # replica-invariant verdicts) does not implement min-p on the
@@ -507,10 +520,6 @@ class GenRM(Base):
                 resp.raise_for_status()
                 break
             except asyncio.CancelledError:
-                raise
-            except HTTPException:
-                # Contract violations (e.g. the min_p validation in
-                # _effective_sampling) are terminal -- retrying cannot help.
                 raise
             except Exception as e:
                 status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)

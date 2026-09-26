@@ -656,6 +656,46 @@ class TestRequestSamplingSeed(unittest.TestCase):
         effective = replica._effective_sampling(self.SPEC, {"temperature": 0.0, "min_p": 0.1}, [1, 2, 3])
         self.assertNotIn("sampling_seed", effective)
 
+    def test_null_temperature_with_min_p_is_rejected(self):
+        """Re-review finding: ``{"temperature": null, "min_p": 0.1}`` slipped
+        through ``float(value or 0.0)`` as greedy, but the pinned SGLang
+        normalizes null temperature to 1.0 (stochastic) -- the request would
+        reach the engine and hit the unsupported seeded min-p path."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"temperature": None, "min_p": 0.1}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_null_temperature_alone_is_rejected(self):
+        """Null temperature delegates to the model default (stochastic,
+        unseeded) -- not bindable to the replica-invariant contract."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"temperature": None}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_null_temperature_never_reaches_the_engine(self):
+        """The 422 fires before any engine HTTP call (bot-requested boundary
+        assertion)."""
+        replica = _replica()
+        replica.instance_specs = {"__default__": dict(self.SPEC)}
+        replica.tokenizers = {"__default__": SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])}
+        posts = []
+        replica._http_client = SimpleNamespace(post=lambda url, json=None: posts.append(url))
+        with self.assertRaises(_HTTPException):
+            _run(
+                replica._call_engine_tracked(
+                    None,
+                    "__default__",
+                    "192.0.2.1",
+                    16001,
+                    [("__default__", "192.0.2.1", 16001)],
+                    [{}],
+                    {"temperature": None, "min_p": 0.1},
+                )
+            )
+        self.assertEqual(posts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

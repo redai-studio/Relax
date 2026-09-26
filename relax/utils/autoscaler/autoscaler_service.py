@@ -591,7 +591,8 @@ class AutoscalerService(Base):
             return
 
         target_count = current_engines + decision.delta
-        url = f"{self.config.get_service_url(runtime.name)}/scale_out"
+        service_url = self.config.get_service_url(runtime.name)
+        url = f"{service_url}/scale_out"
         payload: Dict[str, Any] = {
             "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
@@ -615,6 +616,13 @@ class AutoscalerService(Base):
             "action": "scale_out",
             "triggered_at": time.time(),
             "status": "SUBMITTING",
+            # The operation belongs to the service address it was submitted
+            # to: a later PATCH may repoint the target's URL while the
+            # acceptance response is still in flight, and status/reconcile
+            # queries must keep following the original service (re-review
+            # finding: queries built from the current config hit the new
+            # address and 404).
+            "service_url": service_url,
             "from_engines": current_engines,
             "to_engines": target_count,
             "delta": decision.delta,
@@ -676,7 +684,8 @@ class AutoscalerService(Base):
             return
 
         target_count = current_engines - decision.delta
-        url = f"{self.config.get_service_url(runtime.name)}/scale_in"
+        service_url = self.config.get_service_url(runtime.name)
+        url = f"{service_url}/scale_in"
         payload = {
             "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
@@ -695,6 +704,8 @@ class AutoscalerService(Base):
             "action": "scale_in",
             "triggered_at": time.time(),
             "status": "SUBMITTING",
+            # Submitted-to address, mirroring _execute_scale_out.
+            "service_url": service_url,
             "from_engines": current_engines,
             "to_engines": target_count,
             "delta": decision.delta,
@@ -794,7 +805,12 @@ class AutoscalerService(Base):
 
             try:
                 endpoint = "scale_out" if action == "scale_out" else "scale_in"
-                url = f"{self.config.get_service_url(runtime.name)}/{endpoint}/{req['request_id']}"
+                # Follow the address the operation was submitted to: a config
+                # PATCH may have repointed the service since (re-review
+                # finding). Entries recorded before this field exists fall
+                # back to the current config.
+                base = req.get("service_url") or self.config.get_service_url(runtime.name)
+                url = f"{base}/{endpoint}/{req['request_id']}"
 
                 async with self._http_session.get(url) as response:
                     if response.status == 200:

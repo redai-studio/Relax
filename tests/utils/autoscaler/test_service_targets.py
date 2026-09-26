@@ -62,6 +62,47 @@ class _FakePostSession:
         return _FakeResp(self._post_status, self._post_payload)
 
 
+class _ParkedResp:
+    """Response whose body only arrives once ``release`` is set."""
+
+    def __init__(self, release, payload):
+        self._release = release
+        self._payload = payload
+        self.status = 200
+
+    async def __aenter__(self):
+        await self._release.wait()
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+
+class _ParkedPostSession:
+    """aiohttp-like session that parks POST responses and records GET URLs."""
+
+    def __init__(self, post_payload=None, get_payload=None):
+        self.release = asyncio.Event()
+        self.post_calls = []
+        self.get_calls = []
+        self._post_payload = post_payload or {"request_id": "req-x", "status": "PENDING"}
+        self._get_payload = get_payload or {"status": "ACTIVE", "current": 2, "ready": 2}
+
+    def post(self, url, json=None):
+        self.post_calls.append(url)
+        return _ParkedResp(self.release, self._post_payload)
+
+    def get(self, url):
+        self.get_calls.append(url)
+        return _FakeResp(200, self._get_payload)
+
+
 def _decision(action, delta=1):
     return _ScalingDecision(
         action=action,
@@ -597,72 +638,86 @@ class TestPatchConfig(unittest.TestCase):
         """Re-review finding: cancelling a worker mid-POST lost the acceptance
         response.
 
-        Graceful handover: the old worker finishes the POST (updating the
-        placeholder in the shared state) and exits; the rebuilt runtime's
-        evaluation continues from there.
+        Graceful handover with the pause INSIDE the real POST response window
+        (bot-requested coverage): the old worker finishes the parked POST
+        (updating the placeholder in the shared state) and exits; the rebuilt
+        runtime's evaluation continues from there, same service address.
         """
-
-        class _ParkedSession:
-            def __init__(self):
-                self.release = asyncio.Event()
-                self.calls = 0
-
-            def get(self, url):
-                return self
-
-            async def __aenter__(self):
-                await self.release.wait()
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-            @property
-            def status(self):
-                return 200
-
-            async def json(self):
-                self.calls += 1
-                return {"request_id": "req-handover", "status": "PENDING"}
-
         config = AutoscalerConfig(service_targets={"genrm": "http://genrm:8000/genrm"})
         svc = _service(config)
         asyncio.run(svc.update_config(_ConfigUpdateRequest()))
         svc._state.running = True
         svc._state.enabled = True
-        svc._http_session = _FakePostSession(200, {"request_id": "req-handover", "status": "PENDING"})
-        release = asyncio.Event()
+        session = _ParkedPostSession(post_payload={"request_id": "req-handover", "status": "PENDING"})
+        svc._http_session = session
 
-        async def _parked_evaluation(runtime):
-            # Park like a slow metrics/discovery round, then fire a scale POST
-            # whose acceptance response only lands after the handover.
-            await release.wait()
+        async def _evaluate_and_post(runtime):
+            # The evaluation reaches the engine call and parks inside the
+            # POST response window at the service address.
             await svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, runtime)
 
-        svc._evaluate_service = _parked_evaluation
+        svc._evaluate_service = _evaluate_and_post
 
         async def _main():
             old_runtime = svc._services["genrm"]
             worker = asyncio.ensure_future(svc._service_loop(old_runtime))
-            await asyncio.sleep(0.02)
+            # The worker's first evaluation is parked inside the POST.
+            for _ in range(500):
+                if session.post_calls:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(session.post_calls, ["http://genrm:8000/genrm/scale_out"])
             # Rebuild the runtime under the same name (any config PATCH).
-            await svc.update_config(_ConfigUpdateRequest(service_targets={"genrm": "http://new:8000/genrm"}))
+            await svc.update_config(_ConfigUpdateRequest())
             new_runtime = svc._services["genrm"]
             self.assertIsNot(new_runtime, old_runtime)
-            # The state object is shared across the rebuild.
             self.assertIs(new_runtime.state, old_runtime.state)
-            # Release: the old worker completes its parked evaluation (scale
-            # POST included), then exits at the next iteration boundary.
-            release.set()
+            # Release: the old worker completes the parked POST, updates the
+            # placeholder in the shared state, then exits at the next
+            # iteration boundary.
+            session.release.set()
             await asyncio.wait_for(worker, timeout=5.0)
             return new_runtime
 
         new_runtime = asyncio.run(_main())
-        # The in-flight POST result survived the handover in the shared state.
         self.assertIn(
             ("req-handover", "PENDING"),
-            [(p["request_id"], p.get("status")) for p in new_runtime.state.pending_requests],
+            [(p_["request_id"], p_.get("status")) for p_ in new_runtime.state.pending_requests],
         )
+        self.assertEqual(
+            [p_["service_url"] for p_ in new_runtime.state.pending_requests],
+            ["http://genrm:8000/genrm"],
+        )
+
+    def test_pending_request_tracks_its_submission_url(self):
+        """Re-review finding (residual): when a PATCH repoints the service
+        URL while an operation's acceptance response is still in flight, the
+        saved request_id must still be polled at the address it was submitted
+        to -- building the status URL from the current config queried the new
+        address and 404'd, leaving the old service untracked."""
+        svc = self._svc_with_genrm_runtime()
+        session = _ParkedPostSession(post_payload={"request_id": "req-url", "status": "PENDING"})
+        svc._http_session = session
+
+        async def _main():
+            task = asyncio.ensure_future(
+                svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, svc._services["genrm"])
+            )
+            await asyncio.sleep(0.01)
+            # The POST is parked at the OLD address; repoint the target.
+            await svc.update_config(_ConfigUpdateRequest(service_targets={"genrm": "http://new:8000/genrm"}))
+            session.release.set()
+            await asyncio.wait_for(task, timeout=5.0)
+            # Status polling must follow the OLD address, not the new one.
+            await svc._update_pending_requests(svc._services["genrm"])
+
+        asyncio.run(_main())
+        self.assertEqual(session.get_calls, ["http://genrm:8000/genrm/scale_out/req-url"])
+        # Terminal + clean -> moved to history with the submission URL kept.
+        runtime = svc._services["genrm"]
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], "req-url")
+        self.assertEqual(runtime.state.scale_history[0]["service_url"], "http://genrm:8000/genrm")
 
     def test_rebuilt_runtime_replaces_its_worker(self):
         """Re-review finding: a config PATCH rebuilds ServiceRuntime objects
