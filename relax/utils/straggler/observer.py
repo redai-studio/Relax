@@ -161,10 +161,11 @@ class IntervalToken:
     """Events and metadata for one in-flight interval.
 
     ``seq`` is deliberately *not* set at acquire time: it is stamped by the
-    observer when the interval completes. Megatron nests timers, so a start-order
-    sequence would leave the enclosing interval behind the inner intervals it
-    wraps on the wire, and the collector -- which requires a per-rank sequence
-    that never decreases -- would drop it as out-of-order transport.
+    observer when the interval completes. Megatron nests timers, so a start-
+    order sequence would leave the enclosing interval behind the inner
+    intervals it wraps on the wire, and the collector -- which requires a per-
+    rank sequence that never decreases -- would drop it as out-of-order
+    transport.
     """
 
     __slots__ = (

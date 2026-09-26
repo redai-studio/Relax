@@ -92,9 +92,9 @@ def test_judged_fraction_is_not_mislabelled_as_coverage() -> None:
     """``judged/envelopes`` is a transport ratio, never cohort coverage.
 
     The collector's real cohort coverage is not in the summary here, so
-    ``coverage`` must be absent; the in-process ratio is published under its own
-    key. Reading it as coverage used to show 1.0 on a run whose cohort coverage
-    was far lower.
+    ``coverage`` must be absent; the in-process ratio is published under its
+    own key. Reading it as coverage used to show 1.0 on a run whose cohort
+    coverage was far lower.
     """
     metrics = reporter.build_metrics(StubRuntime({"envelopes": 10, "judged_packets": 4}))
 
@@ -113,8 +113,8 @@ def test_every_drop_counter_is_published_in_dropped() -> None:
     """The detector's capped structures must not be invisible.
 
     ``MAX_SAMPLES_PER_RANK`` and the other caps report their evictions through
-    the detector counters; the aggregate ``dropped`` key used to omit them, so a
-    window that dropped 512 samples published no drop at all.
+    the detector counters; the aggregate ``dropped`` key used to omit them, so
+    a window that dropped 512 samples published no drop at all.
     """
     metrics = reporter.build_metrics(
         StubRuntime(

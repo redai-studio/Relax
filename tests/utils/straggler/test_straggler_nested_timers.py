@@ -24,7 +24,7 @@ They are written to fail against the start-time sequencing:
 """
 
 import time
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Tuple
 
 import pytest
 
@@ -119,7 +119,8 @@ def _identity(rank: int) -> RuntimeIdentity:
 
 
 def _config() -> StragglerConfig:
-    """Profiler config tuned so a verdict lands within six deterministic steps."""
+    """Profiler config tuned so a verdict lands within six deterministic
+    steps."""
     return StragglerConfig(
         enabled=True,
         timer_log_level=2,

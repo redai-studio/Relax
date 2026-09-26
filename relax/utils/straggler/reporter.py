@@ -162,9 +162,9 @@ def _coverage(summary: Mapping[str, Any]) -> Optional[float]:
 
     The name means the fraction of the expected cohort that reported, so it is
     emitted only from an explicit ``coverage_ratio``/``coverage``. The
-    ``judged_packets / envelopes`` fallback measures something else entirely and
-    now has its own key; reporting it as coverage read 1.0 on a run whose real
-    cohort coverage was far lower.
+    ``judged_packets / envelopes`` fallback measures something else entirely
+    and now has its own key; reporting it as coverage read 1.0 on a run whose
+    real cohort coverage was far lower.
     """
     for key in ("coverage_ratio", "coverage"):
         number = _number(summary.get(key))
@@ -211,10 +211,10 @@ def _collector_status_available(runtime: Any) -> Optional[float]:
     """Return 1 when this process owns a collector, 0 when it does not.
 
     The platform merges metrics only on the Megatron primary rank, which owns
-    the collector only when ``pp_size == 1``. Under PP>1 the exporting rank owns
-    none, and this ``0`` is the explicit unavailable marker. A stub runtime
-    without a ``collector`` attribute cannot be classified, so nothing is
-    emitted for it rather than inventing a ``0``.
+    the collector only when ``pp_size == 1``. Under PP>1 the exporting rank
+    owns none, and this ``0`` is the explicit unavailable marker. A stub
+    runtime without a ``collector`` attribute cannot be classified, so nothing
+    is emitted for it rather than inventing a ``0``.
     """
     if not hasattr(runtime, "collector"):
         return None

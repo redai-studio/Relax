@@ -938,10 +938,10 @@ def test_over_worked_peer_does_not_withhold_an_equal_work_straggler() -> None:
     Executed counterexample: four ranks with host times 100/100/100/300 ms and
     tokens 1000/1200/1000/1000. Rank 1 does +20 % tokens, so rank 1 is not
     comparable; rank 3 is genuinely slow with tokens EQUAL to the peer median.
-    Under the pair-wide gate rank 1's incomparability withheld rank 3, which was
-    reported ``uncertain``/``workload_incomparable`` with its own facts saying
-    ``tokens_delta=0.0``. Comparability is a per-rank test, so rank 3 is a
-    straggler and its facts agree with its verdict.
+    Under the pair-wide gate rank 1's incomparability withheld rank 3, which
+    was reported ``uncertain``/``workload_incomparable`` with its own facts
+    saying ``tokens_delta=0.0``. Comparability is a per-rank test, so rank 3 is
+    a straggler and its facts agree with its verdict.
     """
     detector = make_detector(persist_windows=1)
     workload = {
@@ -998,7 +998,8 @@ def test_each_rank_gets_its_own_workload_reason_and_matching_facts() -> None:
 
 
 def test_workload_aggregate_is_arrival_order_independent() -> None:
-    """The same samples in two arrival orders give identical verdicts and facts.
+    """The same samples in two arrival orders give identical verdicts and
+    facts.
 
     Windows are time windows with no step order, so the last-arriving packet is
     not authoritative. Rank 0 is the slow rank and its three token readings are

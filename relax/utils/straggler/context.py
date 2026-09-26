@@ -199,11 +199,12 @@ def set_training_context(
 
     ``optimizer_step`` is **in-rollout only**. ``global_step`` is optional and
     is stored only when the caller passes a genuinely run-wide value; the
-    misleading fallback that emitted the bare optimizer-step index as if it were
-    global is gone. The profiler's own monotonic ``step_ordinal`` is assigned
-    here. ``num_steps_per_rollout`` is accepted for call-site compatibility but
-    is no longer used to derive anything. A failure is counted and the previous
-    context is kept, because a profiler must not perturb the loop it observes.
+    misleading fallback that emitted the bare optimizer-step index as if it
+    were global is gone. The profiler's own monotonic ``step_ordinal`` is
+    assigned here. ``num_steps_per_rollout`` is accepted for call-site
+    compatibility but is no longer used to derive anything. A failure is
+    counted and the previous context is kept, because a profiler must not
+    perturb the loop it observes.
     """
     global _CURRENT, _UPDATES, _STEP_ORDINAL
     try:

@@ -120,7 +120,8 @@ def test_record_optimizer_step_never_derives_a_global_step(monkeypatch: pytest.M
 
 
 def test_record_optimizer_step_without_a_length_is_in_rollout_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The no-length case must not emit the bare step index as if it were global.
+    """The no-length case must not emit the bare step index as if it were
+    global.
 
     The field is typed ``Optional[int]`` and documented as in-rollout only, and
     the snapshot omits ``global_step`` entirely when no run-wide value exists.
