@@ -1015,6 +1015,15 @@ def get_data_from_transfer_queue(
 def post_process_rollout_data(args, rollout_data):
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
+    if "tokens" not in rollout_data and "chosen_tokens" in rollout_data:
+        # Preference rows stay pair-atomic in TransferQueue. Expand them only
+        # after sampling, before the generic sequence post-processing below.
+        from relax.backends.megatron.data import expand_preference_rollout_data
+
+        expanded = expand_preference_rollout_data(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
+
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
     cuda_dev = device_utils.make_current_torch_device()

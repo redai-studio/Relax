@@ -5,6 +5,9 @@ partition naming."""
 
 from argparse import Namespace
 
+import pytest
+import torch
+
 
 def _mk_actor_args(loss_type: str):
     return Namespace(
@@ -39,6 +42,49 @@ def test_sft_data_fields_excludes_rl_only_keys():
 
     for forbidden in ("rollout_log_probs", "rewards", "raw_reward", "teacher_log_probs"):
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
+
+
+def test_preference_data_fields_keep_pairs_atomic():
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="sft")
+    args.sft_objective = "dpo"
+
+    fields = build_data_fields(args)
+
+    assert fields == [
+        "pair_ids",
+        "chosen_tokens",
+        "rejected_tokens",
+        "chosen_loss_masks",
+        "rejected_loss_masks",
+        "chosen_total_lengths",
+        "rejected_total_lengths",
+    ]
+
+
+def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypatch):
+    pytest.importorskip("megatron.core")
+    from relax.utils.data import stream_dataloader
+
+    rollout_data = {
+        "pair_ids": [17],
+        "chosen_tokens": [[1, 2, 3]],
+        "rejected_tokens": [[1, 4]],
+        "chosen_loss_masks": [[0, 1, 1]],
+        "rejected_loss_masks": [[0, 1]],
+        "chosen_total_lengths": [3],
+        "rejected_total_lengths": [2],
+    }
+    args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
+    monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+
+    stream_dataloader.post_process_rollout_data(args, rollout_data)
+
+    assert [tensor.tolist() for tensor in rollout_data["tokens"]] == [[1, 2, 3], [1, 4]]
+    assert [tensor.tolist() for tensor in rollout_data["loss_masks"]] == [[0, 1, 1], [0, 1]]
+    assert rollout_data["preference_pair_ids"] == [17]
+    assert rollout_data["preference_pair_costs"] == [5]
 
 
 def test_sequence_classification_sft_requests_classification_labels():

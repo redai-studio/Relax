@@ -14,7 +14,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode, sft_partition_ids, sft_task_name
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
@@ -78,7 +78,11 @@ class Actor(Base):
             self.actor_model.async_init(
                 config,
                 role=self.role,
-                with_ref=config.kl_coef != 0 or config.use_kl_loss,
+                with_ref=(
+                    config.kl_coef != 0
+                    or config.use_kl_loss
+                    or (is_preference_mode(config) and config.sft_objective == "dpo" and not config.dpo_reference_free)
+                ),
                 with_opd_teacher=self.config.opd_teacher_load,
             )
         )

@@ -257,6 +257,8 @@ export default defineConfig({
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
+                { text: 'DPO Training', link: '/en/guide/dpo-training' },
+
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
@@ -377,6 +379,8 @@ export default defineConfig({
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
+                { text: 'DPO 训练', link: '/zh/guide/dpo-training' },
+
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },

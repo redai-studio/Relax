@@ -36,9 +36,15 @@ from ray import serve
 from transformers import AutoConfig, AutoTokenizer
 
 from relax.components.base import Base
+from relax.engine.sft.dataset.preference import (
+    PreferenceStreamingDataset,
+    ProcessedPreferencePair,
+    pack_preference_pairs_for_tq,
+)
 from relax.engine.sft.dataset.streaming import ProcessedSample, SFTStreamingDataset, pack_samples_for_tq
 from relax.engine.sft.debug_print import print_first_sample
 from relax.engine.sft.runtime import (
+    is_preference_mode,
     resolve_sft_split_indices,
     sft_logical_partition_id,
     sft_partition_ids,
@@ -128,6 +134,26 @@ def _create_sft_train_dataset(
     task_type: str,
     classification_sentinel_token_id: int | None,
 ) -> Any:
+    if is_preference_mode(config):
+        return PreferenceStreamingDataset(
+            path=config.prompt_data,
+            tokenizer=tokenizer,
+            prompt_key=config.input_key,
+            chosen_key=config.preference_chosen_key,
+            rejected_key=config.preference_rejected_key,
+            pair_id_key=config.preference_pair_id_key,
+            metadata_key=config.metadata_key,
+            max_length=config.preference_max_length,
+            max_completion_length=config.preference_max_completion_length,
+            pair_capacity=capacity,
+            seed=getattr(config, "seed", 42),
+            prefetch_max_cached=prefetch_buffer_size,
+            prefetch_chunk_size=prefetch_chunk_size,
+            prefetch_num_workers=prefetch_num_workers,
+            apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
+            expected_chat_template_sha256=getattr(config, "preference_chat_template_sha256", None),
+            require_no_generation_marker=getattr(config, "preference_require_no_generation_marker", False),
+        )
     dataset_cls = _load_custom_dataset_class(getattr(config, "custom_dataset_class_path", None))
     if dataset_cls is None:
         return SFTStreamingDataset(
@@ -167,7 +193,15 @@ def _create_sft_train_dataset(
     )
 
 
-def _prepare_sft_tq_payload(samples: list[ProcessedSample], *, force_multimodal_field: bool) -> dict[str, Any]:
+def _prepare_sft_tq_payload(
+    samples: list[ProcessedSample] | list[ProcessedPreferencePair], *, force_multimodal_field: bool
+) -> dict[str, Any]:
+    if samples and isinstance(samples[0], ProcessedPreferencePair):
+        backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
+        return {
+            "data": dict_to_tensordict(backend_batch, batch_size=len(samples)),
+            "custom_meta": custom_meta,
+        }
     backend_batch = pack_samples_for_tq(samples, force_multimodal_field=force_multimodal_field)
     assert backend_batch is not None
     return {
@@ -644,16 +678,17 @@ class SFT(Base):
             return
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
-        try:
-            self._processor_pool = ProcessorPool(
-                self.config.hf_checkpoint,
-                pool_size=None,
-                trust_remote_code=True,
-                multimodal_config=MultimodalConfig.from_args(self.config),
-            )
-        except Exception as exc:
-            self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
-            self._processor_pool = None
+        if not is_preference_mode(self.config):
+            try:
+                self._processor_pool = ProcessorPool(
+                    self.config.hf_checkpoint,
+                    pool_size=None,
+                    trust_remote_code=True,
+                    multimodal_config=MultimodalConfig.from_args(self.config),
+                )
+            except Exception as exc:
+                self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal samples will fail at push.")
+                self._processor_pool = None
         pad_token_ids = _resolve_pad_token_ids_from_config(self.config.hf_checkpoint)
         self._logger.info(f"Resolved multimodal pad token ids from model config: {sorted(pad_token_ids)}")
 
@@ -842,6 +877,14 @@ class SFT(Base):
         if self.step != 0 or not samples:
             return
         s = samples[0]
+        if isinstance(s, ProcessedPreferencePair):
+            self._logger.info(
+                "First preference pair id=%s chosen_length=%s rejected_length=%s",
+                s.pair_id,
+                s.chosen_total_length,
+                s.rejected_total_length,
+            )
+            return
         try:
             loss_mask = s.loss_mask
             if s.classification_label is not None:
