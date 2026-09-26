@@ -67,7 +67,7 @@ Each sample's scalar advantage is broadcast to its response tokens. Relax masks 
 
 $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
 
-This global-token reduction does not apply a separate $1/T_i$ weight to each response. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
+This global-token reduction does not apply a separate $1/T_i$ weight to each response. An empty or fully masked response still participates in its prompt group's leave-one-out reward baseline, but contributes zero policy-loss tokens and zero to $N_{\mathrm{eff}}$. If the entire global batch has no effective tokens, it is treated as a no-signal step and reports zero loss metrics rather than dividing by zero. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
 
 ### Requirements and Parameters
 
