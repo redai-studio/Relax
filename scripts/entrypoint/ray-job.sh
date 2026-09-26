@@ -7,6 +7,12 @@
 # cluster. It only cleans up residual python/sglang processes and then sets up
 # the environment for running training against an existing Ray cluster.
 #
+# Submissions are serialised machine-wide by an exclusive flock on
+# /root/autodl-tmp/relax-ray-gpu.lock; a second submission fails fast instead of
+# interleaving its cluster-wide cleanup with an in-flight submission. The lock
+# is held by the submitting shell, so a SIGKILLed submission releases it while
+# its Ray job may still run — see the KNOWN LIMITATION note below.
+#
 # Two usage modes:
 #   1) Entry-point mode — first argument is a .sh script path:
 #        bash scripts/entrypoint/ray-job.sh <run-script> [extra-args...]
@@ -25,6 +31,11 @@
 #   RELAX         - Path to Relax project (default: ../../)
 #   RELAX_KERNEL_CACHE_DIR - Shared directory for portable Inductor/Triton cache deltas.
 #   RELAX_KERNEL_CACHE_KEY - Optional graph/topology profile key. Defaults to a hash of the run script and overrides.
+#   RELAX_GPU_LOCK_WAIT - Seconds to wait for the shared GPU lock at
+#                         /root/autodl-tmp/relax-ray-gpu.lock before failing fast
+#                         (default: 0 = fail immediately when another job holds it).
+#   RELAX_GPU_LOCK_PROJECT / RELAX_GPU_LOCK_COMMAND - Optional tags recorded in
+#                         the lock's holder sidecar for the other party.
 
 # Guard: skip if already sourced by another entrypoint
 if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
@@ -58,6 +69,134 @@ set -eo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 # shellcheck source=./kernel-cache.sh
 source "${DIR}/kernel-cache.sh"
+
+# ── physical GPU-cluster lock ───────────────────────────────────────────────
+# One Ray cluster / four GPUs are shared by several projects, and the cleanup
+# below is cluster-wide (it stops competing training jobs and removes their
+# placement groups). Coordination by convention alone already cost hours, so
+# every submission through this launcher must own an exclusive flock on
+# ${RELAX_GPU_LOCK_FILE} for the whole cleanup + submit + wait window. The lock
+# file is created on first use and is never unlinked, so all participants always
+# lock the same inode. Contention fails fast by default: the second submission
+# prints the current holder (sidecar ${RELAX_GPU_LOCK_FILE}.holder) and exits 75
+# (EX_TEMPFAIL) BEFORE any cluster cleanup, instead of queueing forever.
+# RELAX_GPU_LOCK_WAIT=<seconds> opts into a short bounded wait instead.
+#
+# The lock lives on fd 200 and is inherited across `exec bash <run-script>` and
+# by the `ray job submit` client that the run script waits on, so the submitting
+# process tree holds it for the whole cleanup + submit + wait window and the
+# kernel releases it on every exit path: normal completion, any error,
+# SIGINT/SIGTERM/SIGHUP (shell traps below), and even SIGKILL where no trap can
+# run.
+#
+# KNOWN LIMITATION — this lock serialises SUBMISSIONS, not Ray jobs. A Ray
+# driver/worker is spawned by the raylet, NOT by the submitting shell, so it is
+# not a descendant and does not inherit fd 200. If the submitting shell is
+# SIGKILLed the kernel drops the flock while the submitted Ray job keeps
+# running, and a later submission then takes a free lock and its cluster-wide
+# cleanup may stop that live job. A free lock therefore does NOT prove the
+# cluster is idle: check `ray job list` / `ray job status` before assuming so.
+RELAX_GPU_LOCK_FILE="${RELAX_GPU_LOCK_FILE:-/root/autodl-tmp/relax-ray-gpu.lock}"
+RELAX_GPU_LOCK_HOLDER_FILE="${RELAX_GPU_LOCK_FILE}.holder"
+RELAX_GPU_LOCK_WAIT="${RELAX_GPU_LOCK_WAIT:-0}"
+_RELAX_GPU_LOCK_OWNED=0
+
+# Idempotent release: drop the sidecar only if it is still ours, then close
+# fd 200 so the kernel releases the flock. Used by the EXIT and signal traps.
+_relax_gpu_lock_release() {
+    if [ "${_RELAX_GPU_LOCK_OWNED}" != "1" ]; then
+        return 0
+    fi
+    if [ -f "${RELAX_GPU_LOCK_HOLDER_FILE}" ] \
+        && grep -qx "pid=$$" "${RELAX_GPU_LOCK_HOLDER_FILE}" 2>/dev/null; then
+        rm -f "${RELAX_GPU_LOCK_HOLDER_FILE}"
+    fi
+    exec 200>&- 2>/dev/null || true
+    _RELAX_GPU_LOCK_OWNED=0
+    return 0
+}
+
+# Show who holds the lock so the blocked party can act instead of guessing.
+_relax_gpu_lock_report_holder() {
+    if [ -s "${RELAX_GPU_LOCK_HOLDER_FILE}" ]; then
+        echo "  current holder (${RELAX_GPU_LOCK_HOLDER_FILE}):" >&2
+        sed 's/^/    /' "${RELAX_GPU_LOCK_HOLDER_FILE}" >&2
+        _holder_pid="$(sed -n 's/^pid=//p' "${RELAX_GPU_LOCK_HOLDER_FILE}" | head -n 1)"
+        if [ -n "${_holder_pid}" ] && ! kill -0 "${_holder_pid}" 2>/dev/null; then
+            echo "    (recorded pid ${_holder_pid} is gone; this holder info is stale)" >&2
+        fi
+    else
+        echo "  current holder: unknown (no holder info recorded, but the flock is held)" >&2
+    fi
+}
+
+# Re-entrancy guard: a nested or repeated invocation must reuse the ancestor's
+# lock, never contend with itself. Any one of these is sufficient:
+#   1. the RELAX_ENTRYPOINT_MODE guard at the top already short-circuits nested
+#      ray-job.sh invocations;
+#   2. RELAX_GPU_LOCK_HELD, exported below by the invocation that owns the lock;
+#   3. fd 200 inherited from that invocation and still pointing at the lock file
+#      (re-flocking an inherited descriptor is a no-op success, never a block).
+if [ -n "${RELAX_GPU_LOCK_HELD:-}" ] \
+    || [ "$(readlink -m "/proc/self/fd/200" 2>/dev/null || true)" = "$(readlink -m "${RELAX_GPU_LOCK_FILE}")" ]; then
+    echo "=== GPU lock already held by this process tree (${RELAX_GPU_LOCK_HELD:-inherited fd 200}); reusing it ==="
+else
+    if ! exec 200>>"${RELAX_GPU_LOCK_FILE}"; then
+        echo "ERROR: cannot open GPU lock file ${RELAX_GPU_LOCK_FILE}; refusing to touch the cluster." >&2
+        exit 1
+    fi
+    if [ "${RELAX_GPU_LOCK_WAIT}" -gt 0 ] 2>/dev/null; then
+        flock -w "${RELAX_GPU_LOCK_WAIT}" 200 && _relax_gpu_lock_ok=1 || _relax_gpu_lock_ok=0
+    else
+        flock -n 200 && _relax_gpu_lock_ok=1 || _relax_gpu_lock_ok=0
+    fi
+    if [ "${_relax_gpu_lock_ok}" != "1" ]; then
+        echo "ERROR: another job holds the GPU lock ${RELAX_GPU_LOCK_FILE} — refusing to submit (no cluster cleanup was performed)." >&2
+        _relax_gpu_lock_report_holder
+        if [ "${RELAX_GPU_LOCK_WAIT}" -gt 0 ] 2>/dev/null; then
+            echo "  waited ${RELAX_GPU_LOCK_WAIT}s; retry later or unset RELAX_GPU_LOCK_WAIT to fail immediately" >&2
+        fi
+        exec 200>&- 2>/dev/null || true
+        exit 75
+    fi
+    _RELAX_GPU_LOCK_OWNED=1
+    {
+        echo "pid=$$"
+        echo "ppid=${PPID}"
+        echo "host=$(hostname 2>/dev/null || echo unknown)"
+        echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "cwd=$(pwd)"
+        echo "project=${RELAX_GPU_LOCK_PROJECT:-${_RAY_JOB_RUN_SCRIPT:-<source-mode>}}"
+        echo "run_script=${_RAY_JOB_RUN_SCRIPT:-<none>}"
+        echo "submit_command=${RELAX_GPU_LOCK_COMMAND:-bash ${0} ${_RAY_JOB_RUN_SCRIPT} $*}"
+        echo "note=lock guards concurrent submissions only; a SIGKILLed submitter releases it while its Ray job may still run, so check 'ray job list' before treating a free lock as an idle cluster"
+    } > "${RELAX_GPU_LOCK_HOLDER_FILE}"
+    export RELAX_GPU_LOCK_HELD="$$"
+    echo "=== GPU lock acquired: ${RELAX_GPU_LOCK_FILE} (pid $$, project ${RELAX_GPU_LOCK_PROJECT:-${_RAY_JOB_RUN_SCRIPT:-source-mode}}) ==="
+    # A free lock does NOT prove an idle cluster (see KNOWN LIMITATION above): a
+    # SIGKILLed submitter drops the flock while its raylet-spawned job keeps
+    # RUNNING. Surface that loudly BEFORE the cleanup below stops anything. This
+    # is warn-only: a missing/failing/slow Ray CLI can never block submission,
+    # and the `relax.entrypoints.train` filter cannot match this launcher's own
+    # `bash ray-job.sh` driver entrypoint.
+    _live_relax_jobs="$(ray job list 2>/dev/null \
+        | grep RUNNING \
+        | grep -F 'relax.entrypoints.train' \
+        | grep -oP "submission_id='\K[^']+" || true)"
+    if [ -n "${_live_relax_jobs}" ]; then
+        echo "WARNING: the GPU lock was free but these relax training jobs are still RUNNING:" >&2
+        printf '%s\n' "${_live_relax_jobs}" | sed 's/^/  /' >&2
+        echo "  a SIGKILLed submitter releases the lock while its Ray job survives; the cleanup below may stop them." >&2
+    fi
+    # Held for the rest of this shell's life and across `exec`. NOTE: `exec`
+    # discards these traps, but the inherited fd still holds the flock, so the
+    # kernel releases it when the exec'd submitting process tree exits (it does
+    # NOT cover a raylet-spawned Ray job — see KNOWN LIMITATION above).
+    trap '_relax_gpu_lock_release' EXIT
+    trap '_relax_gpu_lock_release; trap - EXIT; exit 130' INT
+    trap '_relax_gpu_lock_release; trap - EXIT; exit 143' TERM
+    trap '_relax_gpu_lock_release; trap - EXIT; exit 129' HUP
+fi
 
 # ── clean up residual Relax/SGLang WORKER processes (NOT ray daemons) ────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
