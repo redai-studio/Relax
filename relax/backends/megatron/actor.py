@@ -82,6 +82,17 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+
+# Imported at module level on purpose: the publish handler must not be able to
+# raise. When these were imported INSIDE the try, a failed import left the except
+# handler raising UnboundLocalError into train(), which would break the profiler's
+# headline failure-isolation invariant. The straggler context module is inert
+# (no side effects) so importing it here costs nothing.
+from relax.utils.straggler.context import (
+    count_workload_publish_error,
+    count_workload_publish_skipped,
+    publish_step_workload,
+)
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
@@ -1238,18 +1249,23 @@ class MegatronTrainRayActor(TrainRayActor):
         # boolean.
         if _straggler_publish_enabled():
             try:
-                from relax.utils.straggler.context import (
-                    count_workload_publish_error,
-                    count_workload_publish_skipped,
-                    publish_step_workload,
-                )
-
                 samples = window.rollout_data["total_lengths"]
                 final_indices = get_seqlen_balanced_partitions(samples, max_k, equal_size=False)
                 if len(final_indices) == max_k and sum(len(group) for group in final_indices) == len(samples):
+                    # ONE entry per OPTIMIZER STEP, not one per micro-batch. This
+                    # path hands the caller a single-element
+                    # `prepared_num_microbatches=[num_microbatches]`, so
+                    # `num_steps_per_rollout == 1` and the step consumes ALL
+                    # `max_k` micro-batches of this window. Publishing one tuple
+                    # per micro-batch made `_step_workload(rollout_id, 0)` return
+                    # only the FIRST group's work (-50% tokens, -83% sequences,
+                    # -75% microbatches on the red team's example), and because a
+                    # first group's size is distribution-dependent, two ranks with
+                    # identical totals reported different tokens and the
+                    # comparability gate suppressed verdicts for equal work.
                     publish_step_workload(
                         rollout_id,
-                        [(sum(samples[index] for index in group), len(group), 1) for group in final_indices],
+                        [(sum(samples), len(samples), len(final_indices))],
                     )
                 else:
                     # The guard rejected the partition: the step runs with no
