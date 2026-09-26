@@ -311,7 +311,7 @@ def test_session_forest_build_sample_and_session_spec() -> None:
         index=7,
         label="lab",
         train_metadata={"loss": "grpo"},
-        metadata={"seed_stage": "bootstrap"},
+        metadata={"seed_stage": "bootstrap", "stop_reason": "env_done"},
     )
     response_kwargs = {
         "parent_state_hash": initial_obs.state_hash,
@@ -331,6 +331,8 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
     assert sample.metadata["agentic_trace"]["turn_count"] == 1
+    assert sample.metadata["rollout_turns"] == 1
+    assert sample.metadata["stop_reason"] == "env_done"
     sample.sampling_params = {"temperature": 0.2}
     (session_spec,) = _build_session_specs(
         [sample],
