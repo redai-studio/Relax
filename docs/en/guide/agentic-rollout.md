@@ -549,6 +549,36 @@ metadata when the custom advantage function needs it. A Group RM that writes rew
 custom logger that restores logical-Session grouping. In multi-context training, reward reports the outcome while
 custom advantage provides training credit.
 
+#### Speculative decoding metrics
+
+Agentic rollout exports speculative-decoding counters for committed generation nodes covered by the exported samples. Shared generation nodes may occur in more than one exported trace, so generation-level metrics are deduplicated within each rollout metric batch by `(session_id, generation_id)`.
+
+The generation-level metrics are:
+
+| Metric | Meaning |
+| --- | --- |
+| `spec/accept_rate` | `sum(accepted) / sum(proposed)` over unique committed generation nodes that provide both counters. |
+| `spec/tokens_per_verify` | `sum(completion) / sum(verify)` over unique committed generation nodes that provide both counters. |
+| `spec/accepted_total` | Total accepted draft tokens in the acceptance-rate cohort. |
+| `spec/proposed_total` | Total proposed draft tokens in the acceptance-rate cohort. |
+| `spec/completion_total` | Total completion tokens in the tokens-per-verify cohort. |
+| `spec/verify_total` | Total verification operations in the tokens-per-verify cohort. |
+| `spec/accept_count_coverage` | Fraction of unique generation nodes that provide both accepted and proposed counts. |
+| `spec/verify_count_coverage` | Fraction of unique generation nodes that provide both completion and verify counts. |
+| `spec/unique_generation_count` | Number of unique committed generation nodes covered by the batch. |
+| `spec/record_occurrence_count` | Number of generation-record occurrences before batch-local deduplication. |
+| `spec/legacy_sample_count` | Number of samples whose legacy data cannot provide generation identities or counter availability. |
+| `spec/conflicting_generation_count` | Number of generation identities that carry conflicting records. |
+| `spec/invalid_record_count` | Number of malformed generation records. |
+
+Coverage also has `*_covered_count` and `*_uncovered_count` forms. A counter reported as zero is considered available. A missing counter remains unavailable. If the aggregated denominator is zero, the corresponding ratio is omitted rather than reported as `0`. A zero numerator with a positive denominator is reported as a valid zero ratio.
+
+The legacy metrics `spec_accept_rate` and `spec_accept_length` are retained for compatibility. They are arithmetic means of per-sample ratios and therefore do not have the same aggregation semantics as `spec/accept_rate` and `spec/tokens_per_verify`. Legacy metrics are emitted only when every sample has complete counters and a positive denominator. Old serialized Agentic samples remain readable, but they do not contribute to generation-level ratios because their generation identities and original counter availability cannot be reconstructed.
+
+Metrics under `spec/sample/` describe ordinary non-Agentic samples with availability-aware counters. They remain separate from deduplicated Agentic generation metrics.
+
+These metrics describe only committed generation nodes covered by the samples exported in the current rollout batch. They do not include discarded branches and do not by themselves demonstrate actual speculative-decoding speedup.
+
 ### Multi-Context Dynamic Batching
 
 A recipe that may export more than one context from a session **must** configure

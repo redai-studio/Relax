@@ -30,6 +30,7 @@ def _shallow_copy_sample(src: Sample) -> Sample:
     new.metadata = dict(src.metadata)
     # Per-sample accumulators — create fresh instances.
     new.spec_info = Sample.SpecInfo()
+    new.spec_generations = None
     new.prefix_cache_info = Sample.PrefixCacheInfo()
     # ``multimodal_inputs`` is read-only downstream — share the reference.
     # ``multimodal_train_inputs`` is *set* (not mutated) per-sample by the
