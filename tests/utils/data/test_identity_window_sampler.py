@@ -10,9 +10,9 @@ _tq = pytest.importorskip("transfer_queue")
 if not hasattr(_tq, "StreamingTokenBudgetSampler"):
     pytest.skip("transfer_queue lacks StreamingTokenBudgetSampler", allow_module_level=True)
 
-from transfer_queue import StreamingTokenBudgetSampler
+from transfer_queue import StreamingTokenBudgetSampler  # noqa: E402 — guarded above
 
-from relax.utils.data.identity_window_sampler import IdentityWindowSampler
+from relax.utils.data.identity_window_sampler import IdentityWindowSampler  # noqa: E402 — guarded above
 
 
 pytestmark = pytest.mark.skipif(
