@@ -217,6 +217,14 @@ class RolloutHealthMonitor:
             logger.debug(f"Skipping kill for engine {rollout_engine_id} (intentionally removed)")
             return
         logger.info(f"Killing engine group {rollout_engine_id}...")
+        blocked = getattr(self._engine_group, "inference_blocked", None)
+        if blocked is not None:
+            blocked.update(
+                range(
+                    rollout_engine_id * self._engine_group.nodes_per_engine,
+                    (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,
+                )
+            )
         for i in range(
             rollout_engine_id * self._engine_group.nodes_per_engine,
             (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,
