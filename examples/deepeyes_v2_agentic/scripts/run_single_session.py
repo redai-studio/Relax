@@ -47,6 +47,7 @@ RELAX_REPO_ROOT = EXAMPLE_DIR.parent.parent
 sys.path.insert(0, str(EXAMPLE_DIR))
 
 from app.prompt import UNIFIED_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
+from app.search_runtime import prepare_search_environment  # noqa: E402
 
 
 DEFAULT_INPUT = Path("/tmp/deepeyes_v2_single_input.json")
@@ -201,6 +202,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     check_env()
+    search_env = prepare_search_environment()
 
     os.environ.setdefault("SANDBOX_CONFIG_PATH", str(EXAMPLE_DIR / "apptainer_env" / "apptainer_config.yaml"))
     os.environ.setdefault("RELAX_INPUT_JSON", str(args.input_json))
@@ -240,7 +242,7 @@ def main() -> int:
             str(args.output_json),
         ],
         cwd=str(EXAMPLE_DIR),
-        env={**os.environ, "PYTHONPATH": sub_pythonpath},
+        env={**os.environ, **search_env, "PYTHONPATH": sub_pythonpath},
     )
     print()
     if proc.returncode != 0:

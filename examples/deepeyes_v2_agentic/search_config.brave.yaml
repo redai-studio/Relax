@@ -1,0 +1,31 @@
+backend: external
+endpoint: https://api.search.brave.com/res/v1/web/search
+topk: 5
+timeout_s: 10.0
+max_retries: 2
+retry_delay_s: 0.5
+retry_max_delay_s: 2.0
+trust_env: false
+method: GET
+headers:
+  Accept: application/json
+auth:
+  header: X-Subscription-Token
+  env: BRAVE_SEARCH_API_KEY
+  prefix: ""
+request:
+  location: query
+  query_field: q
+  size_field: count
+  max_size: 20
+  static_fields: {}
+response:
+  items_path: [web, results]
+  optional_items_paths:
+    - [web]
+  snippet_optional: true
+  fields:
+    title: [title]
+    link: [url]
+    snippet: [description]
+    date: null

@@ -1,0 +1,7 @@
+backend: mock
+topk: 5
+timeout_s: 10.0
+max_retries: 2
+retry_delay_s: 0.5
+retry_max_delay_s: 2.0
+trust_env: false

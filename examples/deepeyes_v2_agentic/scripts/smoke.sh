@@ -18,12 +18,14 @@
 #   SMOKE_ROW            row index in smoke.parquet to drive (default: 0)
 
 set -eu
+set +x
 set -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 EXAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
 # shellcheck source=/dev/null
 [ -f "${EXAMPLE_DIR}/env.sh" ] && source "${EXAMPLE_DIR}/env.sh"
+set +x
 
 for var in DATA_DIR OPENAI_BASE_URL OPENAI_API_KEY; do
     if [ -z "${!var:-}" ]; then
