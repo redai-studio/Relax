@@ -5,6 +5,10 @@ import argparse
 from sglang.srt.server_args import ServerArgs
 
 from relax.utils.http_utils import _wrap_ipv6
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _router_passthrough_skip_fields() -> set[str]:
@@ -296,9 +300,18 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    # Older SGLang versions stored these CLI aliases under their long names,
+    # while newer versions use the short ServerArgs field names as argparse dests.
+    # Keep both attributes available for user code, preferring the newer names
+    # when a namespace happens to contain both.
+    for current_name, legacy_name in (
+        ("sglang_dp_size", "sglang_data_parallel_size"),
+        ("sglang_pp_size", "sglang_pipeline_parallel_size"),
+        ("sglang_ep_size", "sglang_expert_parallel_size"),
+    ):
+        value = getattr(args, current_name) if hasattr(args, current_name) else getattr(args, legacy_name)
+        setattr(args, current_name, value)
+        setattr(args, legacy_name, value)
 
     # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:
@@ -312,6 +325,13 @@ def validate_args(args):
 
     if args.sglang_dp_size > 1:
         assert args.sglang_enable_dp_attention
+
+    if args.sglang_enable_dp_attention and not args.router_dp_aware:
+        logger.warning(
+            "sglang_enable_dp_attention=True requires router_dp_aware=True; "
+            "overriding router_dp_aware=False with True."
+        )
+        args.router_dp_aware = True
 
     if getattr(args, "sglang_router_ip", None):
         args.sglang_router_ip = _wrap_ipv6(args.sglang_router_ip)

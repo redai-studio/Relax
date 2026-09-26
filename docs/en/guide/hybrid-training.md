@@ -18,7 +18,7 @@ Concretely, Actor and Rollout still run on **separate GPU placement groups** (li
 | **Weight sync**     | In-process tensor copy                   | NCCL broadcast via DCS (Checkpoint Engine)                   | Sync `UpdateWeightFromTensor` to rollout; TensorBackuper for ref/actor_fwd          |
 | **Staleness**       | `max_staleness = 0` (strict on-policy)   | Configurable `max_staleness`                                 | Configurable `max_staleness`                                                        |
 | **Roles deployed**  | `actor`, `critic`, `rollout`             | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout` (same as Colocate; ref/actor_fwd live inside actor)    |
-| **`--balance-data`**| Supported                                | Not supported                                                | **Supported** (one of hybrid's reasons to exist)                                    |
+| **DP token balance**| `--balance-data` on static/seqlen path   | Dynamic batch auto-balances DP tokens; `--balance-data` is accepted with no extra effect | Dynamic batch auto-balances DP tokens; static/seqlen path can use `--balance-data`   |
 
 ### When to Use Hybrid
 
@@ -26,7 +26,7 @@ Pick **Hybrid** when:
 
 - You want the throughput benefits of dedicated rollout GPUs and pipelined data flow, but
 - Your model is large enough that running independent ref / actor_fwd services would waste GPUs, or
-- You need `--balance-data` (load-balanced micro-batching across DP ranks), which pure Fully Async cannot provide.
+- You want actor-local ref / actor_fwd computation while keeping the streaming dynamic-batch path, which automatically balances DP tokens.
 
 Pick **Fully Async** when you have spare GPUs for separate ref / actor_fwd / advantages services and want true cross-step pipelining.
 
@@ -150,7 +150,7 @@ ______________________________________________________________________
 
 | Flag                          | Notes                                                                                                    |
 | ----------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `--balance-data`              | Supported in hybrid (rejected in pure fully-async). Enable for DP load balancing.                        |
+| `--balance-data`              | Accepted in hybrid. With `--use-dynamic-batch-size`, DP token balancing is automatic through the streaming sampler; on static/seqlen paths, it enables DP token balancing. |
 | `--num-data-storage-units`    | Number of TransferQueue storage actors.                                                                  |
 | `--use-streaming-dataset`     | Stream prompts from disk instead of loading into memory.                                                 |
 | `--ref-update-interval`       | Periodically refresh the cached ref weights from the latest actor weights.                               |
@@ -163,8 +163,8 @@ When `--hybrid` is set, `relax/utils/arguments.py` defaults the following (unles
 - `compute_advantages_and_returns = True` — actor must compute advantages internally
 - `fully_async = True`, `colocate = True` — derived from `--hybrid`
 
-::: warning
-`--balance-data` requires `--hybrid` if you also want a streaming pipeline. The combination `--fully-async --balance-data` (without `--hybrid`) is rejected at argument parse time.
+::: tip
+Hybrid and pure fully async both use `StreamingTokenBudgetSampler` when `--use-dynamic-batch-size` is enabled, so DP token balancing is automatic on that path. Keep `--balance-data` for static/seqlen-balanced batches; it has no additional effect on dynamic batching.
 :::
 
 ______________________________________________________________________
@@ -201,7 +201,7 @@ Key points in this configuration:
 - 8 total GPUs split 4 + 4 between actor and rollout
 - `max-staleness 2` — actor may consume rollout output up to 2 steps behind the freshest weights
 - `num-iters-per-train-update 8` — each global batch is split into 8 sub-batches for forward passes
-- `balance-data` — DP load balancing enabled
+- `balance-data` — accepted by this script; DP token balancing is handled by the dynamic batch path
 - GRPO algorithm with `--use-kl-loss` and `--use-tis` (these are algorithm flags, orthogonal to hybrid)
 
 ______________________________________________________________________
@@ -218,9 +218,9 @@ This warning fires in `relax/backends/megatron/actor.py` when the actor's Transf
 
 Check rollout-side logs and partition status before assuming a code bug.
 
-### `--balance-data is not supported in pure fully-async mode`
+### Dynamic Batch DP Token Balancing
 
-You passed `--fully-async --balance-data` without `--hybrid`. Either drop `--balance-data` or switch to `--hybrid`, which supports DP-balanced data.
+With `--fully-async` or `--hybrid` plus `--use-dynamic-batch-size`, DP token balancing is automatic through `StreamingTokenBudgetSampler`. If token load still looks uneven, check the token budget (`--max-tokens-per-gpu`), DP size, and streaming sampler stall logs before changing execution mode.
 
 ### Rollout sees stale weights for a long time
 

@@ -20,12 +20,24 @@ except ImportError:
 from conftest import (
     create_test_manager,
     make_engine_group,
+    make_mock_args,
     make_mock_engine,
     make_rollout_server,
 )
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+
+
+def test_engine_rank_allocator_never_reuses_removed_rank():
+    group = make_engine_group(engines=[make_mock_engine()], rank_offset=4)
+    manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=[group])})
+
+    first = manager._reserve_engine_ranks(1)
+    group.all_engines[0] = None
+    second = manager._reserve_engine_ranks(1)
+
+    assert (first, second) == (5, 6)
 
 
 # ==================== create_scale_out_request =============================
@@ -123,6 +135,48 @@ class TestCreateScaleOutRequestRayNative:
         result = manager.create_scale_out_request(num_replicas=3, timeout_secs=999)
         req = manager._scale_out_requests[result["request_id"]]
         assert req.timeout_secs == 999
+
+
+class TestCreateScaleOutRequestLogicalCounting:
+    """``current_total`` in ray_native mode must use the *logical* engine 口径
+    (node-0 engines, excluding dead ``None`` slots) so it matches
+    ``_fetch_engines`` and scale-in.
+
+    The physical ``len(all_engines)``口径 over-counts non-node-0 workers and dead
+    slots -> false NOOP.
+    """
+
+    def test_dead_slot_not_counted(self, patch_ray_get):
+        """A single-node group with a dead ``None`` slot must count only the
+        live logical engine (1), so target=2 yields a real delta, not NOOP."""
+        g = make_engine_group(engines=[make_mock_engine(), None])
+        srv = make_rollout_server(engine_groups=[g])
+        manager = create_test_manager(servers={"default": srv})
+
+        result = manager.create_scale_out_request(num_replicas=2)
+
+        assert result["status"] == "PENDING"
+        assert result["num_replicas"] == 1  # target 2 - current 1
+
+    def test_multinode_counts_logical_engines_only(self, patch_ray_get):
+        """A multi-node group (nodes_per_engine=2) holds 4 physical actors for
+        2 logical engines.
+
+        current must be 2, so target=3 -> delta 1 (not NOOP as the physical口径
+        len(all_engines)==4 would produce).
+        """
+        args = make_mock_args(num_gpus_per_engine=16, num_gpus_per_node=8)
+        engines = [make_mock_engine() for _ in range(4)]  # 2 logical x 2 nodes
+        g = make_engine_group(args=args, engines=engines, num_gpus_per_engine=16)
+        assert g.nodes_per_engine == 2
+        assert len(g.engines) == 2
+        srv = make_rollout_server(engine_groups=[g])
+        manager = create_test_manager(args=args, servers={"default": srv})
+
+        result = manager.create_scale_out_request(num_replicas=3)
+
+        assert result["status"] == "PENDING"
+        assert result["num_replicas"] == 1  # target 3 - current 2
 
 
 class TestCreateScaleOutRequestExternal:

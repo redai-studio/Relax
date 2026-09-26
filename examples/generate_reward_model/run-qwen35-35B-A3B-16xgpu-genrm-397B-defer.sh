@@ -71,11 +71,27 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
+# Training reward is --rm-type dummy (real reward is deferred to the GenRM
+# post-process pass). Eval runs inline, so without an explicit scorer it would
+# inherit the global dummy rm_type and report a constant 0.0 (pass@k all zero).
+# resolve_rm_type prefers the per-sample metadata rm_type over args.rm_type, and
+# inject_metadata sources it from the eval dataset config's rm_type. --eval-config
+# is the only path that can set a per-dataset rm_type (--eval-prompt-data only
+# carries name/path), so pin the AIME eval to the real DAPO math verifier here.
+EVAL_CONFIG=${EXP_DIR}/eval-aime-dapo-${now}.yaml
+cat >"${EVAL_CONFIG}" <<EOF
+eval:
+  datasets:
+    - name: aime
+      path: ${DATA_DIR}/aime-2024/aime-2024.jsonl
+      rm_type: dapo
+EOF
+
 EVAL_ARGS=(
    --log-passrate
    --skip-eval-before-train
    --eval-interval 20
-   --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
+   --eval-config ${EVAL_CONFIG}
    --n-samples-per-eval-prompt 8
    --eval-max-response-len 8192
    --eval-top-p 0.7

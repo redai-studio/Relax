@@ -2,7 +2,7 @@
 
 ## 概述
 
-Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Megatron 训练后端、SGLang 推理引擎、以及 GRPO/GSPO/SAPO 等算法族。框架采用分层架构设计，将编排、组件、引擎、后端和分布式能力解耦为独立模块。
+Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Megatron 训练后端、SGLang 推理引擎，以及 PPO/GRPO/GSPO/SAPO/CISPO 等算法族。框架采用分层架构设计，将编排、组件、引擎、后端和分布式能力解耦为独立模块。
 
 ## 分层架构
 
@@ -75,12 +75,12 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 |------|------|------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | 策略训练（Megatron 后端） |
 | **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，管理 RolloutManager |
-| **Critic** | [`critic.py`](../../../relax/components/critic.py) | 价值估计 |
+| **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value 估计与裁剪 value loss 训练 |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | 前向推理 log-prob（fully-async 模式） |
-| **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（GRPO/GSPO/SAPO 等） |
+| **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（PPO/GRPO/GSPO/SAPO/CISPO 等） |
 | **GenRM** | [`genrm.py`](../../../relax/components/genrm.py) | 生成式奖励模型 |
 
-**同步模式**部署 Actor + Rollout + Critic 三个核心组件；**全异步模式** (`--fully-async`) 额外部署 ActorFwd 和 Advantages 组件。
+实际部署的服务图取决于算法与运行模式。Colocate 的 GRPO-like 算法使用 Actor + Rollout；同步 colocate PPO 会增加 Critic + Advantages。对于非 PPO 算法，**全异步模式**（`--fully-async`）可根据 log-probability 与 KL 配置进一步部署 ActorFwd 和 Reference 服务。暂不支持 fully-async PPO；当前支持的数据流详见 [PPO 训练](./ppo-training.md)。
 
 ### 4. 引擎层 (Engine)
 

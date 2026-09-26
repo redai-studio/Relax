@@ -1,7 +1,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
-ARG BASE_IMAGE=lmsysorg/sglang:v0.5.12.post1-cu129
+ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
 
@@ -12,9 +12,9 @@ ENV NVIDIA_PYTORCH_VERSION=25.06 \
     PYSFX=3 \
     L4T=0 \
     PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
-    TZ=Asia/Shanghai\
+    TZ=Asia/Shanghai \
     LANG=en_US.UTF-8 \
-    LC_ALL=en_US.UTF-8\
+    LC_ALL=en_US.UTF-8 \
     OPENCV_VERSION=4.7.0 \
     DEBIAN_FRONTEND=noninteractive
 
@@ -38,8 +38,23 @@ RUN pip install nvidia-cudnn-cu12==9.16.0.29
 FROM base as train
 
 RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
-    pip install --no-cache-dir flash-linear-attention==0.4.1 && \
+    pip install --no-cache-dir flash-linear-attention==0.4.2 && \
     pip install --no-cache-dir tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
+
+# DeepSeek-V4 DSA deps, both listed under mcore's `no_pypi_wheels` so built from pinned source:
+#   - fast-hadamard-transform: required by the Lightning Indexer (dsa.rotate_activation asserts on it)
+#   - FlashMLA: fused DSA sparse attention; without it the CSA backward is quadratic in seq len
+#     (mcore only allows the fusion on SM90 when dsa_indexer_loss_coeff == 0)
+ARG FLASH_MLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+RUN MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps \
+        git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
+    git clone --recurse-submodules https://github.com/deepseek-ai/FlashMLA.git /opt/FlashMLA && \
+    cd /opt/FlashMLA && git checkout ${FLASH_MLA_COMMIT} && \
+    git submodule update --init --recursive && \
+    MAX_JOBS=64 pip install --no-cache-dir --no-build-isolation --no-deps . && \
+    cd / && python -c "import flash_mla; assert hasattr(flash_mla, 'flash_mla_sparse_fwd'), \
+        'flash_mla built but flash_mla_sparse_fwd missing'" && \
+    rm -rf /opt/FlashMLA
 
 # FA3 (Hopper flash-attention), built from source. This commit's _flash_attn_forward carries
 # window_size_left/right to match TE 2.14.1 (docs/draft/sglang-0.5.12-upgrade-plan.md §8.4).
@@ -68,20 +83,15 @@ RUN MAX_JOBS=64 \
     rm -rf /opt/flash-attention/
 
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
-    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-infra/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
+    TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
+    pip install megatron-energon fsspec==2024.3.1 --no-cache-dir&& \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
     git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
-
-ARG TRAIN_IMAGE=train
-FROM ${TRAIN_IMAGE} as relax
-
-ARG PATCH_VERSION=latest
-ARG ENABLE_SGLANG_PATCH=1
 
 WORKDIR /root
 
@@ -91,7 +101,15 @@ RUN cd /tmp/int4_qat && \
     pip install . --no-build-isolation --no-cache-dir && \
     rm -rf /tmp/int4_qat
 
-ARG MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} as relax
+
+WORKDIR /root
+
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+
+ARG MEGATRON_BRIDGE_COMMIT=af17edf52c514c58c79cd291b04a9b42bc5c57f3
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -114,7 +132,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
 
 # sgl-router: override the official wheel (pulled by requirements.txt above) with
 # slime's r3-capable fork. The official sglang-router drops the routed_experts
@@ -122,7 +140,7 @@ RUN pip install --ignore-installed PyJWT && \
 # --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
 # `support r3` passthrough patch. Must run AFTER the requirements install so it
 # wins.
-RUN pip install --no-cache-dir --force-reinstall \
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
         https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
     python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
 

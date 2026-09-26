@@ -1,0 +1,115 @@
+--- a/resources_servers/workplace_assistant/app.py
++++ b/resources_servers/workplace_assistant/app.py
+@@ -37,6 +37,10 @@
+     model_config = ConfigDict(extra="allow")
+ 
+ 
++class WorkbenchSeedSessionRequest(BaseSeedSessionRequest):
++    model_config = ConfigDict(extra="allow")
++
++
+ class WorkbenchResponse(BaseModel):
+     model_config = ConfigDict(extra="allow")
+ 
+@@ -55,13 +59,21 @@
+ class WorkbenchResourcesServer(SimpleResourcesServer):
+     config: WorkbenchResourcesServerConfig
+     session_id_to_tool_env: Dict[str, Any] = Field(default_factory=dict)
++    session_id_to_rollout_id: Dict[str, str] = Field(default_factory=dict)
++    rollout_id_to_session_id: Dict[str, str] = Field(default_factory=dict)
+ 
+     def setup_webserver(self) -> FastAPI:
+         app = super().setup_webserver()
+         app.post("/{path}")(self.route_to_python_function)
++        app.post("/cleanup/{rollout_id}")(self.cleanup_session)
++        app.get("/cleanup/{rollout_id}")(self.probe_cleanup)
+         return app
+ 
+-    async def seed_session(self, request: Request, body: BaseSeedSessionRequest) -> BaseSeedSessionResponse:
++    async def seed_session(
++        self,
++        request: Request,
++        body: WorkbenchSeedSessionRequest,
++    ) -> BaseSeedSessionResponse:
+         # init session once for each sample.
+         session_id = request.session[SESSION_ID_KEY]
+         toolkits = [
+@@ -72,8 +84,31 @@
+             "customer_relationship_manager",
+         ]
+         self.session_id_to_tool_env[session_id] = get_tools(toolkits)
++        extra = body.model_extra or {}
++        task_index = extra.get("_ng_task_index")
++        rollout_index = extra.get("_ng_rollout_index")
++        if isinstance(task_index, str) and isinstance(rollout_index, str):
++            rollout_id = f"{task_index}-{rollout_index}"
++            self.session_id_to_rollout_id[session_id] = rollout_id
++            self.rollout_id_to_session_id[rollout_id] = session_id
+         return BaseSeedSessionResponse()
+ 
++    async def cleanup_session(self, rollout_id: str) -> dict[str, bool]:
++        session_id = self.rollout_id_to_session_id.pop(rollout_id, None)
++        if session_id is not None:
++            self.session_id_to_rollout_id.pop(session_id, None)
++            self.session_id_to_tool_env.pop(session_id, None)
++        return {"accepted": True}
++
++    async def probe_cleanup(self, rollout_id: str) -> dict[str, bool]:
++        return {"clean": rollout_id not in self.rollout_id_to_session_id}
++
++    def discard_session(self, session_id: str) -> None:
++        rollout_id = self.session_id_to_rollout_id.pop(session_id, None)
++        if rollout_id is not None:
++            self.rollout_id_to_session_id.pop(rollout_id, None)
++        self.session_id_to_tool_env.pop(session_id, None)
++
+     async def route_to_python_function(self, path: str, body: WorkbenchRequest, request: Request) -> WorkbenchResponse:
+         session_id = request.session[SESSION_ID_KEY]
+ 
+@@ -96,27 +131,31 @@
+                 output=f"Error executing tool '{path}': {str(e)}"
+             )  # return error to model so that it can correct itself
+ 
+-    async def verify(self, body: WorkbenchVerifyRequest) -> WorkbenchVerifyResponse:
+-        ground_truth = body.ground_truth
+-        response = body.response.output
++    async def verify(self, body: WorkbenchVerifyRequest, request: Request) -> WorkbenchVerifyResponse:
++        session_id = request.session[SESSION_ID_KEY]
++        try:
++            ground_truth = body.ground_truth
++            response = body.response.output
+ 
+-        total_score = 0.0
++            total_score = 0.0
+ 
+-        # Convert list of ResponseFunctionToolCall objects into list of dictionaries
+-        predicted_function_calls = []
++            # Convert list of ResponseFunctionToolCall objects into list of dictionaries
++            predicted_function_calls = []
+ 
+-        for message in response:
+-            if message.type == "function_call":
+-                predicted_function_calls.append(message.model_dump())
++            for message in response:
++                if message.type == "function_call":
++                    predicted_function_calls.append(message.model_dump())
+ 
+-        predicted_chat_content = []
++            predicted_chat_content = []
+ 
+-        for message in response:
+-            if message.type == "output_text":
+-                predicted_chat_content.append(message.model_dump())
++            for message in response:
++                if message.type == "output_text":
++                    predicted_chat_content.append(message.model_dump())
+ 
+-        total_score += is_correct(predicted_function_calls, ground_truth, None) * 1.0
+-        return WorkbenchVerifyResponse(**body.model_dump(), reward=total_score)
++            total_score += is_correct(predicted_function_calls, ground_truth, None) * 1.0
++            return WorkbenchVerifyResponse(**body.model_dump(), reward=total_score)
++        finally:
++            self.discard_session(session_id)
+ 
+ 
+ if __name__ == "__main__":

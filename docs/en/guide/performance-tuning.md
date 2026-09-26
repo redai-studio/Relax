@@ -351,9 +351,9 @@ Distribute token counts evenly across data parallel ranks to reduce idle time:
 --balance-data
 ```
 
-::: warning
-`--balance-data` is only available in colocate mode. It is not supported in fully async mode (`--fully-async`) because the TransferQueue data consumption path is incompatible with data balancing. Enabling both will raise an error at startup.
-:::
+On the static/seqlen-balanced path, `--balance-data` enables `SeqlenBalancedSampler` and uses `karmarkar_karp` to balance tokens across data parallel ranks.
+
+In fully async with `--use-dynamic-batch-size`, the dynamic batch path automatically performs DP token balancing through `StreamingTokenBudgetSampler`. Passing `--balance-data` is accepted there, but it does not add another balancing pass.
 
 ::: warning
 With `--balance-data`, different responses for the same prompt may be assigned to different training steps.

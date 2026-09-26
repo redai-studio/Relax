@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from functools import partial
@@ -9,7 +11,11 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
-from relax.utils.distributed_utils import distributed_masked_whiten
+from relax.algorithms import get_algorithm
+from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
+from relax.algorithms.policy import compute_policy_loss_for
+from relax.algorithms.spec import ALGORITHM_SPECS
+from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
@@ -18,19 +24,12 @@ from relax.utils.opd.opd_utils import (
     resolve_opd_gather_topk_token_ids,
     validate_opd_topk_gather,
 )
+from relax.utils.replay import capture_hooks
 from relax.utils.training.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
-    compute_cispo_loss,
     compute_gspo_kl,
-    compute_log_probs,
     compute_opsm_mask,
-    compute_policy_loss,
-    compute_sapo_loss,
-    get_advantages_and_returns_batch,
-    get_grpo_returns,
-    get_reinforce_plus_plus_baseline_advantages,
-    get_reinforce_plus_plus_returns,
 )
 from relax.utils.types import RolloutBatch
 
@@ -53,6 +52,7 @@ def get_responses(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    apply_temperature: bool = True,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -174,13 +174,14 @@ def get_responses(
 
         # Apply temperature per-chunk instead of on the full [T, V] logits to avoid
         # a single ~16GiB allocation that OOMs under fragmentation.
-        # Skip when SFT chunked path is on (--sft-chunked-logits): in that mode
-        # `logits_chunk` here is actually `hidden_states` (shape [R, H], not
-        # [R, V]) — dividing hidden activations by a softmax-distribution
-        # temperature is mathematically meaningless. That caller applies
-        # temperature on the real per-sub-chunk logits after lm_head instead.
-        if args.rollout_temperature != 1.0 and not (
-            args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False)
+        # Skipped when apply_temperature is False (value head: scalar predictions
+        # must not be temperature-scaled), and on the SFT chunked path where
+        # `logits_chunk` is hidden_states [R, H] not logits (that caller applies
+        # temperature on the real per-sub-chunk logits after lm_head instead).
+        if (
+            apply_temperature
+            and args.rollout_temperature != 1.0
+            and not (args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False))
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -236,12 +237,18 @@ def _allgather_cp_redistribute(
             e = min(logit_global_end, chunk_end)
 
             if e <= s:
-                # This rank has no response logprobs for this sample
+                # This rank has no response logprobs for this sample. Match the
+                # placeholder's requires_grad to the real data (`value`): forcing
+                # requires_grad=True makes the concatenated all_reduce input require
+                # grad on ranks with an empty chunk while non-empty ranks (F.pad of
+                # a no-grad `value`) do not, so the differentiable dist.nn.all_reduce
+                # below builds a backward graph on some CP ranks but not others and
+                # the collective deadlocks.
                 full_resp = torch.zeros(
                     response_length,
                     dtype=value.dtype,
                     device=value.device,
-                    requires_grad=True,
+                    requires_grad=value.requires_grad,
                 )
             else:
                 resp_start = s - logit_global_start
@@ -301,9 +308,8 @@ def get_log_probs_and_entropy(
 
     For each sample, extracts response-aligned logits and tokens, then computes
     log-probabilities via softmax across the tensor-parallel group. Log-probs
-    are squeezed from `[R, 1]` to `[R]`. Entropy values are always appended
-    (even when `with_entropy=False`), but only included in the result dict
-    when requested.
+    are squeezed from `[R, 1]` to `[R]`. When entropy is requested only as a
+    metric (`entropy_coef == 0`), its backward activations are not retained.
 
     Args:
         logits: Policy logits with shape `[1, T, V]`. When ``lm_head_forward``
@@ -359,6 +365,9 @@ def get_log_probs_and_entropy(
             sft_chunk_size = 1024
     resolved_topk_k = topk_k if topk_k is not None else getattr(args, "opd_log_prob_top_k", 0)
     tp_group = mpu.get_tensor_model_parallel_group()
+    # Keep entropy metrics, but skip saving entropy-backward activations when
+    # the entropy term cannot affect the loss.
+    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
     log_probs_list = []
     entropy_list = []
     topk_token_ids_list = []
@@ -389,14 +398,19 @@ def get_log_probs_and_entropy(
                 logits_sub = logits_sub.squeeze(1).float()
                 if args.rollout_temperature != 1.0:
                     logits_sub = logits_sub / args.rollout_temperature
-                chunk_lps.append(compute_log_probs(logits_sub, tokens_chunk[s:e], tp_group).squeeze(-1))
+                log_prob_sub, _ = calculate_log_probs_and_entropy(
+                    logits_sub,
+                    tokens_chunk[s:e],
+                    tp_group,
+                    with_entropy=False,
+                )
+                chunk_lps.append(log_prob_sub.squeeze(-1))
             log_prob = (
                 torch.cat(chunk_lps, dim=0)
                 if chunk_lps
-                # fp32 to match compute_log_probs's return dtype (Megatron's
-                # fused_vocab_parallel_cross_entropy returns fp32 because we
-                # upcast logits with .float() above). Mismatch would break the
-                # downstream torch.cat over per-sample log_probs.
+                # fp32 to match calculate_log_probs_and_entropy's return dtype;
+                # logits are upcast above. A mismatch would break the downstream
+                # torch.cat over per-sample log-probabilities.
                 else logits_chunk.new_zeros((0,), dtype=torch.float32)
             )
             entropy = None
@@ -406,6 +420,7 @@ def get_log_probs_and_entropy(
                 tokens_chunk,
                 tp_group,
                 with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
                 chunk_size=args.log_probs_chunk_size,
             )
             log_prob = log_prob.squeeze(-1)
@@ -465,8 +480,8 @@ def get_values(
 
     Args:
         logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        args: Configuration passed to `get_responses`; temperature scaling is
+            disabled for value outputs.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
@@ -488,6 +503,7 @@ def get_values(
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        apply_temperature=False,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -515,10 +531,12 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     `args.advantage_estimator`.
 
     This function extracts rewards, log-probs, values, and masks from
-    `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "sapo", "cispo", "ppo", "reinforce_plus_plus",
-    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
-    True, advantages are whitened across the data-parallel group using masked
+    `rollout_data`, computes KL divergences, then dispatches to the estimator
+    named by `relax.algorithms.spec.ALGORITHM_SPECS[...].advantage_fn`. The
+    supported methods are whatever that registry holds -- deliberately not
+    listed here, because keeping algorithm names in prose is the duplication
+    the registry exists to remove. When `args.normalize_advantages` is True,
+    advantages are whitened across the data-parallel group using masked
     statistics.
 
     Early returns if both `log_probs` and `values` are None (intermediate
@@ -534,7 +552,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     """
     log_probs: list[torch.Tensor] = rollout_data.get("rollout_log_probs" if args.use_rollout_logprobs else "log_probs")
     ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-    rewards: list[float] = rollout_data.get("rewards")
+    rewards: list[float] | list[torch.Tensor] = rollout_data.get("rewards")
     values: None | list[torch.Tensor] = rollout_data.get("values")
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
@@ -566,51 +584,21 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]  # noqa: C416
-
-    elif args.advantage_estimator == "ppo":
-        old_rewards = rewards
-        rewards = []
-        kl_coef = -args.kl_coef
-        cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
-            k *= kl_coef
-            if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
-        advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
-        )
-
-    elif args.advantage_estimator == "reinforce_plus_plus":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_reinforce_plus_plus_returns(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-            response_lengths=response_lengths,
-            total_lengths=total_lengths,
-            kl_coef=args.kl_coef,
-            gamma=args.gamma,
-        )
-        advantages = [r for r in returns]  # noqa: C416
-
-    elif args.advantage_estimator == "reinforce_plus_plus_baseline":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        advantages = get_reinforce_plus_plus_baseline_advantages(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-            kl_coef=args.kl_coef,
-        )
-        returns = advantages
-
-    else:
-        raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+    advantages, returns = compute_advantages_and_returns_impl(
+        args,
+        rewards=rewards,
+        kl=kl,
+        loss_masks=loss_masks,
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        values=values,
+        # Only this path can compute it: `maybe_padded_total_lengths` reads
+        # args.qkv_format plus the VL / unsplit-forward flags, which the
+        # Advantages deployment does not have. GAE needs it to slice CP shards
+        # at the padded offsets; omitting it does not raise, it reads the wrong
+        # token positions.
+        padded_total_lengths=padded_total_lengths,
+    )
 
     # Optional pure OPD mode: remove all non-OPD reward contribution.
     # This keeps only the OPD KL term injected below.
@@ -670,18 +658,47 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
             all_masks = torch.cat(mask_chunks)
 
-        if all_masks.numel() > 0:
-            assert all_advs.size() == all_masks.size(), (
-                f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            )
+        assert all_advs.size() == all_masks.size(), (
+            f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
+        )
+        # Which normalisation to apply is declared by the algorithm registry.
+        # This used to be a set of estimator names maintained here and a second
+        # identical set in `policy_loss_function` below, which is exactly the
+        # kind of pair that drifts: the two have to stay in step because
+        # token-global normalisation is only correct together with the
+        # mask-safe reducer.
+        is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
+        if is_token_global or all_masks.numel() > 0:
             dp_group = mpu.get_data_parallel_group()
 
-            whitened_advs_flat = distributed_masked_whiten(
-                all_advs,
-                all_masks,
-                process_group=dp_group,
-                shift_mean=True,
-            )
+            if is_token_global:
+                whitened_advs_flat, raw_mean, raw_variance, valid_count = distributed_masked_normalize(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                )
+                variance_floor = torch.tensor(1e-8, device=raw_variance.device, dtype=raw_variance.dtype)
+                normalized_variance = raw_variance / torch.maximum(raw_variance, variance_floor)
+                num_samples = len(advantages)
+                raw_mean = raw_mean.detach()
+                raw_std = raw_variance.sqrt().detach()
+                normalized_mean = torch.zeros_like(raw_mean)
+                normalized_std = normalized_variance.sqrt().detach()
+                valid_count = valid_count.detach()
+                zero_variance = (raw_variance == 0).to(dtype=raw_variance.dtype).detach()
+                rollout_data["reinforce_pp_advantage_raw_mean"] = [raw_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_raw_std"] = [raw_std] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_mean"] = [normalized_mean] * num_samples
+                rollout_data["reinforce_pp_advantage_normalized_std"] = [normalized_std] * num_samples
+                rollout_data["reinforce_pp_valid_token_count"] = [valid_count] * num_samples
+                rollout_data["reinforce_pp_zero_variance"] = [zero_variance] * num_samples
+            else:
+                whitened_advs_flat = distributed_masked_whiten(
+                    all_advs,
+                    all_masks,
+                    process_group=dp_group,
+                    shift_mean=True,
+                )
             chunk_lengths = [chunk.size(0) for chunk in advantages]
             advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
@@ -752,6 +769,26 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _get_reinforce_plus_plus_mask_safe_reducer(
+    reducer: Callable[[torch.Tensor], torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Exclude masked non-finite values before a REINFORCE++ reduction."""
+    flat_valid_mask = torch.cat([mask.reshape(-1) != 0 for mask in loss_masks], dim=0)
+
+    def reduce_valid_tokens(values: torch.Tensor) -> torch.Tensor:
+        valid_mask = flat_valid_mask.to(device=values.device)
+        if values.shape[0] != valid_mask.numel():
+            raise ValueError(
+                "REINFORCE++ reducer expected one value per response token, "
+                f"got {values.shape[0]} values for {valid_mask.numel()} mask elements."
+            )
+        safe_values = torch.where(valid_mask, values, torch.zeros_like(values))
+        return reducer(safe_values)
+
+    return reduce_valid_tokens
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -786,6 +823,14 @@ def policy_loss_function(
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
         advantages = batch["advantages"]
+
+    # Same registry field as `compute_advantages_and_returns` reads: the
+    # mask-safe reducer is the other half of token-global normalisation, not an
+    # independent choice.
+    is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
+
+    if is_token_global:
+        sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
 
     true_on_policy = getattr(args, "true_on_policy_mode", False)
     # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
@@ -822,7 +867,8 @@ def policy_loss_function(
         old_log_probs = [lp.detach() for lp in log_probs]
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    algorithm = get_algorithm(args.advantage_estimator)
+    need_full_log_probs = args.use_opsm or algorithm.needs_full_log_probs
 
     full_log_probs = None
     full_old_log_probs = None
@@ -881,7 +927,7 @@ def policy_loss_function(
         )
 
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
-    if args.advantage_estimator == "gspo":
+    if algorithm.kl_level == "sequence":
         ppo_kl = compute_gspo_kl(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
@@ -896,22 +942,12 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if args.advantage_estimator == "sapo":
-        tau_pos = getattr(args, "sapo_tau_pos", 1.0)
-        tau_neg = getattr(args, "sapo_tau_neg", 1.05)
-        pg_loss, pg_clipfrac = compute_sapo_loss(
-            ppo_kl=ppo_kl, advantages=advantages, tau_pos=tau_pos, tau_neg=tau_neg
-        )
-    elif args.advantage_estimator == "cispo":
-        pg_loss, pg_clipfrac = compute_cispo_loss(
-            log_probs=log_probs,
-            ppo_kl=ppo_kl,
-            advantages=advantages,
-            eps_clip=args.eps_clip,
-            eps_clip_high=args.eps_clip_high,
-        )
-    else:
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
+        args,
+        log_probs=log_probs,
+        ppo_kl=ppo_kl,
+        advantages=advantages,
+    )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -953,8 +989,8 @@ def policy_loss_function(
             tis_func = vanilla_tis_function
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
-        # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-        # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
+        # Rebuild with the modified numerator mask while preserving the original
+        # logical-sample denominator. The masks are sliced with CP in the reducer.
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths,
             response_lengths,
@@ -965,7 +1001,12 @@ def policy_loss_function(
             padded_total_lengths,
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+            sample_denoms=batch.get("sample_index_mask_sums", None),
         )
+        if is_token_global:
+            sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(
+                sum_of_sample_mean, modified_response_masks
+            )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
@@ -975,6 +1016,8 @@ def policy_loss_function(
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
+        if is_token_global:
+            pg_loss_reducer = _get_reinforce_plus_plus_mask_safe_reducer(pg_loss_reducer, pg_loss_masks)
     else:
         pg_loss_reducer = sum_of_sample_mean
 
@@ -1022,9 +1065,22 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        # Train/inference mismatch = |train-engine logprob - rollout-engine logprob| for
+        # the SAME tokens+weights. old_log_probs is the wrong reference under
+        # --use-rollout-logprobs: there old_log_probs IS rollout_log_probs (see the
+        # assignment above), so the diff would collapse to 0. Use the actor-fwd
+        # train-side recompute (batch["log_probs"], populated when --get-mismatch-metrics
+        # forces the extra forward) and fall back to this step's fresh forward log_probs
+        # otherwise (colocate on-policy: rollout weights == current weights).
+        if not args.use_rollout_logprobs:
+            train_side_log_probs = old_log_probs
+        elif batch.get("log_probs"):
+            train_side_log_probs = torch.cat(batch["log_probs"], dim=0)
+        else:
+            train_side_log_probs = log_probs.detach()
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_side_log_probs - rollout_log_probs).abs())
         train_rollout_prob_abs_diff = sum_of_sample_mean(
-            (torch.exp(old_log_probs) - torch.exp(rollout_log_probs)).abs()
+            (torch.exp(train_side_log_probs) - torch.exp(rollout_log_probs)).abs()
         )
 
     reported_loss = {
@@ -1034,6 +1090,20 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+
+    # Trajectory-replay capture: record the loss.policy stage. No-op unless
+    # capture is enabled and this step is selected (single global read).
+    capture_hooks.capture_policy_loss(
+        old_log_probs=old_log_probs,
+        log_probs=log_probs,
+        entropy=entropy,
+        advantages=advantages,
+        loss_masks=batch["loss_masks"],
+        response_lengths=response_lengths,
+        total_lengths=total_lengths,
+        reported_loss=reported_loss,
+        micro_batch_index=batch.get("replay_micro_batch_index"),
+    )
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -1055,6 +1125,11 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    duplicate_policy_metrics = reported_loss.keys() & policy_scalar_metrics.keys()
+    if duplicate_policy_metrics:
+        raise ValueError(f"Policy scalar metrics would overwrite existing metrics: {sorted(duplicate_policy_metrics)}")
+    reported_loss.update(policy_scalar_metrics)
 
     return loss, reported_loss
 
@@ -1152,6 +1227,8 @@ def sft_loss_function(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1168,6 +1245,91 @@ def sft_loss_function(
             "loss": loss.clone().detach(),
         },
     )
+
+
+def get_sequence_classification_outputs(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, list[int]]:
+    """Pool one classification logit vector per sample on the owning CP
+    rank."""
+    local_logits: list[torch.Tensor] = []
+    local_indices: list[int] = []
+    for sample_idx, (logits_chunk, _) in enumerate(
+        get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+            max_seq_lens=batch.get("max_seq_lens", None),
+            padded_total_lengths=batch.get("padded_total_lengths", None),
+            apply_temperature=False,
+            dynamic_cp_size=batch.get("dynamic_cp_size", None),
+            dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        )
+    ):
+        if logits_chunk.shape[0] == 0:
+            continue
+        if logits_chunk.shape != (1, int(args.num_labels)):
+            raise ValueError(
+                "sequence classification pooling expected one logit vector with shape "
+                f"(1, {args.num_labels}), got {tuple(logits_chunk.shape)} for sample {sample_idx}"
+            )
+        local_logits.append(logits_chunk.squeeze(0))
+        local_indices.append(sample_idx)
+
+    if not local_logits:
+        return logits.new_empty((0, int(args.num_labels))), local_indices
+    return torch.stack(local_logits, dim=0), local_indices
+
+
+def sequence_classification_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute single-label CE or multi-label BCE on last-valid-token
+    logits."""
+    labels = batch.get("classification_labels")
+    if labels is None:
+        raise ValueError("sequence classification batch is missing classification_labels")
+
+    metric_name = "accuracy" if args.problem_type == "single_label_classification" else "subset_accuracy"
+    local_logits, local_indices = get_sequence_classification_outputs(args, batch, logits)
+    if local_indices:
+        local_labels = [labels[i] for i in local_indices]
+        if args.problem_type == "single_label_classification":
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(()) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.long
+            )
+            per_sample_loss = F.cross_entropy(local_logits, label_tensor, reduction="none")
+            per_sample_correct = (local_logits.argmax(dim=-1) == label_tensor).float()
+        else:
+            label_tensor = torch.stack([torch.as_tensor(label).reshape(-1) for label in local_labels]).to(
+                device=local_logits.device, dtype=torch.float32
+            )
+            if label_tensor.shape != local_logits.shape:
+                raise ValueError(
+                    f"multi-label targets must have shape {tuple(local_logits.shape)}, got {tuple(label_tensor.shape)}"
+                )
+            per_sample_loss = F.binary_cross_entropy_with_logits(
+                local_logits,
+                label_tensor,
+                reduction="none",
+            ).mean(dim=-1)
+            predictions = torch.sigmoid(local_logits) >= args.classification_threshold
+            per_sample_correct = predictions.eq(label_tensor.bool()).all(dim=-1).float()
+
+        loss = sum_of_sample_mean(per_sample_loss)
+        accuracy = sum_of_sample_mean(per_sample_correct)
+    else:
+        loss = logits.sum() * 0.0
+        accuracy = logits.detach().sum() * 0.0
+
+    return loss, {"loss": loss.detach(), metric_name: accuracy.detach()}
 
 
 def sft_loss_function_chunked(
@@ -1200,6 +1362,8 @@ def sft_loss_function_chunked(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
     )
 
@@ -1211,6 +1375,18 @@ def sft_loss_function_chunked(
         loss += 0 * hidden_states.sum()
 
     return loss, {"loss": loss.clone().detach()}
+
+
+def mtp_only_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Trigger the attached MTP auxiliary loss without a main language loss."""
+    del args, batch, sum_of_sample_mean
+    loss = 0.0 * hidden_states.sum()
+    return loss, {"loss": loss.detach()}
 
 
 def loss_function(
@@ -1248,7 +1424,9 @@ def loss_function(
         - `normalizer` is `num_tokens` (scalar tensor) if
           `args.calculate_per_token_loss` is True, else `1` (int).
         - `logging_dict` has keys "keys" (list of str metric names) and
-          "values" (1D tensor: [count, metric1, metric2, ...]).
+          "values" (1D tensor: [denominator, metric1, metric2, ...]). The
+          denominator is the token count for per-token loss and a zero
+          placeholder for sample-mean loss.
     """
     # CP-local token count (tokens whose loss this rank actually contributes).
     # Summed across the CP group in finalize_model_grads / the metric all-reduce,
@@ -1266,7 +1444,6 @@ def loss_function(
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
-    num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1278,25 +1455,31 @@ def loss_function(
         batch.get("padded_total_lengths", None),
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
         dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+        sample_denoms=batch.get("sample_index_mask_sums", None),
     )
 
-    match args.loss_type:
-        case "policy_loss":
-            func = policy_loss_function
-        case "value_loss":
-            func = value_loss_function
-        case "sft":
-            if getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
-                # Bind lm_head_forward so chunked path matches the standard
-                # inner-func signature; outer body (recompute, CP guard,
-                # Megatron scaling, return-tuple) is then shared with legacy.
-                func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
-            else:
-                func = sft_loss_function
-        case "custom_loss":
-            func = load_function(args.custom_loss_function_path)
-        case _:
-            raise ValueError(f"Unknown loss type: {args.loss_type}")
+    if getattr(args, "mtp_only_training", False):
+        func = mtp_only_loss_function
+    else:
+        match args.loss_type:
+            case "policy_loss":
+                func = policy_loss_function
+            case "value_loss":
+                func = value_loss_function
+            case "sft":
+                if getattr(args, "task_type", "causal_lm") == "seq_cls":
+                    func = sequence_classification_loss_function
+                elif getattr(args, "sft_chunked_logits", False) and lm_head_forward is not None:
+                    # Bind lm_head_forward so chunked path matches the standard
+                    # inner-func signature; outer body (recompute, CP guard,
+                    # Megatron scaling, return-tuple) is then shared with legacy.
+                    func = partial(sft_loss_function_chunked, lm_head_forward=lm_head_forward)
+                else:
+                    func = sft_loss_function
+            case "custom_loss":
+                func = load_function(args.custom_loss_function_path)
+            case _:
+                raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
         loss, log = checkpoint(
@@ -1309,6 +1492,15 @@ def loss_function(
         )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # Preserve the pre-registry scalar logging convention: only per-token
+    # aggregation compensates for the framework's token denominator.
+    if args.calculate_per_token_loss:
+        algorithm = ALGORITHM_SPECS.get(getattr(args, "advantage_estimator", None))
+        if algorithm is not None:
+            for key in algorithm.policy_scalar_metric_names:
+                if key in log:
+                    log[key] = log[key] * num_tokens
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding or all-masked). Without this, gradient doesn't flow through their attention
@@ -1354,13 +1546,17 @@ def loss_function(
         # full-count denominator, leaving the final loss/grad unchanged.
 
     effective_num_tokens = torch.zeros_like(num_tokens) if is_dummy else num_tokens
-    log_values = torch.tensor(
-        [
-            num_samples if not args.calculate_per_token_loss else effective_num_tokens,
-        ]
-        + list(log.values()),
-        device=logits.device,
+    is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
+    denominator = (
+        effective_num_tokens
+        if args.calculate_per_token_loss or is_sequence_classification
+        else torch.zeros_like(num_tokens)
     )
+    metric_values = [
+        value.to(logits.device) if isinstance(value, torch.Tensor) else torch.tensor(value, device=logits.device)
+        for value in log.values()
+    ]
+    log_values = torch.stack([denominator] + metric_values)
     if is_dummy:
         # Drop this mb's contribution from logged metric averages.
         log_values = torch.zeros_like(log_values)

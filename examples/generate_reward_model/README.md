@@ -16,12 +16,15 @@ Both scripts in this directory train **Qwen3-4B** with **GRPO** on the `dapo-mat
 
 ## Scripts
 
-| Script                                          | Mode                  | Description                                                                                                  |
-| :---------------------------------------------- | :-------------------- | :----------------------------------------------------------------------------------------------------------- |
-| `run-qwen3-4B-8xgpu-colocated.sh`               | Colocate (sync)       | Actor & Rollout share GPUs; GenRM on separate GPUs                                                           |
-| `run-qwen3-4B-8xgpu-async.sh`                   | Fully Async           | Independent GPU pools per role; maximum throughput                                                           |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split-bundle colocate | 35B-A3B policy + 397B FP8 GenRM on 16 GPU (2 nodes), rollout / GenRM on separate 8-GPU shards, inline reward |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Defer / swap colocate | 35B-A3B policy + 397B FP8 GenRM on 16 GPU (2 nodes), shared bundles, two-phase sleep-wake swap, batch reward |
+| Script                                          | Mode                  | Description                                                                                                                                                                                                          |
+| :---------------------------------------------- | :-------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run-qwen3-4B-8xgpu-colocated.sh`               | Colocate (sync)       | Actor & Rollout share GPUs; GenRM on separate GPUs                                                                                                                                                                   |
+| `run-qwen3-4B-8xgpu-async.sh`                   | Fully Async           | Independent GPU pools per role; maximum throughput                                                                                                                                                                   |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split-bundle colocate | 35B-A3B policy + 397B FP8 GenRM on 16 GPU (2 nodes), rollout / GenRM on separate 8-GPU shards, inline reward                                                                                                         |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Defer / swap colocate | 35B-A3B policy + 397B FP8 GenRM on 16 GPU (2 nodes), shared bundles, two-phase sleep-wake swap, batch reward                                                                                                         |
+| `run-qwen3-4B-8xgpu-dual-genrm-split.sh`        | Split-bundle colocate | Qwen3-4B policy on 4 GPU + **two** GenRM instances (`--genrm-instances`) on the other 4 GPU, routed by `route_key`; see [Multi-Instance GenRM](#multi-instance-genrm-multiple-judge-models-behind-one-service) below |
+
+`reward_dual_genrm_quality_safety.py` is the custom reward function (`--custom-rm-path`) used by the dual-GenRM script above. It calls two independently-deployed judge models — one scoring answer correctness (`route_key="quality"`), one scoring response safety (`route_key="safety"`) — and combines both into a single training reward (`score = quality_score * safety_score`). Use it as a template for routing different reward signals — or, in agentic settings, different agent modules — to different GenRM instances.
 
 ## 大模型 GenRM 两种部署模式选择 (35B-A3B + 397B FP8, 16GPU)
 
@@ -72,6 +75,16 @@ Phase C (train):    actor 训练 + weight update, GenRM 保持睡眠
 | GenRM 明显比 policy 大（4×+）                         | **defer**（GenRM 拿满卡收益最大）                        |
 | GenRM 比 policy 小或相当                              | **split**（GenRM 8 卡也够用，overlap 更划算）            |
 | 不确定                                                | 先跑 **defer** 拿到 baseline wall-time，再对比 **split** |
+
+## Multi-Instance GenRM (multiple judge models behind one service)
+
+Everything above assumes a single judge model. `--genrm-instances` lets one GenRM Serve deployment host **several independent judge models** at once (different sizes, different checkpoints, different scoring criteria), each addressed by a `route_key` string the caller supplies per request. This is the mechanism behind `run-qwen3-4B-8xgpu-dual-genrm-split.sh` / `reward_dual_genrm_quality_safety.py` above, and it is the natural fit for **agentic pipelines** where different modules (planner, tool-caller, final-answer judge, ...) want different judges.
+
+See the [**Multi-Instance GenRM** section](../../docs/en/examples/generative-reward-model.md#multi-instance-genrm-multiple-judge-models-behind-one-service) of the full GenRM guide (or its [Chinese version](../../docs/zh/examples/generative-reward-model.md#多实例-genrm一个服务托管多个评判模型)) for the complete `--genrm-instances` reference, the `route_key` request/response format, and an agentic multi-module example. Quick summary:
+
+- Configure `--genrm-instances '{"<route_key>": {"model_path": ..., "num_gpus": ...}, ...}'` instead of `--genrm-model-path` — each entry is a fully independent judge with its own GPU budget (`num_gpus` is required per instance; there is no automatic even split).
+- From a reward function, call `await genrm_client.generate(messages, route_key="<route_key>")` to pick which instance answers the call. Omitting `route_key` (or using the legacy `--genrm-model-path` single-model config) falls back to the sole `"__default__"` instance.
+- `--resource`'s `"genrm"` entry must equal the **sum** of every instance's `num_gpus` (Split/Shared bundle math is otherwise unchanged from the single-model case).
 
 ### Resource Layout
 
@@ -126,14 +139,15 @@ bash examples/generate_reward_model/run-qwen3-4B-8xgpu-async.sh
 
 ## Key Parameters
 
-| Parameter                     | Default                      | Description                            |
-| :---------------------------- | :--------------------------- | :------------------------------------- |
-| `--rm-type dapo-genrm`        | —                            | Use DAPO-GenRM reward function         |
-| `--genrm-model-path`          | —                            | Path to the GenRM judge model          |
-| `--genrm-num-gpus-per-engine` | 1 or 4                       | GPUs allocated per GenRM SGLang engine |
-| `--genrm-engine-config`       | `{"max_context_len": 10240}` | SGLang engine configuration            |
-| `--genrm-sampling-config`     | `{"temperature": 0.1, ...}`  | Sampling params for the judge          |
-| `--max-staleness`             | 0 (coloc) / 2 (async)        | Max data staleness for async training  |
+| Parameter                     | Default                      | Description                                                                                                                                                                                                  |
+| :---------------------------- | :--------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--rm-type dapo-genrm`        | —                            | Use DAPO-GenRM reward function                                                                                                                                                                               |
+| `--genrm-model-path`          | —                            | Path to the GenRM judge model (single-instance config)                                                                                                                                                       |
+| `--genrm-instances`           | —                            | JSON dict deploying multiple named judge models, routed by `route_key`; takes priority over `--genrm-model-path`. See [Multi-Instance GenRM](#multi-instance-genrm-multiple-judge-models-behind-one-service) |
+| `--genrm-num-gpus-per-engine` | 1 or 4                       | GPUs allocated per GenRM SGLang engine                                                                                                                                                                       |
+| `--genrm-engine-config`       | `{"max_context_len": 10240}` | SGLang engine configuration                                                                                                                                                                                  |
+| `--genrm-sampling-config`     | `{"temperature": 0.1, ...}`  | Sampling params for the judge                                                                                                                                                                                |
+| `--max-staleness`             | 0 (coloc) / 2 (async)        | Max data staleness for async training                                                                                                                                                                        |
 
 ## File Structure
 
@@ -144,6 +158,8 @@ examples/generate_reward_model/
 ├── run-qwen3-4B-8xgpu-async.sh                            # 4B fully async mode
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B GenRM, split-bundle (inline reward)
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B GenRM, shared-bundle two-phase swap
+├── run-qwen3-4B-8xgpu-dual-genrm-split.sh                 # 4B policy + two GenRM instances (--genrm-instances), split-bundle
+├── reward_dual_genrm_quality_safety.py                    # Custom reward routing to two GenRM instances via route_key
 └── post_process_genrm_swap.py                             # Custom post-process function used by the defer script
 ```
 

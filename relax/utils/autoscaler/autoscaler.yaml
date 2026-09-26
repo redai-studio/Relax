@@ -18,6 +18,12 @@ metrics_interval_secs: 10.0
 evaluation_interval_secs: 30.0
 condition_window_secs: 60.0
 
+# Metrics coverage guards (fraction of active engines that must report metrics)
+# Scale-out is looser (a few busy engines justify adding capacity); scale-in
+# requires full coverage so we never drop an engine whose metrics we could not read.
+min_coverage_scale_out: 0.5
+min_coverage_scale_in: 1.0
+
 # Service endpoint (will be overridden by rollout_service_url from args)
 rollout_service_url: "http://localhost:8000/rollout"
 

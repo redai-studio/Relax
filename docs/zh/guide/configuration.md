@@ -208,7 +208,7 @@
 | `--use-dynamic-batch-size` | flag | False | 启用动态批处理。根据样本长度动态打包，使每个 micro-batch 的总 Token 数接近 `--max-tokens-per-gpu` 限制 |
 | `--max-tokens-per-gpu` | int | None | 每个 GPU 的最大 Token 数。启用动态批处理时必须设置。使用 CP 时应设为约 `max_response_len / cp_size` |
 | `--log-probs-max-tokens-per-gpu` | int | None | 计算 log probs 时每个 GPU 的最大 Token 数。None 时等于 `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | 使用 `karmarkar_karp` 算法在数据并行 rank 间平衡 Token 数量。仅在 colocate 模式下可用，不支持 `--fully-async`。注意同一 Prompt 的不同响应可能被分到不同训练步 |
+| `--balance-data` | flag | False | 在静态/序列长度均衡路径上使用 `karmarkar_karp` 在数据并行 rank 间平衡 Token 数量。全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡；该 flag 可传入但不会额外改变行为。注意同一 Prompt 的不同响应可能被分到不同训练步 |
 
 ---
 
@@ -255,6 +255,33 @@
 | `--overlap-param-gather` | flag | - | reduce-scatter 与下一步 param all-gather 重叠，强制配合 `--overlap-grad-reduce`（Megatron 原生参数） |
 | `--calculate-per-token-loss` | flag | False | 按 Token 计算损失（Megatron 原生参数） |
 
+### FP16 优化器兼容默认值
+
+| 参数 | FP16 兼容 fallback | 非 FP16 的 Megatron 原生默认值 | 说明 |
+|------|--------------------|--------------------------------|------|
+| `--initial-loss-scale` | `32768` | `2**32` | 动态 loss scaling 的初始 scale |
+| `--min-loss-scale` | `1` | `1` | 动态 loss scaling 的最小 scale |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | 开启 | 关闭 | 开启或关闭 TransformerEngine 精度感知优化器 |
+| `--store-param-remainders` / `--no-store-param-remainders` | 关闭 | 开启 | 控制分布式优化器是否保存参数余数 |
+
+使用动态 FP16 loss scaling（未设置 `--loss-scale`）时，Relax 会为缺省选项保留历史兼容值，并用一条
+warning 列出实际采用的 fallback。设置静态 `--loss-scale` 后，`--initial-loss-scale` 和
+`--min-loss-scale` 不再生效，因此 Relax 不会为它们补默认值、执行校验或发出 warning；两个布尔优化器选项
+缺省时仍使用 FP16 兼容值。显式传入当前生效的选项即可消除 warning。动态模式下，两个 scale 必须为大于零
+的有限值，且 `--min-loss-scale` 不能大于 `--initial-loss-scale`。非 FP16 默认值直接取自 Megatron 的
+`OptimizerConfig`。
+
+Qwen3-4B FP16 脚本会显式配置全部四项。传给脚本的额外参数会追加到训练命令末尾，因此可以覆盖脚本值而
+无需修改文件：
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
+
 ### 优化器 Flag 兼容性
 
 | 场景 | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |
@@ -272,7 +299,7 @@
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | 优势估计器。注意：OPD 现在独立于优势估计器，使用 `--opd-kl-coef > 0` 在任何估计器上启用 OPD |
+| `--advantage-estimator` | str | grpo | 由 `relax/algorithms/spec.py` 的 `ALGORITHM_SPECS` 生成，当前为 `grpo`、`gspo`、`sapo`、`cispo`、`rloo`、`ppo`、`reinforce_plus_plus`、`reinforce_plus_plus_baseline` | 优势估计器。以 `--help` 为准：取值直接读注册表，新增算法无需改这张表即可出现。OPD 独立于该选项，使用 `--use-opd` 及对应 KL/loss 系数启用 |
 | `--normalize-advantages` | flag | False | - | 是否归一化优势 |
 | `--disable-grpo-std-normalization` | flag | - | - | 禁用 GRPO 标准差归一化（来自 [Dr.GRPO](https://arxiv.org/pdf/2503.20783)） |
 | `--disable-rewards-normalization` | flag | - | - | 禁用 reward 归一化 |
@@ -290,13 +317,24 @@
 | `--value-clip` | float | 0.2 | - | 值函数裁剪范围 |
 | `--entropy-coef` | float | 0.0 | - | 熵损失系数 |
 
+### PPO 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--gamma` | float | 1.0 | PPO GAE 折扣因子 |
+| `--lambd` | float | 1.0 | PPO GAE lambda |
+| `--value-clip` | float | 0.2 | PPO Critic value loss 裁剪范围 |
+| `--use-rollout-logprobs` | flag | False | 使用 Rollout logprobs 作为 PPO 旧策略 logprobs；当前提供的 colocate 拓扑必须启用 |
+
+PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `critic` 与 `advantages`。资源拓扑、checkpoint 一致性和 KL 约束详见 [PPO 训练](./ppo-training.md)。
+
 ### KL 散度相关
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--kl-coef` | float | 0.0 | KL 惩罚系数，用于 reward shaping（在优势计算之前应用到 reward 信号）。不能与 `--kl-loss-coef` 同时非零 |
-| `--use-kl-loss` | flag | False | 是否使用 GRPO 中的 KL 损失 |
-| `--kl-loss-coef` | float | 0.0 | KL 惩罚系数，添加到最终 PPO 损失中。不能与 `--kl-coef` 同时非零 |
+| `--kl-coef` | float | 0.0 | KL 惩罚系数，用于 reward shaping。同步 PPO 会将非零值重置为 `0.0`。不能与 `--kl-loss-coef` 同时非零 |
+| `--use-kl-loss` | flag | False | 为 GRPO-like 算法启用 loss-level KL；同步 PPO 会自动禁用该选项 |
+| `--kl-loss-coef` | float | 0.0 | KL 惩罚系数，添加到最终策略损失中。不能与 `--kl-coef` 同时非零 |
 | `--kl-loss-type` | str | k1 | `k1`, `k2`, `k3`, `low_var_kl` | KL 损失类型 |
 | `--use-unbiased-kl` | flag | False | 启用无偏 KL 估计 |
 | `--ref-update-interval` | int | None | 参考模型更新间隔（Rollout 步数）。None 表示不更新参考模型 |
@@ -314,6 +352,8 @@
 |------|------|--------|------|
 | `--num-critic-only-steps` | int | 0 | 仅训练 Critic 的步数 |
 | `--critic-train-only` | flag | False | 仅训练 Critic 模型 |
+| `--critic-load` | str | None | Critic 加载的 checkpoint。None 时等于 `--load` |
+| `--critic-save` | str | None | Critic checkpoint 输出目录 |
 | `--critic-lr` | float | None | Critic 学习率。None 时等于 `--lr` |
 | `--critic-lr-warmup-iters` | int | 0 | Critic 模型线性预热的迭代数 |
 
@@ -364,7 +404,7 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 末尾 5%）；值 ≥1 视为绝对样本数。被预留的尾部会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
+| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
 | `--sft-predict-interval` | int | None | 每 N 个 rollout step 在 eval 集上跑一次生成式 predict，把生成结果写到 `<save>/predict/predictions_step_<rollout_id>.jsonl`。设置该参数后会自动拉起 Rollout 角色（SGLang 必须在线）。它是 always-on 的 PPL eval（`--eval-interval`）的生成式补充。**必需**：`--save`（写到 `<save>/predict/` 下）以及至少一个 eval 数据源（`--eval-prompt-data` / `--eval-config` / `--eval-size`）。 |
 
 ### 流式数据集预取
@@ -376,6 +416,39 @@ SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetc
 | `--sft-prefetch-buffer-size` | int | 256 | SFT 流式数据集 PrefetchBuffer 缓存的最大预加载样本数。设为 0 禁用预取，producer 会回退到基于 ProcessorPool 的 `asyncio.gather` 路径做 batch 级并行。 |
 | `--sft-prefetch-chunk-size` | int | 32 | 每轮派发给 SFT 预取线程池的 chunk 大小。 |
 | `--sft-prefetch-num-workers` | int | 4 | SFT PrefetchBuffer 内部用于 I/O 密集型媒体解码（视频/图像）的工作线程数。 |
+
+### TransferQueue 分片 Producer
+
+`RELAX_SFT_TQ_SHARDS` 控制每个 async-prepacked SFT 训练 step 生成多少个 TransferQueue 分区。这是一个实验性环境变量，便于在不增加公开 CLI 参数的情况下对 shard 数做 A/B 测试。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `RELAX_SFT_TQ_SHARDS` | int | 1 | SFT TransferQueue shard 数。小于等于 0 的值按 1 处理。 |
+
+::: warning 生效条件
+这个变量本身不会开启 prepack。它仅在使用 `--loss-type sft --sft-async-prepack` 时生效，否则 Relax 只使用一个分区。Async prepack 还要求开启 `--per-rank-fetch`、至少允许两个 in-flight step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP=1，并使用 THD QKV 格式。
+:::
+
+当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；原有的 `sft_K` 名称只会在 `N == 1` 时使用。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
+
+满足条件时，Relax 会为 train batch 启动 `N` 个远端 `_SFTBatchProducerActor`。配置的 `--sft-prefetch-num-workers` 会按每个 shard `ceil(workers / N)` 分配，且每个 shard 至少有一个 worker。Eval 仍由 coordinator 本地协调：`--eval-size` 会在每个远端 producer 内使用同一份确定性的 train/eval split，coordinator 负责渲染 holdout 样本（或 `--eval-prompt-data`）并在 eval interval 推送 `sft_eval_<step>_n<N>_<i>` 分区。
+
+遇到以下任一情况时，remote train producer 会 fallback 到本地 coordinator 路径：
+
+- Ray 未初始化。
+- 使用 `--task-type seq_cls`。
+- 设置了 `--custom-dataset-class` / `--custom-dataset-class-path`。
+- `--sft-oversize-strategy` 为 `skip` 或 `custom`，或者 `--sft-invalid-multimodal-strategy` 为 `skip`。
+
+本地 fallback 仍会把 batch 拆成 `N` 个 TransferQueue 分区，但不会创建 `N` 个远端 producer actor。日志出现 `SFT remote shard producer enabled: ... shards=N ...` 才表示 remote producer 并行已生效；fallback 路径会记录 `SFT remote shard producer disabled: ...` 及具体原因。
+
+请在 Ray 运行时环境中配置这个值，确保 producer 和 consumer 推导出相同的分区名：
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
 
 ### 超长样本处理
 
@@ -420,7 +493,11 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--rm-type` | str | None | 内置 Reward 模型类型 |
-| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。函数签名：`def custom_rm(args, sample) -> float` |
+| `--rm-type-fallback` | str | None | 未知/缺失 Reward 类型的回退策略：`zero` 记 0 分并告警，注册名则路由到该 Reward；None 保持报错行为 |
+| `--rm-type-infer` | flag | False | 无显式类型时按注册的 label matcher 推断 Reward 类型；与显式类型冲突时告警并以显式类型优先 |
+| `--custom-rm-path` | str | None | 自定义 Reward 函数路径。单样本函数接收一个样本；batch/group 函数接收完整样本列表，并为每个样本返回一个结果。会绕过格式感知路由 |
+| `--reward-max-concurrency` | int | 64 | 每个调用方进程内同时执行的 Reward 调用数上限。一次自定义 batch/group 调用计为一个调用 |
+| `--reward-num-workers` | int | 16 | 用于执行同步 Reward 的 Ray Actor 数量。异步自定义 Reward 不使用这些 worker |
 | `--reward-key` | str | None | Reward 函数返回 dict 时提取 reward 值的 key |
 | `--eval-reward-key` | str | None | 评估时的 reward key。None 时等于 `--reward-key` |
 | `--group-rm` | flag | False | 是否对整个 group 做 Reward 计算 |
@@ -475,7 +552,7 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 |------|------|--------|------|
 | `--autoscaler-config` | str | None | Autoscaler YAML 配置文件路径。设置后启用自动扩缩容，未设置则禁用。示例：`--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml)。
+Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-studio/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml)。
 
 ### Scale-Out 操作参数
 
@@ -483,6 +560,21 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 |------|------|--------|--------|------|
 | `--scale-out-timeout` | float | 300.0 | - | 所有扩容操作（引擎启动、连接、健康检查、权重同步等）的超时时间（秒） |
 | `--scale-out-partial-success-policy` | str | rollback_all | `rollback_all`, `keep_partial` | 扩容部分成功时的策略。`rollback_all` 回滚所有引擎；`keep_partial` 保留成功的引擎 |
+| `--scale-weight-sync-precheck` | bool | True | - | 扩容权重同步前跑独立 NCCL 预检查，不兼容 transport 直接 fail-closed。默认开；用 `--no-scale-weight-sync-precheck` 关闭（关闭即放弃 fail-closed 保护）。详见 [弹性 Rollout · 权重同步预检查](./elastic-rollout.md#权重同步预检查precheck) |
+
+### Precheck 环境变量
+
+下列环境变量用于调参与排障，均可不设（走默认）。运行时由 `relax/utils/env.py` 读取。
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` | int | 536870912（512 MiB） | Stage 2 探针允许的最低空闲显存字节；低于该值返回 `INSUFFICIENT_GPU_MEMORY` 并 fail-closed。SGLang 预留 85–90% 显存，调低需谨慎（探针可能 OOM） |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE` | int | 18000 | Stage 2 探针子进程 rendezvous 端口段下限 |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX` | int | 20000 | Stage 2 探针子进程 rendezvous 端口段上限。**集群网络策略需放行 `[PORT_BASE, PORT_MAX]` 这段**，否则探针建连失败 → `PROBE_FAILED` |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS` | int | 2 | Stage 2 探针最大尝试次数 |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEMS` | int | 3 | 扩容失败原因在 TUI / 稳定日志里展示的最大条数 |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN` | int | 120 | 单条失败原因截断长度 |
+| `RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN` | int | 512 | 失败原因总截断长度（防止原始错误信息过长） |
 
 ### Scale-In 操作参数
 
@@ -522,7 +614,6 @@ Autoscaler YAML 配置详情请参见 [`relax/utils/autoscaler/autoscaler.yaml`]
 |------|------|--------|------|
 | `--log-passrate` | flag | False | 启用 pass@n 通过率日志 |
 | `--log-multi-turn` | flag | False | 启用多轮 Rollout 信息日志 |
-| `--log-correct-samples` | flag | False | 记录正确样本 |
 | `--log-reward-category` | str | None | 记录 reward 分类统计。指定 reward dict 中的 key |
 
 ### 通知

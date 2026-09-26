@@ -4,18 +4,19 @@ import asyncio
 import ipaddress
 import json
 import multiprocessing
-import os
 import random
 import socket
+from collections.abc import Iterable
+from urllib.parse import urlsplit
 
 import httpx
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
 
-SLIME_HOST_IP_ENV = "SLIME_HOST_IP"
 MAX_RETRIES = 6
 
 
@@ -47,7 +48,7 @@ def is_port_available(port):
 def get_host_info():
     hostname = socket.gethostname()
 
-    # if env_overwrite_local_ip := os.getenv(SLIME_HOST_IP_ENV, None):
+    # if env_overwrite_local_ip := Envs.SLIME_HOST_IP:
     #     return hostname, env_overwrite_local_ip
 
     def _is_loopback(ip):
@@ -88,7 +89,7 @@ def get_host_info():
 
         return None
 
-    prefer_ipv6 = os.getenv("SLIME_PREFER_IPV6", "0").lower() in ("1", "true", "yes", "on")
+    prefer_ipv6 = Envs.SLIME_PREFER_IPV6
     local_ip = None
     final_fallback = "127.0.0.1"
 
@@ -117,6 +118,35 @@ def _wrap_ipv6(host):
         return f"[{host.strip('[]')}]"
     except ipaddress.AddressValueError:
         return host
+
+
+def router_worker_base_url(url: str) -> str:
+    """Convert a router worker identity URL to its reachable base URL."""
+    base_url, separator, dp_rank = url.rpartition("@")
+    if not (separator and dp_rank.isascii() and dp_rank.isdigit()):
+        return url
+
+    try:
+        parsed_base_url = urlsplit(base_url)
+        has_explicit_port = parsed_base_url.port is not None
+    except ValueError:
+        return url
+
+    if (
+        parsed_base_url.scheme in {"http", "https"}
+        and parsed_base_url.hostname
+        and has_explicit_port
+        and parsed_base_url.path in {"", "/"}
+        and not parsed_base_url.query
+        and not parsed_base_url.fragment
+    ):
+        return base_url
+    return url
+
+
+def router_worker_base_urls(urls: Iterable[str]) -> list[str]:
+    """Convert worker identity URLs to stable, deduplicated base URLs."""
+    return list(dict.fromkeys(router_worker_base_url(url) for url in urls))
 
 
 def run_router(args):
@@ -305,9 +335,44 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
     return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
-async def get(url):
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    content = await response.aread()
-    output = json.loads(content)
+async def get(url, max_retries=MAX_RETRIES):
+    # Mirror `_post`'s retry policy: a bare GET without retries lets a transient
+    # connection drop (e.g. httpx.RemoteProtocolError "Server disconnected") on a
+    # control call such as the router's /list_workers propagate immediately. In the
+    # rollout abort path that raise fails the whole rollout step and deadlocks the
+    # colocate loop, so GET must be as resilient as POST.
+    retry_count = 0
+    while retry_count < max_retries:
+        response = None
+        try:
+            response = await _http_client.get(url)
+            response.raise_for_status()
+            content = await response.aread()
+            try:
+                output = json.loads(content)
+            except json.JSONDecodeError:
+                output = content.decode() if isinstance(content, bytes) else content
+        except Exception as e:
+            retry_count += 1
+
+            if isinstance(e, httpx.HTTPStatusError):
+                status_code = e.response.status_code
+                is_retryable_http_error = status_code >= 500 or status_code in {408, 409, 425, 429}
+                if not is_retryable_http_error:
+                    logger.info(
+                        f"Error: {e}, not retrying non-retryable HTTP status (url={url}, status_code={status_code})"
+                    )
+                    raise
+
+            logger.info(f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url})")
+            if retry_count >= max_retries:
+                logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+                raise e
+            await asyncio.sleep(1)
+            continue
+        finally:
+            if response is not None:
+                await response.aclose()
+        break
+
     return output

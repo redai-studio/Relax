@@ -49,7 +49,14 @@ class GenRMClient:
 
         self.service_url = service_url.rstrip("/")
         self.timeout = timeout
-        self._async_client = httpx.AsyncClient(timeout=timeout)
+        # Raise pool limits above httpx's default 100 — a reward step can fire
+        # thousands of concurrent judge calls and a small pool serializes them;
+        # keepalive_expiry >> the default 5s so reused connections aren't reaped
+        # mid-burst.
+        self._async_client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=2048, max_keepalive_connections=2048, keepalive_expiry=600),
+        )
         # Keep a sync client for health checks during init and non-async contexts
         self._sync_client = httpx.Client(timeout=timeout)
 
@@ -59,6 +66,7 @@ class GenRMClient:
         self,
         messages: List[dict],
         sampling_params: Optional[Dict] = None,
+        route_key: Optional[str] = None,
     ) -> str:
         """Async generate response for given chat messages.
 
@@ -72,6 +80,10 @@ class GenRMClient:
             sampling_params: Optional sampling parameters to override defaults.
                 Supported keys: temperature, top_p, top_k, max_new_tokens.
                 Example: {"temperature": 0.3, "top_p": 0.9}
+            route_key: Selects which genRM instance to use, when the service
+                hosts more than one (see --genrm-instances). Typically the
+                name of the reward/scoring task making the call. Omit to use
+                the service's sole instance.
 
         Returns:
             Raw response string from the GenRM model
@@ -82,6 +94,8 @@ class GenRMClient:
         }
         if sampling_params is not None:
             payload["sampling_params"] = sampling_params
+        if route_key is not None:
+            payload["route_key"] = route_key
 
         backoff = _GENRM_INITIAL_BACKOFF_SEC
         for attempt in range(1, _GENRM_MAX_ATTEMPTS + 1):

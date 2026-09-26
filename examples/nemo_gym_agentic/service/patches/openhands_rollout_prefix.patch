@@ -1,0 +1,65 @@
+diff --git a/openhands/agenthub/nemo_gym_client.py b/openhands/agenthub/nemo_gym_client.py
+index 835e41d91..6f5471518 100644
+--- a/openhands/agenthub/nemo_gym_client.py
++++ b/openhands/agenthub/nemo_gym_client.py
+@@ -12,6 +12,9 @@ import time
+ from datetime import datetime, timezone
+ from typing import TYPE_CHECKING
+ 
++from aiohttp import ClientResponseError
++from litellm.exceptions import ContextWindowExceededError
++
+ from openhands.core.logger import openhands_logger as logger
+ from nemo_gym.global_config import get_global_config_dict
+ from nemo_gym.server_utils import ServerClient
+@@ -24,6 +27,22 @@ if TYPE_CHECKING:
+     from openhands.llm.llm import LLM, ModelResponse
+ 
+ 
++def _context_length_error(exc: ClientResponseError) -> dict | None:
++    if exc.status != 400:
++        return None
++    response_content = getattr(exc, "response_content", None)
++    try:
++        payload = json.loads(response_content)
++    except (TypeError, ValueError, UnicodeDecodeError):
++        return None
++    if not isinstance(payload, dict):
++        return None
++    error = payload.get("error")
++    if isinstance(error, dict) and error.get("code") == "context_length_exceeded":
++        return error
++    return None
++
++
+ class NemoGymClient:
+     """Client that proxies LLM completions through the NeMo Gym server.
+ 
+@@ -102,13 +121,25 @@ class NemoGymClient:
+         # via `get_metrics(state)`), mirroring the litellm path in
+         # `openhands/llm/llm.py::_completion`.
+         latency_start = time.perf_counter()
++        rollout_path_prefix = os.getenv("NEMO_GYM_ROLLOUT_PATH_PREFIX", "").rstrip("/")
++        completion_path = f"{rollout_path_prefix}/v1/chat/completions"
+         model_response = await self.ng_server_client.post(
+             server_name=os.getenv("NEMO_GYM_MODEL_SERVER_NAME"),
+-            url_path="/v1/chat/completions",
++            url_path=completion_path,
+             json=params,
+             cookies=self.model_server_cookies,
+         )
+-        await raise_for_status(model_response)
++        try:
++            await raise_for_status(model_response)
++        except ClientResponseError as exc:
++            context_error = _context_length_error(exc)
++            if context_error is None:
++                raise
++            raise ContextWindowExceededError(
++                message=str(context_error.get("message") or exc),
++                model=self.llm.config.model,
++                llm_provider="nemo_gym",
++            ) from exc
+         model_response_json = await get_response_json(model_response)
+         latency = time.perf_counter() - latency_start
+         completion_timestamp = datetime.now(timezone.utc).isoformat()

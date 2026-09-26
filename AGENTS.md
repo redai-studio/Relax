@@ -8,20 +8,36 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 
 ```
 relax/                   核心框架
+├── agentic/             Agentic 层 — Session、pipeline、agent process 与训练导出
 ├── core/                编排层 — 训练循环、服务基类、全局注册表
 ├── components/          组件层 — RL 服务组件（Ray Serve Deployment）
 ├── engine/              引擎层 — Rollout 数据生成、奖励计算、请求路由
 ├── backends/            后端层 — Megatron 训练后端、SGLang 推理引擎
 ├── distributed/         分布式层 — Ray 集群管理、分布式 Checkpoint
 ├── entrypoints/         入口层 — 训练入口脚本
+├── models/              模型层 — 模型专属实现与注册
 └── utils/               基础设施 — 工具函数、指标监控、多模态处理
-tests/                   测试（镜像 relax/ 层级）
+tests/                   模块测试与集成回归测试
 ├── backends/megatron/   Megatron 后端测试（权重转换等）
+├── backends/sglang/     SGLang 后端测试
+├── components/          RL 服务组件测试
+├── core/                Controller、Service 与注册表测试
+├── data/                数据处理与 SFT 数据测试
+├── distributed/checkpoint_service/  分布式 Checkpoint 测试
 ├── distributed/ray/     分布式 / Ray 测试（弹性伸缩等）
 ├── engine/rewards/      奖励函数测试
 ├── engine/rollout/      Rollout 引擎测试（预取、数据源等）
-└── utils/               工具函数测试（HTTP、指标、流式数据集等）
-transfer_queue/          分布式数据传输队列
+├── engine/sft/          SFT 引擎测试
+├── entrypoints/         入口行为测试
+├── examples/            示例级回归测试
+├── integration/         跨模块集成测试
+├── models/              模型专属测试
+├── tools/               工具与辅助脚本测试
+├── utils/               工具函数测试（HTTP、指标、流式数据集等）
+└── test_agentic_rollout.py  Agentic runtime 与 Session 测试
+docs/                   中英文用户文档
+skills/                 仓库开发与运维工作流
+docker/                 训练镜像与依赖 patch
 examples/                用户级示例（deepeyes、OPD 等）
 scripts/                 训练启动脚本 & 模型配置
 configs/env.yaml         运行时环境配置
@@ -110,6 +126,7 @@ Fire the appropriate **expert subagent** or **load a skill** based on what you'r
 | Task Launch & service deployment             | `launcher-expert`  |                   |
 | Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                   |
 | Development & code changes                   | `ray-expert`       | `dev`             |
+| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout` |
 | Distributed training hang debugging          | `ray-expert`       | `debug-hang`      |
 | Code review of git changes                   | --                 | `code-review`     |
 | Creating new skills                          | --                 | `creating-skills` |

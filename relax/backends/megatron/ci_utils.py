@@ -1,13 +1,56 @@
 """CI utilities for Megatron backend testing."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
+import torch
 from megatron.core.distributed import DistributedDataParallel as DDP
 
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class CriticValueHeadUpdateSnapshot:
+    params: list[tuple[str, torch.nn.Parameter, torch.Tensor]]
+    has_nonzero_grad: bool
+
+
+def capture_critic_value_head_update(model: Sequence[DDP]) -> CriticValueHeadUpdateSnapshot:
+    snapshots = []
+    has_nonzero_grad = False
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            if not name.endswith(("output_layer.weight", "output_layer.bias")):
+                continue
+            if param.ndim == 0 or param.shape[0] != 1:
+                continue
+
+            grad = getattr(param, "main_grad", None)
+            if grad is None:
+                grad = param.grad
+            assert grad is not None, f"critic value head parameter {name} has no gradient"
+            assert bool(torch.isfinite(grad).all()), f"critic value head parameter {name} has non-finite gradient"
+            has_nonzero_grad = has_nonzero_grad or bool(torch.count_nonzero(grad))
+            snapshots.append((name, param, param.detach().clone()))
+    return CriticValueHeadUpdateSnapshot(params=snapshots, has_nonzero_grad=has_nonzero_grad)
+
+
+def assert_critic_value_head_updated(
+    snapshot: CriticValueHeadUpdateSnapshot,
+    *,
+    update_successful: bool,
+    learning_rates: Sequence[float],
+) -> None:
+    if not snapshot.params or not update_successful or not snapshot.has_nonzero_grad:
+        return
+    if not any(learning_rate > 0 for learning_rate in learning_rates):
+        return
+    assert any(not torch.equal(param.detach(), before) for _name, param, before in snapshot.params), (
+        "critic value head did not change after a successful optimizer step with non-zero gradient"
+    )
 
 
 def check_mtp_only_grad(model: Sequence[DDP], step_id: int, require_non_mtp_zero: bool = True) -> None:

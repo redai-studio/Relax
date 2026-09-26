@@ -1,9 +1,18 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from megatron.core import mpu
+
+
+try:
+    from megatron.core import mpu
+except ModuleNotFoundError as exc:
+    if exc.name not in {"megatron", "megatron.core"}:
+        raise
+    mpu = None
 
 
 def maybe_padded_total_lengths(
@@ -80,6 +89,41 @@ def get_logits_and_tokens_offset_with_cp(
     return chunk_size, (chunk_0, chunk_1), (logits_0, logits_1), (token_0, token_1)
 
 
+def _slice_loss_mask_with_cp(
+    loss_mask: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    qkv_format: str,
+    max_seq_len: int | None,
+    padded_total_length: int | None,
+    dynamic_cp_size: int | None,
+    dynamic_cp_rank: int | None,
+) -> torch.Tensor:
+    """Slice a response mask in the coordinate system used by CP log-probs.
+
+    RL masks are target-token aligned, while SFT masks have already been
+    shifted to predictor coordinates by ``align_loss_mask_for_sft``. CP log-
+    probs are ordered by target token in both the zigzag and allgather-
+    redistributed paths, so SFT must slice its mask with the matching
+    predictor/logit offsets.
+    """
+    prompt_length = total_length - response_length
+    _, _, logits_offsets, token_offsets = get_logits_and_tokens_offset_with_cp(
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+        padded_total_length,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
+    )
+    if response_length == total_length:
+        mask_offsets = logits_offsets
+    else:
+        mask_offsets = tuple((start - prompt_length, end - prompt_length) for start, end in token_offsets)
+    return torch.cat([loss_mask[start:end] for start, end in mask_offsets], dim=0)
+
+
 def get_sum_of_sample_mean(
     total_lengths: list[int],
     response_lengths: list[int],
@@ -90,16 +134,24 @@ def get_sum_of_sample_mean(
     padded_total_lengths: list[int] | None = None,
     dynamic_cp_size: int | None = None,
     dynamic_cp_rank: int | None = None,
+    sample_denoms: list[int] | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """Calculate correct sample mean for CP."""
+    if not calculate_per_token_loss:
+        if sample_denoms is None:
+            sample_denoms = torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+        else:
+            sample_denoms = torch.as_tensor(sample_denoms, device=loss_masks[0].device)
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
-                    for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
+                    (x_i * loss_mask_i).sum() / torch.clamp_min(denom, 1)
+                    for x_i, loss_mask_i, denom in zip(
+                        x.split(response_lengths, dim=0), loss_masks, sample_denoms, strict=False
+                    )
                 ]
             )
 
@@ -120,27 +172,25 @@ def get_sum_of_sample_mean(
         ):
             max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
             padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-            prompt_length = total_length - response_length
-            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
+            chunked_loss_mask = _slice_loss_mask_with_cp(
+                loss_mask,
                 total_length,
                 response_length,
                 qkv_format,
                 max_seq_len,
                 padded_total_length,
-                dynamic_cp_size=dynamic_cp_size,
-                dynamic_cp_rank=dynamic_cp_rank,
+                dynamic_cp_size,
+                dynamic_cp_rank,
             )
-            loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-            loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-            chunked_loss_masks.append(torch.cat([loss_mask_0, loss_mask_1], dim=0))
+            chunked_loss_masks.append(chunked_loss_mask)
             cp_chunk_lengths.append(chunked_loss_masks[i].size(0))
 
         def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
             return sum(
                 [
-                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-                    for x_i, chunked_loss_mask, loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, loss_masks, strict=False
+                    (x_i * chunked_loss_mask).sum() / torch.clamp_min(denom, 1)
+                    for x_i, chunked_loss_mask, denom in zip(
+                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, sample_denoms, strict=False
                     )
                 ]
             )
@@ -156,6 +206,42 @@ def get_sum_of_sample_mean(
             )
 
     return sum_of_sample_mean if not calculate_per_token_loss else sum_of_token
+
+
+def get_cp_local_mask_sums(
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
+    padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
+) -> torch.Tensor:
+    """Return each row's loss-contributing token count on this CP rank."""
+    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
+    if cp_size == 1:
+        return torch.stack([loss_mask.sum() for loss_mask in loss_masks])
+
+    local_mask_sums: list[torch.Tensor] = []
+    for i, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=False)
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
+        chunked_loss_mask = _slice_loss_mask_with_cp(
+            loss_mask,
+            total_length,
+            response_length,
+            qkv_format,
+            max_seq_len,
+            padded_total_length,
+            dynamic_cp_size,
+            dynamic_cp_rank,
+        )
+        local_mask_sums.append(chunked_loss_mask.sum())
+
+    return torch.stack(local_mask_sums)
 
 
 def get_cp_local_num_tokens(
@@ -185,37 +271,20 @@ def get_cp_local_num_tokens(
     For ``cp_size == 1`` this reduces to the total number of unmasked tokens
     (preserving the historical per-sample ``clamp_min(., 1)``).
     """
+    local_mask_sums = get_cp_local_mask_sums(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        qkv_format,
+        max_seq_lens,
+        padded_total_lengths,
+        dynamic_cp_size,
+        dynamic_cp_rank,
+    )
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
-        return sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in loss_masks])
-
-    # cp_size > 1: mirror the chunk slicing done in get_sum_of_sample_mean so the
-    # counted tokens exactly match the ones sum_of_token contributes on this rank.
-    total: torch.Tensor | None = None
-    for i, (total_length, response_length, loss_mask) in enumerate(
-        zip(total_lengths, response_lengths, loss_masks, strict=False)
-    ):
-        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
-        padded_total_length = padded_total_lengths[i] if padded_total_lengths is not None else None
-        prompt_length = total_length - response_length
-        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(
-            total_length,
-            response_length,
-            qkv_format,
-            max_seq_len,
-            padded_total_length,
-            dynamic_cp_size=dynamic_cp_size,
-            dynamic_cp_rank=dynamic_cp_rank,
-        )
-        loss_mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length]
-        loss_mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length]
-        chunk_count = loss_mask_0.sum() + loss_mask_1.sum()
-        total = chunk_count if total is None else total + chunk_count
-
-    if total is None:
-        # No samples on this rank: mirror the empty-sum behaviour of cp_size == 1.
-        return sum([loss_mask.sum() for loss_mask in loss_masks])
-    return total
+        local_mask_sums = torch.clamp_min(local_mask_sums, 1)
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(
@@ -586,3 +655,122 @@ def dynamic_cp_merge_output(
             new_result[key] = values
         merged.append(new_result)
     return merged
+
+
+def gdn_reassemble_full(
+    gathered: list[torch.Tensor],
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+) -> torch.Tensor:
+    """Reassemble per-CP-rank zig-zag shards into the full sequential sequence.
+
+    ``gathered[r]`` is rank ``r``'s local activation ``[s_local, b, C]``. Each
+    sample is split across CP by :func:`slice_with_cp`: rank ``r`` holds chunk
+    ``r`` and chunk ``2*cp-1-r`` (each of size ``chunk_size``). This reassembles,
+    per sample, the sequential chunk order ``[0, 1, ..., 2*cp-1]``. Pure (no
+    collectives) so it is unit-testable. Returns ``[s_full, b, C]``.
+
+    Inverse of taking, per rank, :func:`gdn_cp_slice`.
+
+    ``cu_seqlens`` are the full (x cp) per-sample boundaries. Pass a **Python
+    ``list[int]``** on the hot path (precomputed once per micro-batch) to avoid a
+    per-layer ``.tolist()`` device sync; a device tensor is also accepted (host
+    sync) for standalone/unit-test use.
+    """
+    cu = cu_seqlens if isinstance(cu_seqlens, list) else cu_seqlens.tolist()
+    local_cu = [c // cp_size for c in cu]
+    pieces: list[torch.Tensor] = []
+    for i in range(len(local_cu) - 1):
+        lo, hi = local_cu[i], local_cu[i + 1]
+        cs = (hi - lo) // 2  # per-rank chunk_size (each rank holds 2 chunks)
+        first_halves = [gathered[r][lo : lo + cs] for r in range(cp_size)]  # chunks 0..cp-1
+        second_halves = [gathered[r][lo + cs : hi] for r in range(cp_size)][::-1]  # chunks cp..2cp-1
+        pieces.extend(first_halves + second_halves)
+    return torch.cat(pieces, dim=0)
+
+
+def gdn_cp_slice(
+    full: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Slice this CP rank's zig-zag shard out of the full sequential sequence.
+
+    Inverse of :func:`gdn_reassemble_full` for one rank: given the full
+    ``[s_full, b, X]`` (sequential order), return this rank's shard
+    ``[s_local, b, X]`` = per sample ``[chunk_r, chunk_{2cp-1-r}]``, matching
+    :func:`slice_with_cp`. Plain indexing + cat, so autograd scatters the grad
+    back into the correct full-sequence positions.
+
+    ``cu_seqlens`` are the full per-sample boundaries. Pass a **Python
+    ``list[int]``** on the hot path (precomputed once per micro-batch) to avoid a
+    per-layer ``.tolist()`` device sync; a device tensor is also accepted.
+    """
+    full_cu = cu_seqlens if isinstance(cu_seqlens, list) else cu_seqlens.tolist()
+    pieces: list[torch.Tensor] = []
+    for i in range(len(full_cu) - 1):
+        flo, fhi = full_cu[i], full_cu[i + 1]
+        cs = (fhi - flo) // (2 * cp_size)
+        c1 = full[flo + cp_rank * cs : flo + (cp_rank + 1) * cs]
+        c2 = full[flo + (2 * cp_size - cp_rank - 1) * cs : flo + (2 * cp_size - cp_rank) * cs]
+        pieces.append(c1)
+        pieces.append(c2)
+    return torch.cat(pieces, dim=0)
+
+
+class _AllGatherFullSequence(torch.autograd.Function):
+    """All-gather each CP rank's shard into the full sequence; backward reduce-
+    scatters (sums) the gradient.
+
+    The GDN all-gather path is **not** a fully-duplicated computation: after the
+    duplicated recurrent scan on the full sequence, each rank slices back *its
+    own* zig-zag shard (:func:`gdn_cp_slice`) for the output projection, so every
+    rank's downstream loss is different. Because the scan is causal/recurrent,
+    rank ``r``'s output positions depend on input positions owned by *other* CP
+    ranks, and — symmetrically — rank ``r``'s input positions receive gradient
+    from *other* ranks' output losses. The correct grad for a full-sequence
+    position is therefore the **sum** over all CP ranks of each rank's local
+    backward, scattered back to the owning rank: exactly ``reduce_scatter(sum)``.
+
+    (A plain ``grads[rank]`` backward — correct only when the post-gather compute
+    is duplicated *and* the loss is identical on every rank — would silently drop
+    these cross-rank contributions and corrupt training gradients.)
+    """
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        ctx.rank = dist.get_rank(group=group)
+        ctx.world_size = dist.get_world_size(group=group)
+        out = [torch.empty_like(x) for _ in range(ctx.world_size)]
+        dist.all_gather(out, x.contiguous(), group=group)
+        return tuple(out)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        # grads[m] = dL_local/d(gathered[m]); sum across ranks and keep this
+        # rank's slot: out = sum_k grads[this_rank](on rank k) = full input grad.
+        template = next((g for g in grads if g is not None), None)
+        grad_list = [torch.zeros_like(template) if g is None else g.contiguous() for g in grads]
+        out = torch.empty_like(grad_list[ctx.rank])
+        dist.reduce_scatter(out, grad_list, group=ctx.group)
+        return out, None
+
+
+def gdn_cp_gather_full(
+    qkvzba: torch.Tensor,
+    cu_seqlens: torch.Tensor | list[int],
+    cp_size: int,
+    cp_group: dist.ProcessGroup,
+) -> torch.Tensor:
+    """Gather the per-CP-rank zig-zag shards into the full sequential sequence.
+
+    All-gathers every rank's local activation (reduce-scatter backward autograd,
+    :class:`_AllGatherFullSequence`) then reassembles with
+    :func:`gdn_reassemble_full`. ``qkvzba`` is ``[s_local, b, C]``; returns
+    ``[s_full, b, C]``. Pass a precomputed host boundary list as ``cu_seqlens`` on
+    the hot path to avoid a per-layer device sync.
+    """
+    gathered = _AllGatherFullSequence.apply(qkvzba, cp_group)
+    return gdn_reassemble_full(gathered, cu_seqlens, cp_size)

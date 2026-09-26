@@ -97,6 +97,18 @@ class AutoscalerConfig:
         metrics_interval_secs: Interval between metrics collections.
         evaluation_interval_secs: Interval between scaling evaluations.
         condition_window_secs: Time window for condition history.
+        min_coverage_scale_out: Minimum metrics coverage (reporting/active) required
+            to allow scale-out. Lower (looser) than scale-in because a few engines
+            reporting high load are enough to justify adding capacity.
+        min_coverage_scale_in: Minimum metrics coverage required to allow scale-in.
+            Defaults to 1.0 (full coverage) because removing capacity based on a
+            partial sample can wrongly drop an engine that is actually overloaded.
+        scale_out_request_timeout_secs: Optional per-request scale-out timeout.
+            forwarded to the Rollout service as ``timeout_secs``. Defaults to None,
+            which makes the server inherit its own ``--scale-out-timeout`` (300s) so
+            default behavior is unchanged and large-model bring-up is not killed
+            prematurely. Ops may set a shorter value to bound how long a stuck pending
+            scale-out blocks subsequent decisions.
         rollout_service_url: URL of the Rollout service for scaling API calls.
         scale_out_policy: Policy configuration for scale-out decisions.
         scale_in_policy: Policy configuration for scale-in decisions.
@@ -110,6 +122,9 @@ class AutoscalerConfig:
     metrics_interval_secs: float = 10.0
     evaluation_interval_secs: float = 30.0
     condition_window_secs: float = 60.0
+    min_coverage_scale_out: float = 0.5
+    min_coverage_scale_in: float = 1.0
+    scale_out_request_timeout_secs: Optional[float] = None
     rollout_service_url: str = "http://localhost:8000/rollout"
     scale_out_policy: ScaleOutPolicy = field(default_factory=ScaleOutPolicy)
     scale_in_policy: ScaleInPolicy = field(default_factory=ScaleInPolicy)
@@ -144,6 +159,29 @@ class AutoscalerConfig:
 
         if self.scale_in_cooldown_secs < 0:
             raise ValueError(f"scale_in_cooldown_secs must be >= 0, got {self.scale_in_cooldown_secs}")
+
+        if not 0 < self.min_coverage_scale_out <= 1:
+            raise ValueError(f"min_coverage_scale_out must be in (0, 1], got {self.min_coverage_scale_out}")
+
+        if not 0 < self.min_coverage_scale_in <= 1:
+            raise ValueError(f"min_coverage_scale_in must be in (0, 1], got {self.min_coverage_scale_in}")
+
+        if self.scale_out_request_timeout_secs is not None and self.scale_out_request_timeout_secs <= 0:
+            raise ValueError(
+                f"scale_out_request_timeout_secs must be None or > 0, got {self.scale_out_request_timeout_secs}"
+            )
+
+        if self.scale_out_policy.condition_duration_secs < 0:
+            raise ValueError(
+                f"scale_out_policy.condition_duration_secs must be >= 0, "
+                f"got {self.scale_out_policy.condition_duration_secs}"
+            )
+
+        if self.scale_in_policy.condition_duration_secs < 0:
+            raise ValueError(
+                f"scale_in_policy.condition_duration_secs must be >= 0, "
+                f"got {self.scale_in_policy.condition_duration_secs}"
+            )
 
         if not 0 < self.scale_out_policy.token_usage_threshold <= 1:
             raise ValueError(
@@ -201,6 +239,9 @@ class AutoscalerConfig:
             metrics_interval_secs=data.get("metrics_interval_secs", 10.0),
             evaluation_interval_secs=data.get("evaluation_interval_secs", 30.0),
             condition_window_secs=data.get("condition_window_secs", 60.0),
+            min_coverage_scale_out=data.get("min_coverage_scale_out", 0.5),
+            min_coverage_scale_in=data.get("min_coverage_scale_in", 1.0),
+            scale_out_request_timeout_secs=data.get("scale_out_request_timeout_secs", None),
             rollout_service_url=rollout_service_url
             or data.get("rollout_service_url", "http://localhost:8000/rollout"),
             scale_out_policy=scale_out_policy,
@@ -242,6 +283,9 @@ class AutoscalerConfig:
             "metrics_interval_secs": self.metrics_interval_secs,
             "evaluation_interval_secs": self.evaluation_interval_secs,
             "condition_window_secs": self.condition_window_secs,
+            "min_coverage_scale_out": self.min_coverage_scale_out,
+            "min_coverage_scale_in": self.min_coverage_scale_in,
+            "scale_out_request_timeout_secs": self.scale_out_request_timeout_secs,
             "rollout_service_url": self.rollout_service_url,
             "scale_out_policy": {
                 "token_usage_threshold": self.scale_out_policy.token_usage_threshold,

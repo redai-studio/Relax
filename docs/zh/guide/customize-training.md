@@ -18,7 +18,7 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 ### Megatron 权重转 HF 权重
 
 ::: tip 使用 Megatron Bridge 无需手动转换
-Relax 默认使用 [Megatron Bridge](../../../relax/backends/megatron/mbridge/) 作为训练后端的权重桥接层，在训练过程中自动完成 HF ↔ Megatron 权重的双向转换，**无需任何手动转换步骤**。只需在启动脚本中指定以下选项即可：
+Relax 默认使用 [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) 作为训练后端的权重桥接层，在训练过程中自动完成 HF ↔ Megatron 权重的双向转换，**无需任何手动转换步骤**。只需在启动脚本中指定以下选项即可：
 :::
 
 ```bash
@@ -115,13 +115,48 @@ python scripts/tools/process_avqa.py \
 
 ## 自定义 Reward 方法
 
-您可以在自己的 `.py` 文件内定义 `reward_func(args, sample: Sample, **kwargs) -> float`，然后在任务启动脚本内加入调用即可，具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
+在自己的 `.py` 文件中定义单样本 Reward
+`reward_func(args, sample: Sample, **kwargs) -> int | float | dict`，或 batch/group Reward
+`reward_func(args, samples: list[Sample], **kwargs) -> list[int | float | dict]`，然后在启动脚本中配置其导入路径。
+具体使用可参考 [DeepEyes](../examples/deepeyes.md)。
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # 自定义 reward_func 允许返回 dict，但若如此您需要明确哪个 key 对应于实际的 reward 得分
 --reward-key score
 ```
+
+同步函数在进程隔离的 Ray `RewardWorker` Actor 中运行。使用 `async def` 声明的函数在调用方进程中直接
+`await`，不使用 worker 池。`--reward-num-workers` 设置同步 worker 数量，`--reward-max-concurrency`
+限制每个调用方进程内同时执行的 Reward 调用数。
+
+batch/group 自定义 Reward 每次接收完整的样本列表，一次调用只占用一个并发名额。自定义函数按需加载并缓存，
+直到显式触发 `custom_rm` reload。
+
+同步自定义 Reward 的输入和返回值必须可由 Ray 序列化。
+
+> **警告：外部 I/O 必须设置超时**
+>
+> 取消调用方或对应的 Ray task 只是 best-effort，**不能保证终止**已经在 `RewardWorker` 中执行的 Python
+> 函数。HTTP、RPC、数据库调用等可能阻塞的外部 I/O 操作必须显式设置 timeout。否则，该 worker 可能一直被占用，
+> 直到函数返回，后续分配到此 worker 的 Reward 调用也必须继续等待。
+
+### 格式感知的 Reward 路由
+
+内置 reward 统一注册在 `relax/engine/rewards/registry.py` 中，新增一个 reward 只需一行 `register_reward` 调用，无需修改任何分发分支：
+
+```python
+register_reward("my_reward", "my_pkg.my_module:my_reward_fn")  # def my_reward_fn(response, label) -> float
+```
+
+每个样本按以下优先级解析 reward 类型：样本 `metadata["rm_type"]` > `--rm-type` > label 推断（需开启）> fallback（需开启）。因此一个 batch 可以混合多种任务格式（如 math + multiple-choice），只需每条数据携带 `"metadata": {"rm_type": "..."}`（列名由 `--metadata-key` 指定，默认 `metadata`）。
+
+两个可选参数控制降级样本的行为，默认值下与现有行为完全一致：
+
+- `--rm-type-fallback`：设为 `zero` 时，未知/缺失类型的样本记 `0.0` 分（感知 reward-key）并告警；设为已注册的 reward 名则路由到该 reward；不设置保持现有报错行为。
+- `--rm-type-infer`：无显式类型时按注册的保守 matcher 从 label 推断类型（严格数字答案 → `math`，`<answer>X</answer>` 单字母 → `multiple_choice`）。当 label 与显式类型冲突时记录告警，并以显式类型优先。
+
+降级告警包含样本 index、异常值与原因；每种 `(原因, 值)` 组合只打印一次，但计数器精确累计。注意：`--custom-rm-path` 仍然完全绕过路由；返回 dict 的 reward（如 `dapo`）不能与标量 reward 混在同一 batch（`--reward-key` 是全局的）；driver 侧运行时调用 `register_reward` 注册的 sync reward 对已启动的 Ray worker 不可见——请像 `registry.py` 一样在 import 期注册，或使用 `--custom-rm-path`。
 
 ## 自定义 Generate 函数
 
@@ -141,7 +176,6 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
 
 ```python
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
@@ -150,7 +184,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # 每轮各取一次 permit：post_generate 内部获取/释放，环境与工具执行期间不占用
+        output = await state.post_generate(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # 模型输出
@@ -164,9 +199,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+
+# 声明本函数按“单次请求”粒度自行管理 permit（不声明则退回会话级锁，行为同旧版）
+generate.manages_inference_permit = True
 ```
 
 通过启动脚本指定（`--custom-generate-function-path examples.deepeyes.rollout.generate`），或在评估数据集配置中通过 `custom_generate_function_path` 按数据集设置。
+
+### 多轮 Rollout 的请求级并发调度
+
+默认情况下，`generate_and_rm` 会为整个自定义 `generate` 调用持有一把会话级并发锁（`GenerateState.semaphore`）——多轮 rollout 在环境/工具执行期间也一直占用名额，降低推理引擎利用率。
+
+要把并发控制细化到「单次模型请求」，在自定义函数上声明 opt-in 标志，并用 `state.post_generate` 发起每轮请求：
+
+- `generate.manages_inference_permit = True`：声明后本函数**不再**被会话级锁包裹，改由函数自身按请求获取 permit；
+- `await state.post_generate(url, payload)`：获取一个 permit → 发请求 → 返回后立即释放。一个 permit == 一次在飞请求（含内部最多 6 次重试）；环境交互、观测编码等应放在 `post_generate` 之外，不占用 permit；
+- **abort**：若获取 permit 时 rollout 已被 abort，`post_generate` 抛出 `GenerationAborted`。可捕获它以写入精细的续跑元数据；**不捕获也不会导致整步崩溃**——框架会兜底把该样本标记为 `ABORTED`。
+
+**使用契约**：只有声明了 `manages_inference_permit = True` 的函数才能调用 `state.post_generate` / `state.inference_permit()`。未声明的函数仍在会话级锁内运行，若再获取 permit 会在**同一把不可重入信号量**上嵌套获取——并发上限为 1 时直接死锁（框架已加运行时护栏，检测到误用会抛出清晰的 `RuntimeError` 而非挂死）。
+
+**注意**：解除会话级锁后，同时“活跃”的会话数不再受该信号量限制（仅在飞请求受限）；如需限制并发环境/工具的资源占用，请在自定义函数内自行控制。
 
 ## 训练脚本与关键参数概览
 
@@ -436,6 +489,6 @@ tail -f /tmp/ray/session_latest/logs/serve/*.log
 
 ## 获取帮助
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [介绍](../guide/introduction.md)

@@ -29,27 +29,13 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 
 ## 提供的脚本
 
-| 脚本                                              | 规模                           | GPU 分配（actor / rollout / teacher）       |
-| ------------------------------------------------- | ------------------------------ | ------------------------------------------- |
-| `run-mopd-qwen3-vl-2b-4xgpu-colocate.sh`          | 学生 2B，单机 4 卡             | 4 / 2 / 2（2 教师各 TP=1）                  |
-| `run-mopd-qwen3-vl-2b-8xgpu-2replica-colocate.sh` | 学生 2B，单机 8 卡，教师多副本 | 8 / 4 / 4（2 教师 × 2 副本，各 TP=1）       |
-| `run-mopd-qwen35-35ba3b-16xgpu-colocate.sh`       | 学生 35B-A3B，2 节点 16 卡     | 16 / 8 / 8（TP=4 PP=2 EP=8；2 教师各 TP=4） |
+| 脚本                                        | 规模                           | GPU 分配（actor / rollout / teacher）       |
+| ------------------------------------------- | ------------------------------ | ------------------------------------------- |
+| `run-mopd-qwen3-vl-2b-8xgpu-colocate.sh`    | 学生 2B，单机 8 卡，教师多副本 | 8 / 4 / 4（2 教师 × 2 副本，各 TP=1）       |
+| `run-mopd-qwen35-9b-8xgpu-colocate.sh`      | 学生 9B，单机 8 卡             | 8 / 4 / 4（2 教师各 TP=2，1 副本）          |
+| `run-mopd-qwen35-35ba3b-16xgpu-colocate.sh` | 学生 35B-A3B，2 节点 16 卡     | 16 / 8 / 8（TP=4 PP=2 EP=8；2 教师各 TP=4） |
 
-### 4 卡布局（`run-mopd-qwen3-vl-2b-4xgpu-colocate.sh`）
-
-```
-┌────────────────────────────────────────────────────┐
-│           Single Node, shared 4-GPU pool           │
-├─────────────┬─────────────┬───────────┬────────────┤
-│   bundle 0  │   bundle 1  │ bundle 2  │ bundle 3   │
-│  student rollout (TP=2)   │ text tchr │ VL tchr    │
-│                           │ GSM8K     │ Geo3K      │
-├───────────────────────────┴───────────┴────────────┤
-│         training: actor uses ALL 4 bundles         │
-└────────────────────────────────────────────────────┘
-```
-
-### 8 卡布局（`run-mopd-qwen3-vl-2b-8xgpu-2replica-colocate.sh`，教师多副本）
+### 8 卡布局（`run-mopd-qwen3-vl-2b-8xgpu-colocate.sh`，教师多副本）
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -65,20 +51,6 @@ actor 卡池（一整块 placement group，大小 = ACTOR_GPUS）
 ```
 
 每个 teacher 内部按 `--teacher-num-gpus-per-engine` 拆成多副本，round-robin 分担同一 data_source 的请求量。
-
-### 16 卡布局（`run-mopd-qwen35-35ba3b-16xgpu-colocate.sh`，2 节点）
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                 2 Nodes × 8 GPU, shared 16-GPU pool             │
-├───────────────────────────┬─────────────────┬───────────────────┤
-│      bundle 0-7           │   bundle 8-11    │  bundle 12-15    │
-│  student rollout (TP=8)   │ text tchr TP=4   │  VL tchr TP=4    │
-│                           │ Qwen3.6-27B      │  Qwen3.5-27B     │
-├───────────────────────────┴─────────────────┴───────────────────┤
-│     training: actor uses ALL 16 GPUs (TP=4 PP=2 EP=8, DP=2)     │
-└─────────────────────────────────────────────────────────────────┘
-```
 
 ## 数据准备
 
@@ -126,8 +98,7 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 ## 启动训练
 
 ```bash
-MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen3-vl-2b-4xgpu-colocate.sh
-MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen3-vl-2b-8xgpu-2replica-colocate.sh
+MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen3-vl-2b-8xgpu-colocate.sh
 MODEL_DIR=/root/models DATA_DIR=/root/data bash run-mopd-qwen35-35ba3b-16xgpu-colocate.sh
 ```
 
@@ -177,4 +148,4 @@ rollout 阶段按每条样本的 `data_source` 找到对应教师，请求 token
 ## 参考
 
 - [On-Policy Distillation - Relax Docs](../README.md)
-- [OPD 参数说明](../README.md#关键参数说明)
+- [OPD 参数配置示例](../README.md#common-combinations)

@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="resident_capacity-title resident_capacity-desc">
+    <title id="resident_capacity-title">Shared resident capacity and prelaunch</title>
+    <desc id="resident_capacity-desc">Data-flow diagram showing demand and optional prelaunch entering a shared group capacity, prepared agents moving into runtime, reward work outside the capacity, and drop or filter gaps creating replacement demand.</desc>
+    <defs>
+      <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Manrope:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
+
+        .zone { fill: rgba(232,56,74,.025); stroke: rgba(232,56,74,.56); stroke-width: 1.2; }
+        .zone-mask { fill: #f7f7f8; }
+        .zone-label { fill: #e8384a; font: 600 8px "Inter", sans-serif; letter-spacing: .16em; }
+        .node-mask { fill: #f7f7f8; }
+        .node { fill: #fff; stroke: #55565e; stroke-width: 1.2; }
+        .node-soft { fill: #f2f2f4; stroke: #8b8c93; stroke-width: 1; }
+        .node-optional { fill: rgba(31,31,35,.018); stroke: rgba(85,86,94,.52); stroke-width: 1; stroke-dasharray: 5 4; }
+        .node-accent { fill: #fff0f2; stroke: #e8384a; stroke-width: 1.6; }
+        .tag { fill: none; stroke: rgba(85,86,94,.45); stroke-width: .8; }
+        .tag-accent { fill: #e8384a; stroke: #e8384a; stroke-width: .8; }
+        .tag-text { fill: #66676e; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .tag-text-white { fill: #fff; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .name { fill: #1f1f23; font: 600 16px "Manrope", sans-serif; }
+        .sub { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .slot-label { fill: #696a72; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .slot-text { fill: #1f1f23; font: 600 12px "Inter", sans-serif; }
+        .slot-free { fill: #f7f7f8; stroke: rgba(85,86,94,.32); stroke-width: 1; stroke-dasharray: 4 3; }
+        .slot-prepare { fill: #fff0f2; stroke: #e8384a; stroke-width: 1.2; }
+        .slot-runtime { fill: #eef1f9; stroke: #4f6fbf; stroke-width: 1.2; }
+        .line { fill: none; stroke: #696a72; stroke-width: 1.4; marker-end: url(#arrow); }
+        .line-accent { fill: none; stroke: #e8384a; stroke-width: 1.6; marker-end: url(#arrow-accent); }
+        .line-link { fill: none; stroke: #4f6fbf; stroke-width: 1.5; marker-end: url(#arrow-link); }
+        .line-optional { fill: none; stroke: #74757c; stroke-width: 1.2; stroke-dasharray: 5 4; marker-end: url(#arrow); }
+        .label-mask { fill: #f7f7f8; }
+        .label { fill: #696a72; font: 600 8px "Inter", sans-serif; letter-spacing: .08em; }
+        .legend { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .note { fill: #55565e; font: 500 12px "Inter", sans-serif; }
+      </style>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#696a72"/></marker>
+      <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#e8384a"/></marker>
+      <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f6fbf"/></marker>
+    </defs>
+
+    <rect width="1280" height="720" fill="#f7f7f8"/>
+
+    <!-- Shared capacity boundary -->
+    <rect class="zone" x="560" y="104" width="400" height="400" rx="8"/>
+    <rect class="zone-mask" x="576" y="100" width="240" height="20"/>
+    <text class="zone-label" x="584" y="112">SHARED RESIDENT CAPACITY · C GROUPS</text>
+
+    <!-- Connectors -->
+    <path class="line-accent" d="M288 228 H328 Q336 228 336 236 V288 Q336 296 344 296 H360"/>
+    <rect class="label-mask" x="292" y="200" width="72" height="16" rx="2"/>
+    <text class="label" x="328" y="212" text-anchor="middle">ON DEMAND</text>
+
+    <path class="line-optional" d="M288 396 H312 Q320 396 320 388 V328 Q320 320 328 320 H360"/>
+    <rect class="label-mask" x="276" y="340" width="80" height="16" rx="2"/>
+    <text class="label" x="316" y="352" text-anchor="middle">IF ENABLED</text>
+
+    <line class="line-accent" x1="504" y1="308" x2="592" y2="308"/>
+    <rect class="label-mask" x="516" y="280" width="64" height="16" rx="2"/>
+    <text class="label" x="548" y="292" text-anchor="middle">LAUNCH</text>
+
+    <line class="line-link" x1="736" y1="308" x2="776" y2="308"/>
+    <rect class="label-mask" x="736" y="280" width="40" height="16" rx="2"/>
+    <text class="label" x="756" y="292" text-anchor="middle">LEASE</text>
+
+    <line class="line" x1="920" y1="308" x2="1024" y2="308"/>
+    <rect class="label-mask" x="936" y="280" width="72" height="16" rx="2"/>
+    <text class="label" x="972" y="292" text-anchor="middle">COMPLETE</text>
+
+    <path class="line-optional" d="M432 360 V468 Q432 476 424 476 H296 Q288 476 288 484 V500"/>
+    <rect class="label-mask" x="392" y="412" width="80" height="16" rx="2"/>
+    <text class="label" x="432" y="424" text-anchor="middle">WHEN FULL</text>
+
+    <path class="line" d="M824 360 V508 Q824 516 816 516 H800 Q792 516 792 524 V552"/>
+    <rect class="label-mask" x="832" y="432" width="40" height="16" rx="2"/>
+    <text class="label" x="852" y="444" text-anchor="middle">DROP</text>
+
+    <path class="line" d="M1096 360 V488 Q1096 496 1088 496 H880 Q872 496 872 504 V552"/>
+    <rect class="label-mask" x="1104" y="420" width="44" height="16" rx="2"/>
+    <text class="label" x="1126" y="432" text-anchor="middle">FILTER</text>
+
+    <path class="line-accent" d="M824 624 V640 Q824 648 816 648 H48 Q40 648 40 640 V252 Q40 244 48 244 H64"/>
+    <rect class="label-mask" x="356" y="620" width="104" height="16" rx="2"/>
+    <text class="label" x="408" y="632" text-anchor="middle">REPLACEMENT</text>
+
+    <!-- Capacity slots -->
+    <text class="slot-label" x="592" y="148">PREPARED + RUNNING ≤ C</text>
+    <rect class="slot-prepare" x="592" y="164" width="48" height="40" rx="4"/>
+    <text class="slot-text" x="616" y="188" text-anchor="middle">P</text>
+    <rect class="slot-prepare" x="652" y="164" width="48" height="40" rx="4"/>
+    <text class="slot-text" x="676" y="188" text-anchor="middle">P</text>
+    <rect class="slot-runtime" x="712" y="164" width="48" height="40" rx="4"/>
+    <text class="slot-text" x="736" y="188" text-anchor="middle">R</text>
+    <rect class="slot-runtime" x="772" y="164" width="48" height="40" rx="4"/>
+    <text class="slot-text" x="796" y="188" text-anchor="middle">R</text>
+    <rect class="slot-free" x="832" y="164" width="48" height="40" rx="4"/>
+    <text class="slot-text" x="856" y="188" text-anchor="middle">·</text>
+    <rect class="slot-free" x="892" y="164" width="40" height="40" rx="4"/>
+    <text class="slot-text" x="912" y="188" text-anchor="middle">…</text>
+
+    <!-- Nodes -->
+    <rect class="node-mask" x="64" y="176" width="224" height="104" rx="8"/>
+    <rect class="node-accent" x="64" y="176" width="224" height="104" rx="8"/>
+    <rect class="tag-accent" x="76" y="188" width="64" height="16" rx="2"/>
+    <text class="tag-text-white" x="108" y="200" text-anchor="middle">DEMAND</text>
+    <text class="name" x="176" y="228" text-anchor="middle">New Group</text>
+    <text class="sub" x="176" y="252" text-anchor="middle">step target or replacement</text>
+
+    <rect class="node-mask" x="64" y="344" width="224" height="104" rx="8"/>
+    <rect class="node-optional" x="64" y="344" width="224" height="104" rx="8"/>
+    <rect class="tag" x="76" y="356" width="72" height="16" rx="2"/>
+    <text class="tag-text" x="112" y="368" text-anchor="middle">OPTIONAL</text>
+    <text class="name" x="176" y="396" text-anchor="middle">Prelaunch</text>
+    <text class="sub" x="176" y="420" text-anchor="middle">start while capacity is free</text>
+
+    <rect class="node-mask" x="360" y="256" width="144" height="104" rx="8"/>
+    <rect class="node" x="360" y="256" width="144" height="104" rx="8"/>
+    <rect class="tag" x="372" y="268" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="396" y="280" text-anchor="middle">GATE</text>
+    <text class="name" x="432" y="308" text-anchor="middle">Capacity Check</text>
+    <text class="sub" x="432" y="328" text-anchor="middle">launch when a</text>
+    <text class="sub" x="432" y="348" text-anchor="middle">resident slot is free</text>
+
+    <rect class="node-mask" x="592" y="256" width="144" height="104" rx="8"/>
+    <rect class="node" x="592" y="256" width="144" height="104" rx="8"/>
+    <rect class="tag" x="604" y="268" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="632" y="280" text-anchor="middle">READY</text>
+    <text class="name" x="664" y="308" text-anchor="middle">Prepared</text>
+    <text class="sub" x="664" y="328" text-anchor="middle">agent started</text>
+    <text class="sub" x="664" y="348" text-anchor="middle">request held</text>
+
+    <rect class="node-mask" x="776" y="256" width="144" height="104" rx="8"/>
+    <rect class="node" x="776" y="256" width="144" height="104" rx="8"/>
+    <rect class="tag" x="788" y="268" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="816" y="280" text-anchor="middle">ACTIVE</text>
+    <text class="name" x="848" y="308" text-anchor="middle">Runtime</text>
+    <text class="sub" x="848" y="328" text-anchor="middle">request released</text>
+    <text class="sub" x="848" y="348" text-anchor="middle">session active</text>
+
+    <rect class="node-mask" x="1024" y="256" width="144" height="104" rx="8"/>
+    <rect class="node-soft" x="1024" y="256" width="144" height="104" rx="8"/>
+    <rect class="tag" x="1036" y="268" width="64" height="16" rx="2"/>
+    <text class="tag-text" x="1068" y="280" text-anchor="middle">OUTSIDE</text>
+    <text class="name" x="1096" y="308" text-anchor="middle">Reward</text>
+    <text class="sub" x="1096" y="332" text-anchor="middle">score or filter</text>
+
+    <rect class="node-mask" x="176" y="500" width="224" height="72" rx="8"/>
+    <rect class="node-optional" x="176" y="500" width="224" height="72" rx="8"/>
+    <text class="name" x="288" y="532" text-anchor="middle">Pending Launch</text>
+    <text class="sub" x="288" y="556" text-anchor="middle">no agent process started yet</text>
+
+    <rect class="node-mask" x="704" y="552" width="240" height="72" rx="8"/>
+    <rect class="node-soft" x="704" y="552" width="240" height="72" rx="8"/>
+    <rect class="tag" x="716" y="564" width="40" height="16" rx="2"/>
+    <text class="tag-text" x="736" y="576" text-anchor="middle">GAP</text>
+    <text class="name" x="824" y="592" text-anchor="middle">Resident Group Missing</text>
+    <text class="sub" x="824" y="612" text-anchor="middle">drop or filter creates replacement demand</text>
+
+    <!-- Legend -->
+    <line x1="40" y1="672" x2="1240" y2="672" stroke="rgba(31,31,35,.12)" stroke-width=".8"/>
+    <text class="zone-label" x="48" y="700">LEGEND</text>
+    <rect class="slot-prepare" x="152" y="684" width="20" height="20" rx="4"/>
+    <text class="legend" x="188" y="700">prepared group</text>
+    <rect class="slot-runtime" x="336" y="684" width="20" height="20" rx="4"/>
+    <text class="legend" x="372" y="700">runtime group</text>
+    <line class="line-optional" x1="536" y1="696" x2="600" y2="696"/>
+    <text class="legend" x="616" y="700">optional prelaunch</text>
+    <text class="note" x="1232" y="700" text-anchor="end">Prelaunch changes process start timing; requests enter Runtime only on demand</text>
+  </svg>

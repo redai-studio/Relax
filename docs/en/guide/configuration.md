@@ -208,7 +208,7 @@ For more parameters, refer to SGLang official documentation.
 | `--use-dynamic-batch-size` | flag | False | Enable dynamic batching. Dynamically packs samples by length so each micro-batch's total tokens approach `--max-tokens-per-gpu` limit |
 | `--max-tokens-per-gpu` | int | None | Maximum tokens per GPU. Must be set when dynamic batching is enabled. Should be set to approximately `max_response_len / cp_size` when using CP |
 | `--log-probs-max-tokens-per-gpu` | int | None | Maximum tokens per GPU when computing log probs. When None, equals `max-tokens-per-gpu` |
-| `--balance-data` | flag | False | Use `karmarkar_karp` algorithm to balance token count across data parallel ranks. Only available in colocate mode; not supported with `--fully-async`. Note: different responses for the same prompt may be assigned to different training steps |
+| `--balance-data` | flag | False | Use `karmarkar_karp` to balance token count across data parallel ranks on the static/seqlen-balanced path. In fully async with `--use-dynamic-batch-size`, DP token balancing is automatic through `StreamingTokenBudgetSampler`; the flag is accepted but has no additional effect. Note: different responses for the same prompt may be assigned to different training steps |
 
 ---
 
@@ -255,6 +255,33 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--overlap-param-gather` | flag | - | Overlap reduce-scatter with next-step param all-gather; requires `--overlap-grad-reduce` (native Megatron parameter) |
 | `--calculate-per-token-loss` | flag | False | Calculate loss per token (native Megatron parameter) |
 
+### FP16 Optimizer Compatibility Defaults
+
+| Parameter | FP16 compatibility fallback | Native non-FP16 default | Description |
+|-----------|-------------------------------|--------------------------|-------------|
+| `--initial-loss-scale` | `32768` | `2**32` | Initial scale used by dynamic loss scaling |
+| `--min-loss-scale` | `1` | `1` | Minimum scale used by dynamic loss scaling |
+| `--use-precision-aware-optimizer` / `--no-use-precision-aware-optimizer` | enabled | disabled | Enable or disable TransformerEngine's precision-aware optimizer |
+| `--store-param-remainders` / `--no-store-param-remainders` | disabled | enabled | Control parameter-remainder storage in the distributed optimizer |
+
+With dynamic FP16 loss scaling (`--loss-scale` omitted), Relax preserves its historical values for omitted options and
+emits one warning listing the applied fallbacks. With a static `--loss-scale`, `--initial-loss-scale` and
+`--min-loss-scale` are inactive, so Relax does not fill, validate, or warn about them; the two boolean optimizer options
+still use their FP16 compatibility fallbacks when omitted. Pass the active options explicitly to silence the warning.
+In dynamic mode, both scale values must be finite and greater than zero, and `--min-loss-scale` must not exceed
+`--initial-loss-scale`. Non-FP16 defaults come directly from Megatron's `OptimizerConfig`.
+
+The Qwen3-4B FP16 recipe configures all four values explicitly. Extra arguments passed to the shell script are appended
+to the training command, so a later value can override the recipe without editing it:
+
+```bash
+bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
+  --initial-loss-scale 65536 \
+  --min-loss-scale 2 \
+  --no-use-precision-aware-optimizer \
+  --store-param-remainders
+```
+
 ### Optimizer Flag Compatibility
 
 | Scenario | `--use-distributed-optimizer` | `--overlap-grad-reduce` / `--overlap-param-gather` |
@@ -272,7 +299,7 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--advantage-estimator` | str | grpo | `grpo`, `gspo`, `on_policy_distillation`, `sapo` | Advantage estimator. Note: OPD is now independent of advantage estimator; enable OPD on any estimator with `--opd-kl-coef > 0` |
+| `--advantage-estimator` | str | grpo | generated from `ALGORITHM_SPECS` in `relax/algorithms/spec.py`; currently `grpo`, `gspo`, `sapo`, `cispo`, `rloo`, `ppo`, `reinforce_plus_plus`, `reinforce_plus_plus_baseline` | Advantage estimator. `--help` is authoritative: the choices are read from the registry, so a new algorithm appears there without this table being edited. OPD is independent of this choice; enable it with `--use-opd` and its KL/loss coefficient |
 | `--normalize-advantages` | flag | False | - | Whether to normalize advantages |
 | `--disable-grpo-std-normalization` | flag | - | - | Disable GRPO standard deviation normalization (from [Dr.GRPO](https://arxiv.org/pdf/2503.20783)) |
 | `--disable-rewards-normalization` | flag | - | - | Disable reward normalization |
@@ -290,13 +317,24 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 | `--value-clip` | float | 0.2 | - | Value function clipping range |
 | `--entropy-coef` | float | 0.0 | - | Entropy loss coefficient |
 
+### PPO Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--gamma` | float | 1.0 | Discount factor for PPO GAE |
+| `--lambd` | float | 1.0 | Lambda for PPO GAE |
+| `--value-clip` | float | 0.2 | Clipping range for PPO Critic value loss |
+| `--use-rollout-logprobs` | flag | False | Use Rollout logprobs as PPO old-policy logprobs; required by the provided colocate topology |
+
+PPO currently supports synchronous colocate mode and requires `critic` and `advantages` entries in `--resource`. See [PPO Training](./ppo-training.md) for resource topology, checkpoint consistency, and KL constraints.
+
 ### KL Divergence Related
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--kl-coef` | float | 0.0 | KL penalty coefficient for reward shaping (applied to reward signal before advantage calculation). Cannot be non-zero simultaneously with `--kl-loss-coef` |
-| `--use-kl-loss` | flag | False | Whether to use KL loss in GRPO |
-| `--kl-loss-coef` | float | 0.0 | KL penalty coefficient added to final PPO loss. Cannot be non-zero simultaneously with `--kl-coef` |
+| `--kl-coef` | float | 0.0 | KL penalty coefficient for reward shaping. Synchronous PPO resets non-zero values to `0.0`. Cannot be non-zero simultaneously with `--kl-loss-coef` |
+| `--use-kl-loss` | flag | False | Enable loss-level KL for GRPO-like algorithms. Synchronous PPO automatically disables this option |
+| `--kl-loss-coef` | float | 0.0 | KL penalty coefficient added to the final policy loss. Cannot be non-zero simultaneously with `--kl-coef` |
 | `--kl-loss-type` | str | k1 | `k1`, `k2`, `k3`, `low_var_kl` | KL loss type |
 | `--use-unbiased-kl` | flag | False | Enable unbiased KL estimation |
 | `--ref-update-interval` | int | None | Reference model update interval in Rollout steps. None means no update |
@@ -314,6 +352,8 @@ Recomputation parameters use native Megatron parameters. For details, refer to M
 |-----------|------|---------|-------------|
 | `--num-critic-only-steps` | int | 0 | Number of steps to train Critic only |
 | `--critic-train-only` | flag | False | Train Critic model only |
+| `--critic-load` | str | None | Critic checkpoint to load. When None, equals `--load` |
+| `--critic-save` | str | None | Critic checkpoint output directory |
 | `--critic-lr` | float | None | Critic learning rate. When None, equals `--lr` |
 | `--critic-lr-warmup-iters` | int | 0 | Number of iterations for linear warmup of Critic model |
 
@@ -364,7 +404,7 @@ These flags only apply under `--loss-type sft`. The SFT pipeline runs an `SFTStr
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → last 5%); a value ≥1 is treated as an absolute sample count. The reserved tail is removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
+| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
 | `--sft-predict-interval` | int | None | Every N rollout steps run a generative predict pass over the eval set and write completions to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Setting this flag implicitly spins up the Rollout role under SFT (SGLang must be online). Controls the generative complement to the always-on PPL eval (`--eval-interval`). **Requires** `--save` (writes under `<save>/predict/`) and at least one eval source (`--eval-prompt-data` / `--eval-config` / `--eval-size`). |
 
 ### Streaming Dataset Prefetch
@@ -376,6 +416,39 @@ The SFT producer uses its own `PrefetchBuffer` independent from the rollout data
 | `--sft-prefetch-buffer-size` | int | 256 | Max pre-loaded samples held by the SFT streaming dataset's PrefetchBuffer. Set to 0 to disable prefetching; the producer then falls back to an `asyncio.gather` path over the ProcessorPool for batch-level parallelism. |
 | `--sft-prefetch-chunk-size` | int | 32 | Chunk size dispatched to the SFT prefetch thread-pool per round. |
 | `--sft-prefetch-num-workers` | int | 4 | Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding (video/image). |
+
+### Sharded TransferQueue Producers
+
+`RELAX_SFT_TQ_SHARDS` controls how many TransferQueue partitions are produced for each async-prepacked SFT train step. This is an experimental environment variable so shard counts can be A/B tested without adding a public CLI flag.
+
+| Environment variable | Type | Default | Description |
+|----------------------|------|---------|-------------|
+| `RELAX_SFT_TQ_SHARDS` | int | 1 | Number of SFT TransferQueue shards. Values less than or equal to 0 are treated as 1. |
+
+::: warning Activation requirement
+This variable does not enable prepacking. It is effective only with `--loss-type sft --sft-async-prepack`; otherwise Relax uses one partition. Async prepacking also requires `--per-rank-fetch`, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, VPP=1, and THD QKV format.
+:::
+
+With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; the existing `sft_K` name is used only when `N == 1`. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.
+
+When eligible, Relax starts `N` remote `_SFTBatchProducerActor` instances for train batches. The configured `--sft-prefetch-num-workers` is distributed as `ceil(workers / N)` per shard, with at least one worker per shard. Eval is still coordinated locally: `--eval-size` uses the same deterministic train/eval split inside every remote producer, while the coordinator renders the held-out samples (or `--eval-prompt-data`) and pushes `sft_eval_<step>_n<N>_<i>` partitions at eval intervals.
+
+Remote train producers fall back to the local coordinator path in any of these cases:
+
+- Ray is not initialized.
+- `--task-type seq_cls` is used.
+- `--custom-dataset-class` / `--custom-dataset-class-path` is set.
+- `--sft-oversize-strategy` is `skip` or `custom`, or `--sft-invalid-multimodal-strategy` is `skip`.
+
+The local fallback still splits the batch into `N` TransferQueue partitions, but it does not create `N` remote producer actors. Look for `SFT remote shard producer enabled: ... shards=N ...` to confirm that remote producer parallelism is active; fallback paths log `SFT remote shard producer disabled: ...` with the reason.
+
+Configure the value in the Ray runtime environment so the producer and consumer derive identical partition names:
+
+```yaml
+# configs/env.yaml
+env_vars:
+  RELAX_SFT_TQ_SHARDS: "2"
+```
 
 ### Oversize Sample Handling
 
@@ -420,7 +493,11 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--rm-type` | str | None | Built-in reward model type |
-| `--custom-rm-path` | str | None | Custom reward function path. Function signature: `def custom_rm(args, sample) -> float` |
+| `--rm-type-fallback` | str | None | Fallback for unknown/missing reward types: `zero` scores 0.0 with a warning, a registered type name routes there. None keeps the error behavior |
+| `--rm-type-infer` | flag | False | Infer the reward type from the sample label via registered matchers when no explicit type is set; conflicts warn and the explicit type wins |
+| `--custom-rm-path` | str | None | Custom reward function path. A single-sample function receives one sample; a batched/group function receives the complete sample list and returns one result per sample. Bypasses format-aware routing |
+| `--reward-max-concurrency` | int | 64 | Maximum concurrent reward calls in each caller process. One custom batch/group invocation counts as one call |
+| `--reward-num-workers` | int | 16 | Number of Ray actors used to run synchronous rewards. Async custom rewards do not use these workers |
 | `--reward-key` | str | None | Key to extract reward value when reward function returns dict |
 | `--eval-reward-key` | str | None | Reward key for evaluation. When None, equals `--reward-key` |
 | `--group-rm` | flag | False | Whether to compute reward for entire group |
@@ -475,7 +552,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 |-----------|------|---------|-------------|
 | `--autoscaler-config` | str | None | Path to autoscaler YAML configuration file. Enables autoscaling when set, disabled when not set. Example: `--autoscaler-config relax/utils/autoscaler/autoscaler.yaml` |
 
-For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-infra/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
+For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscaler.yaml`](https://github.com/redai-studio/Relax/blob/main/relax/utils/autoscaler/autoscaler.yaml).
 
 ### Scale-Out Operation Parameters
 
@@ -483,6 +560,21 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|---------|-------------|
 | `--scale-out-timeout` | float | 300.0 | - | Timeout for all scale-out operations (engine startup, connect, health check, weight sync) in seconds |
 | `--scale-out-partial-success-policy` | str | rollback_all | `rollback_all`, `keep_partial` | Policy for partial success during scale-out. `rollback_all` reverts all engines on any failure; `keep_partial` keeps successfully scaled engines |
+| `--scale-weight-sync-precheck` | bool | True | - | Run an independent NCCL precheck before scale-out weight sync; fail-closed on incompatible transport. On by default; disable with `--no-scale-weight-sync-precheck` (disabling drops the fail-closed protection). See [Elastic Rollout · Weight Sync Precheck](./elastic-rollout.md#weight-sync-precheck) |
+
+### Precheck Env Vars
+
+These environment variables are for tuning and troubleshooting; all are optional (defaults shown). Read at runtime by `relax/utils/env.py`.
+
+| Env var | Type | Default | Description |
+|----------|------|--------|------|
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES` | int | 536870912 (512 MiB) | Minimum free GPU memory (bytes) for the Stage 2 probe; below it the probe returns `INSUFFICIENT_GPU_MEMORY` and fails closed. SGLang reserves 85–90% of VRAM; lowering this risks probe OOM. |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_BASE` | int | 18000 | Lower bound of the Stage 2 probe subprocess rendezvous port range |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_PORT_MAX` | int | 20000 | Upper bound of the Stage 2 probe subprocess rendezvous port range. **Cluster network policy must allow `[PORT_BASE, PORT_MAX]`**, otherwise the probe cannot connect → `PROBE_FAILED` |
+| `RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS` | int | 2 | Max attempts for the Stage 2 probe |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEMS` | int | 3 | Max number of scale-out failure reasons surfaced in the TUI / stable log |
+| `RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN` | int | 120 | Truncation length per failure reason |
+| `RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN` | int | 512 | Total truncation length for failure reasons (prevents excessively long raw-error output) |
 
 ### Scale-In Operation Parameters
 
@@ -522,7 +614,6 @@ For autoscaler YAML configuration details, see [`relax/utils/autoscaler/autoscal
 |-----------|------|---------|-------------|
 | `--log-passrate` | flag | False | Enable pass@n pass rate logging |
 | `--log-multi-turn` | flag | False | Enable multi-turn Rollout information logging |
-| `--log-correct-samples` | flag | False | Log correct samples |
 | `--log-reward-category` | str | None | Log reward category statistics. Specify key in reward dict |
 
 ### Notifications

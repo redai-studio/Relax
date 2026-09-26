@@ -28,6 +28,8 @@ from ray.serve.schema import LoggingConfig
 
 from relax.distributed.checkpoint_service.config import DCSConfig, RoleInfo, TopologyConfig
 from relax.distributed.checkpoint_service.coordinator.topology import TopologyManager
+from relax.utils.env import Envs
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.utils import get_serve_url
 
 
@@ -108,8 +110,12 @@ app = FastAPI(
 )
 
 
+DCS_SERVE_MAX_ONGOING_REQUESTS = Envs.DCS_SERVE_MAX_ONGOING_REQUESTS
+
+
 @serve.deployment(
     num_replicas=1,
+    max_ongoing_requests=DCS_SERVE_MAX_ONGOING_REQUESTS,
     ray_actor_options={"num_cpus": 1},
     logging_config=LoggingConfig(
         log_level="WARNING",
@@ -394,7 +400,7 @@ class DCSCoordinator:
             metadata = role.metadata
             if metadata.get("is_pp_src_rank"):
                 group_name = f"update_actor_pp_{metadata.get('pp_rank')}"
-                init_method = f"tcp://{metadata.get('master_address')}:{metadata.get('master_port')}"
+                init_method = f"tcp://{_wrap_ipv6(metadata.get('master_address'))}:{metadata.get('master_port')}"
                 pp_groups[group_name] = init_method
 
         return GroupRanksResponse(
@@ -465,14 +471,18 @@ class DCSCoordinator:
 # ============================================================================
 
 
-def create_dcs_deployment(config: Optional[DCSConfig] = None):
+def create_dcs_deployment(
+    config: Optional[DCSConfig] = None,
+    ray_actor_options: Optional[Dict[str, Any]] = None,
+):
     """Create a Ray Serve deployment for the coordinator.
 
     Usage:
         deployment = create_dcs_deployment()
     """
-    coordinator = serve.run(
-        DCSCoordinator.bind(config=config), name="dcs_coordinator", route_prefix="/dcs_coordinator"
-    )
+    deployment = DCSCoordinator
+    if ray_actor_options is not None:
+        deployment = deployment.options(ray_actor_options=ray_actor_options)
+    coordinator = serve.run(deployment.bind(config=config), name="dcs_coordinator", route_prefix="/dcs_coordinator")
     coordinator_url = get_serve_url("dcs_coordinator")
     return coordinator, coordinator_url

@@ -1,0 +1,22 @@
+diff --git a/responses_api_agents/swe_agents/setup_scripts/openhands.sh b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+index 928c20a..278c5bf 100755
+--- a/responses_api_agents/swe_agents/setup_scripts/openhands.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+@@ -47,6 +47,17 @@ mamba install -y --override-channels conda-forge::python=3.12 conda-forge::nodej
+ 
+ $miniforge_dir/bin/python -m pip install -q 'packaging==26.0'
+ 
++if [ "${NEMO_GYM_SANITIZE_PLATFORM_RELEASE:-0}" = "1" ]; then
++    : "${NEMO_GYM_PYTHON_STARTUP_DIR:?NEMO_GYM_PYTHON_STARTUP_DIR is required}"
++    python_stdlib="$(
++        "$miniforge_dir/bin/python" -c \
++            'import sysconfig; print(sysconfig.get_paths()["stdlib"])'
++    )"
++    install -m 0644 \
++        "$NEMO_GYM_PYTHON_STARTUP_DIR/sitecustomize.py" \
++        "$python_stdlib/sitecustomize.py"
++fi
++
+ # Install jq as a static binary (avoid conda solver changing other package versions)
+ if [ ! -f "$miniforge_dir/bin/jq" ]; then
+     echo "Installing jq static binary..."

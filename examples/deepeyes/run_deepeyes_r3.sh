@@ -18,9 +18,6 @@ if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 source "${MODEL_CONFIG_DIR}/qwen3-vl-30B-A3B.sh"
 
-# TODO: remove this after
-cp examples/deepeyes/qwen_vl.py /sgl-workspace/sglang/python/sglang/srt/multimodal/processors/qwen_vl.py
-
 ###############################################################################
 #                                    DIRS                                     #
 ###############################################################################
@@ -155,6 +152,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
     --sglang-mem-fraction-static 0.8
+    --sglang-external-model-package examples.deepeyes.sglang_patch
 )
 
 ###############################################################################

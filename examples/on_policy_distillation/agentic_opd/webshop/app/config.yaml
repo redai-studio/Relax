@@ -1,0 +1,30 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+server:
+  host: "127.0.0.1"
+  # WEBSHOP_HOST and WEBSHOP_PORT override the bind address for training.
+  port: 36001
+  # Max concurrent /step calls actually running WebShop CPU work at once (search
+  # is the hot path). A safety valve against saturating node CPU, not a throttle
+  # of active sessions; set generously.
+  step_concurrency: 64
+  # Seconds the boot /health probe waits for the catalog to finish loading.
+  ready_timeout_s: 600
+
+env:
+  # Text observation mode (SDAR-aligned). Do not change.
+  observation_mode: "text"
+  # null = load every product in the catalog file. With the README's 1000-item
+  # subset (DEFAULT_FILE_PATH=items_shuffle_1000.json) this is the full 1000.
+  # Set an int only to sub-sample for a faster smoke test.
+  num_products: null
+  # null = use WebShop's DEFAULT_FILE_PATH / DEFAULT_ATTR_PATH (the 1000-item
+  # subset the README installs). To run full WebShop, download the full catalog
+  # and point these at items_shuffle.json / items_ins_v2.json (also see the
+  # README note about web_agent_site/utils.py DEFAULT_* for the official repo).
+  file_path: null
+  attr_path: null
+  human_goals: false
+  # Fixes goal shuffling inside SimServer so goal_idx -> goal is deterministic
+  # and identical across nodes (each node loads its own server). Aligns with SDAR.
+  seed: 42

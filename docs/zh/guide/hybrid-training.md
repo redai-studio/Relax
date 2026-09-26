@@ -18,7 +18,7 @@
 | **权重同步**        | 进程内 tensor 拷贝                        | 通过 DCS（Checkpoint Engine）做 NCCL broadcast               | 同步的 `UpdateWeightFromTensor` 推给 rollout；ref/actor_fwd 走 TensorBackuper          |
 | **Staleness**       | `max_staleness = 0`（严格 on-policy）     | 可配置 `max_staleness`                                       | 可配置 `max_staleness`                                                                 |
 | **部署的角色**      | `actor`, `critic`, `rollout`              | `actor`, `critic`, `rollout`, `advantages`, `reference`, `actor_fwd` | `actor`, `critic`, `rollout`（与 Colocate 相同；ref/actor_fwd 在 actor 内部）         |
-| **`--balance-data`**| 支持                                      | 不支持                                                       | **支持**（Hybrid 存在的核心原因之一）                                                 |
+| **DP token 均衡**   | 静态/序列长度路径通过 `--balance-data` 支持 | 动态 batch 自动做 DP token 均衡；`--balance-data` 可传入但无额外效果 | 动态 batch 自动做 DP token 均衡；静态/序列长度路径可使用 `--balance-data`              |
 
 ### 何时选择 Hybrid
 
@@ -26,7 +26,7 @@
 
 - 希望获得独立 rollout GPU 与流水线数据带来的吞吐收益，但
 - 模型较大，单独部署 ref / actor_fwd 服务会浪费 GPU，或者
-- 需要 `--balance-data`（DP 间均衡 micro-batch 切分），而纯 Fully Async 不支持此功能。
+- 希望 ref / actor_fwd 在 actor 本地完成，同时保留会自动做 DP token 均衡的流式动态 batch 路径。
 
 选择 **Fully Async**：拥有充足的 GPU 单独运行 ref / actor_fwd / advantages 服务，并希望在 step 之间做真正的并行流水线。
 
@@ -152,7 +152,7 @@ ______________________________________________________________________
 
 | 参数                          | 说明                                                                                                    |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--balance-data`              | Hybrid 模式下支持（纯 fully-async 下被拒绝）。启用后做 DP 间负载均衡。                                  |
+| `--balance-data`              | Hybrid 模式下可传入。启用 `--use-dynamic-batch-size` 时，DP token 均衡由流式 sampler 自动完成；在静态/序列长度路径上，该参数会启用 DP token 均衡。 |
 | `--num-data-storage-units`    | TransferQueue 存储 actor 的数量。                                                                       |
 | `--use-streaming-dataset`     | 从磁盘流式读取 prompts，而不是全量载入内存。                                                            |
 | `--ref-update-interval`       | 周期性地用最新 actor 权重刷新缓存的 ref 权重。                                                          |
@@ -165,8 +165,8 @@ ______________________________________________________________________
 - `compute_advantages_and_returns = True` —— actor 必须在本地计算 advantages
 - `fully_async = True`、`colocate = True` —— 由 `--hybrid` 推导得出
 
-::: warning
-如果你既想做流式数据流水线，又需要 `--balance-data`，必须使用 `--hybrid`。`--fully-async --balance-data`（不带 `--hybrid`）会在参数解析阶段被拒绝。
+::: tip
+Hybrid 和纯 fully async 在启用 `--use-dynamic-batch-size` 时都会使用 `StreamingTokenBudgetSampler`，因此动态 batch 路径会自动做 DP token 均衡。`--balance-data` 主要用于静态/序列长度均衡 batch；在动态 batch 路径上没有额外效果。
 :::
 
 ______________________________________________________________________
@@ -203,7 +203,7 @@ ray job submit --address="http://127.0.0.1:8265" \
 - 8 GPU 总量，actor 与 rollout 各占 4 张
 - `max-staleness 2` —— actor 可以消费比最新权重落后最多 2 个 step 的 rollout 输出
 - `num-iters-per-train-update 8` —— 每个全局 batch 在 forward 阶段被切分为 8 个子批次
-- `balance-data` —— 启用 DP 间负载均衡
+- `balance-data` —— 该脚本可传入；DP token 均衡由动态 batch 路径处理
 - 算法采用 GRPO，附带 `--use-kl-loss` 与 `--use-tis`（这些是算法参数，与 Hybrid 正交）
 
 ______________________________________________________________________
@@ -220,9 +220,9 @@ ______________________________________________________________________
 
 在认定为代码 bug 前，请先排查 rollout 侧日志及 partition 状态。
 
-### `--balance-data is not supported in pure fully-async mode`
+### 动态 batch 的 DP token 均衡
 
-你同时传入了 `--fully-async --balance-data`，但缺少 `--hybrid`。请去掉 `--balance-data`，或者改用 `--hybrid`（Hybrid 模式原生支持 DP 数据均衡）。
+同时启用 `--fully-async` 或 `--hybrid` 与 `--use-dynamic-batch-size` 时，DP token 均衡会通过 `StreamingTokenBudgetSampler` 自动完成。如果仍观察到 token 负载不均，请先检查 token 预算（`--max-tokens-per-gpu`）、DP size 和 streaming sampler 的 stall 日志，再调整执行模式。
 
 ### Rollout 长时间看到旧权重
 

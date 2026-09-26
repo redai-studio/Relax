@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 from relax.utils import device as device_utils
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
+from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.logging_utils import get_logger
 
 from ..weight_conversion import convert_to_hf
@@ -314,7 +315,7 @@ def connect_rollout_engines_from_distributed(
         try:
             model_update_groups = init_process_group(
                 backend=dist_backend,
-                init_method=f"tcp://{master_address}:{master_port}",
+                init_method=f"tcp://{_wrap_ipv6(master_address)}:{master_port}",
                 world_size=world_size,
                 rank=0,
                 group_name=group_name,

@@ -233,6 +233,36 @@ When PP is enabled and you see clearly uneven per-stage memory usage, the last s
 
 `--decoder-last-pipeline-num-layers` is also available if you'd rather reduce the last stage explicitly. Adjust in small steps — move 1–2 layers at a time and watch the per-stage memory water mark.
 
+### 13. Enable `expandable_segments` (Requires `--selective-offload`)
+
+`expandable_segments:True` reduces fragmentation, but it is **incompatible with `torch_memory_saver`** — the default mechanism behind `--offload-train`. TMS cannot track VMM-backed expandable segments, and because its hook is armed from `TMS_INIT_ENABLE` inside the preloaded `.so` before any Python code runs, its own guard never executes. You get a raw driver error instead of a readable message:
+
+```
+[torch_memory_saver.cpp] CUresult error: 1 (invalid argument) file=csrc/utils.h func=cu_mem_create line=169
+```
+
+Two conditions make it usable:
+
+1. **Use `--selective-offload`** — an application-level offload that never loads the `torch_memory_saver` hook, so the conflict disappears.
+2. **Scope the variable to the training actors with `--train-env-vars`**, not `RUNTIME_ENV_JSON`:
+
+```bash
+--selective-offload \
+--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' \
+```
+
+`--train-env-vars` is merged only into the training actors' environment and never into the rollout environment, so SGLang keeps using `torch_memory_saver` untouched.
+
+::: danger
+Do **not** put `expandable_segments:True` in `RUNTIME_ENV_JSON` — that env is global and reaches the rollout workers too. SGLang's `release_memory_occupation` / `resume_memory_occupation` (enabled by `--offload-rollout`) rely on `torch_memory_saver` and have **no fallback**, so inference offload breaks.
+:::
+
+::: tip
+On torch 2.9, `PYTORCH_CUDA_ALLOC_CONF` is deprecated in favour of `PYTORCH_ALLOC_CONF`. Note that `torch_memory_saver`'s own sanity check only inspects the legacy name, so the new name gets no guard at all.
+:::
+
+Colocate weight update ships tensors to SGLang over CUDA IPC, which for expandable-segment tensors goes through `pidfd_open`/`pidfd_getfd`. This works on a modern kernel with normal ptrace permissions; if a hardened container blocks it you would see `Tensors allocated with expandable_segments:True cannot be shared between processes`.
+
 ---
 
 ## OOM in Specific Phases
@@ -297,6 +327,7 @@ When PP is enabled and you see clearly uneven per-stage memory usage, the last s
 | Adjust memory margin | `--train-memory-margin-bytes <bytes>` |
 | SGLang memory (colocate) | `--sglang-mem-fraction-static <fraction>` |
 | Rebalance PP stage layers | `--decoder-first-pipeline-num-layers <count>` |
+| Reduce fragmentation | `--selective-offload` + `--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'` |
 
 ---
 

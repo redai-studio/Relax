@@ -83,6 +83,7 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --colocate
+   --cross-entropy-loss-fusion
 )
 
 OPTIMIZER_ARGS=(

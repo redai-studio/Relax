@@ -3,6 +3,7 @@ import os
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 
 
 ROUTING_REPLAY = None
@@ -77,7 +78,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # ROUTING_REPLAY is None for routers that opt out of replay (e.g. MTP),
         # in which case we fall through to the original implementation.
-        if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1" and ROUTING_REPLAY is not None:
+        if Envs.ENABLE_ROUTING_REPLAY and ROUTING_REPLAY is not None:
             routing_replay_stage = os.environ["ROUTING_REPLAY_STAGE"]
             if routing_replay_stage == "fallthrough":
                 return old_compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
@@ -106,7 +107,7 @@ def get_routing_replay_compute_topk(old_compute_topk):
 
 
 def register_routing_replay(module):
-    if os.environ.get("ENABLE_ROUTING_REPLAY", "0") != "1":
+    if not Envs.ENABLE_ROUTING_REPLAY:
         return
 
     # MTP routers exist in training but rollout (sglang) doesn't run MTP, so

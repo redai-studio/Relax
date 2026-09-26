@@ -4,7 +4,7 @@
 
 ## 概述
 
-Relax 使用 Megatron torch distributed checkpoint（DCP）格式保存训练 checkpoint。在部署或发布训练后的模型前，可使用 `scripts/tools/convert_torch_dist_to_hf_bridge.py` 将其导出为 Hugging Face safetensors。
+Relax 使用 Megatron torch distributed checkpoint（DCP）格式保存训练 checkpoint。在部署或发布训练后的模型前，可使用 `scripts/tools/convert_torch_dist_to_hf_bridge.py` 将其导出为 Hugging Face safetensors。此外，训练过程中也可以通过 `--save-hf` 在线导出 HF checkpoint（可选 FP8），使用的是同一套 FP8 writer，输出与离线转换字节一致。
 
 这是 checkpoint 后置处理流程，不会改变训练阶段使用的精度或执行模式。
 
@@ -13,6 +13,7 @@ Relax 使用 Megatron torch distributed checkpoint（DCP）格式保存训练 ch
 | Megatron DCP | 标准 HF safetensors | `convert_torch_dist_to_hf_bridge.py` |
 | Megatron DCP | FP8 HF safetensors | `convert_torch_dist_to_hf_bridge.py --fp8` |
 | BF16/FP16/FP32 HF safetensors | FP8 HF safetensors | `convert_hf_to_fp8.py` |
+| 训练中 Megatron 状态 | HF safetensors（可选 FP8） | 训练 CLI 参数 `--save-hf` / `--save-hf-dtype fp8` |
 
 ## 前置条件
 
@@ -108,6 +109,100 @@ python scripts/tools/convert_hf_to_fp8.py \
 | `--scale-fmt` | `None` | 仅作兼容元数据。`ue8m0` 不会打包或改变 FP32 scale tensor。 |
 
 离线转换器会保留一个输入 shard 的全部转换结果，直到该 shard 写盘。增大 `--max-workers` 会增加 GPU 显存占用；显存有限时保持为 `1`。
+
+## 训练时在线导出
+
+以上均为训练完成后离线执行的路径。Relax 也支持在训练过程中，每次 Megatron 保存 checkpoint 时同步导出 HF 目录，无需另起 offline 转换作业。此路径与 `convert_torch_dist_to_hf_bridge.py` 复用同一套 Bridge 导出与 FP8 writer，输出布局与离线转换一致。
+
+只在 Megatron 后端 + Actor 角色下生效，且仅由 WORLD rank 0 落盘。
+
+### 基本用法（BF16）
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  ...
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `--save-hf` | HF 导出目录模板。`{rollout_id}` 占位符会被当前 rollout 号替换；不含占位符时每次会覆盖同一目录。触发时机与 `--save-interval` 同步。 |
+
+导出目录约定与全量 checkpoint 的 `iter_*` 分离，方便两类产物独立清理。
+
+### FP8 在线导出
+
+`--save-hf-dtype fp8` 让每次保存直接落 FP8 HF checkpoint，跳过中间 BF16 目录。启用时会用与离线转换相同的 `StreamingFP8Writer` 拦截 Bridge 输出，并把 `quantization_config` 写入 `config.json`。
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  --save-hf-dtype fp8 \
+  --save-hf-fp8-quant-mode block \
+  --save-hf-fp8-block-size 128 128 \
+  ...
+```
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--save-hf-dtype` | `bf16` | 导出精度：`bf16` 保持原有行为；`fp8` 走流式 FP8 writer。 |
+| `--save-hf-fp8-quant-mode` | `block` | 量化策略：`block`、`channel` 或 `tensor`。 |
+| `--save-hf-fp8-block-size` | `128 128` | `block` 策略的 block 形状。 |
+
+启动阶段会做参数校验：`--save-hf-dtype fp8` 必须搭配 `--save-hf`，且 `--hf-checkpoint` 必须指向 safetensors 目录（Bridge 需要读取源索引以确定 HF key 映射）。
+
+FP8 输出的 shard 布局、`quantization_config`、跳过的模块列表都与离线 `--fp8` 完全一致，见上文「FP8 输出布局」。
+
+::: warning MTP 权重
+FP8 在线导出跳过 offline 路径的 MTP reconcile 步骤——因为 FP8 writer 有独立的索引。如果参考 HF 配置启用 MTP、但训练模型不含 MTP 权重，导出结果将不包含 MTP 层。此约束与 `convert_torch_dist_to_hf_bridge.py --fp8` 一致。
+:::
+
+### 保存后钩子
+
+`--save-hf-post-hook-path` 注入一个用户自定义回调函数，在 HF 目录（含 FP8 shard、LoRA adapter、`config.json` patch）完全落盘后由 WORLD rank 0 调用一次。适合接入模型仓库上传、告警、审计等后处理动作。
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  --save-hf-post-hook-path my_pkg.my_module.my_hook \
+  ...
+```
+
+Hook 通过点分路径加载（`importlib.import_module` + `getattr`），因此模块必须可被当前 `PYTHONPATH` 解析。参数会在启动时 dry-import 校验一次，拼写错误会 fail-fast。
+
+内置示例 `scripts/tools/model_upload_hook.py` 提供 `push_to_huggingface`（配合 `HF_TOKEN` + `RELAX_HF_REPO_ID`），直接写到 CLI 即可把每次 save 异步推到 HuggingFace Hub：`--save-hf-post-hook-path scripts.tools.model_upload_hook.push_to_huggingface`。
+
+**回调签名（框架契约）：**
+
+```python
+def my_hook(
+    args,                # argparse.Namespace，完整训练参数
+    hf_path: str,        # 已展开占位符的绝对路径，例如 ".../iter_42"
+    rollout_id: int,     # 当前 rollout 号
+    *,
+    dtype: str,          # "bf16" 或 "fp8"
+    is_lora: bool,       # 训练是否启用 LoRA（True 时 hf_path 下含 lora_adapter/ 子目录）
+) -> None: ...
+```
+
+关键约定：
+
+- **同步返回、快返回。** Hook 在 actor 主线程内调用；重的 I/O（上传、RPC）请自行 offload 到后台线程或队列，避免阻塞下一步训练。
+- **异常被吞。** 框架用 `logger.exception` 记录后继续训练，hook 内部错误永不 crash 训练循环。
+- **仅 WORLD rank 0 触发。** 其他 rank 不调用，无需担心多次执行。
+- **kwargs 保留扩展位。** 未来新增的字段以关键字参数加入，老 hook 不受影响。
+
+**可选：模块级 `flush()` 用于优雅退出**
+
+如果 hook 模块暴露了模块级 `flush(timeout_sec: float = 1800.0)` 函数，训练最后一次 save（`force_sync=True`）时框架会自动调用它，等待后台上传队列排空后才继续 shutdown 流程。适合"训练容器一退出就把队列 kill 掉"的场景（Ray / k8s cgroup 会连子进程一起收），能保证正常结束时不丢 in-flight 上传：
+
+```python
+def flush(timeout_sec: float = 1800.0) -> None:
+    """Block until pending background work drains, or timeout."""
+    ...
+```
+
+约束与 hook 相同：异常被吞掉；不设 `flush` 时该分支自动跳过；训练崩溃触发 `ray.kill()` 走 SIGKILL 路径时依然会丢队列，`flush()` 只兜底"正常结束"这一路。
 
 ## 启动转换后的 FP8 模型
 

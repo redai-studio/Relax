@@ -16,7 +16,9 @@ from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
+from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
 
@@ -79,6 +81,9 @@ class ScaleOutStatusResponse(BaseModel):
     updated_at: float
     error_message: Optional[str]
     weight_version: Optional[str]
+    # Must be declared or FastAPI's response_model strips it from every scale-out
+    # HTTP surface (and the autoscaler poll-back that reads it).
+    failure_categories: List[str] = Field(default_factory=list)
 
 
 class EnginesInfoResponse(BaseModel):
@@ -310,7 +315,11 @@ def satisfy_staleness(partition_list: Optional[List[str]], current_rollout_id: i
     return current_rollout_id + 1 - min(list(map(split_partition, partition_list))) <= max_staleness
 
 
-@serve.deployment
+# Ray Serve's default max_ongoing_requests (5) throttles concurrent load; env-tunable like the genrm knob.
+ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = Envs.ROLLOUT_SERVE_MAX_ONGOING_REQUESTS
+
+
+@serve.deployment(max_ongoing_requests=ROLLOUT_SERVE_MAX_ONGOING_REQUESTS)
 @serve.ingress(app)
 class Rollout(Base):
     """The class to run rollout and convert rollout data to training data."""
@@ -346,6 +355,11 @@ class Rollout(Base):
         self._sglang_base_url: Optional[str] = None
         self._proxy_client: Optional[httpx.AsyncClient] = None
 
+        # Wired by controller in colocate: rollout must wait for all sharing
+        # peers (actor, critic, ...) to finish round N (sleep GPU) before
+        # waking SGLang for round N+1. Stays ``None`` in fully_async.
+        self._peer_barrier: Optional[PeerStepBarrier] = None
+
     def _should_eval(self, local_step):
         if self.config.eval_interval is None or self.config.eval_prompt_data is None:
             return False
@@ -373,6 +387,15 @@ class Rollout(Base):
 
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
+
+    def set_barriers(
+        self,
+        *,
+        rollout: Any = None,  # accepted for interface parity; rollout doesn't gate on itself
+        peers: Optional[PeerStepBarrier] = None,
+    ) -> None:
+        del rollout
+        self._peer_barrier = peers
 
     async def _run_eval_with_mark(self, rollout_id: int) -> None:
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
@@ -447,6 +470,26 @@ class Rollout(Base):
                     should_continue = rollout_done or satisfy_staleness(
                         partition_list, local_step, self.config.max_staleness
                     )
+                    # Colocate barrier: don't start round N+1 until every
+                    # sharing peer (actor / critic / ...) has advanced its step
+                    # past `local_step` — their step increments after
+                    # ``async_train`` returns (which includes the post-train
+                    # sleep), guaranteeing the GPU is released before SGLang
+                    # tries to resume.
+                    if (
+                        should_continue
+                        and not rollout_done
+                        and self._peer_barrier is not None
+                        and not self._peer_barrier.is_empty()
+                    ):
+                        pending = await self._peer_barrier.list_pending_async(local_step)
+                        if pending:
+                            should_continue = False
+                            if wait_count % 30 == 0:
+                                desc = ", ".join(f"{r}(step={s})" for r, s in pending)
+                                self._logger.info(
+                                    f"Rollout {local_step}: waiting for peers to finish round {local_step}: {desc}"
+                                )
                     if not should_continue:
                         should_log = (wait_count >= 1200 and wait_count % 30 == 0) or (
                             600 <= wait_count < 1200 and wait_count % 60 == 0
@@ -549,9 +592,33 @@ class Rollout(Base):
         if can_update:
             self._weight_update_ready.clear()
             self.status = "paused"
-            await self.rollout_manager.health_monitoring_pause.remote()
-            await self.rollout_manager.set_weight_updating.remote(True)
-            self._weight_update_ready.set()
+            try:
+                prepared = await self.rollout_manager.set_weight_updating.remote(True)
+                if prepared is False:
+                    raise HTTPException(status_code=503, detail="Elastic scale-in is draining")
+                await self.rollout_manager.health_monitoring_pause.remote()
+            except Exception:
+                rollback_succeeded = False
+                try:
+                    await self.rollout_manager.set_weight_updating.remote(False)
+                    rollback_succeeded = True
+                except Exception as rollback_error:
+                    self._logger.warning(
+                        "Failed to roll back a partial weight-update handshake: %s",
+                        rollback_error,
+                    )
+                if rollback_succeeded:
+                    self.status = "running"
+                raise
+            finally:
+                # Always release the handshake gate if a remote call above
+                # raises, so a later end_update_weight cannot block forever.
+                # The error still propagates to the actor, which fails closed.
+                # _weight_update_ready only orders
+                # the can_do <-> end_update_weight handshake; it does not gate
+                # the real weight transfer, so setting it on the failure path
+                # cannot make an engine use wrong weights.
+                self._weight_update_ready.set()
             return 1
         return 0
 
@@ -765,14 +832,17 @@ class Rollout(Base):
                 detail="Scale-in is not available when --use-slime-router is enabled. "
                 "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
             )
-        result = await self.rollout_manager.create_scale_in_request.remote(
-            model_name=request.model_name,
-            num_replicas=request.num_replicas,
-            engine_urls=request.engine_urls,
-            timeout_secs=request.timeout_secs,
-            force=request.force,
-            dry_run=request.dry_run,
-        )
+        try:
+            result = await self.rollout_manager.create_scale_in_request.remote(
+                model_name=request.model_name,
+                num_replicas=request.num_replicas,
+                engine_urls=request.engine_urls,
+                timeout_secs=request.timeout_secs,
+                force=request.force,
+                dry_run=request.dry_run,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if result["status"] == "CONFLICT":
             raise HTTPException(status_code=409, detail=result["message"])
         if result["status"] == "REJECTED":
@@ -826,7 +896,7 @@ class Rollout(Base):
         if self._proxy_client is None:
             self._proxy_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(None),
-                limits=httpx.Limits(max_connections=256),
+                limits=httpx.Limits(max_connections=4096, max_keepalive_connections=4096, keepalive_expiry=600),
             )
         return self._proxy_client
 

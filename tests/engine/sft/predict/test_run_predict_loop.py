@@ -73,6 +73,52 @@ def test_split_prompt_and_reference_serializes_list_content_reference():
     assert json.loads(reference) == [{"type": "text", "text": "a cat"}]
 
 
+def test_render_eval_prompts_uses_seeded_random_eval_rows(monkeypatch):
+    accessed_indices = []
+
+    class _FakeDataset:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            pass
+
+        def __len__(self):
+            return 10
+
+        def get_canonical_sample(self, idx):
+            accessed_indices.append(idx)
+            return _sample([("user", f"q{idx}", False), ("assistant", f"a{idx}", True)])
+
+        def stop(self):
+            pass
+
+    class _FakeTokenizer:
+        def apply_chat_template(self, messages, **kwargs):  # noqa: ARG002
+            return messages[-1]["content"]
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", lambda *args, **kwargs: _FakeTokenizer())
+    monkeypatch.setattr("relax.engine.sft.dataset.streaming.SFTStreamingDataset", _FakeDataset)
+    config = SimpleNamespace(
+        hf_checkpoint="/fake/model",
+        context_parallel_size=1,
+        max_tokens_per_gpu=128,
+        seed=42,
+        eval_prompt_data=None,
+        eval_size=0.2,
+        prompt_data="/fake/train.jsonl",
+        input_key="messages",
+        label_key=None,
+        multimodal_keys=None,
+        metadata_key="metadata",
+        tool_key=None,
+        system_prompt=None,
+    )
+
+    rendered = predict_loop.render_eval_prompts(config)
+    _, expected_eval_indices = predict_loop.resolve_sft_split_indices(10, 0.2, seed=42)
+
+    assert accessed_indices == list(expected_eval_indices)
+    assert [reference for _, reference, _ in rendered] == [f"a{idx}" for idx in expected_eval_indices]
+
+
 class _FakeRolloutManager:
     def __init__(self, completion_factory=None):
         self.calls: list[list[str]] = []

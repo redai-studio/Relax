@@ -1,28 +1,23 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import threading
 from argparse import Namespace
 from typing import Any, Dict
 
 import torch
 import transfer_queue as tq
-from megatron.core import mpu
 from ray import serve
 from tensordict import TensorDict
 
+from relax.algorithms.advantages import compute_advantages_and_returns
 from relax.components.base import Base
 from relax.utils.async_utils import run as run_
 from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
     consume_opd_advantage_data,
 )
-from relax.utils.training.ppo_utils import (
-    compute_approx_kl,
-    get_advantages_and_returns_batch,
-    get_grpo_returns,
-    get_reinforce_plus_plus_baseline_advantages,
-    get_reinforce_plus_plus_returns,
-)
+from relax.utils.training.ppo_utils import compute_approx_kl
 
 
 @serve.deployment
@@ -43,6 +38,15 @@ class Advantages(Base):
         self.step = 0
 
     async def run(self) -> None:
+        # Offload the blocking worker loop to a thread so it never blocks the
+        # Serve replica's asyncio event loop. The loop below drives blocking
+        # transfer-queue waits (run_(...).result()) and synchronous advantage
+        # compute; running them inline blocks the event loop for the full tq
+        # wait (20s+ under data imbalance), starving Serve's event-loop health
+        # probe and triggering a false-positive "event loop unresponsive" kill.
+        await asyncio.to_thread(self._run_blocking)
+
+    def _run_blocking(self) -> None:
         step = self.step
         self.data_system_client.reset_consumption(
             partition_id=f"train_{self.step}",
@@ -114,9 +118,9 @@ class Advantages(Base):
         `self.config.advantage_estimator`.
 
         This function extracts rewards, log-probs, values, and masks from
-        `rollout_data`, computes KL divergences, then applies the chosen advantage
-        estimator. Supported methods: "grpo", "gspo", "sapo", "ppo",
-        "reinforce_plus_plus", and "reinforce_plus_plus_baseline".
+        `rollout_data`, computes KL divergences, then delegates to the advantage
+        implementation named by the registry for `self.config.advantage_estimator`
+        (see `relax.algorithms.advantages.ADVANTAGE_FNS`).
 
         Early returns if both `log_probs` and `values` are None (intermediate
         pipeline stages).
@@ -135,7 +139,7 @@ class Advantages(Base):
             "rollout_log_probs" if self.config.use_rollout_logprobs else "log_probs"
         )
         ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-        rewards: list[float] = rollout_data.get("rewards")
+        rewards: torch.Tensor = rollout_data.get("rewards")
         values: None | list[torch.Tensor] = rollout_data.get("values")
         response_lengths: list[int] = rollout_data.get("response_lengths")
         loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
@@ -162,50 +166,19 @@ class Advantages(Base):
                 for i in range(len(log_probs))
             ]
 
-        if self.config.advantage_estimator in ["grpo", "gspo", "sapo", "cispo"]:
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            returns = get_grpo_returns(rewards, kl)
-            advantages = list(returns)  # make a copy
-
-        elif self.config.advantage_estimator == "ppo":
-            # TODO: optimize this
-            old_rewards = rewards
-            rewards = []
-            for reward, k in zip(old_rewards, kl, strict=False):
-                k *= -self.config.kl_coef
-                cp_rank = mpu.get_context_parallel_rank()
-                if cp_rank == 0:
-                    k[-1] += reward
-                rewards.append(k)
-            advantages, returns = get_advantages_and_returns_batch(
-                total_lengths, response_lengths, values, rewards, self.config.gamma, self.config.lambd
-            )
-
-        elif self.config.advantage_estimator == "reinforce_plus_plus":
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            returns = get_reinforce_plus_plus_returns(
-                rewards=rewards,
-                kl=kl,
-                loss_masks=loss_masks,
-                response_lengths=response_lengths,
-                total_lengths=total_lengths,
-                kl_coef=self.config.kl_coef,
-                gamma=self.config.gamma,
-            )
-            advantages = list(returns)
-
-        elif self.config.advantage_estimator == "reinforce_plus_plus_baseline":
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-            advantages = get_reinforce_plus_plus_baseline_advantages(
-                rewards=rewards,
-                kl=kl,
-                loss_masks=loss_masks,
-                kl_coef=self.config.kl_coef,
-            )
-            returns = advantages
-
-        else:
-            raise NotImplementedError(f"advantage_estimator {self.config.advantage_estimator} is not supported. ")
+        advantages, returns = compute_advantages_and_returns(
+            self.config,
+            rewards=rewards,
+            kl=kl,
+            loss_masks=loss_masks,
+            response_lengths=response_lengths,
+            total_lengths=total_lengths,
+            values=values,
+            # `padded_total_lengths` is intentionally omitted: it is derived from
+            # `args.qkv_format` and the VL / unsplit-forward flags in the Megatron
+            # worker, and this deployment has no equivalent. Passing nothing keeps
+            # the behaviour this path already had.
+        )
 
         # Optional pure OPD mode: remove all non-OPD reward contribution.
         if getattr(self.config, "use_opd", False) and getattr(self.config, "opd_only_reward", False):

@@ -351,9 +351,9 @@ Partial Rollout 最适合 `max_response_len` 较大（如 8K+）且响应长度�
 --balance-data
 ```
 
-::: warning
-`--balance-data` 仅在 colocate 模式下可用。全异步模式（`--fully-async`）不支持该功能，因为 TransferQueue 数据消费路径与数据均衡不兼容。同时启用两者会在启动时报错。
-:::
+在静态/序列长度均衡路径上，`--balance-data` 会启用 `SeqlenBalancedSampler`，并使用 `karmarkar_karp` 在数据并行 rank 间均衡 Token。
+
+全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会通过 `StreamingTokenBudgetSampler` 自动做 DP token 均衡。此时传入 `--balance-data` 是允许的，但不会额外增加一次均衡。
 
 ::: warning
 使用 `--balance-data` 时，同一 Prompt 的不同响应可能被分到不同训练步。

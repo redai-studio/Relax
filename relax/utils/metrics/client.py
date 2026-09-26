@@ -1,10 +1,44 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 import threading
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Union
 
 import requests
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively coerce a metric value into a JSON-serializable form.
+
+    The JSON encoder used by ``requests`` rejects non-finite floats (``inf`` /
+    ``nan``) and non-native objects such as ``torch.Tensor`` / ``numpy`` scalars,
+    causing the whole metrics batch to be dropped. This normalizes:
+
+    - ``inf`` / ``nan`` floats -> ``None`` (JSON ``null``)
+    - tensors / ndarrays / numpy scalars -> Python scalars or lists
+    - nested dicts / lists / tuples -> sanitized element-wise
+
+    Unknown objects are returned unchanged (best effort).
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+
+    # torch.Tensor / numpy.ndarray / numpy scalar all expose ``tolist`` which
+    # returns Python scalars or nested lists; re-sanitize to catch inf/nan.
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return _sanitize_for_json(tolist())
+        except Exception:
+            return value
+    return value
 
 
 class MetricsClient:
@@ -165,7 +199,12 @@ class MetricsClient:
         try:
             response = requests.post(
                 f"{self.service_url}/log_metric",
-                json={"step": step, "metric_name": metric_name, "metric_value": metric_value, "tags": tags},
+                json={
+                    "step": step,
+                    "metric_name": metric_name,
+                    "metric_value": _sanitize_for_json(metric_value),
+                    "tags": tags,
+                },
                 timeout=5,
             )
             if response.status_code != 200:
@@ -199,7 +238,7 @@ class MetricsClient:
         try:
             response = requests.post(
                 f"{self.service_url}/log_metrics_batch",
-                json={"step": step, "metrics": metrics, "tags": tags},
+                json={"step": step, "metrics": _sanitize_for_json(metrics), "tags": tags},
                 timeout=5,
             )
             if response.status_code != 200:

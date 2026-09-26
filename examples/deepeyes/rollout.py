@@ -14,9 +14,9 @@ import pybase64
 import torch
 
 from examples.deepeyes.base_env import BaseInteractionEnv
+from relax.engine.rollout.request_permit import GenerationAborted
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.data.processing_utils import _ENCODE_EXECUTOR, encode_image_for_rollout_engine
-from relax.utils.http_utils import post
+from relax.utils.data.processing_utils import encode_image_for_rollout_engine, get_encode_executor
 from relax.utils.types import Sample
 
 
@@ -175,7 +175,7 @@ def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
 async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params: dict, is_resuming: bool = False):
     loop = asyncio.get_running_loop()
     prompt_ids, image_data, init_mm_train = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        get_encode_executor(),
         _prepare_initial_inputs,
         sample,
         state.processor,
@@ -213,7 +213,9 @@ async def _prepare_start_state(sample: Sample, state, args: Any, sampling_params
     return current_image_data, response_tokens, context_budget, generation_budget, multimodal_train_inputs_buffer
 
 
-async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, args=None):
+async def _run_inference_step(
+    state: GenerateState, url: str, tokens: list[int], sampling_params: dict, image_data, tokenizer, args=None
+):
     payload = {
         "input_ids": tokens,
         "sampling_params": sampling_params,
@@ -224,7 +226,9 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     if image_data:
         payload["image_data"] = image_data
 
-    output = await post(url, payload)
+    # Per-request permit: one permit == this one in-flight model request. The
+    # permit is released as soon as post() returns, before env/tool execution.
+    output = await state.post_generate(url, payload)
     response_text = output["text"]
     if "output_token_logprobs" in output["meta_info"]:
         new_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -248,7 +252,7 @@ async def _process_env_step(env: BaseInteractionEnv, response_text: str, tokeniz
     next_user_message = env.format_observation(observation)
     loop = asyncio.get_running_loop()
     obs_prompt_ids, obs_image_data, obs_multimodal_inputs, obs_multimodal_train_inputs = await loop.run_in_executor(
-        _ENCODE_EXECUTOR,
+        get_encode_executor(),
         _encode_observation_for_generation,
         tokenizer,
         processor,
@@ -469,15 +473,25 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             )
 
             inference_start_ts = time.time()
-            (
-                response_text,
-                new_response_tokens,
-                new_response_log_probs,
-                finish_type,
-                meta_info,
-            ) = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
-            )
+            try:
+                (
+                    response_text,
+                    new_response_tokens,
+                    new_response_log_probs,
+                    finish_type,
+                    meta_info,
+                ) = await _run_inference_step(
+                    state, url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer, args=args
+                )
+            except GenerationAborted:
+                # Abort was signalled before this turn's request went out. Mirror the
+                # in-flight finish_abort path: mark ABORTED, do not count this turn, and
+                # keep _current_turn_response_start so resume continues this same turn.
+                sample.status = Sample.Status.ABORTED
+                stop_reason = "finish_abort"
+                turns_executed = turn_idx
+                rollout_traces.append(turn_record)
+                break
             inference_end_ts = time.time()
             trace_recorder.record_inference_output(
                 response_text, finish_type, max(0.0, inference_end_ts - inference_start_ts)
@@ -571,3 +585,9 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             env.close()
         except Exception:
             pass
+
+
+# Opt-in: this custom rollout manages its own per-request inference permits
+# (via state.post_generate per turn), so generate_and_rm must NOT wrap it in the
+# session-level lock. See docs/{zh,en}/guide/customize-training.md.
+generate.manages_inference_permit = True

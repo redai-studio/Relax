@@ -10,8 +10,6 @@ EXTRA_ARGS="$*"
 # settings envs
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${SCRIPT_DIR}/../.."
-pip install clearml math_verify==0.8.0 colorlog pytest-asyncio
-https_proxy=10.140.24.177:3128 pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git" --no-deps
 
 curl -fsSL https://image-url-2-feature-1251524319.cos.ap-shanghai.myqcloud.com/wuhuan2/lib/relax/internal_setup.sh | bash
 

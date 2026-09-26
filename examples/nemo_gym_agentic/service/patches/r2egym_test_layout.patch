@@ -1,0 +1,57 @@
+diff --git a/src/r2egym/agenthub/runtime/docker.py b/src/r2egym/agenthub/runtime/docker.py
+--- a/src/r2egym/agenthub/runtime/docker.py
++++ b/src/r2egym/agenthub/runtime/docker.py
+@@ -1,4 +1,5 @@
+ import os, sys
++import shlex
+ import json
+ from time import sleep
+ import time
+@@ -576,18 +577,38 @@
+             self.run("find /r2e_tests -name '*.pyc' -delete")
+             self.run("find /r2e_tests -name '__pycache__' -exec rm -rf {} +")
+ 
+-            # move all skip files (if present) to /root
++            # Test directories need idempotent handling: mv/ln into an existing
++            # directory symlink otherwise creates r2e_tests -> itself.
+             for skip_file in SKIP_FILES_NEW:
+-                self.run(f"mv {self.repo_path}/{skip_file} {self.alt_path}/{skip_file}")
+-
+-            # r2e_tests are in the / directory, move them to /root
+-            self.run(f"mv /r2e_tests {self.alt_path}/r2e_tests")
+-
+-            # make a softlink for /root/r2e_tests (if present)
+-            self.run(f"ln -s {self.alt_path}/r2e_tests {self.repo_path}/r2e_tests")
+-            # self.run(f"ln -s /r2e_tests {self.repo_path}/r2e_tests")
++                if skip_file != "r2e_tests":
++                    self.run(f"mv {self.repo_path}/{skip_file} {self.alt_path}/{skip_file}")
++            self._setup_r2e_tests()
+         except Exception as e:
+             self.logger.error(f"Error setting up environment: {repr(e)}")
++
++    def _setup_r2e_tests(self) -> None:
++        command = f"""set -eu
++r2e_test_dir={shlex.quote(self.alt_path + "/r2e_tests")}
++r2e_test_link={shlex.quote(self.repo_path + "/r2e_tests")}
++if [ ! -e "$r2e_test_dir" ] && [ ! -L "$r2e_test_dir" ]; then
++    if [ -d /r2e_tests ]; then
++        mv -T /r2e_tests "$r2e_test_dir"
++    elif [ -d "$r2e_test_link" ] && [ ! -L "$r2e_test_link" ]; then
++        mv -T "$r2e_test_link" "$r2e_test_dir"
++    else
++        echo 'R2E-Gym test directory is missing' >&2
++        exit 1
++    fi
++fi
++if [ -L "$r2e_test_dir/r2e_tests" ] && \
++   [ "$(readlink -f "$r2e_test_dir/r2e_tests")" = "$(readlink -f "$r2e_test_dir")" ]; then
++    unlink "$r2e_test_dir/r2e_tests"
++fi
++ln -sfnT "$r2e_test_dir" "$r2e_test_link"
++"""
++        output, exit_code = self.run("bash -c " + shlex.quote(command))
++        if exit_code != "0":
++            raise RuntimeError(f"R2E-Gym test directory setup failed: {output}")
+ 
+     def get_task_instruction(self) -> str:
+         # try getting the content inside of [ISSUE] [/ISSUE] using regex tags for ds['problem_statement'] else return ds['problem_statement']

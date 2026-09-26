@@ -12,13 +12,28 @@ from fastapi import FastAPI
 from ray import serve
 
 from relax.components.base import Base
+from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
-from relax.engine.sft.runtime import is_sft_mode, sft_partition_id, sft_task_name
+from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
 
 app = FastAPI()
+
+
+def _resolve_start_rollout_id(
+    configured_step: Optional[int],
+    backend_step: int,
+    *,
+    explicitly_set: bool,
+) -> int:
+    """Resolve the service step after the backend has loaded its checkpoint."""
+    if configured_step is None:
+        return backend_step
+    if not explicitly_set and configured_step == 0 and backend_step > 1:
+        return backend_step
+    return configured_step
 
 
 @serve.deployment(max_ongoing_requests=10, max_queued_requests=20)
@@ -69,10 +84,25 @@ class Actor(Base):
         )
 
         assert len(set(self.steps)) == 1
-        if self.config.start_rollout_id is None:
-            self.config.start_rollout_id = self.steps[0]
+        configured_step = self.config.start_rollout_id
+        self.config.start_rollout_id = _resolve_start_rollout_id(
+            configured_step,
+            self.steps[0],
+            explicitly_set=getattr(self.config, "_start_rollout_id_explicit", configured_step is not None),
+        )
+        if configured_step is not None and configured_step != self.config.start_rollout_id:
+            self._logger.warning(
+                "Checkpoint backend restored step %s; overriding auto-derived start_rollout_id=%s",
+                self.config.start_rollout_id,
+                configured_step,
+            )
         self.step = self.config.start_rollout_id
         self._logger.info(f"Actor initialized with starting step {self.step}")
+
+        # Wired by controller in colocate mode. In fully_async / hybrid both
+        # stay ``None`` and every barrier-guarded site short-circuits.
+        self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
+        self._peer_barrier: Optional[PeerStepBarrier] = None
 
     def set_rollout_manager(self, rollout_manager: Any) -> None:
         """Set the rollout manager and initialize weights."""
@@ -91,16 +121,26 @@ class Actor(Base):
         if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
             self.actor_model.update_weights()
 
-    def set_genrm_manager(self, genrm_manager: Any) -> None:
-        """Set the genRM manager for coordinated offload/onload.
+    def set_barriers(
+        self,
+        *,
+        rollout: Optional[RolloutOffloadBarrier] = None,
+        peers: Optional[PeerStepBarrier] = None,
+    ) -> None:
+        self._rollout_barrier = rollout
+        self._peer_barrier = peers
 
-        In colocated mode, the genRM manager is used to offload genRM engines
-        before training and onload them before rollout, since they share GPU
-        resources.
+    def set_genrm_manager(self, genrm_manager: Any) -> None:
+        """Set the genRM manager(s) for coordinated offload/onload.
+
+        ``genrm_manager`` is a list of manager handles -- one per genRM
+        instance (a single-instance config still passes a one-element list). In
+        colocated mode, they are used to offload genRM engines before training
+        and onload them before rollout, since they share GPU resources.
         """
         self.genrm_manager = genrm_manager
         self.actor_model.set_genrm_manager(self.genrm_manager)
-        self._logger.info("GenRM manager set on Actor for coordinated offload/onload")
+        self._logger.info("GenRM manager(s) set on Actor for coordinated offload/onload")
 
     def set_teacher_manager(self, teacher_manager: Any) -> None:
         """Set the managed OPD teacher manager for coordinated
@@ -124,10 +164,11 @@ class Actor(Base):
             if self._done_event is not None:
                 await self._done_event.wait()
             return
-        self.data_system_client.reset_consumption(
-            partition_id=sft_partition_id(self.config, self.step),
-            task_name=sft_task_name(self.config, component="actor"),
-        )
+        for partition_id in sft_partition_ids(self.config, self.step):
+            self.data_system_client.reset_consumption(
+                partition_id=partition_id,
+                task_name=sft_task_name(self.config, component="actor"),
+            )
         # Create an asyncio.Event bound to the current event loop so the
         # background thread can signal completion without blocking the loop.
         loop = asyncio.get_running_loop()
@@ -175,16 +216,14 @@ class Actor(Base):
                         continue
 
                 self._logger.info(f"Actor training step {local_step}/{self.config.num_rollout}")
-                self._execute_training()
+                did_train = self._execute_training()
 
                 self._logger.info(f"Actor training completed step {local_step}/{self.config.num_rollout}")
 
-                run(
-                    self.data_system_client.async_clear_partition(
-                        partition_id=sft_partition_id(self.config, local_step)
-                    )
-                )
-                self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
+                if did_train:
+                    for partition_id in sft_partition_ids(self.config, local_step):
+                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                    self._logger.info(f"Actor cleared data for step {local_step}/{self.config.num_rollout}")
 
                 try:
                     self.healthy.update_heartbeat.remote("actor", local_step + 1)
@@ -209,34 +248,64 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
+        partition_ids = sft_partition_ids(self.config, self.step)
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if partition_list is None or sft_partition_id(self.config, self.step) not in partition_list:
+        if partition_list is None or any(partition_id not in partition_list for partition_id in partition_ids):
             time.sleep(1)
             return False
 
-        # RL: poll rollout status — RL rollout runs async on the same GPUs, so
-        # we must wait for it to free them before training. SFT: skip the
-        # poll. The Megatron actor's per-step `requests.get("/predict")` is
-        # synchronous (rank 0 blocks until run_predict + offload returns), so
-        # by the time `_execute_training` returns there's no in-flight rollout
-        # work. Polling here would just deadlock if status ever drifted from
-        # "offload" — which has happened repeatedly across this debug session.
+        # Colocate: block until rollout(SGLang) has offloaded so wake_up/onload
+        # of actor weights doesn't collide with SGLang's static KV pool.
+        # SFT skips the barrier — its rollout is a passive HTTP server driven
+        # by /predict, no async GPU contention.
         if is_sft_mode(self.config):
             return True
-        if self.config.offload_rollout and ray.get(self.rollout_manager.get_status.remote()) == "onload":
-            time.sleep(1)
-            return False
+        if self.config.offload_rollout and self._rollout_barrier is not None:
+            self._rollout_barrier.wait_offloaded_sync()
+
+        # PPO colocate: also block until critic has finished this round
+        # (sleep + step increment) so critic's resident weights are off the
+        # shared card before actor wakes up. Skip during critic-only warmup —
+        # ``_execute_training`` handles that case explicitly.
+        if (
+            self._peer_barrier is not None
+            and not self._peer_barrier.is_empty()
+            and self.step >= getattr(self.config, "num_critic_only_steps", 0)
+        ):
+            self._peer_barrier.wait_completed_round_sync(self.step)
+
         return True
 
-    def _execute_training(self) -> None:
+    def _execute_training(self) -> bool:
         """Execute training for the current step.
 
         Handles critic-only phase, training method selection (sync vs async),
         and model saving based on configuration.
+
+        Returns:
+            True when actor training ran and this service owns partition cleanup.
         """
-        # Skip training during critic-only phase
+        # Skip training during critic-only phase.
+        # But we still must trigger actor.update_weights: it is the only path
+        # that calls rollout_manager.onload_weights / onload_kv on SGLang.
+        # Without it, SGLang's resume_memory_occupation only remaps the weight
+        # region — the contents are uninitialized, so the next rollout's
+        # generate produces garbage tokens. The NCCL broadcast inside
+        # update_weights is what actually populates SGLang's weight memory
+        # (push is idempotent since actor didn't train, but not optional).
         if self.step < self.config.num_critic_only_steps:
-            return
+            if (
+                getattr(self.config, "use_critic", False)
+                and getattr(self.config, "offload_rollout", False)
+                and (not self.config.fully_async or self.config.hybrid)
+            ):
+                # Wait for critic to finish this round before triggering
+                # update_weights, otherwise SGLang onload collides with
+                # critic still training on the same GPUs.
+                if self._peer_barrier is not None:
+                    self._peer_barrier.wait_completed_round_sync(self.step)
+                self.actor_model.update_weights()
+            return False
 
         # Use appropriate training method based on mode
         if self.config.hybrid:
@@ -248,6 +317,7 @@ class Actor(Base):
             self._maybe_save_model()
         else:
             ray.get(self.actor_model.async_train(self.step))
+        return True
 
     def _maybe_save_model(self) -> None:
         """Save model checkpoint if save interval is reached."""
@@ -283,21 +353,24 @@ class Actor(Base):
 
         try:
             # Check if rollout data is available for this step
-            partition_id = sft_partition_id(self.config, step)
+            partition_ids = sft_partition_ids(self.config, step)
             partition_list = run(self.data_system_client.async_get_partition_list())
 
-            if partition_list is not None and partition_id in partition_list:
+            if partition_list is not None and all(partition_id in partition_list for partition_id in partition_ids):
                 self._logger.info(f"Data available for step {step}, executing training")
 
                 # Execute training
-                self._execute_training()
+                did_train = self._execute_training()
 
                 # Only clear partition data if clear_data is True
-                if clear_data:
-                    run(self.data_system_client.async_clear_partition(partition_id=partition_id))
-                    self._logger.info(f"Cleared data partition: {partition_id}")
+                if clear_data and did_train:
+                    for partition_id in partition_ids:
+                        run(self.data_system_client.async_clear_partition(partition_id=partition_id))
+                    self._logger.info(f"Cleared data partitions: {partition_ids}")
+                elif clear_data:
+                    self._logger.info(f"Skipped clearing partitions after skipped actor step: {partition_ids}")
                 else:
-                    self._logger.info(f"Keeping data partition (clear_data=False): {partition_id}")
+                    self._logger.info(f"Keeping data partitions (clear_data=False): {partition_ids}")
 
                 metrics["data_consumed"] = True
                 metrics["elapsed_time"] = time.time() - start_time
@@ -306,7 +379,7 @@ class Actor(Base):
                 self._logger.warning(f"No data available for step {step}, skipping training")
                 metrics["data_consumed"] = False
                 metrics["success"] = True
-                metrics["message"] = f"No data in partition {partition_id}"
+                metrics["message"] = f"No data in partitions {partition_ids}"
 
         except Exception as e:
             self._logger.error(f"Training failed at step {step}: {e}")

@@ -11,6 +11,7 @@ This package provides a distributed checkpoint engine with:
 - Production-grade fault tolerance
 """
 
+from relax._version import get_versions
 from relax.distributed.checkpoint_service.backends import CommBackend, DeviceDirectBackend
 from relax.distributed.checkpoint_service.client import CheckpointEngineClient
 from relax.distributed.checkpoint_service.config import BackendType, DCSConfig, RoleInfo
@@ -18,7 +19,8 @@ from relax.distributed.checkpoint_service.coordinator import DCSCoordinator
 from relax.distributed.checkpoint_service.metrics import MetricsCollector
 
 
-__version__ = "0.1.0"
+__version__ = get_versions()["version"]
+del get_versions
 
 __all__ = [
     "DCSConfig",

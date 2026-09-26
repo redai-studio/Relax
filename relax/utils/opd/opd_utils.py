@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.distributed as dist
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_opsd_worker
 
@@ -167,9 +168,10 @@ def create_managed_opd_teacher_manager(
     from relax.distributed.ray.teacher_manager import TeacherManager
 
     teacher_manager = TeacherManager.options(
-        num_cpus=1,
-        num_gpus=0,
-        runtime_env=runtime_env,
+        **with_control_plane_affinity(
+            args,
+            {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+        )
     ).remote(
         args,
         num_replicas,
@@ -208,7 +210,10 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
             f"[OPD teacher] pre-building shared PG: actor={actor_gpus}, "
             f"rollout={args.resource['rollout'][1]}, teacher={args.resource['teacher'][1]}"
         )
-        shared_pg = create_placement_group(num_gpus=actor_gpus)
+        shared_pg = create_placement_group(
+            num_gpus=actor_gpus,
+            node_group_affinity=getattr(args, "enable_affinity", True),
+        )
 
     # args.resource["teacher"] = [num_cpus, num_gpus]. The teacher replica layout
     # is derived from the GPU total and --teacher-num-gpus-per-engine (TP per
@@ -284,14 +289,6 @@ def _start_managed_multi_teacher(
             f"Per-teacher GPUs ({gpus_per_teacher}) must be divisible by "
             f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
         )
-    replicas_per_teacher = gpus_per_teacher // gpus_per_replica
-
-    # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
-    # (same as the single-teacher colocate path). During training the actor uses
-    # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
-    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
-    # This requires rollout_gpus + total_teacher_gpus == actor_gpus.
-    from relax.core.service import create_placement_group
 
     if not is_managed_opd_teacher_colocate(args):
         raise ValueError(
@@ -299,6 +296,18 @@ def _start_managed_multi_teacher(
             "include both 'actor' and 'rollout' in --resource. Dedicated teacher GPUs "
             "are no longer supported."
         )
+
+    # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
+    # (same as the single-teacher colocate path). During training the actor uses
+    # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
+    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
+    # This requires rollout_gpus + total_teacher_gpus == actor_gpus. Both this
+    # placement-group import and TeacherManager's (below) pull in the full SGLang/
+    # transformers dependency chain, so they stay deferred until every ValueError
+    # check above has had a chance to short-circuit first.
+    from relax.core.service import create_placement_group
+    from relax.distributed.ray.multi_instance_orchestrator import start_multi_instance_managers
+    from relax.distributed.ray.teacher_manager import TeacherManager
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
@@ -311,66 +320,74 @@ def _start_managed_multi_teacher(
             f"--rollout-num-gpus 8 with resource['teacher'][1]=8."
         )
 
-    shared_pg = create_placement_group(num_gpus=actor_gpus)
+    shared_pg = create_placement_group(
+        num_gpus=actor_gpus,
+        node_group_affinity=getattr(args, "enable_affinity", True),
+    )
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
         f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
         f"({gpus_per_teacher} GPU/teacher)"
     )
-
     logger.info(
-        f"[MOPD teacher] launching {num_teachers} teachers x {replicas_per_teacher} replica(s), "
+        f"[MOPD teacher] launching {num_teachers} teachers x {gpus_per_teacher // gpus_per_replica} replica(s), "
         f"{gpus_per_replica} GPU(s)/replica, {gpus_per_teacher} GPU(s)/teacher, total={total_teacher_gpus}"
     )
 
-    from relax.distributed.ray.teacher_manager import TeacherManager
+    def _build_teacher_manager_args(base_args: Any, data_source: str, spec: dict) -> Any:
+        teacher_args = copy.copy(base_args)
+        teacher_args.teacher_hf_checkpoint = spec["checkpoint_path"]
+        return teacher_args
 
-    teacher_managers = []
-    url_routes: dict[str, list[str]] = {}
-
-    for teacher_idx, (data_source, checkpoint_path) in enumerate(routes_map.items()):
-        # Build per-teacher args with overridden model_path.
-        teacher_args = copy.copy(args)
-        teacher_args.teacher_hf_checkpoint = checkpoint_path
-
-        teacher_manager = TeacherManager.options(
-            num_cpus=1,
-            num_gpus=0,
-            runtime_env=runtime_env,
+    def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:
+        return TeacherManager.options(
+            **with_control_plane_affinity(
+                per_instance_args,
+                {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+            )
         ).remote(
-            teacher_args,
-            replicas_per_teacher,
+            per_instance_args,
+            spec["num_gpus"] // gpus_per_replica,
             gpus_per_replica,
-            # Share the actor PG; this teacher takes its own bundle slice after
-            # the rollout region.
             pg=shared_pg,
             shared_pg=True,
-            bundle_offset=(teacher_idx * gpus_per_teacher),
+            bundle_offset=bundle_offset,
         )
+
+    instance_specs = {
+        data_source: {"num_gpus": gpus_per_teacher, "checkpoint_path": ckpt}
+        for data_source, ckpt in routes_map.items()
+    }
+    managers = start_multi_instance_managers(
+        args=args,
+        instance_specs=instance_specs,
+        build_manager_args=_build_teacher_manager_args,
+        spawn_manager=_spawn_teacher_manager,
+        region_offset=0,
+    )
+
+    url_routes: dict[str, list[str]] = {}
+    for data_source, teacher_manager in managers.items():
         urls = list(ray.get(teacher_manager.get_urls.remote()))
         # Append /generate to match the route format expected by _pick_teacher_url.
         replica_urls = [(u if u.endswith("/generate") else u.rstrip("/") + "/generate") for u in urls]
-
         url_routes[data_source] = replica_urls
-        teacher_managers.append(teacher_manager)
         logger.info(
-            f"[MOPD teacher] '{data_source}' → {checkpoint_path} "
-            f"({replicas_per_teacher} replica(s), {gpus_per_replica} GPU(s) each) → {replica_urls}"
+            f"[MOPD teacher] '{data_source}' → {routes_map[data_source]} "
+            f"({len(replica_urls)} replica(s), {gpus_per_replica} GPU(s) each) → {replica_urls}"
         )
-
-    # Offload all teachers so the actor can load for the first training step. They
-    # are onloaded/offloaded in lock-step with the actor thereafter.
-    if getattr(args, "offload_rollout", False):
-        ray.get([tm.offload.remote() for tm in teacher_managers])
 
     # Inject the routes map so per-sample routing works via _pick_teacher_url.
     args.opd_teacher_routes_map = url_routes
-    opd_teacher_key = getattr(args, "opd_teacher_key", "data_source")
+    opd_teacher_key = getattr(args, "opd_teacher_key", None) or "data_source"
     logger.info(f"[MOPD teacher] all teachers ready. key='{opd_teacher_key}', routes={list(url_routes.keys())}")
 
     # Return the shared PG so the controller reuses it for actor/rollout. Second
-    # element is the list of managers for shutdown / offload-onload lock-step.
-    return shared_pg, teacher_managers
+    # element is the list of managers for shutdown / offload-onload lock-step --
+    # start_multi_instance_managers returns a dict, so convert back to preserve
+    # this function's existing (pg, list[manager]) contract for callers that use
+    # isinstance(x, list) to normalize single- vs multi-teacher shapes.
+    return shared_pg, list(managers.values())
 
 
 async def set_managed_opd_teacher_on_actor_service(actor_service: Any, teacher_manager: Any, args: Any) -> None:
@@ -518,8 +535,12 @@ def add_opd_arguments(parser: Any) -> Any:
     parser.add_argument(
         "--opd-teacher-key",
         type=str,
-        default="data_source",
-        help=("Sample metadata field used as the routing key for --opd-teacher-routes. Default: 'data_source'."),
+        default=None,
+        help=(
+            "Sample metadata field used as the routing key for --opd-teacher-routes. "
+            "Falls back to 'data_source' when OPD is enabled; kept None by default so "
+            "compute_mopd_metrics stays a no-op (no per-source logging) in non-OPD runs."
+        ),
     )
     parser.add_argument(
         "--teacher-hf-checkpoint",
@@ -676,6 +697,14 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
 
     if not getattr(args, "use_opd", False):
         return
+
+    # OPD is enabled here. Backfill the routing key so teacher routing AND the
+    # per-source metrics (compute_mopd_metrics) get a consistent value even when
+    # the user didn't pass --opd-teacher-key. The arg default stays None so that
+    # compute_mopd_metrics remains a no-op in non-OPD runs.
+    if getattr(args, "opd_teacher_key", None) is None:
+        args.opd_teacher_key = "data_source"
+
     if args.opd_type is None:
         raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
     if args.opd_teacher_timeout_s <= 0:
@@ -778,7 +807,7 @@ def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> No
             log.info(
                 "MOPD managed multi-teacher enabled: %d teachers, key='%s', sources=%s",
                 len(routes_map),
-                getattr(args, "opd_teacher_key", "data_source"),
+                getattr(args, "opd_teacher_key", None) or "data_source",
                 list(routes_map.keys()),
             )
             if getattr(args, "teacher_hf_checkpoint", None) is not None:
@@ -1475,15 +1504,23 @@ def compute_mopd_metrics(args: Namespace, all_samples: list) -> dict:
 
         teacher_lp_seq: list[float] = []
         student_lp_seq: list[float] = []
+        gap_seq: list[float] = []
         rkl_seq: list[float] = []
 
         for s in samples:
             t_lp = s.teacher_log_probs
             s_lp = s.rollout_log_probs
-            if t_lp and len(t_lp) > 0:
-                teacher_lp_seq.append(sum(t_lp) / len(t_lp))
-            if s_lp and len(s_lp) > 0:
-                student_lp_seq.append(sum(s_lp) / len(s_lp))
+            t_mean = sum(t_lp) / len(t_lp) if t_lp and len(t_lp) > 0 else None
+            s_mean = sum(s_lp) / len(s_lp) if s_lp and len(s_lp) > 0 else None
+            if t_mean is not None:
+                teacher_lp_seq.append(t_mean)
+            if s_mean is not None:
+                student_lp_seq.append(s_mean)
+            # Pair gap/rkl per-sample: only when THIS sample has both teacher and
+            # student log probs, so the values stay aligned to one sample (the
+            # marginal teacher_lp_seq/student_lp_seq lists can differ in membership).
+            if t_mean is not None and s_mean is not None:
+                gap_seq.append(s_mean - t_mean)
             if t_lp and s_lp:
                 n_tok = min(len(t_lp), len(s_lp))
                 if n_tok > 0:
@@ -1493,10 +1530,8 @@ def compute_mopd_metrics(args: Namespace, all_samples: list) -> dict:
             log_dict[prefix + "teacher_logp"] = sum(teacher_lp_seq) / len(teacher_lp_seq)
         if student_lp_seq:
             log_dict[prefix + "student_logp"] = sum(student_lp_seq) / len(student_lp_seq)
-        if teacher_lp_seq and student_lp_seq and len(teacher_lp_seq) == len(student_lp_seq):
-            log_dict[prefix + "logp_gap"] = sum(s - t for s, t in zip(student_lp_seq, teacher_lp_seq)) / len(
-                teacher_lp_seq
-            )
+        if gap_seq:
+            log_dict[prefix + "logp_gap"] = sum(gap_seq) / len(gap_seq)
         if rkl_seq:
             log_dict[prefix + "rkl_approx"] = sum(rkl_seq) / len(rkl_seq)
 

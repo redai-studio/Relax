@@ -2,13 +2,17 @@
 
 """Unit tests for multimodal preprocessing wrapper."""
 
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from relax.engine.sft.dataset.multimodal import (
+    SFTMultimodalMediaLoadError,
+    _fetch_media,
     has_multimodal_content,
     preprocess_multimodal,
     preprocess_multimodal_async,
@@ -17,6 +21,18 @@ from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
     CanonicalSample,
 )
+
+
+@pytest.fixture(autouse=True)
+def stub_processor_pool_module(monkeypatch):
+    processor_pool = ModuleType("relax.utils.data.processor_pool")
+    processor_pool.prepare_mm_inputs_for_ipc = MagicMock(side_effect=lambda mm_inputs: mm_inputs)
+    processor_pool.process_sample_in_worker = MagicMock()
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", processor_pool)
+
+    import relax.utils.data as data_package
+
+    monkeypatch.setattr(data_package, "processor_pool", processor_pool, raising=False)
 
 
 def _text_sample():
@@ -85,6 +101,20 @@ def test_preprocess_image_calls_processor_pool():
 def test_preprocess_without_pool_when_multimodal_raises():
     with pytest.raises(ValueError, match="processor_pool"):
         preprocess_multimodal(_image_sample(), processor_pool=None)
+
+
+def test_preprocess_wraps_media_loader_error(monkeypatch):
+    load_image = MagicMock(side_effect=AssertionError("missing"))
+    for kind in ("image", "video", "audio"):
+        module_name = f"relax.utils.multimodal.{kind}_utils"
+        loader_module = ModuleType(module_name)
+        setattr(loader_module, f"load_{kind}", load_image if kind == "image" else MagicMock())
+        monkeypatch.setitem(sys.modules, module_name, loader_module)
+
+    with pytest.raises(SFTMultimodalMediaLoadError, match=r"image position=0.*row_index=0") as exc_info:
+        _fetch_media(_image_sample(), "<image>")
+    load_image.assert_called_once_with("/tmp/cat.png")
+    assert isinstance(exc_info.value.__cause__, AssertionError)
 
 
 @pytest.mark.asyncio

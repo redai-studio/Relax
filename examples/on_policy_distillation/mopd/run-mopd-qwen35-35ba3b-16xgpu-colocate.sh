@@ -5,13 +5,23 @@
 # Multi-Teacher OPD (MOPD), 2-node 16 GPU colocate:
 #   student : Qwen3.5-35B-A3B,  actor(16) + rollout(8) colocate, TP=4 PP=2 EP=8
 #   teacher : one per data_source, shares the actor GPU pool (colocate)
-#     dapo-math-17k       -> Qwen3.6-27B  (text, 4 GPU TP=4)
-#     multimodal-open-r1  -> Qwen3.5-27B  (VL,   4 GPU TP=4)
+#     dapo-math-17k       -> Qwen3.6-27B  (text, 4 GPU = 2 replicas TP=2)
+#     multimodal-open-r1  -> Qwen3.5-27B  (VL,   4 GPU = 2 replicas TP=2)
 #
 # Colocate GPU layout (2 nodes × 8 GPU, one shared placement group):
 #   training : student actor uses ALL 16 GPUs (TP=4 PP=2 EP=8, DP=2)
-#   rollout  : GPU 0-7 student rollout (TP=8) | GPU 8-15 teachers
-#   teachers : GPU 8-11 text Qwen3.6-27B (TP=4) | GPU 12-15 VL Qwen3.5-27B (TP=4)
+#   rollout  : GPU 0-7 student rollout (2 engines TP=4) | GPU 8-15 teachers
+#   teachers : GPU 8-9 + 10-11 text Qwen3.6-27B | GPU 12-13 + 14-15 VL Qwen3.5-27B
+#
+# Why replicas instead of one wide engine per role: each engine has a single
+# scheduler with a bounded per-iteration prefill budget (chunked-prefill-size),
+# so a step's requests queue up behind it; splitting the same GPUs into more
+# engines gives independent schedulers and divides per-engine concurrency.
+# Requests round-robin across a teacher's replicas (_pick_teacher_url).
+# chunked-prefill-size is raised to 16384 (sglang's max_prefill_tokens ceiling)
+# for student and teachers alike: long multi-image prompts overflow the default
+# budget, which pins prefill at one sequence per iteration and needs many more
+# passes per request.
 # Constraint (enforced): rollout_gpus(8) + teacher_gpus(8) == actor_gpus(16).
 # Teachers live inside the actor placement group and offload/onload in lock-step
 # with training. Training the student on all 16 GPUs (TP=4 PP=2) is what fixes
@@ -28,7 +38,9 @@ set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
 export RELAX_OPD_PREEXPANDED_PATCH=1
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH"
+export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
+export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}RELAX_OPD_PREEXPANDED_PATCH,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -49,18 +61,12 @@ STUDENT_MODEL_NAME="${STUDENT_MODEL_NAME:-Qwen3.5-35B-A3B}"
 TEXT_TEACHER_MODEL_NAME="${TEXT_TEACHER_MODEL_NAME:-Qwen3.6-27B}"
 VL_TEACHER_MODEL_NAME="${VL_TEACHER_MODEL_NAME:-Qwen3.5-27B}"
 PROMPT_SET="${PROMPT_SET:-${DATA_DIR}/MOPD-35B/train.parquet}"
-# Derive eval set from PROMPT_SET's directory so overriding PROMPT_SET alone is
-# enough. Use the small 50-sample balanced subset (25 text + 25 VL) for fast
-# monitoring; point EVAL_SET at test.parquet for a full 1254-sample eval.
 EVAL_SET="${EVAL_SET:-${PROMPT_SET%/*}/test_small.parquet}"
 
-# GPU allocation (colocate: rollout + teacher == actor):
-#   student colocate: 16 GPU actor (TP=4, PP=2, EP=8 → DP=2); rollout uses 8 GPU
-#   teacher total:     8 GPU  (4 per teacher, TEACHER_NUM_GPUS_PER_ENGINE=4 → TP=4 each)
 ACTOR_GPUS="${ACTOR_GPUS:-16}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-8}"
 TEACHER_GPUS="${TEACHER_GPUS:-8}"
-TEACHER_NUM_GPUS_PER_ENGINE="${TEACHER_NUM_GPUS_PER_ENGINE:-4}"
+TEACHER_NUM_GPUS_PER_ENGINE="${TEACHER_NUM_GPUS_PER_ENGINE:-2}"
 
 CKPT_ARGS=(
    --hf-checkpoint "${MODEL_DIR}/${STUDENT_MODEL_NAME}/"
@@ -69,10 +75,6 @@ CKPT_ARGS=(
    # --save-interval 100
 )
 
-# global_batch_size = samples per optimizer step; must divide
-# total_samples = rollout_batch_size(16) × n_samples_per_prompt(8) = 128.
-# GBS=128 → num_rollout_minis=1; 128 samples / dp=2 = 64 per DP rank ✓.
-# NOTE: GBS does NOT include DP (dp=ACTOR_GPUS/(TP×PP)=16/(4×2)=2).
 ROLLOUT_ARGS=(
    --prompt-data "${PROMPT_SET}"
    --input-key prompt
@@ -95,8 +97,6 @@ ROLLOUT_ARGS=(
    --use-streaming-dataset
 )
 
-# Teacher routes: data_source → HF checkpoint path.
-# TEACHER_NUM_GPUS_PER_ENGINE=4 → each teacher gets 1 replica (TP=4).
 TEACHER_ROUTES="{\"dapo-math-17k\":\"${MODEL_DIR}/${TEXT_TEACHER_MODEL_NAME}/\",\"multimodal-open-r1\":\"${MODEL_DIR}/${VL_TEACHER_MODEL_NAME}/\"}"
 
 OPD_ARGS=(
@@ -108,17 +108,12 @@ OPD_ARGS=(
    --opd-teacher-key data_source
    --opd-teacher-routes "${TEACHER_ROUTES}"
    --teacher-num-gpus-per-engine "${TEACHER_NUM_GPUS_PER_ENGINE}"
-   # student_sampled (default) keeps the teacher's per-position output to a single
-   # logprob, so the 8192-token logprob forward is far lighter than top-k=64. That
-   # frees enough memory to raise the static pool back to 0.65 for larger prefill
-   # batching (avoids the 1-seq-at-a-time slowdown), while chunked-prefill=4096
-   # bounds the per-chunk logits allocation to stay clear of OOM.
-   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.65}"
-   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-4096}"
+   --teacher-sglang-mem-fraction-static "${TEACHER_MEM_FRACTION:-0.5}"
+   --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-16384}"
    --teacher-sglang-max-running-requests "${TEACHER_MAX_RUNNING_REQUESTS:-128}"
    --teacher-sglang-disable-cuda-graph
    --opd-log-prob-min-clamp -10.0
-   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-600}"
+   --opd-teacher-timeout-s "${OPD_TEACHER_TIMEOUT_S:-1200}"
    --opd-teacher-image-key images
    --use-rollout-logprobs
 )
@@ -170,16 +165,6 @@ MISC_ARGS=(
    --no-rope-fusion
 )
 
-# Student on 16 GPU: TP=4, PP=2, EP=8, ETP=1, CP=1. Mirrors the proven text recipe
-# scripts/training/text/run-qwen35-35B-A3B-16xgpu.sh:
-#   - PP=2 splits the layers into 2 pipeline stages → ~half the per-GPU weight +
-#     activation vs a single-stage layout (this is what removes the 8-GPU
-#     grad-norm OOM).
-#   - TP=4 shards each layer across 4 GPUs; EP=8 shards all 256 experts (32/GPU).
-#   - DP = 16/(TP4×PP2) = 2.
-# Recompute kept ON for extra headroom (MOPD adds the student-logprob forward).
-# Teachers share the actor placement group (colocate); rollout SGLang: 1 engine
-# × TP=8 over the front-8 rollout region.
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --expert-model-parallel-size 8
@@ -192,10 +177,6 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
    --use-dynamic-batch-size
-   # 10240 = max prompt (~2048) + max response (8192): just fits the longest
-   # single sequence per microbatch without extra packing, minimizing peak
-   # logits/activation memory. log-probs forward is capped the same so the OPD
-   # student-logprob pass does not materialize an oversized [tokens, vocab] tensor.
    --max-tokens-per-gpu 10240
    --log-probs-max-tokens-per-gpu 10240
    --moe-flex-dispatcher-backend deepep
@@ -203,27 +184,14 @@ PERF_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 8
-   # 0.6 (down from 0.7): colocate leaves ~7.7GB of actor residual on each GPU
-   # after offload; at 0.7 the static pool + residual left only ~7.4GB free and
-   # the --use-rollout-logprobs logits tensor (~7.5GB for a large prefill batch)
-   # OOMed by ~50MB at step 15. 0.6 frees ~8GB → ~2x headroom on that alloc.
+   --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.6
-   # Hard cap on concurrent requests so the per-forward logprob logits tensor
-   # (positions x vocab) stays bounded regardless of over-sampling burst.
+   --sglang-chunked-prefill-size 16384
    --sglang-max-running-requests 128
    --sglang-load-format dummy
    --sglang-enable-weights-cpu-backup
-   --sglang-disable-cuda-graph
 )
 
-# Partial rollout: over-sample prompts and abort the slowest (longest) in-flight
-# generations once the batch fills; aborted sequences continue next step
-# (off-policy tokens masked). Caps the number of near-max-length (8192) sequences
-# in each training microbatch -> bounds the optimizer-step activation peak that
-# was OOMing grad-norm at step ~28, WITHOUT truncating responses (they finish
-# across steps). Mirrors the working 35B GRPO reference. OPD-compatible: aborted
-# samples skip teacher scoring.
 PARTIAL_ROLLOUT_ARGS=(
    --partial-rollout
    --over-sampling-batch-size 24

@@ -87,9 +87,8 @@ _IPC_SUFFIX_BUDGET = 8
 # Historical TCP-only failure mode: `jupyter_client.write_connection_file`
 # allocated 5 ZMQ ports via a bind→close→write→ipykernel-rebind dance, racy
 # under concurrency. Switched to AF_UNIX (IPC) transport so this marker is
-# no longer expected to fire. The detection + retry path is preserved as a
-# safety net in case some host path (e.g. a config that overrides transport
-# back to TCP) reintroduces port binding.
+# no longer expected to fire. The bounded detection and retry path remains for
+# any EADDRINUSE reported during kernel startup.
 _ZMQ_EADDRINUSE_MARKERS = ("Address already in use", "EADDRINUSE")
 # jupyter_client.AsyncKernelClient.wait_for_ready raises this exact RuntimeError
 # when its first kernel_info reply doesn't return within the heartbeat window.
@@ -324,7 +323,6 @@ class ApptainerJupyterBackend(BaseSandbox):
                     stdout=stdout_fh,
                     stderr=stderr_fh,
                     stdin=asyncio.subprocess.DEVNULL,
-                    start_new_session=True,
                 )
             finally:
                 stderr_fh.close()

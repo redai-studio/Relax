@@ -342,7 +342,9 @@ class DeepEyesV2Env:
                         relax_img_dir=RELAX_IMAGES_DIR,
                         relax_inputs_dir=RELAX_INPUTS_DIR,
                     )
-                await session.run_code(init_code, timeout=self._code_timeout_s)
+                result = await session.run_code(init_code, timeout=self._code_timeout_s)
+                if result.status != "success":
+                    raise SandboxError(f"sandbox initialization {result.status}")
             except BaseException:
                 # Clean up the half-built session before re-raising; mirrors
                 # xide's bootstrap. Logged in close() if the exit itself fails.
@@ -367,6 +369,7 @@ class DeepEyesV2Env:
             logger.error(f"[deepeyes-v2] {self.data_index} sandbox.run_code failed: {exc!r}")
             return None
         if result.status == "timeout":
+            await self.close()
             return {"stdout": "", "stderr": "Execution timed out.", "status": "error", "images": []}
 
         stdout = _clip_chars(result.stdout, MAX_STDOUT_CHARS, "stdout")

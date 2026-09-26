@@ -30,22 +30,16 @@ export DATA_DIR="${DATA_DIR:-/workspace}"
 export PROJECT_NAME=Relax-Qwen3.5-35B-P800
 export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
 
-export MEGATRON=${WORKDIR}/Megatron-LM
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export RL_MODEL_TYPE="Qwen35_35B_text"
+export XMLIR_USE_HYDRA_LINEAR=${XMLIR_USE_HYDRA_LINEAR:-1}
+export XMLIR_ENABLE_FAST_FC=${XMLIR_ENABLE_FAST_FC:-1}
+export XMLIR_MEMCPY_RETRY_SYNC=${XMLIR_MEMCPY_RETRY_SYNC:-true}
 
-export XMLIR_USE_HYDRA_LINEAR=1
-export XMLIR_ENABLE_FAST_FC=1
-export XTE_DISABLE_MOE_DW_FUSION=0
-
-export RELAX_SKIP_TORCH_MEMORY_SAVER=1
-export XMLIR_MEMCPY_RETRY_SYNC=true
-export CUDA_ENABLE_P2P_NO_UVA=0
-export CUDA_FAKE_UVA_ENABLE=1
-export CUDA_ERROR_LEVEL=0
-export XPU_SUPPORT_IPC_EVENT=1
-export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-"eth0"}
-export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-"eth0"}
-export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-"bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7"}
-
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}
+export TP_SOCKET_IFNAME=${TP_SOCKET_IFNAME:-eth0}
+export BKCL_RDMA_NICS=${BKCL_RDMA_NICS:-bond0,bond1,bond2,bond3,bond4,bond5,bond6,bond7}
 
 unset http_proxy
 unset https_proxy
@@ -153,7 +147,6 @@ OPTIMIZER_ARGS=(
    --moe-aux-loss-coeff 0.0
 )
 
-# 昆仑 XPU 专用 SGLang 参数 + 35B 推理 TP=2
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-mem-fraction-static 0.7
@@ -192,109 +185,7 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-RUNTIME_ENV_JSON="{
-  \"env_vars\": {
-    \"PYTHONPATH\": \"${WORKDIR}/TransferQueue:${WORKDIR}/Megatron-LM/:${SCRIPT_DIR}:${WORKDIR}/Megatron-Bridge/src/:$PYTHONPATH\",
-    \"LD_LIBRARY_PATH\":\"${CONDA_PREFIX}/xcudart/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/xtorch_ops:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/:${CONDA_PREFIX}/lib/python3.10/site-packages/torch_xmlir/xre/so\",
-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"OPENBLAS_NUM_THREADS\": \"64\",
-    \"OMP_NUM_THREADS\": \"64\",
-    \"TOKENIZERS_PARALLELISM\": \"true\",
-    \"NCCL_CUMEM_ENABLE\": \"0\",
-    \"NCCL_SOCKET_IFNAME\": \"eth0\",
-    \"NCCL_IB_HCA\": \"mlx5\",
-    \"NCCL_IB_GID_INDEX\": \"3\",
-    \"CUDA_DEVICE_ORDER\": \"OAM_ID\",
-    \"CUDA_ENABLE_P2P_NO_UVA\": \"0\",
-    \"CUDA_FAKE_UVA_ENABLE\": \"1\",
-    \"CUDART_DUMMY_REGISTER\": \"1\",
-    \"XPU_FORCE_USERMODE_LAUNCH\": \"1\",
-    \"XMLIR_DIST_SINGLETON_STREAM\": \"true\",
-    \"CUDA_VISIBLE_DEVICES\": \"0,1,2,3,4,5,6,7\",
-    \"XPU_VISIBLE_DEVICES\": \"0,1,2,3,4,5,6,7\",
-    \"XMLIR_FA_GEMM_TYPE\": \"float\",
-    \"XBLAS_FC_HBM_VERSION\": \"40\",
-    \"XMLIR_ENABLE_FAST_FC\": \"1\",
-    \"XMLIR_USE_HYDRA_LINEAR\": \"1\",
-    \"XTE_DISABLE_MOE_DW_FUSION\": \"0\",
-    \"XMLIR_PARALLEL_SAVE_MEMORY\": \"false\",
-    \"XMLIR_DISABLE_CUDA_ALLOCATOR\": \"false\",
-    \"XMLIR_XDNN_PYTORCH_CHECK_ENABLE_FALLBACK_BOOL\": \"0\",
-    \"XMLIR_ENABLE_FALLBACK_TO_CPU_BOOL\": \"False\",
-    \"XMLIR_DUMP_FALLBACK_OP_LIST_BOOL\": \"true\",
-    \"XMLIR_DIST_ASYNC_ISEND_IRECV\": \"false\",
-    \"XMLIR_BATCH_PARALLEL\": \"false\",
-    \"XPU_FORCE_SHARED_DEVICE_CONTEXT\": \"1\",
-    \"BKCL_RDMA_PROXY_DISABLE\": \"1\",
-    \"BKCL_USE_AR\": \"1\",
-    \"BKCL_RING_OPT\": \"1\",
-    \"BKCL_FLAT_RING\": \"1\",
-    \"BKCL_CCIX_RING\": \"1\",
-    \"BKCL_TREE_THRESHOLD\": \"1048576\",
-    \"BKCL_CCIX_BUFFER_GM\": \"1\",
-    \"BKCL_FORCE_L3_RDMA\": \"0\",
-    \"BKCL_RING_BUFFER_GM\": \"1\",
-    \"BKCL_ENABLE_XDR\": \"1\",
-    \"BKCL_RDMA_FORCE_TREE\": \"1\",
-    \"BKCL_XLINK_D2D\": \"0\",
-    \"BKCL_XLINK_ETH\": \"0\",
-    \"BKCL_XLINK_C2C\": \"1\",
-    \"BKCL_TRANS_UNSUPPORTED_DATATYPE\": \"1\",
-    \"BKCL_KL3_TURBO_MODE\": \"1\",
-    \"BKCL_RING_BUFFER_SIZE\": \"2097152\",
-    \"ALLREDUCE_ASYNC\": \"false\",
-    \"ALLGATHER_ASYNC\": \"false\",
-    \"ALLREDUCE_FUSION\": \"0\",
-    \"BKCL_TIMEOUT\": \"400000\",
-    \"CUDA_DISABLE_PRINTF\": \"1\",
-    \"BKCL_RDMA_VERBS\": \"1\",
-    \"BKCL_RDMA_NICS\": \"${BKCL_RDMA_NICS}\",
-    \"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES\": \"1\",
-    \"TORCH_XCCL_DEFAUTL_PG_TIMEOUT_MILSEC\": \"7200000\",
-    \"CUDA_ERROR_LEVEL\": \"0\",
-    \"HYDRA_FULL_ERROR\": \"1\",
-    \"XMLIR_ENABLE_NEW_PG\": \"1\",
-    \"TORCH_XCCL_HEARTBEAT_TIMEOUT_SEC\": \"1800\",
-    \"TORCH_XCCL_ENABLE_TIMING\": \"1\",
-    \"TORCH_FR_BUFFER_SIZE\": \"2000\",
-    \"TORCH_XCCL_TRACE_BUFFER_SIZE\": \"2000\",
-    \"VERL_LOGGING_LEVEL\": \"DEBUG\",
-    \"BKCL_ALL_TO_ALL_OPT\": \"1\",
-    \"SGLANG_IS_FLASHINFER_AVAILABLE\": \"false\",
-    \"USE_MOE_FC_V3\": \"1\",
-    \"XMLIR_DIST_SINGLETON_STREAM\": \"1\",
-    \"SGL_CPU_QUANTIZATION\": \"0\",
-    \"XSGL_ENABLE_MEM_SAVER\": \"0\",
-    \"XPU_ENABLE_CTX_LAZY_INIT\": \"1\",
-    \"XPU_SUPPORT_IPC_EVENT\": \"1\",
-    \"XSGL_USE_TORCH_CAUSAL_CONV\": \"1\",
-    \"TRACE_WEIGHT_PATHS\": \"0\",
-    \"TRITON_SKIP_AUTOTUNE\": \"1\",
-    \"FLA_USE_NAIVE\": \"1\",
-    \"FORCE_DISABLE_FLA\": \"1\",
-    \"DUMP_CONVERTED_WEIGHTS_DIR\": \"\",
-    \"DISABLE_CAST_CACHE\": \"1\",
-    \"USE_FUSED_GATED_DELTA_RULE\": \"1\",
-    \"XSGL_TRANSPOSE_SSM_STATE\": \"1\",
-    \"XSGL_TRANSPOSE_CONV_STATE\": \"1\",
-    \"XSGL_FUSE_SPLIT_NORM_ROPE_NEOX\": \"1\",
-    \"XSGL_MOE_UNSTABLE_TOPK\": \"1\",
-    \"XPU_FLASH_ATTENTION_DECODER_USE_BALANCE\": \"1\",
-    \"XMLIR_FORCE_USE_XPU_GRAPH\": \"1\",
-    \"FLASH_TMS_OPT_STATES_INIT\": \"none\",
-    \"FLASH_TMS_CHUNK_SIZE_MB\": \"256\",
-    \"FLASH_TMS_USE_SEPARATE_STREAM\": \"1\",
-    \"SLIME_LAYER_SNAPSHOT\": \"0\",
-    \"RAY_OVERRIDE_JOB_RUNTIME_ENV\":\"1\",
-    \"RELAX_SKIP_TORCH_MEMORY_SAVER\": \"1\",
-    \"XMLIR_MEMCPY_RETRY_SYNC\": \"${XMLIR_MEMCPY_RETRY_SYNC}\",
-    \"HYDRAX_USE_PROTEUS\": \"0\",
-    \"GLOO_SOCKET_IFNAME\": \"${GLOO_SOCKET_IFNAME}\",
-    \"TP_SOCKET_IFNAME\": \"${TP_SOCKET_IFNAME}\",
-    \"NVTE_DEBUG\": \"1\",
-    \"NVTE_DEBUG_LEVEL\": \"1\"
-   }
-}"
+source "${SCRIPT_DIR}/../../entrypoint/runtime-env-klx.sh"
 
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
@@ -306,6 +197,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --max-staleness 0 \
    --num-data-storage-units 1 \
    --use-health-check \
+   --selective-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \

@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 
 from relax.utils.data.mask_utils import get_response_lengths
 from relax.utils.http_utils import post
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.types import Sample
 
 from .radix_tree import StringRadixTrie
@@ -63,6 +64,7 @@ class RadixTreeMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.router = router
         self.args = router.args
+        prepare_model_maybe_update_args(self.args, completeness="metadata")
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
         self.radix_tree = StringRadixTrie(max_cache_size=10000, tokenizer=self.tokenizer, verbose=False)
         self.router.radix_tree = self.radix_tree

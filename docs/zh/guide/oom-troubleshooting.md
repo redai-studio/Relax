@@ -233,6 +233,36 @@ Relax 预留内存以防止碎片化。调整预留量：
 
 类似地可以使用 `--decoder-last-pipeline-num-layers` 单独减少最后一个 stage 的层数。调整时建议小步迭代，每次只移动 1~2 层并观察各 stage 的显存水位。
 
+### 13. 启用 `expandable_segments`（需要 `--selective-offload`）
+
+`expandable_segments:True` 可以缓解碎片化，但它**与 `torch_memory_saver` 不兼容**——后者是 `--offload-train` 默认使用的机制。TMS 无法追踪基于 VMM 的 expandable segment，而且它的 hook 由预加载 `.so` 内部的 `TMS_INIT_ENABLE` 在任何 Python 代码执行之前武装，所以它自带的检查根本不会运行。你拿到的是一行裸的驱动错误，而不是可读的提示：
+
+```
+[torch_memory_saver.cpp] CUresult error: 1 (invalid argument) file=csrc/utils.h func=cu_mem_create line=169
+```
+
+满足两个条件即可使用：
+
+1. **使用 `--selective-offload`** —— 应用层 offload，完全不加载 `torch_memory_saver` hook，冲突随之消失。
+2. **用 `--train-env-vars` 把变量限定到训练 actor**，而不是写进 `RUNTIME_ENV_JSON`：
+
+```bash
+--selective-offload \
+--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' \
+```
+
+`--train-env-vars` 只会合并进训练 actor 的环境，不会进入 rollout 的环境，因此 SGLang 那边仍然正常使用 `torch_memory_saver`。
+
+::: danger
+**不要**把 `expandable_segments:True` 放进 `RUNTIME_ENV_JSON`——那份环境是全局的，rollout worker 也会拿到。SGLang 的 `release_memory_occupation` / `resume_memory_occupation`（由 `--offload-rollout` 启用）依赖 `torch_memory_saver` 且**没有退路**，推理侧的 offload 会直接失效。
+:::
+
+::: tip
+torch 2.9 已将 `PYTORCH_CUDA_ALLOC_CONF` 标记为废弃，建议改用 `PYTORCH_ALLOC_CONF`。注意 `torch_memory_saver` 自带的检查只识别旧名字，所以用新名字时它完全不会报警。
+:::
+
+colocate 的权重同步通过 CUDA IPC 与 SGLang 共享 tensor，expandable segment 的 tensor 通过 `pidfd_open`/`pidfd_getfd` 传递句柄——在常规内核和容器下可以正常工作。只有 ptrace 策略被加固时才会失败，报错形式为 `Tensors allocated with expandable_segments:True cannot be shared between processes`。
+
 ---
 
 ## 特定阶段的 OOM
@@ -297,6 +327,7 @@ Relax 预留内存以防止碎片化。调整预留量：
 | 调整内存预留 | `--train-memory-margin-bytes <字节数>` |
 | SGLang 显存（colocate） | `--sglang-mem-fraction-static <比例>` |
 | 平衡 PP stage 层数 | `--decoder-first-pipeline-num-layers <层数>` |
+| 缓解显存碎片 | `--selective-offload` + `--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'` |
 
 ---
 

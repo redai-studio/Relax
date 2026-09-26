@@ -1,6 +1,6 @@
 # 在线策略蒸馏 (OPD)
 
-在线策略蒸馏 (OPD) 通过在学生模型自身的回滚数据上训练学生，同时匹配教师的词元级对数概率，实现从大型教师模型到小型学生模型的知识迁移。OPD 与优势估计器正交——它作为 KL 惩罚项，可以与任何估计器（GRPO、GSPO、SAPO，以及实验性的 PPO 和 REINFORCE++）结合使用。
+在线策略蒸馏 (OPD) 通过在学生模型自身的回滚数据上训练学生，同时匹配教师的词元级对数概率，实现从大型教师模型到小型学生模型的知识迁移。OPD 与优势估计器正交——它作为 KL 惩罚项，可以与任何估计器结合使用，包括 PPO、GRPO、GSPO、SAPO、CISPO 和 REINFORCE++。
 
 ## 关键参数
 
@@ -29,7 +29,7 @@ OPD 通过计算教师与学生之间的 token 级 KL 散度，将蒸馏信号�
 - **Advantage 模式（adv）**：将 KL 从 advantage 中减去（通过 `--opd-kl-coef` 设置）
 - **Loss 模式（loss）**：将 KL 作为额外 loss 项（通过 `--opd-loss-coef` 设置）
 
-两种方式只能选其一，不能同时启用。OPD 与优势估计器正交，可以与任何估计器（GRPO、GSPO、SAPO，以及实验性的 PPO 和 REINFORCE++）结合使用。
+两种方式只能选其一，不能同时启用。OPD 与优势估计器正交，可以与任何估计器结合使用，包括 PPO、GRPO、GSPO、SAPO、CISPO 和 REINFORCE++。
 
 ## Token-Selection 模式
 
@@ -56,7 +56,7 @@ $$\hat{A}_t = A_t - \lambda_{\text{opd}} \cdot D_{\text{KL}}(P_{\text{teacher}} 
 
 - KL 项使用 `.detach()`，**不产生梯度**
 - 仅影响 advantage 估计，不改变 loss 函数形式
-- 与任何优势估计器（GRPO、GSPO、SAPO 等）正交
+- 与任何优势估计器（PPO、GRPO、GSPO、SAPO、CISPO 等）正交
 
 架构流程：
 

@@ -111,7 +111,7 @@ RELOADABLE_FUNCTIONS: List[ReloadableFunction] = [
         description="Rollout data post-processing function in Actor",
     ),
     # ========== Immediate Scope ==========
-    # These functions are loaded immediately and reloaded on each call
+    # Most functions are reloaded on each call; custom_rm is explicitly cached.
     ReloadableFunction(
         name="custom_loss_function",
         attr_name=None,
@@ -174,7 +174,7 @@ RELOADABLE_FUNCTIONS: List[ReloadableFunction] = [
         config_attr="custom_rm_path",
         scope=ReloadScope.IMMEDIATE,
         required=False,
-        description="Custom reward model function (auto-reloaded on each call)",
+        description="Custom reward model function (cached between explicit reloads)",
     ),
     ReloadableFunction(
         name="rollout_sample_filter",
@@ -379,7 +379,21 @@ class ReloadableMixin:
             logger.info(f"Updated {func_def.attr_name} from {module_path}")
             message = f"Module '{module_name}' reloaded and attribute updated"
         else:
-            # IMMEDIATE scope: Only refresh sys.modules, next load_function will get the new version
+            # IMMEDIATE scope: refresh module state; custom_rm also refreshes executor and workers.
+            if module_name == "custom_rm":
+                from relax.engine.rewards import RewardExecutor
+
+                try:
+                    RewardExecutor.reload_custom_reward(module_path)
+                except Exception as exc:
+                    logger.error(f"Failed to reload custom reward workers for {module_path}: {exc}")
+                    return {
+                        "success": False,
+                        "module_name": module_name,
+                        "module_path": module_path,
+                        "scope": func_def.scope.value,
+                        "error": f"Failed to reload custom reward workers: {exc}",
+                    }
             logger.info(f"Refreshed sys.modules cache for {module_path}")
             message = f"Module '{module_name}' reloaded - will take effect on next call"
 

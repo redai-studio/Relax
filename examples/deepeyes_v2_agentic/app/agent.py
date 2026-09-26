@@ -17,7 +17,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import httpx
 import yaml
 from app.env_deepeyes_v2 import (
     DeepEyesV2Env,
@@ -38,10 +37,8 @@ def read_session_input(path: str | Path) -> dict[str, Any]:
 
 
 def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
-    # Defensive: if Relax already discarded the session (timeout) it will
-    # have deleted the tmpdir out from under us. Runtime SIGKILLs us in that
-    # case, but during the race window we may still reach here. Skip the
-    # write instead of dying with FileNotFoundError.
+    # The launcher may remove a discarded session's temporary directory while
+    # the agent is finishing its output write.
     try:
         Path(path).write_text(json.dumps(payload), encoding="utf-8")
     except FileNotFoundError:
@@ -51,8 +48,8 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
 def load_initial_image(messages: list[dict[str, Any]]) -> Image.Image | None:
     """Pull the first image attached to the last user message, if any.
 
-    Dataset prompts arrive with image data URLs in ``content[*].image_url.url``
-    (see ``relax/agentic/pipeline/runtime.py:1157``).
+    Dataset prompts arrive with image data URLs in
+    ``content[*].image_url.url``.
     """
     if not messages:
         return None
@@ -142,7 +139,10 @@ def _build_executor(backend_name: str, ensure_sandbox_timeout_s: int) -> Sandbox
 
 
 async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) -> dict[str, Any]:
-    from openai import APIStatusError, AsyncOpenAI  # type: ignore[import-not-found]
+    from openai import (  # type: ignore[import-not-found]
+        APIStatusError,
+        AsyncOpenAI,
+    )
 
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     max_turns = int(config["max_turns"])
@@ -161,12 +161,7 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"].rstrip("/"),
-        # 600s gives generous margin over expected 20-45s per-turn even if
-        # some tail requests hit SGLang backpressure. Livelock protection
-        # comes from max_retries=0 (no zombie SDK retry loops) +
-        # runtime.py:322 SIGKILL on cancel, NOT from a short timeout.
-        timeout=httpx.Timeout(timeout=1200.0, connect=30.0),
-        max_retries=0,
+        timeout=9999,
     )
 
     stop_reason = "max_turns"
@@ -186,7 +181,7 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     try:
         for _turn in range(max_turns):
             try:
-                resp = await client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=os.environ.get("OPENAI_MODEL", "model"),
                     messages=messages,
                     extra_body=extra_body,
@@ -197,20 +192,16 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
                 if code == "context_length_exceeded":
                     stop_reason = "finish_length"
                     break
-                # Sync-mode tail discard: Relax pipeline pops the session
-                # record at step close (relax/agentic/rollout.py:953 →
-                # drop_resident_results) when enough committed groups are
-                # in. The agent's next chat hits 404 session_discarded;
-                # the output JSON is no longer consumed, so just exit
-                # cleanly instead of crashing with a traceback.
+                # A session discarded after the rollout target closes returns
+                # 404 session_discarded. Its output JSON is no longer consumed.
                 if code == "session_discarded":
                     stop_reason = "discarded_by_pipeline"
                     break
                 raise
 
-            text = resp.choices[0].message.content or ""
+            text = response.choices[0].message.content or ""
             messages.append({"role": "assistant", "content": text})
-            if resp.choices[0].finish_reason == "length":
+            if response.choices[0].finish_reason == "length":
                 stop_reason = "finish_length"
                 break
 
@@ -241,9 +232,8 @@ async def run_session(messages: list[dict[str, Any]], metadata: dict[str, Any]) 
     finally:
         await env.close()
 
-    # SessionOutput (relax/agentic/pipeline/runtime.py:160) only accepts
-    # "metadata" and "reward". The chat trajectory is already captured by
-    # Relax through the chat-completions endpoint, so don't ship messages.
+    # This app uses the implicit SessionOutput form from
+    # relax.agentic.runner.ipc. Relax already captured the chat trajectory.
     return {
         "metadata": {
             "stop_reason": stop_reason,

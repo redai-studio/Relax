@@ -2,7 +2,7 @@
 
 ## Overview
 
-Relax is a reinforcement learning training framework for large language models, built on Ray Serve. It supports the Megatron training backend, SGLang inference engine, and algorithm families including GRPO/GSPO/SAPO. The framework uses a layered architecture that decouples orchestration, components, engines, backends, and distributed capabilities into independent modules.
+Relax is a reinforcement learning training framework for large language models, built on Ray Serve. It supports the Megatron training backend, SGLang inference engine, and algorithm families including PPO/GRPO/GSPO/SAPO/CISPO. The framework uses a layered architecture that decouples orchestration, components, engines, backends, and distributed capabilities into independent modules.
 
 ## Layered Architecture
 
@@ -52,7 +52,7 @@ Relax is a reinforcement learning training framework for large language models, 
 
 ### 1. Entrypoints Layer
 
-[`relax/entrypoints/train.py`](../../relax/entrypoints/train.py) is the main training entry point:
+[`relax/entrypoints/train.py`](../../../relax/entrypoints/train.py) is the main training entry point:
 
 - Parses command-line arguments (extended from Megatron-LM argument parser)
 - Initializes Ray cluster connection
@@ -63,9 +63,9 @@ Relax is a reinforcement learning training framework for large language models, 
 
 The orchestration layer coordinates the entire training workflow:
 
-- [**Controller**](../../relax/core/controller.py): Core orchestrator — deploys all RL service components, manages the training loop, handles health checking and global restart
-- [**Service**](../../relax/core/service.py): Lifecycle wrapper for Ray Serve deployments — manages placement groups, heartbeat reporting, service restart
-- [**Registry**](../../relax/core/registry.py): Global constants and role registry — defines ROLES, ALGOS mappings
+- [**Controller**](../../../relax/core/controller.py): Core orchestrator — deploys all RL service components, manages the training loop, handles health checking and global restart
+- [**Service**](../../../relax/core/service.py): Lifecycle wrapper for Ray Serve deployments — manages placement groups, heartbeat reporting, service restart
+- [**Registry**](../../../relax/core/registry.py): Global constants and role registry — defines ROLES, ALGOS mappings
 
 ### 3. Components Layer
 
@@ -73,35 +73,35 @@ The components layer contains all RL service components, each deployed as a `@se
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| **Actor** | [`actor.py`](../../relax/components/actor.py) | Policy training (Megatron backend) |
-| **Rollout** | [`rollout.py`](../../relax/components/rollout.py) | Rollout service orchestration, manages RolloutManager |
-| **Critic** | [`critic.py`](../../relax/components/critic.py) | Value estimation |
-| **ActorFwd** | [`actor_fwd.py`](../../relax/components/actor_fwd.py) | Forward inference log-prob (fully-async mode) |
-| **Advantages** | [`advantages.py`](../../relax/components/advantages.py) | Advantage computation (GRPO/GSPO/SAPO etc.) |
-| **GenRM** | [`genrm.py`](../../relax/components/genrm.py) | Generative reward model |
+| **Actor** | [`actor.py`](../../../relax/components/actor.py) | Policy training (Megatron backend) |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout service orchestration, manages RolloutManager |
+| **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value estimation and clipped value-loss training |
+| **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | Forward inference log-prob (fully-async mode) |
+| **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | Advantage computation (PPO/GRPO/GSPO/SAPO/CISPO etc.) |
+| **GenRM** | [`genrm.py`](../../../relax/components/genrm.py) | Generative reward model |
 
-**Sync mode** deploys three core components: Actor + Rollout + Critic. **Fully-async mode** (`--fully-async`) additionally deploys ActorFwd and Advantages components.
+The deployed service graph depends on the algorithm and execution mode. Colocate GRPO-like algorithms use Actor + Rollout; synchronous colocate PPO adds Critic + Advantages. For non-PPO algorithms, **fully-async mode** (`--fully-async`) can additionally deploy ActorFwd and Reference services according to the log-probability and KL configuration. Fully-async PPO is not currently supported; see [PPO Training](./ppo-training.md) for the supported data flow.
 
 ### 4. Engine Layer
 
 The engine layer provides rollout data generation and reward computation:
 
-- [**Rollout Engine**](../../relax/engine/rollout/): SGLang rollout implementation, on-policy distillation, etc.
-- [**Reward Functions**](../../relax/engine/rewards/): Pluggable reward computation (deepscaler, math_utils, genrm, etc.)
-- [**Router**](../../relax/engine/router/): Request routing and load balancing
-- [**Filters**](../../relax/engine/filters/): Data filtering strategies
+- [**Rollout Engine**](../../../relax/engine/rollout/): SGLang rollout implementation, on-policy distillation, etc.
+- [**Reward Functions**](../../../relax/engine/rewards/): Pluggable reward computation (deepscaler, math_utils, genrm, etc.)
+- [**Router**](../../../relax/engine/router/): Request routing and load balancing
+- [**Filters**](../../../relax/engine/filters/): Data filtering strategies
 
 ### 5. Backends Layer
 
 The backends layer wraps underlying training and inference engines:
 
-- [**Megatron Backend**](../../relax/backends/megatron/): Distributed training based on Megatron-LM, supporting TP/PP/CP/EP parallelism
-- [**SGLang Engine**](../../relax/backends/sglang/): High-performance inference engine management and process lifecycle control
+- [**Megatron Backend**](../../../relax/backends/megatron/): Distributed training based on Megatron-LM, supporting TP/PP/CP/EP parallelism
+- [**SGLang Engine**](../../../relax/backends/sglang/): High-performance inference engine management and process lifecycle control
 
 ### 6. Distributed Layer
 
-- [**Ray Actor Groups**](../../relax/distributed/ray/): Manages RolloutManager, GenRMManager, and other Ray Actor groups
-- [**DCS Checkpoint Service**](../../relax/distributed/checkpoint_service/): Distributed weight synchronization service supporting NCCL/GLOO/TCP communication backends
+- [**Ray Actor Groups**](../../../relax/distributed/ray/): Manages RolloutManager, GenRMManager, and other Ray Actor groups
+- [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/): Distributed weight synchronization service supporting NCCL/GLOO/TCP communication backends
 
 ## Directory Structure
 

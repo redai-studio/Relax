@@ -1,6 +1,6 @@
 # On-Policy Distillation (OPD)
 
-On-Policy Distillation (OPD) enables knowledge transfer from a large teacher model to a smaller student model by training the student on its own rollout data while matching the teacher's token-level log-probabilities. OPD is orthogonal to the advantage estimator—it acts as a KL penalty term that can be combined with any estimator (GRPO, GSPO, SAPO, and experimental estimators like PPO and REINFORCE++).
+On-Policy Distillation (OPD) enables knowledge transfer from a large teacher model to a smaller student model by training the student on its own rollout data while matching the teacher's token-level log-probabilities. OPD is orthogonal to the advantage estimator—it acts as a KL penalty term that can be combined with any estimator, including PPO, GRPO, GSPO, SAPO, CISPO, and REINFORCE++.
 
 ## Key Parameters
 
@@ -29,7 +29,7 @@ OPD injects distillation signals into training by computing token-level KL diver
 - **Advantage mode (adv)**: Subtract KL from advantage (via `--opd-kl-coef`)
 - **Loss mode (loss)**: Add KL as an extra loss term (via `--opd-loss-coef`)
 
-Only one mode can be active at a time. OPD is orthogonal to the advantage estimator and can be combined with any estimator (GRPO, GSPO, SAPO, and experimental estimators like PPO and REINFORCE++).
+Only one mode can be active at a time. OPD is orthogonal to the advantage estimator and can be combined with any estimator, including PPO, GRPO, GSPO, SAPO, CISPO, and REINFORCE++.
 
 ## Token-Selection Modes
 
@@ -56,7 +56,7 @@ Characteristics:
 
 - KL term uses `.detach()`, **no gradient** is produced
 - Only affects advantage estimation, does not change the loss function form
-- Orthogonal to any advantage estimator (GRPO, GSPO, SAPO, etc.)
+- Orthogonal to any advantage estimator (PPO, GRPO, GSPO, SAPO, CISPO, etc.)
 
 Architecture flow:
 

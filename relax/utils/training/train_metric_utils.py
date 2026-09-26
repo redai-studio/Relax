@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from argparse import Namespace
 from copy import deepcopy
 from typing import TYPE_CHECKING
@@ -63,8 +64,8 @@ def log_perf_data_raw(
             log_dict["perf/actor_train_tok_per_s"] = sum(seq_lens) / log_dict["perf/actor_train_time"]
 
         # MFU = achieved_per_gpu_tflops / device_peak_tflops
-        log_dict["perf/device_peak_tflops"] = peak_tflops
-        if peak_tflops not in (float("inf"), 0):
+        if math.isfinite(peak_tflops) and peak_tflops > 0:
+            log_dict["perf/device_peak_tflops"] = peak_tflops
             if "perf/actor_train_tflops" in log_dict:
                 log_dict["perf/mfu/actor_train"] = log_dict["perf/actor_train_tflops"] / peak_tflops
             if "perf/log_probs_tflops" in log_dict:

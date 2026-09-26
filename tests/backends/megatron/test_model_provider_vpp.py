@@ -3,11 +3,17 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from relax.utils.training import ppo_utils
+
 
 class _FakeProvider:
-    def __init__(self):
+    def __init__(self, model=None):
         self.calls = []
         self.finalized = False
+        self.model = model or torch.nn.Module()
         self.attention_backend = None
         self.tensor_model_parallel_size = 1
         self.sequence_parallel = False
@@ -35,7 +41,7 @@ class _FakeProvider:
                 "vp_stage": vp_stage,
             }
         )
-        return SimpleNamespace(named_modules=lambda: [])
+        return self.model
 
 
 def _install_fake_megatron(monkeypatch, provider=None):
@@ -43,6 +49,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
+    optimizer = types.ModuleType("megatron.core.optimizer")
     mpu = types.ModuleType("megatron.core.mpu")
     tensor_parallel = types.ModuleType("megatron.core.tensor_parallel")
     models = types.ModuleType("megatron.core.models")
@@ -53,7 +60,10 @@ def _install_fake_megatron(monkeypatch, provider=None):
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
     arguments = types.ModuleType("megatron.training.arguments")
+    tokenizer_package = types.ModuleType("megatron.training.tokenizer")
+    tokenizer = types.ModuleType("megatron.training.tokenizer.tokenizer")
     bridge = types.ModuleType("megatron.bridge")
+    misc = types.ModuleType("relax.utils.misc")
 
     class _FakeGPTModel:
         pass
@@ -76,6 +86,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     mpu.get_tensor_model_parallel_rank = lambda: 0
     core.mpu = mpu
     core.tensor_parallel = tensor_parallel
+    optimizer.OptimizerConfig = SimpleNamespace
     gpt.GPTModel = _FakeGPTModel
     gpt_layer_specs.get_gpt_decoder_block_spec = lambda *args, **kwargs: object()
     gpt_layer_specs.get_gpt_layer_local_spec = lambda *args, **kwargs: object()
@@ -83,11 +94,16 @@ def _install_fake_megatron(monkeypatch, provider=None):
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
+    arguments.parse_args = lambda *args, **kwargs: None
+    arguments.validate_args = lambda *args, **kwargs: None
+    tokenizer._vocab_size_with_padding = lambda *args, **kwargs: None
     bridge.AutoBridge = _FakeAutoBridge
+    misc.load_function = lambda path: None
 
     modules = {
         "megatron": megatron,
         "megatron.core": core,
+        "megatron.core.optimizer": optimizer,
         "megatron.core.mpu": mpu,
         "megatron.core.tensor_parallel": tensor_parallel,
         "megatron.core.models": models,
@@ -98,7 +114,10 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
         "megatron.training.arguments": arguments,
+        "megatron.training.tokenizer": tokenizer_package,
+        "megatron.training.tokenizer.tokenizer": tokenizer,
         "megatron.bridge": bridge,
+        "relax.utils.misc": misc,
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -183,6 +202,253 @@ def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):
     assert provider.vision_dp_when_cp is True
 
 
+def test_bridge_provider_maps_legacy_vision_dp_when_tp_to_cp(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+
+    model_provider = module.get_model_provider_func(_bridge_args(vision_dp_when_tp=True), role="actor")
+    model_provider(pre_process=True, post_process=True)
+
+    assert provider.vision_dp_when_cp is True
+
+
+def test_bridge_vision_cp_all_gather_compat_forwards_cp_group_positionally(monkeypatch):
+    class _OriginalAllGatherVisionEmbeddings:
+        calls = []
+
+        @staticmethod
+        def apply(*args):
+            _OriginalAllGatherVisionEmbeddings.calls.append(args)
+            return "gathered"
+
+    bridge_model_module = SimpleNamespace(AllGatherVisionEmbeddings=_OriginalAllGatherVisionEmbeddings)
+    module, _ = _load_model_provider(monkeypatch)
+
+    assert module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+    assert bridge_model_module.AllGatherVisionEmbeddings.apply("input", "seqlens", cp_group="cp") == "gathered"
+    assert _OriginalAllGatherVisionEmbeddings.calls == [("input", "seqlens", "cp")]
+    assert not module._patch_bridge_vision_cp_all_gather(bridge_model_module, _OriginalAllGatherVisionEmbeddings)
+
+
+def test_bridge_critic_provider_registers_value_head_before_ddp(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    bridge_model = _FakeBridgeModel()
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(bridge_model))
+
+    model_provider = module.get_model_provider_func(_bridge_args(), role="critic")
+    model = model_provider(pre_process=True, post_process=True)
+
+    assert isinstance(model.output_layer, ppo_utils.LinearForLastLayer)
+    assert model.output_layer.out_features == 1
+    assert ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR not in model._modules
+    assert all("relax_hf_output_layer" not in name for name, _ in model.named_parameters())
+
+
+def test_hf_load_context_restores_same_value_head(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    value_head = model.output_layer
+    value_param_ids = tuple(id(param) for param in value_head.parameters())
+    lm_head = getattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+    with ppo_utils.use_critic_lm_head_for_hf_load([model]):
+        assert model.output_layer is lm_head
+
+    assert model.output_layer is value_head
+    assert tuple(id(param) for param in model.output_layer.parameters()) == value_param_ids
+    assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+
+def test_hf_load_context_restores_value_head_on_error(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    value_head = model.output_layer
+
+    with pytest.raises(RuntimeError, match="bridge failed"):
+        with ppo_utils.use_critic_lm_head_for_hf_load([model]):
+            raise RuntimeError("bridge failed")
+
+    assert model.output_layer is value_head
+    assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+
+def test_bridge_actor_provider_registers_sequence_classification_head(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(
+        _bridge_args(task_type="seq_cls", num_labels=3),
+        role="actor",
+    )(post_process=True)
+
+    assert isinstance(model.output_layer, ppo_utils.LinearForLastLayer)
+    assert model.output_layer.weight.shape == (3, 4)
+    assert model.output_layer.bias is None
+    assert ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR not in model._modules
+    assert all("relax_seq_cls_hf_output_layer" not in name for name, _ in model.named_parameters())
+
+
+def test_hf_load_context_restores_same_sequence_classification_head(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(
+        _bridge_args(task_type="seq_cls", num_labels=3),
+        role="actor",
+    )(post_process=True)
+    classification_head = model.output_layer
+    classification_param_ids = tuple(id(param) for param in classification_head.parameters())
+    lm_head = getattr(model, ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+
+    with ppo_utils.use_sequence_classification_lm_head_for_hf_load([model]):
+        assert model.output_layer is lm_head
+
+    assert model.output_layer is classification_head
+    assert tuple(id(param) for param in model.output_layer.parameters()) == classification_param_ids
+    assert not hasattr(model, ppo_utils._RELAX_SEQ_CLS_HF_OUTPUT_LAYER_ATTR)
+
+
+def test_critic_value_head_validation_accepts_ddp_and_optimizer_ownership(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    class _FakeDDP(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.module = inner
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    ddp = _FakeDDP(model)
+    head_params = list(model.output_layer.parameters())
+    for param in head_params:
+        param.main_grad = torch.zeros_like(param)
+
+    plain_optimizer = SimpleNamespace(param_groups=[{"params": head_params}])
+    float_optimizer = SimpleNamespace(float16_groups=[head_params], fp32_from_fp32_groups=[])
+    mixed_optimizer = SimpleNamespace(model_float16_groups=[head_params], model_fp32_groups=[])
+    chained_optimizer = SimpleNamespace(chained_optimizers=[mixed_optimizer])
+
+    expected_ids = tuple(id(param) for param in head_params)
+    assert ppo_utils.validate_critic_value_head_registration([ddp], plain_optimizer) == expected_ids
+    assert ppo_utils.validate_critic_value_head_registration([ddp], float_optimizer) == expected_ids
+    assert ppo_utils.validate_critic_value_head_registration([ddp], chained_optimizer) == expected_ids
+
+
+def test_critic_value_head_validation_accepts_distributed_optimizer_remote_shard(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    head_params = list(model.output_layer.parameters())
+    for param in head_params:
+        param.main_grad = torch.zeros_like(param)
+
+    optimizer = SimpleNamespace(
+        model_param_gbuf_map={param: (0, param.dtype, 0) for param in head_params},
+        model_float16_groups=[],
+        model_fp32_groups=[],
+    )
+
+    expected_ids = tuple(id(param) for param in head_params)
+    assert ppo_utils.validate_critic_value_head_registration([model], optimizer) == expected_ids
+
+
+def test_critic_value_head_validation_accepts_optimizer_main_params(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    head_params = list(model.output_layer.parameters())
+    for param in head_params:
+        param.main_grad = torch.zeros_like(param)
+        param.main_param = torch.nn.Parameter(param.detach().float())
+
+    optimizer = SimpleNamespace(
+        model_float16_groups=[],
+        model_fp32_groups=[],
+        param_groups=[{"params": [param.main_param for param in head_params]}],
+    )
+
+    expected_ids = tuple(id(param) for param in head_params)
+    assert ppo_utils.validate_critic_value_head_registration([model], optimizer) == expected_ids
+
+
+def test_critic_value_head_validation_rejects_missing_ddp_ownership(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+    optimizer = SimpleNamespace(param_groups=[{"params": list(model.output_layer.parameters())}])
+
+    with pytest.raises(AssertionError, match="DDP"):
+        ppo_utils.validate_critic_value_head_registration([model], optimizer)
+
+
+def test_critic_value_head_movement_detection(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    model = module.get_model_provider_func(_bridge_args(), role="critic")(post_process=True)
+
+    init_stats = ppo_utils.snapshot_critic_value_head_state([model])
+    assert init_stats, "snapshot must be non-empty for a post-process critic chunk"
+
+    # Unchanged params → False (not moved).
+    assert ppo_utils.has_critic_value_head_moved([model], init_stats) is False
+
+    # Perturb weight → True (moved).
+    with torch.no_grad():
+        model.output_layer.weight.add_(0.1)
+    assert ppo_utils.has_critic_value_head_moved([model], init_stats) is True
+
+    # Empty stats (e.g., non-post-process rank) → None so caller can skip.
+    assert ppo_utils.has_critic_value_head_moved([model], {}) is None
+
+
 def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
     module, _ = _load_model_provider(monkeypatch)
     calls = []
@@ -204,6 +470,24 @@ def test_wrapper_derives_vp_stage_from_parallel_state(monkeypatch):
     wrapped_provider(pre_process=True, post_process=False)
 
     assert calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+def test_freeze_wrapper_forwards_post_process_to_classification_head(monkeypatch):
+    module, _ = _load_model_provider(monkeypatch)
+    post_process_values = []
+    monkeypatch.setattr(
+        module,
+        "ensure_sequence_classification_head_trainable",
+        lambda model, args, role, post_process: post_process_values.append(post_process),
+    )
+
+    wrapped_provider = module.wrap_model_provider_with_freeze(
+        lambda **kwargs: SimpleNamespace(named_parameters=lambda: []),
+        SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None),
+    )
+    wrapped_provider(post_process=False)
+
+    assert post_process_values == [False]
 
 
 def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):

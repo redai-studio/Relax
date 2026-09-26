@@ -37,5 +37,5 @@ The ActorFwd runs a background loop that:
 
 ## Source
 
-- Implementation: [`relax/components/actor_fwd.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/actor_fwd.py)
-- Base class: [`relax/components/base.py`](https://github.com/redai-infra/Relax/blob/main/relax/components/base.py)
+- Implementation: [`relax/components/actor_fwd.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/actor_fwd.py)
+- Base class: [`relax/components/base.py`](https://github.com/redai-studio/Relax/blob/main/relax/components/base.py)

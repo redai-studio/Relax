@@ -267,6 +267,8 @@ python scripts/tools/convert_torch_dist_to_hf_bridge.py \
 | `--origin-hf-dir` | 原始 HF safetensors 目录，用于读取模型结构、预期权重 key 和 tokenizer 文件 |
 | `--force` | 可选，若输出目录已存在则强制覆盖 |
 
+> **注意（无 MTP 的 RL checkpoint）**：当源 checkpoint 不含 MTP 权重（如未训练 MTP 的 RL/SFT checkpoint），而参考模型 config 启用了 MTP 时，转换器会自动把导出的 `model.safetensors.index.json` 与实际写盘的 tensor 对齐，并从 `--origin-hf-dir` 补齐缺失的 MTP 权重，保证导出的模型可正常加载（含 EAGLE 投机解码）。在线 `--save-hf` 导出同样适用。
+
 FP8 策略参数、显存行为、输出格式和 SGLang 8 卡 TP8 启动命令见[模型 Checkpoint 转换](./model-conversion.md)。
 
 ## 下一步

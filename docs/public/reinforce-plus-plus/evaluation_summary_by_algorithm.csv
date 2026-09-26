@@ -1,0 +1,4 @@
+algorithm,label,seed_count,mean_reward_n,mean_reward_mean,mean_reward_sample_std,pass@2_n,pass@2_mean,pass@2_sample_std,pass@4_n,pass@4_mean,pass@4_sample_std,truncated_ratio_n,truncated_ratio_mean,truncated_ratio_sample_std,response_length_mean_n,response_length_mean_mean,response_length_mean_sample_std
+grpo,GRPO,3,3,0.6077473958,0.01325873168,3,0.7085503472,0.01078321029,3,0.77734375,0.015625,3,0.3997395833,0.0328179249,3,844.2154948,10.21919424
+reinforce_plus_plus,REINFORCE++,3,3,0.5865885417,0.01354338806,3,0.7007378472,0.01120724942,3,0.7734375,0.0078125,3,0.4381510417,0.006353913182,3,860.6152344,6.200662504
+reinforce_plus_plus_baseline,REINFORCE++-baseline,3,3,0.6041666667,0.02153610014,3,0.7076822917,0.02764436686,3,0.7890625,0.02734375,3,0.4208984375,0.05466133582,3,852.6572266,24.68766219

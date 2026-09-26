@@ -1,0 +1,6 @@
+--- a/nemo_gym/server_utils.py
++++ b/nemo_gym/server_utils.py
+@@ -567,2 +567,3 @@ class SimpleServer(BaseServer):
+                 response_content = f"Hit an exception in {self.get_session_middleware_key()} calling an inner server: {e.response_content}"
++                print(format_exc(), flush=True)
+                 if _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG:

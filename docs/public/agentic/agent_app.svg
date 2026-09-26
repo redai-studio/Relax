@@ -1,1 +1,131 @@
-<svg width="1416" height="225" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" overflow="hidden"><g transform="translate(-1517 -884)"><g><path d="M1522.5 959.834C1522.15 944.523 1534.42 932.635 1549.92 932.5 1620.42 925.014 1642.44 951.935 1726.08 932.5 1740.08 931.631 1751.95 947.913 1753.5 959.834 1763.39 986.677 1745.53 1044.81 1753.5 1069.17 1754.13 1082.96 1740.17 1096.34 1726.08 1096.5 1685.63 1115.89 1612.76 1089.9 1549.92 1096.5 1533.21 1099.08 1520.82 1082.32 1522.5 1069.17 1511.67 1024.72 1527.3 1000.63 1522.5 959.834Z" fill="#008FB4" fill-rule="evenodd" fill-opacity="0.14902"/><path d="M1522.5 959.834C1524.24 947.327 1534.92 933.937 1549.92 932.5 1599.43 926.096 1677.15 938.798 1726.08 932.5 1742.37 931.079 1750.36 943.53 1753.5 959.834 1763.11 998.313 1743.68 1019.32 1753.5 1069.17 1751.92 1081.06 1741.48 1093 1726.08 1096.5 1662.69 1099.88 1614.22 1078.16 1549.92 1096.5 1532.73 1096.58 1524.16 1081.27 1522.5 1069.17 1517.24 1029.02 1526.48 988.49 1522.5 959.834Z" stroke="#AFABAB" stroke-width="4.58333" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="8" stroke-opacity="1" fill="none" fill-rule="evenodd"/><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 1568.26 1000)">Agent</text><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 1590.31 1061)">App</text><path d="M1843.5 925.5C1913.06 911.648 1963.57 938.921 2019.5 925.5 2026.43 1012.03 2006.65 1062.06 2019.5 1102.5 1974.52 1108.77 1907.37 1099.32 1843.5 1102.5 1829.83 1057.34 1850.02 996.656 1843.5 925.5Z" fill="#008FB4" fill-rule="evenodd" fill-opacity="0.14902"/><path d="M1843.5 925.5C1884.76 916.614 1947 926.33 2019.5 925.5 2037.99 985.732 2019.2 1035.37 2019.5 1102.5 1934.71 1114.31 1891.01 1087.28 1843.5 1102.5 1833.23 1020.85 1858.54 985.93 1843.5 925.5Z" stroke="#AFABAB" stroke-width="4.58333" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="8" stroke-opacity="1" fill="none" fill-rule="evenodd"/><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 1883.18 1031)">LLM</text><path d="M2096 1011.14 2341.85 1011.14 2341.85 1016.86 2096 1016.86ZM2337.26 1000.25 2364.76 1014 2337.26 1027.75Z" fill="#A5A5A5" fill-rule="nonzero" fill-opacity="0.937255"/><text fill="#000000" fill-opacity="1" font-family="Arial Black,Arial Black_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="900" font-stretch="normal" font-size="46" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 2109.64 947)">Agentic</text><text fill="#000000" fill-opacity="1" font-family="Arial Black,Arial Black_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="900" font-stretch="normal" font-size="46" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 2318.18 947)">RL</text><path d="M2420.5 959.834C2420.15 944.523 2432.42 932.635 2447.92 932.5 2518.42 925.014 2540.44 951.935 2624.08 932.5 2638.08 931.631 2649.95 947.913 2651.5 959.834 2661.39 986.677 2643.53 1044.81 2651.5 1069.17 2652.13 1082.96 2638.17 1096.34 2624.08 1096.5 2583.63 1115.89 2510.76 1089.9 2447.92 1096.5 2431.21 1099.08 2418.82 1082.32 2420.5 1069.17 2409.67 1024.72 2425.3 1000.63 2420.5 959.834Z" fill="#008FB4" fill-rule="evenodd" fill-opacity="0.14902"/><path d="M2420.5 959.834C2422.24 947.327 2432.92 933.937 2447.92 932.5 2497.43 926.096 2575.15 938.798 2624.08 932.5 2640.37 931.079 2648.36 943.53 2651.5 959.834 2661.11 998.313 2641.68 1019.32 2651.5 1069.17 2649.92 1081.06 2639.48 1093 2624.08 1096.5 2560.69 1099.88 2512.22 1078.16 2447.92 1096.5 2430.73 1096.58 2422.16 1081.27 2420.5 1069.17 2415.24 1029.02 2424.48 988.49 2420.5 959.834Z" stroke="#AFABAB" stroke-width="4.58333" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="8" stroke-opacity="1" fill="none" fill-rule="evenodd"/><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 2465.94 1000)">Agent</text><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 2487.99 1061)">App</text><path d="M2740.5 925.5C2810.46 911.648 2861.25 938.921 2917.5 925.5 2924.47 1012.03 2904.57 1062.06 2917.5 1102.5 2872.27 1108.77 2804.74 1099.32 2740.5 1102.5 2726.75 1057.34 2747.05 996.656 2740.5 925.5Z" fill="#C00000" fill-rule="evenodd" fill-opacity="0.14902"/><path d="M2740.5 925.5C2781.99 916.614 2844.59 926.33 2917.5 925.5 2936.09 985.732 2917.19 1035.37 2917.5 1102.5 2832.23 1114.31 2788.28 1087.28 2740.5 1102.5 2730.17 1020.85 2755.63 985.93 2740.5 925.5Z" stroke="#AFABAB" stroke-width="4.58333" stroke-linecap="butt" stroke-linejoin="miter" stroke-miterlimit="8" stroke-opacity="1" fill="none" fill-rule="evenodd"/><text fill="#595959" fill-opacity="1" font-family="DengXian,DengXian_MSFontService,sans-serif" font-style="normal" font-variant="normal" font-weight="700" font-stretch="normal" font-size="50" text-anchor="start" direction="ltr" writing-mode="lr-tb" unicode-bidi="normal" text-decoration="none" transform="matrix(1 0 0 1 2780.86 1031)">LLM</text></g></g></svg>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="agent_app-title agent_app-desc">
+    <title id="agent_app-title">Agentic rollout integration</title>
+    <desc id="agent_app-desc">Architecture showing an existing agent application calling the Relax Chat Completions API, which uses SGLang, records SessionForest state, exports selected contexts, and sends them to training.</desc>
+    <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Manrope:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap');
+
+        .zone { fill: rgba(31,31,35,.018); stroke: rgba(31,31,35,.12); stroke-width: .8; }
+        .zone-label { fill: #74757c; font: 600 8px "Inter", sans-serif; letter-spacing: .16em; }
+        .node-mask { fill: #f7f7f8; }
+        .node { fill: #fff; stroke: #55565e; stroke-width: 1.2; }
+        .node-soft { fill: #f2f2f4; stroke: #8b8c93; stroke-width: 1; }
+        .node-accent { fill: #fff0f2; stroke: #e8384a; stroke-width: 1.6; }
+        .tag { fill: none; stroke: rgba(85,86,94,.45); stroke-width: .8; }
+        .tag-accent { fill: #e8384a; stroke: #e8384a; stroke-width: .8; }
+        .tag-text { fill: #66676e; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .tag-text-white { fill: #fff; font: 600 8px "Inter", sans-serif; letter-spacing: .1em; }
+        .name { fill: #1f1f23; font: 600 16px "Manrope", sans-serif; }
+        .sub { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .mono { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+        .line { fill: none; stroke: #696a72; stroke-width: 1.4; marker-end: url(#arrow); }
+        .line-link { fill: none; stroke: #4f6fbf; stroke-width: 1.5; marker-end: url(#arrow-link); }
+        .line-return { fill: none; stroke: #74757c; stroke-width: 1.2; stroke-dasharray: 5 4; marker-end: url(#arrow); }
+        .label-mask { fill: #f7f7f8; }
+        .label { fill: #696a72; font: 600 8px "Inter", sans-serif; letter-spacing: .08em; }
+        .legend { fill: #696a72; font: 500 12px "Inter", sans-serif; }
+      </style>
+      <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#696a72"/></marker>
+      <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f6fbf"/></marker>
+    </defs>
+
+    <rect width="1280" height="720" fill="#f7f7f8"/>
+
+    <rect class="zone" x="40" y="96" width="280" height="480" rx="8"/>
+    <rect class="node-mask" x="56" y="100" width="120" height="16"/>
+    <text class="zone-label" x="64" y="112">AGENT APPLICATION</text>
+
+    <rect class="zone" x="360" y="64" width="520" height="544" rx="8"/>
+    <rect class="node-mask" x="376" y="68" width="112" height="16"/>
+    <text class="zone-label" x="384" y="80">RELAX RUNTIME</text>
+
+    <rect class="zone" x="920" y="96" width="320" height="480" rx="8"/>
+    <rect class="node-mask" x="936" y="100" width="144" height="16"/>
+    <text class="zone-label" x="944" y="112">MODEL + TRAINING</text>
+
+    <!-- Connectors -->
+    <line class="line-link" x1="280" y1="216" x2="408" y2="216"/>
+    <rect class="label-mask" x="304" y="188" width="80" height="16" rx="2"/>
+    <text class="label" x="344" y="200" text-anchor="middle">ENDPOINT SWAP</text>
+
+    <line class="line-link" x1="608" y1="208" x2="976" y2="208"/>
+    <rect class="label-mask" x="692" y="180" width="200" height="16" rx="2"/>
+    <text class="label" x="792" y="192" text-anchor="middle">GENERATE · INPUT_IDS + MEDIA</text>
+
+    <line class="line-return" x1="976" y1="248" x2="608" y2="248"/>
+    <rect class="label-mask" x="704" y="260" width="176" height="16" rx="2"/>
+    <text class="label" x="792" y="272" text-anchor="middle">TOKENS + LOGPROBS</text>
+
+    <line class="line" x1="508" y1="272" x2="508" y2="360"/>
+    <rect class="label-mask" x="520" y="300" width="64" height="16" rx="2"/>
+    <text class="label" x="552" y="312" text-anchor="middle">COMMIT</text>
+
+    <line class="line" x1="608" y1="400" x2="656" y2="400"/>
+    <line class="line" x1="832" y1="400" x2="976" y2="400"/>
+    <rect class="label-mask" x="860" y="372" width="88" height="16" rx="2"/>
+    <text class="label" x="904" y="384" text-anchor="middle">TRAIN DATA</text>
+
+    <line class="line" x1="144" y1="272" x2="144" y2="360"/>
+    <rect class="label-mask" x="76" y="300" width="56" height="16" rx="2"/>
+    <text class="label" x="104" y="312" text-anchor="middle">CALL</text>
+    <line class="line-return" x1="216" y1="360" x2="216" y2="272"/>
+
+    <!-- Nodes -->
+    <rect class="node-mask" x="80" y="168" width="200" height="104" rx="8"/>
+    <rect class="node" x="80" y="168" width="200" height="104" rx="8"/>
+    <rect class="tag" x="92" y="180" width="72" height="16" rx="2"/>
+    <text class="tag-text" x="128" y="192" text-anchor="middle">EXISTING</text>
+    <text class="name" x="180" y="220" text-anchor="middle">Agent Process</text>
+    <text class="sub" x="180" y="244" text-anchor="middle">on-demand or prelaunched</text>
+
+    <rect class="node-mask" x="80" y="360" width="200" height="80" rx="8"/>
+    <rect class="node-soft" x="80" y="360" width="200" height="80" rx="8"/>
+    <rect class="tag" x="92" y="372" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="116" y="384" text-anchor="middle">TOOLS</text>
+    <text class="name" x="180" y="416" text-anchor="middle">Tools &amp; Environment</text>
+
+    <rect class="node-mask" x="408" y="168" width="200" height="104" rx="8"/>
+    <rect class="node-accent" x="408" y="168" width="200" height="104" rx="8"/>
+    <rect class="tag-accent" x="420" y="180" width="48" height="16" rx="2"/>
+    <text class="tag-text-white" x="444" y="192" text-anchor="middle">API</text>
+    <text class="name" x="508" y="220" text-anchor="middle">Chat Completions</text>
+    <text class="sub" x="508" y="244" text-anchor="middle">request-level pause / resume</text>
+
+    <rect class="node-mask" x="408" y="360" width="200" height="80" rx="8"/>
+    <rect class="node-soft" x="408" y="360" width="200" height="80" rx="8"/>
+    <rect class="tag" x="420" y="372" width="48" height="16" rx="2"/>
+    <text class="tag-text" x="444" y="384" text-anchor="middle">STATE</text>
+    <text class="name" x="508" y="408" text-anchor="middle">SessionForest</text>
+    <text class="sub" x="508" y="428" text-anchor="middle">committed message states</text>
+
+    <rect class="node-mask" x="656" y="360" width="176" height="80" rx="8"/>
+    <rect class="node" x="656" y="360" width="176" height="80" rx="8"/>
+    <rect class="tag" x="668" y="372" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="696" y="384" text-anchor="middle">EXPORT</text>
+    <text class="name" x="744" y="408" text-anchor="middle">Selected Contexts</text>
+    <text class="sub" x="744" y="428" text-anchor="middle">reward + metadata</text>
+
+    <rect class="node-mask" x="976" y="168" width="208" height="104" rx="8"/>
+    <rect class="node" x="976" y="168" width="208" height="104" rx="8"/>
+    <rect class="tag" x="988" y="180" width="56" height="16" rx="2"/>
+    <text class="tag-text" x="1016" y="192" text-anchor="middle">MODEL</text>
+    <text class="name" x="1080" y="220" text-anchor="middle">SGLang</text>
+    <text class="sub" x="1080" y="244" text-anchor="middle">generation backend</text>
+
+    <rect class="node-mask" x="976" y="360" width="208" height="80" rx="8"/>
+    <rect class="node" x="976" y="360" width="208" height="80" rx="8"/>
+    <rect class="tag" x="988" y="372" width="64" height="16" rx="2"/>
+    <text class="tag-text" x="1020" y="384" text-anchor="middle">TRAIN</text>
+    <text class="name" x="1080" y="408" text-anchor="middle">Training Pipeline</text>
+    <text class="sub" x="1080" y="428" text-anchor="middle">loss + optimizer</text>
+
+    <!-- Legend -->
+    <line x1="40" y1="640" x2="1240" y2="640" stroke="rgba(31,31,35,.12)" stroke-width=".8"/>
+    <text class="zone-label" x="48" y="668">LEGEND</text>
+    <line class="line-link" x1="152" y1="664" x2="216" y2="664"/>
+    <text class="legend" x="232" y="668">request</text>
+    <line class="line-return" x1="352" y1="664" x2="416" y2="664"/>
+    <text class="legend" x="432" y="668">return</text>
+    <rect x="544" y="652" width="20" height="20" rx="4" fill="#fff0f2" stroke="#e8384a" stroke-width="1.2"/>
+    <text class="legend" x="580" y="668">integration boundary</text>
+  </svg>

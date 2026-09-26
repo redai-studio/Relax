@@ -10,7 +10,7 @@ Create a virtual environment and install dependencies:
 
 ```bash
 # Clone the repository
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 cd Relax
 
 # Create virtual environment

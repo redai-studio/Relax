@@ -19,7 +19,7 @@
 - 对齐时先做单样本前向一致性，再验证 packed / CP / rollout 训练路径。
 - 不在训练脚本里隐藏模型特例；模型特例应沉淀到 `relax/models/<model_name>/` 下。
 
-dots.mcore / dots.mocr 的完整接入示例见第 6 章。
+dots.mocr 的完整接入示例见第 6 章。
 
 ## 2. SGLang 侧如何接入外部模型
 
@@ -281,9 +281,9 @@ SGLang 侧通常加载 HF 命名空间参数；Megatron 侧训练时使用 fused
 
 建议每个新模型至少保留一个固定 checkpoint、输入样本、prompt、dump 目录和关键并行参数的 compare 脚本，便于后续回归。
 
-## 6. 以 dots.mcore / dots.mocr 为例
+## 6. 以 dots.mocr 为例
 
-dots.mcore / dots.mocr 的接入可以作为外部多模态模型的参考实现。它覆盖了 SGLang 外部模型包、Megatron Bridge、启动脚本和对齐脚本四个部分。
+dots.mocr 的接入可以作为外部多模态模型的参考实现。它覆盖了 SGLang 外部模型包、Megatron Bridge、启动脚本和对齐脚本四个部分。
 
 模型 checkpoint 使用 HuggingFace 上的：
 
@@ -427,16 +427,16 @@ scripts/debug/run-compare-dotsocr-packed.sh
 
 ### 6.6 README 中的支持项
 
-正式发布文档时，README 支持模型表建议增加 dots.mcore：
+正式发布文档时，README 支持模型表建议增加 dots.mocr：
 
 ```markdown
-| **dots.mcore** | dots.mocr | Vision + Language | OCR, document understanding, multimodal reasoning | Megatron |
+| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B | Vision + Language | OCR, document understanding, multimodal reasoning | Megatron |
 ```
 
 中文 README 建议增加：
 
 ```markdown
-| **dots.mcore** | dots.mocr | 视觉 + 语言 | OCR、文档理解、多模态推理 | Megatron |
+| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B | 视觉 + 语言 | OCR、文档理解、多模态推理 | Megatron |
 ```
 
 模型名链接到：

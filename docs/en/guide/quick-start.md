@@ -267,6 +267,8 @@ Parameter descriptions:
 | `--origin-hf-dir` | Original HF safetensors directory, used for architecture, expected weight keys, and tokenizer files |
 | `--force` | Optional, force overwrite if output directory already exists |
 
+> **Note (MTP-free RL checkpoints):** When the source checkpoint has no MTP weights (e.g. an RL/SFT checkpoint trained without MTP) while the reference model's config enables MTP, the converter automatically reconciles the exported `model.safetensors.index.json` with the tensors actually written and supplements the missing MTP weights from `--origin-hf-dir`, so the exported model loads cleanly (including EAGLE speculative decoding). The same reconciliation is applied to online `--save-hf` exports.
+
 For the FP8 strategy options, memory behavior, output format, and an 8-GPU SGLang launch command, see [Model Checkpoint Conversion](./model-conversion.md).
 
 ## Next Steps

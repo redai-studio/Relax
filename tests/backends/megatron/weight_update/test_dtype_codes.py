@@ -12,6 +12,7 @@ sync test so the module imports without a GPU.
 from __future__ import annotations
 
 import sys
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,24 +29,34 @@ _MEGATRON_MODULES = [
     "megatron.core.tensor_parallel",
     "megatron.bridge",
     "megatron.bridge.models",
+    "megatron.bridge.peft",
+    "megatron.bridge.peft.lora",
 ]
 
+_MISSING = object()
 _saved = {}
 for _mod in _MEGATRON_MODULES:
-    if _mod in sys.modules:
-        _saved[_mod] = sys.modules[_mod]
-    sys.modules[_mod] = MagicMock()
+    _saved[_mod] = sys.modules.get(_mod, _MISSING)
+    sys.modules[_mod] = ModuleType(_mod)
+    if _mod in {"megatron", "megatron.core", "megatron.core.transformer", "megatron.bridge", "megatron.bridge.peft"}:
+        sys.modules[_mod].__path__ = []
+sys.modules["megatron.core"].mpu = sys.modules["megatron.core.mpu"]
+sys.modules["megatron.core.transformer.transformer_layer"].get_transformer_layer_offset = MagicMock(return_value=0)
+sys.modules["megatron.bridge.peft.lora"].LoRAMerge = MagicMock
 
-pytest.importorskip("triton")
+try:
+    pytest.importorskip("triton")
 
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
-    _CODE_TO_DTYPE,
-    _DTYPE_TO_CODE,
-)
-
-
-for _mod, _orig in _saved.items():
-    sys.modules[_mod] = _orig
+    from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import (  # noqa: E402
+        _CODE_TO_DTYPE,
+        _DTYPE_TO_CODE,
+    )
+finally:
+    for _mod, _orig in _saved.items():
+        if _orig is _MISSING:
+            sys.modules.pop(_mod, None)
+        else:
+            sys.modules[_mod] = _orig
 
 
 class TestDtypeCodes:

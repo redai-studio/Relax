@@ -1,7 +1,11 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import ast
+import math
+from argparse import Namespace
+from typing import Optional
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 
@@ -15,11 +19,86 @@ from transformers import AutoConfig
 
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import ModelSource
 
 
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = get_logger(__name__)
+
+_FP16_OPTIMIZER_FALLBACKS = {
+    "initial_loss_scale": 32768.0,
+    "min_loss_scale": 1.0,
+    "use_precision_aware_optimizer": True,
+    "store_param_remainders": False,
+}
+_DYNAMIC_LOSS_SCALE_FIELDS = ("initial_loss_scale", "min_loss_scale")
+
+
+def _optimizer_option(name: str) -> str:
+    return f"--{name.replace('_', '-')}"
+
+
+def _format_optimizer_fallback(name: str, value: object) -> str:
+    option = _optimizer_option(name)
+    if isinstance(value, bool):
+        return option if value else f"--no-{option[2:]}"
+    return f"{option} {value!r}"
+
+
+def _validate_fp16_optimizer_args(args) -> None:
+    if getattr(args, "loss_scale", None) is None:
+        for name in _DYNAMIC_LOSS_SCALE_FIELDS:
+            value = getattr(args, name)
+            option = _optimizer_option(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{option} must be a finite number greater than 0, got {value!r}.")
+
+        if args.min_loss_scale > args.initial_loss_scale:
+            raise ValueError(
+                "--min-loss-scale must be less than or equal to --initial-loss-scale, "
+                f"got {args.min_loss_scale!r} > {args.initial_loss_scale!r}."
+            )
+
+    for name, fallback in _FP16_OPTIMIZER_FALLBACKS.items():
+        if not isinstance(fallback, bool):
+            continue
+        value = getattr(args, name)
+        if not isinstance(value, bool):
+            option = _optimizer_option(name)
+            raise ValueError(f"{option} must resolve to a boolean, got {value!r}.")
+
+
+def _resolve_optimizer_precision_args(args):
+    """Resolve precision optimizer arguments before Megatron validates them."""
+    native_defaults = None if args.fp16 else OptimizerConfig()
+    missing = []
+    for name, fp16_fallback in _FP16_OPTIMIZER_FALLBACKS.items():
+        if args.fp16 and getattr(args, "loss_scale", None) is not None and name in _DYNAMIC_LOSS_SCALE_FIELDS:
+            continue
+        if getattr(args, name, None) is None:
+            fallback = fp16_fallback if args.fp16 else getattr(native_defaults, name)
+            setattr(args, name, fallback)
+            if args.fp16:
+                missing.append(name)
+
+    if not args.fp16:
+        return args
+
+    _validate_fp16_optimizer_args(args)
+    if missing:
+        fallback_text = ", ".join(_format_optimizer_fallback(name, getattr(args, name)) for name in missing)
+        logger.warning(
+            "FP16 optimizer options were not explicitly configured; using Relax compatibility fallbacks: %s. "
+            "Pass the active FP16 optimizer options explicitly to silence this warning.",
+            fallback_text,
+        )
+    return args
 
 
 def _validate_dynamic_context_parallel(args):
@@ -48,6 +127,45 @@ def _validate_dynamic_context_parallel(args):
     args.data_parallel_size = args.world_size // total_model_size
     logger.info(f"dynamic_context_parallel init context_parallel_size = {args.context_parallel_size}")
     args.max_seqlen_per_dp_cp_rank = args.max_tokens_per_gpu
+
+
+def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -> None:
+    """Validate the mode name, then GDN-specific flags once the model is known.
+
+    Geometry-dependent rejections (e.g. explicit `headwise` on heads not
+    divisible by `tp*max_cp`) can only be checked once the real GDN head counts
+    are known, which happens in MCore's `TransformerConfig.__post_init__` gate
+    -- not here. Bridge calls this again with the provider's actual config.
+    """
+    model_config = config if config is not None else args
+    mode = getattr(model_config, "linear_cp_mode", "chunkwise")
+    allowed_modes = {"headwise", "chunkwise", "all_gather"}
+    if mode not in allowed_modes:
+        raise ValueError(
+            f"--linear-cp-mode must be one of {sorted(allowed_modes)!r}; got {mode!r}. Resolve 'auto' before construction."
+        )
+
+    # Bridge determines the attention variant from the HF checkpoint. The default
+    # linear_cp_mode on an ordinary-attention model does not make it a GDN model.
+    if getattr(model_config, "experimental_attention_variant", None) != "gated_delta_net":
+        return
+
+    cp_may_exceed_one = (
+        getattr(args, "dynamic_context_parallel", False) or getattr(model_config, "context_parallel_size", 1) > 1
+    )
+    if cp_may_exceed_one and getattr(args, "allgather_cp", False):
+        raise ValueError(
+            "GDN CP requires zig-zag THD packing in every linear_cp_mode; --allgather-cp uses "
+            "contiguous per-rank packing and is incompatible with GDN CP>1. --allgather-cp is a "
+            "data/attention packing flag, separate from --linear-cp-mode=all_gather."
+        )
+
+    if mode == "chunkwise" and cp_may_exceed_one and getattr(model_config, "deterministic_mode", False):
+        raise ValueError(
+            "--linear-cp-mode=chunkwise does not support --deterministic-mode while CP>1 may occur: "
+            "the deterministic torch reference path only accepts cp_context=None. "
+            "Packed GDN inputs also do not support deterministic mode in the other CP modes."
+        )
 
 
 def validate_args(args):
@@ -96,6 +214,8 @@ def validate_args(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )
+
+    _validate_linear_cp_mode(args)
     return args
 
 
@@ -190,6 +310,7 @@ def _set_default_megatron_args(args):
     args.use_distributed_optimizer = True
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
+    _resolve_optimizer_precision_args(args)
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096
@@ -272,9 +393,19 @@ def _derive_cluster_args_from_resource(args):
             logger.info(f"Derived genrm_num_gpus={args.genrm_num_gpus} from --resource")
 
 
-def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
+def megatron_parse_args(
+    extra_args_provider,
+    skip_hf_validate: bool = False,
+    model_source: Optional[ModelSource] = None,
+):
     """Parse megatron args, validate HF config, and set defaults."""
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
+
+    if model_source is not None:
+        # Keep the CLI path so node-local materialization can remap other
+        # arguments that explicitly referenced the same model.
+        args._model_source_original_hf_checkpoint = args.hf_checkpoint
+        args.hf_checkpoint = model_source.uri
 
     if args.hf_checkpoint and not skip_hf_validate:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)

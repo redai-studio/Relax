@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import re
 import time
 from collections import OrderedDict
 
@@ -8,8 +9,23 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 
+
+try:
+    # Megatron-Bridge >= 0.6.0 moved LoRAMerge out of peft.lora into its own module.
+    from megatron.bridge.peft.lora_merge import LoRAMerge
+except ImportError:  # bridge <= 0.5.x
+    from megatron.bridge.peft.lora import LoRAMerge
+
+
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
+from relax.utils.megatron_peft_utils import (
+    is_lora_adapter_mode,
+    is_lora_adapter_param,
+    is_lora_enabled,
+    is_lora_merge_mode,
+)
 from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
@@ -31,8 +47,26 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bridge_converter = BridgeConverter(
             args=self.args, model=self.model, quantization_config=self.quantization_config
         )
-        buckets_result = _build_param_info_buckets(self.args, self.model)
-        self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map = buckets_result
+        self.lora_merge_mode = is_lora_enabled(self.args) and is_lora_merge_mode(self.args)
+        self.lora_adapter_mode = is_lora_enabled(self.args) and is_lora_adapter_mode(self.args)
+        collect_adapters = self.lora_merge_mode or self.lora_adapter_mode
+        buckets_result = _build_param_info_buckets(self.args, self.model, collect_adapters=collect_adapters)
+        self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
+        if self.lora_merge_mode:
+            self.lora_alpha = self.args.lora_alpha
+            self.lora_dim = self.args.lora_rank
+            # Expert LoRA merge selects a per-expert adapter slice locally on the owning EP
+            # rank (no ETP collective). Expert-TP > 1 would need an ETP all-gather that only
+            # the single owning rank reaches -> deadlock; fail loud rather than mis-merge.
+            # MoE LoRA merge is therefore supported only with expert-tensor-parallel-size=1
+            # (expert-model-parallel-size / EP may be > 1). Attention/dense LoRA is unaffected.
+            assert mpu.get_expert_tensor_parallel_world_size() == 1, (
+                "MoE LoRA merge mode requires --expert-tensor-parallel-size 1 "
+                f"(got {mpu.get_expert_tensor_parallel_world_size()}). Set ETP=1 (EP may stay > 1), "
+                "or use --lora-adapter-mode: in colocate the reference stays in-process (no fold), "
+                "so colocate adapter mode is unaffected by ETP. (Fully-async off-policy adapter mode "
+                "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
+            )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         yield from _chunk_with_mla_pairing(
@@ -60,10 +94,16 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._bridge_converter.init_tasks()
         self._bridge_converter.broadcast_and_apply_configs()
 
+        # In LoRA merge mode, fold each adapter into its base weight at load time
+        # (on the owning rank), so the rest of the pipeline sees a single merged model.
+        merge_fn = self._merge_base_with_adapter if self.lora_merge_mode else None
+
         # --- Expert weights: quantize-before-broadcast path ---
         for bucket_infos in self._expert_buckets:
             t_c0 = time.monotonic()
-            params = _load_to_gpu(bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank)
+            params = _load_to_gpu(
+                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+            )
             all_converted = []
             for info, param in zip(bucket_infos, params, strict=True):
                 gathered = all_gather_param(self.args, info.name, param)
@@ -85,7 +125,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         # --- Non-expert weights: original path ---
         for bucket_infos in self._non_expert_buckets:
             t_b0 = time.monotonic()
-            params = _load_and_broadcast(bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank)
+            params = _load_and_broadcast(
+                bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
+            )
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
 
@@ -114,19 +156,98 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 time.monotonic() - t_start,
             )
 
+    def _merge_base_with_adapter(self, info, param, megatron_local_weights, device):
+        """Fold this param's LoRA adapter into the base weight, in Megatron-
+        sharded space.
 
-def _build_param_info_buckets(args, model):
+        Returns a new Parameter ``base + (alpha/dim)·(B @ A)`` with the SAME shape,
+        dtype and TP attributes as ``param`` — so the downstream gather/convert path
+        treats it identically to a non-LoRA base weight. Returns ``param`` unchanged
+        for weights that have no paired adapter (layernorms, router, embeddings, ...).
+
+        Only called on the rank that owns ``param`` (``rank == info.src_rank``). The
+        merge math (incl. the TP all-gather of the sharded adapter dim) is delegated to
+        ``megatron.bridge.peft.lora.LoRAMerge`` — the same implementation the upstream
+        bridge export uses — to avoid drifting from its conventions.
+        """
+        slot = self._adapter_map.get(_base_param_prefix(info.name))
+        if slot is None or "in" not in slot or "out" not in slot:
+            return param
+
+        linear_in = megatron_local_weights[slot["in"]]
+        linear_out = megatron_local_weights[slot["out"]]
+
+        if ".experts." in info.name:
+            # Grouped experts: base is per-expert (``...weight{N}``) while the adapter is a
+            # single grouped tensor on this EP rank. Select expert N's local slice.
+            if linear_in.ndim > 2:
+                ep_size = mpu.get_expert_model_parallel_world_size()
+                ep_rank = mpu.get_expert_model_parallel_rank()
+                global_idx = int(re.search(r"weight(\d+)$", info.name).group(1))
+                local_idx = global_idx - ep_rank * self.args.num_experts // ep_size
+                # Slice on CPU before moving to device: only this expert's slice is used.
+                linear_in = linear_in[local_idx]
+                linear_out = linear_out[local_idx]
+            tp_size = mpu.get_expert_tensor_parallel_world_size()
+            tp_group = mpu.get_expert_tensor_parallel_group()
+        else:
+            tp_size = mpu.get_tensor_model_parallel_world_size()
+            tp_group = mpu.get_tensor_model_parallel_group()
+
+        linear_in = linear_in.to(device=device).float()
+        linear_out = linear_out.to(device=device).float()
+
+        merged = (
+            LoRAMerge()
+            .merge(
+                param.data.float(),
+                linear_out,
+                linear_in,
+                self.lora_alpha,
+                self.lora_dim,
+                tp_size=tp_size,
+                tp_group=tp_group,
+            )
+            .to(param.dtype)
+        )
+
+        merged_param = torch.nn.Parameter(merged, requires_grad=False)
+        for key, value in info.attrs.items():
+            setattr(merged_param, key, value)
+        return merged_param
+
+
+def _base_param_prefix(name):
+    """Strip the LoRA base suffix ``.to_wrap.weight`` (and any expert
+    ``weight{N}``) so it matches the key produced by
+    ``_adapter_base_prefix``."""
+    return re.sub(r"\.to_wrap\.weight\d*$", "", name)
+
+
+def _adapter_base_prefix(name):
+    """Strip the LoRA adapter suffix so it matches ``_base_param_prefix``."""
+    return name.replace(".adapter.linear_in.weight", "").replace(".adapter.linear_out.weight", "")
+
+
+def _build_param_info_buckets(args, model, collect_adapters=False):
     """Build ParamInfo buckets and vanilla-key mapping at init time.
 
     Exchanges parameter metadata across PP/EP ranks so every rank knows about
     all params.  Also records the vanilla-key (TensorBackuper dict key) for
     each param owned by the current rank.
 
+    When ``collect_adapters`` is set (LoRA merge mode), LoRA adapter params are
+    pulled OUT of the conversion buckets (they have no standalone bridge mapping)
+    and returned in ``adapter_map`` keyed by base prefix, so the iterator can
+    splice them into their base weight at load time.
+
     Returns:
         expert_buckets: list of ParamInfo lists for expert params
         non_expert_buckets: list of ParamInfo lists for non-expert params
         vanilla_key_map: dict mapping global_name -> vanilla_key (only for
             params owned by this PP rank)
+        adapter_map: dict base_prefix -> {"in": vanilla_key, "out": vanilla_key}
+            for LoRA adapters owned by this rank (empty unless collect_adapters)
     """
     rank = dist.get_rank()
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -137,7 +258,17 @@ def _build_param_info_buckets(args, model):
 
     local_infos = {}
     vanilla_key_map = {}
+    adapter_map: dict[str, dict[str, str]] = {}
     for (v_name, v_param), (g_name, _g_param) in zip(vanilla_iter, global_iter, strict=True):
+        if collect_adapters and is_lora_adapter_param(g_name):
+            # LoRA adapter param: keep it out of the conversion buckets (no standalone
+            # bridge mapping) and record its vanilla key for load-time merging.
+            slot = adapter_map.setdefault(_adapter_base_prefix(g_name), {})
+            if ".linear_in." in g_name:
+                slot["in"] = v_name
+            elif ".linear_out." in g_name:
+                slot["out"] = v_name
+            continue
         local_infos[g_name] = ParamInfo(
             name=g_name,
             dtype=v_param.dtype,
@@ -196,7 +327,7 @@ def _build_param_info_buckets(args, model):
     expert_buckets = _bucket_by_size(expert_infos, args)
     non_expert_buckets = _bucket_by_size(non_expert_infos, args)
 
-    return expert_buckets, non_expert_buckets, vanilla_key_map
+    return expert_buckets, non_expert_buckets, vanilla_key_map, adapter_map
 
 
 def _bucket_by_size(infos, args):
@@ -219,10 +350,12 @@ def _bucket_by_size(infos, args):
     return buckets
 
 
-def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank):
+def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
     """Load params from CPU dict to GPU.
 
-    No broadcast.
+    No broadcast. When ``merge_fn`` is given (LoRA merge mode), each owned
+    param is passed through it to fold in its LoRA adapter before the
+    gather/convert pipeline.
     """
     params = []
     for info in bucket_infos:
@@ -235,8 +368,10 @@ def _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, 
             param = torch.nn.Parameter(torch.empty(info.shape, dtype=info.dtype, device=device), requires_grad=False)
         for key, value in info.attrs.items():
             setattr(param, key, value)
+        if merge_fn is not None and rank == info.src_rank:
+            param = merge_fn(info, param, megatron_local_weights, device)
         params.append(param)
-    device_utils.synchronize()
+    device_module.synchronize()
     return params
 
 
@@ -272,14 +407,17 @@ def _ep_broadcast(bucket_infos, params):
         handle.wait()
 
 
-def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank):
+def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=None):
     """Load params from CPU dict, PP-broadcast, EP-broadcast.
 
     After this call every rank holds all params from all PP stages and all EP
     shards (still TP-sharded).  Mirrors the broadcast logic in
     ``HfWeightIteratorDirect._get_megatron_full_params``.
+
+    LoRA adapters are merged at load time (before broadcast) so the merged base
+    weight is what propagates to the non-owning PP/EP ranks.
     """
-    params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank)
+    params = _load_to_gpu(bucket_infos, megatron_local_weights, vanilla_key_map, device, rank, merge_fn=merge_fn)
     _pp_broadcast(bucket_infos, params)
     _ep_broadcast(bucket_infos, params)
     return params

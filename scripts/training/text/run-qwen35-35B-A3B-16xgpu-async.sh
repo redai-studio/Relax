@@ -48,11 +48,12 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
    --num-rollout ${NUM_ROLLOUT}
-   --rollout-batch-size 32
+   --rollout-batch-size 16
    --n-samples-per-prompt 8
    --rollout-max-response-len 8192
+   --rollout-max-context-len 20480
    --rollout-temperature 1
-   --global-batch-size 256
+   --global-batch-size 128
    --use-fault-tolerance
 )
 
@@ -67,7 +68,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -109,11 +110,18 @@ OPTIMIZER_ARGS=(
    --no-rope-fusion
    --moe-router-load-balancing-type "none"
    --moe-aux-loss-coeff 0.0
+   --moe-flex-dispatcher-backend deepep
+   --moe-token-dispatcher-type flex
+   --log-probs-chunk-size 2048
+   --data-pad-size-multiplier 1024
+   --recompute-loss-function
+   --use-distributed-optimizer
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.7
+   --sglang-load-format dummy
+   --sglang-mem-fraction-static 0.75
    --sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)
 )
 
@@ -135,6 +143,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+PARTIAL_ROLLOUT_ARGS=(
+    --partial-rollout
+    --over-sampling-batch-size 24
+    --partial-rollout-max-aborted-count 3
+)
+
 mkdir -p log
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
@@ -143,7 +157,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --resource '{"actor": [1, 8], "rollout": [1, 8], "advantages": [1, 0]}'\
    --max-staleness 2 \
    --num-data-storage-units 1 \
-   --num-iters-per-train-update 32 \
+   --num-iters-per-train-update 8 \
    --fully-async \
     --use-health-check \
     "${MODEL_ARGS[@]}" \
@@ -155,4 +169,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
+    "${PARTIAL_ROLLOUT_ARGS[@]}" \
     "${MISC_ARGS[@]}"  2>&1 | tee log/qwen35-35B-A3B-GRPO-gpu16-async-${now}.log

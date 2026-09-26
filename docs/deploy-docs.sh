@@ -29,9 +29,9 @@ echo "✅ Documentation built successfully!"
 # Deployment options
 if [ "$1" == "github" ]; then
     echo "📤 Deploying to GitHub Pages..."
-    
+
     cd .vitepress/dist
-    
+
     # Initialize git if needed
     if [ ! -d ".git" ]; then
         git init
@@ -39,22 +39,22 @@ if [ "$1" == "github" ]; then
         git commit -m "Deploy documentation"
         git branch -M gh-pages
     fi
-    
+
     # Push to GitHub Pages
-    git push -f git@github.com:redai-infra/Relax.git gh-pages
-    
+    git push -f git@github.com:redai-studio/Relax.git gh-pages
+
     echo "✅ Deployed to GitHub Pages!"
-    
+
 elif [ "$1" == "vercel" ]; then
     echo "📤 Deploying to Vercel..."
     npx vercel --prod
     echo "✅ Deployed to Vercel!"
-    
+
 elif [ "$1" == "netlify" ]; then
     echo "📤 Deploying to Netlify..."
     npx netlify deploy --prod --dir=.vitepress/dist
     echo "✅ Deployed to Netlify!"
-    
+
 else
     echo "📋 Build complete! Distribution files are in .vitepress/dist"
     echo ""

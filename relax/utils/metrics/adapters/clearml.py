@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import os
 import subprocess
 from pathlib import Path
 
+from relax.utils.env import Envs, is_env_set
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta
 
@@ -100,11 +100,11 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
         )
 
     def _get_task_info(self, args):
-        project_name = args.tb_project_name or os.getenv("CLEARML_PROJECT", "unknown_project")
-        experiment_name = args.tb_experiment_name or os.getenv("CLEARML_TASK", "unknown_task")
-        tags = os.getenv("CLEARML_TAGS", None)
+        project_name = args.tb_project_name or Envs.CLEARML_PROJECT
+        experiment_name = args.tb_experiment_name or Envs.CLEARML_TASK
+        tags = Envs.CLEARML_TAGS
 
-        if "CLEARML_TAGS" not in os.environ and (user := os.getenv("USER")) and (region := os.getenv("REGION")):
+        if not is_env_set("CLEARML_TAGS") and (user := Envs.USER) and (region := Envs.REGION):
             tags = f"userid={user},region={region}"
 
         if isinstance(tags, str):

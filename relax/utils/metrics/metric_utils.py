@@ -1,9 +1,14 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import logging
 import math
 from typing import Any, Literal
 
 import numpy as np
+import torch
 
+from relax.algorithms.spec import get_algorithm
+from relax.utils.repetition import detect_repetition
 from relax.utils.types import Sample
 
 
@@ -109,7 +114,96 @@ def finalize_rollout_explicit_metric_values(metric_values: dict[str, list[float]
     return log_dict
 
 
-def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict[str, float]:
+def _compute_rloo_group_diagnostics(args, samples: list[Sample]) -> dict[str, float]:
+    """Compute leave-one-out diagnostics from training rollout samples.
+
+    Gated on the algorithm registry's ``reward_normalizer`` rather than on the
+    estimator's name: what makes these numbers meaningful is that the reward
+    stage produced a leave-one-out baseline, so any algorithm declaring that
+    normalizer gets them. The ``rloo/`` key prefix stays as-is -- those metric
+    names are already published to dashboards.
+
+    These keys are returned with an ``rloo/`` prefix. The training rollout
+    logger adds the outer ``rollout/`` prefix before publishing them.
+
+    These are purely observational rollout statistics and do not feed back into
+    the training path. ``no_signal_frac`` here means effective loss tokens whose
+    RLOO advantage is exactly zero (the leave-one-out baseline is zero whenever
+    all rewards in a group are equal); it is not a zero-token training-step
+    concept. ``empty_response_frac`` intentionally uses the literal response
+    length and therefore remains distinct from a sample whose response exists
+    but is fully masked.
+    """
+    spec = get_algorithm(getattr(args, "advantage_estimator", None) or "grpo")
+    if spec.reward_normalizer != "group_leave_one_out":
+        return {}
+    if (
+        getattr(args, "custom_reward_post_process_path", None) is not None
+        or getattr(args, "agentic_custom_advantage_path", None) is not None
+    ):
+        # These hooks can replace the advantages consumed by training. Raw
+        # rewards are insufficient to reconstruct that custom signal here, so
+        # suppress the standard RLOO diagnostics instead of publishing values
+        # that may disagree with the optimizer input.
+        return {}
+
+    from relax.utils.training.ppo_utils import compute_rloo_leave_one_out_rewards
+
+    group_size = args.n_samples_per_prompt
+    groups: dict[int, list[tuple[Sample, float]]] = {}
+    for sample in samples:
+        group_index = sample.group_index
+        if group_index is None:
+            continue
+        groups.setdefault(group_index, []).append((sample, sample.get_reward_value(args)))
+
+    baseline_means: list[float] = []
+    advantage_abs_means: list[float] = []
+    zero_adv_groups = 0
+    complete_groups = 0
+    dropped_groups = 0
+    zero_adv_tokens = 0
+    effective_response_tokens = 0
+
+    for items in groups.values():
+        if len(items) != group_size:
+            dropped_groups += 1
+            continue
+        complete_groups += 1
+        rewards = torch.tensor([reward for _, reward in items], dtype=torch.float32)
+        advantages = compute_rloo_leave_one_out_rewards(rewards)
+        baselines = rewards - advantages
+        baseline_means.append(baselines.mean().item())
+        advantage_abs_means.append(advantages.abs().mean().item())
+        if bool(advantages.abs().max().item() < 1e-12):
+            zero_adv_groups += 1
+        for (sample, _), advantage in zip(items, advantages.tolist(), strict=True):
+            effective_length = sample.effective_response_length or 0
+            effective_response_tokens += effective_length
+            if abs(advantage) < 1e-12:
+                zero_adv_tokens += effective_length
+
+    total_samples = len(samples)
+    observed_groups = complete_groups + dropped_groups
+    empty_responses = sum((sample.response_length or 0) == 0 for sample in samples)
+    return {
+        "rloo/baseline_mean": sum(baseline_means) / len(baseline_means) if baseline_means else 0.0,
+        "rloo/adv_abs_mean": sum(advantage_abs_means) / len(advantage_abs_means) if advantage_abs_means else 0.0,
+        "rloo/no_signal_frac": (zero_adv_tokens / effective_response_tokens if effective_response_tokens > 0 else 0.0),
+        "rloo/empty_response_frac": empty_responses / total_samples if total_samples > 0 else 0.0,
+        "rloo/zero_adv_group_frac": zero_adv_groups / complete_groups if complete_groups > 0 else 0.0,
+        "rloo/dropped_group_frac": dropped_groups / observed_groups if observed_groups > 0 else 0.0,
+    }
+
+
+def compute_rollout_reward_metrics(
+    args,
+    samples: list[Sample],
+    *,
+    include_rloo_diagnostics: bool = True,
+) -> dict[str, float]:
+    reward_values = [sample.get_reward_value(args) for sample in samples if sample.reward is not None]
+    log_dict = {"raw_reward": np.mean(reward_values).item()} if reward_values else {}
     reward_metric_values: dict[str, list[float]] = {}
     primary_reward_key = getattr(args, "reward_key", None)
     for sample in samples:
@@ -126,7 +220,20 @@ def compute_rollout_explicit_reward_metrics(args, samples: list[Sample]) -> dict
             ):
                 continue
             append_rollout_numeric_metric_values(reward_metric_values, key=key, value=value)
-    return finalize_rollout_explicit_metric_values(reward_metric_values)
+    log_dict |= finalize_rollout_explicit_metric_values(reward_metric_values)
+    if args.log_passrate and reward_values:
+        log_dict |= dict_add_prefix(
+            compute_pass_rate(flat_rewards=reward_values, group_size=args.n_samples_per_prompt),
+            "passrate/",
+        )
+
+    if include_rloo_diagnostics:
+        log_dict |= _compute_rloo_group_diagnostics(args, samples)
+
+    return log_dict
+
+
+compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
 
 
 def compression_ratio(
@@ -173,11 +280,8 @@ def compression_ratio(
     return ratio, savings_pct
 
 
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
+def has_repetition(text: str) -> bool:
+    return detect_repetition(text, stop_after_first_hit=True).has_repetition
 
 
 def compute_rollout_step(args, rollout_id):

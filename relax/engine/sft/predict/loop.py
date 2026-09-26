@@ -8,8 +8,8 @@ trailing assistant turn), batches them through SGLang via
 ``<save>/predict/predictions_step_<train_step>.jsonl``.
 
 Eval data source mirrors ``components/sft.py::SFT._init_data_pipeline``:
-``--eval-prompt-data`` (separate dataset) or ``--eval-size`` (tail slice of
-``--prompt-data``). Argparse guarantees one of them is set whenever
+``--eval-prompt-data`` (separate dataset) or ``--eval-size`` (fixed-seed
+random subset of ``--prompt-data``). Argparse guarantees one of them is set whenever
 ``--sft-predict-interval`` is set.
 """
 
@@ -17,7 +17,9 @@ import json
 from pathlib import Path
 
 from relax.engine.sft.dataset.sample import CanonicalSample
+from relax.engine.sft.runtime import resolve_sft_split_indices
 from relax.utils.logging_utils import get_logger
+from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.training.eval_config import build_named_prompt_data_configs
 
 
@@ -82,8 +84,8 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
     multimodal_inputs)``.
 
     Uses the same source resolution as ``SFT._init_data_pipeline``:
-    ``--eval-size`` carves the tail of ``--prompt-data``; ``--eval-prompt-data``
-    loads a separate dataset.
+    ``--eval-size`` uses the same deterministic random row split as SFT PPL
+    evaluation; ``--eval-prompt-data`` loads a separate dataset.
 
     ``multimodal_inputs`` is the dict shape consumed by
     ``_encode_multimodal_inputs`` (or ``None`` for text-only samples).
@@ -92,6 +94,7 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
 
     from relax.engine.sft.dataset.streaming import SFTStreamingDataset
 
+    prepare_model_maybe_update_args(config, completeness="metadata")
     tokenizer = AutoTokenizer.from_pretrained(config.hf_checkpoint, trust_remote_code=True)
     cp_size = max(1, getattr(config, "context_parallel_size", 1) or 1)
     capacity = config.max_tokens_per_gpu * cp_size
@@ -116,12 +119,11 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
         n_avail = len(dataset)
-        n_eval = max(1, int(n_avail * eval_size_arg)) if eval_size_arg < 1 else int(eval_size_arg)
-        n_eval = min(n_eval, max(n_avail - 1, 0))
-        start = n_avail - n_eval
+        _, eval_indices = resolve_sft_split_indices(n_avail, eval_size_arg, seed)
     elif eval_prompt_data:
         eval_input_key = getattr(config, "eval_input_key", None) or config.input_key
         eval_label_key = getattr(config, "eval_label_key", None) or config.label_key
@@ -143,19 +145,19 @@ def render_eval_prompts(config) -> list[tuple[str, str, dict | None]]:
             seed=seed,
             prefetch_max_cached=0,
             pad_token_ids=None,
+            invalid_multimodal_strategy=getattr(config, "sft_invalid_multimodal_strategy", "error"),
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
         )
-        start, n_eval = 0, len(dataset)
+        eval_indices = tuple(range(len(dataset)))
     else:
         raise RuntimeError("render_eval_prompts requires --eval-prompt-data or --eval-size")
 
-    if n_eval <= 0:
+    if not eval_indices:
         dataset.stop()
         return []
 
     out: list[tuple[str, str, dict | None]] = []
-    for offset in range(n_eval):
-        idx = start + offset
+    for idx in eval_indices:
         try:
             sample = dataset.get_canonical_sample(idx)
         except Exception:

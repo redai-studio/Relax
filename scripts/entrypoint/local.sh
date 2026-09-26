@@ -27,6 +27,8 @@ if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
 fi
 
 _LOCAL_SH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./kernel-cache.sh
+source "${_LOCAL_SH_DIR}/kernel-cache.sh"
 
 # ── delegate to ray-job.sh when inside an existing Ray cluster ─────────────
 # When RAY_ADDRESS is set AND `ray status` succeeds, we're already part of an
@@ -63,6 +65,9 @@ export RELAX=${RELAX:-${_LOCAL_SH_DIR}/../../}
 export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${_LOCAL_SH_DIR}/../models"
 
+relax_kernel_cache_configure "${RELAX_RUN_SCRIPT_PATH:-${BASH_SOURCE[1]:-}}" "$@"
+relax_kernel_cache_prepare_local
+
 # ── NVLink detection ────────────────────────────────────────────────────────
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || true)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -97,6 +102,8 @@ ray start --head \
     --dashboard-host=0.0.0.0 \
     --dashboard-port=8265
 
+relax_kernel_cache_start_agents attach
+
 # ── set entrypoint mode ────────────────────────────────────────────────────
 export RELAX_ENTRYPOINT_MODE="local"
 
@@ -117,10 +124,12 @@ export RUNTIME_ENV_JSON="{
    \"NVSHMEM_DISABLE_NCCL\": \"${NVSHMEM_DISABLE_NCCL:-1}\",
    \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
-   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
+   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-0}\",
    \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\"
 }
 }"
+
+relax_kernel_cache_inject_runtime_env
 
 echo "=== Local environment ready ==="

@@ -73,6 +73,22 @@ def test_teacher_gpu_index_starts_at_zero_for_dedicated_pg(monkeypatch):
     )
 
 
+def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    args = SimpleNamespace(rollout_num_gpus=8)
+
+    assert (
+        teacher_manager._resolve_teacher_gpu_index(
+            args=args,
+            replica=1,
+            gpus_per_replica=2,
+            shared_pg=True,
+            bundle_offset=4,
+        )
+        == 14
+    )
+
+
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
     # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default
@@ -98,3 +114,35 @@ def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
 
     assert hasattr(teacher_manager.TeacherManager, "remote")
     assert hasattr(teacher_manager.TeacherManager, "options")
+
+
+def test_teacher_recovery_reuses_original_endpoint(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager._shared_pg = True
+    original = {
+        "host": "192.0.2.1",
+        "port": 15001,
+        "nccl_port": 15002,
+        "dist_init_addr": "192.0.2.1:15003",
+    }
+    manager._engine_addr_and_ports = {0: original}
+
+    result = manager._allocate_engine_addr_and_ports(new_engines=[(0, object())])
+
+    assert result == {0: original}
+    assert result[0] is not original
+    sys.modules["relax.utils.http_utils"].find_available_port.assert_not_called()
+    sys.modules["relax.distributed.ray.rollout"]._allocate_rollout_engine_addr_and_ports_normal.assert_not_called()
+
+
+def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager._shared_pg = False
+    manager.all_engines = [None]
+
+    with pytest.raises(RuntimeError, match="global restart"):
+        manager.recover()

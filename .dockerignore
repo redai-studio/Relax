@@ -4,6 +4,7 @@
 
 # Python
 __pycache__
+**/env.sh
 *.py[cod]
 *$py.class
 *.so

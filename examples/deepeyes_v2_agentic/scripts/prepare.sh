@@ -1,18 +1,19 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# One-shot prep for DeepEyes V2: builds the SIF, downloads + converts the
-# DeepEyesV2_RL training parquets, generates the smoke parquet — all into
-# ${DATA_DIR}/{sif,data}/. Idempotent.
+# One-shot prep for DeepEyes V2: prepares the node-local host app environment,
+# builds the SIF, downloads + converts the training parquets, and generates the
+# smoke parquet under ${DATA_DIR}. Idempotent.
 #
 # Required:
-#   DATA_DIR    root dir for everything. After this script:
+#   DATA_DIR    root dir for shared data assets. After this script:
 #                 ${DATA_DIR}/sif/deepeyes_v2_kernel.sif    (~115 MiB)
 #                 ${DATA_DIR}/data/raw/*.parquet            (~10 GiB raw)
 #                 ${DATA_DIR}/data/*.parquet                (~10 GiB converted)
 #                 ${DATA_DIR}/data/smoke.parquet            (~16 KiB synthetic)
 #
 # Optional (set in env.sh — see env.sh.example):
+#   DEEPEYES_V2_APP_ENV_ROOT        node-local app environment root (default /tmp/deepeyes-v2-app-env)
 #   HF_ENDPOINT                    default https://huggingface.co
 #   HF_HTTP_PROXY                  HTTPS proxy URL (no default)
 #   HF_NO_PROXY                    comma-separated no_proxy list
@@ -50,6 +51,9 @@ SIF_OUT="${SIF_DIR}/deepeyes_v2_kernel.sif"
 SMOKE_PARQUET="${DATA_DIR_INNER}/smoke.parquet"
 
 mkdir -p "${SIF_DIR}" "${DATA_DIR_INNER}" "${RAW_DIR}"
+
+bash "${SCRIPT_DIR}/prepare_app_env.sh"
+echo
 
 echo "[prepare] DATA_DIR : ${DATA_DIR}"
 echo "[prepare] sif      : ${SIF_OUT}"

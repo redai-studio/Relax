@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import pytest
 
-from relax.utils.http_utils import _post
+from relax.utils.http_utils import _post, router_worker_base_url, router_worker_base_urls
 
 
 class _StubClient:
@@ -55,3 +55,38 @@ def test_post_retries_retryable_503_then_succeeds():
 
     assert result == {"ok": True}
     assert client.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("worker_url", "expected"),
+    [
+        ("http://worker:8000", "http://worker:8000"),
+        ("http://worker:8000@0", "http://worker:8000"),
+        ("http://[2001:db8::1]:8000@12", "http://[2001:db8::1]:8000"),
+        ("http://user:password@worker:8000", "http://user:password@worker:8000"),
+        ("http://user:p%40ss@worker:8000@2", "http://user:p%40ss@worker:8000"),
+        ("http://user@123", "http://user@123"),
+        ("http://worker:8000@rank0", "http://worker:8000@rank0"),
+        ("http://worker:8000@-1", "http://worker:8000@-1"),
+        ("http://worker:8000@²", "http://worker:8000@²"),
+        ("http://worker:8000/path@0", "http://worker:8000/path@0"),
+        ("http://worker:8000?rank=@0", "http://worker:8000?rank=@0"),
+        ("", ""),
+    ],
+)
+def test_router_worker_base_url(worker_url, expected):
+    assert router_worker_base_url(worker_url) == expected
+
+
+def test_router_worker_base_urls_stably_deduplicates_dp_ranks():
+    urls = [
+        "http://worker-a:8000@0",
+        "http://worker-b:8000@0",
+        "http://worker-a:8000@1",
+        "http://worker-b:8000@1",
+    ]
+
+    assert router_worker_base_urls(urls) == [
+        "http://worker-a:8000",
+        "http://worker-b:8000",
+    ]

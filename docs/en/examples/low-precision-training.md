@@ -112,9 +112,9 @@ Output:
 For the FP8 training workflow you usually do **not** need this script — bridge mode (`--megatron-to-hf-mode bridge`) reads the FP8 HF directly. This tool is for offline conversion when you need a BF16 HF as input to a different pipeline (e.g. as a `--ref-load` source for another recipe, or to feed `convert_hf_to_int4.py`).
 :::
 
-### `convert_hf_to_int4.py`
+### `convert_hf_to_int4.py` {#convert-hf-to-int4}
 
-Quantize a BF16 HF checkpoint to W4A16 (compressed-tensors). Uses the `fake_int4_quant_cuda` kernel, which must be built first (see [Build the int4_qat kernel](#build-the-int4_qat-kernel)).
+Quantize a BF16 HF checkpoint to W4A16 (compressed-tensors). Uses the `fake_int4_quant_cuda` kernel, which must be built first (see [Build the int4_qat kernel](#build-int4-qat-kernel)).
 
 ```bash
 python scripts/tools/convert_hf_to_int4.py \
@@ -185,7 +185,7 @@ Relax ships two reference recipes for Qwen3-30B-A3B (8-GPU colocate): **FP8 nati
 1. A BF16 HF checkpoint (e.g. `Qwen3-30B-A3B`).
 2. The Megatron patch at `docker/patch/megatron/20260506-85bced0ae.patch` applied (baked into the project Dockerfile). It provides both the FP8 overrides and the INT4 `_FakeInt4QuantizationSTE` that overrides `TEGroupedLinear._get_weight_tensors()`.
 
-The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise scaling support. The INT4 recipe additionally needs the `fake_int4_quant_cuda` CUDA extension built — see [Build the int4_qat kernel](#build-the-int4-qat-kernel) below.
+The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise scaling support. The INT4 recipe additionally needs the `fake_int4_quant_cuda` CUDA extension built — see [Build the int4_qat kernel](#build-int4-qat-kernel) below.
 
 ### FP8 Recipe
 
@@ -217,7 +217,7 @@ The FP8 recipe additionally needs a TransformerEngine build with FP8 blockwise s
 
 ### INT4 fake-QAT Recipe
 
-#### Build the int4_qat kernel
+#### Build the int4_qat kernel {#build-int4-qat-kernel}
 
 ```bash
 cd relax/backends/megatron/kernels/int4_qat
@@ -331,5 +331,5 @@ Do not swap `--sglang-hf-checkpoint` to the BF16 cast for "consistency". SGLang'
 :::
 
 ::: tip
-This recipe assumes the W4A16 release was produced with **symmetric** quantization (matching the training-side STE). If you regenerate the W4A16 from BF16 via `convert_hf_to_int4.py`, always pass `--is-symmetric` — see the warning in the [Offline Quantization Tools](#convert_hf_to_int4-py) section above.
+This recipe assumes the W4A16 release was produced with **symmetric** quantization (matching the training-side STE). If you regenerate the W4A16 from BF16 via `convert_hf_to_int4.py`, always pass `--is-symmetric` — see the warning in the [Offline Quantization Tools](#convert-hf-to-int4) section above.
 :::

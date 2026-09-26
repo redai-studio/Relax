@@ -1,6 +1,6 @@
 # 外部模型接入
 
-本文说明如何把外部模型接入 Relax 的 SGLang rollout 和 Megatron 训练路径。当前 dots.mcore / dots.mocr 支持可作为参考实现。
+本文说明如何把外部模型接入 Relax 的 SGLang rollout 和 Megatron 训练路径。当前 dots.mocr 支持可作为参考实现。
 
 ## 概述
 
@@ -110,7 +110,7 @@ MISC_ARGS=(...)
 - `--fully-async`
 - `--hybrid`
 
-纯 fully async 不支持 `--balance-data`；需要数据均衡时使用 colocate 或 hybrid。
+全异步结合 `--use-dynamic-batch-size` 时，动态 batch 路径会自动在 DP rank 间做 token 均衡。`--balance-data` 仍适用于静态/序列长度均衡路径；在动态 batch 路径上传入该 flag 是允许的，但不会额外改变行为。
 
 ## 对齐验证
 
@@ -137,7 +137,7 @@ scripts/debug/run-compare-dotsocr-packed.sh
 - Bridge 缺少 fused qkv、fused MLP 或 vision tower 映射。
 - SGLang `load_weights()` 无法消费导出的 HF 参数名。
 
-## dots.mcore / dots.mocr 参考
+## dots.mocr 参考
 
 模型 checkpoint：
 

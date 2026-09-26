@@ -4,7 +4,7 @@ Convert a trained Relax checkpoint to Hugging Face format as a post-training ste
 
 ## Overview
 
-Relax saves Megatron training checkpoints in torch distributed checkpoint (DCP) format. Before serving or publishing a trained model, use `scripts/tools/convert_torch_dist_to_hf_bridge.py` to export it to Hugging Face safetensors.
+Relax saves Megatron training checkpoints in torch distributed checkpoint (DCP) format. Before serving or publishing a trained model, use `scripts/tools/convert_torch_dist_to_hf_bridge.py` to export it to Hugging Face safetensors. In addition, HF checkpoints (optionally FP8) can be exported online during training via `--save-hf`; the online path shares the same FP8 writer as the offline script and produces byte-identical output.
 
 This is a checkpoint post-processing workflow and does not change the precision or execution mode used during training.
 
@@ -13,6 +13,7 @@ This is a checkpoint post-processing workflow and does not change the precision 
 | Megatron DCP | Standard HF safetensors | `convert_torch_dist_to_hf_bridge.py` |
 | Megatron DCP | FP8 HF safetensors | `convert_torch_dist_to_hf_bridge.py --fp8` |
 | BF16/FP16/FP32 HF safetensors | FP8 HF safetensors | `convert_hf_to_fp8.py` |
+| In-training Megatron state | HF safetensors (optionally FP8) | Training CLI `--save-hf` / `--save-hf-dtype fp8` |
 
 ## Prerequisites
 
@@ -108,6 +109,100 @@ python scripts/tools/convert_hf_to_fp8.py \
 | `--scale-fmt` | `None` | Compatibility metadata only. `ue8m0` does not pack or change the FP32 scale tensors. |
 
 The offline converter keeps all converted tensors for one source shard until that shard is saved. Increasing `--max-workers` therefore increases GPU memory use; keep it at `1` when memory is limited.
+
+## Online Training-time Export
+
+All paths above are offline post-training. Relax also supports exporting an HF directory synchronously each time Megatron saves a checkpoint, so no separate offline conversion job is needed. This path reuses the same Bridge export and FP8 writer as `convert_torch_dist_to_hf_bridge.py`, and the output layout is identical to the offline result.
+
+The online path only activates under the Megatron backend + actor role, and only WORLD rank 0 writes to disk.
+
+### Basic usage (BF16)
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  ...
+```
+
+| Flag | Description |
+| --- | --- |
+| `--save-hf` | HF export directory template. `{rollout_id}` is substituted with the current rollout id; without the placeholder the same directory is overwritten each time. Triggered in sync with `--save-interval`. |
+
+The exported directory is kept separate from the full Megatron checkpoint's `iter_*` layout so the two artifact families can be rotated independently.
+
+### FP8 online export
+
+`--save-hf-dtype fp8` writes an FP8 HF checkpoint on every save, skipping the intermediate BF16 directory. When enabled, the framework installs the same `StreamingFP8Writer` used by the offline converter to intercept Bridge output, and writes `quantization_config` into `config.json`.
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  --save-hf-dtype fp8 \
+  --save-hf-fp8-quant-mode block \
+  --save-hf-fp8-block-size 128 128 \
+  ...
+```
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--save-hf-dtype` | `bf16` | Export precision: `bf16` preserves prior behavior; `fp8` uses the streaming FP8 writer. |
+| `--save-hf-fp8-quant-mode` | `block` | Quantization strategy: `block`, `channel`, or `tensor`. |
+| `--save-hf-fp8-block-size` | `128 128` | Block shape for the `block` strategy. |
+
+Argument validation runs at startup: `--save-hf-dtype fp8` requires `--save-hf`, and `--hf-checkpoint` must point to a safetensors directory (Bridge needs the source index to resolve the HF key map).
+
+The resulting shard layout, `quantization_config`, and skipped-module list are exactly the same as the offline `--fp8` path; see "FP8 output layout" above.
+
+::: warning MTP weights
+The FP8 online export skips the MTP reconcile step that the offline path performs, because the FP8 writer maintains its own index. If the reference HF config enables MTP but the training model has no MTP weights, the exported checkpoint will not include MTP layers. This constraint matches `convert_torch_dist_to_hf_bridge.py --fp8`.
+:::
+
+### Post-save hook
+
+`--save-hf-post-hook-path` injects a user callback that runs on WORLD rank 0 once the HF directory (including FP8 shards, LoRA adapter, and `config.json` patch) is fully on disk. It is meant for post-processing such as pushing to a model registry, sending notifications, or auditing.
+
+```bash
+python -m relax.entrypoints.train \
+  --save-hf /path/to/hf_output/iter_{rollout_id} \
+  --save-hf-post-hook-path my_pkg.my_module.my_hook \
+  ...
+```
+
+The hook is resolved via a dotted path (`importlib.import_module` + `getattr`), so the module must be importable from the current `PYTHONPATH`. The value is dry-imported at startup so typos fail fast.
+
+A ready-made example lives at `scripts/tools/model_upload_hook.py`; its `push_to_huggingface` variant (paired with `HF_TOKEN` + `RELAX_HF_REPO_ID`) pushes each save asynchronously to a HuggingFace Hub repo: `--save-hf-post-hook-path scripts.tools.model_upload_hook.push_to_huggingface`.
+
+**Callback signature (framework contract):**
+
+```python
+def my_hook(
+    args,                # argparse.Namespace, full training args
+    hf_path: str,        # absolute path with the placeholder expanded, e.g. ".../iter_42"
+    rollout_id: int,     # current rollout id
+    *,
+    dtype: str,          # "bf16" or "fp8"
+    is_lora: bool,       # whether LoRA is enabled (True means hf_path contains a lora_adapter/ subdir)
+) -> None: ...
+```
+
+Key guarantees:
+
+- **Synchronous, fast-return.** The hook runs on the actor main thread; offload heavy I/O (uploads, RPCs) to a background thread or queue so the next training step is not blocked.
+- **Exceptions are swallowed.** The framework logs via `logger.exception` and continues; a hook error can never crash the training loop.
+- **WORLD rank 0 only.** Other ranks do not invoke the hook; you never need to worry about duplicate execution.
+- **kwargs reserved for evolution.** Additional fields will be added as keyword-only arguments so existing hooks keep working.
+
+**Optional: module-level `flush()` for graceful shutdown**
+
+If the hook module exposes a module-level `flush(timeout_sec: float = 1800.0)` function, the framework automatically invokes it on the final training save (`force_sync=True`) and blocks until it returns. This is meant for the "training container tears down as soon as the entrypoint returns" case (Ray / k8s cgroup will collect child processes), so in-flight uploads finish before the container exits:
+
+```python
+def flush(timeout_sec: float = 1800.0) -> None:
+    """Block until pending background work drains, or timeout."""
+    ...
+```
+
+Same guarantees as the hook: exceptions are swallowed, and the branch is a no-op when `flush` is not defined. Note that `flush()` only covers the normal-completion path; if training crashes and `ray.kill()` SIGKILLs the actor, the queue is still lost.
 
 ## Serve the Converted FP8 Model
 

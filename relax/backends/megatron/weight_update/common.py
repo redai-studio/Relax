@@ -11,6 +11,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.backends.megatron.weight_update.train_offload import torch_memory_saver_preloaded
 from relax.utils.device import is_npu_available
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
@@ -23,6 +24,8 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
     ".experts.", else regular-TP. linear_fc1 rechunked (GLU), linear_fc2 dim
     fix.
     """
+    name = name.replace(".to_wrap.", ".")
+
     if "expert_bias" in name:
         return param
 
@@ -138,8 +141,10 @@ def all_gather_params_async(
     handles = []
 
     for info, param in param_infos_and_params:
-        # Prepare async all_gather
-        if "expert_bias" in info.name:
+        # Prepare async all_gather. Strip the LoRA ``.to_wrap.`` infix so name-based
+        # dispatch matches the plain non-LoRA name (see all_gather_param). No-op otherwise.
+        name = info.name.replace(".to_wrap.", ".")
+        if "expert_bias" in name:
             gather_tasks.append((info, param, None, None, None))
             handles.append(None)
         elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
@@ -147,7 +152,7 @@ def all_gather_params_async(
             handles.append(None)
         else:
             # Start async all_gather
-            if ".experts." in info.name:
+            if ".experts." in name:
                 tp_size = mpu.get_expert_tensor_parallel_world_size()
                 tp_group = mpu.get_expert_tensor_parallel_group()
             else:
@@ -174,13 +179,14 @@ def all_gather_params_async(
         else:
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_dim must be set for TP-sharded params"
+            name = info.name.replace(".to_wrap.", ".")
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name and "vision_model" not in info.name:
+            if "linear_fc1.weight" in name and "vision_model" not in name:
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name and "vision_model" not in info.name:
+            if "linear_fc2.weight" in name and "vision_model" not in name:
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)
@@ -207,11 +213,24 @@ def named_params_and_buffers(
     return ans
 
 
-def _maybe_get_cpu_backup(x: torch.Tensor):
-    from torch_memory_saver import torch_memory_saver
+def _maybe_get_cpu_backup(x: torch.Tensor) -> torch.Tensor:
+    # Selective offload (weight_update/train_offload.py): when the offloader
+    # frees a param's GPU storage via storage().resize_(0), it stashes the CPU copy
+    # on the tensor as ``_relax_cpu_offload_data``. If the GPU storage is empty, read
+    # from that CPU copy instead of touching the now-invalid CUDA storage.
+    if getattr(x, "_relax_cpu_offload_data", None) is not None and x.storage().size() == 0:
+        return x._relax_cpu_offload_data
 
-    if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
-        return cpu_tensor
+    # torch_memory_saver path: only usable when its LD_PRELOAD hook is active;
+    # otherwise get_cpu_backup() would assert on an uninitialized saver.
+    # NOTE: with --selective-offload, actor_group.py does NOT LD_PRELOAD the TMS hook,
+    # so torch_memory_saver_preloaded() is False here and this branch is skipped —
+    # i.e. LD_PRELOAD is the single source of truth for "TMS is the active mechanism".
+    if torch_memory_saver_preloaded():
+        from torch_memory_saver import torch_memory_saver
+
+        if (cpu_tensor := torch_memory_saver.get_cpu_backup(x)) is not None:
+            return cpu_tensor
 
     return x
 

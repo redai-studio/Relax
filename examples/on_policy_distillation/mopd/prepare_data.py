@@ -99,6 +99,31 @@ def _detect_format(df: pd.DataFrame) -> str:
 
 SYSTEM_PROMPT_MATH = "Please reason step by step, and put your final answer within \\boxed{}."
 
+# The multimodal-open-r1 VL teacher (Qwen3.5-9B-vl-teacher-hf) was RL-trained
+# (GRPO) WITH this exact system prompt. Without it the model never emits
+# <answer></answer> tags, so the openr1mm reward can't extract its answer and its
+# accuracy collapses (~0.6 -> ~0.35) — which starves the OPD signal for VL. We
+# prepend it to the VL prompt string (rather than a real system turn) because the
+# MOPD parquet stores `prompt` as a plain string and a message-list column can't
+# be mixed with the text rows' string prompts. Byte-identical to the string in
+# scripts/training/multimodal/run-qwen35-9B-8xgpu-openr1mm-async.sh.
+OPENR1MM_SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+    "The assistant first thinks about the reasoning process in the mind and then provides the user with the "
+    "answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> "
+    "tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>"
+)
+
+# Geo3K instruction, kept byte-identical to verl's data_preprocess/geo3k.py so the
+# format_reward in relax/engine/rewards/geo3k.py (which requires <think></think>
+# followed by \boxed{}) actually fires. Appended AFTER the problem, matching verl's
+# `prompt = problem + " " + instruction_following`.
+GEO3K_INSTRUCTION = (
+    "You FIRST think about the reasoning process as an internal monologue and then provide the final answer. "
+    "The reasoning process MUST BE enclosed within <think> </think> tags. "
+    "The final answer MUST BE put in \\boxed{}."
+)
+
 
 def _convert_gsm8k_row(row: pd.Series) -> dict:
     """Convert a raw GSM8K row to the unified MOPD schema.
@@ -162,8 +187,13 @@ def _convert_geo3k_row(row: pd.Series) -> dict:
     # don't — guard against iterating over it.
     images = None if raw_images is None or isinstance(raw_images, float) else _encode_geo3k_images(raw_images)
     has_image = images is not None
-    body = f"<image>\n{row['problem']}" if has_image else row["problem"]
-    prompt = f"{SYSTEM_PROMPT_MATH}\n{body}"
+    # Some raw Geo3K variants already embed the "<image>" placeholder in ``problem``
+    # (e.g. "<image>Find x."); only prepend one when it is absent, so we never emit
+    # two placeholders for a single image (which desyncs the VL processor).
+    body = row["problem"]
+    if has_image and "<image>" not in str(body):
+        body = f"<image>\n{body}"
+    prompt = f"{body} {GEO3K_INSTRUCTION}"
     result: dict = {
         "prompt": prompt,
         "label": str(row["answer"]).strip(),
@@ -272,9 +302,18 @@ def _load_openr1mm_parquet(parquet_path: str) -> pd.DataFrame:
         # convention as _convert_geo3k_row above): the Relax loader wraps a
         # string prompt as the user turn and, when --multimodal-keys is set,
         # splits the content on "<image>" to inject one image per marker.
-        content = problem if "<image>" in problem else f"<image>\n{problem}"
-        prompt = content if img_uri else problem
-        images = [img_uri] if img_uri else None
+        # Prepend OPENR1MM_SYSTEM_PROMPT so the VL teacher runs in-distribution
+        # during MOPD (see the constant's docstring for why).
+        if img_uri:
+            body = problem if "<image>" in problem else f"<image>\n{problem}"
+            images = [img_uri]
+        else:
+            # No image bytes for this row: strip any stray "<image>" so the prompt
+            # never carries a placeholder without a matching image (that desyncs
+            # the VL processor when it splits on the marker to inject images).
+            body = problem.replace("<image>", "").strip()
+            images = None
+        prompt = f"{OPENR1MM_SYSTEM_PROMPT}\n{body}"
 
         records.append(
             {
@@ -340,10 +379,40 @@ def _merge_and_shuffle(
     frames: list[pd.DataFrame],
     seed: int,
 ) -> pd.DataFrame:
-    """Concatenate dataframes and shuffle."""
+    """Concatenate dataframes and interleave by ``data_source``.
+
+    A plain global shuffle can still produce long same-source runs by chance
+    (e.g. 64 consecutive ``dapo-math-17k`` rows). Since each DP rank in
+    streaming/colocate training consumes a contiguous slice of the dataset
+    order (see ``get_data_iterator`` in ``relax/backends/megatron/data.py``), a
+    run that long can leave one rank's local training step with zero multimodal
+    samples — the student model's vision-encoder parameters then get no
+    gradient that step, crashing Megatron's grad-sync with "Communication call
+    has not been issued for this bucket". Smooth weighted round-robin (shuffle
+    within each source, then interleave sources proportionally to their size, à
+    la nginx's SWRR load balancing) bounds the max run length of any single
+    source to ``ceil(total / count[source])`` instead of leaving it to chance.
+    """
     merged = pd.concat(frames, ignore_index=True)
-    merged = merged.sample(frac=1, random_state=seed).reset_index(drop=True)
-    return merged
+    groups = {
+        src: group.sample(frac=1, random_state=seed).reset_index(drop=True)
+        for src, group in merged.groupby("data_source", sort=True)
+    }
+    counts = {src: len(group) for src, group in groups.items()}
+    total = sum(counts.values())
+
+    credits = dict.fromkeys(groups, 0.0)
+    cursor = dict.fromkeys(groups, 0)
+    rows = []
+    for _ in range(total):
+        for src in groups:
+            credits[src] += counts[src] / total
+        pick = max((src for src in groups if cursor[src] < counts[src]), key=lambda s: credits[s])
+        credits[pick] -= 1.0
+        rows.append(groups[pick].iloc[cursor[pick]])
+        cursor[pick] += 1
+
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def _train_test_split(

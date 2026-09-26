@@ -162,6 +162,19 @@
 }
 
 /**
+ * Component: Task List
+ * -------------------------------------------------------------------------- */
+
+.vp-doc li.task-list-item {
+  list-style: none;
+}
+
+.vp-doc .task-list-item-checkbox {
+  margin: 0 0.5em 0 -1.4em;
+  vertical-align: middle;
+}
+
+/**
  * ASCII Art Background — Dark Home Page
  * -------------------------------------------------------------------------- */
 
@@ -192,6 +205,7 @@
 .VPHero {
   position: relative;
   z-index: 1;
+  overflow-x: clip;
 }
 
 .VPHome .VPHero .container {

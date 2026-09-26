@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.http_utils import router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import print_memory
 
@@ -269,10 +270,10 @@ async def _get_sglang_worker_urls(args) -> list[str]:
 
     if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(args, "use_slime_router", False):
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        return response["urls"]
+        return router_worker_base_urls(response["urls"])
     else:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        return [worker["url"] for worker in response["workers"]]
+        return router_worker_base_urls(worker["url"] for worker in response["workers"])
 
 
 async def start_sglang_profile(args, rollout_id: int) -> None:

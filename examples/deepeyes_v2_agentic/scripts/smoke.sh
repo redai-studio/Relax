@@ -37,7 +37,12 @@ if [ ! -f "${SMOKE_PARQUET}" ]; then
     echo "ERROR: ${SMOKE_PARQUET} not found. Run: DATA_DIR=${DATA_DIR} bash ${SCRIPT_DIR}/prepare.sh"
     exit 1
 fi
+APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
+if [ ! -x "${APP_PYTHON}" ]; then
+    echo "ERROR: DeepEyes V2 app environment not found. Run: bash ${SCRIPT_DIR}/prepare_app_env.sh"
+    exit 1
+fi
 
-exec python "${SCRIPT_DIR}/run_single_session.py" \
+exec "${APP_PYTHON}" "${SCRIPT_DIR}/run_single_session.py" \
     --parquet "${SMOKE_PARQUET}" \
     --row "${SMOKE_ROW:-0}"

@@ -106,6 +106,10 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+   --initial-loss-scale 32768
+   --min-loss-scale 1
+   --use-precision-aware-optimizer
+   --no-store-param-remainders
 )
 
 SGLANG_ARGS=(
@@ -155,4 +159,5 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}"  2>&1 | tee log/qwen3-4b-GRPO-gpu8-fp16-${now}.log
+    "${MISC_ARGS[@]}" \
+    "$@" 2>&1 | tee log/qwen3-4b-GRPO-gpu8-fp16-${now}.log

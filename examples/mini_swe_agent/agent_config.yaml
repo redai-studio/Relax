@@ -1,0 +1,85 @@
+agent:
+  step_limit: 40
+
+model:
+  model_name: openai/model
+  cost_tracking: ignore_errors
+  model_kwargs:
+    timeout: 7200
+
+environment:
+  executable: apptainer
+  # Retry `apptainer instance start` on transient failures. Under 128 concurrent
+  # sandbox launches, reading the ~0.5GB SIF from shared network storage plus
+  # overlay/namespace setup intermittently fails with CalledProcessError (the
+  # same command succeeds when run alone). Retrying with backoff absorbs these
+  # so a whole rollout group is not dropped as zero-std over a flaky start.
+  sandbox_build_retries: 3
+  # env entries are forwarded into the sandbox via `--env` (exec_args uses
+  # --cleanenv, so host env does NOT leak in; only entries listed here reach the
+  # container).
+  env:
+    PATH: /root/.venv/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    # Cap BLAS/OpenMP threads inside the sandbox. R2E tasks run pandas/numpy
+    # tests that do not need multi-threaded BLAS; with 128 concurrent sandboxes,
+    # the library default (one thread per core, ~192) creates tens of thousands
+    # of idle BLAS threads -> context-switch storm on the colocated node.
+    OMP_NUM_THREADS: "2"
+    MKL_NUM_THREADS: "2"
+    OPENBLAS_NUM_THREADS: "2"
+  exec_args:
+    - --contain
+    - --cleanenv
+    - --no-home
+    - --no-mount
+    - /etc/localtime
+
+r2e:
+  datasets:
+    train:
+      directory: R2E-Gym-Lite
+      pattern: data/train-*.parquet
+      samples: 8
+      columns:
+        - docker_image
+        - expected_output_json
+        - problem_statement
+    eval:
+      directory: SWE-Bench-Lite
+      pattern: data/test-*.parquet
+      samples: 1
+      count: 50
+      columns:
+        - docker_image
+        - instance_id
+        - repo
+        - version
+        - base_commit
+        - problem_statement
+        - test_patch
+        - PASS_TO_PASS
+        - FAIL_TO_PASS
+  wheel_mount: /r2e_wheels
+  setup_commands:
+    train: |
+      set -e
+      mkdir -p /root/.local/bin
+      ln -s /testbed/.venv /root/.venv
+      ln -s /testbed/.venv/bin/python /root/.local/bin/python
+      ln -s /testbed/.venv/bin/python /root/.local/bin/python3
+      find /testbed/.venv/bin -type f -executable -exec ln -sf {} /root/.local/bin/ \;
+      uv pip install --no-index --find-links /r2e_wheels chardet==5.2.0
+      mv /testbed/run_tests.sh /root/run_tests.sh
+      chmod +x /root/run_tests.sh
+      find /r2e_tests -name '*.pyc' -delete
+      find /r2e_tests -name '__pycache__' -exec rm -rf {} +
+      mv /r2e_tests /root/r2e_tests
+      ln -s /root/r2e_tests /testbed/r2e_tests
+    eval: |
+      set -e
+      chmod +x /run_tests.sh
+      ln -s /opt/miniconda3/envs/testbed /root/.venv
+      python -m pip install --no-index --find-links /r2e_wheels chardet==5.2.0
+  reward_commands:
+    train: bash /root/run_tests.sh
+    eval: bash /run_tests.sh

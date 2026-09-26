@@ -21,13 +21,13 @@ Run the following commands to clone the repository, pull the latest image, and s
 
 ```bash
 # Clone the repository
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 
 # Pull the Docker image
-docker pull ghcr.io/redai-infra/relaxrl:latest
+docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # Run the container, mounting the local repository to /root/Relax inside the container
-docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-infra/relaxrl:latest /bin/bash
+docker run -it --gpus all -v $(pwd)/Relax:/root/Relax ghcr.io/redai-studio/relaxrl:latest /bin/bash
 ```
 
 Alternatively, build the image from the Dockerfile:
@@ -57,13 +57,13 @@ DOCKER_BUILDKIT=1 docker build \
   .
 ```
 
-For more details on Docker releases, see [Docker README](https://github.com/redai-infra/Relax/blob/main/docker/README.md).
+For more details on Docker releases, see [Docker README](https://github.com/redai-studio/Relax/blob/main/docker/README.md).
 
 ### Method 2: Install from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/redai-infra/Relax.git
+git clone https://github.com/redai-studio/Relax.git
 cd Relax
 
 # Install dependencies
@@ -87,7 +87,7 @@ export MEGATRON="your megatron path"
 export PYTHONPATH=your_megatron_path:$PYTHONPATH
 ```
 
-Additionally, Relax depends on [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) for weight conversion. Follow the install steps in [`docker/Dockerfile`](https://github.com/redai-infra/Relax/blob/main/docker/Dockerfile): merge the Bridge sources with the Megatron-LM submodule into a single directory and add it to `PYTHONPATH`:
+Additionally, Relax depends on [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) for weight conversion. Follow the install steps in [`docker/Dockerfile`](https://github.com/redai-studio/Relax/blob/main/docker/Dockerfile): merge the Bridge sources with the Megatron-LM submodule into a single directory and add it to `PYTHONPATH`:
 
 ```bash
 export MEGATRON_BRIDGE_COMMIT=2faedbf6fe3c422835a44b2b360cadcb2a116a54

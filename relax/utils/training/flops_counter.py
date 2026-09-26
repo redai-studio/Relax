@@ -14,7 +14,11 @@ _DEVICE_FLOPS = {
     "CPU": 448e9,
     "GB200": 2.5e15,
     "B200": 2.25e15,
-    "MI300X": 1336e12,
+    "GB300": 2.5e15,
+    "B300": 2.25e15,
+    "MI300X": 1307e12,
+    "MI350X": 2300e12,
+    "MI355X": 2500e12,
     "H100": 989e12,
     "H800": 989e12,
     "L20Y": 989e12,
@@ -50,9 +54,9 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
     """
     if device_name is None:
         try:
-            from relax.utils.device import get_device_properties
+            from relax.utils.device import device_module
 
-            device_name = get_device_properties().name
+            device_name = device_module.get_device_properties().name
         except (AttributeError, ImportError):
             device_name = "CPU"
 

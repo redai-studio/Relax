@@ -1,0 +1,19 @@
+diff --git a/responses_api_agents/swe_agents/setup_scripts/openhands.sh b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+index 928c20a..d89387f 100755
+--- a/responses_api_agents/swe_agents/setup_scripts/openhands.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+@@ -90,6 +90,14 @@ else
+     git apply "$rollout_patch"
+ fi
+ 
++r2e_runtime_patch="$(dirname "$0")/openhands_r2e_runtime.patch"
++if git apply --reverse --check "$r2e_runtime_patch" >/dev/null 2>&1; then
++    echo "OpenHands R2E runtime patch already applied."
++else
++    echo "Applying OpenHands R2E runtime patch..."
++    git apply "$r2e_runtime_patch"
++fi
++
+ # Build OpenHands
+ echo "Building OpenHands (this may take 5-10 minutes)..."
+ export INSTALL_DOCKER=0

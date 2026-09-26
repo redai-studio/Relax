@@ -42,6 +42,7 @@ python -m sglang.launch_server \
     --port "$SGLANG_JUDGE_PORT" \
     --api-key "EMPTY" \
     --mem-fraction-static 0.05 \
+    --disable-cuda-graph \
     > "$LOG_FILE" 2>&1 &
 
 SGLANG_JUDGE_PID=$!

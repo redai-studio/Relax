@@ -1,0 +1,11 @@
+# Qwen3-4B elastic Rollout example for four baseline 1-GPU engines.
+
+enabled: true
+
+# Must match the four protected initial Rollout engines in the run script.
+min_engines: 4
+# Total engine ceiling: four initial engines plus up to four elastic engines.
+max_engines: 8
+
+scale_out_policy:
+  max_delta: 1

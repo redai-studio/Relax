@@ -57,6 +57,29 @@ examples/deepeyes/
 ├── base_env.py            # 环境实现基类
 ├── env_deepeyes.py        # 环境实现
 ├── reward_deepeyes.py     # 奖励函数实现
+├── processor_patch_utils.py  # 预展开 token 处理逻辑
+├── sglang_patch/             # SGLang 外部 processor 注册包
 └── rollout.py             # 多轮采样逻辑
 
 ```
+
+## SGLang processor 兼容性
+
+`run_deepeyes_r3.sh` 通过 SGLang 外部 processor 注册机制加载
+`DeepEyesQwenVLImageProcessor`。该子类只覆盖 `process_mm_data_async` 并委托上游
+实现；差异仅处理 DeepEyes 传入的预展开
+`input_ids`：调用上游 processor 前将连续的 `<|image_pad|>` 折叠为一个占位符，
+处理完成后再恢复原始 token 序列；多轮工具调用产生多个图像 item 时，会先合并
+各 item 的 grid 再重新计算 mRoPE。其余输出仍由上游实现产生。
+脚本不会修改 SGLang 安装目录，重复 import/注册也会覆盖到同一个 processor 映射。
+
+当前补丁对应官方镜像中的 SGLang `0.5.12.post1`。升级 SGLang 时，先对比上游
+`QwenVLImageProcessor.process_mm_data_async` 的签名和返回类型，再更新
+`SUPPORTED_SGLANG_VERSION`，运行：
+
+```bash
+pytest -v tests/examples/test_deepeyes_processor_patch.py
+bash examples/deepeyes/run_deepeyes_r3.sh
+```
+
+版本或方法签名不兼容时，启动会直接报错并提示需要复核补丁，而不会静默回退。

@@ -42,3 +42,18 @@ def test_actor_helpers_emit_train_partition_under_rl():
     assert sft_partition_id(rl_cfg, 5) == "train_5"
     # NOTE: components/actor.py uses "train_actor" historically; preserve that for RL.
     assert sft_task_name(rl_cfg, component="actor") == "train_actor"
+
+
+def test_actor_resume_uses_backend_step_over_auto_cold_start():
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(0, 200, explicitly_set=False) == 200
+
+
+def test_actor_cold_start_and_explicit_step_are_preserved():
+    from relax.components.actor import _resolve_start_rollout_id
+
+    assert _resolve_start_rollout_id(0, 1, explicitly_set=False) == 0
+    assert _resolve_start_rollout_id(0, 200, explicitly_set=True) == 0
+    assert _resolve_start_rollout_id(100, 200, explicitly_set=True) == 100
+    assert _resolve_start_rollout_id(None, 200, explicitly_set=False) == 200

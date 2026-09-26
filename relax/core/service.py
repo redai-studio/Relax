@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import os
 import threading
 import time
 from argparse import Namespace
@@ -11,6 +12,7 @@ from ray import serve
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import InfoActor, sort_key
 from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
@@ -31,6 +33,8 @@ class Service:
         data_source: Optional[Any] = None,
         actor_rollout_pgs: Optional[Any] = None,
         runtime_env=None,
+        *,
+        defer_deploy: bool = False,
     ) -> None:
         """Service wrapper that deploys a Ray Serve deployment.
 
@@ -43,6 +47,7 @@ class Service:
             data_source: Optional data source actor or factory used by rollout.
             actor_rollout_pgs: Optional placement group for colocated actor-rollout.
             runtime_env: Optional Ray runtime environment dict for the service.
+            defer_deploy: Allocate resources without deploying until ``deploy`` is called.
         """
         logger.info(
             f"[{role}] Initializing service with num_gpus={num_gpus}, actor_rollout_pgs={actor_rollout_pgs is not None}"
@@ -55,6 +60,7 @@ class Service:
         self.data_source = data_source
         self.runtime_env = runtime_env
         self._is_shared_pgs = actor_rollout_pgs is not None
+        self._deployed = False
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
@@ -63,12 +69,23 @@ class Service:
         elif num_gpus == 0:
             pgs = None
         else:
-            pgs = create_placement_group(num_gpus=num_gpus)
+            pgs = create_placement_group(
+                num_gpus=num_gpus,
+                node_group_affinity=self.config.enable_affinity,
+            )
         self.pgs = pgs
         logger.info(f"[{role}] Placement group initialized: {pgs}")
 
-        self._deploy(pgs)
-        logger.info(f"[{role}] Service deployed successfully")
+        if not defer_deploy:
+            self.deploy()
+
+    def deploy(self) -> None:
+        """Deploy a prepared service exactly once."""
+        if self._deployed:
+            raise RuntimeError(f"[{self.role}] Service has already been deployed")
+        self._deploy(self.pgs)
+        self._deployed = True
+        logger.info(f"[{self.role}] Service deployed successfully")
 
     def _deploy(self, pgs: Optional[Any] = None) -> None:
         """Bind and deploy the Ray Serve deployment with the given placement
@@ -77,12 +94,16 @@ class Service:
         Args:
             pgs: Placement group tuple or None.
         """
+        ray_actor_options = with_control_plane_affinity(
+            self.config,
+            {"runtime_env": self.runtime_env},
+        )
         if self.data_source is not None:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
             )
         else:
-            self.service = self.cls.options(ray_actor_options={"runtime_env": self.runtime_env}).bind(
+            self.service = self.cls.options(ray_actor_options=ray_actor_options).bind(
                 self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
             )
         logger.info(f"[{self.role}] Deploying service...")
@@ -161,11 +182,15 @@ class Service:
     async def get_rollout_manager(self) -> Any:
         return await self.handle.get_rollout_manager.remote()
 
+    async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
+        await self.handle.set_barriers.remote(rollout=rollout, peers=peers)
+
     async def set_genrm_manager(self, genrm_manager: Any) -> None:
         await self.handle.set_genrm_manager.remote(genrm_manager)
 
-    async def get_genrm_manager(self) -> Any:
-        return await self.handle.get_genrm_manager.remote()
+    async def get_genrm_manager(self, route_key: Optional[str] = None) -> Any:
+        """Get the GenRM manager selected by ``route_key``."""
+        return await self.handle.get_genrm_manager.remote(route_key)
 
     async def set_step(self, set_step: int) -> None:
         await self.handle.set_step.remote(set_step)
@@ -287,17 +312,54 @@ class Service:
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to remove old placement group: {e}")
 
-        # Rebuild
-        new_pgs = create_placement_group(num_gpus=self.num_gpus)
+        # Keep recovered baseline roles on the stable worker group.
+        new_pgs = create_placement_group(
+            num_gpus=self.num_gpus,
+            node_group_affinity=self.config.enable_affinity,
+        )
         self.pgs = new_pgs
         logger.info(f"[{self.role}] New placement group created")
         return new_pgs
 
 
-def create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs."""
+def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: float = 2.0) -> None:
+    """Raise if the node-group marker resources remain unavailable."""
+    required = {f"{node_group}_gpu", f"{node_group}_cpu"}
+    last_available: dict = {}
+    for attempt in range(retries):
+        cluster_resources = ray.cluster_resources()
+        last_available = cluster_resources
+        missing = {r for r in required if cluster_resources.get(r, 0) <= 0}
+        if not missing:
+            return
+        if attempt < retries - 1:
+            logger.warning(
+                f"[Affinity] Node-group marker resources {sorted(missing)} not yet present "
+                f"(attempt {attempt + 1}/{retries}); retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+
+    missing = sorted(r for r in required if last_available.get(r, 0) <= 0)
+    raise RuntimeError(
+        f"Node-group affinity is enabled (RELAX_INITIAL_NODE_GROUP='{node_group}'), but the "
+        f"required custom marker resources {missing} are not declared anywhere in this cluster. "
+        f"Baseline placement groups would hang forever waiting for them. This usually means the "
+        f"cluster has no '{node_group}' worker-group declaring '{node_group}_gpu'/'{node_group}_cpu' "
+        f"custom resources. Please check your cluster environment; if this cluster intentionally has "
+        f"no such marker resources, disable affinity by passing --no-enable-affinity."
+    )
+
+
+def create_placement_group(num_gpus, node_group_affinity=True):
+    """Create a packed GPU placement group with optional node-group
+    affinity."""
     accel_resource = device_utils.get_ray_accelerator_name()
-    bundles = [{accel_resource: 1, "CPU": 1} for _ in range(num_gpus)]
+    base_bundle = {accel_resource: 1, "CPU": 1}
+    node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
+    if node_group_affinity and node_group:
+        _require_node_group_markers(node_group)
+        base_bundle = {**base_bundle, f"{node_group}_gpu": 1, f"{node_group}_cpu": 1}
+    bundles = [dict(base_bundle) for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
     ray.get(pg.ready())

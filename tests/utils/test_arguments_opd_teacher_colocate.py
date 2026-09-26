@@ -56,6 +56,23 @@ def test_recompute_loss_function_use_reentrant_option(arguments_module, argv, ex
     assert args.recompute_loss_function_use_reentrant is expected
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], "error"),
+        (["--sft-invalid-multimodal-strategy", "skip"], "skip"),
+    ],
+)
+def test_sft_invalid_multimodal_strategy_option(arguments_module, argv, expected):
+    arguments_module.RouterArgs = SimpleNamespace(add_cli_args=lambda parser, **_kwargs: parser)
+    parser = argparse.ArgumentParser()
+    arguments_module.get_slime_extra_args_provider()(parser)
+
+    args = parser.parse_args(argv)
+
+    assert args.sft_invalid_multimodal_strategy == expected
+
+
 def _opd_args() -> SimpleNamespace:
     return SimpleNamespace(
         loss_type="grpo",
@@ -68,6 +85,7 @@ def _opd_args() -> SimpleNamespace:
         use_agentic_rollout=False,
         partial_rollout=False,
         use_rollout_routing_replay=False,
+        distributed_timeout_minutes=30,
         kl_coef=0.0,
         kl_loss_coef=0.0,
         use_kl_loss=False,
@@ -183,3 +201,45 @@ def test_managed_opd_teacher_colocate_preserves_rollout_resource_split(arguments
     arguments_module.slime_validate_args(args)
 
     assert args.rollout_num_gpus == 4
+
+
+def test_sequence_classification_accepts_multimodal_keys(arguments_module):
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.task_type = "seq_cls"
+    args.label_key = "label"
+    args.prompt_data = ["/train.jsonl"]
+    args.num_labels = 3
+    args.classification_threshold = 0.5
+    args.multimodal_keys = {"image": "images"}
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.sft_chunked_logits = False
+    args.allgather_cp = False
+    args.sft_oversize_strategy = "keep"
+    args.custom_dataset_class_path = None
+    args.save_hf = None
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.multimodal_keys == {"image": "images"}
+
+
+def test_arguments_dynamic_context_parallel_allows_sft_eval(arguments_module):
+    args = _opd_args()
+    args.loss_type = "sft"
+    args.dynamic_context_parallel = True
+    args.eval_interval = 10
+    args.eval_size = 0.1
+    args.prompt_data = ["/train.jsonl"]
+    args.sft_oversize_strategy = "drop"
+    args.sft_oversize_custom_function_path = None
+    args.use_dynamic_batch_size = True
+    args.max_tokens_per_gpu = 4096
+    args.rollout_max_context_len = 4096
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.dynamic_context_parallel is True
+    assert args.eval_interval == 10
+    assert args.eval_size == 0.1

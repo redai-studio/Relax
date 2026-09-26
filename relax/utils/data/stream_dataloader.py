@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import logging
-import os
 import pickle
 import time
 from argparse import Namespace
@@ -16,8 +15,9 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
-from relax.utils.timer import timer
+from relax.utils.timer import Timer, timer
 
 
 logger = logging.getLogger(__name__)
@@ -49,14 +49,14 @@ def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
     """
     if rollout_data[0] is None:
         return
-    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+    if not Envs.RELAX_TGD_PROFILE:
         return
     if dist.is_initialized() and dist.get_rank() != 0:
         return
 
     global _per_rank_fetch_diag_call_count
     _per_rank_fetch_diag_call_count += 1
-    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    every = Envs.RELAX_TGD_PROFILE_EVERY
     if _per_rank_fetch_diag_call_count > 3 and _per_rank_fetch_diag_call_count % every != 0:
         return
 
@@ -92,6 +92,64 @@ def _maybe_log_per_rank_fetch_diag(rollout_data: list) -> None:
     )
 
 
+def _agree_on_fetch(
+    rollout_data: list,
+    fetch_once: Callable[[], list],
+    include_pipeline: bool,
+    context: str,
+) -> list:
+    """Make model-parallel ranks for one logical DP slot agree on data state.
+
+    In ``per_rank_fetch`` every TP/CP/PP rank calls ``get_meta`` itself. Ranks
+    arriving before the producer fills ``ready_indexes`` can get empty meta,
+    while later ranks get real samples and warm the TQ sampler replay state for
+    this ``batch_index``. Empty ranks can then re-fetch the same logical request
+    and converge.
+
+    The reduction sums ``[has_data, not has_data]`` over TP x CP, plus PP when
+    pipeline stages are in lockstep: ``missing == 0`` means everyone holds the
+    batch, while ``got == 0`` is a normal empty poll. We intentionally do not
+    synchronize the data-parallel group because different DP ranks consume
+    different TQ slices and may legitimately arrive at different times.
+    """
+    groups = [mpu.get_tensor_and_context_parallel_group()]
+    if include_pipeline:
+        groups.append(mpu.get_pipeline_model_parallel_group())
+    max_retries = Envs.RELAX_FETCH_SPLIT_MAX_RETRIES
+
+    for attempt in range(max_retries + 1):
+        has_data = rollout_data[1] is not None and rollout_data[1].size > 0
+        tally = torch.tensor(
+            [1, 0] if has_data else [0, 1],
+            dtype=torch.int32,
+            device=device_utils.make_current_torch_device(),
+        )
+        for group in groups:
+            dist.all_reduce(tally, op=dist.ReduceOp.SUM, group=group)
+        got, missing = tally.tolist()
+
+        if not missing or not got:
+            return rollout_data
+        if not has_data:
+            logger.warning(
+                "[per_rank_fetch] %s: %d/%d ranks got data, re-fetching (attempt %d)",
+                context,
+                got,
+                got + missing,
+                attempt + 1,
+            )
+            # Ranks holding data block in the next agreement all-reduce while
+            # empty ranks repeat the rank-local TQ RPC.
+            time.sleep(0.25)
+            rollout_data = fetch_once()
+
+    raise RuntimeError(
+        f"[per_rank_fetch] {context}: model-parallel replica still split after {max_retries} retries "
+        f"({got}/{got + missing} ranks have data); continuing would desync the next collective. "
+        f"Raise RELAX_FETCH_SPLIT_MAX_RETRIES if the producer is legitimately this slow."
+    )
+
+
 def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
     """Opt-in diagnostic: log pickle cost and per-field byte size on the
     tp_rank-0 fetcher so we can see how much of ``broadcast_object_list`` is
@@ -107,12 +165,12 @@ def _maybe_log_tgd_pickle_diag(rollout_data: list, should_fetch: bool) -> None:
         return
     if rollout_data[0] is None:
         return
-    if os.environ.get("RELAX_TGD_PROFILE", "0") != "1":
+    if not Envs.RELAX_TGD_PROFILE:
         return
 
     global _tgd_diag_call_count
     _tgd_diag_call_count += 1
-    every = int(os.environ.get("RELAX_TGD_PROFILE_EVERY", "50"))
+    every = Envs.RELAX_TGD_PROFILE_EVERY
     if _tgd_diag_call_count > 3 and _tgd_diag_call_count % every != 0:
         return
 
@@ -553,6 +611,69 @@ def _broadcast_multimodal_inputs(spec, send_tensors, is_src, cuda_dev, broadcast
     return out
 
 
+def _tensor_to_python_values(value: torch.Tensor) -> list[Any]:
+    if not value.is_nested:
+        return value.tolist()
+
+    rows = value.unbind(0)
+
+    try:
+        dense = torch.stack(rows)
+    except RuntimeError:
+        # Preserve row boundaries for truly ragged values.
+        return [row.tolist() for row in rows]
+
+    # TransferQueue may reconstruct scalar fields as singleton rows when
+    # the per-sample shape () is reported as (1,).
+    if dense.ndim == 2 and dense.shape[1] == 1:
+        return dense.squeeze(-1).tolist()
+
+    return dense.tolist()
+
+
+def fetch_data_from_transfer_queue(
+    tq_client,
+    data_fields,
+    batch_size,
+    partition_id,
+    task_name,
+    sampling_config,
+    batch_index,
+    token_budget: int | None = None,
+    allow_underfill: bool = True,
+) -> tuple[list, float]:
+    """Fetch one raw TransferQueue batch without collectives or GPU work.
+
+    The result must be finalized by :func:`get_data_from_transfer_queue` on the
+    main training thread, where model-parallel ranks agree on availability.
+    """
+    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
+    if token_budget is not None:
+        config["allow_underfill"] = allow_underfill
+
+    start = time.perf_counter()
+    if token_budget is not None:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            token_budget=token_budget,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+    else:
+        batch_meta = tq_client.get_meta(
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            sampling_config=config,
+            task_name=task_name,
+        )  # type: ignore
+
+    if batch_meta.size == 0:
+        return [None, batch_meta], time.perf_counter() - start
+    return [tq_client.get_data(batch_meta), batch_meta], time.perf_counter() - start
+
+
 def get_data_from_transfer_queue(
     args,
     tq_client,
@@ -566,6 +687,10 @@ def get_data_from_transfer_queue(
     per_rank_fetch: bool = False,
     token_budget: int | None = None,
     allow_underfill: bool = True,
+    post_process: bool = True,
+    synchronize_per_rank_fetch: bool = True,
+    prefetched_rollout_data: list | None = None,
+    prefetched_fetch_time_s: float | None = None,
 ):
     """Fetch a batch from the transfer queue and broadcast it across tensor-
     parallel and optionally pipeline-parallel ranks.
@@ -595,28 +720,33 @@ def get_data_from_transfer_queue(
         broadcast_pp: Whether to broadcast across pipeline parallel ranks.
             True for colocate mode, False for fully async mode.
         per_rank_fetch: When True, every TP/PP rank independently calls
-            ``get_meta`` + ``get_data`` (relying on the TQ sampler's
-            ``(partition_id, task_name, dp_rank, batch_index)`` cache to
-            return identical sample id lists across ranks), and all TP/PP
-            broadcasts are skipped.  Trades a single rank-0 pickle + one
+            ``get_meta`` + ``get_data`` (relying on the TQ sampler's replay
+            state for the same logical ``dp_rank`` and ``batch_index`` to return
+            identical sample id lists across model-parallel ranks), and all
+            TP/PP broadcasts are skipped.  Trades a single rank-0 pickle + one
             NCCL bcast for N parallel ZMQ deserialises — wins when pickle
             dominates ``tgd_bcast_tp_time``.  Caller must ensure
             ``rollout_routed_experts`` is not in ``data_fields`` (its bcast
             path is incompatible) — actor.py guards this.
+        post_process: Move and reshape rollout fields for Megatron. Set to
+            False only for CPU-only background prefetch; the training thread
+            must materialize each micro-batch before use.
+        synchronize_per_rank_fetch: When True, per-rank fetches agree on
+            empty-vs-data state across the model-parallel replica before
+            returning. Set to False only when the caller has its own foreground
+            synchronization point and must keep this call collective-free.
+        prefetched_rollout_data: Raw ``[data, meta]`` result from
+            :func:`fetch_data_from_transfer_queue`. It is finalized on this
+            main thread, preserving collective and GPU-work ordering.
+        prefetched_fetch_time_s: Wall-clock TQ RPC time associated with
+            ``prefetched_rollout_data`` for the fetch metric.
 
     Returns:
         Tuple[Optional[dict], Optional[Any]]: A tuple of (rollout_data, batch_meta).
         If no data is available, both elements are None.
     """
-
-    # Compose request configuration and ask the queue for metadata.
-    config = {**sampling_config, "batch_index": batch_index, "partition_id": partition_id}
-    if token_budget is not None:
-        # Token-budget fetch mode: the streaming sampler needs dp_size and
-        # allow_underfill in sampling_config to decide bucket assignment and
-        # end-of-stream behaviour.  dp_rank is already in sampling_config.
-        config["allow_underfill"] = allow_underfill
-
+    if not synchronize_per_rank_fetch and not per_rank_fetch:
+        raise ValueError("synchronize_per_rank_fetch=False requires per_rank_fetch=True")
     # Determine which rank should fetch data
     #
     # CP=0 must be in the predicate (alongside TP=0 / PP=0) — otherwise every CP
@@ -632,10 +762,9 @@ def get_data_from_transfer_queue(
     # returns to main_loop → 16 idle + 16 hung on TP2/PP2/CP8/DP1.
     if per_rank_fetch:
         # Each rank pulls its own copy from TQ; broadcasts are skipped below.
-        # Safe because the TQ sampler caches the meta on
-        # (partition_id, task_name, dp_rank, batch_index) so all ranks within
-        # a DP group receive byte-identical samples (see transfer_queue
-        # sampler/*_sampler.py).
+        # Safe because all model-parallel ranks present the same logical
+        # dp_rank/batch_index to the TQ sampler, so cache/replay returns
+        # byte-identical sample ids.
         should_fetch = True
     elif broadcast_pp:
         # Colocate mode: only (tp_rank, pp_rank, cp_rank) == (0, 0, 0) fetches data
@@ -654,37 +783,48 @@ def get_data_from_transfer_queue(
     # In per_rank_fetch mode every rank records a real value (no broadcast
     # below) so the metric becomes wall-clock fetch+deserialise per rank.
     fetch_timer_name = "per_rank_fetch" if per_rank_fetch else "tgd_fetch"
-    with timer(fetch_timer_name):
-        if should_fetch:
-            if token_budget is not None:
-                batch_meta = tq_client.get_meta(
-                    data_fields=data_fields,
-                    token_budget=token_budget,
-                    partition_id=partition_id,
-                    sampling_config=config,
-                    task_name=task_name,
-                )  # type: ignore
-            else:
-                batch_meta = tq_client.get_meta(
-                    data_fields=data_fields,
-                    batch_size=batch_size,
-                    partition_id=partition_id,
-                    sampling_config=config,
-                    task_name=task_name,
-                )  # type: ignore
 
-            if batch_meta.size == 0:
-                rollout_data = [None, None]
+    def _fetch_once() -> list:
+        """One get_meta (+ get_data) round-trip on this rank."""
+        rollout_data, _ = fetch_data_from_transfer_queue(
+            tq_client=tq_client,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
+            batch_index=batch_index,
+            token_budget=token_budget,
+            allow_underfill=allow_underfill,
+        )
+        return rollout_data
+
+    if prefetched_rollout_data is not None:
+        rollout_data = prefetched_rollout_data
+        if prefetched_fetch_time_s is not None:
+            Timer().add(fetch_timer_name, prefetched_fetch_time_s)
+    else:
+        with timer(fetch_timer_name):
+            if should_fetch:
+                rollout_data = _fetch_once()
             else:
-                rollout_data = [tq_client.get_data(batch_meta), batch_meta]
-        else:
-            # Non-fetching ranks start with an empty placeholder and
-            # will receive the real data via broadcast.
-            rollout_data = [None, None]
+                # Non-fetching ranks start with an empty placeholder and
+                # will receive the real data via broadcast.
+                rollout_data = [None, None]
+
+    if per_rank_fetch and synchronize_per_rank_fetch:
+        # No broadcast follows, so a producer race can split this logical DP
+        # rank into "got data" and "empty meta" model-parallel subsets.
+        rollout_data = _agree_on_fetch(
+            rollout_data,
+            _fetch_once,
+            include_pipeline=broadcast_pp,
+            context=f"partition={partition_id} batch_index={batch_index}",
+        )
 
     # Use an explicit device so the communication backend (e.g. NCCL)
     # can bind to a known device context.
-    cuda_dev = device_utils.make_current_torch_device()
+    cuda_dev = None if per_rank_fetch else device_utils.make_current_torch_device()
 
     # --- Extract rollout_routed_experts BEFORE broadcast_object_list ---
     # broadcast_object_list uses pickle for the entire payload. When
@@ -782,7 +922,7 @@ def get_data_from_transfer_queue(
     rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
 
     if rollout_data is None:
-        return None, None
+        return None, batch_meta
 
     # --- Stream multimodal tensors via NCCL (zero-copy, CPU-resident result) ---
     mm_inputs = None
@@ -810,9 +950,10 @@ def get_data_from_transfer_queue(
     if isinstance(rollout_data, TensorDict):
         new_rollout_data: Dict[str, Any] = {}
         for k, v in rollout_data.items():
-            # Convert length/reward-style fields to Python lists.
-            if "lengths" in k or "reward" in k:
-                new_rollout_data[k] = v.tolist()
+            # Keep scalar metadata as Python values across the TensorDict boundary,
+            # including NestedTensor values reconstructed by TransferQueue.
+            if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
+                new_rollout_data[k] = _tensor_to_python_values(v)
             elif k == "multimodal_train_inputs":
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
@@ -865,7 +1006,8 @@ def get_data_from_transfer_queue(
     if has_multimodal and mm_inputs is not None:
         rollout_data["multimodal_train_inputs"] = mm_inputs
 
-    post_process_rollout_data(args, rollout_data)
+    if post_process:
+        post_process_rollout_data(args, rollout_data)
 
     return rollout_data, batch_meta
 
@@ -880,6 +1022,20 @@ def post_process_rollout_data(args, rollout_data):
     rollout_data["loss_masks"] = [
         torch.as_tensor(t, dtype=torch.int, device=cuda_dev) for t in rollout_data["loss_masks"]
     ]
+    if "classification_labels" in rollout_data:
+        label_dtype = (
+            torch.long
+            if getattr(args, "problem_type", "single_label_classification") == "single_label_classification"
+            else torch.float32
+        )
+        rollout_data["classification_labels"] = [
+            torch.as_tensor(label, dtype=label_dtype, device=cuda_dev)
+            for label in rollout_data["classification_labels"]
+        ]
+    if "sample_weights" in rollout_data:
+        rollout_data["sample_weights"] = [
+            torch.as_tensor(weight, dtype=torch.float32, device=cuda_dev) for weight in rollout_data["sample_weights"]
+        ]
     # NOTE: multimodal_train_inputs are intentionally left on CPU here. Moving
     # the whole batch's pixel tensors to GPU up front would spike memory
     if args.qkv_format == "bshd":
@@ -900,14 +1056,24 @@ def post_process_rollout_data(args, rollout_data):
         or getattr(args, "uses_unsplit_forward", False),
     )
 
-    for key in [
+    response_float_fields = [
         "log_probs",
         "ref_log_probs",
         "rollout_log_probs",
         "advantages",
         "returns",
+        "values",
         *iter_opd_cp_float_fields(),
-    ]:
+    ]
+    rewards = rollout_data.get("rewards", [])
+    if rewards and isinstance(rewards[0], list):
+        rollout_data["rewards"] = [
+            row * response_length if len(row) == 1 else row
+            for row, response_length in zip(rewards, rollout_data["response_lengths"], strict=True)
+        ]
+        response_float_fields.append("rewards")
+
+    for key in response_float_fields:
         if key not in rollout_data:
             continue
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
@@ -985,13 +1151,20 @@ class StreamingTQIterator:
         dp_rank: Data-parallel rank of this worker.
         dp_size: Data-parallel world size.
         task_name: TQ task name (default ``"actor_train"``).
-        max_samples: Optional local sample limit for one rollout-mini window.
-        rollout_mini_index: Rollout-mini window id, passed to the TQ sampler.
+        window_quota: Global per-window sample count (``mini_global_samples``),
+            forwarded to the TQ sampler. The sampler stops dispatching this
+            rollout-mini window once ``window_quota`` samples have been handed
+            out across ALL DPs; per-DP counts stay uneven (token-budget driven)
+            and the dummy-pad aligns cross-DP micro-batch counts. Termination is
+            the per-window drained signal (``all_consumed_fn``), NOT a per-DP
+            count target. ``None`` (fwd/logprob path) → no window cap.
+        rollout_mini_index: Rollout-mini window id, passed to the TQ sampler
+            (keys the sampler's per-window dispatch counter).
         start_batch_index: First batch index for this iterator; used to keep
             sampler cache keys distinct across rollout-mini windows.
-        overflow_buffer: Shared FIFO of already-fetched samples that crossed a
-            rollout-mini boundary. Used by consecutive rollout-mini iterators.
         max_empty_sleep: Maximum sleep duration (seconds) between empty-poll retries.
+        max_stream_stall_s: Wall-clock timeout for consecutive empty polls while
+            the rollout is not yet drained. Exceeding it raises (deadlock guard).
     """
 
     def __init__(
@@ -1006,14 +1179,17 @@ class StreamingTQIterator:
         dp_rank: int,
         dp_size: int,
         task_name: str = "actor_train",
-        max_samples: Optional[int] = None,
+        window_quota: Optional[int] = None,
         rollout_mini_index: int = 0,
         start_batch_index: int = 0,
-        overflow_buffer: Optional[List[Tuple[Dict[str, Any], Any]]] = None,
         max_empty_sleep: float = 2.0,
+        max_stream_stall_s: float = 3600.0,
+        per_round_dummy: bool = False,
     ) -> None:
-        if max_samples is not None and max_samples <= 0:
-            raise ValueError(f"max_samples must be positive when set, got {max_samples}")
+        if window_quota is not None and window_quota <= 0:
+            raise ValueError(f"window_quota must be positive when set, got {window_quota}")
+        if max_stream_stall_s <= 0:
+            raise ValueError(f"max_stream_stall_s must be positive, got {max_stream_stall_s}")
         self.args = args
         self.tq_client = tq_client
         self.data_fields = data_fields
@@ -1021,14 +1197,30 @@ class StreamingTQIterator:
         self.token_budget = token_budget
         self.loss_scale = loss_scale
         self.all_consumed_fn = all_consumed_fn
+        # per_round_dummy: train path only. When True, on an empty fetch the
+        # iterator reads the DUMMY-round flag from the fetched meta's extra_info
+        # (sampler-driven per-round alignment) and emits a zero-grad dummy micro-
+        # batch so all DPs run equal micro-batch counts (MoE EP all-to-all matches
+        # by call order). The forward-only path keeps this False and uses the
+        # legacy end-phase dummy-pad (a dummy there would corrupt put-back data).
+        self.per_round_dummy = per_round_dummy
         self.dp_rank = dp_rank
         self.dp_size = dp_size
         self.task_name = task_name
-        self.max_samples = max_samples
+        # Global per-window sample quota (mini_global_samples), forwarded to the
+        # TQ sampler so it stops dispatching this window once the quota is met
+        # across all DPs.  The consumer no longer enforces a per-DP count target;
+        # termination is the per-window drained signal (all_consumed_fn).
+        self.window_quota = window_quota
         self.rollout_mini_index = rollout_mini_index
         self._sample_count: int = 0
-        self._overflow_buffer = overflow_buffer if overflow_buffer is not None else []
         self.max_empty_sleep = max_empty_sleep
+        # Wall-clock guard: if the stream produces no data for this long while
+        # the rollout is NOT yet drained, raise instead of polling forever.
+        # A genuine deadlock (e.g. a sample the sampler never dispatched to any
+        # bucket, so all_consumed can never flip true) then surfaces as a fast,
+        # diagnosable error rather than a silent hang that ends in an OOM kill.
+        self.max_stream_stall_s = max_stream_stall_s
 
         self._batch_index: int = start_batch_index
         self._mb_count: int = 0
@@ -1064,13 +1256,8 @@ class StreamingTQIterator:
 
             self._prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream-tq-prefetch")
 
-    def _remaining_samples(self) -> Optional[int]:
-        if self.max_samples is None:
-            return None
-        return max(self.max_samples - self._sample_count, 0)
-
     def _sampling_config(self, batch_index: int) -> Dict[str, Any]:
-        config = {
+        return {
             "dp_rank": self.dp_rank,
             "dp_size": self.dp_size,
             "task_name": self.task_name,
@@ -1078,17 +1265,11 @@ class StreamingTQIterator:
             "partition_id": f"train_{self.rollout_id}",
             "allow_underfill": True,
             "rollout_mini_index": self.rollout_mini_index,
+            # Global per-window cap for the sampler (mini_global_samples). The
+            # sampler stops dispatching this window once the quota is met across
+            # all DPs; None on the fwd/logprob path → no cap.
+            "window_quota": self.window_quota,
         }
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None:
-            config.update(
-                {
-                    "max_samples": self.max_samples,
-                    "consumed_samples": self._sample_count,
-                    "remaining_samples": remaining_samples,
-                }
-            )
-        return config
 
     @staticmethod
     def _num_samples(data: Dict[str, Any]) -> int:
@@ -1098,34 +1279,6 @@ class StreamingTQIterator:
                 return len(value)
         return 0
 
-    @staticmethod
-    def _split_sample_value(value: Any, split_at: int, n_samples: int) -> Tuple[Any, Any]:
-        if isinstance(value, torch.Tensor) and value.dim() > 0 and value.size(0) == n_samples:
-            return value[:split_at], value[split_at:]
-        if isinstance(value, list) and len(value) == n_samples:
-            return value[:split_at], value[split_at:]
-        if isinstance(value, tuple) and len(value) == n_samples:
-            return value[:split_at], value[split_at:]
-        return value, value
-
-    def _split_batch_at_sample(
-        self,
-        data: Dict[str, Any],
-        meta: Any,
-        split_at: int,
-        n_samples: int,
-    ) -> Tuple[Tuple[Dict[str, Any], Any], Tuple[Dict[str, Any], Any]]:
-        if split_at <= 0 or split_at >= n_samples:
-            raise ValueError(f"split_at must be in (0, {n_samples}), got {split_at}")
-
-        current: Dict[str, Any] = {}
-        overflow: Dict[str, Any] = {}
-        for key, value in data.items():
-            current_value, overflow_value = self._split_sample_value(value, split_at, n_samples)
-            current[key] = current_value
-            overflow[key] = overflow_value
-        return (current, meta), (overflow, meta)
-
     def _warm_next_batch_index(self, next_index: int) -> None:
         """Fire-and-forget controller cache warm-up for ``next_index``.
 
@@ -1133,9 +1286,6 @@ class StreamingTQIterator:
         sampling_config / partition / batch_index) so the controller sampler
         prepares & caches all dp slices.  Meta-only: result is discarded.
         """
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None and remaining_samples <= 0:
-            return
         if self._prefetch_executor is None or next_index <= self._prefetched_index:
             return
         self._prefetched_index = next_index
@@ -1181,13 +1331,45 @@ class StreamingTQIterator:
 
     def _make_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
         """Build a dummy micro-batch from the last real one, tagged so the loss
-        contributes zero gradient (used to pad short DP ranks to the per-DP
-        max)."""
+        contributes zero gradient (keeps all DP ranks at the same micro-batch
+        count)."""
+        if self._last_batch is None:
+            # A dp asked to emit a dummy before ever seeing a real batch = it got
+            # ZERO samples this window. With the fair per-window quota
+            # (mini_global_samples % dp_size == 0) every dp normally gets >= 1
+            # real sample, so this is pathological — fail loudly rather than
+            # fabricate a shape-less batch.
+            raise RuntimeError(
+                f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                f"dp={self.dp_rank} must emit a dummy micro-batch but received zero real samples "
+                "this window (no template to build a dummy from)."
+            )
         data, meta = self._last_batch
         dummy = dict(data)
         dummy["__is_dummy__"] = True
         dummy["__loss_scale__"] = self.loss_scale
         return dummy, meta
+
+    def _emit_dummy_batch(self) -> Tuple[Dict[str, Any], Any]:
+        """Emit one zero-grad dummy micro-batch for a DUMMY round (this dp is
+        short this round but another dp still has a real slice).
+
+        Advances batch_index + mb_count for lockstep with other DPs; does NOT
+        count toward sample_count or the log buffer (it carries no real data).
+        """
+        dummy = self._make_dummy_batch()
+        self._batch_index += 1
+        self._mb_count += 1
+        if self._mb_count % 20 == 0:
+            logger.info(
+                "[StreamingTQIterator] rollout=%s mini=%d dp=%d dummy round mb=%d batch_index=%d",
+                self.rollout_id,
+                self.rollout_mini_index,
+                self.dp_rank,
+                self._mb_count,
+                self._batch_index,
+            )
+        return dummy
 
     def _finish_real_batches(self, reason: str) -> Tuple[Dict[str, Any], Any]:
         # Real data exhausted. Align mb count across DP ranks: MAX-reduce the
@@ -1205,7 +1387,7 @@ class StreamingTQIterator:
             k_real,
             k_global,
             self._sample_count,
-            f"/{self.max_samples}" if self.max_samples is not None else "",
+            f"/{self.window_quota}" if self.window_quota is not None else "",
             max(0, k_global - k_real),
             total_wait,
             reason,
@@ -1225,7 +1407,6 @@ class StreamingTQIterator:
         data: Dict[str, Any],
         meta: Any,
         tq_wait: float,
-        from_overflow: bool,
     ) -> Tuple[Dict[str, Any], Any]:
         n_samples = self._num_samples(data)
         if n_samples <= 0:
@@ -1234,19 +1415,8 @@ class StreamingTQIterator:
                 "received a non-empty batch with zero sample-aligned fields"
             )
 
-        remaining_samples = self._remaining_samples()
-        if remaining_samples is not None and n_samples > remaining_samples:
-            (data, meta), overflow = self._split_batch_at_sample(data, meta, remaining_samples, n_samples)
-            self._overflow_buffer.insert(0, overflow)
-            logger.info(
-                "[StreamingTQIterator] rollout=%s mini=%d split overfilled mb: used=%d overflow=%d",
-                self.rollout_id,
-                self.rollout_mini_index,
-                remaining_samples,
-                n_samples - remaining_samples,
-            )
-            n_samples = remaining_samples
-
+        # The sampler enforces the per-window global quota, so a fetched mb never
+        # straddles a window boundary — no consumer-side split/spill needed.
         data["__loss_scale__"] = self.loss_scale
         self._sample_count += n_samples
         self._buffer.append((data, meta))
@@ -1262,8 +1432,7 @@ class StreamingTQIterator:
         # values, which get_batch does not mutate) so the dummy always
         # rebuilds from the pristine raw fields.
         self._last_batch = (dict(data), meta)
-        if not from_overflow:
-            self._batch_index += 1
+        self._batch_index += 1
         self._mb_count += 1
 
         adv_info = ""
@@ -1274,6 +1443,16 @@ class StreamingTQIterator:
                 adv_info = (
                     f" adv_means=[{','.join(f'{v:.4f}' for v in adv_vals[:4])}{'...' if len(adv_vals) > 4 else ''}]"
                 )
+        # ``samples`` reports GLOBAL window progress (sum across all dps) vs the
+        # window quota, so it monotonically approaches ``window_quota`` (e.g.
+        # 256).  The controller piggybacks this global count on the fetched
+        # meta's extra_info (``window_dispatched``) — no cross-DP all_reduce.
+        # Falls back to this dp's local count when the global count is absent
+        # (legacy/non-streaming fetches).
+        extra = getattr(meta, "extra_info", None) or {}
+        window_progress = extra.get("window_dispatched")
+        if window_progress is None:
+            window_progress = self._sample_count
         logger.info(
             "[StreamingTQIterator] rollout=%s mini=%d dp=%d/%d mb=%d source=%s tq_wait=%.3fs "
             "n_samples=%d samples=%d%s loss_scale=%.6f%s",
@@ -1282,18 +1461,17 @@ class StreamingTQIterator:
             self.dp_rank,
             self.dp_size,
             self._mb_count,
-            "overflow" if from_overflow else "tq",
+            "tq",
             tq_wait,
             n_samples,
-            self._sample_count,
-            f"/{self.max_samples}" if self.max_samples is not None else "",
+            window_progress,
+            f"/{self.window_quota}" if self.window_quota is not None else "",
             self.loss_scale,
             adv_info,
         )
-        if not from_overflow:
-            # Warm the controller cache for the next mb while the trainer
-            # computes this one (tail prefetch; meta-only).
-            self._warm_next_batch_index(self._batch_index)
+        # Warm the controller cache for the next mb while the trainer
+        # computes this one (tail prefetch; meta-only).
+        self._warm_next_batch_index(self._batch_index)
         return data, meta
 
     def __next__(self) -> Tuple[Dict[str, Any], Any]:
@@ -1312,19 +1490,11 @@ class StreamingTQIterator:
             )
             return self._make_dummy_batch()
 
-        partition_id = f"train_{self.rollout_id}"
-
         t0 = time.monotonic()
         empty_streak = 0
+        partition_id = f"train_{self.rollout_id}"
 
         while True:
-            if self.max_samples is not None and self._sample_count >= self.max_samples:
-                return self._finish_real_batches("rollout mini sample limit reached")
-
-            if self._overflow_buffer:
-                data, meta = self._overflow_buffer.pop(0)
-                return self._emit_data_batch(data, meta, tq_wait=0.0, from_overflow=True)
-
             sampling_config = self._sampling_config(self._batch_index)
             data, meta = get_data_from_transfer_queue(
                 args=self.args,
@@ -1343,20 +1513,31 @@ class StreamingTQIterator:
             if data is not None:
                 tq_wait = time.monotonic() - t0
                 self._tq_wait_times.append(tq_wait)
-                return self._emit_data_batch(data, meta, tq_wait=tq_wait, from_overflow=False)
+                return self._emit_data_batch(data, meta, tq_wait=tq_wait)
 
-            # Data not yet available — check if the rollout is fully consumed.
-            if self.all_consumed_fn():
-                if self.max_samples is not None and self._sample_count < self.max_samples:
+            # Data not yet available for this (dp, batch_index).
+            if self.per_round_dummy:
+                # Train path: the consumer decides from WHAT IT FETCHED — the
+                # sampler carries a DUMMY-round flag in the (empty) meta's
+                # extra_info. DUMMY → this dp is short this round but another dp
+                # still got a real slice; emit a zero-grad dummy and advance so all
+                # dps run the SAME number of micro-batches (MoE EP all-to-all
+                # matches by call order). drained → StopIteration. No extra RPC,
+                # no cross-DP all_reduce.
+                extra = getattr(meta, "extra_info", None) or {}
+                if extra.get("dummy_round"):
+                    return self._emit_dummy_batch()
+                if extra.get("stream_end"):
                     self._shutdown_prefetch()
-                    raise RuntimeError(
-                        f"Transfer queue stream drained before rollout {self.rollout_id} mini "
-                        f"{self.rollout_mini_index} reached its local sample target: "
-                        f"{self._sample_count}/{self.max_samples}"
-                    )
-                return self._finish_real_batches("transfer queue stream drained")
+                    raise StopIteration
+            else:
+                # Forward-only / legacy path: end-phase dummy-pad via all_reduce
+                # (a per-round dummy here would corrupt put-back log-probs).
+                if self.all_consumed_fn():
+                    return self._finish_real_batches("transfer queue window drained (underfill ok)")
 
             empty_streak += 1
+            elapsed = time.monotonic() - t0
             if empty_streak % 20 == 0:
                 logger.info(
                     "[StreamingTQIterator] rollout=%s dp=%d polling: empty_streak=%d "
@@ -1366,7 +1547,20 @@ class StreamingTQIterator:
                     empty_streak,
                     self._batch_index,
                     self._mb_count,
-                    time.monotonic() - t0,
+                    elapsed,
+                )
+            # Deadlock guard: no data for max_stream_stall_s while not drained
+            # means the stream can never complete (e.g. a produced sample that
+            # the sampler never dispatched to any bucket, so all_consumed stays
+            # False forever).  Fail fast and diagnosably instead of hanging.
+            if elapsed >= self.max_stream_stall_s:
+                self._shutdown_prefetch()
+                raise RuntimeError(
+                    f"StreamingTQIterator rollout={self.rollout_id} mini={self.rollout_mini_index} "
+                    f"dp={self.dp_rank} stalled {elapsed:.0f}s (>{self.max_stream_stall_s:.0f}s) with no "
+                    f"data and rollout not drained: samples={self._sample_count} "
+                    f"batch_index={self._batch_index} empty_streak={empty_streak}. Likely a sample was "
+                    "never dispatched to a DP bucket by the sampler, or the drained predicate is stuck."
                 )
             sleep_s = min(0.05 * empty_streak, self.max_empty_sleep)
             time.sleep(sleep_s)

@@ -507,7 +507,7 @@ class TestHighConcurrency:
             num_workers=args.reward_num_workers,
         )
         # Force worker initialization
-        executor._ensure_workers()
+        await executor._ensure_workers()
 
         initial_index = executor._worker_index
         n = 20

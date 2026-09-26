@@ -11,6 +11,7 @@ Functions:
 - read_file: Read data from JSONL or Parquet files
 - parse_generalized_path: Parse path with optional slice notation
 - build_messages: Build message format from raw data
+- collect_message_multimodal_data: Collect inline media in message order
 - process_raw_sample: Process raw data dict into a Sample
 - check_sample_length: Check if sample exceeds max_length
 - filter_long_prompts: Filter samples by length (batch version)
@@ -50,10 +51,111 @@ __all__ = [
     "parse_generalized_path",
     "resolve_path_plan",
     "build_messages",
+    "collect_message_multimodal_data",
+    "count_message_multimodal_items",
     "process_raw_sample",
     "check_sample_length",
     "filter_long_prompts",
 ]
+
+_MULTIMODAL_CONTENT_TYPE_ALIASES = {
+    "image": "image",
+    "image_url": "image",
+    "video": "video",
+    "audio": "audio",
+}
+
+
+def _extract_inline_multimodal_value(item: dict[str, Any]) -> tuple[str | None, Any | None]:
+    item_type = item.get("type")
+    media_name = _MULTIMODAL_CONTENT_TYPE_ALIASES.get(item_type) if isinstance(item_type, str) else None
+    if media_name is None:
+        return None, None
+
+    if item_type == "image_url":
+        value = item.get("image_url")
+        if isinstance(value, dict):
+            value = value.get("url")
+        if not isinstance(value, str):
+            return media_name, None
+    elif media_name == "image":
+        value = item.get("image")
+    else:
+        value = item.get(media_name)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return media_name, None
+    return media_name, value
+
+
+def _normalize_inline_multimodal_items(prompt: Any) -> Any:
+    if not isinstance(prompt, list):
+        return prompt
+
+    normalized_messages = []
+    for message in prompt:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            normalized_messages.append(message)
+            continue
+        normalized_content = []
+        for item in message["content"]:
+            if not isinstance(item, dict):
+                normalized_content.append(item)
+                continue
+            media_name, value = _extract_inline_multimodal_value(item)
+            if media_name is None or value is None:
+                normalized_content.append(item)
+                continue
+            normalized_item = dict(item)
+            normalized_item["type"] = media_name
+            if media_name == "image":
+                normalized_item.pop("image_url", None)
+            normalized_item[media_name] = value
+            normalized_content.append(normalized_item)
+        normalized_message = dict(message)
+        normalized_message["content"] = normalized_content
+        normalized_messages.append(normalized_message)
+    return normalized_messages
+
+
+def count_message_multimodal_items(prompt: str | list[Any]) -> dict[str, int]:
+    """Count literal placeholders and structured media items in messages."""
+    counts = {media.name: 0 for media in MultimodalTypes.all()}
+    if isinstance(prompt, str):
+        contents: list[Any] = [prompt]
+    else:
+        contents = [message.get("content") for message in prompt if isinstance(message, dict)]
+
+    for content in contents:
+        if isinstance(content, str):
+            for media in MultimodalTypes.all():
+                counts[media.name] += content.count(media.placeholder)
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                media_name, _ = _extract_inline_multimodal_value(item)
+                if media_name is not None:
+                    counts[media_name] += 1
+    return counts
+
+
+def collect_message_multimodal_data(prompt: str | list[Any]) -> dict[str, list[Any]]:
+    """Collect valid inline image/video/audio payloads from messages in
+    encounter order."""
+    collected = {media.name: [] for media in MultimodalTypes.all()}
+    if not isinstance(prompt, list):
+        return collected
+
+    for message in prompt:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for item in message["content"]:
+            if not isinstance(item, dict):
+                continue
+            media_name, value = _extract_inline_multimodal_value(item)
+            if media_name is not None and value is not None:
+                collected[media_name].append(value)
+    return collected
 
 
 def parse_generalized_path(s: str) -> tuple[str, Optional[slice]]:
@@ -119,10 +221,13 @@ def build_messages(
         else:
             prompt = [{"role": "user", "content": prompt}]
 
+    prompt = _normalize_inline_multimodal_items(prompt)
+
     # TODO(xide): audio in video special case
     if multimodal_keys:
         # Build mapping: placeholder -> (MultimodalType, content_list)
         multimodals = {}
+        multimodals_by_name = {}
         remain_data = defaultdict(int)
         for type_name, data_key in multimodal_keys.items():
             mt = MultimodalTypes.get(type_name)
@@ -132,6 +237,7 @@ def build_messages(
             placeholder = mt.placeholder
             multimodal_data = list(data.get(data_key) or [])
             multimodals[placeholder] = (mt, multimodal_data)
+            multimodals_by_name[mt.name] = (mt, multimodal_data)
             remain_data[mt.name] += len(multimodal_data)
 
         if multimodals:
@@ -158,13 +264,34 @@ def build_messages(
                     built_message["content"] = content_list
                     built_prompt.append(built_message)
                 elif isinstance(message["content"], list):
-                    # Pre-structured content: count multimodal items so the
-                    # remain_data check below doesn't false-positive.
+                    content_list = []
                     for item in message["content"]:
-                        item_type = item.get("type")
-                        if item_type in remain_data:
-                            remain_data[item_type] -= 1
-                    built_prompt.append(message)
+                        if not isinstance(item, dict):
+                            content_list.append(item)
+                            continue
+                        media_name, inline_value = _extract_inline_multimodal_value(item)
+                        if media_name is None or inline_value is not None or media_name not in multimodals_by_name:
+                            content_list.append(item)
+                            continue
+                        _, content = multimodals_by_name[media_name]
+                        remain_data[media_name] -= 1
+                        if remain_data[media_name] < 0:
+                            logger.warning(
+                                f"The number of structured {media_name} placeholders in prompt "
+                                "is more than data number."
+                            )
+                        if content:
+                            built_item = dict(item)
+                            built_item["type"] = media_name
+                            if media_name == "image":
+                                built_item.pop("image_url", None)
+                            built_item[media_name] = content.pop(0)
+                            content_list.append(built_item)
+                        else:
+                            content_list.append(item)
+                    built_message = dict(message)
+                    built_message["content"] = content_list
+                    built_prompt.append(built_message)
                 else:
                     raise ValueError(
                         f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"

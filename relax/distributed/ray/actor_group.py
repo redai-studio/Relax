@@ -7,8 +7,26 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
+
+
+def _resolve_train_actor_class(args):
+    """Return the train actor class for the configured ``--train-backend``.
+
+    Defaults to Megatron so existing token-RL runs are unaffected; ``fsdp``
+    selects the FSDP2 actor used by native generative RL (design doc 8.3).
+    """
+    backend = getattr(args, "train_backend", "megatron")
+    if backend == "fsdp":
+        from relax.backends.fsdp.actor import FSDPTrainRayActor
+
+        return FSDPTrainRayActor
+    from relax.backends.megatron.actor import MegatronTrainRayActor
+
+    return MegatronTrainRayActor
 
 
 class RayTrainGroup:
@@ -55,14 +73,28 @@ class RayTrainGroup:
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
             # we need also set it to 0 to prevent nccl error.
-            "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
-            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": os.environ.get("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1"),
+            "NCCL_CUMEM_ENABLE": Envs.NCCL_CUMEM_ENABLE,
+            "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": Envs.NVTE_FP8_BLOCK_SCALING_FP32_SCALES,
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.runtime_env.get("env_vars", {}),
             **self.args.train_env_vars,
         }
+        # Compiler cache paths are train-actor-only.  Putting them in the Job
+        # runtime env would make Serve/TQ/SGLang processes pollute the cache.
+        kernel_cache_local_dir = env_vars.get("RELAX_KERNEL_CACHE_LOCAL_DIR")
+        if kernel_cache_local_dir:
+            env_vars["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "inductor")
+            env_vars["TRITON_CACHE_DIR"] = os.path.join(kernel_cache_local_dir, "triton")
 
-        if self.args.offload_train and self.args.train_backend == "megatron":
+        # Only preload the torch_memory_saver hook when it is actually the offload
+        # mechanism. --selective-offload uses application-level selective CPU offload
+        # and must NOT LD_PRELOAD the TMS hook (its global allocator hook + whole-pool
+        # CPU backup would defeat the purpose and confuse torch_memory_saver_preloaded()).
+        if (
+            self.args.offload_train
+            and self.args.train_backend == "megatron"
+            and not getattr(self.args, "selective_offload", False)
+        ):
             import torch_memory_saver
 
             dynlib_path = os.path.join(
@@ -79,12 +111,10 @@ class RayTrainGroup:
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
 
-        from relax.backends.megatron.actor import MegatronTrainRayActor
-
-        actor_impl = MegatronTrainRayActor
+        actor_impl = _resolve_train_actor_class(self.args)
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
-        lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+        lock = Lock.options(**with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})).remote()
 
         # Create worker actors
         self._actor_handlers = []

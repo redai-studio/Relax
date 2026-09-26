@@ -3,16 +3,20 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 from typing import Any
 
 import yaml
 from sglang_router.launch_router import RouterArgs
 
+from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.utils import device as device_utils
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import is_model_source_alias, is_model_uri
 from relax.utils.opd.opd_utils import (
     add_opd_arguments,
     is_managed_opd_teacher_enabled,
@@ -31,6 +35,51 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
+# Minimum required TransferQueue version and the command to upgrade to it.
+_MIN_TQ_VERSION = "0.1.10.dev0"
+_TQ_UPGRADE_CMD = (
+    'pip install "transferqueue @ git+https://github.com/redai-studio/'
+    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+)
+
+_MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
+_REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
+
+
+def check_transfer_queue_version() -> None:
+    """Fail fast if the installed TransferQueue is older than the required
+    version.
+
+    Only fully-async mode needs the newer TransferQueue, so this is called from
+    ``parse_args`` only when ``--fully-async`` is set.
+    """
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as pkg_version
+
+    from packaging.version import parse as parse_version
+
+    try:
+        installed = pkg_version("transferqueue")
+    except PackageNotFoundError as e:
+        raise ImportError(
+            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        ) from e
+
+    if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
+        raise RuntimeError(
+            f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
+            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+        )
+
+
+def _positive_int(value: str) -> int:
+    """argparse type that rejects non-positive integers at parse time."""
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 def reset_arg(parser, name, **kwargs):
     """Reset the default value of a Megatron argument.
 
@@ -45,6 +94,55 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _add_fp16_optimizer_arguments(parser):
+    """Expose FP16 optimizer settings while preserving an unset sentinel."""
+    reset_arg(
+        parser,
+        "--initial-loss-scale",
+        type=float,
+        default=None,
+        help="Initial loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--min-loss-scale",
+        type=float,
+        default=None,
+        help="Minimum loss scale for dynamic FP16 loss scaling.",
+    )
+    reset_arg(
+        parser,
+        "--use-precision-aware-optimizer",
+        action="store_true",
+        default=None,
+        help="Use TransformerEngine's precision-aware optimizer.",
+    )
+    if "--no-use-precision-aware-optimizer" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-use-precision-aware-optimizer",
+            action="store_false",
+            dest="use_precision_aware_optimizer",
+            default=None,
+            help="Disable TransformerEngine's precision-aware optimizer.",
+        )
+    reset_arg(
+        parser,
+        "--store-param-remainders",
+        action="store_true",
+        default=None,
+        help="Store parameter remainders in the distributed optimizer.",
+    )
+    if "--no-store-param-remainders" not in parser._option_string_actions:
+        parser.add_argument(
+            "--no-store-param-remainders",
+            action="store_false",
+            dest="store_param_remainders",
+            default=None,
+            help="Do not store parameter remainders in the distributed optimizer.",
+        )
+    return parser
 
 
 def get_slime_extra_args_provider(add_custom_arguments=None):
@@ -267,6 +365,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
+                "--selective-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake by copying only the "
+                    "live train state (weights + optimizer state) instead of torch_memory_saver's "
+                    "whole-pool pause. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
+            )
+            parser.add_argument(
                 "--disable-weights-backuper",
                 action="store_false",
                 dest="enable_weights_backuper",
@@ -287,6 +396,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "to speed up NFS-backed reads. Applies uniformly to the main model (bridge), "
                     "and to genrm / teacher SGLang engines. Coordinated per node per checkpoint path, "
                     "so each unique checkpoint is streamed at most once per node."
+                ),
+            )
+            parser.add_argument(
+                "--disable-s3-model-download",
+                action="store_true",
+                default=False,
+                help="Disable Relax-managed S3 model loading, including registered model-source providers",
+            )
+            parser.add_argument(
+                "--disable-s3-model-cleanup",
+                action="store_true",
+                default=False,
+                help="Keep downloaded S3 model weight shards in SHM after service initialization",
+            )
+            parser.add_argument(
+                "--s3-model-download-workers",
+                type=int,
+                default=20,
+                help="Number of concurrent workers used to download an S3 model to SHM",
+            )
+            parser.add_argument(
+                "--s3-model-shm-root",
+                type=str,
+                default="/dev/shm",
+                help=(
+                    "S3 model SHM root; it must already exist on every model consumer node, "
+                    "otherwise loading fails without falling back to disk"
                 ),
             )
             parser.add_argument(
@@ -318,6 +454,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Whether to freeze the vision projection parameters (used in bridge mode for multimodal models).",
+            )
+            parser.add_argument(
+                "--vit-lr",
+                type=float,
+                default=None,
+                help=(
+                    "Peak learning rate for trainable vision-encoder parameters. The ViT group follows the same "
+                    "warmup and decay schedule as --lr, with --min-lr scaled by vit_lr / lr. Vision projection "
+                    "or merger parameters remain on the main learning rate."
+                ),
             )
             parser.add_argument(
                 "--freeze-audio-model",
@@ -375,9 +521,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SFT only: defer lm_head into the loss and chunk the lm_head + CE "
                 "matmul (sft_loss_function_chunked) to avoid materializing full [B,S,V/TP] "
                 "logits. Default off — legacy external-loss SFT path materializes full logits "
-                "and runs CE externally. Set --sft-chunked-logits to opt in. Force-disabled "
-                "when --enable-mtp-training is set (MTP head needs the real output_layer; "
-                "bypass would break it) or when embeddings are tied "
+                "and runs CE externally. Set --sft-chunked-logits to opt in. MTP head calls "
+                "continue to use the real output_layer before the main head is deferred. "
+                "Incompatible when embeddings are tied "
                 "(--untie-embeddings-and-output-weights not set: output_layer is built with "
                 "skip_weight_param_allocation=True so output_layer.weight is None and the "
                 "chunked path's lm_head matmul has nothing to multiply against; tied models "
@@ -448,9 +594,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carve a held-out eval split from --prompt-data instead of providing a separate "
                     "--eval-prompt-data. A value <1 is treated as a fraction of the train dataset "
-                    "(e.g. 0.05 → last 5%); a value ≥1 is treated as an absolute sample count. "
-                    "The reserved tail is removed from the train pool so train and eval samples never "
-                    "overlap. Mutually exclusive with --eval-prompt-data."
+                    "(e.g. 0.05 → 5%); a value ≥1 is treated as an absolute sample count. "
+                    "Rows are randomly split once using --seed; held-out rows are excluded from every "
+                    "training epoch. Mutually exclusive with --eval-prompt-data."
                 ),
             )
             parser.add_argument(
@@ -462,6 +608,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This is the maximum number of sft_<step> partitions allowed in flight, "
                     "including the current train step. When set, it maps to "
                     "--max-staleness = sft_max_in_flight_steps - 1."
+                ),
+            )
+            parser.add_argument(
+                "--sft-train-data-prefetch",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. While training step N, prefetch the next step's raw "
+                    "TransferQueue payload on a CPU worker. Requires --per-rank-fetch "
+                    "and at least two SFT partitions in flight; collective agreement and "
+                    "GPU transfer remain on the main training thread."
                 ),
             )
             parser.add_argument(
@@ -485,6 +642,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=4,
                 help="Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding.",
+            )
+            parser.add_argument(
+                "--sft-async-prepack",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable the SFT prepack pipeline: TQ fetch + seqlen-balanced "
+                    "micro-batch partitioning + THD packing + pinned-memory H2D "
+                    "are all offloaded to a background worker, keeping only "
+                    "fwd/bwd on the training thread. Data / batch / loss-scaling "
+                    "semantics match the standard SFT path exactly (same K, same "
+                    "get_seqlen_balanced_partitions, same __loss_scale__). Requires "
+                    "--per-rank-fetch and at least two in-flight steps "
+                    "(--max-staleness >= 1 or --sft-max-in-flight-steps >= 2); "
+                    "PP=1, CP=1, VPP=1 and THD qkv format only."
+                ),
             )
             parser.add_argument(
                 "--sft-oversize-strategy",
@@ -512,6 +685,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sft-loss-last-turn-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. When set, only the FINAL learnable round (the last assistant answer and "
+                    "any tool-calls after the final user query) contributes to the loss; earlier "
+                    "assistant/function_call turns are masked. Default off = train all assistant turns. "
+                    "Applies to both the generation-marker template path and the per-message fallback."
+                ),
+            )
+            parser.add_argument(
+                "--sft-ignore-empty-think",
+                action="store_true",
+                default=False,
+                help=(
+                    "SFT-only. When set, an empty `<think></think>` block inside an assistant turn is "
+                    "kept entirely out of the loss (not just its opener tag). Default off. Only affects "
+                    "the per-message fallback path (the generation-marker template path has no think "
+                    "info; a one-time warning is logged)."
+                ),
+            )
+            parser.add_argument(
+                "--sft-invalid-multimodal-strategy",
+                type=str,
+                default="error",
+                choices=["error", "skip"],
+                help=(
+                    "How to handle SFT samples where a rendered image/video/audio marker cannot resolve to "
+                    "exactly one inline or top-level media source, or duplicate sources are supplied. "
+                    "`error` (default) fails before model forward; `skip` emits a WARNING and refills the batch."
+                ),
+            )
+            parser.add_argument(
                 "--sft-tq-timeout-minutes",
                 type=int,
                 default=None,
@@ -533,6 +739,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Setting this flag implicitly spins up the Rollout role (SGLang must be online to serve generation)."
                 ),
             )
+            parser = _add_fp16_optimizer_arguments(parser)
             return parser
 
         # rollout
@@ -854,6 +1061,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Timeout in seconds to wait for a rollout engine /health_generate response before killing it.",
             )
             parser.add_argument(
+                "--rollout-http-timeout",
+                type=float,
+                default=120.0,
+                help="Timeout in seconds for actor HTTP probes to rollout and actor_fwd services.",
+            )
+            parser.add_argument(
                 "--rollout-health-check-first-wait",
                 type=float,
                 default=0,
@@ -889,6 +1102,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="rollback_all",
                 choices=["rollback_all", "keep_partial"],
                 help="Policy for handling partial success during scale-out. 'rollback_all' reverts all engines on any failure. 'keep_partial' keeps successfully scaled engines.",
+            )
+            parser.add_argument(
+                "--scale-weight-sync-precheck",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Run an independent NCCL precheck before scale-out weight sync; fail-closed on "
+                "incompatible transport. Disable with --no-scale-weight-sync-precheck.",
             )
             # Elastic rollout scale-in arguments
             parser.add_argument(
@@ -1004,6 +1224,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
+                "--task-type",
+                type=str,
+                choices=["causal_lm", "seq_cls"],
+                default="causal_lm",
+                help="SFT task type. `seq_cls` replaces the vocabulary head with a classification head.",
+            )
+            parser.add_argument(
+                "--num-labels",
+                type=int,
+                default=None,
+                help="Number of classes for --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--problem-type",
+                type=str,
+                choices=["single_label_classification", "multi_label_classification"],
+                default="single_label_classification",
+                help="Classification objective used by --task-type seq_cls.",
+            )
+            parser.add_argument(
+                "--classification-threshold",
+                type=float,
+                default=0.5,
+                help="Sigmoid threshold used by multi-label classification evaluation.",
+            )
+            parser.add_argument(
                 "--multimodal-keys",
                 type=json.loads,
                 default=None,
@@ -1107,6 +1353,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--encode-max-workers",
+                type=_positive_int,
+                default=None,
+                help=(
+                    "Worker threads for the shared media-encoding thread pool (image/video/audio "
+                    "encoding offloaded from the asyncio event loop). Positive integer. If unset, "
+                    "falls back to $RELAX_ENCODE_MAX_WORKERS, then to min(32, usable CPU count)."
+                ),
+            )
+            parser.add_argument(
                 "--custom-prompt-path",
                 type=str,
                 default=None,
@@ -1176,7 +1432,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Balance the number of tokens between data parallel ranks with `karmarkar_karp` for verl. "
                     "Note that this may allocate the different response of the same prompt into different training steps. "
-                    "In fully-async + --use-dynamic-batch-size mode this is effectively always on: the "
+                    "In streaming dynamic-batch mode this is effectively always on: the "
                     "StreamingTokenBudgetSampler already balances tokens across DP ranks per sample, so the "
                     "flag is accepted but has no additional effect there."
                 ),
@@ -1279,22 +1535,80 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="SGLang reasoning parser for agentic rollout.",
             )
             parser.add_argument(
-                "--agentic-prepare-pool-size",
+                "--agentic-custom-advantage-path",
+                type=str,
+                default=None,
+                help="Custom group-level advantage function for explicit agentic exports.",
+            )
+            parser.add_argument(
+                "--agentic-concurrency",
                 type=int,
                 default=None,
                 help=(
-                    "Positive target size of the agentic prepare pool in groups, or 0 to start agent processes after "
-                    "rollout begins. If unset, defaults to over_sampling_batch_size."
+                    "Maximum number of resident training groups across Prepare and Runtime. "
+                    "If unset, defaults to over_sampling_batch_size."
                 ),
             )
             parser.add_argument(
-                "--agentic-eval-prepare-pool-size",
+                "--agentic-eval-concurrency",
                 type=int,
                 default=None,
+                help=("Maximum number of resident eval groups. If unset, derives from the training session capacity."),
+            )
+            parser.add_argument(
+                "--agentic-prelaunch",
+                action="store_true",
+                default=False,
+                help="Prelaunch agent processes for the next rollout step.",
+            )
+            parser.add_argument(
+                "--agentic-session-lifecycle",
+                action="store_true",
+                default=False,
                 help=(
-                    "Target size of the agentic eval prepare pool in groups. "
-                    "If unset, derives from the train prepare pool session budget."
+                    "Tag every backend attempt with its Agentic session ID and release the session's radix-cache "
+                    "entries when the session terminates. Requires --sglang-enable-session-radix-cache."
                 ),
+            )
+            parser.add_argument(
+                "--agentic-program-admission",
+                action="store_true",
+                default=False,
+                help=(
+                    "Gate each backend attempt with a cluster-wide execution-token budget. Capacity-bound attempts "
+                    "wait in a global FIFO queue; stale or unavailable metrics fail open to the request limiter."
+                ),
+            )
+            parser.add_argument(
+                "--agentic-admission-headroom",
+                type=float,
+                default=0.90,
+                help="Fraction of aggregate KV token capacity usable as the admission ceiling (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-expected-decode-cap",
+                type=int,
+                default=None,
+                help="Upper bound on expected decode tokens per reservation. Defaults to --rollout-max-response-len.",
+            )
+            parser.add_argument(
+                "--agentic-admission-pressure-threshold",
+                type=float,
+                default=0.92,
+                help="Per-worker KV token usage at or above which new attempts wait, in (0, 1].",
+            )
+            parser.add_argument(
+                "--agentic-admission-max-wait-s",
+                type=float,
+                default=30.0,
+                help="Maximum FIFO wait before the attempt bypasses admission, in seconds. Must be >= 0.",
+            )
+            parser.add_argument(
+                "--agentic-admission-scope",
+                type=str,
+                default="train",
+                choices=["train", "all"],
+                help="Which scopes admission applies to: 'train' only (default) or 'all' (train + eval).",
             )
             return parser
 
@@ -1372,10 +1686,88 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--ref-ckpt-step", type=int, default=None, help="The checkpoint step for reference model. "
             )
+            parser.add_argument(
+                "--lora-rank",
+                type=int,
+                default=0,
+                help="LoRA rank for parameter-efficient fine-tuning (0=disabled).",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=32,
+                help="LoRA alpha scaling factor for learning rate adjustment.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Target modules for LoRA. Megatron-style names on the Megatron backend "
+                    "(e.g. linear_qkv, linear_proj, linear_fc1, linear_fc2), expanded to "
+                    "HF-style names automatically when exporting the adapter; module-name "
+                    "suffixes of the trainable transformer on the FSDP generative backend "
+                    "(e.g. attn.to_q, attn.to_out.0). Unset falls back to the Megatron "
+                    "defaults, or to the generative model adapter's own list under "
+                    "--train-backend fsdp."
+                ),
+            )
+            parser.add_argument(
+                "--lora-scope",
+                type=str,
+                choices=["all", "language", "vision"],
+                default="all",
+                help=(
+                    "Which model region receives LoRA adapters (VL models only; no effect "
+                    "on text models, which have no vision tower). 'all' (default) wraps every "
+                    "matched module including the vision tower; 'language' excludes the vision "
+                    "tower / projector / audio encoder (typical for language-only RL); 'vision' "
+                    "wraps only those. Controls adapter INJECTION, not base-weight freezing."
+                ),
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability for LoRA layers.",
+            )
+            parser.add_argument(
+                "--lora-merge-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Merge LoRA adapters into base weights before weight synchronization. "
+                    "Simplifies rollout but slower rollout inference."
+                ),
+            )
+            parser.add_argument(
+                "--lora-adapter-mode",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable LoRA adapter mode: sync the base model once, then each step push only "
+                    "the trained LoRA adapter to the rollout engine via SGLang's runtime LoRA API "
+                    "(rollouts select it via lora_path). Saves per-step full-weight-sync bandwidth. "
+                    "Requires --enable-lora (auto-set by the engine) and sglang_dp_size == 1. "
+                    "Supported in colocate and fully-async modes. Mutually exclusive with --lora-merge-mode."
+                ),
+            )
             reset_arg(parser, "--load", type=str, default=None)
             reset_arg(parser, "--save", type=str, default=None)
             reset_arg(parser, "--save-interval", type=int, default=None)
             reset_arg(parser, "--async-save", action="store_true")
+            parser.add_argument(
+                "--save-lora-only",
+                action="store_true",
+                default=False,
+                help=(
+                    "Save a lightweight, resumable actor checkpoint containing LoRA tensors plus optimizer, "
+                    "scheduler, RNG, and iteration state. Frozen base weights are restored from --hf-checkpoint. "
+                    "The initial implementation supports synchronous BF16 torch_dist checkpoints only. "
+                    "When unset, save the regular full distributed checkpoint."
+                ),
+            )
             reset_arg(
                 parser,
                 "--no-save-optim",
@@ -1393,6 +1785,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Path to save the model in HuggingFace format when using Megatron backend. "
                     "The model will be saved to `save_hf.format(rollout_id)`. "
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-dtype",
+                type=str,
+                choices=["bf16", "fp8"],
+                default="bf16",
+                help=(
+                    "Precision for online --save-hf export. 'bf16' (default) preserves prior "
+                    "behavior; 'fp8' streams e4m3 quantized shards. FP8 requires --save-hf and "
+                    "an --hf-checkpoint backed by safetensors."
+                ),
+            )
+            parser.add_argument(
+                "--save-hf-fp8-quant-mode",
+                type=str,
+                choices=["block", "channel", "tensor"],
+                default="block",
+                help="FP8 quantization strategy for --save-hf-dtype fp8 (default: block).",
+            )
+            parser.add_argument(
+                "--save-hf-fp8-block-size",
+                type=int,
+                nargs=2,
+                default=None,
+                metavar=("ROWS", "COLS"),
+                help="Block shape for block FP8; defaults to (128, 128) when quant-mode=block.",
+            )
+            parser.add_argument(
+                "--save-hf-post-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Dotted path (module.func) to a callable invoked on WORLD rank 0 after each "
+                    "HF checkpoint is written. Signature: "
+                    "`hook(args, hf_path: str, rollout_id: int, *, dtype: str, is_lora: bool) -> None`. "
+                    "Called synchronously; heavy work (uploads, RPCs) must be enqueued to a background "
+                    "thread by the hook itself. Exceptions are logged and swallowed."
                 ),
             )
             reset_arg(parser, "--seed", type=int, default=1234)
@@ -1456,19 +1886,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--advantage-estimator",
                 type=str,
-                choices=[
-                    "grpo",
-                    "gspo",
-                    "reinforce_plus_plus",
-                    "reinforce_plus_plus_baseline",
-                    "ppo",
-                    "sapo",
-                    "cispo",
-                ],
+                choices=list_algorithm_names(),
                 default="grpo",
                 help=(
-                    "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
-                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
+                    "Advantage estimator to use. The choices come from the algorithm registry in "
+                    "relax/algorithms/spec.py. Note: on-policy distillation (OPD) is orthogonal "
+                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
             parser.add_argument(
@@ -1482,6 +1906,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=1.05,
                 help="Temperature for negative advantages in SAPO (default: 1.05)",
+            )
+            parser.add_argument(
+                "--m2po-kl2-budget",
+                type=float,
+                default=0.01,
+                help="M2PO second-moment budget per harmful token (KL2_budget in paper; paper uses 0.04, default: 0.01)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-low",
+                type=float,
+                default=0.3,
+                help="M2PO minimum lower clip epsilon floor (paper default: 0.3)",
+            )
+            parser.add_argument(
+                "--m2po-miniclip-high",
+                type=float,
+                default=0.5,
+                help="M2PO minimum upper clip epsilon floor (paper default: 0.5)",
             )
             parser.add_argument(
                 "--disable-compute-advantages-and-returns",
@@ -1747,12 +2189,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Specify the key in the reward dict using this argument.",
                 ),
             )
-            parser.add_argument(
-                "--log-correct-samples",
-                action="store_true",
-                default=False,
-                help="Whether to turn on passrate logging, which will log the pass@n of the responses in the rollout.",
-            )
             parser.add_argument("--wandb-run-id", type=str, default=None)
             return parser
 
@@ -1829,6 +2265,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
+            parser.add_argument(
+                "--load-forge-rollout-data",
+                type=str,
+                default=None,
+                help=(
+                    "Path (or {rollout_id} template) to a dumped rollout .pt replayed by "
+                    "relax.engine.rollout.forge_load.generate_rollout. A path without the placeholder is "
+                    "a literal file reused for every rollout; a path with {rollout_id} loads a per-rollout "
+                    "file. Unlike --load-debug-rollout-data, this does NOT set skip_sglang, so sglang, "
+                    "router, weight sync and the colocate offload/onload dance stay live (the point: "
+                    "measuring real colocate memory at long context)."
+                ),
+            )
             parser.add_argument(
                 "--load-debug-rollout-data-subsample",
                 type=float,
@@ -1930,6 +2379,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Type of the reward model",
+            )
+            parser.add_argument(
+                "--rm-type-fallback",
+                type=str,
+                default=None,
+                help=(
+                    "Fallback for samples whose reward type is unknown or missing. "
+                    "None (default) keeps the current behavior of raising. 'zero' scores "
+                    "the sample 0.0 (reward-key aware) with a warning. Any registered "
+                    "reward type name routes degraded samples to that reward instead."
+                ),
+            )
+            parser.add_argument(
+                "--rm-type-infer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Infer the reward type from the sample label via registered label "
+                    "matchers when neither sample metadata nor --rm-type provides one. "
+                    "Also enables conflict detection (warn; the explicit type wins)."
+                ),
             )
             parser.add_argument(
                 "--reward-key",
@@ -2079,6 +2549,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     'Example: \'{ "temperature": 0.2, "max_response_len": 2048 }\''
                 ),
             )
+            parser.add_argument(
+                "--genrm-instances",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON dict deploying multiple named genRM instances, routed by a "
+                    "reward/scoring task name the caller passes to GenRMClient.generate(route_key=...). "
+                    "Each key is a route name; each value is a dict with keys: "
+                    "model_path (str, required), num_gpus (int, required), "
+                    "num_gpus_per_engine (int, optional, defaults to --genrm-num-gpus-per-engine), "
+                    "engine_config (dict, optional, defaults to --genrm-engine-config), "
+                    "sampling_config (dict, optional, defaults to --genrm-sampling-config). "
+                    'Example: \'{"quality": {"model_path": "/a", "num_gpus": 4}, '
+                    '"safety": {"model_path": "/b", "num_gpus": 4}}\'. '
+                    "When set, this takes priority over --genrm-model-path (and the latter is ignored "
+                    "with a warning if also set)."
+                ),
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -2188,6 +2676,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Enable MTP layer parameter updates during training",
             )
+            parser.add_argument(
+                "--mtp-detach-paths",
+                nargs="+",
+                choices=(*_MTP_DETACH_PATHS, "none"),
+                default=_MTP_DETACH_PATHS,
+                help=(
+                    "MTP auxiliary-loss gradient paths to detach. Choose any combination of embedding, "
+                    "backbone, and lm-head, or use none by itself for fully joint gradients. "
+                    "Defaults to detaching all three paths."
+                ),
+            )
+            parser.add_argument(
+                "--mtp-only-training",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train only MTP parameters on SFT data. This enables MTP training, freezes every "
+                    "non-MTP parameter before DDP/optimizer construction, and skips the main language-model loss. "
+                    "Defaults --mtp-num-layers to 1 when it is not specified."
+                ),
+            )
+            # Auto-maps to TransformerConfig.mtp_use_repeated_layer. When set with
+            # --mtp-num-layers N, all N depths reuse the single physical MTP layer
+            # (layer_idx=0), so a checkpoint that only ships mtp.layers.0 drives N>1
+            # depths. reset_arg (not add_argument): Megatron already registers the flag.
+            reset_arg(
+                parser,
+                "--mtp-use-repeated-layer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Reuse one physical MTP layer across all --mtp-num-layers prediction depths "
+                    "(shared weights). Default off."
+                ),
+            )
 
             return parser
 
@@ -2225,6 +2748,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: --autoscaler-config relax/utils/autoscaler/autoscaler.yaml"
                 ),
             )
+            parser.add_argument(
+                "--enable-affinity",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help=(
+                    "Whether baseline roles (actor / rollout-seed / colocate shared PG) require the "
+                    "'stable' worker-group node-group affinity markers, keeping elastic "
+                    "(autoscaler-enabled) jobs' baseline off elastic workers (which get reclaimed -> "
+                    "whole-job restart). Defaults to True. This flag is forwarded to "
+                    "create_placement_group(node_group_affinity=...); passing --no-enable-affinity "
+                    "opts every baseline placement group out of the marker requirement (escape valve) "
+                    "-- use it on plain/local clusters that don't declare the "
+                    "'{group}_gpu'/'{group}_cpu' custom resources so placement stays unconstrained "
+                    "and never hangs waiting for the markers. (Whether the job is elastic at all is "
+                    "gated separately by --autoscaler-config + its YAML 'enabled'.)"
+                ),
+            )
             return parser
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
@@ -2255,6 +2795,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_ci_arguments(parser)
         parser = add_autoscaler_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        # Native generative RL (FSDP2 diffusion/flow training). Adds engine /
+        # adapter / task / reward / sampling / weight-sync flags and the FSDP2
+        # training group; default path is unaffected (all flags default off).
+        from relax.backends.fsdp.arguments import add_generative_arguments
+
+        parser = add_generative_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",
@@ -2287,7 +2833,7 @@ def _pre_parse_mode():
     Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron"], default="megatron")
+    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -2296,8 +2842,52 @@ def _pre_parse_mode():
     return temp_args
 
 
+def _pre_parse_cli_model_source():
+    """Build a serializable model source from the generic CLI."""
+    from relax.utils.model_source import ModelSource
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--hf-checkpoint", help="Hugging Face checkpoint path or model URI")
+    parser.add_argument(
+        "--disable-s3-model-download",
+        action="store_true",
+        help="Disable Relax-managed S3 model loading, including registered model-source providers",
+    )
+    pre, _ = parser.parse_known_args()
+    if pre.disable_s3_model_download or not is_s3_uri(pre.hf_checkpoint):
+        return None
+    return ModelSource(uri=pre.hf_checkpoint)
+
+
 def parse_args(add_custom_arguments=None):
+    """Parse Relax arguments with an optional registered model source."""
+    from relax.utils.model_source import resolve_model_source
+
+    cli_source = _pre_parse_cli_model_source()
+    provider_source = None if _s3_model_download_disabled() else resolve_model_source(sys.argv)
+    return _parse_args_impl(add_custom_arguments, model_source=provider_source or cli_source)
+
+
+def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
+    for token in argv:
+        option = token.split("=", 1)[0]
+        if option in _REMOVED_MTP_DETACH_FLAGS:
+            raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
+
+
+def _s3_model_download_disabled() -> bool:
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--disable-s3-model-download", action="store_true")
+    pre, _ = parser.parse_known_args()
+    return pre.disable_s3_model_download
+
+
+def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # Users may call `parse_args` very early, thus we ensure logger is configured here
+    from relax.utils.s3_model_loader import is_s3_uri
+
+    _reject_removed_mtp_detach_flags(sys.argv[1:])
 
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
@@ -2320,7 +2910,12 @@ def parse_args(add_custom_arguments=None):
 
     args = megatron_parse_args(
         extra_args_provider=add_slime_arguments,
-        skip_hf_validate=pre.debug_rollout_only or pre.skip_hf_validate,
+        model_source=model_source,
+        skip_hf_validate=(
+            pre.debug_rollout_only
+            or pre.skip_hf_validate
+            or (model_source is not None and is_s3_uri(model_source.uri))
+        ),
     )
 
     # Merge pre-parsed args into the main namespace
@@ -2336,13 +2931,37 @@ def parse_args(add_custom_arguments=None):
         for key, value in vars(teacher_sglang_ns).items():
             setattr(args, key, value)
 
+    # Preserve whether the user explicitly requested a rollout start before
+    # validation derives 0 for an apparent HF/cold-start load. Actor init uses
+    # this provenance to recover from a checkpoint-readiness race without
+    # overriding an intentional --start-rollout-id.
+    args._start_rollout_id_explicit = args.start_rollout_id is not None
+
+    # Serialize the driver-derived descriptor with args to every Ray actor.
+    args.model_source = model_source
+    # --lora-target-modules is backend-flavoured: Megatron wants Megatron module
+    # names, the FSDP generative backend wants diffusers module-name suffixes and
+    # gets a per-model-family default from its adapter. Resolve the Megatron
+    # fallback here so every downstream Megatron consumer keeps seeing a concrete
+    # list, and leave it None for fsdp so the actor can defer to the adapter.
+    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+        args.lora_target_modules = ["linear_qkv", "linear_proj"]
+
     slime_validate_args(args)
 
-    if not args.debug_rollout_only:
+    if args.train_backend == "fsdp":
+        from relax.backends.fsdp.arguments import validate_generative_config
+
+        validate_generative_config(args)
+    elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
     if not args.debug_train_only:
         sglang_validate_args(args)
+
+    # Only fully-async mode relies on the newer TransferQueue streaming sampler.
+    if getattr(args, "fully_async", False):
+        check_transfer_queue_version()
 
     return args
 
@@ -2391,16 +3010,176 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+_MTP_ONLY_PARAM_PATTERN = r"(^|\.)mtp(\.|$)"
+
+
+_GENRM_DEFAULT_INSTANCE_KEY = "__default__"
+
+
+def _resolve_genrm_instances(args) -> dict:
+    """Normalize --genrm-instances vs the legacy single-instance flags into one
+    ``{route_key: spec}`` shape.
+
+    Returns an empty dict if genRM is not enabled at all. Each spec has keys
+    ``model_path``, ``num_gpus``, ``num_gpus_per_engine``, ``engine_config``,
+    ``sampling_config``.
+    """
+    instances = getattr(args, "genrm_instances", None)
+    if instances is not None:
+        if not isinstance(instances, dict) or not instances:
+            raise ValueError("--genrm-instances must be a non-empty JSON object.")
+        if getattr(args, "genrm_model_path", None) is not None:
+            logger.warning(
+                "Both --genrm-instances and --genrm-model-path are set; --genrm-instances "
+                "takes priority and --genrm-model-path is ignored."
+            )
+        resolved = {}
+        for key, spec in instances.items():
+            if key == _GENRM_DEFAULT_INSTANCE_KEY:
+                raise ValueError(
+                    f"--genrm-instances route key '{_GENRM_DEFAULT_INSTANCE_KEY}' is reserved for "
+                    "the legacy --genrm-model-path configuration."
+                )
+            if not isinstance(key, str) or not key:
+                raise ValueError("--genrm-instances route keys must be non-empty strings.")
+            if not isinstance(spec, dict):
+                raise ValueError(f"--genrm-instances['{key}'] must be a JSON object.")
+            if "model_path" not in spec:
+                raise ValueError(f"--genrm-instances['{key}'] is missing required key 'model_path'.")
+            if "num_gpus" not in spec:
+                raise ValueError(
+                    f"--genrm-instances['{key}'] is missing required key 'num_gpus'. "
+                    "Each genRM instance must explicitly state its GPU budget "
+                    "(no implicit even split across instances)."
+                )
+            resolved[key] = {
+                "model_path": spec["model_path"],
+                "num_gpus": spec["num_gpus"],
+                "num_gpus_per_engine": spec.get("num_gpus_per_engine") or args.genrm_num_gpus_per_engine,
+                "engine_config": spec.get("engine_config", args.genrm_engine_config) or {},
+                "sampling_config": spec.get("sampling_config", args.genrm_sampling_config) or {},
+            }
+        return resolved
+
+    if getattr(args, "genrm_model_path", None) is None:
+        return {}
+
+    return {
+        _GENRM_DEFAULT_INSTANCE_KEY: {
+            "model_path": args.genrm_model_path,
+            "num_gpus": args.genrm_num_gpus,
+            "num_gpus_per_engine": args.genrm_num_gpus_per_engine,
+            "engine_config": args.genrm_engine_config or {},
+            "sampling_config": args.genrm_sampling_config or {},
+        }
+    }
+
+
+def _validate_genrm_resource_config(args, instance_specs: dict) -> None:
+    """Require the GenRM placement-group budget to match all instances."""
+    if not instance_specs:
+        return
+    resource = getattr(args, "resource", None) or {}
+    if "genrm" not in resource:
+        raise ValueError("GenRM is enabled, but --resource has no 'genrm' entry.")
+    resource_gpus = resource["genrm"][1]
+    instance_gpus = sum(spec["num_gpus"] for spec in instance_specs.values())
+    if resource_gpus != instance_gpus:
+        raise ValueError(
+            "--resource['genrm'] GPU count must equal the sum of all GenRM instance GPU budgets; "
+            f"got resource={resource_gpus}, instances={instance_gpus}."
+        )
+
+
+def _normalize_mtp_detach_paths(args) -> None:
+    """Validate and canonicalize the MTP auxiliary-loss detach paths."""
+    requested_paths = tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS))
+    if "none" in requested_paths:
+        if requested_paths != ("none",):
+            raise ValueError("--mtp-detach-paths none cannot be combined with other paths.")
+        args.mtp_detach_paths = ()
+        return
+
+    unknown_paths = sorted(set(requested_paths) - set(_MTP_DETACH_PATHS))
+    if unknown_paths:
+        raise ValueError(f"Unknown --mtp-detach-paths values: {', '.join(unknown_paths)}.")
+    args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
+
+
+def _normalize_mtp_only_training_args(args) -> None:
+    """Resolve the public MTP-only mode into existing training primitives."""
+    if not getattr(args, "mtp_only_training", False):
+        return
+
+    if getattr(args, "loss_type", None) != "sft":
+        raise ValueError("--mtp-only-training requires --loss-type sft.")
+
+    conflicts = []
+    if getattr(args, "only_train_params_name_list", None):
+        conflicts.append("--only-train-params-name-list")
+    if getattr(args, "freeze_params_name_list", None):
+        conflicts.append("--freeze-params-name-list")
+    if getattr(args, "lora_rank", 0) > 0:
+        conflicts.append("--lora-rank")
+    if getattr(args, "sft_chunked_logits", False):
+        conflicts.append("--sft-chunked-logits")
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        conflicts.append("--overlap-moe-expert-parallel-comm")
+    if getattr(args, "fully_async", False):
+        conflicts.append("--fully-async")
+    if getattr(args, "hybrid", False):
+        conflicts.append("--hybrid")
+    if tuple(getattr(args, "mtp_detach_paths", _MTP_DETACH_PATHS)) != _MTP_DETACH_PATHS:
+        conflicts.append("--mtp-detach-paths")
+    if conflicts:
+        raise ValueError(f"--mtp-only-training is incompatible with: {', '.join(conflicts)}.")
+
+    if args.mtp_num_layers is None:
+        args.mtp_num_layers = 1
+    if args.mtp_num_layers != 1:
+        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_loss_scaling_factor <= 0:
+        raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
+
+    args.enable_mtp_training = True
+    args.mtp_detach_paths = _MTP_DETACH_PATHS
+    args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
+
+
 def _normalize_sft_max_in_flight_steps(args, is_sft: bool) -> None:
     sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
     if sft_max_in_flight_steps is None:
+        if is_sft and getattr(args, "sft_async_prepack", False) and args.max_staleness < 1:
+            raise ValueError("--sft-async-prepack requires --max-staleness >= 1 or --sft-max-in-flight-steps >= 2.")
         return
 
     if not is_sft:
         raise ValueError("--sft-max-in-flight-steps is only meaningful under --loss-type sft.")
-    if sft_max_in_flight_steps < 1:
+    minimum_steps = 2 if getattr(args, "sft_async_prepack", False) else 1
+    if sft_max_in_flight_steps < minimum_steps:
+        if minimum_steps == 2:
+            raise ValueError("--sft-async-prepack requires --sft-max-in-flight-steps >= 2.")
         raise ValueError("--sft-max-in-flight-steps must be >= 1.")
     args.max_staleness = sft_max_in_flight_steps - 1
+
+
+def _validate_sft_train_data_prefetch(args, is_sft: bool) -> None:
+    if not getattr(args, "sft_train_data_prefetch", False):
+        return
+    if getattr(args, "sft_async_prepack", False):
+        raise ValueError(
+            "--sft-train-data-prefetch and --sft-async-prepack are mutually exclusive; "
+            "async prepack already includes raw TransferQueue lookahead."
+        )
+    if not is_sft:
+        raise ValueError("--sft-train-data-prefetch is only meaningful under --loss-type sft.")
+    if not args.per_rank_fetch:
+        raise ValueError("--sft-train-data-prefetch requires --per-rank-fetch.")
+    if args.max_staleness < 1:
+        raise ValueError(
+            "--sft-train-data-prefetch requires at least two SFT partitions in flight; "
+            "set --sft-max-in-flight-steps >= 2."
+        )
 
 
 def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
@@ -2411,6 +3190,72 @@ def _normalize_sft_tq_timeout(args, is_sft: bool) -> None:
         args.sft_tq_timeout_minutes = args.distributed_timeout_minutes
     elif timeout <= 0:
         raise ValueError("--sft-tq-timeout-minutes must be > 0.")
+
+
+def validate_save_hf_fp8_args(args) -> None:
+    """Validate --save-hf-dtype and its FP8 sub-options; fill block-size
+    default."""
+    dtype = getattr(args, "save_hf_dtype", "bf16")
+    if dtype != "fp8":
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-dtype fp8 requires --save-hf to be set.")
+
+    from relax.utils.quant_cast.fp8 import validate_fp8_options
+
+    strategy = getattr(args, "save_hf_fp8_quant_mode", "block")
+    block_size = getattr(args, "save_hf_fp8_block_size", None)
+    if strategy == "block" and block_size is None:
+        block_size = [128, 128]
+        args.save_hf_fp8_block_size = block_size
+    validate_fp8_options(strategy, block_size)
+
+
+def validate_save_hf_post_hook_args(args) -> None:
+    """Validate --save-hf-post-hook-path resolves and is paired with --save-
+    hf."""
+    hook_path = getattr(args, "save_hf_post_hook_path", None)
+    if not hook_path:
+        return
+    if not getattr(args, "save_hf", None):
+        raise ValueError("--save-hf-post-hook-path requires --save-hf to be set.")
+
+    from relax.utils.misc import load_function
+
+    hook = load_function(hook_path)
+    if not callable(hook):
+        raise TypeError(f"--save-hf-post-hook-path {hook_path!r} is not callable: got {type(hook).__name__}")
+
+
+def validate_save_lora_only_args(args) -> None:
+    if not getattr(args, "save_lora_only", False):
+        return
+
+    incompatible = []
+    if args.train_backend != "megatron":
+        incompatible.append("--train-backend must be megatron")
+    if args.lora_rank <= 0:
+        incompatible.append("--lora-rank must be greater than 0")
+    if args.save is None:
+        incompatible.append("--save must be set")
+    if args.ckpt_format != "torch_dist":
+        incompatible.append("--ckpt-format must be torch_dist")
+    if args.async_save:
+        incompatible.append("--async-save")
+    if args.rotate_ckpt:
+        incompatible.append("--rotate-ckpt")
+    if args.no_save_optim:
+        incompatible.append("--no-save-optim")
+    if args.no_save_rng:
+        incompatible.append("--no-save-rng")
+    if args.fp8:
+        incompatible.append("--fp8")
+    if args.fp16:
+        incompatible.append("--fp16")
+    if args.save_hf is not None:
+        incompatible.append("--save-hf")
+    if incompatible:
+        raise ValueError("--save-lora-only is incompatible with: " + ", ".join(incompatible))
 
 
 def _validate_agentic_rollout_args(args) -> None:
@@ -2437,10 +3282,485 @@ def _validate_agentic_rollout_args(args) -> None:
             raise ValueError(f"--agent-env entry must include a non-empty key, got {item!r}.")
         if key.startswith("RELAX_"):
             raise ValueError(f"--agent-env does not allow reserved key {key!r}.")
-    if args.agentic_prepare_pool_size is not None and args.agentic_prepare_pool_size < 0:
-        raise ValueError("--agentic-prepare-pool-size must be >= 0.")
-    if args.agentic_eval_prepare_pool_size is not None and args.agentic_eval_prepare_pool_size <= 0:
-        raise ValueError("--agentic-eval-prepare-pool-size must be > 0.")
+    if args.agentic_concurrency is not None and args.agentic_concurrency <= 0:
+        raise ValueError("--agentic-concurrency must be > 0.")
+    if args.agentic_eval_concurrency is not None and args.agentic_eval_concurrency <= 0:
+        raise ValueError("--agentic-eval-concurrency must be > 0.")
+    if args.agentic_program_admission:
+        if args.agentic_admission_expected_decode_cap is None:
+            args.agentic_admission_expected_decode_cap = args.rollout_max_response_len
+        elif args.agentic_admission_expected_decode_cap <= 0:
+            raise ValueError("--agentic-admission-expected-decode-cap must be > 0.")
+        if not 0.0 < args.agentic_admission_headroom <= 1.0:
+            raise ValueError("--agentic-admission-headroom must be in (0, 1].")
+        if not 0.0 < args.agentic_admission_pressure_threshold <= 1.0:
+            raise ValueError("--agentic-admission-pressure-threshold must be in (0, 1].")
+        if args.agentic_admission_max_wait_s < 0:
+            raise ValueError("--agentic-admission-max-wait-s must be >= 0.")
+    if args.agentic_session_lifecycle:
+        if not args.sglang_enable_session_radix_cache:
+            raise ValueError("--agentic-session-lifecycle requires --sglang-enable-session-radix-cache.")
+        if args.sglang_radix_eviction_policy != "priority":
+            raise ValueError("--agentic-session-lifecycle requires --sglang-radix-eviction-policy priority.")
+
+
+def _validate_reinforce_plus_plus_args(args, is_sft: bool) -> None:
+    """Validate the frozen Task 29 REINFORCE++ algorithm contracts."""
+    if is_sft:
+        return
+
+    estimator = getattr(args, "advantage_estimator", None)
+    variants = {"reinforce_plus_plus", "reinforce_plus_plus_baseline"}
+    if estimator not in variants:
+        return
+
+    if not getattr(args, "normalize_advantages", False):
+        raise ValueError(f"--advantage-estimator {estimator} requires --normalize-advantages.")
+    if getattr(args, "fully_async", False) or getattr(args, "hybrid", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} supports synchronous colocate training only; "
+            "--fully-async and --hybrid are not supported because normalization requires a closed global batch."
+        )
+    if not getattr(args, "colocate", False):
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --colocate.")
+    if getattr(args, "context_parallel_size", 1) != 1:
+        raise ValueError(f"--advantage-estimator {estimator} currently requires --context-parallel-size 1.")
+    if getattr(args, "calculate_per_token_loss", False):
+        raise ValueError(
+            f"--advantage-estimator {estimator} uses response-mean loss reduction; "
+            "--calculate-per-token-loss is not supported."
+        )
+
+    kl_coef = getattr(args, "kl_coef", 0.0)
+    kl_loss_coef = getattr(args, "kl_loss_coef", 0.0)
+    kl_loss_type = getattr(args, "kl_loss_type", "k1")
+    use_kl_loss = getattr(args, "use_kl_loss", False)
+
+    if estimator == "reinforce_plus_plus":
+        if kl_coef <= 0:
+            raise ValueError("reinforce_plus_plus requires --kl-coef > 0 for token-level KL reward shaping.")
+        if kl_loss_type != "k1":
+            raise ValueError("reinforce_plus_plus requires --kl-loss-type k1 for token-level KL reward shaping.")
+        if use_kl_loss or kl_loss_coef != 0:
+            raise ValueError(
+                "reinforce_plus_plus uses KL reward shaping and does not support a separate --use-kl-loss."
+            )
+        return
+
+    if getattr(args, "n_samples_per_prompt", 1) <= 1:
+        raise ValueError("reinforce_plus_plus_baseline requires --n-samples-per-prompt > 1.")
+    if getattr(args, "custom_reward_post_process_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--custom-reward-post-process-path is not supported."
+        )
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        raise ValueError(
+            "reinforce_plus_plus_baseline freezes inclusive group-mean centering; "
+            "--agentic-custom-advantage-path is not supported."
+        )
+    if not getattr(args, "rewards_normalization", True):
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires group-mean centering; "
+            "--disable-rewards-normalization is not supported."
+        )
+    if kl_coef != 0:
+        raise ValueError("reinforce_plus_plus_baseline does not put token KL in the advantage; set --kl-coef 0.")
+    if not use_kl_loss or kl_loss_coef <= 0:
+        raise ValueError(
+            "reinforce_plus_plus_baseline requires an independent k2 penalty via --use-kl-loss and --kl-loss-coef > 0."
+        )
+    if kl_loss_type != "k2":
+        raise ValueError("reinforce_plus_plus_baseline requires --kl-loss-type k2.")
+    if getattr(args, "use_unbiased_kl", False):
+        raise ValueError(
+            "reinforce_plus_plus_baseline uses the plain k2 estimator; --use-unbiased-kl is not supported."
+        )
+
+
+def _declares_non_language_encoder(hf_checkpoint: str) -> bool | None:
+    """Whether the HF config declares a vision / audio encoder next to the LM.
+
+    Tri-state on purpose: ``None`` means the config could not be read (path not
+    materialized yet, or custom code that needs ``trust_remote_code``). Callers
+    degrade to a warning in that case — a best-effort guard must not become a
+    new way for a valid run to fail.
+    """
+    from relax.utils.misc import get_hf_config
+
+    try:
+        config = get_hf_config(hf_checkpoint)
+    except Exception as e:  # noqa: BLE001 - best-effort probe, never fatal
+        logger.warning("Could not read HF config at %s to check for a vision tower: %s", hf_checkpoint, e)
+        return None
+    return any(getattr(config, key, None) is not None for key in ("vision_config", "audio_config"))
+
+
+def _validate_lora_vision_scope(args) -> None:
+    """Reject LoRA adapter mode that would train a vision-tower adapter.
+
+    SGLang hosts LoRA on language-model layers only: ``should_apply_lora`` accepts
+    ``model.layers.*`` and nothing else, and its adapter loader bins tensors by a
+    ``layers.<N>.`` regex that a vision name (``model.visual.blocks.<N>....``) never
+    matches. A vision adapter therefore trains but is dropped on the way to the
+    rollout engine WITHOUT any log line — the actor optimizes a policy the rollout
+    never runs, and the gap widens every step.
+
+    Only adapter mode is affected. Merge mode folds the adapter into the base weights
+    and syncs those, so the engine never sees LoRA at all and any scope is safe.
+    """
+    if not getattr(args, "lora_adapter_mode", False) or getattr(args, "lora_scope", "all") != "all":
+        return
+
+    hf_checkpoint = getattr(args, "hf_checkpoint", None)
+    if not hf_checkpoint:
+        return
+
+    has_encoder = _declares_non_language_encoder(hf_checkpoint)
+    if has_encoder is None:
+        logger.warning(
+            "Skipped the --lora-scope check for --lora-adapter-mode (HF config unreadable). "
+            "If %s is a VL/omni model, pass --lora-scope language: SGLang cannot host a "
+            "vision-tower adapter and would silently drop it.",
+            hf_checkpoint,
+        )
+        return
+    if not has_encoder:
+        return
+
+    raise ValueError(
+        "--lora-adapter-mode with --lora-scope all is not supported on a model that has a "
+        "vision/audio encoder: SGLang only hosts LoRA on language-model layers, so the "
+        "vision-tower adapter would be trained but silently dropped before rollout, breaking "
+        "the on-policy assumption. Either pass --lora-scope language (keeps adapter mode and "
+        "its per-step bandwidth saving; the vision tower is left un-adapted), or switch to "
+        "--lora-merge-mode (folds the vision adapter into the synced base weights, at the cost "
+        "of a full weight sync every step). Pass --lora-scope language explicitly if your "
+        "--lora-target-modules provably match nothing in the vision tower."
+    )
+
+
+def _normalize_sync_ppo_kl_args(args) -> bool:
+    """Disable KL options that have no ref-logprob producer in sync PPO."""
+    is_sync_ppo = (
+        getattr(args, "use_critic", False)
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "hybrid", False)
+    )
+    if not is_sync_ppo or (not getattr(args, "use_kl_loss", False) and getattr(args, "kl_coef", 0.0) == 0):
+        return False
+
+    args.use_kl_loss = False
+    args.kl_coef = 0.0
+    return True
+
+
+def _assert_spec_implementations_resolve(spec) -> None:
+    """Check that every implementation the spec names is actually registered.
+
+    Imports the implementation tables lazily: they pull in torch, and this
+    module is imported for `--help`.
+    """
+    from relax.algorithms.advantages import ADVANTAGE_FNS
+    from relax.algorithms.policy import POLICY_LOSS_FNS
+    from relax.algorithms.rewards import REWARD_NORMALIZERS
+
+    for field, key, table in (
+        ("reward_normalizer", spec.reward_normalizer, REWARD_NORMALIZERS),
+        ("advantage_fn", spec.advantage_fn, ADVANTAGE_FNS),
+        ("policy_loss_fn", spec.policy_loss_fn, POLICY_LOSS_FNS),
+    ):
+        if key not in table:
+            raise ValueError(
+                f"Algorithm {spec.name!r} declares {field}={key!r}, which is not registered. "
+                f"Available: {sorted(table)}."
+            )
+
+
+def validate_algorithm_args(args) -> None:
+    """Apply the constraints the algorithm registry declares for this run.
+
+    These rules used to be `if args.advantage_estimator == "..."` checks
+    scattered across this file, which meant a new algorithm could silently miss
+    one. They now come from AlgorithmSpec fields, so declaring the algorithm is
+    enough. Also sets ``args.use_critic``, the only role switch derived from
+    the algorithm.
+
+    Runs *after* ``_validate_reinforce_plus_plus_args`` on purpose: that
+    function owns the frozen Task 29 wording for the REINFORCE++ variants, and
+    checking the same conditions here first would replace its messages.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+
+    # The spec references its implementations by name, so a typo in the registry
+    # would otherwise surface as a KeyError deep inside a worker on the first
+    # batch. Resolve them here, while the error can still name the culprit.
+    _assert_spec_implementations_resolve(spec)
+
+    args.use_critic = spec.needs_critic
+
+    if not spec.supports_context_parallel and (
+        getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False)
+    ):
+        raise ValueError(
+            f"--advantage-estimator {spec.name} currently requires --context-parallel-size 1 "
+            "with --dynamic-context-parallel disabled: its current implementation does not support CP-sharded responses."
+        )
+
+    if spec.requires_normalize_advantages and not args.normalize_advantages:
+        raise ValueError(
+            f"The {spec.name!r} advantage estimator requires advantage normalization. "
+            "Please add `--normalize-advantages` to your command."
+        )
+
+    if args.n_samples_per_prompt < spec.min_group_size:
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires --n-samples-per-prompt >= {spec.min_group_size} "
+            f"(got {args.n_samples_per_prompt}); its reward stage is undefined for a smaller group."
+        )
+
+    if spec.requires_rewards_normalization and not args.rewards_normalization:
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires rewards normalization to be enabled "
+            "(its group-reward stage is what --disable-rewards-normalization skips). "
+            "Please remove --disable-rewards-normalization."
+        )
+
+    if spec.forbids_normalize_advantages and args.normalize_advantages:
+        raise ValueError(
+            f"--advantage-estimator {spec.name} is incompatible with --normalize-advantages: "
+            "the latter re-whitens advantages after DP sharding "
+            "(distributed_masked_whiten in loss.py), which re-introduces the std "
+            f"normalization {spec.name} removes and makes the result depend on the DP partition. "
+            "Please remove --normalize-advantages."
+        )
+
+    if spec.requires_global_token_loss and not args.calculate_per_token_loss:
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires --calculate-per-token-loss so policy loss is "
+            "normalized by the global number of valid response tokens. The per-sample token-mean "
+            "reducer would reweight unequal-length responses by 1 / response_length."
+        )
+
+    if spec.requires_on_policy_updates:
+        if args.fully_async or getattr(args, "hybrid", False):
+            raise ValueError(
+                f"--advantage-estimator {spec.name} only supports synchronous (colocate) training. "
+                "Please remove --fully-async / --hybrid."
+            )
+        if args.max_staleness != 0:
+            raise ValueError(
+                f"--advantage-estimator {spec.name} requires --max-staleness 0: the unclipped objective "
+                "has no importance-ratio correction for stale rollout data."
+            )
+        if args.partial_rollout or args.use_dynamic_global_batch_size:
+            raise ValueError(
+                f"--advantage-estimator {spec.name} is incompatible with --partial-rollout / "
+                "--use-dynamic-global-batch-size: they cause the effective batch size to drift "
+                "at runtime, breaking the one-update-per-rollout guarantee."
+            )
+
+
+def validate_reward_side_kl(args, is_sft: bool) -> None:
+    """Reject ``--kl-coef`` for estimators that have nowhere to put it.
+
+    Separate from :func:`validate_algorithm_args`, and called much earlier,
+    because of what runs in between: a nonzero ``--kl-coef`` makes validation
+    require ``--ref-load`` to exist on disk. Checking this later would report a
+    missing reference checkpoint for a run whose real problem is that the
+    estimator would have ignored the coefficient anyway.
+    """
+    if is_sft:
+        return
+    spec = get_algorithm(args.advantage_estimator)
+    if not spec.forbids_reward_side_kl or args.kl_coef == 0:
+        return
+
+    # `_validate_reinforce_plus_plus_args` is the frozen Task 29 contract and
+    # owns the wording for its two estimators, but it runs later than this
+    # point. Give it the first word here rather than pre-empting it -- and only
+    # on a path that is about to raise anyway, so no other error's precedence
+    # changes.
+    _validate_reinforce_plus_plus_args(args, is_sft)
+
+    raise ValueError(
+        f"--advantage-estimator {spec.name} does not support nonzero --kl-coef: reward-side KL "
+        "shaping is not implemented for the completion-level signal it trains on. Set --kl-coef 0; "
+        "for a supported direct KL penalty, provide --ref-load and use --use-kl-loss with "
+        "--kl-loss-coef."
+    )
+
+
+def validate_update_schedule(args) -> None:
+    """Reject repeated optimizer updates on one rollout.
+
+    Called before ``--num-steps-per-rollout`` is folded into
+    ``global_batch_size``: afterwards the two are consistent by construction
+    and a mismatch surfaces as an assertion about batch arithmetic rather than
+    as the reason the schedule is wrong.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+    if spec.requires_on_policy_updates and args.num_steps_per_rollout not in (None, 1):
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires --num-steps-per-rollout 1 "
+            "(the unclipped objective has no ratio correction, so repeated updates on the same "
+            "rollout would be off-policy)."
+        )
+
+
+def derive_global_batch_size(args, *, enforce_consistency: bool = True) -> None:
+    """Fold ``--num-steps-per-rollout`` into ``global_batch_size``.
+
+    A function rather than three inline lines because
+    :func:`validate_batch_shape` reads the value it writes, and both have to
+    run again after ``--custom-config-path`` merges. Leaving the derivation
+    inline is what made re-running the validator alone *reject a legitimate
+    config*: a YAML file that switches from ``num_steps_per_rollout: 4`` to
+    ``1`` should get a global batch of ``rollout * n``, but the validator saw
+    the stale value derived from 4 and refused it.
+    """
+    if getattr(args, "num_steps_per_rollout", None) is None:
+        return
+    global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
+    if enforce_consistency and args.global_batch_size is not None:
+        assert args.global_batch_size == global_batch_size, (
+            f"global_batch_size {args.global_batch_size} is not equal to "
+            f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
+            f"// num_steps_per_rollout {args.num_steps_per_rollout}"
+        )
+    args.global_batch_size = global_batch_size
+
+
+def validate_batch_shape(args) -> None:
+    """Require the rollout to fill exactly one optimizer step.
+
+    Called after ``global_batch_size`` has taken its final value -- checking
+    earlier would compare against a number validation is still deriving.
+    """
+    spec = get_algorithm(args.advantage_estimator)
+    if spec.requires_on_policy_updates and args.rollout_batch_size * args.n_samples_per_prompt != (
+        args.global_batch_size
+    ):
+        raise ValueError(
+            f"--advantage-estimator {spec.name} requires exactly one optimizer update per rollout "
+            "(the unclipped objective has no ratio correction, so a second update on the "
+            "same rollout is off-policy without correction). This means "
+            "rollout_batch_size * n_samples_per_prompt must equal global_batch_size, "
+            f"got {args.rollout_batch_size} * {args.n_samples_per_prompt} = "
+            f"{args.rollout_batch_size * args.n_samples_per_prompt} != "
+            f"{args.global_batch_size}."
+        )
+
+
+def apply_custom_config_overrides(args) -> None:
+    """Merge ``--custom-config-path`` YAML into ``args`` and re-check the
+    result.
+
+    The merge happens late in validation so that a YAML file can override
+    derived values, which means every algorithm check that already ran was made
+    against a config we may no longer be training with. Re-running them here is
+    what stops a YAML file from quietly switching on a flag the algorithm
+    forbids.
+    """
+    if not args.custom_config_path:
+        return
+
+    loss_type_before_override = getattr(args, "loss_type", None)
+    use_critic_before_override = getattr(args, "use_critic", False)
+    with open(args.custom_config_path) as f:
+        data = yaml.safe_load(f) or {}
+    for k, v in data.items():
+        if hasattr(args, k):
+            logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
+        setattr(args, k, v)
+
+    if getattr(args, "loss_type", None) != loss_type_before_override:
+        raise ValueError(
+            "--custom-config-path cannot change loss_type after the training mode has already been configured. "
+            "Pass --loss-type on the command line instead of overriding it from YAML."
+        )
+
+    if args.loss_type in ("sft", "sft_loss", "sft-loss"):
+        return
+
+    # Every *algorithm* validator, and the one derivation they read. Be precise
+    # about the scope: this function does not close every hole, it closes the
+    # algorithm-shaped ones.
+    #
+    # What it covers: `validate_reward_side_kl`, `validate_update_schedule` and
+    # `validate_batch_shape` were split out of `validate_algorithm_args`
+    # because argument validation has a derivation order. Re-running only the
+    # spec-driven validator would leave a YAML file free to select rloo and
+    # then set `--kl-coef`, `--num-steps-per-rollout 4`, or a
+    # `global_batch_size` that breaks the one-update guarantee, with nothing
+    # objecting. `_validate_reinforce_plus_plus_args` is re-run too, because
+    # the frozen function owns a constraint the spec deliberately does not
+    # restate.
+    #
+    # What it does NOT cover, and a YAML file can still move: the `--ref-load`
+    # existence check, the `kl_coef`/`kl_loss_coef` exclusion assert,
+    # `_normalize_sync_ppo_kl_args`, the fully-async resource checks, the
+    # `rollout_batch_size` derivation, and the over-sampling assert. All of
+    # them run before the merge and none is an algorithm validator. Closing
+    # that class properly means merging the YAML *before* validation rather
+    # than bolting re-runs on after it, which is a larger change than this one.
+    _validate_reinforce_plus_plus_args(args, is_sft=False)
+    validate_algorithm_args(args)
+    validate_reward_side_kl(args, is_sft=False)
+    validate_update_schedule(args)
+    # The derivation, then the validator that reads what it writes. Re-running
+    # the validator alone rejected a legitimate config: a YAML switching
+    # `num_steps_per_rollout` from 4 to 1 should get a global batch of
+    # `rollout * n`, and the validator instead saw the value derived from 4.
+    # `enforce_consistency=False` because the stale value is, by construction,
+    # the one derived before the merge -- comparing against it is the bug.
+    #
+    # A YAML file that *names* `global_batch_size` is a different case: that is
+    # not a stale value left over from an earlier derivation, it is the override
+    # this function exists to apply. Re-deriving over it wrote the YAML's value
+    # and then replaced it in the next statement, so the run used neither the
+    # configured number nor an error -- the one outcome the override contract
+    # rules out. Derive first so the comparison has something to name, then
+    # refuse the conflict rather than picking a winner.
+    yaml_global_batch_size = data.get("global_batch_size")
+    derive_global_batch_size(args, enforce_consistency=False)
+    if yaml_global_batch_size is not None and args.global_batch_size != yaml_global_batch_size:
+        raise ValueError(
+            f"--custom-config-path sets global_batch_size to {yaml_global_batch_size}, but "
+            f"num_steps_per_rollout {args.num_steps_per_rollout} over rollout_batch_size "
+            f"{args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} derives "
+            f"{args.global_batch_size}. Remove one of the two from the YAML -- whichever you drop, "
+            f"the other is what the run would otherwise have used without saying so."
+        )
+    validate_batch_shape(args)
+    if args.use_critic != use_critic_before_override:
+        # Role composition and the offload flags were derived from the pre-override
+        # value earlier in validation, so accepting the new one here would leave the
+        # run half-configured rather than either fully critic or fully critic-free.
+        raise ValueError(
+            f"--custom-config-path changed the algorithm to {args.advantage_estimator!r}, which needs a different "
+            f"critic setup than the one already derived. Pass --advantage-estimator on the command line instead "
+            f"of overriding it from YAML."
+        )
+
+
+def _validate_ref_load(args: argparse.Namespace) -> None:
+    """Validate a local reference checkpoint or defer a source alias."""
+    if is_model_source_alias(args, args.ref_load):
+        return
+    if is_model_uri(args.ref_load):
+        raise ValueError(
+            f"ref_load URI {args.ref_load!r} does not match the configured model source; "
+            "only a ref_load alias of hf_checkpoint or a local path is supported."
+        )
+    if not os.path.exists(args.ref_load):
+        raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+    if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+        logger.info(
+            f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
+            "please make sure it is a valid megatron checkpoint directory."
+        )
 
 
 def slime_validate_args(args):
@@ -2481,31 +3801,67 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding. Spec_v2 routes
-    # requests through EAGLEWorkerV2.verify(), which (in our pinned SGLang
-    # v0.5.9 build) does not populate output_token_logprobs — rollout sees
-    # response_length=1 for every sample and training silently degenerates.
-    if getattr(args, "sglang_speculative_algorithm", None) and os.environ.get("SGLANG_ENABLE_SPEC_V2", "").lower() in (
+    if getattr(args, "lora_rank", 0) > 0:
+        if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
+            raise ValueError(
+                "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
+            )
+        if getattr(args, "lora_adapter_mode", False) and getattr(args, "sglang_dp_size", 1) != 1:
+            raise ValueError(
+                "--lora-adapter-mode requires --sglang-dp-size 1 (SGLang dynamic LoRA loading does not "
+                "support dp_size > 1)."
+            )
+        _validate_lora_vision_scope(args)
+        if "router" in getattr(args, "lora_target_modules", []) and not getattr(args, "lora_adapter_mode", False):
+            # Merge folds each adapter into its base via LoRAMerge, which only transforms
+            # LoRALinear modules; the router uses LoRATopKRouter, so its adapter would be
+            # silently dropped at sync time. Fail loud instead of training a router LoRA that
+            # never reaches the rollout engine. (Adapter mode exports via the bridge, which
+            # does handle the router, so it is not blocked here.)
+            raise ValueError(
+                "LoRA on 'router' is only supported in --lora-adapter-mode; merge mode cannot fold "
+                "the router adapter (LoRAMerge skips non-LoRALinear modules). Remove 'router' from "
+                "--lora-target-modules or switch to --lora-adapter-mode."
+            )
+        if not getattr(args, "lora_merge_mode", False) and not getattr(args, "lora_adapter_mode", False):
+            logger.info(
+                "LoRA enabled (lora_rank=%d): forcing --lora-merge-mode (default supported LoRA rollout path).",
+                args.lora_rank,
+            )
+            args.lora_merge_mode = True
+
+    # Refuse SGLANG_ENABLE_SPEC_V2=1 with speculative decoding on SGLang <= 0.5.9.
+    # There, spec_v2 routes requests through EAGLEWorkerV2.verify(), which does
+    # not populate output_token_logprobs — rollout sees response_length=1 for
+    # every sample and training silently degenerates. Fixed after 0.5.9, so
+    # newer builds may combine the two freely.
+    if getattr(args, "sglang_speculative_algorithm", None) and Envs.SGLANG_ENABLE_SPEC_V2.lower() in (
         "1",
         "true",
         "yes",
         "y",
     ):
-        raise ValueError(
-            "SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
-            "--sglang-speculative-algorithm in this build: spec_v2 EAGLE worker "
-            "does not populate output_token_logprobs, which collapses rollout "
-            "response_length to 1 and silently breaks training. "
-            "Unset SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the "
-            "spec_v1 EAGLE worker. For Qwen3.5-MoE-style hybrid models, keep "
-            "--sglang-mamba-scheduler-strategy extra_buffer — that flag alone "
-            "satisfies SGLang's mamba radix-cache check and does NOT auto-enable "
-            "spec_v2."
-        )
+        import sglang
+        from packaging.version import parse
+
+        if parse(sglang.__version__) <= parse("0.5.9"):
+            raise ValueError(
+                f"SGLANG_ENABLE_SPEC_V2=1 is not supported together with "
+                f"--sglang-speculative-algorithm on sglang {sglang.__version__}: the spec_v2 "
+                f"EAGLE worker does not populate output_token_logprobs, which collapses "
+                f"rollout response_length to 1 and silently breaks training. Unset "
+                f"SGLANG_ENABLE_SPEC_V2 (or set it to 0) to fall back to the spec_v1 EAGLE "
+                f"worker, or upgrade past 0.5.9. For Qwen3.5-MoE-style hybrid models, keep "
+                f"--sglang-mamba-scheduler-strategy extra_buffer — that flag alone satisfies "
+                f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
+            )
 
     _normalize_sft_max_in_flight_steps(args, is_sft)
+    _validate_sft_train_data_prefetch(args, is_sft)
     _normalize_sft_tq_timeout(args, is_sft)
     _validate_agentic_rollout_args(args)
+    validate_save_hf_fp8_args(args)
+    validate_save_hf_post_hook_args(args)
 
     if not is_sft and args.partial_rollout and args.use_rollout_routing_replay:
         raise ValueError(
@@ -2514,15 +3870,10 @@ def slime_validate_args(args):
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
 
-    if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+    validate_reward_side_kl(args, is_sft)
 
-        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
-            logger.info(
-                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
-                "please make sure it is a valid megatron checkpoint directory."
-            )
+    if not is_sft and (args.kl_coef != 0 or args.use_kl_loss):
+        _validate_ref_load(args)
 
     validate_opd_args(args, is_sft=is_sft, log=logger)
 
@@ -2590,12 +3941,31 @@ def slime_validate_args(args):
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 
-    if not is_sft:
-        if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
-            assert args.normalize_advantages, (
-                "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
-                "require advantage normalization. Please add `--normalize-advantages` to your command."
+    _validate_reinforce_plus_plus_args(args, is_sft)
+
+    if args.rollout_batch_size is None:
+        if args.global_batch_size is None:
+            raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
+        if args.n_samples_per_prompt <= 0:
+            raise ValueError("--n-samples-per-prompt must be positive when deriving --rollout-batch-size.")
+        # An estimator that must consume exactly one rollout per update cannot
+        # absorb the remainder this floor division would drop.
+        if get_algorithm(args.advantage_estimator).requires_on_policy_updates and (
+            args.global_batch_size % args.n_samples_per_prompt != 0
+        ):
+            raise ValueError(
+                f"--global-batch-size must be divisible by --n-samples-per-prompt for "
+                f"{args.advantage_estimator} when --rollout-batch-size is omitted, got "
+                f"{args.global_batch_size} % {args.n_samples_per_prompt} != 0."
             )
+        args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
+        logger.info(
+            f"--rollout-batch-size not set; derived as global_batch_size ({args.global_batch_size}) "
+            f"// n_samples_per_prompt ({args.n_samples_per_prompt}) = {args.rollout_batch_size}"
+        )
+
+    if not is_sft:
+        validate_algorithm_args(args)
 
         if args.fully_async:
             assert not args.normalize_advantages, (
@@ -2684,6 +4054,17 @@ def slime_validate_args(args):
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
 
+    rm_type_fallback = getattr(args, "rm_type_fallback", None)
+    if rm_type_fallback is not None and rm_type_fallback != "zero":
+        # Lazy import: only pay for the rewards package when the flag is set.
+        from relax.engine.rewards.registry import list_reward_types
+
+        if rm_type_fallback not in list_reward_types():
+            raise ValueError(
+                f"--rm-type-fallback {rm_type_fallback!r} is not a registered reward type. "
+                f"Use 'zero' or one of: {list_reward_types()}"
+            )
+
     if hasattr(args, "rollout_result_dir"):
         if args.rollout_result_dir is None and getattr(args, "save", None):
             args.rollout_result_dir = f"{args.save}/rollout_result"
@@ -2713,6 +4094,16 @@ def slime_validate_args(args):
     if args.loss_type == "sft":
         if not args.custom_dataset_class_path and not args.prompt_data:
             raise ValueError("--loss-type sft requires --prompt-data.")
+        if getattr(args, "sft_async_prepack", False):
+            if not args.per_rank_fetch:
+                raise ValueError(
+                    "--sft-async-prepack enables background prepacking and requires --per-rank-fetch; "
+                    "background prefetch workers must not execute CP/TP/PP collectives."
+                )
+            if args.use_routing_replay or args.use_rollout_routing_replay:
+                raise ValueError(
+                    "--sft-async-prepack does not support routing replay because its iterator is single-pass."
+                )
         if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # SFT does not use advantages / reference; force-disable to avoid wasted compute.
@@ -2727,16 +4118,63 @@ def slime_validate_args(args):
                 "SFT relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
                 "samples that cannot fit on a single GPU."
             )
-        # The controller always installs SeqlenBalancedSampler for SFT (see
-        # `core/controller.py:_initialize_data_system`). That sampler can hand
-        # different sample counts to each DP rank, which the Megatron data
-        # path only handles correctly when args.balance_data is True. Force it
-        # on so the two layers stay consistent.
+        # The controller installs SeqlenBalancedSampler for SFT, so keep the
+        # Megatron data path in DP-balanced mode as well.
         if not args.balance_data:
             logger.info("--loss-type sft: auto-enabling --balance-data for DP-balanced batching.")
             args.balance_data = True
+    elif getattr(args, "sft_async_prepack", False):
+        raise ValueError("--sft-async-prepack is only meaningful under --loss-type sft.")
 
-    args.use_critic = args.advantage_estimator == "ppo"
+    task_type = getattr(args, "task_type", "causal_lm")
+    if task_type == "seq_cls":
+        if args.loss_type != "sft":
+            raise ValueError("--task-type seq_cls requires --loss-type sft.")
+        if not args.label_key:
+            raise ValueError("--task-type seq_cls requires --label-key.")
+        if args.num_labels is None or args.num_labels < 2:
+            raise ValueError("--task-type seq_cls requires --num-labels >= 2.")
+        if not 0.0 <= args.classification_threshold <= 1.0:
+            raise ValueError("--classification-threshold must be in [0, 1].")
+        incompatible = {
+            "--fully-async": bool(args.fully_async),
+            "--hybrid": bool(args.hybrid),
+            "--sft-predict-interval": args.sft_predict_interval is not None,
+            "--sft-chunked-logits": bool(args.sft_chunked_logits),
+            "--enable-mtp-training": bool(args.enable_mtp_training),
+            "--mtp-num-layers": bool(args.mtp_num_layers),
+            "--save-hf": args.save_hf is not None,
+            "--allgather-cp": bool(args.allgather_cp),
+            "--custom-dataset-class": args.custom_dataset_class_path is not None,
+            "--sft-oversize-strategy custom": args.sft_oversize_strategy == "custom",
+            "--debug-train-only": bool(args.debug_train_only),
+        }
+        enabled = [name for name, is_enabled in incompatible.items() if is_enabled]
+        if enabled:
+            raise ValueError(f"--task-type seq_cls does not support: {', '.join(enabled)}.")
+    elif getattr(args, "num_labels", None) is not None:
+        raise ValueError("--num-labels is only meaningful under --task-type seq_cls.")
+
+    # `use_critic` is set by validate_algorithm_args for RL runs; SFT never has one.
+    if is_sft:
+        args.use_critic = False
+    # Synchronous PPO has no producer for
+    # `ref_log_probs`: actor's ref forward in backends/megatron/actor.py:800 is
+    # gated on `advantage_estimator != "ppo"`, and the sync role set does not
+    # deploy a separate reference service. Either KL option would make
+    # advantages / actor request a field that never arrives and hang in
+    # TQ.get_meta, so disable both for the currently supported sync topology.
+    if _normalize_sync_ppo_kl_args(args):
+        logger.warning(
+            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+            "Drop these KL options from the launch script to silence this warning."
+        )
+    elif args.use_critic and args.use_kl_loss:
+        # Preserve the existing behavior outside the synchronous topology.
+        logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
+        args.use_kl_loss = False
     if args.critic_num_gpus_per_node is None:
         args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     if args.critic_num_nodes is None:
@@ -2785,8 +4223,11 @@ def slime_validate_args(args):
         "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."
     )
 
-    # Check if genRM is enabled
-    genrm_enabled = args.genrm_model_path is not None
+    # Check if genRM is enabled, and normalize --genrm-instances vs the legacy
+    # single-instance flags into one shape downstream code can rely on.
+    args._genrm_instances_resolved = _resolve_genrm_instances(args)
+    _validate_genrm_resource_config(args, args._genrm_instances_resolved)
+    genrm_enabled = bool(args._genrm_instances_resolved)
     managed_opd_teacher_enabled = is_managed_opd_teacher_enabled(args)
     args._genrm_colocate_with_rollout = False
 
@@ -2814,8 +4255,6 @@ def slime_validate_args(args):
                 f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
             )
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
     elif args.colocate and genrm_enabled:
         if args.offload_train is None:
             args.offload_train = True
@@ -2834,7 +4273,7 @@ def slime_validate_args(args):
             actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
         rollout_g = args.rollout_num_gpus
-        genrm_g = args.genrm_num_gpus
+        genrm_g = sum(spec["num_gpus"] for spec in args._genrm_instances_resolved.values())
         if rollout_g + genrm_g == actor_total_gpus:
             args._genrm_colocate_with_rollout = False
             logger.info(
@@ -2864,27 +4303,37 @@ def slime_validate_args(args):
     if args.use_critic:
         args.offload_train = True
 
+    # expandable_segments cannot coexist with torch_memory_saver, the default mechanism
+    # behind --offload-train. TMS's hook is armed from TMS_INIT_ENABLE inside the
+    # LD_PRELOAD'ed .so before any Python runs, so neither its own sanity check nor any
+    # in-process guard can intervene — the actor just dies with a bare
+    # "CUresult error: 1 (invalid argument)" from cu_mem_create. Fail here instead, while
+    # the message can still be read. Only the CUDA variable names are checked on purpose:
+    # NPU uses a different torch_memory_saver build and its scripts already combine
+    # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True with offload successfully.
+    if args.offload_train and not getattr(args, "selective_offload", False):
+        alloc_conf_sources = {
+            **{name: os.environ.get(name, "") for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")},
+            **{key: str(value) for key, value in getattr(args, "train_env_vars", {}).items()},
+        }
+        for name, value in alloc_conf_sources.items():
+            if "expandable_segments:True" in value:
+                raise ValueError(
+                    f"{name} enables expandable_segments, which torch_memory_saver cannot track. "
+                    "Add --selective-offload to use the application-level offload instead, "
+                    "or drop expandable_segments."
+                )
+
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
 
-    if args.rollout_batch_size is None:
-        if args.global_batch_size is None:
-            raise ValueError("Either --rollout-batch-size or --global-batch-size must be set.")
-        args.rollout_batch_size = args.global_batch_size // args.n_samples_per_prompt
-        logger.info(
-            f"--rollout-batch-size not set; derived as global_batch_size ({args.global_batch_size}) "
-            f"// n_samples_per_prompt ({args.n_samples_per_prompt}) = {args.rollout_batch_size}"
-        )
+    if not is_sft:
+        validate_update_schedule(args)
 
-    if args.num_steps_per_rollout is not None:
-        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
-        if args.global_batch_size is not None:
-            assert args.global_batch_size == global_batch_size, (
-                f"global_batch_size {args.global_batch_size} is not equal to "
-                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
-                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
-            )
-        args.global_batch_size = global_batch_size
+    derive_global_batch_size(args)
+
+    if not is_sft:
+        validate_batch_shape(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
@@ -2892,6 +4341,9 @@ def slime_validate_args(args):
 
     if args.over_sampling_batch_size is None:
         args.over_sampling_batch_size = args.rollout_batch_size
+
+    if args.use_agentic_rollout and args.agentic_concurrency is None:
+        args.agentic_concurrency = args.over_sampling_batch_size
 
     assert args.over_sampling_batch_size >= args.rollout_batch_size, (
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
@@ -2921,13 +4373,16 @@ def slime_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
-    # --sft-chunked-logits incompatibilities. All three are flagged here so
-    # downstream (model.py _should_use_sft_chunked + the three loss.py direct
+    # --sft-chunked-logits incompatibilities. Both are flagged here so
+    # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
-    # All three are hard asserts — the user must remove --sft-chunked-logits
+    # Both are hard asserts — the user must remove --sft-chunked-logits
     # from their script rather than have it silently flipped off.
     if getattr(args, "sft_chunked_logits", False):
         # 1) Tied-embedding (set automatically from HF config.tie_word_embeddings).
@@ -2944,14 +4399,7 @@ def slime_validate_args(args):
             "multiply against). Remove --sft-chunked-logits; the chunked "
             "memory win is marginal on tied-weight models."
         )
-        # 2) MTP. MTP's _postprocess reaches for self.output_layer directly;
-        #    _bypass_output_layer's passthrough would break the MTP head.
-        assert not getattr(args, "enable_mtp_training", False), (
-            "--sft-chunked-logits is incompatible with --enable-mtp-training "
-            "(MTP head needs the real output_layer; the chunked path's "
-            "passthrough would break it). Remove one of the two flags."
-        )
-        # 3) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
+        # 2) Combined 1F1B. overlap_moe_expert_parallel_comm routes training
         #    forward through model.build_schedule_plan(), which does NOT call
         #    model(**kwargs) and so never hits _bypass_output_layer — chunked
         #    silently degrades to the full-logits path.
@@ -2965,13 +4413,11 @@ def slime_validate_args(args):
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
-    if args.custom_config_path:
-        with open(args.custom_config_path) as f:
-            data = yaml.safe_load(f) or {}
-        for k, v in data.items():
-            if hasattr(args, k):
-                logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
-            setattr(args, k, v)
+    apply_custom_config_overrides(args)
+
+    # Custom YAML is applied late and may override any checkpoint option, so
+    # validate this mutually exclusive mode only after those overrides settle.
+    validate_save_lora_only_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(
@@ -2996,13 +4442,6 @@ def slime_validate_args(args):
         )
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
-
-    if args.advantage_estimator == "ppo":
-        raise ValueError(
-            "PPO (Proximal Policy Optimization) is no longer supported in Relax. "
-            "Please use one of the following advantage estimators instead: "
-            "'grpo', 'gspo', 'sapo', 'cispo', 'reinforce_plus_plus', or 'reinforce_plus_plus_baseline'."
-        )
 
     if args.rotate_ckpt:
         assert args.save is not None, "--save must be set when --rotate-ckpt is set."

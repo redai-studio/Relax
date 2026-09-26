@@ -57,12 +57,17 @@ sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768
 
 # ── environment setup ───────────────────────────────────────────────────────
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=./kernel-cache.sh
+source "${DIR}/kernel-cache.sh"
 export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MEGATRON=${MEGATRON:-/root/Megatron-LM/}
 export RELAX=${RELAX:-${DIR}/../../}
 export PYTHONPATH=${RELAX}:$MEGATRON:$RELAX:${PYTHONPATH:-}
 export MODEL_CONFIG_DIR="${DIR}/../models"
+
+relax_kernel_cache_configure "${RUN_SCRIPT}" "$@"
+relax_kernel_cache_prepare_local
 
 # ── NVLink detection ────────────────────────────────────────────────────────
 if [ -e /dev/xpuctrl ]; then
@@ -115,6 +120,8 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
         fi
     done
 
+    relax_kernel_cache_start_agents attach
+
     # Delegate to the training script
     echo "=== Launching training script: $RUN_SCRIPT ==="
     export RELAX_ENTRYPOINT_MODE="spmd-multinode"
@@ -141,12 +148,13 @@ if [ "$MASTER_ADDR" = "$POD_NAME" ]; then
    \"SGLANG_HEALTH_CHECK_TIMEOUT\": \"${SGLANG_HEALTH_CHECK_TIMEOUT:-180}\",
    \"INDEXER_ROPE_NEOX_STYLE\": \"${INDEXER_ROPE_NEOX_STYLE:-0}\",
    \"NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME\": \"${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME:-${NCCL_SOCKET_IFNAME}}\",
-   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-1}\",
+   \"NVTE_USE_CUTLASS_GROUPED_GEMM\": \"${NVTE_USE_CUTLASS_GROUPED_GEMM:-0}\",
    \"NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK\": \"${NVTE_CUTLASS_GROUPED_GEMM_WARN_FALLBACK:-1}\",
    \"LD_LIBRARY_PATH\": \"${CURRENT_LD_LIBRARY_PATH}\"
 
 }
 }"
+    relax_kernel_cache_inject_runtime_env
     exec bash "$RUN_SCRIPT" "$@"
 else
     # ── WORKER NODE ─────────────────────────────────────────────────────────

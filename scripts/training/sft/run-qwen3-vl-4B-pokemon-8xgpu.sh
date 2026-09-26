@@ -37,8 +37,16 @@ CKPT_ARGS=(
    --megatron-to-hf-mode bridge
    --save ${SAVE_DIR}/sft/${EXP_NAME}
    --load ${SAVE_DIR}/sft/${EXP_NAME}
-   --save-interval 1000
+   --save-interval 20
    --num-epoch 10
+)
+
+# Online FP8 HF export.
+HF_EXPORT_ARGS=(
+   --save-hf ${SAVE_DIR}/hf_output/${EXP_NAME}/iter_{rollout_id}
+   --save-hf-dtype fp8
+   --save-hf-fp8-quant-mode block
+   --save-hf-fp8-block-size 128 128
 )
 
 SFT_ARGS=(
@@ -52,6 +60,7 @@ SFT_ARGS=(
    --max-tokens-per-gpu 20480
    --balance-data
    --per-rank-fetch
+   --sft-async-prepack
    --sft-prefetch-num-workers 16
    --sft-prefetch-buffer-size 512
 )
@@ -62,7 +71,7 @@ EVAL_ARGS=(
 )
 
 PREDICT_ARGS=(
-    --sft-predict-interval 10
+    --sft-predict-interval 100
     --eval-temperature 0.0
     --eval-max-response-len 512
 )
@@ -82,6 +91,7 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --colocate
+   --cross-entropy-loss-fusion
 )
 
 OPTIMIZER_ARGS=(
@@ -123,6 +133,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
    --num-data-storage-units 8 \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
+   "${HF_EXPORT_ARGS[@]}" \
    "${SFT_ARGS[@]}" \
    "${EVAL_ARGS[@]}" \
    "${PREDICT_ARGS[@]}" \

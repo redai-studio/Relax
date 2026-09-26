@@ -1,11 +1,32 @@
 diff --git a/src/megatron/bridge/models/conversion/utils.py b/src/megatron/bridge/models/conversion/utils.py
-index 5a66e719..3d411c17 100644
+index 86ddf8661..115624b16 100644
 --- a/src/megatron/bridge/models/conversion/utils.py
 +++ b/src/megatron/bridge/models/conversion/utils.py
-@@ -203,6 +203,15 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
+@@ -203,6 +203,17 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
+         ):  # bound methods
+             return None
+ 
++    # Convert OmegaConf containers to plain dict/list to avoid in-place
++    # mutation triggering "dictionary changed size during iteration" errors
++    # inside OmegaConf's internal _flags_cache handling.
++    try:
++        from omegaconf import DictConfig, ListConfig, OmegaConf as _OmegaConf
++
++        if isinstance(obj, (DictConfig, ListConfig)):
++            obj = _OmegaConf.to_container(obj, resolve=True)
++    except ImportError:
++        pass
++
+     # Handle dataclass/object with attributes
+     if hasattr(obj, "__dict__"):
+         # Create a copy to avoid modifying the original
+@@ -213,9 +224,18 @@ def remove_non_pickleables(obj, max_depth: int = 3, current_depth: int = 0):
  
              # Recursively clean attribute
              cleaned_value = remove_non_pickleables(attr_value, max_depth, current_depth + 1)
+-
+-            # Set the cleaned value (or None if it was removed)
+-            setattr(cleaned_obj, attr_name, cleaned_value)
 +            if hasattr(cleaned_obj, '__setattr__'):
 +                try:
 +                    setattr(cleaned_obj, attr_name, cleaned_value)
@@ -15,6 +36,33 @@ index 5a66e719..3d411c17 100644
 +                        print(f"Skipping attribute '{attr_name}' due to Union type")
 +                        continue
 +                    raise
++            else:
++                # Fallback for objects without __setattr__ override
++                setattr(cleaned_obj, attr_name, cleaned_value)
  
-             # Set the cleaned value (or None if it was removed)
-             setattr(cleaned_obj, attr_name, cleaned_value)
+         return cleaned_obj
+ 
+diff --git a/src/megatron/bridge/peft/utils.py b/src/megatron/bridge/peft/utils.py
+index 1ca5b18bd..4797e2e42 100644
+--- a/src/megatron/bridge/peft/utils.py
++++ b/src/megatron/bridge/peft/utils.py
+@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.router import TopKRouter
+ 
+ from megatron.bridge.utils.import_utils import safe_import_from
+ 
++from relax.utils.device import is_npu_available
+ 
+ TEColumnParallelLinear, HAVE_TE_COL_LINEAR = safe_import_from(
+     "megatron.core.extensions.transformer_engine", "TEColumnParallelLinear"
+@@ -62,7 +63,10 @@ HAVE_TE = all(
+     )
+ )
+ 
+-MixedFusedLayerNorm, HAVE_APEX = safe_import_from("apex.normalization.fused_layer_norm", "MixedFusedLayerNorm")
++if is_npu_available:
++    MixedFusedLayerNorm, HAVE_APEX = None, False
++else:
++    MixedFusedLayerNorm, HAVE_APEX = safe_import_from("apex.normalization.fused_layer_norm", "MixedFusedLayerNorm")
+ 
+ TECL = (TEColumnParallelLinear, TELayerNormColumnParallelLinear, TEColumnParallelGroupedLinear)
+ TERL = (TERowParallelLinear, TERowParallelGroupedLinear)

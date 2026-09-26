@@ -1,6 +1,6 @@
 # External Model Integration
 
-This guide covers the minimum path for adding an external model to Relax with SGLang rollout and Megatron training. Use the current dots.mcore / dots.mocr support as the reference implementation.
+This guide covers the minimum path for adding an external model to Relax with SGLang rollout and Megatron training. Use the current dots.mocr support as the reference implementation.
 
 ## Overview
 
@@ -110,7 +110,7 @@ Choose exactly one execution mode:
 - `--fully-async`
 - `--hybrid`
 
-Pure fully async mode does not support `--balance-data`; use colocate or hybrid when data balancing is required.
+In fully async with `--use-dynamic-batch-size`, the dynamic batch path automatically balances tokens across DP ranks. `--balance-data` remains useful on the static/seqlen-balanced path and is accepted without extra effect on dynamic batching.
 
 ## Alignment
 
@@ -137,7 +137,7 @@ Common alignment failures:
 - Missing Bridge mappings for fused qkv, fused MLP, or vision tower weights.
 - SGLang `load_weights()` not accepting the exported HF names.
 
-## dots.mcore / dots.mocr Reference
+## dots.mocr Reference
 
 Model checkpoint:
 

@@ -156,3 +156,58 @@ def distributed_masked_whiten(
         whitened_values += global_mean
 
     return whitened_values
+
+
+def distributed_masked_normalize(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    process_group: dist.ProcessGroup | None = None,
+    variance_floor: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize valid values with global population moments.
+
+    This is the REINFORCE++ normalization contract: statistics are computed
+    over every mask-nonzero element across the supplied process group, the
+    population variance uses ``ddof=0``, and the output is explicitly zero
+    outside the mask.
+
+    Returns:
+        A tuple of ``(normalized, mean, variance, count)``. The three moment
+        tensors contain global values and are identical on every rank.
+    """
+    if values.shape != mask.shape:
+        raise ValueError(f"values and mask must have the same shape, got {values.shape} and {mask.shape}.")
+    if variance_floor <= 0:
+        raise ValueError(f"variance_floor must be positive, got {variance_floor}.")
+
+    working_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
+    working_values = values.to(dtype=working_dtype)
+    valid_mask = mask.to(device=values.device) != 0
+    working_mask = valid_mask.to(dtype=working_dtype)
+    masked_values = torch.where(valid_mask, working_values, torch.zeros_like(working_values))
+
+    mean_stats = torch.stack((masked_values.sum(), working_mask.sum()))
+    dist.all_reduce(mean_stats, group=process_group)
+    global_sum, global_count = mean_stats.unbind()
+
+    # Keep the empty-global-batch invariant on device. Calling ``.item()`` here
+    # would synchronize every CUDA training batch with the host.
+    torch._assert_async(
+        global_count > 0,
+        "The global mask sum across all participating ranks is zero.",
+    )
+    safe_global_count = global_count.clamp_min(1)
+
+    global_mean = global_sum / safe_global_count
+    centered = torch.where(valid_mask, working_values - global_mean, torch.zeros_like(working_values))
+    centered_sum_sq = centered.square().sum()
+    dist.all_reduce(centered_sum_sq, group=process_group)
+    global_variance = (centered_sum_sq / safe_global_count).clamp_min(0.0)
+    inverse_std = torch.rsqrt(global_variance.clamp_min(variance_floor))
+    normalized = torch.where(
+        valid_mask,
+        (working_values - global_mean) * inverse_std,
+        torch.zeros_like(working_values),
+    )
+
+    return normalized, global_mean, global_variance, global_count

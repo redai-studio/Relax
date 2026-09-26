@@ -116,7 +116,7 @@ cp /tmp/relax_new.patch /root/data/Relax/docker/patch/latest/sglang.patch
 - `:4` `BASE_IMAGE` → 新 tag。
 - 删除过时的源码 overlay(如 `update-transformers-v5` rsync 段)。
 - CUDA 耦合项:若 `-cuXXX` 变了,复核 tilelang wheel 源、flash-attn/apex/TE 重编、cudnn 版本(注:slime 在 cu129 base 上 tilelang 仍用 cu128)。
-- `torch_memory_saver`:跟进 slime 的 `TMS_CUDA_MAJOR` **自动探测**写法 `$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')`;commit 取 redai-infra fork 的 HEAD(先确认比 slime 用的新,别降级)。
+- `torch_memory_saver`:跟进 slime 的 `TMS_CUDA_MAJOR` **自动探测**写法 `$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')`;commit 取 redai-studio fork 的 HEAD(先确认比 slime 用的新,别降级)。
 - `docker/Dockerfile.npu` 的 `git clone -b <tag>` 同步。
 
 `requirements.txt`(属 CLAUDE.md "Ask First",改前确认):

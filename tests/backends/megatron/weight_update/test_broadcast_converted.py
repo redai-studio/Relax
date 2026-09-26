@@ -11,6 +11,7 @@ multi-rank scenarios.
 from __future__ import annotations
 
 import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,13 +33,20 @@ _MEGATRON_MODULES = [
     "megatron.core.tensor_parallel",
     "megatron.bridge",
     "megatron.bridge.models",
+    "megatron.bridge.peft",
+    "megatron.bridge.peft.lora",
 ]
 
 _MISSING = object()
 _saved = {}
 for _mod in _MEGATRON_MODULES:
     _saved[_mod] = sys.modules.get(_mod, _MISSING)
-    sys.modules[_mod] = MagicMock()
+    sys.modules[_mod] = ModuleType(_mod)
+    if _mod in {"megatron", "megatron.core", "megatron.core.transformer", "megatron.bridge", "megatron.bridge.peft"}:
+        sys.modules[_mod].__path__ = []
+sys.modules["megatron.core"].mpu = sys.modules["megatron.core.mpu"]
+sys.modules["megatron.core.transformer.transformer_layer"].get_transformer_layer_offset = MagicMock(return_value=0)
+sys.modules["megatron.bridge.peft.lora"].LoRAMerge = MagicMock
 
 try:
     pytest.importorskip("triton")

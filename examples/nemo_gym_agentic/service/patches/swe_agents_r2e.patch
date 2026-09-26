@@ -1,0 +1,250 @@
+diff --git a/responses_api_agents/swe_agents/app.py b/responses_api_agents/swe_agents/app.py
+index f492ba1..8f02ed4 100644
+--- a/responses_api_agents/swe_agents/app.py
++++ b/responses_api_agents/swe_agents/app.py
+@@ -94,6 +94,10 @@ class AgentPromptOverride(BaseModel):
+     )
+ 
+ 
++class SWEBenchRunRequest(BaseRunRequest):
++    model_config = ConfigDict(extra="allow")
++
++
+ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
+     model_server: ModelServerRef
+ 
+@@ -121,6 +125,12 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
+     container_formatter: str | list[str] = Field(
+         default="docker://swebench/sweb.eval.x86_64.{instance_id}", description="Container path template"
+     )
++    dataset_harness: Literal["all", "r2e_gym"] = Field(
++        default="all",
++        description=(
++            "Dataset harnesses to initialize. Use 'r2e_gym' to avoid downloading unrelated SWE harnesses."
++        ),
++    )
+     swebench_tests_timeout: int = Field(default=30 * 60, description="Timeout for running tests (seconds)")
+ 
+     swebench_agent_timeout: int = Field(default=45 * 60, description="Timeout for running the agent (seconds)")
+@@ -194,10 +204,10 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
+ class SWEBenchWrapperServerConfig(BaseModel):
+     ng_global_config_dict_str: str
+     model_server_name: str
+-    swebench_setup_dir: Path
+-    r2e_gym_setup_dir: Path
+-    swe_rebench_setup_dir: Path
+-    swebench_multilingual_setup_dir: Path
++    swebench_setup_dir: Optional[Path] = None
++    r2e_gym_setup_dir: Optional[Path] = None
++    swe_rebench_setup_dir: Optional[Path] = None
++    swebench_multilingual_setup_dir: Optional[Path] = None
+     run_session_id: str
+     base_results_dir: Path
+     openhands_setup_dir: Optional[Path] = None
+@@ -254,6 +264,7 @@ class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapper
+ 
+     # GRPO related fields
+     mask_sample: bool = False
++    rollout_path_prefix: str = ""
+ 
+     @property
+     def instance_id(self) -> str:
+@@ -514,7 +525,7 @@ SWEBENCH_COMMIT={swebench_commit} \\
+ class R2EGymDatasetProcessor(BaseDatasetHarnessProcessor):
+     def setup(self) -> Path:
+         eval_harness_repo = "https://github.com/sdevare-nv/nv-R2E-Gym.git"
+-        eval_harness_commit = "local-eval"
++        eval_harness_commit = "6823e64f94ae645f5265c03af0eb2e8523530a0d"
+ 
+         setup_dir = self.parent_dir / "swe_r2e_gym_setup"
+ 
+@@ -550,9 +561,15 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+             return setup_dir
+ 
+     def get_run_command(self) -> ExecuteContainerCommandArgs:
++        predictions_path = (
++            "gold" if self.config.verify_golden_patch else str(self.config.output_for_eval_mounted_path)
++        )
++        wait_for_predictions = (
++            "" if self.config.verify_golden_patch else f"{self._get_command_sleep_until_predictions_file()} && "
++        )
+         r2e_gym_cmd = (
+             f'date +"%s.%N" > {self.config.final_eval_apptainer_spinup_timestamp_mounted_fpath} && '
+-            f"{self._get_command_sleep_until_predictions_file()} && "
++            f"{wait_for_predictions}"
+             # Use mounted directory path for cd
+             "cd /r2egym_setup/R2E-Gym && "
+             # Set UV environment variables to use the mounted portable directories
+@@ -562,7 +579,7 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+             # Run with clean environment to avoid venv contamination
+             # Use the pre-built venv directly with its absolute path
+             f"env -u VIRTUAL_ENV {self.config.r2e_gym_setup_dir}/R2E-Gym/venv/bin/python src/r2egym/agenthub/run/run_local_evaluation.py "
+-            f"    --predictions_path {self.config.output_for_eval_mounted_path} "
++            f"    --predictions_path {predictions_path} "
+             f"    --instance_id {self.config.instance_id} "
+             f"    --timeout {self.config.swebench_tests_timeout} "
+             f"    --dataset /root/dataset/data.jsonl "
+@@ -1716,6 +1727,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+             f"export NEMO_GYM_METRICS_FPATH={self.config.base_mounted_dir}/nemo_gym_metrics.json && "
+             f"export NEMO_GYM_CONFIG_DICT={self.config.ng_global_config_dict_str} && "
+             f"export NEMO_GYM_MODEL_SERVER_NAME={self.config.model_server_name} &&"
++            f"export NEMO_GYM_ROLLOUT_PATH_PREFIX={shlex.quote(self.config.rollout_path_prefix)} && "
+             "export VIRTUAL_ENV=/openhands_setup/OpenHands/.venv && "
+             "export PATH=$PATH:/openhands_setup/OpenHands/.venv/bin && "
+             # CRITICAL: Configure poetry to only use the OpenHands venv (ignore external venvs)
+@@ -2679,12 +2697,13 @@ class RunOpenHandsAgent(BaseModel):
+             or dataset_name == "denovoswe"
+             or "SWE-bench" in dataset_name
+             or "SWE-rebench" in dataset_name
++            or "R2E-Gym" in dataset_name
+         )
+         if not supported:
+             raise NotImplementedError(
+                 "verify_golden_patch is only supported for dataset_name in "
+                 "{'swe-bench-ext', 'deepswe', 'denovoswe'} or the SWE-bench / "
+-                f"SWE-bench_Multilingual / SWE-rebench families (got {dataset_name!r})."
++                f"SWE-bench_Multilingual / SWE-rebench / R2E-Gym families (got {dataset_name!r})."
+             )
+ 
+         instance_dict = json.loads(self.config.problem_info["instance_dict"])
+@@ -2692,7 +2711,11 @@ class RunOpenHandsAgent(BaseModel):
+         # DeNovoSWE has no model-style patch — the original source code already
+         # lives in the image at ``parent_commit``. An empty patch is the
+         # legitimate "grade the image's pre-existing code" case there.
+-        if not golden_patch.strip() and dataset_name != "denovoswe":
++        if (
++            not golden_patch.strip()
++            and dataset_name != "denovoswe"
++            and "R2E-Gym" not in dataset_name
++        ):
+             raise ValueError(f"No golden patch found in instance_dict['patch'] for {instance_id}.")
+         if golden_patch and not golden_patch.endswith("\n"):
+             golden_patch += "\n"
+@@ -2762,6 +2774,17 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+     def model_post_init(self, context: Any) -> None:
+         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
+         workspace_root = Path(__file__).parent
++        swebench_setup_dir = None
++        swebench_multilingual_setup_dir = None
++        r2e_gym_setup_dir = None
++        swe_rebench_setup_dir = None
++        if self.config.dataset_harness == "r2e_gym":
++            r2e_gym_setup_dir = R2EGymDatasetProcessor(config=self.config).setup()
++        else:
++            swebench_setup_dir = SweBenchDatasetProcessor(config=self.config).setup()
++            swebench_multilingual_setup_dir = SweBenchMultilingualDatasetProcessor(config=self.config).setup()
++            r2e_gym_setup_dir = R2EGymDatasetProcessor(config=self.config).setup()
++            swe_rebench_setup_dir = SWERebenchDatasetProcessor(config=self.config).setup()
+         # Only set up the agent harness that's actually selected. Both share the
+         # same dataset/eval setup paths.
+         openhands_setup_dir, opencode_setup_dir = None, None
+@@ -2777,10 +2800,10 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+             model_server_name=self.config.model_server.name,
+             openhands_setup_dir=openhands_setup_dir,
+             opencode_setup_dir=opencode_setup_dir,
+-            swebench_setup_dir=SweBenchDatasetProcessor(config=self.config).setup(),
+-            swebench_multilingual_setup_dir=SweBenchMultilingualDatasetProcessor(config=self.config).setup(),
+-            r2e_gym_setup_dir=R2EGymDatasetProcessor(config=self.config).setup(),
+-            swe_rebench_setup_dir=SWERebenchDatasetProcessor(config=self.config).setup(),
++            swebench_setup_dir=swebench_setup_dir,
++            swebench_multilingual_setup_dir=swebench_multilingual_setup_dir,
++            r2e_gym_setup_dir=r2e_gym_setup_dir,
++            swe_rebench_setup_dir=swe_rebench_setup_dir,
+         )
+ 
+         self._sem = Semaphore(self.config.concurrency)
+@@ -3132,6 +3155,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+                     f"--mount type=bind,src={params.resolved_system_prompt_template},"
+                     f"dst=/opencode_setup/opencode/system_prompt.txt,ro"
+                 )
++        elif command.mode == "eval":
++            # Evaluators only need the task metadata and their dataset-specific
++            # harness. Mounting the OpenHands work directories here makes a
++            # golden-patch check depend on directories that are only created
++            # after an agent run.
++            mount_args.append(f"--mount type=bind,src={dataset_path_to_mount},dst=/root/dataset/data.jsonl")
+         else:
+             # OpenHands path (default).
+             assert params.openhands_setup_dir is not None, "openhands_setup_dir not set"
+@@ -3170,7 +3199,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+ 
+         # Add SWE-bench setup directory mount if available (for evaluation)
+         # swe-bench-ext, nv-internal-1, and deepswe don't use the swebench harness
+-        if command.mode == "eval" and data_point["dataset_name"] not in ("nv-internal-1", "swe-bench-ext", "deepswe"):
++        if (
++            command.mode == "eval"
++            and data_point["dataset_name"] not in ("nv-internal-1", "swe-bench-ext", "deepswe")
++            and "R2E-Gym" not in data_point["dataset_name"]
++        ):
++            assert params.swebench_setup_dir is not None, "swebench_setup_dir not set"
+             # Mount the entire setup directory at both /swebench_setup and its original absolute path
+             # This is needed because uv venv has hardcoded absolute paths
+             mount_args.append(f"--mount type=bind,src={params.swebench_setup_dir},dst=/swebench_setup")
+@@ -3197,6 +3225,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+ 
+         if command.mode == "eval" and "R2E-Gym" in data_point["dataset_name"]:
+             # Mount the entire setup directory at both /r2egym_setup and its original absolute path
++            assert params.r2e_gym_setup_dir is not None, "r2e_gym_setup_dir not set"
+             # This is needed because uv venv has hardcoded absolute paths in its wrappers
+             # print(f"Mounting R2E-Gym setup directory from: {self.r2e_gym_setup_dir}", flush=True)
+             mount_args.append(f"--mount type=bind,src={params.r2e_gym_setup_dir},dst=/r2egym_setup")
+@@ -3376,7 +3405,10 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+     def _setup_params(
+         self, body: NeMoGymResponseCreateParamsNonStreaming
+     ) -> Tuple[SWEBenchWrapperInstanceConfig, BaseDatasetHarnessProcessor]:
+-        problem_info = body.metadata | {"container_formatter": self.config.container_formatter}
++        problem_info = dict(body.metadata or {})
++        rollout_path_prefix = problem_info.pop("_ng_rollout_path_prefix", "")
++        body = body.model_copy(update={"metadata": problem_info})
++        problem_info = problem_info | {"container_formatter": self.config.container_formatter}
+         instance_id = problem_info.get("instance_id", "unknown")
+ 
+         # REPLAY_MESSAGES_PATH support (OpenHands harness only): when the request's
+@@ -3475,6 +3507,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+             generation_apptainer_spinup_timestamp_fpath=persistent_dir / "generation_apptainer_spinup_timestamp",
+             generation_apptainer_spinup_timestamp_mounted_fpath=base_mounted_dir
+             / "generation_apptainer_spinup_timestamp",
++            rollout_path_prefix=rollout_path_prefix,
+         )
+ 
+         params.metrics_fpath.write_text("{}")
+@@ -3668,12 +3701,18 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+             metadata=metadata,
+         )
+ 
+-    async def run(self, body: BaseRunRequest) -> SWEBenchVerifyResponse:
++    async def run(self, body: SWEBenchRunRequest) -> SWEBenchVerifyResponse:
+         async with self._sem:
+             body.responses_create_params.parallel_tool_calls = True
+             body.responses_create_params.tool_choice = "auto"
+ 
+-            response = await self.responses(body.responses_create_params)
++            responses_create_params_for_run = body.responses_create_params.model_copy(deep=True)
++            rollout_path_prefix = self.url_path_for_run("", body)
++            if rollout_path_prefix:
++                metadata = dict(responses_create_params_for_run.metadata or {})
++                metadata["_ng_rollout_path_prefix"] = rollout_path_prefix
++                responses_create_params_for_run.metadata = metadata
++            response = await self.responses(responses_create_params_for_run)
+ 
+             metadata, response.metadata = response.metadata, None
+             responses_create_params = body.responses_create_params.model_dump() | {
+diff --git a/responses_api_agents/swe_agents/setup_scripts/openhands.sh b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+index 6273db0..928c20a 100755
+--- a/responses_api_agents/swe_agents/setup_scripts/openhands.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+@@ -82,6 +82,14 @@ cd $openhands_dir
+ echo "Checking out $agent_framework_commit..."
+ git checkout $agent_framework_commit
+ 
++rollout_patch="$(dirname "$0")/openhands_rollout_prefix.patch"
++if git apply --reverse --check "$rollout_patch" >/dev/null 2>&1; then
++    echo "OpenHands rollout-prefix patch already applied."
++else
++    echo "Applying OpenHands rollout-prefix patch..."
++    git apply "$rollout_patch"
++fi
++
+ # Build OpenHands
+ echo "Building OpenHands (this may take 5-10 minutes)..."
+ export INSTALL_DOCKER=0

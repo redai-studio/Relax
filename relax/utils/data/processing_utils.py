@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import atexit
 import base64
 import io
 import json
 import os
 import tempfile
+import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
@@ -24,8 +26,92 @@ logger = get_logger(__name__)
 # PNG compression (libpng), H.264 encoding (libx264), and base64 encoding are all C-level
 # operations that release the GIL, so a thread pool achieves true parallelism without the
 # serialization overhead of a process pool.
-# FIXME: hardcode
-_ENCODE_EXECUTOR = ThreadPoolExecutor(max_workers=32)
+#
+# Built lazily (not at import) so --encode-max-workers, parsed after import, can size the pool.
+_ENCODE_MAX_WORKERS_ENV = "RELAX_ENCODE_MAX_WORKERS"
+_encode_executor: ThreadPoolExecutor | None = None
+_encode_executor_workers: int | None = None
+_encode_executor_lock = threading.Lock()
+
+
+def _usable_cpu_count() -> int:
+    """CPUs this process may actually run on, respecting cgroup/cpuset
+    affinity.
+
+    ``os.sched_getaffinity`` reflects Ray/container CPU pinning;
+    ``os.cpu_count`` reports every host core and would oversubscribe on a
+    shared or limited node.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # non-Linux platforms
+        return os.cpu_count() or 8
+
+
+def _validate_encode_max_workers(max_workers) -> int:
+    # bool is rejected explicitly since bool is a subclass of int.
+    if isinstance(max_workers, bool) or not isinstance(max_workers, int):
+        raise TypeError(f"encode_max_workers must be an integer, got {max_workers!r}")
+    if max_workers <= 0:
+        raise ValueError(f"encode_max_workers must be a positive integer, got {max_workers}")
+    return max_workers
+
+
+def resolve_encode_max_workers(max_workers: int | None) -> tuple[int, str]:
+    """Resolve the worker count and its source, in priority order: explicit
+    ``--encode-max-workers`` > ``$RELAX_ENCODE_MAX_WORKERS`` > affinity-aware
+    default."""
+    if max_workers is not None:
+        return _validate_encode_max_workers(max_workers), "flag"
+    env_value = os.environ.get(_ENCODE_MAX_WORKERS_ENV)
+    if env_value is not None:
+        return _validate_encode_max_workers(int(env_value)), f"${_ENCODE_MAX_WORKERS_ENV}"
+    return min(32, _usable_cpu_count()), "default"
+
+
+def configure_encode_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
+    """Create the shared media-encoding thread pool once and return it.
+
+    Called from the rollout worker init. Idempotent for a matching size; raises
+    if asked to reconfigure a live pool to a different size, since a
+    ThreadPoolExecutor cannot be resized.
+    """
+    global _encode_executor, _encode_executor_workers
+    workers, source = resolve_encode_max_workers(max_workers)
+    with _encode_executor_lock:
+        if _encode_executor is None:
+            _encode_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="relax-encode")
+            _encode_executor_workers = workers
+            atexit.register(shutdown_encode_executor)
+            logger.info("Initialized encode executor with %d workers (source: %s)", workers, source)
+        elif _encode_executor_workers != workers:
+            raise RuntimeError(
+                f"Encode executor already initialized with {_encode_executor_workers} workers; "
+                f"cannot reconfigure to {workers}."
+            )
+        return _encode_executor
+
+
+def get_encode_executor() -> ThreadPoolExecutor:
+    """Return the shared encode pool, lazily creating it with defaults if
+    needed."""
+    executor = _encode_executor
+    if executor is not None:
+        return executor
+    return configure_encode_executor()
+
+
+def shutdown_encode_executor() -> None:
+    """Tear down the shared encode pool (registered with atexit on
+    creation)."""
+    global _encode_executor, _encode_executor_workers
+    with _encode_executor_lock:
+        executor = _encode_executor
+        _encode_executor = None
+        _encode_executor_workers = None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
 
 # Default image patch size for vision-language models
 # Note: Qwen3-VL uses 16, Qwen2.5-VL uses 14
@@ -383,12 +469,12 @@ def encode_audio_for_rollout_engine(
 
 async def async_encode_image_for_rollout_engine(image) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_ENCODE_EXECUTOR, encode_image_for_rollout_engine, image)
+    return await loop.run_in_executor(get_encode_executor(), encode_image_for_rollout_engine, image)
 
 
 async def async_encode_video_tensor_for_rollout_engine(video: torch.Tensor) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_ENCODE_EXECUTOR, encode_video_tensor_for_rollout_engine, video)
+    return await loop.run_in_executor(get_encode_executor(), encode_video_tensor_for_rollout_engine, video)
 
 
 async def async_encode_audio_for_rollout_engine(
@@ -396,4 +482,4 @@ async def async_encode_audio_for_rollout_engine(
     sample_rate: int = 16000,
 ) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_ENCODE_EXECUTOR, encode_audio_for_rollout_engine, audio, sample_rate)
+    return await loop.run_in_executor(get_encode_executor(), encode_audio_for_rollout_engine, audio, sample_rate)

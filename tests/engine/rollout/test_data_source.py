@@ -10,10 +10,26 @@ Run with: pytest tests/engine/rollout/test_data_source.py -v
 
 import json
 import os
+import sys
 import tempfile
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture
+def data_source_module(monkeypatch):
+    processing_utils = ModuleType("relax.utils.data.processing_utils")
+    processing_utils.load_processor = MagicMock(return_value=None)
+    processing_utils.load_tokenizer = MagicMock()
+    monkeypatch.setitem(sys.modules, "relax.utils.data.processing_utils", processing_utils)
+    monkeypatch.delitem(sys.modules, "relax.engine.rollout.data_source", raising=False)
+
+    from relax.engine.rollout import data_source
+
+    yield data_source
+    monkeypatch.delitem(sys.modules, "relax.engine.rollout.data_source", raising=False)
 
 
 class TestEagerDataset:
@@ -74,9 +90,8 @@ class TestDataSourceIntegration:
         yield filepath, data
         os.unlink(filepath)
 
-    def test_factory_function_streaming(self, jsonl_file):
+    def test_factory_function_streaming(self, jsonl_file, data_source_module):
         """Test _create_dataset factory with streaming enabled."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         filepath, data = jsonl_file
@@ -99,14 +114,13 @@ class TestDataSourceIntegration:
 
         tokenizer = MagicMock()
 
-        dataset = _create_dataset(args, tokenizer, processor=None)
+        dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
         assert isinstance(dataset, StreamingDataset)
         assert len(dataset) == len(data)
 
-    def test_factory_function_traditional(self, jsonl_file):
+    def test_factory_function_traditional(self, jsonl_file, data_source_module):
         """Test _create_dataset factory with streaming disabled."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.data import Dataset
 
         filepath, data = jsonl_file
@@ -128,14 +142,13 @@ class TestDataSourceIntegration:
 
         tokenizer = MagicMock()
 
-        dataset = _create_dataset(args, tokenizer, processor=None)
+        dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
         assert isinstance(dataset, Dataset)
 
-    def test_factory_function_streaming_multi_file_slice(self):
+    def test_factory_function_streaming_multi_file_slice(self, data_source_module):
         """Test _create_dataset factory with streaming dataset over multiple
         files and outer slice."""
-        from relax.engine.rollout.data_source import _create_dataset
         from relax.utils.data.streaming_dataset import StreamingDataset
 
         data1 = [{"text": f"A{i}", "label": f"a{i}"} for i in range(3)]
@@ -165,7 +178,7 @@ class TestDataSourceIntegration:
             args.custom_prompt_path = None
 
             tokenizer = MagicMock()
-            dataset = _create_dataset(args, tokenizer, processor=None)
+            dataset = data_source_module._create_dataset(args, tokenizer, processor=None)
 
             assert isinstance(dataset, StreamingDataset)
             assert len(dataset) == 4

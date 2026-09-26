@@ -91,6 +91,7 @@ sys.modules.update(
 for _name in [
     "relax.distributed.ray",
     "relax.distributed.ray.placement_group",
+    "relax.engine.sft.runtime",
     "relax.utils.async_utils",
     "relax.utils.data.processing_utils",
     "relax.utils.opd.opd_utils",

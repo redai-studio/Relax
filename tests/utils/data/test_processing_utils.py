@@ -7,12 +7,66 @@ imageio / soundfile / transformers / torch stack at module level, which trips a
 numpy ABI mismatch in this CI image during pytest collection.
 """
 
+import importlib
+import sys
+from types import ModuleType
+
 import pytest
 
 
-@pytest.fixture(scope="module")
-def adapt_processor_kwargs():
-    from relax.utils.data.processing_utils import adapt_processor_kwargs as fn
+@pytest.fixture()
+def processing_utils_module(monkeypatch):
+    transformers = ModuleType("transformers")
+
+    class AutoProcessor:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            return cls()
+
+    class PreTrainedTokenizerBase:
+        pass
+
+    class ProcessorMixin:
+        pass
+
+    transformers.AutoProcessor = AutoProcessor
+    transformers.AutoTokenizer = AutoTokenizer
+    transformers.PreTrainedTokenizerBase = PreTrainedTokenizerBase
+    transformers.ProcessorMixin = ProcessorMixin
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+
+    module_name = "relax.utils.data.processing_utils"
+    original_module = sys.modules.get(module_name)
+    module_was_loaded = module_name in sys.modules
+    data_module = sys.modules.get("relax.utils.data")
+    processing_attr_was_set = data_module is not None and hasattr(data_module, "processing_utils")
+    original_processing_attr = getattr(data_module, "processing_utils", None) if processing_attr_was_set else None
+
+    sys.modules.pop(module_name, None)
+    if data_module is not None and processing_attr_was_set:
+        delattr(data_module, "processing_utils")
+    module = importlib.import_module(module_name)
+    try:
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+        if module_was_loaded:
+            sys.modules[module_name] = original_module
+        if data_module is not None:
+            if processing_attr_was_set:
+                setattr(data_module, "processing_utils", original_processing_attr)
+            elif hasattr(data_module, "processing_utils"):
+                delattr(data_module, "processing_utils")
+
+
+@pytest.fixture()
+def adapt_processor_kwargs(processing_utils_module):
+    fn = processing_utils_module.adapt_processor_kwargs
 
     return fn
 
@@ -84,13 +138,16 @@ def test_adapt_processor_kwargs_kimi_no_images_returns_only_return_tensors(adapt
     assert out == {"return_tensors": "pt"}
 
 
-def test_adapt_processor_kwargs_kimi_warns_on_unsupported_modalities(caplog, adapt_processor_kwargs):
+def test_adapt_processor_kwargs_kimi_warns_on_unsupported_modalities(
+    monkeypatch, processing_utils_module, adapt_processor_kwargs
+):
     proc = KimiK25Processor()
     mm = {"images": ["x"], "videos": ["v"], "audio": ["a"]}
-    with caplog.at_level("WARNING"):
-        out = adapt_processor_kwargs(proc, mm, None)
+    warnings = []
+    monkeypatch.setattr(processing_utils_module.logger, "warning", lambda msg: warnings.append(msg))
+    out = adapt_processor_kwargs(proc, mm, None)
 
-    msgs = " ".join(r.getMessage() for r in caplog.records)
+    msgs = " ".join(warnings)
     assert "video" in msgs.lower()
     assert "audio" in msgs.lower()
     assert "videos" not in out

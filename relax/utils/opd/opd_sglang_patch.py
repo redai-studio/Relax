@@ -55,7 +55,6 @@ from __future__ import annotations
 import base64
 import io
 import logging
-import os
 
 import torch
 
@@ -220,9 +219,11 @@ def apply_opd_preexpanded_patch() -> None:
         logger.warning("Failed to apply OPD pre-expanded patch: %r", e)
 
 
-# Apply on import ONLY when explicitly enabled via the env flag. Merely
-# importing this module must stay a complete no-op unless
-# ``RELAX_OPD_PREEXPANDED_PATCH=1`` is set, so sglang 0.5.12.post1 and all its
-# other modules are left untouched when the feature is disabled.
-if os.environ.get("RELAX_OPD_PREEXPANDED_PATCH", "0") == "1":
-    apply_opd_preexpanded_patch()
+# No apply-on-import hook. The sole importer,
+# ``sglang_engine.py::_launch_server_with_patches``, already checks
+# ``RELAX_OPD_PREEXPANDED_PATCH`` before importing this module and then calls
+# ``apply_opd_preexpanded_patch()`` explicitly, so an import-time gate would
+# only apply the (idempotent) patch a second time — and would read the flag at
+# import time, before a Ray worker's runtime_env is necessarily in play.
+# Importing this module is therefore a complete no-op: sglang and all its other
+# modules stay untouched until a caller opts in.

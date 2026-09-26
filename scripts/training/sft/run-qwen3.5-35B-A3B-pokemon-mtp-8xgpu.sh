@@ -60,6 +60,7 @@ MTP_ARGS=(
    --mtp-num-layers 1
    --enable-mtp-training
    --mtp-loss-scaling-factor 0.2
+   --mtp-detach-paths none
    # --ci-test
 )
 
@@ -98,6 +99,9 @@ PERF_ARGS=(
    --no-rope-fusion
 
    --colocate
+   --cross-entropy-loss-fusion
+   --sft-chunked-logits
+   --sft-logits-chunk-size ${SFT_LOGITS_CHUNK_SIZE:-2048}
 )
 
 OPTIMIZER_ARGS=(

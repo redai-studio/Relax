@@ -18,7 +18,7 @@ hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
 ### Megatron Weights to HF Weights
 
 ::: tip No Manual Conversion Needed with Megatron Bridge
-Relax uses [Megatron Bridge](../../../relax/backends/megatron/mbridge/) as the weight bridging layer for its training backend, automatically handling bidirectional HF ↔ Megatron weight conversion during training — **no manual conversion steps required**. Simply specify the following option in your launch script:
+Relax uses [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) as the weight bridging layer for its training backend, automatically handling bidirectional HF ↔ Megatron weight conversion during training — **no manual conversion steps required**. Simply specify the following option in your launch script:
 :::
 
 ```bash
@@ -116,13 +116,49 @@ python scripts/tools/process_avqa.py \
 
 ## Custom Reward Methods
 
-You can define `reward_func(args, sample: Sample, **kwargs) -> float` in your own `.py` file, then add it to your task launch script. See [DeepEyes](../examples/deepeyes.md) for a concrete example.
+Define either a single-sample reward,
+`reward_func(args, sample: Sample, **kwargs) -> int | float | dict`, or a batched/group reward,
+`reward_func(args, samples: list[Sample], **kwargs) -> list[int | float | dict]`, in your own `.py` file. Then add
+its import path to the launch script. See [DeepEyes](../examples/deepeyes.md) for an example.
 
 ```bash
 --custom-rm-path examples.deepeyes.reward_deepeyes.reward_func
 # Custom reward_func may return a dict; if so, specify which key corresponds to the actual reward score
 --reward-key score
 ```
+
+Synchronous functions run in process-isolated Ray `RewardWorker` actors. Functions declared with `async def` are
+awaited in the caller process and do not use the worker pool. `--reward-num-workers` sets the synchronous worker
+count, while `--reward-max-concurrency` limits concurrent reward calls in each caller process.
+
+A batched/group custom reward is called once with the complete sample list, and that call counts as one concurrent
+call. Custom functions are loaded lazily and cached until `custom_rm` is explicitly reloaded.
+
+Inputs and return values of synchronous custom rewards must be serializable by Ray.
+
+> **Warning: Set timeouts for external I/O**
+>
+> Cancelling the caller or its Ray task is best-effort. It does **not** guarantee termination of a Python function
+> that is already running in a `RewardWorker`. Every potentially blocking external I/O operation, such as an HTTP,
+> RPC, or database call, must set an explicit timeout. Otherwise, the worker may remain occupied until the function
+> returns, and later reward calls assigned to that worker must wait.
+
+### Format-aware reward routing
+
+Built-in rewards live in a registry (`relax/engine/rewards/registry.py`). Adding one is a single `register_reward` call — no dispatch branch to edit:
+
+```python
+register_reward("my_reward", "my_pkg.my_module:my_reward_fn")  # def my_reward_fn(response, label) -> float
+```
+
+Each sample resolves its reward type as: `metadata["rm_type"]` in the sample > `--rm-type` > label inference (opt-in) > fallback (opt-in). A batch can therefore mix task formats (e.g. math + multiple-choice) by carrying `"metadata": {"rm_type": "..."}` per data row (column name set by `--metadata-key`, default `metadata`).
+
+Two optional flags control degraded samples; their defaults keep today's behavior exactly:
+
+- `--rm-type-fallback`: `zero` scores unknown/missing-type samples `0.0` (reward-key aware) with a warning; a registered reward name routes them there; unset keeps the current error.
+- `--rm-type-infer`: infers the type from the label via conservative registered matchers (strict numeric answer → `math`, `<answer>X</answer>` single letter → `multiple_choice`) when no explicit type exists. When the label disagrees with an explicit type, a conflict warning is logged and the explicit type wins.
+
+Degradation warnings carry the sample index, offending value, and reason; each `(reason, value)` identity is logged once and counted exactly. Notes: `--custom-rm-path` still bypasses routing entirely; rewards returning dicts (e.g. `dapo`) cannot be mixed with scalar rewards in one batch because `--reward-key` is global; runtime `register_reward` calls in the driver are not visible to already-running Ray workers for sync rewards — register at import time (as `registry.py` does) or use `--custom-rm-path`.
 
 ## Custom Generate Function
 
@@ -142,7 +178,6 @@ The function must populate these `sample` fields before returning: `tokens` (ful
 
 ```python
 from relax.engine.rollout.sglang_rollout import GenerateState
-from relax.utils.http_utils import post
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
@@ -151,7 +186,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     sample.tokens, sample.loss_mask, sample.rollout_log_probs, response_tokens = list(prompt_ids), [], [], []
     for turn in range(args.max_turns):
-        output = await post(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
+        # One permit per turn: post_generate acquires/releases it internally; the
+        # permit is not held during env/tool execution.
+        output = await state.post_generate(url, {"input_ids": sample.tokens, "sampling_params": sampling_params, "return_logprob": True})
         new_tokens = [t[1] for t in output["meta_info"]["output_token_logprobs"]]
         new_probs = [t[0] for t in output["meta_info"]["output_token_logprobs"]]
         sample.tokens.extend(new_tokens); response_tokens.extend(new_tokens)                 # model output
@@ -165,9 +202,28 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = len(response_tokens)
     sample.status = Sample.Status.COMPLETED
     return sample
+
+
+# Opt in to per-request permit management (without this flag the function falls
+# back to the session-level lock, i.e. the legacy behavior).
+generate.manages_inference_permit = True
 ```
 
 Specify via launch script (`--custom-generate-function-path examples.deepeyes.rollout.generate`), or per eval dataset via `custom_generate_function_path` in eval config.
+
+### Per-request concurrency scheduling for multi-turn rollout
+
+By default `generate_and_rm` holds one session-level concurrency permit (`GenerateState.semaphore`) for the entire custom `generate` call — a multi-turn rollout keeps the slot even while running env/tool steps, which hurts engine utilization.
+
+To scope concurrency down to a single model request, declare the opt-in flag on your function and issue each turn's request via `state.post_generate`:
+
+- `generate.manages_inference_permit = True`: once declared, the function is **no longer** wrapped in the session-level lock; it acquires a per-request permit itself.
+- `await state.post_generate(url, payload)`: acquire one permit → send the request → release immediately on return. One permit == one in-flight request (including up to 6 internal retries); keep env interaction and observation encoding **outside** `post_generate` so they do not hold a permit.
+- **abort**: if the rollout has already been aborted by the time the permit is acquired, `post_generate` raises `GenerationAborted`. You may catch it to write fine-grained resume metadata; **not catching it will not crash the step** — the framework contains it and marks the sample `ABORTED`.
+
+**Usage contract**: only functions that declare `manages_inference_permit = True` may call `state.post_generate` / `state.inference_permit()`. A function without the flag still runs under the session-level lock; acquiring a permit from there nests an acquire on the **same non-reentrant semaphore** and deadlocks when the concurrency limit is 1 (a runtime guard detects the misuse and raises a clear `RuntimeError` instead of hanging).
+
+**Note**: once the session-level lock is lifted, the number of concurrently *active* sessions is no longer bounded by this semaphore (only in-flight requests are); throttle concurrent env/tool resource usage inside your function if needed.
 
 ## Training Script and Key Parameters
 
@@ -404,6 +460,6 @@ bash scripts/entrypoint/ray-job.sh scripts/training/multimodal/run-qwen35-9B-8xg
 
 ## Getting Help
 
-- [GitHub Issues](https://github.com/redai-infra/Relax/issues)
-- [Discussions](https://github.com/redai-infra/Relax/discussions)
+- [GitHub Issues](https://github.com/redai-studio/Relax/issues)
+- [Discussions](https://github.com/redai-studio/Relax/discussions)
 - [Introduction](../guide/introduction.md)

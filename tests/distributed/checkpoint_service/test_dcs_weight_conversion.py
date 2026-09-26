@@ -31,17 +31,20 @@ pytest.importorskip("megatron.bridge.models.conversion.param_mapping")
 # in megatron-bridge. We alias the new names to the old test-local names so
 # the rest of this file keeps reading naturally; the Qwen3-VL / Qwen3.5
 # variants now resolve to the *same* class object.
-from megatron.bridge.models.conversion.param_mapping import (
-    FusedExpertMapping as ExpertMLPDownProjMapping,
-)
-from megatron.bridge.models.conversion.param_mapping import (
-    FusedGatedExpertMapping as ExpertMLPGateUpProjMapping,
-)
-from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
-    GatedMLPMapping,
-    MegatronParamMapping,
-    ReplicatedMapping,
-)
+try:
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedExpertMapping as ExpertMLPDownProjMapping,
+    )
+    from megatron.bridge.models.conversion.param_mapping import (
+        FusedGatedExpertMapping as ExpertMLPGateUpProjMapping,
+    )
+    from megatron.bridge.models.conversion.param_mapping import (  # noqa: E402
+        GatedMLPMapping,
+        MegatronParamMapping,
+        ReplicatedMapping,
+    )
+except ImportError as _exc:
+    pytest.skip(f"megatron bridge mapping API unavailable: {_exc}", allow_module_level=True)
 
 
 Qwen35ExpertMLPDownProjMapping = ExpertMLPDownProjMapping

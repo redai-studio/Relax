@@ -98,5 +98,3 @@ export RELAX_ENTRYPOINT_MODE="local"
 
 # Runtime env (RUNTIME_ENV_JSON) is intentionally omitted on P800: the NVIDIA
 # NCCL/NVSHMEM-specific tuning vars used on CUDA do not apply here.
-
-echo "=== Local P800 environment ready ==="

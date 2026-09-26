@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from relax.utils.env import Envs
 from relax.utils.external.typer_utils import dataclass_cli
 from relax.utils.misc import exec_command
 
@@ -41,11 +42,17 @@ def convert_checkpoint(
     if multinode:
         # This variable can be provided via:
         # `export SLURM_JOB_HOSTNAMES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")`
-        print(f"{os.environ.get('SLURM_JOB_HOSTNAMES')=} {os.environ.get('SLURM_NODEID')=}")
-        job_hostnames = os.environ["SLURM_JOB_HOSTNAMES"].strip().split("\n")
+        hostnames_raw = Envs.SLURM_JOB_HOSTNAMES
+        node_rank = Envs.SLURM_NODEID
+        print(f"{hostnames_raw=} {node_rank=}")
+        if hostnames_raw is None or node_rank is None:
+            raise RuntimeError(
+                "A multinode launch needs both SLURM_JOB_HOSTNAMES and SLURM_NODEID; export the former with "
+                '`export SLURM_JOB_HOSTNAMES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")`.'
+            )
+        job_hostnames = hostnames_raw.strip().split("\n")
         master_addr = job_hostnames[0]
         nnodes = len(job_hostnames)
-        node_rank = int(os.environ["SLURM_NODEID"])
 
         multinode_args = f"--master-addr {master_addr} --master-port 23456 --nnodes={nnodes} --node-rank {node_rank} "
 
@@ -84,7 +91,7 @@ def fp8_cast_bf16(path_src, path_dst):
 @dataclass
 class ExecuteTrainConfig:
     cuda_core_dump: bool = False
-    num_nodes: int = int(os.environ.get("SLURM_JOB_NUM_NODES", "1"))
+    num_nodes: int = Envs.SLURM_JOB_NUM_NODES
     extra_env_vars: str = ""
 
 
@@ -101,8 +108,8 @@ def execute_train(
         extra_env_vars = {}
     if config is None:
         config = ExecuteTrainConfig()
-    external_ray = get_bool_env_var("SLIME_SCRIPT_EXTERNAL_RAY")
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    external_ray = Envs.SLIME_SCRIPT_EXTERNAL_RAY
+    master_addr = Envs.MASTER_ADDR
 
     exec_command(
         "pkill -9 sglang; "
@@ -156,7 +163,12 @@ def execute_train(
         }
     )
 
-    if get_bool_env_var("SLIME_SCRIPT_ENABLE_RAY_SUBMIT", "1"):
+    # `SLIME_SCRIPT_ENABLE_RAY_SUBMIT=` (set but empty) means off, which is what
+    # the launcher did before the registry existed. The registry reads empty as
+    # unset, and this is the only declared flag whose default is True, so the
+    # raw value has to be consulted to keep the old reading.
+    enable_ray_submit = Envs.SLIME_SCRIPT_ENABLE_RAY_SUBMIT and os.environ.get("SLIME_SCRIPT_ENABLE_RAY_SUBMIT") != ""
+    if enable_ray_submit:
         cmd_megatron_model_source = (
             f'source "{repo_base_dir}/scripts/models/{megatron_model_type}.sh" && '
             if megatron_model_type is not None
@@ -186,7 +198,7 @@ def check_has_nvlink():
 
 
 def get_default_wandb_args(test_file: str, run_name_prefix: str | None = None, run_id: str | None = None):
-    if not os.environ.get("WANDB_API_KEY"):
+    if not Envs.WANDB_API_KEY:
         print("Skip wandb configuration since WANDB_API_KEY is not found")
         return ""
 
@@ -196,13 +208,13 @@ def get_default_wandb_args(test_file: str, run_name_prefix: str | None = None, r
         test_name = f"{test_file.parent.name}_{test_name}"
 
     wandb_run_name = run_id or create_run_id()
-    if (x := os.environ.get("GITHUB_COMMIT_NAME")) is not None:
+    if x := Envs.GITHUB_COMMIT_NAME:
         wandb_run_name += f"_{x}"
     if (x := run_name_prefix) is not None:
         wandb_run_name = f"{x}_{wandb_run_name}"
 
     # Use the actual key value from environment to avoid shell expansion issues
-    wandb_key = os.environ.get("WANDB_API_KEY")
+    wandb_key = Envs.WANDB_API_KEY
     return (
         "--use-wandb "
         f"--wandb-project slime-{test_name} "
@@ -216,27 +228,8 @@ def create_run_id() -> str:
     return datetime.datetime.utcnow().strftime("%y%m%d-%H%M%S") + f"-{random.Random().randint(0, 999):03d}"
 
 
-_warned_bool_env_var_keys = set()
-
-
-# copied from SGLang
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            print(f"get_bool_env_var({name}) see non-understandable value={value} and treat as false")
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
 def get_env_enable_infinite_run():
-    return get_bool_env_var("SLIME_TEST_ENABLE_INFINITE_RUN", "false")
+    return Envs.SLIME_TEST_ENABLE_INFINITE_RUN
 
 
 def save_to_temp_file(text: str, ext: str):

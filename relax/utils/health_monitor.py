@@ -3,6 +3,7 @@
 import threading
 
 import ray
+from ray.exceptions import RayActorError
 
 from relax.utils.logging_utils import get_logger
 
@@ -110,7 +111,6 @@ class RolloutHealthMonitor:
             return
         logger.info("Resuming health monitor...")
         self._need_first_wait = True  # Need to wait after each resume
-        self._consecutive_failures.clear()  # Reset failure counts on resume
         self._pause_event.clear()
         self._is_checking_enabled = True
 
@@ -172,7 +172,19 @@ class RolloutHealthMonitor:
 
         try:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
+        except RayActorError as e:
+            # Hard death: the whole rollout actor (or its node) is gone. The
+            # consecutive-failure counter can never recover from this, so bypass
+            # it and kill/rebuild immediately.
+            logger.error(
+                f"Health check failed for rollout engine {rollout_engine_id} "
+                f"(actor is dead). Killing actor immediately. Exception: {e}"
+            )
+            self._kill_engine(rollout_engine_id=rollout_engine_id)
         except Exception as e:
+            # Soft failure: the actor is alive but the sglang subprocess is
+            # unreachable (RayTaskError wrapping ConnectionError/Timeout, etc.).
+            # Accumulate across resume windows until the threshold is hit.
             self._consecutive_failures[rollout_engine_id] = self._consecutive_failures.get(rollout_engine_id, 0) + 1
             failure_count = self._consecutive_failures[rollout_engine_id]
             if failure_count >= self._max_consecutive_failures:
@@ -189,6 +201,9 @@ class RolloutHealthMonitor:
                     f"will retry). Exception: {e}"
                 )
         else:
+            # Only a successful check clears the counter. This keeps "consecutive"
+            # literal (a single success rescues an intermittently slow engine) and
+            # prevents overload false-kills now that resume() no longer resets it.
             if self._consecutive_failures.get(rollout_engine_id, 0) > 0:
                 logger.info(
                     f"Health check recovered for rollout engine {rollout_engine_id} "
@@ -219,3 +234,6 @@ class RolloutHealthMonitor:
             else:
                 logger.info(f"Engine at index {i} is already None")
             self._engine_group.all_engines[i] = None
+        # Drop any stale failure count so a rebuilt engine reusing this slot
+        # starts from a clean slate instead of inheriting a near-threshold count.
+        self._consecutive_failures.pop(rollout_engine_id, None)

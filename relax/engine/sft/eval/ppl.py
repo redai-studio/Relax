@@ -33,6 +33,8 @@ def compute_sft_eval_step(
     max_seq_lens=None,
     padded_total_lengths=None,
     loss_masks=None,
+    dynamic_cp_size=None,
+    dynamic_cp_rank=None,
     **_,
 ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
     """Per-microbatch callback: returns ``(loss_placeholder, dict)`` where the
@@ -59,6 +61,8 @@ def compute_sft_eval_step(
         with_entropy=False,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
     )
     log_probs_flat = torch.cat(lp["log_probs"], dim=0)
 
@@ -70,6 +74,8 @@ def compute_sft_eval_step(
         qkv_format=args.qkv_format,
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
+        dynamic_cp_size=dynamic_cp_size,
+        dynamic_cp_rank=dynamic_cp_rank,
     )
     sum_neg_lp = -sum_of_token(log_probs_flat).detach()
     # Count tokens on the *chunked* mask (via sum_of_token with x=1) so that

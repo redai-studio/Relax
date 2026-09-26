@@ -6,7 +6,7 @@ Input format (per line):
     {
       "tools": "<json-string of tool definitions>",
       "messages": [
-        {"role": "system" | "user" | "assistant" | "tool_call" | "tool_response", "content": str},
+        {"role": "system" | "user" | "assistant" | "tool_call" | "tool" | "tool_response", "content": str},
         ...
       ],
       ...other meta fields preserved as-is
@@ -27,7 +27,7 @@ Rules:
     ``{"name", "arguments"}``) and appended to the ``tool_calls`` list of
     the most recently emitted ``assistant`` message. If no assistant exists
     yet, an empty assistant turn is inserted to hold the call.
-  * ``tool_response`` is renamed to ``tool``; content kept as-is.
+  * ``tool`` passes through; ``tool_response`` is renamed to ``tool``; content kept as-is.
   * ``system`` / ``user`` / ``assistant`` pass through unchanged.
 
 Usage:
@@ -55,7 +55,7 @@ def convert_messages(raw_messages: list[dict]) -> list[dict]:
         content = msg["content"]
         if role in ("system", "user", "assistant"):
             out.append({"role": role, "content": content})
-        elif role == "tool_response":
+        elif role in ("tool", "tool_response"):
             out.append({"role": "tool", "content": content})
         elif role == "tool_call":
             call = _parse_tool_call(content)

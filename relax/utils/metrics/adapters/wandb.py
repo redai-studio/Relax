@@ -5,6 +5,7 @@ from copy import deepcopy
 
 import wandb
 
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 
 
@@ -19,7 +20,7 @@ def _is_offline_mode(args) -> bool:
     """
     if args.wandb_mode:
         return args.wandb_mode == "offline"
-    return os.environ.get("WANDB_MODE") == "offline"
+    return Envs.WANDB_MODE == "offline"
 
 
 def init_wandb_primary(args):
@@ -85,11 +86,13 @@ def init_wandb_primary(args):
 def _compute_config_for_logging(args):
     output = deepcopy(args.__dict__)
 
-    whitelist_env_vars = [
-        "SLURM_JOB_ID",
-        # We may insert more default values here, and may also allow users to configure a whitelist
-    ]
-    output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
+    # Add more Envs bindings here as needed. Unset variables are dropped so
+    # the logged config only carries values that were actually present, matching
+    # the previous `os.environ`-filtering behaviour.
+    whitelist_env_vars = {
+        "SLURM_JOB_ID": Envs.SLURM_JOB_ID,
+    }
+    output["env_vars"] = {k: v for k, v in whitelist_env_vars.items() if v is not None}
 
     return output
 

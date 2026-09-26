@@ -1,0 +1,106 @@
+diff --git a/evaluation/benchmarks/swe_bench/run_infer.py b/evaluation/benchmarks/swe_bench/run_infer.py
+index 485d2c831..ace42c99a 100644
+--- a/evaluation/benchmarks/swe_bench/run_infer.py
++++ b/evaluation/benchmarks/swe_bench/run_infer.py
+@@ -823,6 +823,7 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+ 
+         # Detach so the current branch can be moved safely.
+         'git checkout --detach "$BASE" && '
++        'git tag -f swebench_baseline "$BASE" && '
+ 
+         'echo && '
+         'echo "Resetting local branches that are descendants of base..." && '
+@@ -914,7 +915,8 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+             extra={'msg_type': 'ACTION'},
+         )
+         nuclear_reset_cmd = (
+-            f'BASE=$(git rev-parse --verify {base_commit}^{{commit}}) && '
++            'BASE=$(git rev-parse --verify refs/tags/swebench_baseline^{commit} '
++            f'2>/dev/null || git rev-parse --verify {base_commit}^{{commit}}) && '
+             'ORIG_BRANCH=$(git symbolic-ref --short -q HEAD || echo main) && '
+             'echo "Base commit: $BASE, restoring branch: $ORIG_BRANCH" && '
+ 
+@@ -932,6 +934,9 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+             'git for-each-ref --format="delete %(refname)" refs/heads '
+             '| git update-ref --stdin && '
+ 
++            # Keep BASE reachable if cleanup below prunes unreachable objects.
++            'git tag -f swebench_baseline "$BASE" && '
++
+             # Strip transient operation refs.
+             'git_dir=$(git rev-parse --git-dir) && '
+             'rm -f "$git_dir"/FETCH_HEAD "$git_dir"/ORIG_HEAD '
+@@ -1512,7 +1517,11 @@ def complete_runtime(
+         else:
+             assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
+ 
+-    assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
++    assert_and_raise(
++        git_patch is not None,
++        f'Failed to get git diff against {diff_base_ref}: '
++        f'last observation={obs!r}',
++    )
+ 
+     # Remove binary diffs from the patch
+     git_patch = remove_binary_diffs(git_patch)
+@@ -1658,8 +1667,11 @@ def process_instance(
+         # Check if we have replay data for this instance
+         replay_events = None
+         if instance.instance_id in REPLAY_DATA:
+-            replay_events, replay_initial_action = REPLAY_DATA[instance.instance_id]
+-            message_action = replay_initial_action
++            stored_replay_events, stored_initial_action = REPLAY_DATA[
++                instance.instance_id
++            ]
++            replay_events = copy.deepcopy(stored_replay_events)
++            message_action = copy.deepcopy(stored_initial_action)
+             logger.info(
+                 f'Replay mode: replaying {len(replay_events)} events for {instance.instance_id}'
+             )
+@@ -1692,7 +1704,17 @@ def process_instance(
+             )
+         else:
+             complete_runtime_fn = complete_runtime
+-        return_val = complete_runtime_fn(runtime, instance)
++        if state.last_error:
++            # Agent-side error (e.g. context_length_exceeded) usually leaves
++            # the sandbox tmux pane mid-command; running complete_runtime
++            # would block on 600s hard_timeouts in the recovery ladder.
++            logger.warning(
++                f'Skipping complete_runtime for {instance.instance_id} '
++                f'due to agent error: {state.last_error!r}'
++            )
++            return_val = {'git_patch': ''}
++        else:
++            return_val = complete_runtime_fn(runtime, instance)
+         git_patch = return_val['git_patch']
+         logger.info(
+             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
+diff --git a/openhands/memory/conversation_memory.py b/openhands/memory/conversation_memory.py
+--- a/openhands/memory/conversation_memory.py
++++ b/openhands/memory/conversation_memory.py
+@@ -16,9 +16,11 @@
+     CmdRunAction,
+     FileEditAction,
+     FileReadAction,
++    FunctionCallNotExistsAction,
+     IPythonRunCellAction,
+     MessageAction,
+     TaskTrackingAction,
++    ValidationFailureAction,
+ )
+ from openhands.events.action.mcp import MCPAction
+ from openhands.events.action.opencode import (
+@@ -259,10 +261,12 @@
+                 IPythonRunCellAction,
+                 FileEditAction,
+                 FileReadAction,
++                FunctionCallNotExistsAction,
+                 BrowseInteractiveAction,
+                 BrowseURLAction,
+                 MCPAction,
+                 TaskTrackingAction,
++                ValidationFailureAction,
+                 # OpenCode-style actions
+                 GlobAction,
+                 GrepAction,

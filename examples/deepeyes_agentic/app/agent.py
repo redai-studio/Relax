@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
 import yaml
 from app.env_deepeyes import DeepeyesToolEnv, load_initial_image
 from openai import APIStatusError, AsyncOpenAI
@@ -38,7 +37,7 @@ async def run_deepeyes(messages: list[dict[str, Any]]) -> dict[str, Any]:
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_BASE_URL"],
-        timeout=httpx.Timeout(timeout=900.0, connect=30.0),
+        timeout=9999,
     )
     stop_reason = "max_turns"
     env_infos: list[dict[str, Any]] = []

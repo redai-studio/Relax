@@ -1,0 +1,73 @@
+# Qwen-Image T2I LoRA (FlowGRPO + PickScore). Reference YAML; the canonical
+# launch path is scripts/training/diffusion/run-qwen-image-t2i-lora-8xgpu.sh.
+# Layers on common/lora.yaml.
+#
+# Differs from t2i_full.yaml in the LoRA block (plus fp32 optimizer masters), a
+# ~10x larger learning rate (adapters need it; 1e-5 barely moves a rank-64
+# adapter), and a larger n_samples_per_prompt, which is what the freed optimizer
+# memory is for. See docs/{en,zh}/guide/diffusion-generative-rl.md.
+generation_task: t2i
+model_path: ${MODEL_DIR}/Qwen-Image
+model_revision: null
+model_adapter_path: relax.models.qwen_image.adapter.QwenImageAdapter
+
+input_key: prompt
+# Produced by examples/diffusion/curate_data.py --prefix pickapic_ (see README).
+prompt_data: ${DATA_DIR}/processed/t2i/pickapic_train.jsonl
+artifact_root: ${ARTIFACT_ROOT}/t2i_lora
+multimodal_keys: null
+
+resource:
+  actor: [1, 8]
+  rollout: [1, 8]
+
+rollout_num_gpus_per_engine: 1
+rollout_batch_size: 48
+n_samples_per_prompt: 24
+global_batch_size: 1152
+micro_batch_size: 1
+# Group std matches canonical Relax/Text GRPO semantics. Use `batch` for the
+# reference diffusion LoRA recipe's global std, or `none` for Dr.GRPO.
+generative_advantage_std_mode: group
+
+sampling:
+  height: 384
+  width: 384
+  num_inference_steps: 12
+  guidance_scale: 1.0
+  eta: 0.7
+  num_sde_steps: 3
+  # See t2i_full.yaml for the full rationale: step 0 has sigma == 1, where the
+  # SDE coefficient sqrt(sigma / (1 - sigma)) is singular and the replayed
+  # Gaussian no longer matches the sampler's, so it is excluded from both the
+  # explicit indices and the per-rollout pool. Preflight rejects a trained
+  # step 0, and sde_timestep_fraction [0.0, 0.5] would resolve to [0, 2, 4].
+  sde_indices: [1, 3, 5]
+  sde_resample_per_rollout: true
+  sde_pool: [1, 2, 3, 4, 5]
+
+training:
+  trainable_mode: lora
+  trainable_attr: transformer
+  param_dtype: bf16
+  master_dtype: fp32
+  activation_checkpointing: true
+  lr: 3.0e-4
+  lora_rank: 64
+  lora_alpha: 128
+  lora_dropout: 0.0
+  # Unset -> QwenImageAdapter.lora_target_modules (the eight attention projections).
+  # lora_target_modules: [attn.to_q, attn.to_k, attn.to_v, attn.to_out.0]
+  lora_merge_mode: false
+  lora_adapter_mode: true
+
+reward:
+  runtime: colocate
+  scorer_path: relax.engine.rewards.pickscore.PickScoreScorer
+  required_components: [pickscore]
+  component_weights: {pickscore: 1.0}
+
+weight_sync:
+  mode: adapter
+  wire_dtype: bf16
+  bucket_size_mb: 512

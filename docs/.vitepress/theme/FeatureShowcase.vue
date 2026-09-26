@@ -131,13 +131,7 @@ function switchTab(index: number) {
   tabs[currentIndex]?.classList.add('active')
   panels[currentIndex]?.classList.add('active')
 
-  // Re-trigger CSS animation for panel 3
-  const container = displayContainerRef.value
-  if (container) {
-    container.classList.remove('panel-active-anim')
-    void container.offsetWidth
-    container.classList.add('panel-active-anim')
-  }
+  restartPanelAnimation()
 
   // Progress bar
   startProgressBar(tabs[currentIndex])
@@ -246,11 +240,23 @@ function setPanelRef(el: any, index: number) {
   if (el) panelRefs.value[index] = el
 }
 
-// --- Panel 1: code tab switching (environment / agent loop / reward) ---
-const codeTab = ref<'environment' | 'agentloop' | 'reward'>('environment')
+function restartPanelAnimation() {
+  const container = displayContainerRef.value
+  if (!container) return
+  container.classList.remove('panel-active-anim')
+  void container.offsetWidth
+  container.classList.add('panel-active-anim')
+}
 
-function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
-  codeTab.value = tab
+// --- Panel 1: current Agentic rollout integration path ---
+const agenticTab = ref<'apps' | 'contexts' | 'request'>('apps')
+
+function switchAgenticTab(tab: 'apps' | 'contexts' | 'request') {
+  agenticTab.value = tab
+  nextTick(() => {
+    restartPanelAnimation()
+    displayContainerRef.value?.style.setProperty('--panel-play-state', 'running')
+  })
 }
 </script>
 
@@ -311,9 +317,9 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
               <div class="progress-container"><div class="progress-bar-fill" /></div>
               <div class="feature-header">
                 <div class="step-number">3</div>
-                <h3 class="feature-title">Agentic RL Training</h3>
+                <h3 class="feature-title">Agentic Rollout</h3>
               </div>
-              <p class="feature-desc">Define environments and reward functions as simple Python classes. Relax orchestrates multi-turn agent interactions with tool use, vision, and custom scoring — all natively integrated into the training loop.</p>
+              <p class="feature-desc">Connect an existing agent app through Chat Completions. Relax manages the process, records multi-turn contexts, and sends selected contexts to training.</p>
             </div>
 
             <!-- Tab 4: Elastic Rollout -->
@@ -346,85 +352,203 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
             <span class="window-title">Relax Framework</span>
           </div>
 
-          <!-- Panel 3: Agentic Code with bottom tab buttons -->
+          <!-- Panel 3: Agentic visual showcase -->
           <div class="display-panel" :ref="(el) => setPanelRef(el, 2)" id="showcase-panel-1">
-            <div class="code-file-tab">
-              <span class="code-file-icon">&#x1F40D;</span>
-              <span class="code-file-name">{{ codeTab === 'environment' ? 'custom_env.py' : codeTab === 'agentloop' ? 'agent_loop.py' : 'reward_fn.py' }}</span>
+            <div class="agentic-visual-stage">
+              <!-- Existing agent applications remain outside Relax. -->
+              <div v-show="agenticTab === 'apps'" class="agentic-visual agentic-apps-view">
+                <svg viewBox="0 0 600 420" role="img" aria-labelledby="agent-apps-title agent-apps-desc">
+                  <title id="agent-apps-title">Existing agent applications connect to Relax</title>
+                  <desc id="agent-apps-desc">Search, coding, and multimodal agent applications remain separate from Relax and call one Chat Completions endpoint, which records SessionForest state and sends selected contexts to training.</desc>
+                  <defs>
+                    <marker id="agent-app-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7da2ff" />
+                    </marker>
+                  </defs>
+
+                  <path class="agent-app-flow" d="M208 118 H376" marker-end="url(#agent-app-arrow)" />
+                  <path class="agent-app-flow" d="M208 208 H280 Q288 208 288 200 V134 Q288 126 296 126 H376" marker-end="url(#agent-app-arrow)" />
+                  <path class="agent-app-flow" d="M208 298 H304 Q312 298 312 290 V150 Q312 142 320 142 H376" marker-end="url(#agent-app-arrow)" />
+                  <path class="agent-app-internal-flow" d="M460 160 V188" marker-end="url(#agent-app-arrow)" />
+                  <path class="agent-app-internal-flow" d="M460 244 V284" marker-end="url(#agent-app-arrow)" />
+
+                  <path class="agent-app-flow-active agent-app-flow-active-1" d="M208 118 H376" aria-hidden="true" />
+                  <path class="agent-app-flow-active agent-app-flow-active-2" d="M208 208 H280 Q288 208 288 200 V134 Q288 126 296 126 H376" aria-hidden="true" />
+                  <path class="agent-app-flow-active agent-app-flow-active-3" d="M208 298 H304 Q312 298 312 290 V150 Q312 142 320 142 H376" aria-hidden="true" />
+                  <path class="agent-app-internal-active agent-app-flow-active-4" d="M460 160 V188" aria-hidden="true" />
+                  <path class="agent-app-internal-active agent-app-flow-active-5" d="M460 244 V284" aria-hidden="true" />
+
+                  <rect class="agent-app-zone" x="24" y="44" width="220" height="320" rx="10" />
+                  <text class="agent-app-zone-label" x="44" y="72">EXISTING AGENT APPS</text>
+
+                  <rect class="agent-app-zone agent-app-relax-zone" x="344" y="44" width="232" height="320" rx="10" />
+                  <text class="agent-app-zone-label" x="364" y="72">RELAX</text>
+
+                  <rect class="agent-app-node" x="56" y="90" width="152" height="56" rx="8" />
+                  <text class="agent-app-node-title" x="132" y="116" text-anchor="middle">Search Agent</text>
+                  <text class="agent-app-node-sub" x="132" y="134" text-anchor="middle">existing application</text>
+
+                  <rect class="agent-app-node" x="56" y="180" width="152" height="56" rx="8" />
+                  <text class="agent-app-node-title" x="132" y="206" text-anchor="middle">Coding Agent</text>
+                  <text class="agent-app-node-sub" x="132" y="224" text-anchor="middle">existing application</text>
+
+                  <rect class="agent-app-node" x="56" y="270" width="152" height="56" rx="8" />
+                  <text class="agent-app-node-title" x="132" y="296" text-anchor="middle">Multimodal Agent</text>
+                  <text class="agent-app-node-sub" x="132" y="314" text-anchor="middle">existing application</text>
+
+                  <rect class="agent-app-node agent-app-api-node" x="376" y="96" width="168" height="64" rx="8" />
+                  <text class="agent-app-node-title" x="460" y="124" text-anchor="middle">Chat Completions</text>
+                  <text class="agent-app-node-sub" x="460" y="144" text-anchor="middle">one Relax endpoint</text>
+
+                  <rect class="agent-app-node agent-app-state-node" x="376" y="188" width="168" height="56" rx="8" />
+                  <text class="agent-app-node-title" x="460" y="214" text-anchor="middle">SessionForest</text>
+                  <text class="agent-app-node-sub" x="460" y="232" text-anchor="middle">committed contexts</text>
+
+                  <rect class="agent-app-node agent-app-train-node" x="376" y="284" width="168" height="56" rx="8" />
+                  <text class="agent-app-node-title" x="460" y="310" text-anchor="middle">Training</text>
+                  <text class="agent-app-node-sub" x="460" y="328" text-anchor="middle">selected contexts</text>
+
+                  <text class="agent-app-callout" x="300" y="400" text-anchor="middle">Change the endpoint · keep the agent app</text>
+                </svg>
+              </div>
+
+              <!-- SessionForest branches become selected training contexts. -->
+              <div v-show="agenticTab === 'contexts'" class="agentic-visual agentic-contexts-view">
+                <svg viewBox="0 0 600 420" role="img" aria-labelledby="agent-contexts-title agent-contexts-desc">
+                  <title id="agent-contexts-title">Select training contexts from SessionForest</title>
+                  <desc id="agent-contexts-desc">A SessionForest contains main, searcher, and alternative branches. Main and searcher are selected and sent to training while the alternative branch remains omitted.</desc>
+                  <defs>
+                    <marker id="context-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7da2ff" />
+                    </marker>
+                  </defs>
+
+                  <path class="context-tree-edge" d="M144 210 H164 Q172 210 172 202 V112 Q172 104 180 104 H208" />
+                  <path class="context-tree-edge" d="M144 210 H208" />
+                  <path class="context-tree-edge" d="M144 210 H164 Q172 210 172 218 V304 Q172 312 180 312 H208" />
+                  <path class="context-export-edge" d="M352 104 H444" marker-end="url(#context-arrow)" />
+                  <path class="context-export-edge" d="M352 210 H396 Q404 210 404 218 V244 Q404 252 412 252 H444" marker-end="url(#context-arrow)" />
+
+                  <path class="context-export-active context-export-active-1" d="M352 104 H444" aria-hidden="true" />
+                  <path class="context-export-active context-export-active-2" d="M352 210 H396 Q404 210 404 218 V244 Q404 252 412 252 H444" aria-hidden="true" />
+
+                  <rect class="context-zone" x="24" y="40" width="360" height="332" rx="10" />
+                  <text class="context-zone-label" x="44" y="68">SESSIONFOREST</text>
+                  <rect class="context-zone context-training-zone" x="420" y="40" width="156" height="332" rx="10" />
+                  <text class="context-zone-label" x="440" y="68">TRAINING CONTEXTS</text>
+
+                  <rect class="context-node context-root-node" x="48" y="182" width="96" height="56" rx="8" />
+                  <text class="context-node-title" x="96" y="208" text-anchor="middle">Session</text>
+                  <text class="context-node-sub" x="96" y="226" text-anchor="middle">one process</text>
+
+                  <rect class="context-node context-selected-node context-main-node" x="208" y="76" width="144" height="56" rx="8" />
+                  <text class="context-node-title" x="280" y="102" text-anchor="middle">main</text>
+                  <text class="context-node-sub" x="280" y="120" text-anchor="middle">selected</text>
+
+                  <rect class="context-node context-selected-node context-searcher-node" x="208" y="182" width="144" height="56" rx="8" />
+                  <text class="context-node-title" x="280" y="208" text-anchor="middle">searcher_0</text>
+                  <text class="context-node-sub" x="280" y="226" text-anchor="middle">selected</text>
+
+                  <rect class="context-node context-omitted-node" x="208" y="284" width="144" height="56" rx="8" />
+                  <text class="context-node-title" x="280" y="310" text-anchor="middle">alternative</text>
+                  <text class="context-node-sub" x="280" y="328" text-anchor="middle">omitted</text>
+
+                  <rect class="context-tray-slot context-tray-main" x="444" y="84" width="108" height="72" rx="8" />
+                  <text class="context-node-title" x="498" y="114" text-anchor="middle">main</text>
+                  <text class="context-credit" x="498" y="138" text-anchor="middle">credit 1.0</text>
+
+                  <rect class="context-tray-slot context-tray-searcher" x="444" y="216" width="108" height="72" rx="8" />
+                  <text class="context-node-title" x="498" y="246" text-anchor="middle">searcher_0</text>
+                  <text class="context-credit" x="498" y="270" text-anchor="middle">credit 0.6</text>
+
+                  <text class="agent-app-callout" x="300" y="400" text-anchor="middle">Export selected contexts · omit the rest</text>
+                </svg>
+              </div>
+
+              <!-- The Agent App sees one request and one response. -->
+              <div v-show="agenticTab === 'request'" class="agentic-visual agentic-request-view">
+                <svg viewBox="0 0 600 420" role="img" aria-labelledby="agent-request-title agent-request-desc">
+                  <title id="agent-request-title">Agentic requests with and without a rollout step interruption</title>
+                  <desc id="agent-request-desc">Without a rollout step interruption, an Agent App request passes through Relax to SGLang. In partial rollout or fully async mode, a step close makes Relax hold the request; the next step open resumes it toward SGLang. The close, hold, and resume remain invisible to the Agent App. Both responses return through Relax.</desc>
+                  <defs>
+                    <marker id="request-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7da2ff" />
+                    </marker>
+                    <marker id="response-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="#e8384a" />
+                    </marker>
+                  </defs>
+
+                  <!-- Scenario 1: forward in the current rollout step. -->
+                  <rect class="request-scenario request-scenario-now" x="28" y="44" width="544" height="146" rx="10" />
+                  <text class="request-scenario-title" x="50" y="72">NO INTERRUPTION</text>
+                  <text class="request-scenario-sub" x="50" y="90">request continues in the current rollout step</text>
+
+                  <rect class="request-node request-agent-node" x="64" y="110" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="118" y="134" text-anchor="middle">Agent App</text>
+                  <text class="request-node-sub" x="118" y="151" text-anchor="middle">waiting</text>
+                  <rect class="request-node request-relax-node" x="246" y="110" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="300" y="142" text-anchor="middle">Relax</text>
+                  <rect class="request-node request-sglang-node" x="428" y="110" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="482" y="134" text-anchor="middle">SGLang</text>
+                  <text class="request-node-sub" x="482" y="151" text-anchor="middle">generate</text>
+
+                  <path class="request-flow" d="M172 126 H246" marker-end="url(#request-arrow)" />
+                  <path class="request-flow" d="M354 126 H428" marker-end="url(#request-arrow)" />
+                  <path class="request-response-flow" d="M428 148 H354" marker-end="url(#response-arrow)" />
+                  <path class="request-response-flow" d="M246 148 H172" marker-end="url(#response-arrow)" />
+                  <text class="request-path-label" x="187" y="118">REQUEST</text>
+                  <text class="request-path-label request-response-label" x="187" y="166">RESPONSE</text>
+
+                  <!-- Scenario 2: hold and continue in a later rollout step. -->
+                  <rect class="request-scenario request-scenario-later" x="28" y="208" width="544" height="166" rx="10" />
+                  <text class="request-scenario-title" x="50" y="236">STEP CLOSE → STEP OPEN</text>
+                  <text class="request-scenario-sub" x="50" y="254">partial rollout · fully async</text>
+
+                  <rect class="request-node request-agent-node" x="64" y="278" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="118" y="302" text-anchor="middle">Agent App</text>
+                  <text class="request-node-sub" x="118" y="319" text-anchor="middle">still waiting</text>
+                  <rect class="request-node request-relax-node" x="244" y="278" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="298" y="310" text-anchor="middle">Relax</text>
+                  <rect class="request-hold-chip" x="370" y="282" width="44" height="24" rx="12" />
+                  <text class="request-state-static" x="392" y="298" text-anchor="middle">HOLD→RESUME</text>
+                  <text class="request-state-active request-hold-label" x="392" y="298" text-anchor="middle" aria-hidden="true">HOLD</text>
+                  <text class="request-state-active request-resume-label" x="392" y="298" text-anchor="middle" aria-hidden="true">RESUME</text>
+                  <text class="request-event-static" x="422" y="270" text-anchor="middle">STEP CLOSE → STEP OPEN</text>
+                  <text class="request-event-active request-event-close" x="422" y="270" text-anchor="middle" aria-hidden="true">STEP CLOSE</text>
+                  <text class="request-event-active request-event-open" x="422" y="270" text-anchor="middle" aria-hidden="true">STEP OPEN</text>
+                  <rect class="request-node request-sglang-node" x="448" y="278" width="108" height="52" rx="8" />
+                  <text class="request-node-title" x="502" y="302" text-anchor="middle">SGLang</text>
+                  <text class="request-node-sub" x="502" y="319" text-anchor="middle">generate</text>
+
+                  <path class="request-flow" d="M172 294 H244" marker-end="url(#request-arrow)" />
+                  <path class="request-flow" d="M352 294 H370" marker-end="url(#request-arrow)" />
+                  <path class="request-flow" d="M414 294 H448" marker-end="url(#request-arrow)" />
+                  <path class="request-response-flow" d="M448 322 H352" marker-end="url(#response-arrow)" />
+                  <path class="request-response-flow" d="M244 322 H172" marker-end="url(#response-arrow)" />
+                  <text class="request-path-label" x="181" y="286">REQUEST</text>
+                  <text class="request-path-label request-response-label" x="181" y="340">RESPONSE</text>
+
+                  <!-- Decorative motion overlays; static meaning remains complete. -->
+                  <path class="request-flow-active request-active-now-agent" d="M172 126 H246" marker-end="url(#request-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-now-engine" d="M354 126 H428" marker-end="url(#request-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-now-return-engine" d="M428 148 H354" marker-end="url(#response-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-now-return-agent" d="M246 148 H172" marker-end="url(#response-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-later-agent" d="M172 294 H244" marker-end="url(#request-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-later-hold" d="M352 294 H370" marker-end="url(#request-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-later-out" d="M414 294 H448" marker-end="url(#request-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-later-return-engine" d="M448 322 H352" marker-end="url(#response-arrow)" aria-hidden="true" />
+                  <path class="request-flow-active request-active-later-return-agent" d="M244 322 H172" marker-end="url(#response-arrow)" aria-hidden="true" />
+
+                  <text class="agent-app-callout" x="300" y="402" text-anchor="middle">The Agent App always sees one request and one response</text>
+                </svg>
+              </div>
             </div>
-            <div class="code-scroll">
-              <!-- environment code -->
-              <table v-show="codeTab === 'environment'" class="code-table"><tbody>
-                <tr class="code-line"><td class="line-num">1</td><td class="line-code"><span class="ck">class</span> <span class="cc">CustomAgentEnv</span>(<span class="cc">BaseInteractionEnv</span>):</td></tr>
-                <tr class="code-line"><td class="line-num">2</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">def</span> <span class="cf">reset</span>(<span class="cp">self</span>):</td></tr>
-                <tr class="code-line"><td class="line-num">3</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cp">self</span>.turn, <span class="cp">self</span>.memory, <span class="cp">self</span>.trajectory = <span class="cn">0</span>, [], []</td></tr>
-                <tr class="code-line"><td class="line-num">4</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">5</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">def</span> <span class="cf">step</span>(<span class="cp">self</span>, <span class="cp">response</span>):</td></tr>
-                <tr class="code-line"><td class="line-num">6</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">if</span> <span class="cf">has_answer</span>(response):</td></tr>
-                <tr class="code-line"><td class="line-num">7</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> <span class="cf">obs</span>(<span class="cs">"done"</span>), <span class="cn">0.0</span>, <span class="cn">True</span>, <span class="cn">False</span>, {<span class="cs">"answer"</span>: <span class="cf">extract</span>(response)}</td></tr>
-                <tr class="code-line"><td class="line-num">8</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">9</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tool_call = <span class="cf">parse</span>(response)</td></tr>
-                <tr class="code-line"><td class="line-num">10</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">if</span> tool_call <span class="ck">is</span> <span class="cn">None</span>:</td></tr>
-                <tr class="code-line"><td class="line-num">11</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> <span class="cf">obs</span>(<span class="cs">"invalid"</span>), <span class="cn">-0.1</span>, <span class="cn">True</span>, <span class="cn">False</span>, {<span class="cs">"error"</span>: <span class="cn">True</span>}</td></tr>
-                <tr class="code-line"><td class="line-num">12</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">13</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;result = <span class="ck">await</span> tools[tool_call.name].<span class="cf">execute</span>(tool_call.args)</td></tr>
-                <tr class="code-line"><td class="line-num">14</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cp">self</span>.memory.<span class="cf">append</span>({<span class="cs">"action"</span>: tool_call, <span class="cs">"obs"</span>: result})</td></tr>
-                <tr class="code-line"><td class="line-num">15</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cp">self</span>.trajectory.<span class="cf">append</span>({tool_call, result, <span class="cp">self</span>.turn})</td></tr>
-                <tr class="code-line"><td class="line-num">16</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">if</span> <span class="cf">should_stop</span>(<span class="cp">self</span>.memory):</td></tr>
-                <tr class="code-line"><td class="line-num">17</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> <span class="cf">obs</span>(result), <span class="cn">0.0</span>, <span class="cn">True</span>, <span class="cn">False</span>, {<span class="cs">"stop"</span>: <span class="cn">True</span>}</td></tr>
-                <tr class="code-line"><td class="line-num">18</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">19</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cp">self</span>.turn += <span class="cn">1</span></td></tr>
-                <tr class="code-line"><td class="line-num">20</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;truncated = (<span class="cp">self</span>.turn >= <span class="cp">self</span>.max_turns)</td></tr>
-                <tr class="code-line"><td class="line-num">21</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> <span class="cf">obs</span>(result), <span class="cn">0.0</span>, <span class="cn">False</span>, truncated, {<span class="cs">"turn"</span>: <span class="cp">self</span>.turn}</td></tr>
-              </tbody></table>
-              <!-- agent loop code -->
-              <table v-show="codeTab === 'agentloop'" class="code-table"><tbody>
-                <tr class="code-line"><td class="line-num">1</td><td class="line-code"><span class="cm"># --custom-generate-function-path your_module.generate</span></td></tr>
-                <tr class="code-line"><td class="line-num">2</td><td class="line-code"><span class="ck">async def</span> <span class="cf">generate</span>(<span class="cp">args</span>, <span class="cp">sample</span>: <span class="cc">Sample</span>, <span class="cp">sampling_params</span>) -> <span class="cc">Sample</span>:</td></tr>
-                <tr class="code-line"><td class="line-num">3</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;env = <span class="cf">build_env</span>(sample, args);&nbsp;&nbsp;env.<span class="cf">reset</span>()</td></tr>
-                <tr class="code-line"><td class="line-num">4</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;tokens = sample.tokens</td></tr>
-                <tr class="code-line"><td class="line-num">5</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;loss_mask, log_probs, rewards = [], [], []</td></tr>
-                <tr class="code-line"><td class="line-num">6</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">7</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">for</span> turn <span class="ck">in</span> <span class="cf">range</span>(max_turns):</td></tr>
-                <tr class="code-line"><td class="line-num">8</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;out = <span class="ck">await</span> engine.<span class="cf">generate</span>(tokens)</td></tr>
-                <tr class="code-line"><td class="line-num">9</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tokens += out.ids;&nbsp;&nbsp;loss_mask += [<span class="cn">1</span>] * <span class="cf">len</span>(out.ids)</td></tr>
-                <tr class="code-line"><td class="line-num">10</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log_probs += out.log_probs</td></tr>
-                <tr class="code-line"><td class="line-num">11</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">12</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;obs, reward, terminated, truncated, info = env.<span class="cf">step</span>(out.text)</td></tr>
-                <tr class="code-line"><td class="line-num">13</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;rewards.<span class="cf">append</span>(reward)</td></tr>
-                <tr class="code-line"><td class="line-num">14</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">if</span> terminated <span class="ck">or</span> truncated: <span class="ck">break</span></td></tr>
-                <tr class="code-line"><td class="line-num">15</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">16</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;obs_ids = <span class="cf">tokenize</span>(env.<span class="cf">format_observation</span>(obs))</td></tr>
-                <tr class="code-line"><td class="line-num">17</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;tokens += obs_ids;&nbsp;&nbsp;loss_mask += [<span class="cn">0</span>] * <span class="cf">len</span>(obs_ids)</td></tr>
-                <tr class="code-line"><td class="line-num">18</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;log_probs += [<span class="cn">0.0</span>] * <span class="cf">len</span>(obs_ids)</td></tr>
-                <tr class="code-line"><td class="line-num">19</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">20</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> <span class="cf">finalize</span>(sample, tokens, loss_mask, log_probs, rewards)</td></tr>
-              </tbody></table>
-              <!-- reward code -->
-              <table v-show="codeTab === 'reward'" class="code-table"><tbody>
-                <tr class="code-line"><td class="line-num">1</td><td class="line-code"><span class="cm"># --custom-rm-path your_module.reward</span></td></tr>
-                <tr class="code-line"><td class="line-num">2</td><td class="line-code"><span class="ck">async def</span> <span class="cf">reward</span>(<span class="cp">sample</span>: <span class="cc">Sample</span>) -> <span class="cc">dict</span>:</td></tr>
-                <tr class="code-line"><td class="line-num">3</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;answer = <span class="cf">extract_answer</span>(sample.response)</td></tr>
-                <tr class="code-line"><td class="line-num">4</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;acc = <span class="cn">1.0</span> <span class="ck">if</span> <span class="cf">is_exact_match</span>(answer, sample.label) <span class="ck">else</span> <span class="cn">0.0</span></td></tr>
-                <tr class="code-line"><td class="line-num">5</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">6</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;judge_response = <span class="ck">await</span> judge_model.<span class="cf">generate</span>(</td></tr>
-                <tr class="code-line"><td class="line-num">7</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;prompt=sample.prompt,</td></tr>
-                <tr class="code-line"><td class="line-num">8</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;answer=answer,</td></tr>
-                <tr class="code-line"><td class="line-num">9</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;label=sample.label,</td></tr>
-                <tr class="code-line"><td class="line-num">10</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;multimodal_inputs=sample.multimodal_inputs,</td></tr>
-                <tr class="code-line"><td class="line-num">11</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;)</td></tr>
-                <tr class="code-line"><td class="line-num">12</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;judge_score = <span class="cf">parse_verdict</span>(judge_response)</td></tr>
-                <tr class="code-line"><td class="line-num">13</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;fmt = <span class="cn">1.0</span> <span class="ck">if</span> <span class="cf">is_well_formatted</span>(sample.response) <span class="ck">else</span> <span class="cn">0.0</span></td></tr>
-                <tr class="code-line"><td class="line-num">14</td><td class="line-code"></td></tr>
-                <tr class="code-line"><td class="line-num">15</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;score = <span class="cn">0.5</span> * acc + <span class="cn">0.3</span> * judge_score + <span class="cn">0.2</span> * fmt</td></tr>
-                <tr class="code-line"><td class="line-num">16</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;<span class="ck">return</span> {<span class="cs">"score"</span>: score, <span class="cs">"acc"</span>: acc, <span class="cs">"format"</span>: fmt,</td></tr>
-                <tr class="code-line"><td class="line-num">17</td><td class="line-code">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="cs">"judge_response"</span>: judge_response}</td></tr>
-              </tbody></table>
-            </div>
-            <div class="code-tab-bar">
-              <button class="code-tab-btn" :class="{ active: codeTab === 'environment' }" @click="switchCodeTab('environment')">environment</button>
-              <button class="code-tab-btn" :class="{ active: codeTab === 'agentloop' }" @click="switchCodeTab('agentloop')">agent loop</button>
-              <button class="code-tab-btn" :class="{ active: codeTab === 'reward' }" @click="switchCodeTab('reward')">reward</button>
+
+            <div class="agentic-tab-bar">
+              <button class="agentic-tab-btn" :class="{ active: agenticTab === 'apps' }" @click="switchAgenticTab('apps')">agent apps</button>
+              <button class="agentic-tab-btn" :class="{ active: agenticTab === 'contexts' }" @click="switchAgenticTab('contexts')">contexts</button>
+              <button class="agentic-tab-btn" :class="{ active: agenticTab === 'request' }" @click="switchAgenticTab('request')">cross-step</button>
             </div>
           </div>
 
@@ -968,7 +1092,7 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
 }
 
 /* ============================================================
-   Panel 1: Agentic Code Editor (table-based for proper indent)
+   Panel 1: Agentic visual showcase
    ============================================================ */
 #showcase-panel-1 {
   background: linear-gradient(135deg, #131316 0%, #1f1f23 100%);
@@ -976,69 +1100,287 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
   flex-direction: column;
 }
 
-.code-file-tab {
+.agentic-visual-stage {
+  flex: 1;
+  min-height: 0;
+  padding: 8px 12px 0;
+}
+
+.agentic-visual {
+  height: 100%;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px 20px;
-  background: rgba(255, 255, 255, 0.04);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  flex-shrink: 0;
+  justify-content: center;
 }
 
-.code-file-icon { font-size: 14px; }
+.agentic-visual svg {
+  width: 100%;
+  height: 100%;
+}
 
-.code-file-name {
+.agent-app-zone,
+.context-zone {
+  fill: rgba(255, 255, 255, 0.025);
+  stroke: rgba(255, 255, 255, 0.14);
+  stroke-width: 1;
+}
+
+.agent-app-relax-zone,
+.context-training-zone {
+  fill: rgba(232, 56, 74, 0.035);
+  stroke: rgba(232, 56, 74, 0.38);
+}
+
+.agent-app-zone-label,
+.context-zone-label {
+  fill: #8b8c93;
+  font-family: "Manrope", sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.4px;
+}
+
+.agent-app-node,
+.context-node {
+  fill: #1f1f23;
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 1;
+}
+
+.agent-app-api-node,
+.context-selected-node {
+  fill: rgba(232, 56, 74, 0.12);
+  stroke: #e8384a;
+  stroke-width: 1.4;
+}
+
+.agent-app-node-title,
+.context-node-title {
+  fill: #f0edf1;
+  font-family: "Manrope", sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.agent-app-node-sub,
+.context-node-sub {
+  fill: #8b8c93;
+  font-family: "Manrope", sans-serif;
+  font-size: 10px;
+}
+
+.agent-app-flow,
+.agent-app-internal-flow {
+  fill: none;
+  stroke: #7da2ff;
+  stroke-width: 1.4;
+}
+
+.agent-app-internal-flow {
+  stroke: #9ca3af;
+}
+
+.agent-app-flow-active,
+.agent-app-internal-active,
+.context-export-active {
+  fill: none;
+  stroke: #7da2ff;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  opacity: 0;
+}
+
+.agent-app-internal-active {
+  stroke: #e8384a;
+}
+
+.agent-app-callout {
+  fill: #b7b5bb;
+  font-family: "Manrope", sans-serif;
   font-size: 12px;
-  color: #9CA3AF;
-  font-family: "Manrope", -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-weight: 500;
 }
 
-.code-scroll {
-  flex: 1;
-  overflow: auto;
-  padding: 12px 0;
+.agent-app-state-node,
+.context-root-node {
+  fill: rgba(255, 255, 255, 0.045);
 }
 
-.code-table {
-  border-collapse: collapse;
-  border-spacing: 0;
-  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, Monaco, 'Courier New', monospace;
-  font-size: 13px;
-  line-height: 1.75;
-  white-space: pre;
+.agent-app-train-node {
+  fill: rgba(125, 162, 255, 0.08);
+  stroke: rgba(125, 162, 255, 0.65);
 }
 
-.code-line td {
-  padding: 0;
-  vertical-align: top;
+.context-tree-edge,
+.context-export-edge {
+  fill: none;
+  stroke: #6f7179;
+  stroke-width: 1.2;
 }
 
-.code-line .line-num {
-  color: #555;
-  user-select: none;
-  width: 36px;
-  text-align: right;
-  padding-right: 16px;
-  white-space: nowrap;
+.context-export-edge {
+  stroke: #7da2ff;
 }
 
-.code-line .line-code {
-  color: #fcfcfc;
-  padding-right: 20px;
+.context-omitted-node {
+  fill: rgba(255, 255, 255, 0.015);
+  stroke: rgba(255, 255, 255, 0.24);
+  stroke-dasharray: 5 4;
+  opacity: 0.55;
 }
 
-.code-line.hl {
-  background: rgba(79, 151, 215, 0.08);
+.context-tray-slot {
+  fill: rgba(125, 162, 255, 0.08);
+  stroke: rgba(125, 162, 255, 0.65);
+  stroke-width: 1.2;
 }
 
-.code-line.hl .line-num {
-  border-left: 2px solid #4f97d7;
+.context-credit {
+  fill: #8b8c93;
+  font-family: "Manrope", sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
 }
 
+.request-scenario {
+  fill: rgba(255, 255, 255, 0.018);
+  stroke: rgba(255, 255, 255, 0.13);
+}
 
-/* Bottom code-tab button bar */
-.code-tab-bar {
+.request-scenario-later {
+  fill: rgba(232, 56, 74, 0.025);
+  stroke: rgba(232, 56, 74, 0.28);
+}
+
+.request-scenario-title,
+.request-scenario-sub,
+.request-path-label,
+.request-event-static,
+.request-event-active {
+  fill: #8b8c93;
+  font-family: "Manrope", sans-serif;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.request-scenario-title {
+  fill: #d2d5dc;
+}
+
+.request-scenario-later + .request-scenario-title {
+  fill: #e98d97;
+}
+
+.request-scenario-sub {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+}
+
+.request-node {
+  fill: rgba(255, 255, 255, 0.025);
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 1;
+}
+
+.request-relax-node {
+  fill: rgba(232, 56, 74, 0.055);
+  stroke: rgba(232, 56, 74, 0.48);
+}
+
+.request-sglang-node {
+  fill: rgba(125, 162, 255, 0.07);
+  stroke: rgba(125, 162, 255, 0.55);
+}
+
+.request-node-title {
+  fill: #f0edf1;
+  font-family: "Manrope", sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.request-node-sub {
+  fill: #8b8c93;
+  font-family: "Manrope", sans-serif;
+  font-size: 9px;
+}
+
+.request-event-static,
+.request-event-active {
+  fill: #e98d97;
+  font-size: 8px;
+}
+
+.request-event-active {
+  opacity: 0;
+}
+
+.request-hold-chip {
+  fill: rgba(232, 56, 74, 0.1);
+  stroke: rgba(232, 56, 74, 0.62);
+}
+
+.request-hold-label,
+.request-resume-label,
+.request-state-static {
+  fill: #e98d97;
+  font-family: "Manrope", sans-serif;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+}
+
+.request-state-static {
+  font-size: 6px;
+  letter-spacing: 0;
+}
+
+.request-state-active {
+  opacity: 0;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-event-static,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-state-static {
+  opacity: 0;
+}
+
+.request-flow,
+.request-response-flow {
+  fill: none;
+  stroke: #7da2ff;
+  stroke-width: 1.4;
+  stroke-dasharray: 5 4;
+}
+
+.request-response-flow {
+  stroke: #e8384a;
+}
+
+.request-response-label {
+  fill: #e98d97;
+}
+
+.request-flow-active {
+  fill: none;
+  stroke: #7da2ff;
+  stroke-width: 1.4;
+  stroke-dasharray: 5 4;
+  stroke-linecap: round;
+  opacity: 0;
+}
+
+.request-active-now-return-engine,
+.request-active-now-return-agent,
+.request-active-later-return-engine,
+.request-active-later-return-agent {
+  stroke: #e8384a;
+}
+
+/* Bottom Agentic visual tab bar */
+.agentic-tab-bar {
   display: flex;
   justify-content: center;
   gap: 12px;
@@ -1048,7 +1390,7 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
   flex-shrink: 0;
 }
 
-.code-tab-btn {
+.agentic-tab-btn {
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: #888;
@@ -1060,12 +1402,12 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
   transition: all 0.2s ease;
 }
 
-.code-tab-btn:hover {
+.agentic-tab-btn:hover {
   background: rgba(255, 255, 255, 0.1);
   color: #ccc;
 }
 
-.code-tab-btn.active {
+.agentic-tab-btn.active {
   background: #e8384a;
   color: #ffffff;
   font-weight: 500;
@@ -1501,6 +1843,169 @@ function switchCodeTab(tab: 'environment' | 'agentloop' | 'reward') {
 .showcase-display-section[style*="paused"] *::after,
 .showcase-display-section[style*="paused"] *::before {
   animation-play-state: paused !important;
+}
+
+/* Agentic visual tabs: complete static diagrams with decorative motion overlays. */
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-flow-active,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-internal-active,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-export-active {
+  stroke-dasharray: 18 260;
+  stroke-dashoffset: 278;
+  animation: agenticPathFlow 4.8s linear infinite;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-flow-active-2 {
+  animation-delay: 1.2s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-flow-active-3 {
+  animation-delay: 2.4s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-flow-active-4 {
+  animation-delay: 1.8s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-flow-active-5 {
+  animation-delay: 2.8s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agent-apps-view .agent-app-api-node,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-selected-node,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-tray-slot {
+  animation: agenticNodeFocus 4.8s ease-in-out infinite;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-searcher-node,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-tray-searcher {
+  animation-delay: 1.2s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-contexts-view .context-export-active-2 {
+  animation-delay: 1.2s;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-flow,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-response-flow {
+  opacity: 0;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-flow-active {
+  animation-name: var(--request-reveal), requestDashFlow;
+  animation-duration: 7.6s, 0.8s;
+  animation-timing-function: linear, linear;
+  animation-iteration-count: infinite, infinite;
+  animation-fill-mode: both, none;
+}
+
+.request-active-now-agent { --request-reveal: requestReveal06; }
+.request-active-now-engine { --request-reveal: requestReveal14; }
+.request-active-now-return-engine { --request-reveal: requestReveal22; }
+.request-active-now-return-agent { --request-reveal: requestReveal30; }
+.request-active-later-agent { --request-reveal: requestReveal38; }
+.request-active-later-hold { --request-reveal: requestReveal46; }
+.request-active-later-out { --request-reveal: requestReveal62; }
+.request-active-later-return-engine { --request-reveal: requestReveal74; }
+.request-active-later-return-agent { --request-reveal: requestReveal82; }
+
+@keyframes requestDashFlow {
+  from { stroke-dashoffset: 18; }
+  to { stroke-dashoffset: 0; }
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-event-close {
+  animation: requestCloseState 7.6s linear infinite both;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-hold-chip {
+  animation: requestReveal50 7.6s linear infinite both;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-hold-label {
+  animation: requestHoldState 7.6s linear infinite both;
+}
+
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-event-open,
+.showcase-display-section.panel-active-anim #showcase-panel-1 .agentic-request-view .request-resume-label {
+  animation: requestReveal62 7.6s linear infinite both;
+}
+
+@keyframes agenticPathFlow {
+  0% {
+    opacity: 0;
+    stroke-dashoffset: 278;
+  }
+  12%, 78% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes agenticNodeFocus {
+  0%, 100% {
+    stroke-width: 1.4;
+  }
+  40%, 65% {
+    stroke-width: 2.4;
+  }
+}
+
+@keyframes requestReveal06 { 0%, 5% { opacity: 0; } 6%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal14 { 0%, 13% { opacity: 0; } 14%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal22 { 0%, 21% { opacity: 0; } 22%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal30 { 0%, 29% { opacity: 0; } 30%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal38 { 0%, 37% { opacity: 0; } 38%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal46 { 0%, 45% { opacity: 0; } 46%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal50 { 0%, 49% { opacity: 0; } 50%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal62 { 0%, 61% { opacity: 0; } 62%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal74 { 0%, 73% { opacity: 0; } 74%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+@keyframes requestReveal82 { 0%, 81% { opacity: 0; } 82%, 96% { opacity: 1; } 98%, 100% { opacity: 0; } }
+
+@keyframes requestCloseState {
+  0%, 45% { opacity: 0; }
+  46%, 61% { opacity: 1; }
+  62%, 100% { opacity: 0; }
+}
+
+@keyframes requestHoldState {
+  0%, 49% { opacity: 0; }
+  50%, 61% { opacity: 1; }
+  62%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #showcase-panel-1 *,
+  #showcase-panel-1 *::before,
+  #showcase-panel-1 *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  #showcase-panel-1 .agent-app-flow-active,
+  #showcase-panel-1 .agent-app-internal-active,
+  #showcase-panel-1 .context-export-active,
+  #showcase-panel-1 .request-flow-active,
+  #showcase-panel-1 .request-event-active,
+  #showcase-panel-1 .request-state-active {
+    display: none;
+  }
+
+  #showcase-panel-1 .request-event-static,
+  #showcase-panel-1 .request-state-static {
+    opacity: 1 !important;
+  }
+
+  #showcase-panel-1 .request-hold-chip {
+    opacity: 1 !important;
+  }
+
+  #showcase-panel-1 .request-flow,
+  #showcase-panel-1 .request-response-flow {
+    opacity: 1;
+  }
 }
 
 /*

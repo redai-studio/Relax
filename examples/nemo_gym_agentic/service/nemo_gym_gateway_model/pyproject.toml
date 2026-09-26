@@ -1,0 +1,12 @@
+[project]
+name = "relax-gateway-model"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["nemo-gym"]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61"]
+
+[tool.setuptools]
+py-modules = ["app"]

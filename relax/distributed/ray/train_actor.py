@@ -12,10 +12,12 @@ import torch.distributed as dist
 import relax.utils.training.eval_config
 from relax.distributed.ray.ray_actor import RayActor
 from relax.utils import device as device_utils
-from relax.utils.device import ray_get_device_ids
+from relax.utils.device import device_module, ray_get_device_ids
 from relax.utils.distributed_utils import init_gloo_group
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory, print_memory
+from relax.utils.memory_utils import set_role as set_memory_role
 
 
 logger = get_logger(__name__)
@@ -54,13 +56,14 @@ class TrainRayActor(RayActor):
     def init(self, args, role, with_ref=False, with_opd_teacher=False):
         self.args = args
         self.role = role
+        set_memory_role(role)
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
 
         torch.serialization.add_safe_globals([relax.utils.training.eval_config.EvalDatasetConfig])
 
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device_utils.set_device(f"{device_utils.get_device_name()}:{local_rank}")
+        local_rank = Envs.LOCAL_RANK
+        device_module.set_device(f"{device_utils.get_device_name()}:{local_rank}")
 
         backend = args.distributed_backend
 
@@ -73,7 +76,7 @@ class TrainRayActor(RayActor):
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
 
-        numa_local_rank = int(os.environ["RANK"]) % args.num_gpus_per_node
+        numa_local_rank = Envs.RANK % args.num_gpus_per_node
         device_utils.set_numa_affinity(numa_local_rank)
 
     def clear_memory(self):

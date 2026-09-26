@@ -83,6 +83,7 @@ The following CLI arguments enable isolated debugging:
 | `--save-debug-rollout-data <path>` | Save rollout results to the specified path for later replay. |
 | `--load-debug-rollout-data <path>` | Load rollout data from the specified path. Automatically sets `--debug-train-only`. |
 | `--dump-details <dir>` | Dump all training details (automatically enables rollout data saving). |
+| `--load-forge-rollout-data <path>` | Replay a saved rollout dump **while keeping SGLang live** (does not set `--debug-train-only`). Requires `--rollout-function-path relax.engine.rollout.forge_load.generate_rollout`. |
 
 ### Workflow 1: Debug Inference Only
 
@@ -136,4 +137,28 @@ python3 relax/entrypoints/train.py \
 
 ::: tip
 `--dump-details` is also useful for collecting data for bug reports — it captures everything needed to reproduce an issue.
+:::
+
+### Workflow 4: Replay Rollout with SGLang Live (Memory Profiling)
+
+`--load-debug-rollout-data` (Workflow 2) skips SGLang entirely, so it measures the training loop in isolation. To profile the **real colocate memory footprint** — training peak, weight sync, and the offload/onload transitions — you need SGLang, the router, and weight update to stay live. `forge_load` replays a saved rollout dump instead of generating, keeping the full pipeline alive while skipping only the (slow) real generation.
+
+First capture a dump (e.g. via Workflow 1 or `--dump-details`), then replay it:
+
+```bash
+python3 relax/entrypoints/train.py \
+    --rollout-function-path relax.engine.rollout.forge_load.generate_rollout \
+    --load-forge-rollout-data /path/to/rollout_data/data_{rollout_id}.pt \
+    # ... keep the SAME model / colocate / batch args as the run that produced the dump
+```
+
+`--load-forge-rollout-data` accepts two forms, mirroring the `format(rollout_id=...)` convention of `--save-debug-rollout-data`:
+
+- **Literal path** — `--load-forge-rollout-data /path/to/rollout_data/0.pt`
+  No `{rollout_id}` placeholder: the same file is reused for **every** rollout step. Best for a memory test that replays one dump across `--num-rollout > 1`.
+- **Template path** — `--load-forge-rollout-data /path/to/rollout_data/data_{rollout_id}.pt`
+  Contains `{rollout_id}`: each step loads its **own** file (`data_0.pt`, `data_1.pt`, …). If a step's file is missing, the training path falls back to the `0` dump.
+
+::: warning
+Keep batch-related args (`--global-batch-size`, `--n-samples-per-prompt`, parallelism) identical to the dump run — the dump must contain exactly one step's worth of samples. Do **not** combine with `--debug-rollout-only` or `--load-debug-rollout-data`; both would defeat the purpose (no training, or SGLang skipped). `forge_load` does not exercise decode-time memory, so it is not a substitute for measuring the generation-phase peak.
 :::

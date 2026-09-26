@@ -83,6 +83,7 @@ Relax 支持将训练和推理组件分开独立运行，从而实现：
 | `--save-debug-rollout-data <path>` | 将 rollout 结果保存到指定路径，供后续回放使用。 |
 | `--load-debug-rollout-data <path>` | 从指定路径加载 rollout 数据。自动设置 `--debug-train-only`。 |
 | `--dump-details <dir>` | 保存训练的全部细节（自动开启 rollout 数据保存）。 |
+| `--load-forge-rollout-data <path>` | 回放已保存的 rollout dump，**同时保持 SGLang 存活**（不会设置 `--debug-train-only`）。需配合 `--rollout-function-path relax.engine.rollout.forge_load.generate_rollout`。 |
 
 ### 工作流 1：仅调试推理
 
@@ -136,4 +137,28 @@ python3 relax/entrypoints/train.py \
 
 ::: tip 提示
 `--dump-details` 在收集 bug 报告数据时也非常有用 — 它会捕获复现问题所需的所有信息。
+:::
+
+### 工作流 4：保持 SGLang 存活回放 Rollout（显存分析）
+
+`--load-debug-rollout-data`（工作流 2）会完全跳过 SGLang，因此只能孤立地测量训练循环。若要分析**真实的 colocate 显存占用** —— 训练峰值、权重同步、以及 offload/onload 切换 —— 就需要 SGLang、router 和权重更新全程存活。`forge_load` 用回放已保存的 rollout dump 来替代真实生成，从而保持整条流水线存活，只省掉（缓慢的）真实生成。
+
+先抓一份 dump（例如通过工作流 1 或 `--dump-details`），再回放：
+
+```bash
+python3 relax/entrypoints/train.py \
+    --rollout-function-path relax.engine.rollout.forge_load.generate_rollout \
+    --load-forge-rollout-data /path/to/rollout_data/data_{rollout_id}.pt \
+    # ... 保持与产生该 dump 的那次运行相同的 模型 / colocate / batch 参数
+```
+
+`--load-forge-rollout-data` 支持两种写法，沿用 `--save-debug-rollout-data` 的 `format(rollout_id=...)` 约定：
+
+- **字面路径（literal）** —— `--load-forge-rollout-data /path/to/rollout_data/0.pt`
+  不含 `{rollout_id}` 占位符：**每个** rollout step 都复用同一个文件。适合用一份 dump 反复回放 `--num-rollout > 1` 的显存测试。
+- **模板路径（template）** —— `--load-forge-rollout-data /path/to/rollout_data/data_{rollout_id}.pt`
+  含 `{rollout_id}`：每个 step 加载**各自**的文件（`data_0.pt`、`data_1.pt` ……）。若某个 step 的文件缺失，训练路径会回退到 `0` 那份 dump。
+
+::: warning 注意
+batch 相关参数（`--global-batch-size`、`--n-samples-per-prompt`、并行度）要与产生 dump 的那次运行保持一致 —— dump 必须恰好包含一个 step 的样本量。**不要**与 `--debug-rollout-only` 或 `--load-debug-rollout-data` 同时使用，二者都会破坏其目的（不训练，或跳过 SGLang）。`forge_load` 不会触发解码期显存，因此不能替代对生成阶段峰值的测量。
 :::

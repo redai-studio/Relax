@@ -95,15 +95,17 @@ def get_mopd_reward(response: str, label, metadata: dict | None = None) -> float
     """Per-data-source reward routing for MOPD.
 
     Routes each sample to its domain-appropriate scorer based on ``data_source``
-    in metadata, always returning a scalar (rm_type="mopd" carries no reward_key):
-      - geometry3k / geo3k         : grade_answer_verl (flexible LaTeX matching, -1/1)
+    in metadata, always returning a scalar (rm_type="mopd" carries no reward_key).
+    Each source delegates to the same integrated reward the standalone rm_type
+    would use, so MOPD scoring matches single-source training:
+      - geometry3k / geo3k         : rm_type="math" scorer (grade_answer_verl, {0,1})
       - multimodal-open-r1 / openr1mm : openr1mm rule-based scorer
-      - dapo-math                  : DAPO scorer's scalar "score"
+      - dapo-math                  : DAPO scorer's scalar "score" (dict → scalar)
       - all others                 : GSM8K scorer with EOS/repeat hardening (-1/1)
     """
     data_source = (metadata or {}).get("data_source", "").lower()
     if "geometry3k" in data_source or "geo3k" in data_source:
-        return 1.0 if grade_answer_verl(response, label) else -1.0
+        return 1.0 if grade_answer_verl(response, label) else 0.0
     if "multimodal-open-r1" in data_source or "openr1mm" in data_source:
         return get_openr1mm_rule_based_reward(response, label)
     if "dapo" in data_source:

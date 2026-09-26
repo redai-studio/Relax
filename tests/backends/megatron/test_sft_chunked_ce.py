@@ -11,12 +11,12 @@ Covers two concerns:
    fused kernels needed).
 
 2. **Bypass plumbing** — ``_bypass_output_layer`` correctly (a) finds the
-   lm_head through DDP / VL wrappers, (b) replaces ``output_layer.forward``
-   with a passthrough that returns the input unchanged, (c) restores the
-   original forward on exit, (d) handles missing output_layer as a no-op,
-   and (e) passes ``tensor_parallel_output_grad=False`` to the SP gather so
-   gradients are not silently scaled by TP (regression guard for the bug
-   discovered 2026-06-17).
+   lm_head through DDP / VL wrappers, (b) keeps MTP head calls intact and
+   replaces only the main ``output_layer.forward`` with a passthrough,
+   (c) restores the original forward on exit, (d) handles missing output_layer
+   as a no-op, and (e) passes ``tensor_parallel_output_grad=False`` to the SP
+   gather so gradients are not silently scaled by TP (regression guard for the
+   bug discovered 2026-06-17).
 """
 
 from __future__ import annotations
@@ -26,12 +26,16 @@ from argparse import Namespace
 import pytest
 import torch
 
+from relax.engine.sft.runtime import should_use_sft_chunked
+
 
 try:
     from relax.backends.megatron import loss as _loss_mod
-    from relax.backends.megatron import model as _model_mod
     from relax.backends.megatron.loss import sft_loss_function_chunked
-    from relax.backends.megatron.model import _bypass_output_layer, _find_lm_output_layer
+    from relax.backends.megatron.model import (
+        _bypass_output_layer,
+        _find_lm_output_layer,
+    )
 except Exception as exc:
     pytest.skip(f"relax.backends.megatron unavailable: {exc}", allow_module_level=True)
 
@@ -215,6 +219,113 @@ def test_bypass_returns_input_unchanged_during_model_forward():
         torch.testing.assert_close(z, x @ head.weight.t())
 
 
+def test_bypass_preserves_mtp_heads_and_defers_only_main_head():
+    """MTP depths use the real output layer; only the following main call is
+    bypassed."""
+    head = _FakeLmHead(in_features=4, out_features=8)
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = head
+
+    m = M()
+    x = torch.randn(3, 4)
+    expected = x @ head.weight.t()
+
+    with _bypass_output_layer(m, mtp_output_layer_calls=2) as lm_head_forward:
+        mtp_1, _ = m.output_layer(x)
+        mtp_2, _ = m.output_layer(x)
+        main_hidden, main_bias = m.output_layer(x)
+
+        torch.testing.assert_close(mtp_1, expected)
+        torch.testing.assert_close(mtp_2, expected)
+        assert torch.equal(main_hidden, x)
+        assert main_bias is None
+
+        main_logits, _ = lm_head_forward(main_hidden)
+        torch.testing.assert_close(main_logits, expected)
+
+
+def test_bypass_preserves_functional_mtp_head_call():
+    """Relax's patched MTP path uses torch.func.functional_call for its
+    detached head."""
+    head = _FakeLmHead(in_features=4, out_features=8)
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = head
+
+    m = M()
+    x = torch.randn(3, 4)
+    detached_params = {name: param.detach() for name, param in head.named_parameters()}
+
+    with _bypass_output_layer(m, mtp_output_layer_calls=1) as lm_head_forward:
+        mtp_logits, _ = torch.func.functional_call(
+            head,
+            detached_params,
+            (x,),
+            {"runtime_gather_output": None},
+        )
+        main_hidden, _ = m.output_layer(x)
+        main_logits, _ = lm_head_forward(main_hidden)
+
+    torch.testing.assert_close(mtp_logits, x @ head.weight.t())
+    torch.testing.assert_close(main_logits, x @ head.weight.t())
+
+
+def test_bypass_rejects_mtp_call_count_mismatch_and_restores_forward():
+    """Fail clearly if MCore no longer calls the head once per configured MTP
+    depth."""
+    head = _FakeLmHead(in_features=4, out_features=8)
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = head
+
+    m = M()
+    x = torch.randn(3, 4)
+    with pytest.raises(RuntimeError, match="main output_layer was not reached"):
+        with _bypass_output_layer(m, mtp_output_layer_calls=1):
+            m.output_layer(x)  # Consumed as the expected MTP call; main call is missing.
+
+    logits, _ = m.output_layer(x)
+    torch.testing.assert_close(logits, x @ head.weight.t())
+
+
+def test_bypass_reuses_explicit_main_weight_for_tied_embeddings():
+    """The deferred main call supplies the shared embedding weight for later
+    chunks."""
+
+    class TiedHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = None
+            self.sequence_parallel = False
+            self.tp_group = object()
+
+        def forward(self, input_, weight=None, runtime_gather_output=None):
+            assert weight is not None
+            return torch.nn.functional.linear(input_, weight), None
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = TiedHead()
+
+    m = M()
+    x = torch.randn(3, 4)
+    shared_weight = torch.nn.Parameter(torch.randn(8, 4))
+
+    with _bypass_output_layer(m) as lm_head_forward:
+        main_hidden, _ = m.output_layer(x, weight=shared_weight)
+        main_logits, _ = lm_head_forward(main_hidden)
+
+    torch.testing.assert_close(main_logits, x @ shared_weight.t())
+
+
 def test_bypass_restores_forward_on_exit():
     """After the context exits the layer must compute the real matmul again."""
     head = _FakeLmHead(in_features=4, out_features=8)
@@ -229,7 +340,8 @@ def test_bypass_restores_forward_on_exit():
     expected = x @ head.weight.t()
 
     with _bypass_output_layer(m) as _:
-        pass
+        hidden, _ = m.output_layer(x)
+        assert torch.equal(hidden, x)
 
     y, _ = m.output_layer(x)
     torch.testing.assert_close(y, expected)
@@ -280,7 +392,8 @@ def test_bypass_chunked_call_handles_fp32_input_against_bf16_weight():
     m = M()
     x_fp32 = torch.randn(3, 4, dtype=torch.float32)
     with _bypass_output_layer(m) as lm_head_forward:
-        y, _ = lm_head_forward(x_fp32)  # would raise without the downcast
+        hidden, _ = m.output_layer(x_fp32)
+        y, _ = lm_head_forward(hidden)  # would raise without the downcast
     assert y.dtype == torch.bfloat16
     assert y.shape == (3, 8)
 
@@ -303,8 +416,9 @@ def test_bypass_restores_sequence_parallel_flag_after_chunked_call():
     x = torch.randn(2, 4)
     head.sequence_parallel = False  # bypass's sp_enabled is captured here as False
     with _bypass_output_layer(m) as lm_head_forward:
+        hidden, _ = m.output_layer(x)
         head.sequence_parallel = True  # simulate concurrent external flip
-        lm_head_forward(x)
+        lm_head_forward(hidden)
         assert head.sequence_parallel is True, "chunked_call must restore SP flag"
 
 
@@ -355,6 +469,30 @@ def test_bypass_sp_gather_passes_output_grad_false(monkeypatch):
         f"_passthrough must pass tensor_parallel_output_grad=False — got "
         f"kwargs={captured_kwargs}. Default True scales backward grads by TP_size."
     )
+
+
+def test_bypass_can_skip_sp_gather_for_mtp_only_anchor(monkeypatch):
+    head = _FakeLmHead(in_features=4, out_features=8)
+    head.sequence_parallel = True
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.output_layer = head
+
+    def fail_gather(*_args, **_kwargs):
+        raise AssertionError("MTP-only passthrough must not gather sequence-parallel hidden states")
+
+    monkeypatch.setattr(
+        "megatron.core.tensor_parallel.mappings.gather_from_sequence_parallel_region",
+        fail_gather,
+    )
+
+    x = torch.randn(3, 4)
+    with _bypass_output_layer(M(), gather_passthrough=False):
+        hidden, _ = head(x)
+
+    assert torch.equal(hidden, x)
 
 
 def test_chunked_loss_delegates_to_get_log_probs_and_entropy(monkeypatch):
@@ -453,14 +591,13 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
 def test_should_use_sft_chunked(loss_type, chunked_flag, expected):
     """The chunked-path gate predicate: SFT mode + explicit opt-in.
 
-    Incompatibilities (MTP, tied embeddings, combined-1f1b) are enforced as
-    hard AssertionErrors in arguments.py.slime_validate_args, so by the time we
-    reach this gate sft_chunked_logits=True is guaranteed compatible — no re-
-    check needed here. Functional check on the helper extracted from
-    ``forward_step``.
+    Remaining incompatibilities (tied embeddings, combined-1f1b) are enforced
+    as hard AssertionErrors in arguments.py.slime_validate_args, so by the time
+    we reach this gate sft_chunked_logits=True is guaranteed compatible.
+    Functional check on the helper extracted from ``forward_step``.
     """
     args = Namespace(
         loss_type=loss_type,
         sft_chunked_logits=chunked_flag,
     )
-    assert _model_mod._should_use_sft_chunked(args) is expected
+    assert should_use_sft_chunked(args) is expected
