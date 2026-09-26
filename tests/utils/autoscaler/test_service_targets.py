@@ -27,6 +27,14 @@ from relax.utils.autoscaler.scaling_decision import ScalingDecisionEngine  # noq
 from relax.utils.genrm_scale_registry import GenRMScaleRegistry  # noqa: E402
 
 
+try:
+    from tests.utils._dep_stubs import import_rollout_component
+
+    _rollout_component = import_rollout_component()
+except Exception:  # pragma: no cover - only when the component chain is unavailable
+    _rollout_component = None
+
+
 _AutoscalerService = getattr(svc_module.AutoscalerService, "func_or_class", svc_module.AutoscalerService)
 _AutoscalerState = svc_module.AutoscalerState
 _ConfigUpdateRequest = svc_module.ConfigUpdateRequest
@@ -242,6 +250,71 @@ class _ParkedPostSession:
     def get(self, url):
         self.get_calls.append(url)
         return _FakeResp(200, self._get_payload)
+
+
+class _RolloutWireServer:
+    """aiohttp-like session speaking the real Rollout HTTP contract.
+
+    POST /scale_out|/scale_in replies with the acceptance shape
+    (ScaleOutResponse/ScaleInResponse: no cleanup_required -- a POST reply
+    never proves cleanup). GET /scale_out|in/{id} replies with the actual
+    ScaleOutStatusResponse/ScaleInStatusResponse wire serialization, built
+    through the real Pydantic models so this fake fails together with the
+    component contract if the cleanup flag is ever dropped again.
+    """
+
+    def __init__(self, scale_out_status="ACTIVE", scale_in_status="COMPLETED", expose_cleanup=True):
+        self._scale_out_status = scale_out_status
+        self._scale_in_status = scale_in_status
+        self._expose_cleanup = expose_cleanup
+        self.posts = []
+        self.get_calls = []
+
+    def post(self, url, json=None):
+        self.posts.append((url, json))
+        if url.endswith("/scale_out"):
+            return _FakeResp(200, {"request_id": "ro-1", "status": "PENDING", "message": "accepted"})
+        return _FakeResp(200, {"request_id": "ri-1", "status": "PENDING", "message": "accepted"})
+
+    def get(self, url):
+        self.get_calls.append(url)
+        if "/scale_out/" in url:
+            payload = _rollout_component.ScaleOutStatusResponse(
+                request_id="ro-1",
+                status=self._scale_out_status,
+                model_name="default",
+                num_replicas=2,
+                engine_urls=["http://engine:30000"],
+                engine_ids=["engine-1"],
+                failed_engines=[],
+                created_at=1.0,
+                updated_at=2.0,
+                error_message=None,
+                weight_version=None,
+                failure_categories=[],
+            ).model_dump()
+        else:
+            payload = _rollout_component.ScaleInStatusResponse(
+                request_id="ri-1",
+                status=self._scale_in_status,
+                model_name="default",
+                num_replicas=1,
+                engine_urls=[],
+                timeout_secs=120.0,
+                force=False,
+                dry_run=False,
+                created_at=1.0,
+                updated_at=2.0,
+                selected_engines=["engine-1"],
+                removed_engines=["engine-1"],
+                failed_engines=[],
+                error_message=None,
+            ).model_dump()
+        if not self._expose_cleanup:
+            # The pre-fix wire shape: FastAPI's response_model dropped the
+            # undeclared field entirely.
+            payload.pop("cleanup_required", None)
+        return _FakeResp(200, payload)
 
 
 def _decision(action, delta=1):
@@ -1412,6 +1485,132 @@ class TestAmbiguousRecoveryLifecycle(unittest.TestCase):
             )
             self.assertEqual(decision.action, _ScalingAction.NONE)
             self.assertIn("cooldown", decision.reason.lower())
+
+
+@unittest.skipIf(_rollout_component is None, "relax.components.rollout not importable")
+class TestRolloutTerminalCleanupContract(unittest.TestCase):
+    """Shared-autoscaler regression (re-review P1): rollout terminal operations
+    must finalize.
+
+    Rollout status responses declare ``cleanup_required`` explicitly (False
+    under rollout's terminal-is-clean lifecycle: a FAILED scale-out rolls its
+    engines back before reporting, a COMPLETED scale-in reports the engines
+    removed). Before the contract fix, FastAPI's response_model dropped the
+    undeclared field, the autoscaler correctly read the missing flag as UNKNOWN
+    (missing != clean -- the fail-closed read GenRM's dirty-terminal lifecycle
+    requires), and every rollout terminal operation stayed pending forever:
+    decisions frozen, history never written, and a removable target stuck on
+    409.
+    """
+
+    def _service_with_runtime(self, session):
+        config = AutoscalerConfig(rollout_service_url="http://rollout:8000/rollout")
+        svc = _service(config, session)
+        svc._services = {}
+        svc._rebuild_service_runtimes()
+        return svc
+
+    def _decision_without_debounce(self, runtime):
+        engine = runtime.decision_engine
+        engine.config.scale_out_policy.condition_duration_secs = 0.0
+        engine.config.scale_in_policy.condition_duration_secs = 0.0
+        return engine
+
+    def test_scale_out_terminal_finalizes_and_unblocks_next_decision(self):
+        session = _RolloutWireServer(scale_out_status="ACTIVE")
+        svc = self._service_with_runtime(session)
+        runtime = svc._services["rollout"]
+
+        asyncio.run(svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT, delta=1), current_engines=1))
+
+        # The POST acceptance carries no cleanup proof: UNKNOWN until the
+        # authoritative GET answers.
+        self.assertEqual([p["request_id"] for p in runtime.state.pending_requests], ["ro-1"])
+        self.assertIsNone(runtime.state.pending_requests[0].get("cleanup_required"))
+
+        asyncio.run(svc._update_pending_requests(runtime))
+
+        # Terminal AND explicitly clean: finalized into history.
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], "ro-1")
+        self.assertIs(runtime.state.scale_history[0]["cleanup_required"], False)
+
+        # The next scaling evaluation is no longer frozen by the finished
+        # operation: busy metrics proceed to a scale-out decision instead of
+        # being blocked by a stale pending entry.
+        engine = self._decision_without_debounce(runtime)
+        decision = engine.evaluate(
+            aggregated_metrics=_busy_metrics(),
+            current_engines=2,
+            last_scale_time=None,
+            last_scale_action=None,
+            pending_requests=runtime.state.pending_requests,
+        )
+        self.assertNotIn("in progress or awaiting cleanup", decision.reason)
+        self.assertEqual(decision.action, _ScalingAction.SCALE_OUT)
+
+    def test_scale_in_terminal_finalizes(self):
+        session = _RolloutWireServer(scale_in_status="COMPLETED")
+        svc = self._service_with_runtime(session)
+        runtime = svc._services["rollout"]
+
+        asyncio.run(svc._execute_scale_in(_decision(_ScalingAction.SCALE_IN, delta=1), current_engines=2))
+
+        self.assertEqual([p["request_id"] for p in runtime.state.pending_requests], ["ri-1"])
+        self.assertIsNone(runtime.state.pending_requests[0].get("cleanup_required"))
+
+        asyncio.run(svc._update_pending_requests(runtime))
+
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], "ri-1")
+        self.assertIs(runtime.state.scale_history[0]["cleanup_required"], False)
+
+    def test_missing_cleanup_flag_stays_unknown_and_blocks(self):
+        """Fail-closed guard: the fix lives in the rollout contract, never in
+        the autoscaler defaulting a missing flag to clean."""
+        session = _RolloutWireServer(scale_out_status="ACTIVE", expose_cleanup=False)
+        svc = self._service_with_runtime(session)
+        runtime = svc._services["rollout"]
+
+        asyncio.run(svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT, delta=1), current_engines=1))
+        asyncio.run(svc._update_pending_requests(runtime))
+
+        # Terminal but UNKNOWN cleanup: retained, and the decision stays
+        # frozen (this is the pre-fix harm, pinned so the shared fail-closed
+        # invariant cannot silently regress into missing == clean).
+        self.assertEqual(len(runtime.state.pending_requests), 1)
+        self.assertIsNone(runtime.state.pending_requests[0].get("cleanup_required"))
+        engine = self._decision_without_debounce(runtime)
+        decision = engine.evaluate(
+            aggregated_metrics=_busy_metrics(),
+            current_engines=2,
+            last_scale_time=None,
+            last_scale_action=None,
+            pending_requests=runtime.state.pending_requests,
+        )
+        self.assertIn("in progress or awaiting cleanup", decision.reason)
+        self.assertEqual(decision.action, _ScalingAction.NONE)
+
+    def test_finalized_target_removal_not_blocked_by_stale_pending(self):
+        """A removable rollout-contract target must not 409 forever: once the
+        terminal operation finalizes, the removal guard passes."""
+        config = AutoscalerConfig(service_targets={"rollout2": "http://rollout:8000/rollout"})
+        session = _RolloutWireServer(scale_out_status="ACTIVE")
+        svc = _service(config, session)
+        svc._services = {}
+        svc._rebuild_service_runtimes()
+        runtime = svc._services["rollout2"]
+
+        asyncio.run(
+            svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT, delta=1), current_engines=1, runtime=runtime)
+        )
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(runtime.state.pending_requests, [])
+
+        # Removing the target now succeeds: no stale UNKNOWN pending entry
+        # references it any more.
+        asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertNotIn("rollout2", svc._services)
 
 
 if __name__ == "__main__":

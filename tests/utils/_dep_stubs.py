@@ -191,3 +191,28 @@ def import_genrm_manager():
         ray.exceptions = exceptions
     _install("relax.backends.sglang.sglang_engine", GenRMEngine=type("GenRMEngine", (), {}))
     return importlib.import_module("relax.distributed.ray.genrm")
+
+
+def import_rollout_component():
+    """Import relax.components.rollout without the transfer_queue runtime.
+
+    The component touches ``transfer_queue`` only inside runtime methods
+    (``tq.init``/``tq.get_client``); its HTTP contract models are real
+    Pydantic classes at module level, so stubbing the data-system bridge
+    lets contract tests exercise the exact wire serialization with every
+    other dependency (fastapi/pydantic/ray) kept real whenever importable.
+
+    The stub stays installed for the session: sibling modules imported by
+    the contract tests (``relax.components.actor``,
+    ``relax.distributed.ray.rollout``) also bind ``transfer_queue`` at
+    module level and must keep importing. Tests that need the REAL
+    ``transfer_queue`` features guard on the attribute, not just the
+    module name (see tests/utils/data/test_identity_window_sampler.py).
+    """
+    try:
+        return importlib.import_module("relax.components.rollout")
+    except Exception:
+        pass
+    install_web_framework_stubs()
+    _install("transfer_queue")
+    return importlib.import_module("relax.components.rollout")
