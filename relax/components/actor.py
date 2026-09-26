@@ -7,7 +7,6 @@ from argparse import Namespace
 from typing import Any, Dict, Optional
 
 import ray
-import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
@@ -17,6 +16,7 @@ from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import is_sft_mode, sft_partition_ids, sft_task_name
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 app = FastAPI()
@@ -71,16 +71,16 @@ class Actor(Base):
 
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role=self.role,
+        )
 
-        self.steps = ray.get(
-            self.actor_model.async_init(
-                config,
-                role=self.role,
-                with_ref=config.kl_coef != 0 or config.use_kl_loss,
-                with_opd_teacher=self.config.opd_teacher_load,
-            )
+        self.steps = self.actor_model.init_and_wait(
+            config,
+            role=self.role,
+            with_ref=config.kl_coef != 0 or config.use_kl_loss,
+            with_opd_teacher=self.config.opd_teacher_load,
         )
 
         assert len(set(self.steps)) == 1

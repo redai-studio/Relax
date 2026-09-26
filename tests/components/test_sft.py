@@ -92,8 +92,7 @@ def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(mon
     from relax.components.sft import SFT
 
     fake_ds, _ = _patch_pipeline_dependencies(monkeypatch, n_samples=10)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", MagicMock())
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", MagicMock())
 
     args = _make_args(global_batch_size=2)
     args.eval_size = 0.2
@@ -135,8 +134,7 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", lambda *a, **kw: fake_client)
 
     args = _make_args(global_batch_size=4)
     SFTCls = SFT.func_or_class
@@ -179,8 +177,7 @@ async def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
 
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", lambda *a, **kw: fake_client)
 
     args = _make_args(global_batch_size=4)
     args.sft_async_prepack = True
@@ -289,8 +286,7 @@ def test_sft_remote_batch_producer_resolves_model_on_its_node(monkeypatch):
     fake_dataset.index_manager = _FakeIndexManager()
     fake_dataset._prefetch = None
 
-    monkeypatch.setattr(sft_module.tq, "init", MagicMock())
-    monkeypatch.setattr(sft_module.tq, "get_client", MagicMock(return_value=fake_client))
+    monkeypatch.setattr(sft_module, "attach_tq_client", MagicMock(return_value=fake_client))
     monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", _prepare_model)
     monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", _load_tokenizer)
     monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
@@ -331,8 +327,7 @@ def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatc
     fake_dataset.index_manager = _FakeIndexManager()
     fake_dataset._prefetch = None
 
-    monkeypatch.setattr(sft_module.tq, "init", MagicMock())
-    monkeypatch.setattr(sft_module.tq, "get_client", MagicMock())
+    monkeypatch.setattr(sft_module, "attach_tq_client", MagicMock())
     monkeypatch.setattr(sft_module, "prepare_model_maybe_update_args", MagicMock())
     monkeypatch.setattr(sft_module.AutoTokenizer, "from_pretrained", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(sft_module, "ProcessorPool", MagicMock())
@@ -349,6 +344,73 @@ def test_sft_remote_batch_producer_restricts_train_pool_for_eval_size(monkeypatc
     train_indices, _eval_indices = resolve_sft_split_indices(10, 0.2, seed=args.seed)
     assert state["train_size"] == 8
     fake_dataset.restrict_training_indices.assert_called_once_with(train_indices)
+
+
+def _make_remote_producer(monkeypatch, sft_module):
+    detach = MagicMock()
+    monkeypatch.setattr(sft_module, "detach_tq_client", detach)
+
+    args = _make_args(global_batch_size=2)
+    producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
+    producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
+    producer.data_system_client = MagicMock()
+    producer._dataset = MagicMock()
+    producer._processor_pool = MagicMock()
+    return producer, detach
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_detaches_tq_client_on_stop(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+    producer._dataset.stop.assert_called_once_with()
+    producer._processor_pool.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_stop_detaches_once_across_repeated_stops(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    await producer.stop()
+    await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+
+
+@pytest.mark.asyncio
+async def test_sft_remote_batch_producer_stop_detaches_when_local_workers_fail(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+    producer._dataset.stop.side_effect = RuntimeError("worker join failed")
+
+    with pytest.raises(RuntimeError, match="worker join failed"):
+        await producer.stop()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
+
+
+def test_sft_remote_batch_producer_detaches_tq_client_on_actor_teardown(monkeypatch):
+    from relax.components import sft as sft_module
+
+    producer, detach = _make_remote_producer(monkeypatch, sft_module)
+
+    # Graceful actor teardown without a stop() call must still release the shard's
+    # TQ client instead of leaving its segment until client_ttl.
+    producer.__del__()
+
+    detach.assert_called_once_with()
+    assert producer.data_system_client is None
 
 
 @pytest.mark.asyncio
@@ -403,8 +465,7 @@ def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(mon
     fake_ds, _ = _patch_pipeline_dependencies(monkeypatch, n_samples=10)
     monkeypatch.setenv("RELAX_SFT_TQ_SHARDS", "2")
     monkeypatch.setattr("relax.components.sft.ray.is_initialized", lambda: True)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", MagicMock())
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", MagicMock())
 
     args = _make_args(global_batch_size=2)
     args.sft_async_prepack = True
@@ -503,8 +564,7 @@ async def test_sft_step_rejects_empty_or_partial_batch(monkeypatch, returned_cou
 
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", lambda *a, **kw: fake_client)
 
     args = _make_args(global_batch_size=4)
     SFTCls = SFT.func_or_class
@@ -539,8 +599,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     _patch_pipeline_dependencies(monkeypatch)
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", lambda *a, **kw: fake_client)
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
@@ -618,8 +677,7 @@ async def test_sft_loop_advances_step(monkeypatch):
     fake_client = MagicMock()
     fake_client.async_put = AsyncMock(return_value=None)
     fake_client.async_get_partition_list = AsyncMock(return_value=[])
-    monkeypatch.setattr("relax.components.sft.tq.init", lambda *a, **kw: None, raising=False)
-    monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
+    monkeypatch.setattr("relax.components.sft.attach_tq_client", lambda *a, **kw: fake_client)
 
     args = _make_args(global_batch_size=2, num_rollout=3)
     SFTCls = SFT.func_or_class

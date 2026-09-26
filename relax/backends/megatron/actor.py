@@ -14,7 +14,6 @@ import ray
 import requests
 import torch
 import torch.distributed as dist
-import transfer_queue as tq
 from megatron.core import mpu
 
 
@@ -83,6 +82,7 @@ from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
@@ -334,6 +334,18 @@ class MegatronTrainRayActor(TrainRayActor):
         periodic predict steps; Megatron stays awake between."""
         return not is_sft_mode(self.args)
 
+    def __del__(self) -> None:
+        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
+        # kills skip destructors, in which case the Mooncake master TTL
+        # reclaims the segment.
+        if getattr(self, "data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+            self.data_system_client = None
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
+
     def init(
         self,
         args: Namespace,
@@ -370,8 +382,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if repatch is not None:
             repatch(args)
         init(args)
-        tq.init(args.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            args.tq_config,
+            role=role,
+        )
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None

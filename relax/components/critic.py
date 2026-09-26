@@ -7,7 +7,6 @@ from argparse import Namespace
 from typing import Any, Optional
 
 import ray
-import transfer_queue as tq
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
@@ -16,6 +15,7 @@ from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import sft_partition_id
 from relax.utils.async_utils import run
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 @serve.deployment(
@@ -40,14 +40,16 @@ class Critic(Base):
         self.healthy = healthy
         self.role = role
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role=self.role,
+        )
 
         self.critic_model = allocate_train_group(
             args=config, num_gpus=num_gpus, pg=pgs, role=self.role, runtime_env=runtime_env
         )
 
-        ray.get(self.critic_model.async_init(config, role=self.role, with_ref=False))
+        self.critic_model.init_and_wait(config, role=self.role, with_ref=False)
         self.step = getattr(self.config, "start_rollout_id", None) or 0
         # Wired by controller in colocate PPO to gate wake_up on SGLang offload.
         self._rollout_barrier: Optional[RolloutOffloadBarrier] = None
