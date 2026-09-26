@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -244,7 +244,12 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(
+    server_args: ServerArgs,
+    *,
+    publication: bool = False,
+    on_start: Callable[[multiprocessing.Process], None] | None = None,
+) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
     # Each SGLang patch is controlled by its own env flag and applied
@@ -263,20 +268,23 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))
     p.start()
+    if on_start is not None:
+        on_start(p)
 
     if server_args.node_rank != 0:
-        return
+        return p
 
     _wait_server_healthy(
         base_url=server_args.url(),
         api_key=server_args.api_key,
         is_process_alive=lambda: p.is_alive(),
+        flush_cache=not publication,
     )
 
     return p
 
 
-def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
+def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None, *, flush_cache=True):
     """Wait until the server at *base_url* is healthy.
 
     Args:
@@ -319,6 +327,9 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
             time.sleep(2)
 
+        if not flush_cache:
+            return  # Managed bootstrap probe already completed its own drain.
+
         # use flush_cache to make sure the working queue is empty, so that we can do offload
         while True:
             _check_deadline("flush_cache")
@@ -333,6 +344,87 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
                 raise Exception("Server process terminated unexpectedly.")
 
             time.sleep(2)
+
+
+class PublicationEngineClient:
+    """Fixed Ray engine handle; only transport, no version/execution
+    ownership."""
+
+    def __init__(self, handle, identity) -> None:
+        self.handle = handle
+        self.identity = identity
+
+    def _payload(self, snapshot, cohort_id: str, operation_id: str) -> dict:
+        from relax.engine.lora.publication import native_instance_id
+
+        return {
+            "cohort_id": cohort_id,
+            "engine_boot_id": self.identity.boot_id,
+            "native_lora_id": native_instance_id(self.identity, cohort_id, operation_id),
+            "digest": snapshot.digest,
+        }
+
+    async def _version_call(self, endpoint: str, snapshot, cohort_id: str, operation_id: str, *, path=None):
+        from relax.engine.lora.publication import AdapterPublicationError, EngineReceipt
+
+        payload = self._payload(snapshot, cohort_id, operation_id)
+        if path is not None:
+            payload["path"] = path
+        result = await self.handle.lora_publication_call.remote(endpoint, payload)
+        if result.get("transport_unknown"):
+            raise ConnectionError(result["error"])
+        if result.get("error_code"):
+            raise AdapterPublicationError(result["error_code"], result.get("error", ""))
+        if any(result.get(key) != payload[key] for key in ("cohort_id", "engine_boot_id", "native_lora_id", "digest")):
+            raise AdapterPublicationError("ENGINE_RECEIPT_MISMATCH")
+        return EngineReceipt(
+            self.identity,
+            cohort_id,
+            operation_id,
+            snapshot.version_id,
+            result["digest"],
+            result["native_lora_id"],
+            result["state"],
+            result["pinned"],
+            result["resident"],
+            result["fenced"],
+            actual_unload_count=result.get("actual_unload_count"),
+            observation=result.get("observation"),
+        )
+
+    async def prepare(self, snapshot, cohort_id: str, operation_id: str):
+        checked = await self.handle.verify_lora_artifact.options(concurrency_group="artifact").remote(
+            snapshot.version_id, snapshot.digest, cohort_id, self.identity.boot_id
+        )
+        return await self._version_call(
+            "prepare_lora_version", snapshot, cohort_id, operation_id, path=checked["path"]
+        )
+
+    async def status(self, snapshot, cohort_id: str, operation_id: str):
+        return await self._version_call("lora_version_status", snapshot, cohort_id, operation_id)
+
+    async def retire(self, snapshot, cohort_id: str, operation_id: str):
+        return await self._version_call("retire_lora_version", snapshot, cohort_id, operation_id)
+
+    async def close_session(self, cohort_id: str, owner_epoch: str, session_id: str):
+        from relax.engine.lora.publication import AdapterPublicationError, SessionReceipt
+
+        result = await self.handle.lora_publication_call.remote(
+            "close_lora_session",
+            {
+                "cohort_id": cohort_id,
+                "engine_boot_id": self.identity.boot_id,
+                "owner_epoch": owner_epoch,
+                "session_id": session_id,
+            },
+        )
+        if result.get("transport_unknown"):
+            raise ConnectionError(result["error"])
+        if result.get("engine_boot_id") != self.identity.boot_id:
+            raise AdapterPublicationError("ENGINE_EPOCH_MISMATCH")
+        return SessionReceipt(
+            self.identity, result["cohort_id"], result["owner_epoch"], result["session_id"], result["state"]
+        )
 
 
 class SGLangEngine(RayActor):
@@ -353,6 +445,7 @@ class SGLangEngine(RayActor):
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
         self._evicted = threading.Event()
+        self._lora_closing = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
         if register_sigterm_handler:
@@ -538,8 +631,49 @@ class SGLangEngine(RayActor):
 
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
+        publication = getattr(self.args, "_lora_publication_launch", None)
+        if publication is not None:
+            if self.worker_type != "regular":
+                raise ValueError("publication requires regular inference engines")
+            server_args_dict.update(
+                model_path=self.args.hf_checkpoint,
+                load_format="auto",
+                skip_server_warmup=True,
+                enable_lora=True,
+                max_lora_rank=self.args.lora_rank,
+                lora_target_modules=convert_megatron_to_sglang_target_modules(self.args.lora_target_modules),
+                max_loras_per_batch=publication["capacity"] + 1,
+                max_loaded_loras=publication["capacity"] + 1,
+                enable_weights_cpu_backup=bool(server_args_dict.get("enable_memory_saver"))
+                or server_args_dict.get("enable_weights_cpu_backup", False),
+            )
+            from pathlib import Path
+
+            from relax.engine.lora.artifact import ModelContract
+            from relax.engine.lora.snapshot import fingerprint_model
+
+            base = fingerprint_model(server_args_dict["model_path"])
+            if base != publication["base_model_digest"]:
+                raise ValueError("BASE_MODEL_MISMATCH")
+            self._lora_contract = ModelContract(
+                base,
+                json.loads((Path(server_args_dict["model_path"]) / "config.json").read_text()),
+                server_args_dict["max_lora_rank"],
+                tuple(server_args_dict["lora_target_modules"]),
+            )
+            os.environ["RELAX_LORA_NATIVE_CONFIG"] = json.dumps(
+                {key: publication[key] for key in ("artifact_store", "cohort_id", "max_lifecycle_records")}
+            )
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        try:
+            self.process = launch_server_process(
+                ServerArgs(**server_args_dict),
+                publication=publication is not None,
+                on_start=lambda process: setattr(self, "process", process),
+            )
+        finally:
+            if publication is not None:
+                os.environ.pop("RELAX_LORA_NATIVE_CONFIG", None)
 
         bootstrap_port = (
             server_args_dict.get("disaggregation_bootstrap_port") if self.worker_type == "prefill" else None
@@ -569,9 +703,63 @@ class SGLangEngine(RayActor):
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
+            if payload and payload.get("lora_memory_sequence") is not None:
+                raise RuntimeError(f"managed memory control failed: {response.text}") from e
             e.add_note(f"{response.text=}")
             raise
         return response.json()
+
+    def lora_publication_identity(self) -> dict:
+        response = requests.get(self.get_url() + "/lora_publication_capability", timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("protocol") != "relax.immutable-lora.v3" or not result.get("engine_boot_id"):
+            raise ValueError("engine has no verified native publication capability")
+        return {
+            **result,
+            "endpoint": self.get_url(),
+            "engine_id": str(self.rank - self.node_rank),
+            "base_model_digest": self._lora_contract.base_digest,
+        }
+
+    def verify_lora_artifact(self, version_id: str, digest: str, cohort_id: str, boot_id: str) -> dict:
+        """Read-only artifact group; cancellation/health retain the control
+        group."""
+        from pathlib import Path
+
+        from relax.engine.lora.snapshot import AdapterSnapshot
+
+        def check_boot():
+            if self._lora_closing.is_set():
+                raise RuntimeError("ENGINE_CLOSING")
+            current = self.lora_publication_identity()
+            if (current["cohort_id"], current["engine_boot_id"]) != (cohort_id, boot_id):
+                raise RuntimeError("ENGINE_EPOCH_MISMATCH")
+
+        check_boot()
+        store = Path(self.args._lora_publication_launch["artifact_store"]).resolve(strict=True)
+        snapshot = AdapterSnapshot(
+            version_id, digest, self._lora_contract.base_digest, store / "versions" / version_id
+        )
+        if snapshot.path.resolve().parent != store / "versions":
+            raise ValueError("INVALID_ARTIFACT_PATH")
+        snapshot.confirm_sealed()
+        self._lora_contract.validate(snapshot.path)
+        check_boot()
+        return {"path": str(snapshot.path)}
+
+    def lora_publication_call(self, endpoint: str, payload: dict) -> dict:
+        if endpoint not in {
+            "prepare_lora_version",
+            "lora_version_status",
+            "retire_lora_version",
+            "close_lora_session",
+        }:
+            raise ValueError("unsupported publication control method")
+        try:
+            return self._make_request(endpoint, payload, timeout=5)
+        except (requests.Timeout, requests.ConnectionError) as error:
+            return {"transport_unknown": True, "error": str(error)}
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -791,8 +979,71 @@ class SGLangEngine(RayActor):
             time.sleep(1)
 
     def shutdown(self):
+        self._lora_closing.set()
         if self.args.rollout_external:
             return
+
+        if getattr(self.args, "_lora_publication_launch", None):
+            import psutil
+
+            process = getattr(self, "process", None)
+            if process is None:
+                # Ray serializes init/shutdown; no process was ever launched.
+                return {"processes_exited": True}
+            if not hasattr(self, "_lora_shutdown_children"):
+                try:
+                    root = psutil.Process(process.pid)
+                    # Suspend the parent before taking the descendant inventory
+                    # so shutdown cannot race another scheduler spawn.
+                    root.suspend()
+                    frozen = {root.pid: root}
+                    # A child may itself be starting workers. Freeze each
+                    # discovered descendant and repeat until the tree closes.
+                    while True:
+                        children = root.children(recursive=True)
+                        unseen = [child for child in children if child.pid not in frozen]
+                        if not unseen:
+                            break
+                        for child in unseen:
+                            try:
+                                child.suspend()
+                                frozen[child.pid] = child
+                            except psutil.NoSuchProcess:
+                                pass
+                    self._lora_shutdown_children = list(frozen.values())
+                except psutil.NoSuchProcess:
+                    raise RuntimeError("ENGINE_PROCESS_EXIT_UNKNOWN: process disappeared before inventory")
+            deadline = time.monotonic() + 10
+            for child in reversed(self._lora_shutdown_children):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            # Reap our direct child through multiprocessing, which owns its
+            # exit status. Grandchildren may remain zombies under Docker PID 1;
+            # wait_procs treats those unreaped PIDs as alive although they can
+            # no longer execute. Keep one deadline below RM's 15-second timeout.
+            process.join(timeout=max(0, deadline - time.monotonic()))
+            while True:
+                alive, unreaped = {}, []
+                for child in self._lora_shutdown_children:
+                    try:
+                        if not child.is_running():  # Also rejects a reused PID.
+                            continue
+                        status = child.status()
+                        if status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                            unreaped.append(child.pid)
+                        else:
+                            alive[child.pid] = status
+                    except psutil.NoSuchProcess:
+                        pass
+                if not alive:
+                    if unreaped:
+                        logger.info("Engine processes exited; PID entries await parent reaping: %s", unreaped)
+                    return {"processes_exited": True}
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"ENGINE_PROCESS_EXIT_UNKNOWN: remaining processes {alive}")
+                time.sleep(0.05)
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
         self.unregister_from_router()
@@ -1013,16 +1264,27 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response.json()["weight_version"]
 
-    def release_memory_occupation(self):
-        self.flush_cache()
-        return self._make_request("release_memory_occupation")
-
-    def resume_memory_occupation(self, tags: list[str] = None):
-        """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
-            "resume_memory_occupation",
-            {"tags": tags},
+    def release_memory_occupation(
+        self, memory_sequence: int | None = None, memory_owner: tuple[str, str] | None = None
+    ):
+        if getattr(self.args, "_lora_publication_launch", None) is None:
+            self.flush_cache()
+        # Managed native control drains before its explicit offload KV reset.
+        payload = (
+            {}
+            if memory_sequence is None
+            else {"lora_memory_sequence": memory_sequence, "lora_memory_owner": memory_owner}
         )
+        return self._make_request("release_memory_occupation", payload)
+
+    def resume_memory_occupation(
+        self, tags: list[str] = None, memory_sequence: int | None = None, memory_owner: tuple[str, str] | None = None
+    ):
+        """Available tags for multi-stage resume: weights, kv_cache."""
+        payload = {"tags": tags}
+        if memory_sequence is not None:
+            payload.update(lora_memory_sequence=memory_sequence, lora_memory_owner=memory_owner)
+        return self._make_request("resume_memory_occupation", payload)
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})

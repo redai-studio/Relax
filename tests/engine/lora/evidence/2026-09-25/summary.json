@@ -1,0 +1,512 @@
+{
+  "status": "PASS",
+  "full_acceptance": "PASS",
+  "missing_evidence": [],
+  "gpus": [
+    {
+      "index": "2",
+      "uuid": "GPU-5fae9c69-13d8-5041-b4fe-a6d2030e9d21",
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memory_mb": "49140",
+      "driver": "580.126.09"
+    },
+    {
+      "index": "3",
+      "uuid": "GPU-71e28212-ad41-8e21-3dbb-b4e1055569d7",
+      "name": "NVIDIA RTX 6000 Ada Generation",
+      "memory_mb": "49140",
+      "driver": "580.126.09"
+    }
+  ],
+  "software": {
+    "python": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "packages": {
+      "torch": "2.11.0+cu129",
+      "sglang": "0.5.17",
+      "ray": "2.58.0",
+      "transformers": "5.12.1",
+      "safetensors": "0.8.0",
+      "peft": "0.20.0"
+    },
+    "relax_commit": "6d78410f577aa98a0671221651de108af371bb4e",
+    "relax_status": " M docker/patch/sglang/v0.5.17.patch\n M relax/agentic/pipeline/runtime.py\n M relax/agentic/session/service.py\n M relax/agentic/session/state.py\n M relax/backends/megatron/actor.py\n M relax/backends/megatron/checkpoint.py\n M relax/backends/sglang/sglang_engine.py\n M relax/components/actor.py\n M relax/components/rollout.py\n M relax/distributed/ray/actor_group.py\n M relax/distributed/ray/rollout.py\n M relax/distributed/ray/rollout_validation.py\n M relax/utils/arguments.py\n M tests/backends/megatron/weight_update/test_lora_weight_sync.py\n M tests/backends/sglang/test_sglang_engine.py\n M tests/distributed/ray/conftest.py\n M tests/distributed/ray/test_utils.py\n M tests/test_agentic_rollout.py\n?? docs/draft/immutable-lora-publication-redesign-rfc.md\n?? examples/immutable_lora/\n?? relax/engine/lora/\n?? tests/backends/megatron/test_lora_export_lifecycle.py\n?? tests/backends/sglang/conftest.py\n?? tests/backends/sglang/lora_test_hooks/\n?? tests/backends/sglang/test_lora_verification_hooks.py\n?? tests/backends/sglang/test_native_lora_execution.py\n?? tests/backends/sglang/test_native_lora_execution_hooks.py\n?? tests/backends/sglang/test_native_lora_retirement.py\n?? tests/backends/sglang/test_native_lora_versions.py\n?? tests/components/test_actor_lora_publication.py\n?? tests/distributed/ray/test_lora_membership.py\n?? tests/engine/lora/\n",
+    "sglang_patch_sha256": "e8d169e72532760f5883379c5dde21a4e246fcdfd1ebd25c3d09981f2be3ebf0"
+  },
+  "inference_profile": "deterministic_triton",
+  "raw_report": {
+    "path": "/tmp/relax-no7-acceptance-20260925-r2/report.json",
+    "sha256": "ddb58d2bf74d9905b0d39ebac531dea1fe87609d49b26d93b30ae8d24b798abb"
+  },
+  "task_evidence": {
+    "publication": {
+      "path": "publication.json.gz",
+      "sha256": "a4551df3c69d08c96ab69df55224dc392f75723b34baaba570ea5394dd466c19",
+      "bytes": 14457,
+      "status": "PASS"
+    },
+    "sessions": {
+      "path": "sessions.json.gz",
+      "sha256": "6e71d042006fbbcc2369d76c9b4676cd8889a0c9a0d463502136ea4c22f1fb0c",
+      "bytes": 243187,
+      "status": "PASS"
+    },
+    "capacity": {
+      "path": "capacity.json.gz",
+      "sha256": "fadf9524a25f1b284bb78c2e3c23e6980c54ef6221b567fa7ae8115e95cc3bf4",
+      "bytes": 22024,
+      "status": "PASS"
+    },
+    "numerical_cache": {
+      "path": "numerical_cache.json.gz",
+      "sha256": "127dd056ecade74d44663fff8c1902b3a4b5c319acd12de4114153060e429607",
+      "bytes": 204161,
+      "status": "PASS"
+    },
+    "performance": {
+      "path": "performance.json.gz",
+      "sha256": "445a543e88c9d3866a5c44764b96aafe517837fc448727de3956756ade6035e3",
+      "bytes": 493751,
+      "status": "PASS"
+    },
+    "export": {
+      "path": "export.json.gz",
+      "sha256": "beb590ca1ddcf55e8994465e673b31884f40b789955bd530fbd1470ba1fefacb",
+      "bytes": 4258,
+      "status": "PASS"
+    }
+  },
+  "checks": {
+    "partial_readiness": "PASS",
+    "failure_late_ack": "PASS",
+    "publication_idempotence": "PASS",
+    "content_conflict": "PASS",
+    "session_logprob_comparison": "PASS",
+    "old_session_logprobs": "PASS",
+    "new_session_logprobs": "PASS",
+    "abort_resume": "PASS",
+    "missing_adapter_rejected": "PASS",
+    "native_pin": "PASS",
+    "capacity": "PASS",
+    "last_gpu_use": "PASS",
+    "cancel_finish_race": "PASS",
+    "slot_clear_completion": "PASS",
+    "slot_reuse": "PASS",
+    "slot_reuse_negative_control": "PASS",
+    "c_generation_and_b_continuation": "PASS",
+    "cuda_graph": "PASS",
+    "baseline_repeatability": "PASS",
+    "fixture_separation": "PASS",
+    "kv_sensitivity": "PASS",
+    "cache_a_to_b": "PASS",
+    "cache_b_to_a": "PASS",
+    "wrong_kv_negative_control": "PASS",
+    "mixed_batch": "PASS",
+    "steady_state_overhead": "PASS",
+    "continuous_traffic": "PASS",
+    "real_export": "PASS"
+  },
+  "tolerances": {
+    "atol": 0.001,
+    "rtol": 0.001,
+    "kv_atol": 0.001,
+    "kv_rtol": 0.001
+  },
+  "session_comparisons": {
+    "sessions": {
+      "count": 65,
+      "max_error": 0.0
+    },
+    "publication": {
+      "count": 3,
+      "max_error": 0.0
+    }
+  },
+  "cache_comparisons": {
+    "cache_a_to_b": {
+      "count": 64,
+      "max_error": 0.0
+    },
+    "cache_b_to_a": {
+      "count": 64,
+      "max_error": 0.0
+    }
+  },
+  "continuous_traffic": {
+    "status": "PASS",
+    "steady_a": {
+      "start": 2651200.162328957,
+      "end": 2651230.163277856,
+      "token_throughput": {
+        "all": 320.1232078473677,
+        "0": 164.12814196589324,
+        "1": 155.9950658814745
+      },
+      "accepted": 8,
+      "failed": 0,
+      "forbidden_mutation_calls": 0,
+      "ttft": [
+        0.027260283939540386,
+        0.02674949634820223,
+        0.028004168067127466,
+        0.027581047266721725,
+        0.027325063943862915,
+        0.026775399688631296,
+        0.027307623997330666,
+        0.026723627001047134
+      ],
+      "p50": 12.531707310583442,
+      "p95": 13.183076669927686,
+      "p99": 13.183076669927686,
+      "max_progress_gaps": {
+        "all": 0.049814990255981684,
+        "0": 0.05345636187121272,
+        "1": 0.05020781699568033
+      },
+      "throughput": 0.26665823227602475,
+      "publication": {}
+    },
+    "publication_a": {
+      "start": 2651252.749923292,
+      "end": 2651282.750907127,
+      "token_throughput": {
+        "all": 320.78947987226456,
+        "0": 164.72793116466454,
+        "1": 156.06154870760005
+      },
+      "accepted": 8,
+      "failed": 0,
+      "forbidden_mutation_calls": 0,
+      "ttft": [
+        0.026559813879430294,
+        0.025962252635508776,
+        0.02835720730945468,
+        0.027738105040043592,
+        0.02641140203922987,
+        0.02586324606090784,
+        0.027525935787707567,
+        0.026791926939040422
+      ],
+      "p50": 12.45444568991661,
+      "p95": 13.126006675884128,
+      "p99": 13.126006675884128,
+      "max_progress_gaps": {
+        "all": 0.04904773412272334,
+        "0": 0.04974834620952606,
+        "1": 0.05052997078746557
+      },
+      "throughput": 0.2666579217558309,
+      "publication": {
+        "started": 2651252.749956901,
+        "result": {
+          "operation_id": "2fc1f9430b304503ad3726488eb8ba76",
+          "version_id": "B",
+          "digest": "2a78ebe47f93c98ba3845d16d5419808f624837347430a74d2d19eb29bf045c1",
+          "state": "PUBLISHED",
+          "cleanup_pending": false,
+          "session_refs": 0,
+          "binding": {
+            "cohort_id": "e51af83229c246ceac14b9470fb474b2",
+            "version_id": "B",
+            "digest": "2a78ebe47f93c98ba3845d16d5419808f624837347430a74d2d19eb29bf045c1",
+            "publication_id": "2fc1f9430b304503ad3726488eb8ba76",
+            "publication_epoch": 2,
+            "lora_path": "relax_policy@B",
+            "source_train_step": 0
+          },
+          "publish_targets": [
+            "0",
+            "1"
+          ],
+          "resident_targets": [
+            "0",
+            "1"
+          ],
+          "native_instances": {
+            "1": "dadc0926d55d5f7bbce1cf1be5c9e118",
+            "0": "d1cd557b609757e3be602a7a7783debd"
+          },
+          "ready": {
+            "0": {
+              "engine": {
+                "engine_id": "0",
+                "boot_id": "78d05fa8e03c4d209c365e0b32a9f02b:19b1f5e0bd8c39e472fbe11168136b51751f7aa32ac641f62b058ea705052b6c",
+                "endpoint": "http://engine-host-1.invalid:15431"
+              },
+              "cohort_id": "e51af83229c246ceac14b9470fb474b2",
+              "operation_id": "2fc1f9430b304503ad3726488eb8ba76",
+              "version_id": "B",
+              "digest": "2a78ebe47f93c98ba3845d16d5419808f624837347430a74d2d19eb29bf045c1",
+              "native_lora_id": "d1cd557b609757e3be602a7a7783debd",
+              "state": "READY",
+              "pinned": true,
+              "resident": true,
+              "fenced": false,
+              "actual_unload_count": 0,
+              "observation": {
+                "native_lora_id": "d1cd557b609757e3be602a7a7783debd",
+                "state": "READY",
+                "slot": 2,
+                "resident": true,
+                "clearing": false,
+                "pinned": true,
+                "cpu_adapter": true,
+                "config": true,
+                "native_executions": 0,
+                "actual_unload_count": 0
+              }
+            },
+            "1": {
+              "engine": {
+                "engine_id": "1",
+                "boot_id": "4a8e918eb36c4b9a81c4d0b2b9f3ac5a:a13dc32fc3dd4afbd0578d7792bb5a0d45d63870570c11a8113c89c170b1e3cd",
+                "endpoint": "http://engine-host-1.invalid:15433"
+              },
+              "cohort_id": "e51af83229c246ceac14b9470fb474b2",
+              "operation_id": "2fc1f9430b304503ad3726488eb8ba76",
+              "version_id": "B",
+              "digest": "2a78ebe47f93c98ba3845d16d5419808f624837347430a74d2d19eb29bf045c1",
+              "native_lora_id": "dadc0926d55d5f7bbce1cf1be5c9e118",
+              "state": "READY",
+              "pinned": true,
+              "resident": true,
+              "fenced": false,
+              "actual_unload_count": 0,
+              "observation": {
+                "native_lora_id": "dadc0926d55d5f7bbce1cf1be5c9e118",
+                "state": "READY",
+                "slot": 2,
+                "resident": true,
+                "clearing": false,
+                "pinned": true,
+                "cpu_adapter": true,
+                "config": true,
+                "native_executions": 0,
+                "actual_unload_count": 0
+              }
+            }
+          },
+          "absent": [],
+          "absence_receipts": {},
+          "errors": {},
+          "publication_seconds": 0.3548701172694564
+        },
+        "completed": 2651253.166933539,
+        "seconds": 0.41697663767263293,
+        "crossing_requests": {
+          "0": [
+            "02eb1b2180684be382b376b40429a970",
+            "7489732f93d04d6a8d979e3efc478d16"
+          ],
+          "1": [
+            "d2e1bbd90e76421c861adccbdb2af441",
+            "0d08e34f627340508997b7b8dbca3411"
+          ]
+        }
+      }
+    },
+    "steady_ab": {
+      "start": 2651305.377822365,
+      "end": 2651335.378844068,
+      "token_throughput": {
+        "all": 323.5889796080647,
+        "0": 167.66095667784975,
+        "1": 155.92802293021495
+      },
+      "accepted": 8,
+      "failed": 0,
+      "forbidden_mutation_calls": 0,
+      "ttft": [
+        0.025840194895863533,
+        0.025255870074033737,
+        0.028206900227814913,
+        0.027568912133574486,
+        0.025940666906535625,
+        0.025370150804519653,
+        0.028660327196121216,
+        0.028148062992841005
+      ],
+      "p50": 12.213259025011212,
+      "p95": 13.12264575343579,
+      "p99": 13.12264575343579,
+      "max_progress_gaps": {
+        "all": 0.04903243202716112,
+        "0": 0.04951271880418062,
+        "1": 0.05034713773056865
+      },
+      "throughput": 0.2666575851735185,
+      "publication": {}
+    },
+    "comparison": "publication uses retained A sessions; compared with the same A-only offered load"
+  },
+  "steady_state_overhead": {
+    "status": "PASS",
+    "ordinary": {
+      "start": 2651147.994125176,
+      "end": 2651177.994701439,
+      "token_throughput": {
+        "all": 326.09373614338097,
+        "0": 168.09677106931107,
+        "1": 157.9969650740699
+      },
+      "accepted": 8,
+      "failed": 0,
+      "forbidden_mutation_calls": 0,
+      "ttft": [
+        0.027924514841288328,
+        0.027445483952760696,
+        0.03018734324723482,
+        0.02968156710267067,
+        0.02624646807089448,
+        0.02557106502354145,
+        0.027451133355498314,
+        0.026982647366821766
+      ],
+      "p50": 12.34851820487529,
+      "p95": 13.14517194731161,
+      "p99": 13.14517194731161,
+      "max_progress_gaps": {
+        "all": 0.03714680904522538,
+        "0": 0.03714680904522538,
+        "1": 0.04059477290138602
+      },
+      "throughput": 0.26666154442880996,
+      "publication": {}
+    },
+    "managed": {
+      "start": 2651200.162328957,
+      "end": 2651230.163277856,
+      "token_throughput": {
+        "all": 320.1232078473677,
+        "0": 164.12814196589324,
+        "1": 155.9950658814745
+      },
+      "accepted": 8,
+      "failed": 0,
+      "forbidden_mutation_calls": 0,
+      "ttft": [
+        0.027260283939540386,
+        0.02674949634820223,
+        0.028004168067127466,
+        0.027581047266721725,
+        0.027325063943862915,
+        0.026775399688631296,
+        0.027307623997330666,
+        0.026723627001047134
+      ],
+      "p50": 12.531707310583442,
+      "p95": 13.183076669927686,
+      "p99": 13.183076669927686,
+      "max_progress_gaps": {
+        "all": 0.049814990255981684,
+        "0": 0.05345636187121272,
+        "1": 0.05020781699568033
+      },
+      "throughput": 0.26665823227602475,
+      "publication": {}
+    }
+  },
+  "single_unload_per_engine": {
+    "1": 1,
+    "0": 1
+  },
+  "training_export": {
+    "state": "SEALED",
+    "producer": "relax.backends.fsdp.checkpoint.export_peft_adapter",
+    "exported_step": 1,
+    "export_step": 1,
+    "scope": "single-process real HF optimizer step and existing Relax DCP save/export; no distributed trainer",
+    "checkpoint": "/tmp/relax-no7-acceptance-20260925-r2/training-export/checkpoints/publication_acceptance/iter_0000001",
+    "save_function": "relax.backends.fsdp.checkpoint.save_checkpoint",
+    "model_path": "/workspace/models/Qwen3-1.7B",
+    "base_model_digest": "0e80bf436f210fabecaff5fd897c732afc7dedd0801731a09f5ad5d43871b4c1",
+    "loss": 6.617617607116699,
+    "training_tokens": 16,
+    "injected_layers": 56,
+    "changed_tensors": 56,
+    "max_adapter_update": 0.001007080078125,
+    "exported_tensor_count": 112,
+    "round_trip_exact": true,
+    "snapshot": {
+      "version_id": "TRAINED",
+      "digest": "5d150235ccaf07f2f9ebb322fda25ad32febe4715843aaec5dce95e45d363518",
+      "path": "/tmp/relax-no7-acceptance-20260925-r2/artifacts/store/versions/TRAINED"
+    }
+  },
+  "cpu_regression": {
+    "passed": 442,
+    "skipped": 7,
+    "log_sha256": "c83003a1b420354439928b0b871e9033c364cc209152287c22995d23d5d57287",
+    "invocation": "RELAX_SGLANG_SOURCE=/workspace/sglang-no7 python -m pytest",
+    "supplementary": {
+      "passed": 67,
+      "skipped": 1,
+      "overlaps_main_selection": true
+    }
+  },
+  "source_sha256": {
+    "docker/patch/sglang/v0.5.17.patch": "e8d169e72532760f5883379c5dde21a4e246fcdfd1ebd25c3d09981f2be3ebf0",
+    "examples/immutable_lora/agent.py": "dec2da4b324d94580ba4abb0df3c3c310e27754b43c5951d9779449643a970c7",
+    "relax/agentic/pipeline/runtime.py": "66704a89025352bd22b8455770f070f7db4f007de192a5c58dceb0d309fed890",
+    "relax/agentic/session/service.py": "a30a532a0194830b25c70b36da1f4d297508a97bdc78e8d652fec396ac6742d0",
+    "relax/agentic/session/state.py": "2dfffe6d8870d4d8ba4786426c4393d3b7c1e89a68f53bff5c9239a964ae64af",
+    "relax/backends/megatron/actor.py": "1cc601067ed5e2c6e69457af1c7a258448b05631e4d2d02d9be4a47d7914f909",
+    "relax/backends/megatron/checkpoint.py": "f3813a494664bdc8414d91be1ee5237e0cd1776c9be592cc50cac62f64d0b372",
+    "relax/backends/sglang/sglang_engine.py": "341b87841e576cf378d5ec2ec99b7cc11677a9f28d9630decc8331ad2dc79327",
+    "relax/components/actor.py": "b4a0b995260144f33a768729e86c40a8442bf4acbea4817d459cc8280b8c0124",
+    "relax/components/rollout.py": "8a956272489c8d42478fa8f78ff2a41aa9317a4b497d50575e4471c8ff081dd6",
+    "relax/distributed/ray/actor_group.py": "8fdf121cf867db09264eb50ba6d1fa36eda1bb5c894886d865e4ab0117cd2a19",
+    "relax/distributed/ray/rollout.py": "a807490d7d15cfd06b5cde22f60e004ae11959019ef2a3d6b906a89cef625fd6",
+    "relax/distributed/ray/rollout_validation.py": "abea7370a7524a941a4bacfc0da62ccc8d708baf0d901a05594ee999a2dd6ed8",
+    "relax/engine/lora/__init__.py": "5fab053142466e2d7d77dfae5c845ef8ca6c9e4c3e73bfc0d73792ab4be157cc",
+    "relax/engine/lora/artifact.py": "08328f9a67e7c83bd42bfc56b9d2d05479d13c777e65d47162745a9f5720c104",
+    "relax/engine/lora/cli.py": "87a5e4346f76434ca13080ab3f6ba1372e78588fcaab1805f0c768ea86930d7e",
+    "relax/engine/lora/publication.py": "7c9aaf5cb4abee0d60ddc5ebb65c5fdf279bab52c248b3f14e08ece772c85eb7",
+    "relax/engine/lora/snapshot.py": "090e48f975106e8f8bece051fb5ace8496fe2b3be70c8daeaf29bc8ecd55e13f",
+    "relax/utils/arguments.py": "10e643171649d785610824e99c32873d7aafd912466343dddcbb123bed1639fb",
+    "tests/backends/megatron/test_lora_export_lifecycle.py": "26fff09077fd1712a24663a753a5d22b356147df8ca9f87f013ddf9ed759833a",
+    "tests/backends/megatron/weight_update/test_lora_weight_sync.py": "e75977e524743c06acdb24a3dcc92d5cab1d0447ecf3298c2c1bb0edf996cf97",
+    "tests/backends/sglang/conftest.py": "9898af19306009f05de2b030bc96e70491329b5a41f6bebdcf04812ad73e164c",
+    "tests/backends/sglang/lora_test_hooks/sitecustomize.py": "2e3d12ed547d98c135ecbe48b9a91e149bb58a4a324c10cf30dbe7e7d11208f2",
+    "tests/backends/sglang/test_lora_verification_hooks.py": "174e8b82020881e8b2d92eca03e47f1adfeda508cba330528b5626a88b1afef6",
+    "tests/backends/sglang/test_native_lora_execution.py": "030ad2b55334e86c2b8813945591783112c1c9b9a2b1810c8cfeeafde3948455",
+    "tests/backends/sglang/test_native_lora_execution_hooks.py": "94ae61832f0059655e3a3e9ff6ff3343d92faf01ef690521434eca8a51fb9aea",
+    "tests/backends/sglang/test_native_lora_retirement.py": "77f1494aa8290e65a4a96495e3fa2f02fdb6a979d06559242d701e3cdc06765d",
+    "tests/backends/sglang/test_native_lora_versions.py": "8687c52b8f033747b357748b1cb3c0ecb12eaf6c0d232a60d8e12d3edea4ee42",
+    "tests/backends/sglang/test_sglang_engine.py": "cc236e83891c7ea82f4ab33a78aa22bc9b141ec1db1b717c5ba28c89cab56aa2",
+    "tests/components/test_actor_lora_publication.py": "920878830773f4bd794ffa1e83c41beb5b57677f112ed84aeb2284fb05ce7f5e",
+    "tests/distributed/ray/conftest.py": "3e32a56dd626bab681df22859c7f4c9bcea5cf11d6bee4c1f7591948ab4dcae7",
+    "tests/distributed/ray/test_lora_membership.py": "3fce41f42db85a456dc09e3086bc48661d5272a9c13af90ec20f5cf449a8b7e0",
+    "tests/distributed/ray/test_utils.py": "77613520cc3629010fd3342ddc71a038a0834fd6289b586e01f4694438087137",
+    "tests/engine/lora/acceptance/__init__.py": "9159d3b39fe8459663af830c9068ace20cef5d7ccb123bee71873cfbc52d271b",
+    "tests/engine/lora/acceptance/__main__.py": "fb7bc68bfef7ccff0c0f5870700114bbb6b77878f9b39a68f4be9ade19c2d190",
+    "tests/engine/lora/acceptance/agent.py": "dec2da4b324d94580ba4abb0df3c3c310e27754b43c5951d9779449643a970c7",
+    "tests/engine/lora/acceptance/assertions.py": "54e1f40f2caa869fd928373562257fb56f69d4617fdeaa240c3ebc6fa7d1d752",
+    "tests/engine/lora/acceptance/cluster.py": "61b298a1f4b8ffc625ae5af21d23a12f4069eb6e686744560e9a374bac24ab10",
+    "tests/engine/lora/acceptance/conftest.py": "b8f2de544455fa8b1fe011bed250a27007bb2f0f545c3b65dc5099a3d921812d",
+    "tests/engine/lora/acceptance/deployment.py": "cb4f1687cd7be2416c409b56830e5c3c283ce0e72808e0dbd4b0b7a908925787",
+    "tests/engine/lora/acceptance/diagnose.py": "de72530aa2460eb6bdcaf357d4671b942d30af91b098bf24a82cce599c6b2d98",
+    "tests/engine/lora/acceptance/fixtures.py": "6a797c94983d9419640cc49d30c743f19b5bebcd38e2c4e1ab1f043647f1d470",
+    "tests/engine/lora/acceptance/overhead.py": "ac27ec66d7ca1249799f876a4857fe59f7d6b0bfc1c9c9ee3a0b4b6d7162c3bf",
+    "tests/engine/lora/acceptance/overhead_diagnostics.py": "e6602bd1d4021f0d20058ee21932e36439aeb0d1f4a47108402f7f56702ffeb5",
+    "tests/engine/lora/acceptance/performance.py": "e8473157e4a12ea0f6f9a438ad65edccdc71b85e62bc623c587fb5adbb05d6a5",
+    "tests/engine/lora/acceptance/prepare.py": "90493d6c688678e4696600b8ad4e0e29f61272f46c05ffe502ad117cddd8926b",
+    "tests/engine/lora/acceptance/processes.py": "1ae6007c61b08090d80a0c8a159640b34477e7612301911408d5f495f368f538",
+    "tests/engine/lora/acceptance/scenarios.py": "f18d5754f9fa4e73ae8fa313b113cffdd5dd30fe3c53efb1b70920208535d125",
+    "tests/engine/lora/acceptance/support.py": "d69df9de64beee1e47532ff3b02832eeb0002fad18a9c90f8e91ceb6340ef8dd",
+    "tests/engine/lora/acceptance/test_capacity.py": "758628cc352c7c9a354241ddaf7da489a124121f3386e0d2894e1f9dd6119b49",
+    "tests/engine/lora/acceptance/test_export.py": "d4833678f303b53c00e478b3d6ce582b8605f509c8f20b22fdc6a3d3b64402eb",
+    "tests/engine/lora/acceptance/test_numerical_cache.py": "03538ab991d5484417598b57e1d8a0a7727bff5a1731f749772b89914c44a699",
+    "tests/engine/lora/acceptance/test_performance.py": "7dbf7ab13175c01176f9edaf82f130f7e2cc96bb77428ef3993cd0ca6d983ace",
+    "tests/engine/lora/acceptance/test_publication.py": "1d244776398251e998a3b2da41b907fb51136414d51b5878a45728154fcc7033",
+    "tests/engine/lora/acceptance/test_sessions.py": "684d87f14b3efe16bc81b4b70a3bf847bfab213f2242ec9076b19b38901a2fae",
+    "tests/engine/lora/acceptance/training_export.py": "26f8d1062377d673a4cc32fac23621e83cc768a3f82df021df455c37bb06d47c",
+    "tests/engine/lora/test_acceptance.py": "425e7feadd15367a531d0ae059144079a2a225dd571933fe54f52d834dbe024d",
+    "tests/engine/lora/test_agentic_publication_transport.py": "02a1a01874ad4955f61aa38facef7001c59fb79e923acf8fabc7d181e76251c3",
+    "tests/engine/lora/test_configuration.py": "7f6029ebeee4f238dc3ac679065c0125d56b3945b15f6d7d7429d117471c5536",
+    "tests/engine/lora/test_publication.py": "bbfb0ea63a246973c384d53d38fd49eabb157a06131c4dd178ab05c81c40e8e5",
+    "tests/engine/lora/test_snapshot.py": "b81dca53cae12231e61adfb5829ea3b763f55c480415183535da45f6aa36f01c",
+    "tests/test_agentic_rollout.py": "55745ae16460f11570cbea8256cc3838040eed13ffe4386a29c951caf90b372d"
+  },
+  "source_manifest_note": "Computed after the GPU suite; production source was unchanged after this run.",
+  "redaction": "Private non-loopback IPv4 addresses replaced consistently with engine-host-N.invalid in summary and task archives. Numerical values, version/instance identities, timings and resource counters unchanged. raw_report.sha256 identifies the original unredacted local report."
+}

@@ -41,6 +41,7 @@ from relax.agentic.pipeline.runtime import (
     finish_before_cancellation,
 )
 from relax.agentic.profile import (
+    TRACE_KEY,
     agentic_trace_events,
     mark_agentic_event,
     mark_agentic_event_once,
@@ -69,6 +70,10 @@ from relax.agentic.session.state import (
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
+
+
+class PermitNotGranted(RuntimeError):
+    """The limiter confirmed that this identity owns no execution permit."""
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -1435,6 +1440,8 @@ class _SessionRecord:
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    adapter_binding: dict[str, Any] | None = None
+    adapter_bind_task: asyncio.Task | None = None
 
     @property
     def interrupted(self) -> bool:
@@ -1487,6 +1494,13 @@ class AgenticSessionShard:
             RayAdmissionClient(admission_coordinator) if admission_coordinator is not None else None
         )
         self._permit_cleanup_tasks: set["asyncio.Task[None]"] = set()
+        self._managed_permit_lock = threading.Lock()
+        self._managed_permit_records: dict[str, str] = {}
+        self._managed_permit_capacity = sglang_request_capacity
+        self._managed_permits_held = 0
+        self._managed_permit_epoch = 0
+        self._managed_permit_limit = getattr(args, "_lora_publication_launch", {}).get("max_lifecycle_records", 100000)
+        self._publication_configuration: tuple[str, dict[str, Any], int] | None = None
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
         self._generation_backend = SGLangBackendAdapter(args)
@@ -1495,20 +1509,106 @@ class AgenticSessionShard:
             resolve_chat_api_base_url(),
         )
 
-    @ray.method(concurrency_group="sglang_request_permit")
-    async def acquire_sglang_request_permit(self) -> None:
-        """Queue one backend attempt on the fleet-global limit."""
+    async def configure_lora_publication(self, manager: Any, launch: dict[str, Any], request_capacity: int) -> dict:
+        """Install one RM/cohort before admitting any groups, without calling
+        back into the RM constructor.
 
+        Replays never reset live permit state.
+        """
+        if not getattr(self.args, "lora_publication_config", None):
+            raise ValueError("PUBLICATION_NOT_CONFIGURED")
+        if (
+            not isinstance(launch.get("cohort_id"), str)
+            or not launch["cohort_id"]
+            or type(request_capacity) is not int
+            or request_capacity <= 0
+            or type(launch.get("max_lifecycle_records")) is not int
+            or launch["max_lifecycle_records"] <= 0
+        ):
+            raise ValueError("INVALID_PUBLICATION_CONFIGURATION")
+        # Ray handle equality in older releases compares hashes; compare the
+        # actual actor ID so a different coordinator cannot adopt this Shard.
+        if manager is None:
+            raise ValueError("PUBLICATION_MANAGER_REQUIRED")
+        configuration = (manager._actor_id.hex(), dict(launch), request_capacity)
+        with self._managed_permit_lock:
+            if self._publication_configuration is not None:
+                if self._publication_configuration != configuration:
+                    raise ValueError("PUBLICATION_CONFIGURATION_CONFLICT")
+            else:
+                if (
+                    self._groups
+                    or self._session_records
+                    or self._managed_permit_records
+                    or self._managed_permits_held
+                    or self._permit_cleanup_tasks
+                ):
+                    raise ValueError("PUBLICATION_CONFIGURATION_IN_USE")
+                self._generation_backend.configure_publication(manager)
+                self.args._lora_publication_manager = manager
+                self.args._lora_publication_launch = dict(launch)
+                self._managed_permit_limit = launch["max_lifecycle_records"]
+                if self._sglang_request_semaphore is not None:
+                    self._managed_permit_capacity = request_capacity
+                self._publication_configuration = configuration
+        return {"cohort_id": launch["cohort_id"], "manager_id": configuration[0], "request_capacity": request_capacity}
+
+    @ray.method(concurrency_group="sglang_request_permit")
+    async def acquire_sglang_request_permit(self, permit_id: str | None = None) -> None:
+        """An explicit ID makes managed acquire/release replay safe."""
         semaphore = cast(threading.BoundedSemaphore, self._sglang_request_semaphore)
-        while not semaphore.acquire(blocking=False):
+        if permit_id is None:
+            while not semaphore.acquire(blocking=False):
+                await asyncio.sleep(0.01)
+            return
+        while True:
+            with self._managed_permit_lock:
+                state = self._managed_permit_records.get(permit_id)
+                if state == "HELD":
+                    return
+                if state == "RELEASED":
+                    raise PermitNotGranted("PERMIT_ALREADY_RELEASED")
+                if state is None:
+                    if len(self._managed_permit_records) >= self._managed_permit_limit:
+                        raise PermitNotGranted("LIFECYCLE_CAPACITY_EXCEEDED")
+                    self._managed_permit_records[permit_id] = "WAITING"
+                if self._managed_permits_held < self._managed_permit_capacity:
+                    self._managed_permits_held += 1
+                    self._managed_permit_records[permit_id] = "HELD"
+                    return
             await asyncio.sleep(0.01)
 
     @ray.method(concurrency_group="sglang_request_control")
-    async def release_sglang_request_permit(self) -> None:
-        """Return one backend-attempt permit to the fleet."""
-
+    async def release_sglang_request_permit(self, permit_id: str | None = None) -> None:
         semaphore = cast(threading.BoundedSemaphore, self._sglang_request_semaphore)
-        semaphore.release()
+        if permit_id is None:
+            semaphore.release()
+            return
+        with self._managed_permit_lock:
+            state = self._managed_permit_records.get(permit_id)
+            if state == "RELEASED":
+                return
+            if state != "HELD":
+                raise RuntimeError("PERMIT_NOT_ACQUIRED")
+            self._managed_permits_held -= 1
+            self._managed_permit_records[permit_id] = "RELEASED"
+
+    @ray.method(concurrency_group="sglang_request_control")
+    async def set_sglang_request_capacity(self, cohort_id: str, topology_epoch: int, capacity: int) -> dict:
+        """Resize the managed budget without revoking already held permits."""
+        launch = getattr(self.args, "_lora_publication_launch", {})
+        if not launch or cohort_id != launch["cohort_id"] or self._managed_permit_capacity is None:
+            raise ValueError("PERMIT_OWNER_MISMATCH")
+        if type(capacity) is not int or capacity <= 0 or type(topology_epoch) is not int or topology_epoch < 0:
+            raise ValueError("INVALID_PERMIT_CAPACITY")
+        with self._managed_permit_lock:
+            if topology_epoch < self._managed_permit_epoch:
+                raise ValueError("STALE_TOPOLOGY_EPOCH")
+            if topology_epoch == self._managed_permit_epoch and capacity != self._managed_permit_capacity:
+                raise ValueError("TOPOLOGY_EPOCH_CONFLICT")
+            self._managed_permit_epoch = topology_epoch
+            self._managed_permit_capacity = capacity
+            return {"topology_epoch": topology_epoch, "capacity": capacity, "in_use": self._managed_permits_held}
 
     def _notify_state_change(self, group: Optional[ResidentGroup] = None) -> None:
         """Advance the Shard event cursor after owned refs change."""
@@ -1567,6 +1667,8 @@ class AgenticSessionShard:
     ) -> None:
         """Register one group and start every Session agent."""
 
+        if getattr(self.args, "lora_publication_config", None) and self._publication_configuration is None:
+            raise RuntimeGroupError("PUBLICATION_NOT_READY")
         if group_id in self._groups:
             raise RuntimeGroupError(f"group token is already resident: {group_id}")
 
@@ -1844,10 +1946,13 @@ class AgenticSessionShard:
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
             )
-        await finish_before_cancellation(
-            group.drop_task,
-            f"drop-group:{group.group_id}",
-        )
+        task = group.drop_task
+        try:
+            await finish_before_cancellation(task, f"drop-group:{group.group_id}")
+        except Exception:
+            if group.drop_task is task:
+                group.drop_task = None
+            raise
 
     async def chat(
         self,
@@ -2313,49 +2418,90 @@ class AgenticSessionShard:
         ir.waiter.set_exception(error)
         self._dispatch_queued_irs_locked(session)
 
-    async def _acquire_sglang_request_permit(self) -> None:
+    async def _acquire_sglang_request_permit(self, permit_id: str | None = None) -> None:
         """Acquire the fleet-global permit before backend entry."""
 
         try:
             if self._sglang_request_semaphore is not None:
-                await self.acquire_sglang_request_permit()
+                try:
+                    await self.acquire_sglang_request_permit(permit_id)
+                except asyncio.CancelledError:
+                    # This UUID is local-only: no remote acquire can replay it.
+                    # Cancellation at the waiting sleep precedes any grant, so
+                    # do not spend the cohort's lifetime budget on an unused ID.
+                    if permit_id is not None:
+                        with self._managed_permit_lock:
+                            if self._managed_permit_records.get(permit_id) == "WAITING":
+                                del self._managed_permit_records[permit_id]
+                    raise
                 return
 
-            acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote()
+            acquire_ref = self._sglang_request_limiter.acquire_sglang_request_permit.remote(permit_id)
             try:
                 await asyncio.shield(acquire_ref)
             except asyncio.CancelledError:
                 cleanup_task = asyncio.create_task(
-                    self._release_sglang_request_permit_after_cancel(acquire_ref),
+                    self._release_sglang_request_permit_after_cancel(acquire_ref, permit_id),
                     name="sglang-permit-cancel",
                 )
                 self._permit_cleanup_tasks.add(cleanup_task)
                 cleanup_task.add_done_callback(self._discard_successful_permit_cleanup)
                 raise
         except Exception as error:
+            if (
+                permit_id is not None
+                and self._sglang_request_semaphore is None
+                and not isinstance(error, PermitNotGranted)
+            ):
+                task = asyncio.create_task(self._settle_managed_acquire(permit_id))
+                self._permit_cleanup_tasks.add(task)
+                task.add_done_callback(self._discard_successful_permit_cleanup)
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
 
-    async def _release_sglang_request_permit(self) -> None:
+    async def _settle_managed_acquire(self, permit_id: str) -> None:
+        # No generate was sent. Resolve the possibly-held acquire under the
+        # original ID, then return it idempotently, surviving another lost ACK.
+        while True:
+            try:
+                await self._sglang_request_limiter.acquire_sglang_request_permit.remote(permit_id)
+                break
+            except PermitNotGranted:
+                return
+            except Exception:
+                await asyncio.sleep(0.2)
+        await self._finish_managed_permit(None, permit_id)
+
+    async def _release_sglang_request_permit(self, permit_id: str | None = None) -> None:
         """Return one acquired permit before forwarding cancellation."""
 
         try:
             release = (
-                self.release_sglang_request_permit()
+                self.release_sglang_request_permit(permit_id)
                 if self._sglang_request_semaphore is not None
-                else self._sglang_request_limiter.release_sglang_request_permit.remote()
+                else self._sglang_request_limiter.release_sglang_request_permit.remote(permit_id)
             )
             await finish_before_cancellation(release, "sglang-permit-release")
         except Exception as error:
             raise RuntimeGroupError(f"SGLang permit release failed: {type(error).__name__}: {error}") from error
 
-    async def _release_sglang_request_permit_after_cancel(self, acquire_ref: Any) -> None:
+    async def _release_sglang_request_permit_after_cancel(
+        self, acquire_ref: Any, permit_id: str | None = None
+    ) -> None:
         """Return a remote permit acquired after runner cancellation."""
 
+        if permit_id is not None:
+            try:
+                await acquire_ref
+            except Exception:
+                await self._settle_managed_acquire(permit_id)
+            else:
+                await self._finish_managed_permit(None, permit_id)
+            return
         try:
             await acquire_ref
         except Exception as error:
             raise RuntimeGroupError(f"SGLang permit acquire failed: {type(error).__name__}: {error}") from error
-        await self._release_sglang_request_permit()
+        await self._release_sglang_request_permit(permit_id)
 
     def _discard_successful_permit_cleanup(self, task: "asyncio.Task[None]") -> None:
         """Release successful compensation refs; retain failures."""
@@ -2397,15 +2543,62 @@ class AgenticSessionShard:
                     "agentic-admission-lease-release",
                 )
 
+    async def _bind_adapter_once(self, session: _SessionRecord) -> None:
+        async with session.lock:
+            if session.adapter_binding is not None:
+                return
+            if session.adapter_bind_task is None:
+                session.adapter_bind_task = asyncio.create_task(
+                    self._generation_backend.bind_adapter_session(session.session_id)
+                )
+                session.adapter_bind_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
+            task = session.adapter_bind_task
+        try:
+            binding = await asyncio.shield(task)
+        except Exception:
+            async with session.lock:
+                if session.adapter_bind_task is task:
+                    session.adapter_bind_task = None
+            raise
+        async with session.lock:
+            if session.phase is not SessionPhase.ACTIVE:
+                return  # finish owns the close, including a late bind result.
+            session.adapter_binding = binding
+            if session.forest is not None:
+                session.forest.static_metadata["lora_adapter"] = copy.deepcopy(binding["binding"])
+
+    async def _finish_managed_permit(self, request_id: str | None, permit_id: str) -> None:
+        if request_id is not None:
+            await self._generation_backend.finish_adapter_request(request_id)
+        while True:
+            try:
+                await self._release_sglang_request_permit(permit_id)
+                return
+            except Exception:
+                # Replay uses the same permit ID; a lost release ACK cannot
+                # increase semaphore capacity twice. Retain the small task.
+                await asyncio.sleep(0.2)
+
     @asynccontextmanager
     async def _sglang_request_permit(self):
-        """Hold one fleet request permit around backend execution."""
-
-        await self._acquire_sglang_request_permit()
+        managed = bool(getattr(self.args, "lora_publication_config", None))
+        permit_id = uuid4().hex if managed else None
+        if managed:
+            await self._acquire_sglang_request_permit(permit_id)
+        else:
+            await self._acquire_sglang_request_permit()
+        ownership = {"request_id": None}
         try:
-            yield
+            yield ownership
         finally:
-            await self._release_sglang_request_permit()
+            if managed:
+                task = asyncio.create_task(self._finish_managed_permit(ownership["request_id"], permit_id))
+                self._permit_cleanup_tasks.add(task)
+                task.add_done_callback(self._discard_successful_permit_cleanup)
+            else:
+                await self._release_sglang_request_permit()
 
     async def _run_ir(
         self,
@@ -2431,7 +2624,17 @@ class AgenticSessionShard:
 
         try:
             async with self._admission_lease(session, ir):
-                async with self._sglang_request_permit():
+                async with self._sglang_request_permit() as permit:
+                    if getattr(self.args, "lora_publication_config", None):
+                        async with session.lock:
+                            if not is_current():
+                                return
+                            if not self._group_generation_open(group) and not session.protected_until_finalize:
+                                ir.runner_task = None
+                                session.queued_irs.appendleft(ir)
+                                self._notify_state_change(group)
+                                return
+                        await self._bind_adapter_once(session)
                     async with session.lock:
                         if not is_current():
                             return
@@ -2441,6 +2644,7 @@ class AgenticSessionShard:
                             self._notify_state_change(group)
                             return
                         backend_request_id = _backend_request_id(ir)
+                        permit["request_id"] = backend_request_id
                         ir.backend_started = True
                         remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
                         mark_agentic_event(
@@ -2458,6 +2662,11 @@ class AgenticSessionShard:
                             audio_data=ir.history_backend_audio_data,
                             video_data=ir.history_backend_video_data,
                             return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                            **(
+                                {"adapter_binding": session.adapter_binding}
+                                if session.adapter_binding is not None
+                                else {}
+                            ),
                         )
                     finally:
                         mark_agentic_event(
@@ -2567,6 +2776,17 @@ class AgenticSessionShard:
     ) -> None:
         """Accumulate one backend attempt on the stable IR ref."""
 
+        adapter = result.meta_info.get("lora_adapter")
+        if adapter is not None:
+            start = len(ir.history_train_token_prefix) + len(ir.pending_token_delta)
+            ir.pending_export_metadata_patch.setdefault("lora_attempts", []).append(
+                {
+                    **copy.deepcopy(adapter),
+                    "rid": _backend_request_id(ir),
+                    "token_start": start,
+                    "token_end": start + len(result.new_tokens),
+                }
+            )
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
@@ -2843,6 +3063,10 @@ class AgenticSessionShard:
         if not any(node.kind == "resp" for node in lineage):
             raise _NonFinalizableExportError("export leaf has no committed response")
         node = lineage[-1]
+        if "lora_adapter" in forest.static_metadata and any(
+            key in metadata for key in ("lora_adapter", "lora_attempts")
+        ):
+            raise _NonFinalizableExportError("adapter provenance is owned by the native generation path")
         if mutate_node:
             _merge_export_metadata(node.export_metadata_patch, metadata)
             agentic_trace_events(node.export_metadata_patch).update(finalize_events)
@@ -2850,7 +3074,10 @@ class AgenticSessionShard:
         if reward is not None:
             sample.reward = copy.deepcopy(reward)
         if not mutate_node:
+            trusted_turns = copy.deepcopy(sample.metadata.get(TRACE_KEY, {}).get("turns"))
             _merge_export_metadata(sample.metadata, metadata)
+            if "lora_adapter" in forest.static_metadata and trusted_turns is not None:
+                sample.metadata.setdefault(TRACE_KEY, {})["turns"] = trusted_turns
             agentic_trace_events(sample.metadata).update(finalize_events)
         mark_sample_agentic_event(sample, "finalize_end_at")
         return sample
@@ -2890,7 +3117,13 @@ class AgenticSessionShard:
                     name=f"session-finish:{session.session_id}",
                 )
                 session.finish_task = finish_task
-        return await asyncio.shield(finish_task)
+        try:
+            return await asyncio.shield(finish_task)
+        except Exception:
+            async with session.lock:
+                if session.finish_task is finish_task:
+                    session.finish_task = None  # Unaccepted close handoffs remain retryable.
+            raise
 
     async def _finish_session_once(
         self,
@@ -2922,13 +3155,39 @@ class AgenticSessionShard:
 
         for runner_task in pre_backend_tasks:
             runner_task.cancel()
-        abort_outcomes = await asyncio.gather(
-            *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
-            return_exceptions=True,
-        )
+        if getattr(self.args, "lora_publication_config", None):
+            # RM accepts in-memory close responsibility for this cohort; the
+            # native engine retains instance GPU dependencies until retirement.
+            while True:
+                try:
+                    await self._generation_backend.close_adapter_session(session.session_id)
+                    break
+                except Exception as error:
+                    # The finish task owns retries even after the process watcher
+                    # exits. HTTP cancellation cannot stand in for native completion.
+                    logger.warning("Session %s close handoff pending: %s", session.session_id, error)
+                    if resources is not None:
+                        await asyncio.gather(resources.process.terminate_and_join(), return_exceptions=True)
+                        resources = None
+                    if process_wait is not None:
+                        process_wait.cancel()
+                    for runner_task in backend_tasks:
+                        runner_task.cancel()
+                    async with session.lock:
+                        session.resources = None
+                        session.forest = None
+                    await asyncio.sleep(0.2)
+            for runner_task in backend_tasks:
+                runner_task.cancel()
+            abort_outcomes = []
+        else:
+            abort_outcomes = await asyncio.gather(
+                *(self._generation_backend.abort_request(request_id) for request_id in backend_request_ids),
+                return_exceptions=True,
+            )
         await asyncio.gather(*pre_backend_tasks, *backend_tasks, return_exceptions=True)
         lifecycle_closed = True
-        if self.args.agentic_session_lifecycle:
+        if self.args.agentic_session_lifecycle and not getattr(self.args, "lora_publication_config", None):
             lifecycle_closed = await self._generation_backend.close_session(
                 session.session_id,
                 timeout_s=_SESSION_CLOSE_TIMEOUT_S,
@@ -2990,11 +3249,11 @@ class AgenticSessionShard:
             return_exceptions=True,
         )
         await asyncio.gather(*watcher_tasks, return_exceptions=True)
-        self._groups.pop(group_id, None)
         self._notify_state_change()
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
-                raise outcome
+                raise outcome  # Preserve the Group as owner of failed close handoffs.
+        self._groups.pop(group_id, None)
 
 
 def create_agentic_session_shards(
@@ -3007,8 +3266,9 @@ def create_agentic_session_shards(
     lived Session records and agent processes.
     """
 
+    shared = getattr(config, "_lora_publication_launch", {}).get("engines_per_gpu", 1)
     sglang_request_capacity = (
-        config.sglang_server_concurrency * config.rollout_num_gpus // config.rollout_num_gpus_per_engine
+        config.sglang_server_concurrency * config.rollout_num_gpus * shared // config.rollout_num_gpus_per_engine
     )
     shard_entries: list[tuple[str, Any]] = []
     try:

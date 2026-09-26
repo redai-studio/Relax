@@ -9,6 +9,7 @@ from argparse import Namespace
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Callable
 
 import torch
 
@@ -689,8 +690,24 @@ def _is_dir_nonempty(path):
 
 
 def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> None:
-    """Save the LoRA adapter as a standard HF-PEFT directory under
-    ``checkpoint_dir``.
+    """Compatibility path for native/full-HF checkpoint saving."""
+    export_lora_adapter(model, Path(checkpoint_dir) / "lora_adapter", args, bridge)
+
+
+def export_lora_adapter(
+    model: Any,
+    output_dir: str | Path,
+    args: Namespace,
+    bridge: Any = None,
+    *,
+    seal: Callable[[Path], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Export only adapter weights at a caller-owned training boundary.
+
+    This never saves the base model, optimizer or resumable checkpoint. The
+    optional writer-only ``seal`` callback runs before the final result broadcast;
+    all ranks receive its descriptor or the same cooperative error. A crashed
+    rank or stuck Bridge collective still needs the training fault policy.
 
     This is a portable *export* artifact (HF ``adapter_model.safetensors`` +
     ``adapter_config.json``) for external / inference use — e.g. loading with
@@ -699,14 +716,14 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
     persists and restores them on resume.
 
     Every rank exports its owned (TP-gathered) adapter params via Megatron-Bridge, the
-    shards are gathered to global rank 0, and rank 0 writes one consolidated adapter.
+    shards are gathered to rank 0 of the export group, which writes the adapter.
 
     Collective: the export + ``gather_object`` MUST run in lockstep on every rank, so
     nothing before the gather is gated behind a rank check.
 
     Args:
         model: The training model (sequence of VPP chunks) with LoRA.
-        checkpoint_dir: Directory where ``lora_adapter/`` will be written.
+        output_dir: Exact HF-PEFT output directory.
         args: Training arguments.
         bridge: Optional pre-built ``AutoBridge`` (reused by ``save_hf_model``); built
             from ``args.hf_checkpoint`` when not supplied.
@@ -717,7 +734,8 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
     from relax.utils.megatron_peft_utils import convert_megatron_to_hf_target_modules, write_hf_peft_adapter
 
     gloo = get_gloo_group()
-    is_dst = dist.get_rank() == 0
+    writer_rank = dist.get_global_rank(gloo, 0)
+    is_dst = dist.get_rank(group=gloo) == 0
     local_error = None
     local_adapter = {}
     try:
@@ -728,11 +746,16 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
         # Export this rank's owned adapter params (TP already gathered by the bridge);
         # cpu=True so the tensors can travel over the gloo gather below.
         with megatron_bridge_utils.patch_megatron_model(model):
-            local_adapter = {
-                item.param_name: item.weight.detach().cpu() for item in bridge.export_adapter_weights(model, cpu=True)
-            }
+            for item in bridge.export_adapter_weights(model, cpu=True):
+                value = item.weight.detach().cpu()
+                previous = local_adapter.get(item.param_name)
+                if previous is not None and (
+                    previous.shape != value.shape or previous.dtype != value.dtype or not torch.equal(previous, value)
+                ):
+                    raise ValueError(f"conflicting duplicate adapter tensor: {item.param_name}")
+                local_adapter[item.param_name] = value
     except Exception as exc:
-        local_error = f"rank {dist.get_rank()}: {type(exc).__name__}: {exc}"
+        local_error = f"rank {dist.get_rank(group=gloo)}: {type(exc).__name__}: {exc}"
 
     errors = [None] * dist.get_world_size(group=gloo)
     dist.all_gather_object(errors, local_error, group=gloo)
@@ -741,19 +764,27 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
         raise RuntimeError("LoRA adapter export failed before gather: " + "; ".join(errors))
 
     gathered = [None] * dist.get_world_size(group=gloo) if is_dst else None
-    dist.gather_object(local_adapter, object_gather_list=gathered, dst=0, group=gloo)
+    dist.gather_object(local_adapter, object_gather_list=gathered, dst=writer_rank, group=gloo)
 
     write_error = None
+    sealed = None
     if is_dst:
         try:
             merged: dict[str, torch.Tensor] = {}
             for shard in gathered:
-                if shard:
-                    merged.update(shard)
+                for name, value in (shard or {}).items():
+                    previous = merged.get(name)
+                    if previous is not None and (
+                        previous.shape != value.shape
+                        or previous.dtype != value.dtype
+                        or not torch.equal(previous, value)
+                    ):
+                        raise ValueError(f"conflicting duplicate adapter tensor: {name}")
+                    merged[name] = value
             if not merged:
                 raise RuntimeError("LoRA enabled but no adapter parameters were gathered.")
 
-            adapter_dir = Path(checkpoint_dir) / "lora_adapter"
+            adapter_dir = Path(output_dir)
             # args.lora_target_modules holds canonical Megatron names; the on-disk HF-PEFT
             # adapter_config.json must carry HF-style names so standard PEFT loaders can match
             # them against the HF module tree.
@@ -787,11 +818,14 @@ def _save_lora_to_checkpoint(model, checkpoint_dir: str, args, bridge=None) -> N
                 mode_str = "merge"
             else:
                 mode_str = "standard"
+            if seal is not None:
+                sealed = seal(adapter_dir)
             logger.info(f"Saved LoRA adapter to {adapter_dir} ({len(merged)} tensors, mode={mode_str})")
         except Exception as exc:
             write_error = f"{type(exc).__name__}: {exc}"
 
-    write_status = [write_error]
-    dist.broadcast_object_list(write_status, src=0, group=gloo)
+    write_status = [write_error, sealed]
+    dist.broadcast_object_list(write_status, src=writer_rank, group=gloo)
     if write_status[0] is not None:
         raise RuntimeError(f"Failed to write LoRA adapter: {write_status[0]}")
+    return write_status[1]

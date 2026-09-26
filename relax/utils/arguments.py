@@ -345,7 +345,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "old_log_probs (ppo_kl ≡ 0, ratio ≡ 1), saving the dedicated actor_fwd "
                     "GPU group and one weight-sync per step. "
                     "Auto-enabled when --fully-async and "
-                    "rollout_batch_size * n_samples_per_prompt == global_batch_size; no need "
+                    "rollout_batch_size * n_samples_per_prompt == global_batch_size "
+                    "outside immutable LoRA publication mode; no need "
                     "to pass this flag explicitly. The caller is responsible for ensuring the "
                     "regime is actually on-policy (e.g. --max-staleness=0, "
                     "--num-iters-per-train-update=1); off-policy use yields incorrect gradients. "
@@ -1560,6 +1561,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Prelaunch agent processes for the next rollout step.",
+            )
+            parser.add_argument(
+                "--lora-publication-config",
+                type=str,
+                default=None,
+                help="YAML configuration for immutable LoRA publication on the resident policy engines.",
             )
             parser.add_argument(
                 "--agentic-session-lifecycle",
@@ -3259,6 +3266,13 @@ def validate_save_lora_only_args(args) -> None:
 
 
 def _validate_agentic_rollout_args(args) -> None:
+    if getattr(args, "lora_publication_config", None):
+        from relax.engine.lora.publication import PublicationConfig
+
+        # Revalidated by RolloutManager after mode defaults are finalized.
+        PublicationConfig.read(args.lora_publication_config)
+        if not args.use_agentic_rollout or args.agentic_program_admission:
+            raise ValueError("publication requires Agentic rollout without program admission")
     if not args.use_agentic_rollout:
         return
     args.rollout_function_path = "relax.agentic.rollout.generate_rollout"
@@ -3985,7 +3999,11 @@ def slime_validate_args(args):
         # one global batch in fully-async mode. In this regime the train forward's
         # log_probs equal what actor_fwd would have produced, so the actor_fwd role
         # can be skipped (see relax/backends/megatron/loss.py:policy_loss_function).
-        if args.fully_async and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size:
+        if (
+            args.fully_async
+            and not getattr(args, "lora_publication_config", None)
+            and args.rollout_batch_size * args.n_samples_per_prompt == args.global_batch_size
+        ):
             if not args.true_on_policy_mode:
                 logger.info(
                     "Auto-enabling --true-on-policy-mode: rollout_batch_size * n_samples_per_prompt "

@@ -559,6 +559,14 @@ class SGLangBackendAdapter:
         self._args = args
         self._resources = load_agentic_compiler_resources(args)
         self._session_lifecycle = args.agentic_session_lifecycle
+        self._publication_manager = None
+        self._publication_owner = uuid.uuid4().hex
+        self._publication_attempts: dict[str, dict[str, Any]] = {}
+        self._publication_data = None
+        self._publication_commands = None
+        manager = getattr(args, "_lora_publication_manager", None)
+        if manager is not None:
+            self.configure_publication(manager)
         self.tokenizer = self._resources.tokenizer
         self.compiler = SGLangMessageCompiler(
             tokenizer=self._resources.tokenizer,
@@ -569,6 +577,22 @@ class SGLangBackendAdapter:
             multimodal_config=MultimodalConfig.from_args(args),
             cpu_executor=self._resources.cpu_executor,
         )
+
+    def configure_publication(self, manager: Any) -> None:
+        """Attach the actual RM after its engines initialize; never RPC back
+        into the still-constructing actor from this startup handoff."""
+        if manager is None:
+            raise ValueError("PUBLICATION_MANAGER_REQUIRED")
+        if self._publication_manager is not None:
+            if self._publication_manager is not manager and self._publication_manager._actor_id != manager._actor_id:
+                raise ValueError("PUBLICATION_MANAGER_CONFLICT")
+            return
+        self._publication_data = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None), trust_env=False)
+        # Long generations cannot consume the connections needed for cleanup.
+        self._publication_commands = httpx.AsyncClient(
+            timeout=5.0, trust_env=False, limits=httpx.Limits(max_connections=16, max_keepalive_connections=8)
+        )
+        self._publication_manager = manager
 
     @property
     def _router_url(self) -> str:
@@ -585,7 +609,10 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        adapter_binding: dict[str, Any] | None = None,
     ) -> BackendGenerateResult:
+        if getattr(self._args, "lora_publication_config", None) and self._publication_manager is None:
+            raise RuntimeError("PUBLICATION_NOT_READY")
         payload = {
             "input_ids": input_ids,
             "sampling_params": sampling_params,
@@ -600,16 +627,56 @@ class SGLangBackendAdapter:
             payload["audio_data"] = list(audio_data)
         if video_data:
             payload["video_data"] = video_data
-        if session_id and self._session_lifecycle:
-            # The full input_ids remain authoritative; session_id only tags
-            # the resulting radix leaves for terminal cleanup.
+        if session_id and (self._session_lifecycle or self._publication_manager is not None):
+            # Native Session identity is also used for the close fence.
             payload["session_id"] = session_id
         headers = None
         if session_id and (self._args.sglang_router_policy == "consistent_hashing" or self._args.slime_router_sticky):
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            if self._publication_manager is not None:
+                if not session_id or adapter_binding is None:
+                    raise RuntimeError("immutable LoRA generation requires a bound Session")
+                binding = adapter_binding["binding"]
+                engine = adapter_binding["engine"]
+                identity = {
+                    "cohort_id": binding["cohort_id"],
+                    "engine_boot_id": engine["boot_id"],
+                    "digest": binding["digest"],
+                    "native_lora_id": adapter_binding["native_lora_id"],
+                    "owner_epoch": self._publication_owner,
+                    "session_id": session_id,
+                }
+                payload["lora_path"] = adapter_binding["native_lora_id"]
+                payload["lora_binding"] = identity
+                if request_id in self._publication_attempts:
+                    raise RuntimeError("ATTEMPT_ALREADY_EXISTS")
+                attempt = {
+                    "endpoint": engine["endpoint"],
+                    "identity": {**identity, "rid": request_id},
+                    "delivered": False,
+                }
+                self._publication_attempts[request_id] = attempt  # Before the first send/await.
+                response = await self._publication_data.post(engine["endpoint"] + "/generate", json=payload)
+                response.raise_for_status()
+                output = response.json()
+                actual = output.get("meta_info", {}).get("lora_adapter")
+                expected = {
+                    "adapter_version_id": binding["version_id"],
+                    "adapter_digest": binding["digest"],
+                    "publication_id": binding["publication_id"],
+                    "source_train_step": binding["source_train_step"],
+                    "engine_boot_id": engine["boot_id"],
+                    "native_lora_id": adapter_binding["native_lora_id"],
+                }
+                native_keys = ("adapter_digest", "engine_boot_id", "native_lora_id")
+                if not isinstance(actual, dict) or any(actual.get(key) != expected[key] for key in native_keys):
+                    raise RuntimeError("ADAPTER_IDENTITY_MISMATCH")
+                output["meta_info"]["lora_adapter"] = expected
+                attempt["delivered"] = True
+            else:
+                output = await post(f"{self._router_url}/generate", payload, headers=headers)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
@@ -626,13 +693,80 @@ class SGLangBackendAdapter:
             elapsed=elapsed,
         )
 
+    async def _publication_control(self, action: str, session_id: str) -> dict[str, Any]:
+        if self._publication_manager is None:
+            raise RuntimeError("publication manager is not configured")
+        result = await self._publication_manager.lora_control.remote(
+            action,
+            {
+                "owner_epoch": self._publication_owner,
+                "session_id": session_id,
+            },
+        )
+        if result.get("error_code"):
+            raise RuntimeError(result["error_code"])
+        return result
+
     async def abort_request(self, request_id: str) -> None:
+        if self._publication_manager is not None:
+            attempt = self._publication_attempts.get(request_id)
+            if attempt is not None:
+                response = await self._publication_commands.post(
+                    attempt["endpoint"] + "/cancel_lora_attempt", json=attempt["identity"], timeout=5
+                )
+                response.raise_for_status()
+            return
         urls = await self._worker_urls()
         await asyncio.gather(*(post(f"{url}/abort_request", {"rid": request_id}) for url in urls))
+
+    async def bind_adapter_session(self, session_id: str) -> dict[str, Any]:
+        return await self._publication_control("bind", session_id)
+
+    async def close_adapter_session(self, session_id: str) -> None:
+        result = await self._publication_control("close", session_id)
+        if not result["accepted"]:
+            raise RuntimeError("Session close responsibility was not accepted")
+
+    async def finish_adapter_request(self, request_id: str) -> None:
+        """Wait for native logical completion; instance retirement owns GPU
+        safety."""
+        attempt = self._publication_attempts.get(request_id)
+        if attempt is None:
+            return  # This process never entered the send path for this RID.
+        while True:
+            try:
+                endpoint = "/lora_attempt_status" if attempt["delivered"] else "/cancel_lora_attempt"
+                response = await self._publication_commands.post(
+                    attempt["endpoint"] + endpoint, json=attempt["identity"], timeout=5
+                )
+                response.raise_for_status()
+                state = response.json()
+                identity = attempt["identity"]
+                if any(
+                    state.get(key) != identity[key]
+                    for key in (
+                        "cohort_id",
+                        "engine_boot_id",
+                        "native_lora_id",
+                        "owner_epoch",
+                        "session_id",
+                        "rid",
+                    )
+                ):
+                    raise RuntimeError("ENGINE_COMPLETION_IDENTITY_MISMATCH")
+                if state["state"] in {"REQUEST_FINISHED", "SESSION_DRAINED"}:
+                    del self._publication_attempts[request_id]
+                    return
+            except httpx.HTTPError:
+                pass  # Keep the lightweight permit owner; timeout is not completion.
+            await asyncio.sleep(0.2)
 
     async def close_session(self, session_id: str, *, timeout_s: float) -> bool:
         """Release one terminal Session from every engine radix cache."""
 
+        if self._publication_manager is not None:
+            result = await self._publication_control("session_status", session_id)
+            return result["state"] == "CLOSED"
         if not self._session_lifecycle:
             return True
 
@@ -668,6 +802,11 @@ class SGLangBackendAdapter:
         return router_worker_base_urls(response["urls"])
 
     async def shutdown(self) -> None:
+        if self._publication_manager is not None:
+            try:
+                await self._publication_data.aclose()
+            finally:
+                await self._publication_commands.aclose()
         self._resources.shutdown()
 
 
