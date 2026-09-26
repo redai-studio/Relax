@@ -1138,7 +1138,7 @@ index 6eb0ad1a..d27815f3 100644
          """Load a new LoRA adapter without re-launching the engine."""
  
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index ac38b466..ea54bac1 100644
+index ac38b46..41854eb 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
 @@ -132,6 +132,7 @@ from sglang.srt.managers.io_struct import (
@@ -1215,7 +1215,7 @@ index ac38b466..ea54bac1 100644
  @app.post("/update_weight_version")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def update_weight_version(
-@@ -1539,6 +1564,19 @@ async def load_lora_adapter_from_tensors(
+@@ -1539,6 +1564,31 @@ async def load_lora_adapter_from_tensors(
      return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
  
  
@@ -1224,11 +1224,23 @@ index ac38b466..ea54bac1 100644
 +async def update_lora_from_distributed(
 +    obj: Annotated[UpdateLoRAFromDistributedReqInput, Body()], request: Request
 +):
-+    """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group."""
++    """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group.
++
++    A staged publication answers per ``op``; its reply carries a `clean` verdict, and
++    a failure the engine could NOT prove clean (a half-written load, a broken
++    collective) is reported as a server error so the caller fails the publication
++    closed instead of retrying on top of unknown state.
++    """
 +    result = await _global_state.tokenizer_manager.update_lora_from_distributed(
 +        obj, request
 +    )
-+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
++    status_code = HTTPStatus.OK
++    if not result.success:
++        status_code = (
++            HTTPStatus.INTERNAL_SERVER_ERROR
++            if getattr(result, "clean", None) is False
++            else HTTPStatus.BAD_REQUEST
++        )
 +    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 +
 +
@@ -1415,8 +1427,454 @@ index 87b2a334..7c70342c 100644
          lora_backend.is_moe_lora = True
  
          self.experts_shared_outer_loras: bool = False
+diff --git a/test/registered/lora/test_lora_staged_publication.py b/test/registered/lora/test_lora_staged_publication.py
+new file mode 100644
+index 0000000..3797d92
+--- /dev/null
++++ b/test/registered/lora/test_lora_staged_publication.py
+@@ -0,0 +1,339 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Unit tests for the staged LoRA publication protocol (op=begin/bucket/end/unload).
++
++No GPU and no real broadcast: the receive step is stubbed out, so what is under test
++is the state machine and, more importantly, the *verdicts* it reports -- which kind
++of failure leaves the rank provably absent and which one makes it unknown.
++"""
++
++import hashlib
++import unittest
++from types import SimpleNamespace
++
++import torch
++
++from sglang.srt.lora.utils import verify_lora_tensor_checksums
++from sglang.srt.managers.io_struct import (
++    LoRAUpdateOutput,
++    UpdateLoRAFromDistributedReqInput,
++)
++from sglang.srt.managers.tokenizer_control_mixin import (
++    _merge_lora_update_results,
++    TokenizerControlMixin,
++)
++from sglang.srt.model_executor.model_runner import ModelRunner
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=10, suite="base-c-test-cpu")
++
++
++ADAPTER_CONFIG = {"target_modules": ["q_proj"], "r": 8, "lora_alpha": 16}
++
++
++def _checksums(tensors):
++    return {
++        name: hashlib.sha256(
++            tensor.detach().cpu().contiguous().flatten().view(torch.uint8).numpy().tobytes()
++        ).hexdigest()
++        for name, tensor in tensors.items()
++    }
++
++
++class _FakeLoRAManager:
++    """Records what the staged protocol asked of the real load/unload paths."""
++
++    def __init__(self, load_success=True):
++        self.base_hf_config = SimpleNamespace(vocab_size=1000)
++        self.load_success = load_success
++        self.validated = []
++        self.loaded = []
++        self.unloaded_names = []
++
++    def validate_new_adapter(self, adapter, lora_ref):
++        self.validated.append((lora_ref.lora_name, adapter.r))
++
++    def load_lora_adapter_from_tensors(
++        self, lora_ref, tensors, config_dict, added_tokens_config=None
++    ):
++        self.loaded.append((lora_ref, dict(tensors)))
++        if not self.load_success:
++            return LoRAUpdateOutput(success=False, error_message="boom")
++        return LoRAUpdateOutput(success=True)
++
++    def unload_lora_adapter_by_name(self, lora_name):
++        self.unloaded_names.append(lora_name)
++        return LoRAUpdateOutput(success=True)
++
++
++class _StagedRank:
++    """One rank of the engine side, with the collective stubbed out."""
++
++    def __init__(self, load_success=True):
++        self.lora_manager = _FakeLoRAManager(load_success=load_success)
++        self.ps = SimpleNamespace(tp_rank=0)
++        self.rank = ModelRunner.__new__(ModelRunner)
++        self.rank.lora_manager = self.lora_manager
++        self.rank.ps = self.ps
++        self.receive_calls = []
++        self.rank._receive_lora_buckets = self._receive
++
++    def _receive(self, names, dtypes, shapes, group_name, bucket_sizes):
++        # One deterministic tensor per announced name, so a replayed bucket is
++        # byte-identical to the original and the manifest can be computed up front.
++        self.receive_calls.append(tuple(names))
++        return {
++            name: torch.full((2,), float(index + 1), dtype=torch.float32)
++            for index, name in enumerate(names)
++        }
++
++    def begin(self, name, attempt, config=None, lora_id="id-1"):
++        return self.rank.stage_lora_begin(
++            UpdateLoRAFromDistributedReqInput(
++                op="begin",
++                lora_name=name,
++                attempt_id=attempt,
++                lora_id=lora_id,
++                config_dict=ADAPTER_CONFIG if config is None else config,
++                pinned=True,
++            )
++        )
++
++    def bucket(self, name, attempt, index, bucket_names=("a",), lora_id="id-1"):
++        # Tensors are recomputed exactly as _receive will, so the test can build the
++        # sender's manifest from the same deterministic content.
++        tensors = {
++            bucket_name: torch.full((2,), float(i + 1), dtype=torch.float32)
++            for i, bucket_name in enumerate(bucket_names)
++        }
++        result = self.rank.stage_lora_bucket(
++            UpdateLoRAFromDistributedReqInput(
++                op="bucket",
++                lora_name=name,
++                attempt_id=attempt,
++                bucket_index=index,
++                lora_id=lora_id,
++                names=list(bucket_names),
++                dtypes=["float32"] * len(bucket_names),
++                shapes=[[2]] * len(bucket_names),
++                bucket_sizes=[len(bucket_names)],
++            )
++        )
++        return result, tensors
++
++    def end(self, name, attempt, expected, lora_id="id-1"):
++        return self.rank.stage_lora_end(
++            UpdateLoRAFromDistributedReqInput(
++                op="end",
++                lora_name=name,
++                attempt_id=attempt,
++                lora_id=lora_id,
++                config_dict=ADAPTER_CONFIG,
++                expected_checksums=expected,
++            )
++        )
++
++    def unload(self, name):
++        return self.rank.unload_lora_from_distributed(
++            UpdateLoRAFromDistributedReqInput(
++                op="unload", lora_name=name, reason="test"
++            )
++        )
++
++
++class TestChecksumVerification(unittest.TestCase):
++    def _tensors(self):
++        return {
++            "a": torch.arange(4, dtype=torch.float32),
++            "b": torch.zeros(2, 2, dtype=torch.bfloat16),
++        }
++
++    def test_accepts_a_matching_manifest(self):
++        tensors = self._tensors()
++        verify_lora_tensor_checksums(tensors, _checksums(tensors))
++
++    def test_value_drift_is_detected(self):
++        tensors = self._tensors()
++        expected = _checksums(tensors)
++        tensors["a"] = tensors["a"] + 1
++        with self.assertRaises(RuntimeError) as ctx:
++            verify_lora_tensor_checksums(tensors, expected)
++        self.assertIn("MISMATCH", str(ctx.exception))
++
++    def test_missing_and_extra_tensors_are_detected(self):
++        tensors = self._tensors()
++        expected = _checksums(tensors)
++        with self.assertRaises(RuntimeError):
++            verify_lora_tensor_checksums({"a": tensors["a"]}, expected)
++        with self.assertRaises(RuntimeError):
++            verify_lora_tensor_checksums({**tensors, "c": tensors["a"]}, expected)
++
++
++class TestStagedStateMachine(unittest.TestCase):
++    def test_happy_path_loads_the_manifested_tensors(self):
++        rank = _StagedRank()
++        self.assertTrue(rank.begin("v1", 1).success)
++        self.assertEqual(rank.lora_manager.validated, [("v1", 8)])
++
++        result, tensors = rank.bucket("v1", 1, 0)
++        self.assertTrue(result.success)
++        self.assertEqual(rank.rank.staged_lora_key, ("v1", 1))
++
++        self.assertTrue(rank.end("v1", 1, _checksums(tensors)).success)
++        (lora_ref, loaded), = rank.lora_manager.loaded
++        self.assertEqual(lora_ref.lora_name, "v1")
++        self.assertEqual(lora_ref.lora_id, "id-1")
++        # READY_LOCAL: the candidate is gone but must not be revivable.
++        self.assertIsNone(rank.rank.staged_lora_key)
++        self.assertEqual(rank.rank.staged_lora_terminal, ("v1", 1, "READY_LOCAL"))
++
++    def test_buckets_must_arrive_in_bucket_order(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        _, first = rank.bucket("v1", 1, 0, bucket_names=("a",))
++        _, second = rank.bucket("v1", 1, 1, bucket_names=("b",))
++        self.assertEqual(sorted(rank.rank.staged_lora_buckets), [0, 1])
++        self.assertTrue(rank.end("v1", 1, _checksums({**first, **second})).success)
++        (_, loaded), = rank.lora_manager.loaded
++        self.assertEqual(sorted(loaded), ["a", "b"])
++
++    def test_duplicate_bucket_is_drained_and_stays_idempotent(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        rank.bucket("v1", 1, 0)
++        stashed = rank.rank.staged_lora_buckets[0]
++        result, _ = rank.bucket("v1", 1, 0)
++        self.assertTrue(result.success)
++        self.assertIs(rank.rank.staged_lora_buckets[0], stashed)
++        # Participation is unconditional: the collective happened for the duplicate.
++        self.assertEqual(len(rank.receive_calls), 2)
++
++    def test_stale_bucket_participates_then_reports(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        result, _ = rank.bucket("v1", 2, 0)
++        self.assertFalse(result.success)
++        self.assertIsNot(result.clean, False)
++        self.assertEqual(len(rank.receive_calls), 1)
++        self.assertEqual(rank.rank.staged_lora_buckets, {})
++
++    def test_terminal_attempt_is_never_revived(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        _, tensors = rank.bucket("v1", 1, 0)
++        rank.end("v1", 1, _checksums(tensors))
++
++        # Same-attempt late RPCs are answered from the terminal state instead of
++        # reviving the candidate: drained buckets and a repeated End are idempotent
++        # success, and nothing is loaded twice.
++        late_bucket, _ = rank.bucket("v1", 1, 0)
++        self.assertTrue(late_bucket.success)
++        self.assertIsNone(rank.rank.staged_lora_key)
++        self.assertTrue(rank.end("v1", 1, _checksums(tensors)).success)
++        self.assertTrue(rank.begin("v1", 1).success)
++        self.assertEqual(len(rank.lora_manager.loaded), 1)
++
++    def test_manifest_mismatch_is_clean_and_aborts_the_attempt(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        _, tensors = rank.bucket("v1", 1, 0)
++        wrong = {"a": "0" * 64}
++        result = rank.end("v1", 1, wrong)
++        self.assertFalse(result.success)
++        self.assertIsNot(result.clean, False)
++        self.assertEqual(rank.lora_manager.loaded, [])
++        self.assertEqual(rank.rank.staged_lora_terminal, ("v1", 1, "ABORTED"))
++        self.assertFalse(rank.end("v1", 1, _checksums(tensors)).success)
++
++    def test_end_without_manifest_is_refused_before_loading(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        rank.bucket("v1", 1, 0)
++        result = rank.end("v1", 1, None)
++        self.assertFalse(result.success)
++        self.assertEqual(rank.lora_manager.loaded, [])
++
++    def test_load_failure_reports_an_unknown_rank(self):
++        rank = _StagedRank(load_success=False)
++        rank.begin("v1", 1)
++        _, tensors = rank.bucket("v1", 1, 0)
++        result = rank.end("v1", 1, _checksums(tensors))
++        self.assertFalse(result.success)
++        self.assertIs(result.clean, False)
++
++    def test_begin_refuses_a_second_candidate_and_bad_config(self):
++        rank = _StagedRank()
++        self.assertFalse(rank.begin("v1", 1, config={}).success)
++        self.assertIsNone(rank.rank.staged_lora_key)
++
++        self.assertTrue(rank.begin("v1", 1).success)
++        self.assertFalse(rank.begin("v2", 1).success)
++        # Duplicate Begin of the same attempt is idempotent and keeps the stash.
++        rank.bucket("v1", 1, 0)
++        self.assertTrue(rank.begin("v1", 1).success)
++        self.assertEqual(sorted(rank.rank.staged_lora_buckets), [0])
++
++    def test_new_attempt_starts_empty_but_only_after_cleanup(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        rank.bucket("v1", 1, 0)
++        # A full retry (new attempt_id) is only legal once the publisher cleaned the
++        # previous attempt back to absent; without that cleanup the engine refuses
++        # rather than silently mixing two attempts' buckets.
++        self.assertFalse(rank.begin("v1", 2).success)
++        self.assertTrue(rank.unload("v1").success)
++        self.assertTrue(rank.begin("v1", 2).success)
++        self.assertEqual(rank.rank.staged_lora_key, ("v1", 2))
++        self.assertEqual(rank.rank.staged_lora_buckets, {})
++
++    def test_unload_discards_the_candidate_and_is_idempotent(self):
++        rank = _StagedRank()
++        rank.begin("v1", 1)
++        rank.bucket("v1", 1, 0)
++        self.assertTrue(rank.unload("v1").success)
++        self.assertIsNone(rank.rank.staged_lora_key)
++        self.assertEqual(rank.rank.staged_lora_buckets, {})
++        self.assertTrue(rank.unload("v1").success)
++        self.assertEqual(rank.lora_manager.unloaded_names, ["v1", "v1"])
++
++
++class TestTokenizerStagedBookkeeping(unittest.TestCase):
++    def test_merge_keeps_an_unknown_rank_unknown(self):
++        clean = LoRAUpdateOutput(success=False, error_message="refused")
++        unknown = LoRAUpdateOutput(success=False, error_message="dirty", clean=False)
++        merged = _merge_lora_update_results([clean, unknown])
++        self.assertFalse(merged.success)
++        self.assertIs(merged.clean, False)
++        self.assertIn("refused", merged.error_message)
++        self.assertIn("dirty", merged.error_message)
++        self.assertIsNone(_merge_lora_update_results([clean]).clean)
++
++    def test_destructive_updates_are_refused_while_a_candidate_is_in_flight(self):
++        owner = SimpleNamespace(staged_lora_publication=None)
++        self.assertIsNone(
++            TokenizerControlMixin._reject_if_staged_lora_pending(owner, "update")
++        )
++        owner.staged_lora_publication = SimpleNamespace(
++            lora_name="v1", attempt_id=7
++        )
++        refusal = TokenizerControlMixin._reject_if_staged_lora_pending(
++            owner, "update"
++        )
++        self.assertIn("v1", refusal)
++        self.assertIn("7", refusal)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
+index c3a74a5..a1be875 100644
+--- a/python/sglang/srt/lora/utils.py
++++ b/python/sglang/srt/lora/utils.py
+@@ -1,6 +1,7 @@
++import logging
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import Iterable, List, Optional, Set, Tuple, Union
++from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
+ 
+ import torch
+ 
+@@ -8,6 +9,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.utils.hf_transformers_utils import AutoConfig
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ @dataclass
+ class MoELoRABatchInfo:
+     # Per-request segment indptrs used by MoE LoRA routing, shape (bs + 1,).
+@@ -610,3 +614,49 @@ def build_lm_head_pass_segments(
+         result.append((seg_wi, seg_lens))
+ 
+     return result
++
++
++def verify_lora_tensor_checksums(
++    tensors: Dict[str, torch.Tensor],
++    expected_checksums: Dict[str, str],
++    identify: str = "",
++) -> None:
++    """Verify received adapter tensors against the sender's sha256 manifest.
++
++    Value-level authority of the staged publication protocol: the sender announces
++    one digest per tensor name, so a wrong payload, a dropped bucket or a stale
++    attempt is *provable* before anything is loaded -- while the engine can still
++    refuse cleanly instead of having to claim an unknown state. Raises
++    ``RuntimeError`` on any drift; the caller decides what that means for the
++    candidate (the staged path discards it and stays absent).
++    """
++    import hashlib
++
++    mismatch, missing = [], []
++    for name, want in expected_checksums.items():
++        if name not in tensors:
++            missing.append(name)
++            continue
++        got = hashlib.sha256(
++            tensors[name]
++            .detach()
++            .cpu()
++            .contiguous()
++            .flatten()
++            .view(torch.uint8)
++            .numpy()
++            .tobytes()
++        ).hexdigest()
++        if got != want:
++            mismatch.append(name)
++    extra = [name for name in tensors if name not in expected_checksums]
++    if mismatch or missing or extra:
++        raise RuntimeError(
++            f"[LORA-CHECK]{identify} adapter sync MISMATCH of {len(expected_checksums)} expected: "
++            f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
++            f"{len(extra)} extra {extra[:5]}"
++        )
++    logger.info(
++        f"[LORA-CHECK]{identify} adapter sync OK: "
++        f"{len(expected_checksums)}/{len(expected_checksums)} tensors match (sha256)"
++    )
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index c462494..3e4ae7c 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -324,6 +324,23 @@ class LoRAManager:
+         )
+         return result
+ 
++    def unload_lora_adapter_by_name(self, lora_name: str) -> LoRAUpdateOutput:
++        """Unload every loaded adapter carrying ``lora_name``.
++
++        Name-scoped and idempotent on purpose: the cleanup caller knows the
++        candidate *name* it wants gone but not whether each rank ever got as far as
++        loading it (a failed staged attempt can leave some ranks loaded and others
++        untouched). "Nothing to unload" therefore has to be success, and a name has
++        to be addressable without knowing the lora_id it was loaded under.
++        """
++        for lora_ref in [
++            ref for ref in self.lora_refs.values() if ref.lora_name == lora_name
++        ]:
++            result = self._unload_lora_adapter(lora_ref)
++            if not result.success:
++                return result
++        return self.create_lora_update_result(success=True)
++
+     def _unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
+         """
+         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 928348eb..1c5bf177 100644
+index 928348e..bc06ed1 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -1862,6 +1862,16 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
@@ -1436,7 +1894,7 @@ index 928348eb..1c5bf177 100644
  class CheckWeightsReqInput(BaseReq, kw_only=True):
      action: str = "checksum"
      allow_quant_error: bool = False
-@@ -2166,6 +2176,45 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+@@ -2166,15 +2176,83 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
          )
  
  
@@ -1450,17 +1908,39 @@ index 928348eb..1c5bf177 100644
 +    the ``LoRAManager`` rather than ``model.load_weights``. ``config_dict`` is
 +    the HF-PEFT adapter config (same content the disk path writes to
 +    ``adapter_config.json``).
++
++    ``op`` selects the transport: ``legacy`` is the one-shot push (one call, one
++    bucket plan, same wire shape as before); ``begin``/``bucket``/``end`` are the
++    staged protocol that publishes an immutable adapter *version* under a fresh
++    name while it keeps serving -- the receiver stashes buckets across calls and
++    only loads (and hence only occupies a LoRA slot) at ``end``. ``unload`` is the
++    idempotent, name-scoped cleanup that both discards a staged candidate and
++    physically unloads a name, so a publisher that cannot tell how far a failed
++    attempt got can still retry from a clean slate. Fields below are optional
++    because each op carries only the subset it needs.
 +    """
 +
++    op: Literal["legacy", "begin", "bucket", "end", "unload"] = "legacy"
 +    lora_name: str
-+    config_dict: Dict[str, Any]
-+    names: List[str]
-+    dtypes: List[str]
-+    shapes: List[List[int]]
++    config_dict: Optional[Dict[str, Any]] = None
++    names: Optional[List[str]] = None
++    dtypes: Optional[List[str]] = None
++    shapes: Optional[List[List[int]]] = None
 +    # Number of tensors per broadcast bucket, in ``names`` order; sums to len(names).
 +    # The sender picks the boundaries and the receiver must use the identical ones or the
 +    # two desync on the broadcast. ``None`` means one bucket (pre-bucketing senders).
 +    bucket_sizes: Optional[List[int]] = None
++    # Identifies one staged publication attempt. All of ``begin``/``bucket``/``end`` must
++    # carry the same value; the same name under a new attempt is a new candidate, never a
++    # resume of the old one.
++    attempt_id: Optional[int] = None
++    # Ordinal of this bucket within one attempt (staged ``bucket`` op only).
++    bucket_index: Optional[int] = None
++    # Sender-side sha256 of every tensor it announced. ``end`` verifies the stashed
++    # payload against it before anything is loaded.
++    expected_checksums: Optional[Dict[str, str]] = None
++    # Free-form reason for an ``unload`` (surfaced in logs and error text only).
++    reason: Optional[str] = None
 +    # The NCCL group name to receive the adapter tensors on (reuses the weight-update group).
 +    group_name: str = "weight_update_group"
 +    # Whether to pin the LoRA adapter in memory.
@@ -1482,7 +1962,15 @@ index 928348eb..1c5bf177 100644
  class LoRAUpdateOutput(BaseReq, kw_only=True):
      success: bool
      error_message: Optional[str] = None
-@@ -2174,7 +2223,7 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
+     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
++    # Whether the engine can *prove* it did not mutate anything before failing.
++    # ``True`` means the candidate is provably still absent locally, so a caller may
++    # clean up and try again; ``False``/``None`` means the outcome is unknown (a
++    # partially written load, a broken collective) and the caller must not treat the
++    # engine as clean. Only the staged protocol sets this; the HTTP layer reports a
++    # failure without a proof as 400 and one with ``clean=False`` as 500.
++    clean: Optional[bool] = None
+ 
  
  LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
      LoadLoRAAdapterFromTensorsReqOutput
@@ -1647,10 +2135,18 @@ index 653b28c4..d30ce9f9 100644
          """Reject freeing/restoring model weights while the CUDA IPC weight
          cache is active: the weights are shared with the daemon via CUDA IPC, so
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index 7cfd98b8..03ac104c 100644
+index 7cfd98b..c1a28ef 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
-@@ -48,6 +48,8 @@ from sglang.srt.managers.io_struct import (
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import dataclasses
+ import hashlib
+ import logging
+ import time
+@@ -48,6 +49,8 @@ from sglang.srt.managers.io_struct import (
      LoadLoRAAdapterReqOutput,
      LoRAUpdateOutput,
      OpenSessionReqInput,
@@ -1659,7 +2155,7 @@ index 7cfd98b8..03ac104c 100644
      ProfileReq,
      ProfileReqOutput,
      ProfileReqType,
-@@ -66,6 +68,8 @@ from sglang.srt.managers.io_struct import (
+@@ -66,6 +69,8 @@ from sglang.srt.managers.io_struct import (
      SlowDownReqOutput,
      UnloadLoRAAdapterReqInput,
      UnloadLoRAAdapterReqOutput,
@@ -1668,7 +2164,7 @@ index 7cfd98b8..03ac104c 100644
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromDistributedReqOutput,
      UpdateWeightsFromIPCReqInput,
-@@ -101,6 +105,7 @@ _COMMUNICATOR_SPECS = [
+@@ -101,6 +106,7 @@ _COMMUNICATOR_SPECS = [
      ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
      ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
      ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
@@ -1676,7 +2172,67 @@ index 7cfd98b8..03ac104c 100644
      ("get_weights_by_name", GetWeightsByNameReqOutput),
      ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
      ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
-@@ -738,6 +743,103 @@ class TokenizerControlMixin:
+@@ -141,9 +147,29 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
+         success=False,
+         error_message=" | ".join(error_messages),
+         loaded_adapters=failed[0].loaded_adapters,
++        # One rank reporting an unknown state makes the whole fan-out unknown: the
++        # caller may only treat the engine as clean when every rank proved it.
++        clean=False if any(r.clean is False for r in failed) else None,
+     )
+ 
+ 
++@dataclasses.dataclass
++class StagedLoRAPublication:
++    """Tokenizer-side record of one in-flight staged adapter publication.
++
++    Only the candidate's *identity* lives here (name, attempt, the lora_id it will
++    be registered under, its config). The tensors and the per-bucket classification
++    live in each worker, which is where the receiving actually happens; this record
++    exists so ``begin`` can hand out a stable lora_id, ``end`` can register that
++    exact id, and ``unload`` can drop the candidate by name.
++    """
++
++    lora_name: str
++    attempt_id: int
++    lora_ref: LoRARef
++    config_dict: Dict
++
++
+ class TokenizerControlMixin:
+     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
+     profile, internal state, etc.) -- everything that talks to the scheduler via
+@@ -456,6 +482,9 @@ class TokenizerControlMixin:
+                 results = await self.update_weights_from_distributed_communicator(obj)
+ 
+         if not is_paused:
++            refusal = self._reject_if_staged_lora_pending("full-weight update")
++            if refusal:
++                return False, refusal
+             async with self.model_update_lock.writer_lock:
+                 results = await self.update_weights_from_distributed_communicator(obj)
+ 
+@@ -517,6 +546,9 @@ class TokenizerControlMixin:
+                 results = await self.update_weights_from_tensor_communicator(obj)
+ 
+         if not is_paused:
++            refusal = self._reject_if_staged_lora_pending("full-weight update")
++            if refusal:
++                return False, refusal
+             async with self.model_update_lock.writer_lock:
+                 results = await self.update_weights_from_tensor_communicator(obj)
+ 
+@@ -548,6 +580,9 @@ class TokenizerControlMixin:
+                     success, message = result.success, result.message
+ 
+             if not is_paused:
++                refusal = self._reject_if_staged_lora_pending("IPC weight update")
++                if refusal:
++                    raise ValueError(refusal)
+                 async with self.model_update_lock.writer_lock:
+                     result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                     success, message = result.success, result.message
+@@ -738,6 +773,307 @@ class TokenizerControlMixin:
                  error_message=str(e),
              )
  
@@ -1697,9 +2253,29 @@ index 7cfd98b8..03ac104c 100644
 +                self.server_args.dp_size == 1
 +            ), "dp_size must be 1 for dynamic lora loading"
 +            logger.info(
-+                "Start update Lora adapter from distributed. Lora name=%s",
++                "Start update Lora adapter from distributed. Lora name=%s op=%s",
 +                obj.lora_name,
++                obj.op,
 +            )
++
++            op = obj.op or "legacy"
++            if op == "begin":
++                return await self._update_lora_from_distributed_begin(obj)
++            if op == "bucket":
++                return await self._update_lora_from_distributed_bucket(obj)
++            if op == "end":
++                return await self._update_lora_from_distributed_end(obj)
++            if op == "unload":
++                return await self._update_lora_from_distributed_unload(obj)
++            if op != "legacy":
++                return UpdateLoRAFromDistributedReqOutput(
++                    success=False, error_message=f"unknown staged LoRA op {op!r}"
++                )
++            if not obj.names or obj.config_dict is None:
++                raise ValueError(
++                    "op=legacy requires config_dict/names/dtypes/shapes and the full "
++                    "bucket layout; use op=begin/bucket/end for a staged publication."
++                )
 +
 +            async with self.lora_update_lock:
 +                # Self-contained same-name replacement: drop the prior version of
@@ -1777,10 +2353,194 @@ index 7cfd98b8..03ac104c 100644
 +                error_message=str(e),
 +            )
 +
++    # ------------------------------------------------------------------
++    # Staged LoRA publication: begin / bucket / end / unload
++    #
++    # An immutable adapter version is published under a *fresh* name while the
++    # engine keeps serving the old one, so the whole transaction may overlap normal
++    # generation (it only writes a name nothing can resolve yet). It must not
++    # overlap a base/full-weight mutation, which `_reject_if_staged_lora_pending`
++    # enforces on the writer side.
++    #
++    # Begin/Bucket/End are separate control calls and therefore never hold a lock
++    # across requests: the guard is the `staged_lora_publication` record itself.
++    # ------------------------------------------------------------------
++
++    def _reject_if_staged_lora_pending(
++        self: TokenizerManager, what: str
++    ) -> Optional[str]:
++        """Fail fast on a destructive update while a candidate is in flight.
++
++        A staged candidate's tensors were verified against the model the sender
++        broadcast them for; running a base/full-weight update in the middle of that
++        transaction would silently invalidate the payload the candidate is about to
++        be loaded from.
++        """
++        staged = getattr(self, "staged_lora_publication", None)
++        if staged is None:
++            return None
++        return (
++            f"refusing {what} while staged LoRA publication '{staged.lora_name}' "
++            f"(attempt {staged.attempt_id}) is in flight"
++        )
++
++    async def _update_lora_from_distributed_begin(
++        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        """``op=begin``: open the staged slot and hand out the candidate identity.
++
++        Runs before any collective, so every refusal here is provably clean: no
++        worker has received anything and the name stays unresolvable.
++        """
++
++        if obj.attempt_id is None:
++            return UpdateLoRAFromDistributedReqOutput(
++                success=False, error_message="op=begin requires attempt_id"
++            )
++        attempt = (obj.lora_name, int(obj.attempt_id))
++        async with self.model_update_lock.reader_lock:
++            async with self.lora_update_lock:
++                staged = self.staged_lora_publication
++                if staged is not None and (
++                    staged.lora_name,
++                    staged.attempt_id,
++                ) != attempt:
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False,
++                        error_message=(
++                            "another staged LoRA publication is in flight: "
++                            f"('{staged.lora_name}', {staged.attempt_id})"
++                        ),
++                    )
++                if obj.lora_name in self.lora_registry.get_all_adapters():
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False,
++                        error_message=(
++                            f"LoRA '{obj.lora_name}' is already registered; a staged "
++                            "publication must use a fresh immutable name"
++                        ),
++                    )
++                if staged is None:
++                    staged = StagedLoRAPublication(
++                        lora_name=obj.lora_name,
++                        attempt_id=int(obj.attempt_id),
++                        lora_ref=LoRARef(
++                            lora_name=obj.lora_name,
++                            lora_path="__distributed__",
++                            pinned=bool(obj.pinned),
++                        ),
++                        config_dict=dict(obj.config_dict or {}),
++                    )
++                    self.staged_lora_publication = staged
++                # A retransmitted Begin of the same attempt is idempotent and keeps the
++                # candidate's identity (and its lora_id) stable; the workers keep any
++                # buckets that already arrived.
++                obj.lora_id = staged.lora_ref.lora_id
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
++                if not result.success:
++                    # Nothing was broadcast yet, so reject the whole attempt and free the
++                    # slot; the publisher may retry with a new attempt_id.
++                    self.staged_lora_publication = None
++                return result
++
++    async def _update_lora_from_distributed_bucket(
++        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        """``op=bucket``: relay one collective.
++
++        Deliberately unconditional: the sender is already inside the collective when
++        this call arrives, so the payload is always received and any semantic verdict
++        (new bucket, duplicate, stale attempt) is reached by the workers *after* the
++        transfer. The tokenizer keeps no per-bucket state, which is what makes a
++        refused attempt callable without a session to revive.
++        """
++
++        async with self.model_update_lock.reader_lock:
++            return _merge_lora_update_results(
++                await self.update_lora_adapter_communicator(obj)
++            )
++
++    async def _update_lora_from_distributed_end(
++        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        """``op=end``: load the verified candidate and register it locally.
++
++        Registering here makes the version resolvable by generation, but it stays
++        *invisible to sessions* until the publisher commits it fleet-wide in the
++        LoRA version registry -- the engine has no say in which version is current.
++        """
++
++        async with self.model_update_lock.reader_lock:
++            async with self.lora_update_lock:
++                staged = self.staged_lora_publication
++                if staged is None or (
++                    staged.lora_name,
++                    staged.attempt_id,
++                ) != (obj.lora_name, int(obj.attempt_id or -1)):
++                    return UpdateLoRAFromDistributedReqOutput(
++                        success=False,
++                        error_message=(
++                            "no staged LoRA publication for "
++                            f"('{obj.lora_name}', {obj.attempt_id})"
++                        ),
++                    )
++                obj.lora_id = staged.lora_ref.lora_id
++                obj.config_dict = staged.config_dict
++                result = _merge_lora_update_results(
++                    await self.update_lora_adapter_communicator(obj)
++                )
++                # Either way the attempt is over: on success the version lives in the
++                # registry under this exact lora_id, on failure the publisher cleans the
++                # unpublished leftovers up by name (never by reviving this candidate).
++                self.staged_lora_publication = None
++                if result.success:
++                    await self.lora_registry.register(staged.lora_ref)
++                    logger.info(
++                        "Staged LoRA publication ('%s', %d) is READY_LOCAL as %s",
++                        staged.lora_name,
++                        staged.attempt_id,
++                        staged.lora_ref.lora_id,
++                    )
++                return result
++
++    async def _update_lora_from_distributed_unload(
++        self: TokenizerManager, obj: UpdateLoRAFromDistributedReqInput
++    ) -> UpdateLoRAFromDistributedReqOutput:
++        """``op=unload``: idempotent, name-scoped cleanup and reclamation.
++
++        Covers both situations a publisher needs: a candidate that never became
++        visible (drop the staged record, discard whatever the workers stashed or half
++        loaded) and a version that is registered here but must go away (unregister ->
++        drain in-flight users -> physical unload). An absent name is success, which is
++        what lets the publisher clean up after a failed attempt without knowing how
++        far the attempt got on each engine.
++        """
++
++        async with self.lora_update_lock:
++            staged = self.staged_lora_publication
++            if staged is not None and staged.lora_name == obj.lora_name:
++                self.staged_lora_publication = None
++                logger.info(
++                    "Dropping staged LoRA candidate ('%s', %d): %s",
++                    staged.lora_name,
++                    staged.attempt_id,
++                    obj.reason or "cleanup",
++                )
++            if obj.lora_name in self.lora_registry.get_all_adapters():
++                # Stop new requests from resolving the name, then wait for the ones
++                # already holding a reference before touching the weights.
++                lora_id = await self.lora_registry.unregister(obj.lora_name)
++                await self.lora_registry.wait_for_unload(lora_id)
++            return _merge_lora_update_results(
++                await self.update_lora_adapter_communicator(obj)
++            )
++
      async def unload_lora_adapter(
          self: TokenizerManager,
          obj: UnloadLoRAAdapterReqInput,
-@@ -797,6 +899,16 @@ class TokenizerControlMixin:
+@@ -797,6 +1133,19 @@ class TokenizerControlMixin:
          self.auto_create_handle_loop()
          await self.resume_memory_occupation_communicator(obj)
  
@@ -1790,6 +2550,9 @@ index 7cfd98b8..03ac104c 100644
 +        request: Optional[fastapi.Request] = None,
 +    ) -> Tuple[bool, str]:
 +        self.auto_create_handle_loop()
++        refusal = self._reject_if_staged_lora_pending("post-load weight rewrite")
++        if refusal:
++            return False, refusal
 +        async with self.model_update_lock.writer_lock:
 +            results = await self.post_process_weights_communicator(obj)
 +        return FanOutCommunicator.merge_results(results)
@@ -1798,10 +2561,45 @@ index 7cfd98b8..03ac104c 100644
          self: TokenizerManager,
          obj: CheckWeightsReqInput,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 80351f33..99e4a1c2 100644
+index 80351f3..355f348 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -2840,27 +2840,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -96,7 +96,10 @@ from sglang.srt.managers.schedule_batch import (
+     get_request_return_hidden_states_mode,
+ )
+ from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
+-from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
++from sglang.srt.managers.tokenizer_control_mixin import (
++    StagedLoRAPublication,
++    TokenizerControlMixin,
++)
+ from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+ from sglang.srt.managers.utils import (
+     compute_num_reserved_tokens,
+@@ -625,6 +628,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         # Please note that, unlike `model_update_lock`, this does not block inference, allowing
+         # LoRA updates and inference to overlap.
+         self.lora_update_lock = asyncio.Lock()
++        # The one in-flight staged LoRA publication, if any. It is the transaction guard
++        # for the begin/bucket/end protocol: it stays set across those separate control
++        # calls, which no single lock can express (and holding one across calls would
++        # serialize them against normal generation for the whole transfer).
++        self.staged_lora_publication: Optional[StagedLoRAPublication] = None
+         # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
+         # point to their latest LoRARef objects, so that they can be
+         # dynamically loaded if needed for inference
+@@ -2010,6 +2018,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         async with self.is_pause_cond:
+             is_paused = self.is_pause
+ 
++        refusal = self._reject_if_staged_lora_pending("full-weight update from disk")
++        if refusal:
++            return False, refusal, 0
++
+         lock_context = (
+             self.model_update_lock.writer_lock if not is_paused else nullcontext()
+         )
+@@ -2840,27 +2852,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
              priority = getattr(state.obj, "priority", None)
              if priority is not None:
                  labels["priority"] = str(priority)
@@ -1838,7 +2636,48 @@ index 80351f33..99e4a1c2 100644
  
          if state.finished:
              # Get detailed cache breakdown if available
-@@ -3731,7 +3729,14 @@ def _get_processor_wrapper(server_args):
+@@ -3497,6 +3507,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 for logical_rid in self._logical_rids(obj)
+                 if (state := self.rid_to_state.get(logical_rid)) is not None
+             }
++        # The LoRA reference acquired for a request is normally released when its
++        # output arrives (or when the scheduler reports an abort). A request dropped
++        # here never gets either -- the state is gone before the answer comes back --
++        # so its reference has to be released now. Otherwise the adapter's refcount
++        # never reaches zero and `wait_for_unload` blocks an unload forever.
++        released_lora_ids = []
+         for logical_rid in self._logical_rids(obj):
+             lifecycle_id = lifecycle_ids.get(logical_rid)
+             if lifecycle_id is None:
+@@ -3510,6 +3526,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+                 )
+             )
+             logical_state = self.rid_to_state.get(logical_rid)
++            # The logical state owns the reference; fall back to a child when the logical
++            # state was already reaped (parallel sampling reaps it after dispatching).
++            lora_ref_owner = logical_state
++            if lora_ref_owner is None and child_rids:
++                lora_ref_owner = self.rid_to_state[child_rids[0]]
++            if (
++                self.enable_lora
++                and lora_ref_owner is not None
++                and getattr(lora_ref_owner.obj, "lora_path", None)
++            ):
++                released_lora_ids.append(lora_ref_owner.obj.lora_id)
+             owns_logical_state = (
+                 logical_state is not None and logical_state.lifecycle_id is lifecycle_id
+             )
+@@ -3531,6 +3558,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+             for child_rid in child_rids:
+                 self._remove_req_state(child_rid, lifecycle_id)
+             self._remove_req_state(logical_rid, lifecycle_id)
++        for lora_id in released_lora_ids:
++            if lora_id is not None:
++                asyncio.create_task(self.lora_registry.release(lora_id))
+ 
+     def _should_dispatch_to_encoder(
+         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+@@ -3731,7 +3761,14 @@ def _get_processor_wrapper(server_args):
  
  
  def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
@@ -1855,13 +2694,22 @@ index 80351f33..99e4a1c2 100644
      if is_cross_node:
          # Fallback to default CPU transport for multi-node
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index 0fdf5b96..2cda3ba5 100644
+index 0fdf5b9..f8d3cdd 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
-@@ -30,8 +30,10 @@ from sglang.srt.managers.io_struct import (
+@@ -23,6 +23,7 @@ import torch
+ 
+ from sglang.srt.distributed import get_pp_group, get_world_group
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
++from sglang.srt.lora.utils import verify_lora_tensor_checksums
+ from sglang.srt.managers.io_struct import (
+     DestroyWeightsUpdateGroupReqInput,
+     GetWeightsByNameReqInput,
+@@ -30,8 +31,11 @@ from sglang.srt.managers.io_struct import (
      InitWeightsUpdateGroupReqInput,
      LoadLoRAAdapterFromTensorsReqInput,
      LoadLoRAAdapterReqInput,
++    LoRAUpdateOutput,
 +    PostProcessWeightsReqInput,
      SendWeightsToRemoteInstanceReqInput,
      UnloadLoRAAdapterReqInput,
@@ -1869,7 +2717,7 @@ index 0fdf5b96..2cda3ba5 100644
      UpdateWeightFromDiskReqInput,
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
-@@ -195,6 +197,13 @@ class BaseTpWorker(ABC):
+@@ -195,6 +199,13 @@ class BaseTpWorker(ABC):
          )
          return success, message
  
@@ -1883,15 +2731,70 @@ index 0fdf5b96..2cda3ba5 100644
      def _deserialize_own_rank(self, serialized_named_tensors):
          """Each rank deserializes only its own payload (index ps.tp_rank);
          deserializing another rank's copy would break producer-side CUDA-IPC
-@@ -285,6 +294,23 @@ class BaseTpWorker(ABC):
+@@ -247,35 +258,8 @@ class BaseTpWorker(ABC):
+         else:
+             tensors = data
+         if recv_req.expected_checksums is not None:
+-            import hashlib
+-
+-            exp = recv_req.expected_checksums
+-            mismatch, missing = [], []
+-            for name, want in exp.items():
+-                if name not in tensors:
+-                    missing.append(name)
+-                    continue
+-                got = hashlib.sha256(
+-                    tensors[name]
+-                    .detach()
+-                    .cpu()
+-                    .contiguous()
+-                    .flatten()
+-                    .view(torch.uint8)
+-                    .numpy()
+-                    .tobytes()
+-                ).hexdigest()
+-                if got != want:
+-                    mismatch.append(name)
+-            extra = [n for n in tensors if n not in exp]
+-            if mismatch or missing or extra:
+-                raise RuntimeError(
+-                    f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync MISMATCH of {len(exp)} expected: "
+-                    f"{len(mismatch)} value-diff {mismatch[:5]}, {len(missing)} missing {missing[:5]}, "
+-                    f"{len(extra)} extra {extra[:5]}"
+-                )
+-            logger.info(
+-                f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
++            verify_lora_tensor_checksums(
++                tensors, recv_req.expected_checksums, identify=f" rank{self.ps.tp_rank}"
+             )
+         result = self.model_runner.load_lora_adapter_from_tensors(
+             recv_req.to_ref(),
+@@ -285,6 +269,40 @@ class BaseTpWorker(ABC):
          )
          return result
  
 +    def update_lora_from_distributed(
 +        self, recv_req: UpdateLoRAFromDistributedReqInput
 +    ):
-+        # Every TP worker joins the broadcast; the LoRA code slices its own shard
-+        # internally (slice_lora_a_weights / slice_lora_b_weights).
++        """One control call of the distributed LoRA transport, by ``op``.
++
++        Every TP worker joins every broadcast; the LoRA code slices its own shard
++        internally (slice_lora_a_weights / slice_lora_b_weights). The staged ops
++        keep their state inside the model runner, so the dispatch here stays thin.
++        """
++        op = recv_req.op or "legacy"
++        staged = {
++            "begin": self.model_runner.stage_lora_begin,
++            "bucket": self.model_runner.stage_lora_bucket,
++            "end": self.model_runner.stage_lora_end,
++            "unload": self.model_runner.unload_lora_from_distributed,
++        }
++        if op in staged:
++            return staged[op](recv_req)
++        if op != "legacy":
++            return LoRAUpdateOutput(
++                success=False, error_message=f"unknown staged LoRA op {op!r}"
++            )
 +        result = self.model_runner.update_lora_from_distributed(
 +            recv_req.to_ref(),
 +            recv_req.names,
@@ -1976,7 +2879,7 @@ index 2916f8c6..32b81c49 100644
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8e957f66..1bd46d38 100644
+index 8e957f6..ccea515 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -376,9 +376,10 @@ class ModelRunner:
@@ -1993,10 +2896,69 @@ index 8e957f66..1bd46d38 100644
  
          self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
  
-@@ -1183,10 +1184,130 @@ class ModelRunner:
+@@ -1183,10 +1184,366 @@ class ModelRunner:
              lora_ref, tensors, config_dict, added_tokens_config
          )
  
++    def _receive_lora_buckets(self, names, dtypes, shapes, group_name, bucket_sizes):
++        """Collectively receive the announced adapter tensors, bucket by bucket.
++
++        Every participant must issue exactly the same broadcasts as the source, so
++        callers that turn out to be uninterested in the payload (a stale attempt, a
++        duplicate bucket) still call this and drop the result afterwards. Each
++        bucket is staged on device, received, then moved to host memory and
++        released, so peak device memory is ONE bucket instead of the whole adapter:
++        a MoE adapter runs to several GB, and allocating that on top of the KV cache
++        OOMs mid-broadcast, which wedges every other participant until the NCCL
++        timeout. Host tensors are what ``LoRAAdapter`` keeps anyway
++        (``_process_weight`` calls ``.cpu()``).
++        """
++        model_update_group = self.weight_updater._model_update_group
++        assert group_name in model_update_group, (
++            f"Group {group_name} not in {list(model_update_group.keys())}. "
++            "Please call `init_weights_update_group` first."
++        )
++        if not bucket_sizes:
++            bucket_sizes = [len(names)]
++        assert sum(bucket_sizes) == len(names), (
++            f"bucket_sizes sum to {sum(bucket_sizes)} but {len(names)} tensors were "
++            "announced; sender and receiver would issue different broadcasts and hang."
++        )
++
++        tensors = {}
++        offset = 0
++        for count in bucket_sizes:
++            handles = []
++            staged = []
++            for name, dtype, shape in zip(
++                names[offset : offset + count],
++                dtypes[offset : offset + count],
++                shapes[offset : offset + count],
++            ):
++                target_dtype = (
++                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
++                )
++                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
++                handles.append(
++                    torch.distributed.broadcast(
++                        weight,
++                        src=0,
++                        group=model_update_group[group_name],
++                        async_op=True,
++                    )
++                )
++                staged.append((name, weight))
++            for handle in handles:
++                handle.wait()
++            handles.clear()
++            # Move off-device and drop the staging buffers before the next bucket is
++            # allocated, so the device high-water mark stays at one bucket.
++            for name, weight in staged:
++                tensors[name] = weight.to("cpu")
++            staged.clear()
++            offset += count
++        return tensors
++
 +    def update_lora_from_distributed(
 +        self,
 +        lora_ref: LoRARef,
@@ -2015,64 +2977,15 @@ index 8e957f66..1bd46d38 100644
 +        gathered tensors are handed to the ``LoRAManager`` instead of
 +        ``model.load_weights``. The full (TP-gathered, PP-merged) adapter is
 +        broadcast to every worker, which slices its own shard internally.
-+
-+        ``bucket_sizes`` is the number of tensors per broadcast bucket, exactly as the
-+        sender grouped them. Each bucket is staged on device, received, then moved to
-+        host memory and released, so peak device memory is ONE bucket instead of the
-+        whole adapter: a MoE adapter runs to several GB, and allocating that on top of
-+        the KV cache OOMs mid-broadcast, which wedges every other participant until the
-+        NCCL timeout. Host tensors are what ``LoRAAdapter`` keeps anyway
-+        (``_process_weight`` calls ``.cpu()``). ``None`` means a single bucket.
++        ``None`` ``bucket_sizes`` means a single bucket.
 +        """
 +        from sglang.srt.managers.io_struct import LoRAUpdateOutput
 +
-+        model_update_group = self.weight_updater._model_update_group
-+        assert group_name in model_update_group, (
-+            f"Group {group_name} not in {list(model_update_group.keys())}. "
-+            "Please call `init_weights_update_group` first."
-+        )
-+        if not bucket_sizes:
-+            bucket_sizes = [len(names)]
-+        assert sum(bucket_sizes) == len(names), (
-+            f"bucket_sizes sum to {sum(bucket_sizes)} but {len(names)} tensors were "
-+            "announced; sender and receiver would issue different broadcasts and hang."
-+        )
 +        logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
 +        try:
-+            tensors = {}
-+            offset = 0
-+            for count in bucket_sizes:
-+                handles = []
-+                staged = []
-+                for name, dtype, shape in zip(
-+                    names[offset : offset + count],
-+                    dtypes[offset : offset + count],
-+                    shapes[offset : offset + count],
-+                ):
-+                    target_dtype = (
-+                        dtype
-+                        if isinstance(dtype, torch.dtype)
-+                        else getattr(torch, dtype)
-+                    )
-+                    weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-+                    handles.append(
-+                        torch.distributed.broadcast(
-+                            weight,
-+                            src=0,
-+                            group=model_update_group[group_name],
-+                            async_op=True,
-+                        )
-+                    )
-+                    staged.append((name, weight))
-+                for handle in handles:
-+                    handle.wait()
-+                handles.clear()
-+                # Move off-device and drop the staging buffers before the next bucket is
-+                # allocated, so the device high-water mark stays at one bucket.
-+                for name, weight in staged:
-+                    tensors[name] = weight.to("cpu")
-+                staged.clear()
-+                offset += count
++            tensors = self._receive_lora_buckets(
++                names, dtypes, shapes, group_name, bucket_sizes
++            )
 +        except Exception as e:
 +            error_msg = f"Failed to receive LoRA adapter over distributed group: {e}."
 +            logger.error(error_msg)
@@ -2088,6 +3001,232 @@ index 8e957f66..1bd46d38 100644
          """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
          return self.lora_manager.unload_lora_adapter(lora_ref)
  
++    # ------------------------------------------------------------------
++    # Staged LoRA publication (one candidate at a time)
++    #
++    # An immutable adapter version arrives as several control calls: `begin`
++    # reserves the slot, each `bucket` receives one NCCL broadcast into
++    # ``staged_lora_buckets``, and `end` verifies the whole stash against the
++    # sender's manifest before anything is loaded. Until `end` succeeds the
++    # candidate is invisible: not in the LoRA registry, not in the resident pool,
++    # and never resolvable by generation.
++    # ------------------------------------------------------------------
++
++    def _ensure_staged_lora_state(self):
++        """Lazily created so model runners without LoRA stay untouched."""
++        if not hasattr(self, "staged_lora_key"):
++            self.staged_lora_key: Optional[Tuple[str, int]] = None
++            self.staged_lora_buckets: Dict[int, Dict[str, torch.Tensor]] = {}
++            # (lora_name, attempt_id, "ABORTED" | "READY_LOCAL") of the last terminal
++            # local attempt. It only answers RPCs that belong to that very attempt and
++            # never revives it, so a late bucket is drained and reported rather than
++            # mistaken for a brand new session.
++            self.staged_lora_terminal: Optional[Tuple[str, int, str]] = None
++
++    def _discard_staged_lora(self, state: Optional[str] = None) -> None:
++        self._ensure_staged_lora_state()
++        if self.staged_lora_key is not None:
++            self.staged_lora_terminal = (
++                self.staged_lora_key[0],
++                self.staged_lora_key[1],
++                state or "ABORTED",
++            )
++        self.staged_lora_key = None
++        self.staged_lora_buckets.clear()
++
++    def _staged_terminal_reply(self, attempt, name, what):
++        """Answer an RPC that belongs to an already finished attempt."""
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        ready = self.staged_lora_terminal[2] == "READY_LOCAL"
++        return LoRAUpdateOutput(
++            success=ready,
++            error_message=None
++            if ready
++            else f"staged LoRA attempt {attempt} is {self.staged_lora_terminal[2]}; {what}",
++        )
++
++    def stage_lora_begin(self, recv_req):
++        """``op=begin``: reserve the staged slot and run every static check.
++
++        The publisher waits for all Begin ACKs before it enters any collective, so
++        this is the last moment a doomed publication can be refused without putting
++        a single tensor on the wire.
++        """
++        from sglang.srt.lora.lora_config import LoRAConfig
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        self._ensure_staged_lora_state()
++        attempt = (recv_req.lora_name, int(recv_req.attempt_id))
++        if (
++            self.staged_lora_terminal is not None
++            and self.staged_lora_terminal[:2] == attempt
++        ):
++            # Retransmitted Begin of a finished attempt: report the terminal state
++            # instead of reviving it (a full retry uses a new attempt_id).
++            return self._staged_terminal_reply(attempt, recv_req.lora_name, "begin")
++        if self.staged_lora_key is not None and self.staged_lora_key != attempt:
++            return LoRAUpdateOutput(
++                success=False,
++                error_message=f"another staged LoRA publication is in flight: {self.staged_lora_key}",
++            )
++        try:
++            new_adapter = LoRAConfig.from_dict(
++                recv_req.config_dict or {},
++                recv_req.added_tokens_config,
++                base_vocab_size=self.lora_manager.base_hf_config.vocab_size,
++            )
++            self.lora_manager.validate_new_adapter(new_adapter, recv_req.to_ref())
++        except Exception as e:
++            return LoRAUpdateOutput(
++                success=False, error_message=f"staged LoRA config rejected: {e}"
++            )
++        if self.staged_lora_key != attempt:
++            # A new attempt starts from an empty stash; the same attempt's duplicate
++            # Begin keeps whatever buckets already arrived.
++            self.staged_lora_key = attempt
++            self.staged_lora_buckets.clear()
++        logger.info(
++            f"Staged LoRA publication {attempt} accepted: "
++            f"{len(self.staged_lora_buckets)} buckets already stashed"
++        )
++        return LoRAUpdateOutput(success=True)
++
++    def stage_lora_bucket(self, recv_req):
++        """``op=bucket``: participate in the broadcast, then classify what it was for.
++
++        Participation is unconditional and comes first: the sender is already
++        inside the collective when this call arrives, so a receiver that skipped it
++        would desync the whole group and wedge every later publication. Only once
++        the tensors are in does the handler decide whether they belong to the
++        candidate (stash), are a duplicate (drain), or are stale (drain and report).
++        """
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        self._ensure_staged_lora_state()
++        attempt = (recv_req.lora_name, int(recv_req.attempt_id))
++        index = int(recv_req.bucket_index)
++        active = self.staged_lora_key == attempt
++        duplicate = active and index in self.staged_lora_buckets
++        try:
++            tensors = self._receive_lora_buckets(
++                recv_req.names,
++                recv_req.dtypes,
++                recv_req.shapes,
++                recv_req.group_name,
++                recv_req.bucket_sizes,
++            )
++        except Exception as e:
++            # The collective itself broke: the group may be unusable for every
++            # participant, so this must not look like a refusal the publisher could
++            # simply retry as if nothing had crossed the wire.
++            return LoRAUpdateOutput(
++                success=False,
++                error_message=f"staged LoRA bucket {index} receive failed: {e}",
++                clean=False,
++            )
++        if active:
++            if duplicate:
++                logger.warning(
++                    f"Staged LoRA publication {attempt}: duplicate bucket {index} drained"
++                )
++                return LoRAUpdateOutput(success=True)
++            self.staged_lora_buckets[index] = tensors
++            return LoRAUpdateOutput(success=True)
++        if (
++            self.staged_lora_terminal is not None
++            and self.staged_lora_terminal[:2] == attempt
++        ):
++            return self._staged_terminal_reply(
++                attempt, recv_req.lora_name, f"bucket {index} drained"
++            )
++        return LoRAUpdateOutput(
++            success=False,
++            error_message=f"no staged LoRA publication for {attempt}; bucket {index} drained",
++        )
++
++    def stage_lora_end(self, recv_req):
++        """``op=end``: verify the stash, then load it locally.
++
++        Ordering is the safety property: every check that can *prove* a mismatch
++        runs before the ``LoRAManager`` is touched, because that load is not
++        transactional -- once it has run and failed there is no rollback, and the
++        caller must be told this rank's state is unknown rather than clean.
++        """
++        from sglang.srt.lora.utils import verify_lora_tensor_checksums
++        from sglang.srt.managers.io_struct import LoRAUpdateOutput
++
++        self._ensure_staged_lora_state()
++        attempt = (recv_req.lora_name, int(recv_req.attempt_id))
++        if self.staged_lora_key != attempt:
++            if (
++                self.staged_lora_terminal is not None
++                and self.staged_lora_terminal[:2] == attempt
++            ):
++                return self._staged_terminal_reply(
++                    attempt, recv_req.lora_name, "end"
++                )
++            return LoRAUpdateOutput(
++                success=False, error_message=f"no staged LoRA publication for {attempt}"
++            )
++        if not recv_req.expected_checksums:
++            self._discard_staged_lora()
++            return LoRAUpdateOutput(
++                success=False,
++                error_message=f"staged LoRA end for {attempt} without expected_checksums",
++            )
++        tensors = {}
++        for index in sorted(self.staged_lora_buckets):
++            tensors.update(self.staged_lora_buckets[index])
++        try:
++            verify_lora_tensor_checksums(
++                tensors,
++                recv_req.expected_checksums,
++                identify=f" rank{self.ps.tp_rank} staged",
++            )
++        except Exception as e:
++            # Proven mismatch and nothing loaded yet: this rank is cleanly absent
++            # again, so the attempt may be retried after the caller cleans up.
++            self._discard_staged_lora()
++            return LoRAUpdateOutput(
++                success=False, error_message=f"staged LoRA manifest rejected: {e}"
++            )
++        result = self.lora_manager.load_lora_adapter_from_tensors(
++            recv_req.to_ref(), tensors, recv_req.config_dict, recv_req.added_tokens_config
++        )
++        if not result.success:
++            # The load may have written configs/backend state before failing, and v1 has
++            # no rollback: report this rank as unknown (never clean) so the caller fails
++            # the publication closed instead of retrying on top of dirty state.
++            logger.error(
++                f"Staged LoRA publication {attempt} failed to load on rank "
++                f"{self.ps.tp_rank}: {result.error_message}"
++            )
++            result.clean = False
++            return result
++        self._discard_staged_lora(state="READY_LOCAL")
++        # No LRU eviction here: the staged protocol's own capacity accounting keeps the
++        # number of registered versions within `max_loaded_loras`, and every version it
++        # publishes is pinned, so evicting one to make room would break a bound session.
++        logger.info(f"Staged LoRA publication {attempt} loaded locally (READY_LOCAL).")
++        return result
++
++    def unload_lora_from_distributed(self, recv_req):
++        """``op=unload``: idempotent, name-scoped cleanup.
++
++        Covers both branches a publisher needs after a failed attempt: a staged
++        candidate (discarded, along with any half-loaded orphan) and a version that
++        loaded locally but was never fleet-published. Absent is success, so the
++        caller can retry from a clean slate.
++        """
++        self._ensure_staged_lora_state()
++        if (
++            self.staged_lora_key is not None
++            and self.staged_lora_key[0] == recv_req.lora_name
++        ):
++            self._discard_staged_lora()
++        return self.lora_manager.unload_lora_adapter_by_name(recv_req.lora_name)
++
 +    def post_process_weights(
 +        self,
 +        restore_weights_before_load: bool = False,
@@ -2124,7 +3263,7 @@ index 8e957f66..1bd46d38 100644
      @property
      def effective_max_total_num_tokens(self):
          """Return the max token pool size considering hybrid swa settings."""
-@@ -1441,6 +1562,12 @@ class ModelRunner:
+@@ -1441,6 +1798,12 @@ class ModelRunner:
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -2137,7 +3276,7 @@ index 8e957f66..1bd46d38 100644
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1448,7 +1575,7 @@ class ModelRunner:
+@@ -1448,7 +1811,7 @@ class ModelRunner:
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -2146,7 +3285,7 @@ index 8e957f66..1bd46d38 100644
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -1456,7 +1583,7 @@ class ModelRunner:
+@@ -1456,7 +1819,7 @@ class ModelRunner:
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -2154,7 +3293,7 @@ index 8e957f66..1bd46d38 100644
 +                cuda_graph_batch=cuda_graph_num_tokens,
                  no_copy_to_cpu=no_copy_to_cpu,
              )
-
+ 
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
 index 08c47b99..06a222fe 100644
 --- a/python/sglang/srt/models/qwen3_5.py
