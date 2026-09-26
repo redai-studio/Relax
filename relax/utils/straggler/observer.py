@@ -158,7 +158,14 @@ class TorchCudaEventBackend:
 
 
 class IntervalToken:
-    """Events and metadata for one in-flight interval."""
+    """Events and metadata for one in-flight interval.
+
+    ``seq`` is deliberately *not* set at acquire time: it is stamped by the
+    observer when the interval completes. Megatron nests timers, so a start-order
+    sequence would leave the enclosing interval behind the inner intervals it
+    wraps on the wire, and the collector -- which requires a per-rank sequence
+    that never decreases -- would drop it as out-of-order transport.
+    """
 
     __slots__ = (
         "start_event",
@@ -171,7 +178,7 @@ class IntervalToken:
         "seq",
     )
 
-    def __init__(self, start_event: Any, end_event: Any, seq: int) -> None:
+    def __init__(self, start_event: Any, end_event: Any) -> None:
         self.start_event = start_event
         self.end_event = end_event
         self.name = ""
@@ -179,7 +186,9 @@ class IntervalToken:
         self.host_start = 0.0
         self.host_end = 0.0
         self.barrier = False
-        self.seq = seq
+        #: Stamped by ``StragglerObserver.complete_interval``; 0 means the
+        #: interval has not completed yet and must never be shipped.
+        self.seq = 0
 
 
 class EventPool:
@@ -507,7 +516,7 @@ class StragglerObserver:
                 self._note_name_failure(name)
                 self._note_failure("pool_exhausted")
                 return None
-            token = IntervalToken(pair[0], pair[1], self._next_seq())
+            token = IntervalToken(pair[0], pair[1])
             token.name = name
             token.log_level = log_level
             self._backend.record(token.start_event)
@@ -525,15 +534,19 @@ class StragglerObserver:
             return None
 
     def _next_seq(self) -> int:
-        """Hand every interval a distinct sequence number.
+        """Hand every completed interval a distinct sequence number.
 
         The wire protocol keys idempotency on ``(run_id, topology_epoch, rank,
         sample_seq)``. Host-only intervals -- the whole no-CUDA path, and any
         interval whose event acquisition failed -- used to carry ``seq=0``, so
         every one of them after the first looked like a duplicate of the first
-        and the degraded path silently stopped being judged at all. Only the
-        training thread mutates this counter, so a plain increment is atomic
-        enough and allocates nothing.
+        and the degraded path silently stopped being judged at all. The sequence
+        is allocated from :meth:`complete_interval` (never from
+        :meth:`acquire_interval`) so it follows *completion* order: a nested
+        outer timer completes after the inner timers it wraps, and a start-order
+        sequence made the collector reject it as late. Only the training thread
+        mutates this counter, so a plain increment is atomic enough and
+        allocates nothing.
         """
         self._seq += 1
         return self._seq
@@ -579,6 +592,14 @@ class StragglerObserver:
             token.host_start = host_start
             token.host_end = host_end
             token.barrier = barrier
+            # Stamp the sequence now, at completion, so the sequence order is
+            # the order intervals finish. Megatron's level-1 timer wraps the
+            # level-2 ones, so a start-time sequence gives the outer interval the
+            # lowest number but the latest completion, and the collector's
+            # never-decreasing-per-rank check dropped every enclosing interval as
+            # "late" transport noise. Completion order is also exactly the order
+            # in which this training thread appends tokens to ``_pending``.
+            token.seq = self._next_seq()
             self._backend.record(token.end_event)
             with self._cv:
                 full = len(self._pending) >= self._config.queue_max
