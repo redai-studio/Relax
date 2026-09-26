@@ -812,6 +812,104 @@ def test_within_tolerance_workload_still_judges_normally() -> None:
     assert detector.stats()["workload_incomparable_windows"] == 0
 
 
+def test_over_worked_peer_does_not_withhold_an_equal_work_straggler() -> None:
+    """A peer's incomparability must not suppress an unrelated equal-work rank.
+
+    Executed counterexample: four ranks with host times 100/100/100/300 ms and
+    tokens 1000/1200/1000/1000. Rank 1 does +20 % tokens, so rank 1 is not
+    comparable; rank 3 is genuinely slow with tokens EQUAL to the peer median.
+    Under the pair-wide gate rank 1's incomparability withheld rank 3, which was
+    reported ``uncertain``/``workload_incomparable`` with its own facts saying
+    ``tokens_delta=0.0``. Comparability is a per-rank test, so rank 3 is a
+    straggler and its facts agree with its verdict.
+    """
+    detector = make_detector(persist_windows=1)
+    workload = {
+        0: {"tokens": 1000.0},
+        1: {"tokens": 1200.0},
+        2: {"tokens": 1000.0},
+        3: {"tokens": 1000.0},
+    }
+
+    verdicts = feed_equal_windows(detector, 4, {0: 100.0, 1: 100.0, 2: 100.0, 3: 300.0}, workload=workload)
+    verdicts.extend(detector.flush())
+
+    rank3 = [v for v in verdicts if v.rank == 3 and v.kind == VERDICT_STRAGGLER]
+    assert rank3, "an equal-work genuine straggler must survive a peer's incomparability"
+    facts = rank3[0].facts
+    assert facts["tokens_delta"] == pytest.approx(0.0)
+    assert facts["workload_delta"] == pytest.approx(0.0)
+    assert facts["workload_comparable"] is True
+    assert facts["workload_delta_beyond_tolerance"] is False
+    # The over-worked peer is counted as incomparable for the pair-window ...
+    assert detector.stats()["workload_incomparable_windows"] == 4
+    # ... and never leaks its reason into rank 3's verdict.
+    assert [v for v in verdicts if v.rank == 3 and v.reason == "workload_incomparable"] == []
+
+
+def test_each_rank_gets_its_own_workload_reason_and_matching_facts() -> None:
+    """The reason and the facts agree per rank, even in a mixed pair-window.
+
+    Two slow ranks: rank 1 did more tokens (incomparable) and rank 3 did the
+    peer-median tokens (comparable). Rank 1 is ``uncertain`` with
+    ``workload_comparable=False`` and ``workload_delta_beyond_tolerance=True``;
+    rank 3 is a straggler with the opposite, self-consistent pair.
+    """
+    detector = make_detector(persist_windows=1)
+    workload = {
+        0: {"tokens": 1000.0},
+        1: {"tokens": 1200.0},
+        2: {"tokens": 1000.0},
+        3: {"tokens": 1000.0},
+    }
+
+    verdicts = feed_equal_windows(detector, 2, {0: 100.0, 1: 300.0, 2: 100.0, 3: 300.0}, workload=workload)
+    verdicts.extend(detector.flush())
+
+    rank1 = [v for v in verdicts if v.rank == 1 and v.kind == VERDICT_UNCERTAIN]
+    assert rank1 and all(v.reason == "workload_incomparable" for v in rank1)
+    assert rank1[0].facts["workload_delta_beyond_tolerance"] is True
+    assert rank1[0].facts["workload_comparable"] is False
+
+    rank3 = [v for v in verdicts if v.rank == 3 and v.kind == VERDICT_STRAGGLER]
+    assert rank3
+    assert rank3[0].facts["workload_delta_beyond_tolerance"] is False
+    assert rank3[0].facts["workload_comparable"] is True
+
+
+def test_workload_aggregate_is_arrival_order_independent() -> None:
+    """The same samples in two arrival orders give identical verdicts and facts.
+
+    Windows are time windows with no step order, so the last-arriving packet is
+    not authoritative. Rank 0 is the slow rank and its three token readings are
+    1000/1000/2000 (median 1000). When the stale 2000 packet arrives last the
+    old last-wins rule flipped rank 0 to
+    ``uncertain``/``workload_incomparable``; reversed, it stayed a straggler.
+    The per-window aggregate is now the median of the rank's readings, so the
+    order cannot change the verdict or any fact.
+    """
+    host = {0: 300.0, 1: 100.0, 2: 100.0}
+    rounds = {
+        0: [{"tokens": 1000.0}, {"tokens": 1000.0}, {"tokens": 2000.0}],
+        1: [{"tokens": 1000.0}, {"tokens": 1000.0}, {"tokens": 1000.0}],
+        2: [{"tokens": 1000.0}, {"tokens": 1000.0}, {"tokens": 1000.0}],
+    }
+
+    def run(order: List[int]) -> Dict[int, Any]:
+        detector = make_detector(persist_windows=1)
+        for step in order:
+            feed_window(detector, 0, host, workload={rank: rounds[rank][step] for rank in host})
+        return {verdict.rank: verdict for verdict in detector.flush()}
+
+    stale_last = run([0, 1, 2])
+    correct_last = run([2, 1, 0])
+
+    assert stale_last[0].kind == correct_last[0].kind == VERDICT_STRAGGLER
+    assert stale_last[0].facts == correct_last[0].facts
+    assert stale_last[0].facts["workload_delta"] == pytest.approx(0.0)
+    assert stale_last[0].facts["workload_comparable"] is True
+
+
 def test_published_workload_is_per_rank_and_differs_under_unequal_batches() -> None:
     """The producer must publish LOCAL counts, never a rank-invariant
     figure."""

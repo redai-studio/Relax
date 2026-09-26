@@ -72,10 +72,20 @@ of silently reading as a straggler.
 C2 still never *normalises* timings by workload, but it does withhold the
 straggler verdict: when a rank's token workload exceeds ``work_tolerance`` past
 its peers' median, the window is reported as ``uncertain`` with reason
-``workload_incomparable`` (``facts["workload_comparable"]`` is ``False``) rather
-than as a straggler. That is a deliberate, documented suppression --- an
+``workload_incomparable`` (``facts["workload_window_comparable"]`` is ``False``)
+rather than as a straggler. That is a deliberate, documented suppression --- an
 unexplained +100% timing gap on a rank doing +100% of the tokens is not evidence
 of a straggler.
+
+Workload is optional, so its absence is a *degraded* measurement, never a
+comparable one: a rank whose ``tokens`` were not published, or that has no peer
+``tokens`` to compare against, records ``facts["workload_reported"] is False``,
+``facts["workload_comparable"] is None`` and
+``facts["workload_evidence_degraded"] is True``, and the pair-window is counted
+in ``workload_missing_windows``. Missing workload does **not** suppress the
+timing verdict --- detection must still work for a vehicle that publishes no
+workload --- but the verdict can never be read as if the workload had been
+checked and found equal.
 """
 
 import json
@@ -183,7 +193,12 @@ def _field_delta(
     ranks: List[int],
     field: str,
 ) -> Optional[float]:
-    """Peer-relative delta for an evidence-only workload field."""
+    """Peer-relative delta for an evidence-only workload field.
+
+    Like the tokens gate, the rank's own value is the median of its per-sample
+    readings, so the evidence cannot depend on which packet arrived last in a
+    time window that has no step order.
+    """
     values = [value for _, _, workload in per_rank[rank] if (value := _workload_metric(workload, field)) is not None]
     peers = [
         value
@@ -195,7 +210,7 @@ def _field_delta(
     if not values or not peers:
         return None
     median = float(statistics.median(peers))
-    return (values[-1] - median) / median if median > 0.0 else None
+    return (float(statistics.median(values)) - median) / median if median > 0.0 else None
 
 
 def _workload_metric(workload: Any, field: str) -> Optional[float]:
@@ -320,8 +335,10 @@ class Verdict:
         cohort_size: ranks that reported for this pair in the window.
         reason: **pure measurement classification**, one of
             ``host_only_stall``, ``gpu_stream_stall``, ``attribution_unknown``,
-            ``within_tolerance`` or ``cohort_below_min_size``. It never names a
-            cause; ``candidate_causes`` is the only place a cause appears.
+            ``within_tolerance``, ``cohort_below_min_size``,
+            ``below_absolute_floor`` or ``workload_incomparable``. It never
+            names a cause; ``candidate_causes`` is the only place a cause
+            appears.
         facts: everything measured or counted (rank, cohort, stage, window,
             sample counts, observed/peer_fastest/peer_median host medians, ratio,
             absolute delta, tolerance, persistence, cohort size/expected,
@@ -409,7 +426,8 @@ class Verdict:
             f"delta_ms={millis('absolute_delta_ms')} samples={facts.get('samples_rank')}/"
             f"{facts.get('samples_peers_min')} cohort={self.cohort_size}/{facts.get('cohort_expected')} "
             f"coverage={number('coverage_ratio')} device_available={facts.get('device_available')} "
-            f"workload_delta={number('workload_delta')} measurement_kind={self.measurement_kind}) "
+            f"workload_delta={number('workload_delta')} workload_degraded={facts.get('workload_evidence_degraded')} "
+            f"measurement_kind={self.measurement_kind}) "
             f"reason(measurement)={self.reason} {self._cause_label()}"
         )
 
@@ -531,9 +549,14 @@ class StragglerDetector:
             "uncertain_judgements": 0,
             "sub_floor_judgements": 0,
             "workload_incomparable_windows": 0,
+            "workload_missing_windows": 0,
             "single_rank_windows": 0,
             "stragglers_reported": 0,
             "recoveries_reported": 0,
+            # Malformed input and window-close failures are their own thing; they
+            # are NOT "uncertain judgements" (which counts uncertain verdicts).
+            "observe_errors": 0,
+            "close_errors": 0,
             # Evictions from the bounded structures below; every cap reports.
             "verdict_evictions": 0,
             "streak_evictions": 0,
@@ -603,13 +626,17 @@ class StragglerDetector:
             else:
                 window.add(envelope)
         except Exception:
-            self._counters["uncertain_judgements"] += 1
+            # A malformed envelope is an input error, not a judgement: counting
+            # it here used to make "uncertain judgements" mean two things and
+            # made a cohort-too-small count appear out of nowhere.
+            self._counters["observe_errors"] += 1
             return []
 
         verdicts: List[Verdict] = []
         try:
             verdicts.extend(self._close_ready_windows())
         except Exception:
+            self._counters["close_errors"] += 1
             logger.warning("straggler detector failed to close a window", exc_info=True)
         return verdicts
 
@@ -669,7 +696,16 @@ class StragglerDetector:
                 for _, _, workload in per_rank[rank]
                 if (value := _workload_metric(workload, "tokens")) is not None
             ]
-            workload_totals[rank] = tokens[-1] if tokens else None
+            # The per-window workload of a rank is the MEDIAN of its per-sample
+            # token readings, never the last packet that happened to arrive. A
+            # window is a time window with no step order, so the last arrival is
+            # not authoritative: a stale packet that arrives late used to
+            # override a correct earlier one and flip the verdict. The median is
+            # order-independent, and it estimates per-step work --- what the
+            # comparability rule actually compares. Summing across the window
+            # would instead measure how many steps fitted into it, which is
+            # itself a function of speed and would suppress the straggler.
+            workload_totals[rank] = float(statistics.median(tokens)) if tokens else None
 
         cohort_size = len(ranks)
         if cohort_size < 2:
@@ -687,27 +723,33 @@ class StragglerDetector:
         device_values = [value for value in device_medians.values() if value is not None]
         device_reference = min(device_values) if device_values else None
 
-        # Workload comparability: when the cohort's own local work differs by more
-        # than the tolerance, a timing gap cannot be attributed to slowness. The
-        # window is still reported, because an unequal-work cohort is itself the
-        # finding; it just cannot produce a straggler verdict.
-        workload_incomparable = False
+        # Workload comparability is a PER-RANK test: a rank whose own tokens are
+        # within tolerance of its peer median is judged on its timing even when
+        # some other rank of the same pair is not comparable. Evaluating the
+        # gate pair-wide let one over-worked peer withhold an unrelated
+        # equal-work straggler. Each verdict's reason and its workload facts are
+        # derived from this same ``rank_beyond`` flag, so they always agree.
+        work_tolerance = self._config.work_tolerance
+        rank_workload: Dict[int, Optional[float]] = dict(workload_totals)
+        peer_work_median: Dict[int, Optional[float]] = {}
+        rank_beyond: Dict[int, Optional[bool]] = {}
         for rank in ranks:
-            rank_work = workload_totals[rank]
-            peer_work = [
-                workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None
-            ]
-            if rank_work is None or not peer_work:
-                continue
-            peer_work_median = float(statistics.median(peer_work))
-            if (
-                peer_work_median > 0.0
-                and abs(rank_work - peer_work_median) / peer_work_median > self._config.work_tolerance
-            ):
-                workload_incomparable = True
-                break
-        if workload_incomparable:
+            peers = [workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None]
+            median = float(statistics.median(peers)) if peers else None
+            peer_work_median[rank] = median
+            own = workload_totals[rank]
+            if own is None or median is None or median <= 0.0:
+                # No workload to compare against: the measurement is DEGRADED,
+                # which is not the same as comparable. ``None`` records that and
+                # never withholds the timing verdict, because the profiler must
+                # still detect a straggler on a vehicle that publishes no work.
+                rank_beyond[rank] = None
+            else:
+                rank_beyond[rank] = abs(own - median) / median > work_tolerance
+        if any(beyond is True for beyond in rank_beyond.values()):
             self._counters["workload_incomparable_windows"] += 1
+        if any(workload_totals[rank] is None for rank in ranks):
+            self._counters["workload_missing_windows"] += 1
 
         def build(
             rank: int,
@@ -717,8 +759,15 @@ class StragglerDetector:
             host_only: bool,
             reason: str,
             label: str,
+            workload_judged: bool = True,
         ) -> Verdict:
-            """Build one verdict whose facts are all measured or counted."""
+            """Build one verdict whose facts are all measured or counted.
+
+            ``workload_judged`` is ``False`` only for the too-small-cohort
+            branch, where no peer median was used to judge: the comparability
+            facts must then be ``None`` rather than a claim the reason
+            contradicts.
+            """
             rank_device = device_medians[rank]
             device_available = rank_device is not None and device_reference is not None
             device_deviation = (
@@ -726,19 +775,16 @@ class StragglerDetector:
                 if device_available and rank_device is not None and device_reference is not None
                 else 0.0
             )
-            host_grew = deviation > self._config.work_tolerance
-            device_grew = device_available and device_deviation > self._config.work_tolerance
+            host_grew = deviation > work_tolerance
+            device_grew = device_available and device_deviation > work_tolerance
             peer_counts = {other: sample_counts[other] for other in ranks if other != rank}
-            peer_workloads = [
-                workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None
-            ]
-            rank_workload = workload_totals[rank]
-            peer_workload_median: Optional[float] = None
+            own_workload = rank_workload[rank]
+            median = peer_work_median[rank]
             workload_delta: Optional[float] = None
-            if rank_workload is not None and peer_workloads:
-                peer_workload_median = float(statistics.median(peer_workloads))
-                if peer_workload_median > 0.0:
-                    workload_delta = (rank_workload - peer_workload_median) / peer_workload_median
+            if own_workload is not None and median is not None and median > 0.0:
+                workload_delta = (own_workload - median) / median
+            beyond = rank_beyond[rank] if workload_judged else None
+            comparable = None if beyond is None else not beyond
             facts: Dict[str, Any] = {
                 "rank": rank,
                 "cohort": cohort,
@@ -752,7 +798,7 @@ class StragglerDetector:
                 "peer_median_ms": host_median,
                 "ratio": _ratio(host_medians[rank], host_reference),
                 "absolute_delta_ms": host_medians[rank] - host_reference,
-                "work_tolerance": self._config.work_tolerance,
+                "work_tolerance": work_tolerance,
                 "persistence": streak,
                 "cohort_size": cohort_size,
                 "cohort_expected": window.cohort_expected,
@@ -761,21 +807,27 @@ class StragglerDetector:
                 "peer_device_ms": device_reference,
                 "device_available": device_available,
                 "device_ratio": _ratio(rank_device, device_reference) if device_available else None,
-                # Workload is reported next to the timing gap, never divided out:
-                # a genuine +100% workload looks exactly like a +100% straggler
-                # until this number is read.
+                # Workload is reported next to the timing gap, never divided out.
+                # ``workload_reported`` records absence explicitly instead of
+                # letting it read as comparable, and ``workload_comparable`` is
+                # the two-sided test on this rank's OWN tokens versus its peer
+                # median --- the same test ``workload_delta_beyond_tolerance``
+                # uses, so the pair can never disagree.
+                "workload_reported": own_workload is not None,
                 "workload_delta": workload_delta,
-                "workload_rank": rank_workload,
-                "workload_rank_tokens": rank_workload,
-                "workload_peer_tokens": peer_workload_median,
+                "workload_rank": own_workload,
+                "workload_rank_tokens": own_workload,
+                "workload_peer_tokens": median,
                 "tokens_delta": workload_delta,
                 "sequences_delta": _field_delta(per_rank, rank, ranks, "sequences"),
                 "microbatches_delta": _field_delta(per_rank, rank, ranks, "microbatches"),
-                "workload_comparable": not workload_incomparable,
-                "workload_peer_median": peer_workload_median,
-                "workload_delta_beyond_tolerance": (
-                    None if workload_delta is None else workload_delta > self._config.work_tolerance
-                ),
+                "workload_comparable": comparable,
+                "workload_peer_median": median,
+                "workload_delta_beyond_tolerance": beyond,
+                # Degraded means the comparison could not be made (missing
+                # workload, no peer, or a cohort too small to judge). It is not
+                # a finding of incomparability, which is ``comparable is False``.
+                "workload_evidence_degraded": comparable is None,
             }
             return self._verdict(
                 kind=kind,
@@ -799,6 +851,9 @@ class StragglerDetector:
             )
 
         if cohort_size < self._config.min_cohort_size:
+            # Too few peers to establish a peer median at all: no workload
+            # comparability claim is made, and each uncertain verdict is counted
+            # once.
             self._counters["uncertain_judgements"] += 1
             return [
                 build(
@@ -809,17 +864,19 @@ class StragglerDetector:
                     False,
                     REASON_COHORT_BELOW_MIN_SIZE,
                     window.labels.get(rank, f"rank{rank}"),
+                    workload_judged=False,
                 )
                 for rank in ranks
             ]
 
+        onset_streak = max(1, int(self._config.persist_windows))
         verdicts: List[Verdict] = []
         for rank in ranks:
             deviation = _relative_deviation(host_medians[rank], host_reference)
             key = (cohort, name, rank)
             label = window.labels.get(rank, f"rank{rank}")
             self._cache_label(key, label)
-            slow = deviation > self._config.work_tolerance
+            slow = deviation > work_tolerance
             absolute_delta = host_medians[rank] - host_reference
             # Below the absolute floor the relative deviation is dominated by
             # host/launch jitter: a 2 ms gap on a 0.2 ms metadata stage reads as
@@ -829,14 +886,19 @@ class StragglerDetector:
                 max(host_medians[rank], host_reference) < self._config.min_stage_ms
                 or absolute_delta <= self._config.min_stage_ms
             )
-            judged_slow = slow and not below_floor and not workload_incomparable
+            # Only this rank's OWN incomparability withholds its verdict; a
+            # peer's does not. A missing workload (``None``) is degraded
+            # evidence, not an incomparability, so it does not withhold either.
+            judged_slow = slow and not below_floor and rank_beyond[rank] is not True
             streak = self._streak.get(key, 0) + 1 if judged_slow else 0
             self._set_streak(key, streak)
-            if slow and workload_incomparable:
+            if slow and rank_beyond[rank] is True:
+                self._counters["uncertain_judgements"] += 1
                 verdicts.append(
                     build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_WORKLOAD_INCOMPARABLE, label)
                 )
             elif slow and below_floor:
+                self._counters["uncertain_judgements"] += 1
                 self._counters["sub_floor_judgements"] += 1
                 verdicts.append(
                     build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_BELOW_ABSOLUTE_FLOOR, label)
@@ -848,8 +910,12 @@ class StragglerDetector:
                 if stream_visible and rank_device is not None and device_reference is not None
                 else 0.0
             )
-            host_only = judged_slow and stream_visible and device_deviation <= self._config.work_tolerance
-            if streak >= self._config.persist_windows and key not in self._active:
+            host_only = judged_slow and stream_visible and device_deviation <= work_tolerance
+            # Onset is the exact window in which the persistence threshold is
+            # first crossed, not "not currently in the active set": the active
+            # set is capped, and an evicted-but-still-slow key used to be
+            # counted as a fresh onset (double counting one stall).
+            if streak == onset_streak:
                 _evict_set_to_cap(self._active, MAX_ACTIVE_ENTRIES, self._counters, "active_evictions")
                 self._active.add(key)
                 self._counters["stragglers_reported"] += 1
@@ -961,10 +1027,12 @@ __all__ = [
     "MEASUREMENT_HOST_ONLY",
     "MEASUREMENT_UNKNOWN",
     "REASON_ATTRIBUTION_UNKNOWN",
+    "REASON_BELOW_ABSOLUTE_FLOOR",
     "REASON_COHORT_BELOW_MIN_SIZE",
     "REASON_GPU_STREAM_STALL",
     "REASON_HOST_ONLY_STALL",
     "REASON_WITHIN_TOLERANCE",
+    "REASON_WORKLOAD_INCOMPARABLE",
     "VERDICT_RECOVERED",
     "VERDICT_STRAGGLER",
     "VERDICT_UNCERTAIN",
