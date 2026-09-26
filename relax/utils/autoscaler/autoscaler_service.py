@@ -704,11 +704,12 @@ class AutoscalerService(Base):
 
                         logger.info(f"[Autoscaler] {label} request accepted: request_id={request_id}, status={status}")
 
-                        placeholder.update(request_id=request_id, status=status)
-                        runtime.state.last_scale_time = time.time()
-                        runtime.state.last_scale_action = (
-                            ScalingAction.SCALE_OUT if action == "scale_out" else ScalingAction.SCALE_IN
-                        )
+                        # Single adoption point (shared with the inline retry
+                        # and background recovery): the POST reply proves
+                        # ownership and the logical status only -- cleanup
+                        # starts UNKNOWN and only the authoritative status
+                        # endpoint may clear it.
+                        self._adopt_scale_operation(runtime, placeholder, action, request_id, status)
                         return
                     if response.status >= 500:
                         # Server-side error after unknown processing: the
@@ -741,6 +742,40 @@ class AutoscalerService(Base):
                     )
                     return
                 await asyncio.sleep(backoff * attempts)
+
+    def _adopt_scale_operation(
+        self,
+        runtime: "ServiceRuntime",
+        req: Dict[str, Any],
+        action: str,
+        request_id: Optional[str],
+        status: str,
+    ) -> None:
+        """Adopt ownership of a scale operation the server has admitted.
+
+        Single bookkeeping point shared by the normal acceptance, the inline
+        same-key retry and the background ``SUBMIT_UNKNOWN`` recovery:
+        request identity, cooldown accounting and the cleanup reset. A POST
+        reply -- fresh or replayed -- proves ownership and the logical status
+        only; ``GenRMScaleResponse`` carries no ``cleanup_required``, so a
+        replayed terminal status (e.g. FAILED) must never be mistaken for a
+        completed cleanup. Cleanup therefore starts UNKNOWN (``None``) and
+        only the authoritative status endpoint may set it to ``False``
+        (re-review finding: terminal replay != physical cleanup proof).
+
+        Cooldown semantics are identical on every adoption path: the server's
+        acceptance timestamp is unknown for a background recovery, so the
+        adoption time is used instead -- deliberately conservative. The
+        cooldown may start a little late, but a recovered operation is never
+        invisible to the cooldown gate; an immediate second scale right after
+        recovery is worse than a slightly longer cooldown (re-review finding:
+        recovered operation != invisible operation).
+        """
+        req["request_id"] = request_id
+        req["status"] = status
+        req["cleanup_required"] = None
+        runtime.state.last_scale_time = time.time()
+        runtime.state.last_scale_action = ScalingAction.SCALE_OUT if action == "scale_out" else ScalingAction.SCALE_IN
 
     async def _execute_scale_in(
         self, decision: ScalingDecision, current_engines: int, runtime: Optional[ServiceRuntime] = None
@@ -790,18 +825,25 @@ class AutoscalerService(Base):
             runtime, "scale_in", url, payload, placeholder, decision, current_engines, target_count
         )
 
-    async def _recover_ambiguous_submission(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> None:
+    async def _recover_ambiguous_submission(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> bool:
         """Recover ownership of a scale POST with an unknown outcome.
 
         Re-POSTs the exact submission body (same idempotency key, model,
         target, timeout) to the address the operation was submitted to. A 2xx
-        replays the server's answer: acceptance adopts the request_id,
-        NOOP/CONFLICT remove the placeholder. A 4xx is a definitive rejection
-        (nothing was accepted); a 5xx or transport failure stays ambiguous and
-        is retried on the next evaluation cycle.
+        replays the server's answer: acceptance adopts the request_id through
+        the same adoption helper as a normal response (cooldown + cleanup
+        UNKNOWN semantics identical), NOOP/CONFLICT remove the placeholder. A
+        4xx is a definitive rejection (nothing was accepted); a 5xx or
+        transport failure stays ambiguous and is retried on the next
+        evaluation cycle.
+
+        Returns ``True`` when ownership was adopted -- the caller must then
+        read the authoritative status in the same cycle, because the replayed
+        status (even terminal) proves nothing about cleanup. Returns ``False``
+        when the request is still unresolved or was definitively rejected.
         """
         if self._http_session is None:
-            return
+            return False
         action = req.get("action", "scale_out")
         base = req.get("service_url") or self.config.get_service_url(runtime.name)
         url = f"{base}/{action}"
@@ -819,7 +861,7 @@ class AutoscalerService(Base):
                         f"[Autoscaler] Ambiguous scale submission recovery still uncertain "
                         f"(HTTP {response.status}); retrying next cycle"
                     )
-                    return
+                    return False
                 if response.status not in (200, 201):
                     runtime.state.pending_requests.remove(req)
                     text = await response.text()
@@ -827,20 +869,25 @@ class AutoscalerService(Base):
                         f"[Autoscaler] Ambiguous scale submission definitively rejected: "
                         f"HTTP {response.status} - {text}"
                     )
-                    return
+                    return False
                 data = await response.json()
                 status = data.get("status", "PENDING")
                 if status in ("NOOP", "CONFLICT"):
                     runtime.state.pending_requests.remove(req)
                     logger.info(f"[Autoscaler] Ambiguous scale submission resolved as {status}; nothing to track")
-                    return
-                req.update(request_id=data.get("request_id"), status=status)
+                    return False
+                # Same adoption bookkeeping as a normal acceptance: the
+                # replayed status is logical state only, cleanup stays UNKNOWN
+                # until the status endpoint proves otherwise.
+                self._adopt_scale_operation(runtime, req, action, data.get("request_id"), status)
                 logger.info(f"[Autoscaler] Recovered ambiguous scale submission: request_id={data.get('request_id')}")
+                return True
         except Exception as e:
             logger.warning(
                 f"[Autoscaler] Ambiguous scale submission recovery failed "
                 f"({type(e).__name__}: {e}); retrying next cycle"
             )
+            return False
 
     def _record_noop(
         self,
@@ -871,13 +918,24 @@ class AutoscalerService(Base):
         runtime.state.total_scale_operations += 1
 
     async def _update_pending_requests(self, runtime: Optional[ServiceRuntime] = None) -> None:
+        """Drive tracked scale operations toward completion.
+
+        Lifecycle: submit (elsewhere) -> adopt (ownership + cooldown +
+        cleanup UNKNOWN) -> refresh authoritative status -> maybe reconcile
+        (terminal dirty only) -> finalize (terminal AND cleanup proven False).
+        A POST reply -- fresh or replayed -- never triggers the final history
+        transition; only the status endpoint (directly or after a successful
+        reconcile) proves cleanup.
+        """
         runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         completed = []
 
-        for req in runtime.state.pending_requests:
+        # Iterate a copy: recovery may remove entries from the live list
+        # (definitive rejection / NOOP / CONFLICT).
+        for req in list(runtime.state.pending_requests):
             action = req.get("action", "scale_out")
 
             status = req.get("status")
@@ -891,59 +949,119 @@ class AutoscalerService(Base):
                 # The server either never saw the request (fresh admission)
                 # or already accepted it (replay returns the original
                 # request_id); either way exactly one operation exists.
-                await self._recover_ambiguous_submission(runtime, req)
-                continue
-            if is_scale_request_terminal(action, status) and not req.get("cleanup_required"):
+                if not await self._recover_ambiguous_submission(runtime, req):
+                    continue
+                # Ownership adopted: fall through so the SAME cycle reads the
+                # authoritative status -- a replayed terminal status must not
+                # skip the cleanup query (re-review finding).
+                status = req.get("status")
+            if is_scale_request_terminal(action, status) and req.get("cleanup_required") is False:
+                # Terminal AND cleanup already proven clean by an earlier
+                # authoritative status query: safe to finalize without
+                # re-querying.
                 completed.append(req)
                 continue
 
-            try:
-                endpoint = "scale_out" if action == "scale_out" else "scale_in"
-                # Follow the address the operation was submitted to: a config
-                # PATCH may have repointed the service since (re-review
-                # finding). Entries recorded before this field exists fall
-                # back to the current config.
-                base = req.get("service_url") or self.config.get_service_url(runtime.name)
-                url = f"{base}/{endpoint}/{req['request_id']}"
-
-                async with self._http_session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        new_status = data.get("status")
-                        req["status"] = new_status
-                        req["error_message"] = data.get("error_message")
-                        req["failure_categories"] = data.get("failure_categories") or []
-                        req["actual_current"] = data.get("current")
-                        req["actual_ready"] = data.get("ready")
-                        req["cleanup_required"] = bool(data.get("cleanup_required", False))
-
-                        if is_scale_request_terminal(action, new_status) and req["cleanup_required"]:
-                            # A terminal dirty operation is still a hard
-                            # per-service gate. Ask the server to reconcile
-                            # the original operation; never issue a new scale
-                            # request while it owns unresolved resources.
-                            reconcile_url = f"{url}/reconcile"
-                            async with self._http_session.post(reconcile_url) as reconcile_response:
-                                if reconcile_response.status == 200:
-                                    reconcile_data = await reconcile_response.json()
-                                    req["cleanup_required"] = bool(reconcile_data.get("cleanup_required", True))
-                        if is_scale_request_terminal(action, new_status) and not req["cleanup_required"]:
-                            completed.append(req)
-                            req["completed_at"] = time.time()
-                            logger.info(
-                                f"[Autoscaler] Scale request {req['request_id']} completed: "
-                                f"status={new_status}, action={action}, "
-                                f"from={req.get('from_engines')} -> to={req.get('to_engines')}"
-                            )
-
-            except Exception as e:
-                logger.warning(f"Error checking request {req.get('request_id')}: {e}")
+            if await self._refresh_authoritative_status(runtime, req):
+                completed.append(req)
 
         for req in completed:
-            runtime.state.pending_requests.remove(req)
-            req["status"] = req.get("status", "UNKNOWN")
-            runtime.state.scale_history.appendleft(req)
-            runtime.state.total_scale_operations += 1
+            self._finalize_scale_request(runtime, req)
+
+    async def _refresh_authoritative_status(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> bool:
+        """Query the authoritative status endpoint for one tracked request.
+
+        This endpoint is the ONLY cleanup authority: a POST reply -- fresh or
+        replayed -- never proves physical cleanup. Returns ``True`` only when
+        the refreshed state is terminal AND the authoritative cleanup flag is
+        exactly ``False``; an unreadable response or a missing/malformed flag
+        leaves the request pending with UNKNOWN cleanup (missing != clean,
+        fail closed).
+        """
+        action = req.get("action", "scale_out")
+        request_id = req.get("request_id")
+        if request_id is None:
+            # Cannot query an unidentified request: it stays pending and keeps
+            # blocking decisions and target removal (fail closed).
+            return False
+        # Follow the address the operation was submitted to: a config
+        # PATCH may have repointed the service since (re-review finding).
+        # Entries recorded before this field exists fall back to the current
+        # config.
+        base = req.get("service_url") or self.config.get_service_url(runtime.name)
+        endpoint = "scale_out" if action == "scale_out" else "scale_in"
+        url = f"{base}/{endpoint}/{request_id}"
+        try:
+            async with self._http_session.get(url) as response:
+                if response.status != 200:
+                    # Unreadable status: no new cleanup evidence; keep whatever
+                    # was proven before (possibly nothing) and retry next
+                    # cycle.
+                    return False
+                data = await response.json()
+        except Exception as e:
+            logger.warning(f"Error checking request {request_id}: {e}")
+            return False
+        if not isinstance(data, dict):
+            return False
+
+        new_status = data.get("status")
+        req["status"] = new_status
+        req["error_message"] = data.get("error_message")
+        req["failure_categories"] = data.get("failure_categories") or []
+        req["actual_current"] = data.get("current")
+        req["actual_ready"] = data.get("ready")
+        # Authoritative cleanup proof: only an explicit boolean counts; a
+        # missing or malformed field stays UNKNOWN (unknown != clean).
+        cleanup = data.get("cleanup_required")
+        req["cleanup_required"] = cleanup if isinstance(cleanup, bool) else None
+
+        if is_scale_request_terminal(action, new_status) and req["cleanup_required"] is True:
+            # A terminal dirty operation is still a hard per-service gate.
+            await self._maybe_reconcile(req, url)
+        return is_scale_request_terminal(action, new_status) and req["cleanup_required"] is False
+
+    async def _maybe_reconcile(self, req: Dict[str, Any], url: str) -> None:
+        """Reconcile a terminal-dirty operation.
+
+        Asks the server to retry the ORIGINAL operation's unfinished resource
+        cleanup (no new request id, no victim re-selection, no re-scaling);
+        never issues a new scale request while the operation owns unresolved
+        resources. A failed or unreadable reconcile keeps the request dirty
+        (fail closed).
+        """
+        try:
+            async with self._http_session.post(f"{url}/reconcile") as reconcile_response:
+                if reconcile_response.status != 200:
+                    return
+                reconcile_data = await reconcile_response.json()
+        except Exception as e:
+            logger.warning(f"Error reconciling request {req.get('request_id')}: {e}")
+            return
+        if not isinstance(reconcile_data, dict):
+            return
+        # Fail closed: an unreadable/missing flag keeps the request dirty.
+        cleanup = reconcile_data.get("cleanup_required")
+        req["cleanup_required"] = cleanup if isinstance(cleanup, bool) else True
+
+    def _finalize_scale_request(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> None:
+        """Move a terminal, cleanup-proven request into history.
+
+        The only transition into history: terminal status AND
+        ``cleanup_required is False`` -- proven by the authoritative status
+        endpoint (directly or after a successful reconcile), never by a POST
+        reply.
+        """
+        req["completed_at"] = time.time()
+        logger.info(
+            f"[Autoscaler] Scale request {req['request_id']} completed: "
+            f"status={req.get('status')}, action={req.get('action')}, "
+            f"from={req.get('from_engines')} -> to={req.get('to_engines')}"
+        )
+        runtime.state.pending_requests.remove(req)
+        req["status"] = req.get("status", "UNKNOWN")
+        runtime.state.scale_history.appendleft(req)
+        runtime.state.total_scale_operations += 1
 
     # ===================== HTTP Endpoints =====================
 
@@ -1224,7 +1342,7 @@ class AutoscalerService(Base):
                 unresolved = [
                     req
                     for req in old.state.pending_requests
-                    if req.get("cleanup_required")
+                    if req.get("cleanup_required") is not False
                     or not is_scale_request_terminal(req.get("action", "scale_out"), req.get("status"))
                 ]
                 if unresolved:
@@ -1232,8 +1350,8 @@ class AutoscalerService(Base):
                         status_code=409,
                         detail=(
                             f"cannot remove service target '{name}': {len(unresolved)} unresolved scale "
-                            "operation(s) (non-terminal or cleanup_required) still reference it; let them "
-                            "finish or reconcile them first"
+                            "operation(s) (non-terminal or cleanup not yet proven clean) still reference it; "
+                            "let them finish or reconcile them first"
                         ),
                     )
             candidate.service_targets = dict(request.service_targets)

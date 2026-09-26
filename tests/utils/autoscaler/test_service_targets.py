@@ -22,6 +22,9 @@ from tests.utils._dep_stubs import import_autoscaler_service
 svc_module = import_autoscaler_service()
 
 from relax.utils.autoscaler.config import AutoscalerConfig, ScaleOutPolicy, ServiceScalingPolicy  # noqa: E402
+from relax.utils.autoscaler.metrics_collector import AggregatedMetrics  # noqa: E402
+from relax.utils.autoscaler.scaling_decision import ScalingDecisionEngine  # noqa: E402
+from relax.utils.genrm_scale_registry import GenRMScaleRegistry  # noqa: E402
 
 
 _AutoscalerService = getattr(svc_module.AutoscalerService, "func_or_class", svc_module.AutoscalerService)
@@ -123,7 +126,98 @@ class _IdempotentScaleServer:
 
     def get(self, url):
         self.get_calls.append(url)
-        return _FakeResp(200, {"status": "ACTIVE", "current": 2, "ready": 2})
+        # GenRMScaleStatusResponse always carries cleanup_required.
+        return _FakeResp(200, {"status": "ACTIVE", "current": 2, "ready": 2, "cleanup_required": False})
+
+
+class _RegistryBackedScaleServer:
+    """aiohttp-like session backed by a production GenRMScaleRegistry.
+
+    Speaks the real GenRM HTTP contract: POST /scale_out|scale_in submits (or
+    replays by idempotency key), GET /scale_out|in/{id} returns the
+    authoritative status INCLUDING cleanup_required (like
+    GenRMScaleStatusResponse), and POST .../reconcile clears cleanup (like the
+    component's reconcile). POST responses omit cleanup_required exactly like
+    GenRMScaleResponse -- a terminal replay therefore carries no cleanup
+    proof, which is the bug condition under test.
+    """
+
+    def __init__(self, registry, current=1, ready=1, lose_responses=0):
+        self.registry = registry
+        self._current = current
+        self._ready = ready
+        self._lose = lose_responses
+        self.posts = []  # (url, body) for the scale endpoints only
+        self.get_calls = []
+        self.reconcile_calls = []
+        self.fail_gets = 0
+        self.reconcile_dirty = False
+        self.admitted_request_id = None
+
+    def post(self, url, json=None):
+        if url.endswith("/reconcile"):
+            self.reconcile_calls.append(url)
+            request_id = url.rstrip("/").split("/")[-2]
+            op = self.registry.get_status("scale_out", request_id) or self.registry.get_status("scale_in", request_id)
+            if self.reconcile_dirty:
+                # Cleanup still unfinished server-side (e.g. victim draining).
+                return _FakeResp(
+                    200,
+                    {
+                        "request_id": request_id,
+                        "direction": op["direction"],
+                        "status": op["status"],
+                        "cleanup_required": True,
+                        "victim_cleared": False,
+                    },
+                )
+            self.registry.clear_cleanup(request_id)
+            refreshed = self.registry.get_status(op["direction"], request_id)
+            return _FakeResp(
+                200,
+                {
+                    "request_id": request_id,
+                    "direction": refreshed["direction"],
+                    "status": refreshed["status"],
+                    "cleanup_required": refreshed["cleanup_required"],
+                    "victim_cleared": True,
+                },
+            )
+        self.posts.append((url, json))
+        direction = "scale_out" if url.endswith("/scale_out") else "scale_in"
+        decision = self.registry.submit(
+            direction,
+            model_name="default",
+            target=json["num_replicas"],
+            timeout_secs=json.get("timeout_secs"),
+            idempotency_key=json.get("idempotency_key"),
+            current=self._current,
+            ready=self._ready,
+        )
+        if decision.get("request_id"):
+            self.admitted_request_id = decision["request_id"]
+        if self._lose > 0:
+            # The transport dies AFTER the server admitted the operation --
+            # the acceptance response is the only thing that is lost.
+            self._lose -= 1
+            return _LostResponse()
+        if decision.get("http", 200) != 200:
+            return _FakeResp(decision["http"], decision)
+        # GenRMScaleResponse shape: NO cleanup_required field.
+        return _FakeResp(200, {"status": decision["status"], "request_id": decision.get("request_id")})
+
+    def get(self, url):
+        self.get_calls.append(url)
+        if self.fail_gets > 0:
+            self.fail_gets -= 1
+            return _LostResponse()
+        parts = url.rstrip("/").split("/")
+        direction, request_id = parts[-2], parts[-1]
+        op = self.registry.get_status(direction, request_id)
+        if op is None:
+            return _FakeResp(404, {"detail": "unknown request_id"})
+        # GenRMScaleStatusResponse shape: cleanup_required always present.
+        return _FakeResp(200, op)
 
 
 class _ParkedPostSession:
@@ -134,7 +228,12 @@ class _ParkedPostSession:
         self.post_calls = []
         self.get_calls = []
         self._post_payload = post_payload or {"request_id": "req-x", "status": "PENDING"}
-        self._get_payload = get_payload or {"status": "ACTIVE", "current": 2, "ready": 2}
+        self._get_payload = get_payload or {
+            "status": "ACTIVE",
+            "current": 2,
+            "ready": 2,
+            "cleanup_required": False,
+        }
 
     def post(self, url, json=None):
         self.post_calls.append(url)
@@ -152,6 +251,39 @@ def _decision(action, delta=1):
         reason="test",
         triggered_conditions=["cond"],
         metrics_snapshot={"m": 1},
+    )
+
+
+def _genrm_registry():
+    """Production registry with the autoscaler's default model registered."""
+    registry = GenRMScaleRegistry()
+    registry.register_initial("default", 1)
+    return registry
+
+
+def _busy_metrics():
+    """Non-empty snapshot with high token usage -> scale-out would trigger."""
+    return AggregatedMetrics(
+        num_engines=2,
+        total_queue_reqs=0,
+        avg_token_usage=0.95,
+        throughput_variance=0.0,
+        is_empty=False,
+        coverage=1.0,
+    )
+
+
+def _idle_metrics():
+    """Non-empty snapshot where every scale-in condition holds."""
+    return AggregatedMetrics(
+        num_engines=2,
+        total_queue_reqs=0,
+        total_running_reqs=0,
+        avg_token_usage=0.0,
+        total_throughput=100.0,
+        throughput_variance=0.0,
+        is_empty=False,
+        coverage=1.0,
     )
 
 
@@ -445,11 +577,13 @@ class TestPatchConfig(unittest.TestCase):
         self.assertIn("genrm", svc._services)
 
     def test_remove_target_with_clean_history_succeeds(self):
-        """Terminal, reconciled requests do not block removal."""
+        """Terminal requests whose cleanup was PROVEN clean (authoritative
+        ``cleanup_required=False``) do not block removal; an unproven
+        (missing/UNKNOWN) flag fails closed."""
         svc = self._svc_with_genrm_runtime()
         svc._services["genrm"].state.pending_requests.append(
             # scale_out terminal vocabulary: ACTIVE (not COMPLETED).
-            {"action": "scale_out", "request_id": "req-3", "status": "ACTIVE", "delta": 1}
+            {"action": "scale_out", "request_id": "req-3", "status": "ACTIVE", "delta": 1, "cleanup_required": False}
         )
         asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
         self.assertNotIn("genrm", svc._services)
@@ -875,7 +1009,20 @@ class TestPatchConfig(unittest.TestCase):
         server._lose = 0
         asyncio.run(svc._update_pending_requests(svc._services["genrm"]))
         pending = svc._services["genrm"].state.pending_requests
-        self.assertEqual([(p["request_id"], p["status"]) for p in pending], [("req-1", "PENDING")])
+        # Ownership recovered AND the same cycle read the authoritative
+        # status (ACTIVE + cleanup proven clean) -> completed into history.
+        self.assertEqual(pending, [])
+        self.assertEqual(
+            (
+                svc._services["genrm"].state.scale_history[0]["request_id"],
+                svc._services["genrm"].state.scale_history[0]["status"],
+            ),
+            ("req-1", "ACTIVE"),
+        )
+        # Cooldown bookkeeping was written by the recovery adoption (P2-2):
+        # the recovered operation is visible to the cooldown gate.
+        self.assertIsNotNone(svc._services["genrm"].state.last_scale_time)
+        self.assertEqual(svc._services["genrm"].state.last_scale_action, _ScalingAction.SCALE_OUT)
         # One operation per key across every attempt, inline and recovery.
         self.assertEqual(len(server.operations), 1)
         replay_keys = {body.get("idempotency_key") for _, body in server.posts}
@@ -920,6 +1067,351 @@ class TestPatchConfig(unittest.TestCase):
         self.assertEqual(svc.config.max_engines, 8)
         self.assertEqual(svc.config.get_service_url("rollout"), "http://new:8000/rollout")
         self.assertEqual(svc.config.service_targets["rollout"], "http://new:8000/rollout")
+
+    def test_patch_collector_start_failure_keeps_committed_config(self):
+        """Known-limit documentation (no fix by design): a collector side-
+        effect failure AFTER the candidate commit surfaces as an error, and the
+        already-committed config/runtimes are NOT rolled back.
+
+        Only the validation/rejection phase of PATCH /config is atomic; full
+        transactional rollback of runtime side effects is a documented
+        limitation, not a contract of this endpoint.
+        """
+        from unittest import mock
+
+        svc = self._svc_with_genrm_runtime()
+        rollout_collector = svc._services["rollout"].metrics_collector
+
+        class _BoomCollector:
+            def __init__(self, config):
+                self.config = config
+
+            async def start(self):
+                raise RuntimeError("collector start boom")
+
+            async def stop(self):
+                pass
+
+        # The stubbed import machinery gives the service class a globals dict
+        # distinct from the re-exported module's __dict__, so patch the
+        # function's own globals rather than the module attribute.
+        cls = type(svc)
+        with mock.patch.dict(cls._rebuild_service_runtimes.__globals__, {"MetricsCollector": _BoomCollector}):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    svc.update_config(
+                        _ConfigUpdateRequest(
+                            service_targets={
+                                "rollout": "http://rollout:8000/rollout",
+                                "genrm": "http://genrm:8000/genrm",
+                                "extra": "http://extra:8000/extra",
+                            }
+                        )
+                    )
+                )
+        # Current, documented behavior: the candidate was already committed.
+        self.assertIn("extra", svc.config.service_targets)
+        self.assertIn("extra", svc._services)
+        # Existing runtimes keep their original collectors.
+        self.assertIs(svc._services["rollout"].metrics_collector, rollout_collector)
+        # The failed collector is retained for the next PATCH to retry.
+        self.assertEqual(len(svc._collectors_to_start), 1)
+
+
+class TestAmbiguousRecoveryLifecycle(unittest.TestCase):
+    """Bot round-8 P2 regressions.
+
+    P2-1: a replayed terminal status must never be trusted as cleanup proof
+    -- cleanup is three-state (True / False / UNKNOWN) and only the
+    authoritative status endpoint (or a reconcile) may prove it clean.
+
+    P2-2: an operation recovered via SUBMIT_UNKNOWN replay must carry the
+    same cooldown/accounting semantics as a normal acceptance.
+
+    Every scenario runs the production GenRMScaleRegistry behind an
+    HTTP-contract-shaped fake plus the real AutoscalerService submit /
+    recovery / status-polling methods (no plain fake dicts).
+    """
+
+    def _svc(self):
+        config = AutoscalerConfig(service_targets={"genrm": "http://genrm:8000/genrm"})
+        svc = object.__new__(_AutoscalerService)
+        svc.config = config
+        svc._services = {}
+        svc._rebuild_service_runtimes()
+        return svc
+
+    def _ambiguous_submit(self, svc, server, action, current):
+        """Submit a scale op whose every inline response is lost."""
+        svc._submit_retry_attempts = 2
+        svc._submit_retry_backoff_secs = 0.0
+        runtime = svc._services["genrm"]
+        if action == "scale_out":
+            asyncio.run(svc._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), current, runtime))
+        else:
+            asyncio.run(svc._execute_scale_in(_decision(_ScalingAction.SCALE_IN), current, runtime))
+        self.assertEqual(
+            [(p["request_id"], p["status"]) for p in runtime.state.pending_requests], [(None, "SUBMIT_UNKNOWN")]
+        )
+        return runtime, server.admitted_request_id
+
+    def test_matrix_a_replay_pending_completes_via_authoritative_status(self):
+        """Matrix A: response lost -> replay returns PENDING -> authoritative
+        status eventually ACTIVE -> normal finish.
+
+        The replay POST alone never finalizes anything.
+        """
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=1, ready=1, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_out", 1)
+
+        # Transport recovers while the server-side op is still live: the
+        # replay returns PENDING (non-terminal) and the SAME cycle queries the
+        # authoritative status.
+        server._lose = 0
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(
+            [(p["request_id"], p["status"]) for p in runtime.state.pending_requests],
+            [(request_id, "PENDING")],
+        )
+        self.assertEqual(len(runtime.state.scale_history), 0)
+        self.assertEqual(server.get_calls, [f"http://genrm:8000/genrm/scale_out/{request_id}"])
+
+        # Server-side lifecycle finishes cleanly; the next cycle finalizes.
+        registry.finish(request_id, status="ACTIVE", current=2, ready=2, created=1)
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], request_id)
+        self.assertEqual(runtime.state.scale_history[0]["status"], "ACTIVE")
+
+    def test_matrix_b_replay_failed_dirty_reconciles_before_history(self):
+        """Matrix B: response lost -> replay returns FAILED -> authoritative
+        status shows cleanup_required=true -> request retained, reconcile
+        called, cleanup completed, THEN history.
+
+        The old code finalized on the terminal replay alone (status GET count
+        0) while the remote operation kept its per-model mutex held and every
+        later scale 409'd.
+        """
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=1, ready=1, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_out", 1)
+
+        # Server-side: the operation failed with unfinished cleanup.
+        registry.finish(request_id, status="FAILED", current=1, ready=1, failed=1, cleanup_required=True)
+
+        server._lose = 0
+        asyncio.run(svc._update_pending_requests(runtime))
+        # The SAME cycle queried the authoritative status and reconciled --
+        # despite the replay already returning a terminal status.
+        self.assertEqual(server.get_calls, [f"http://genrm:8000/genrm/scale_out/{request_id}"])
+        self.assertEqual(server.reconcile_calls, [f"http://genrm:8000/genrm/scale_out/{request_id}/reconcile"])
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], request_id)
+        self.assertEqual(runtime.state.scale_history[0]["status"], "FAILED")
+        # Mutex released server-side: a new scale request is admitted (the
+        # bug left it 409-ing forever).
+        second = registry.submit("scale_out", model_name="default", target=2, current=1, ready=1)
+        self.assertEqual(second.get("http", 200), 200)
+        self.assertNotEqual(second.get("request_id"), request_id)
+
+    def test_matrix_c_partial_dirty_not_prematurely_removed(self):
+        """Matrix C: replay returns PARTIAL with cleanup_required=true and the
+        reconcile does NOT clear it yet -> the request is retained (no history
+        transition, decisions frozen, server-side mutex still blocks new
+        scale); a later successful reconcile finalizes it."""
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=1, ready=1, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_out", 1)
+
+        registry.finish(request_id, status="PARTIAL", current=1, ready=1, created=0, failed=1, cleanup_required=True)
+
+        server._lose = 0
+        server.reconcile_dirty = True  # cleanup still unfinished server-side
+        asyncio.run(svc._update_pending_requests(runtime))
+        pending = runtime.state.pending_requests
+        self.assertEqual(
+            [(p["request_id"], p["status"], p["cleanup_required"]) for p in pending],
+            [(request_id, "PARTIAL", True)],
+        )
+        self.assertEqual(len(runtime.state.scale_history), 0)
+        # The retained dirty request freezes new scaling decisions (cooldown
+        # excluded here to isolate the pending gate).
+        engine = ScalingDecisionEngine(runtime.config)
+        decision = engine.evaluate(_busy_metrics(), 2, None, None, pending)
+        self.assertEqual(decision.action, _ScalingAction.NONE)
+        self.assertIn("pending", decision.reason)
+        # Server-side mutex still blocks a direct submission.
+        blocked = registry.submit("scale_out", model_name="default", target=2, current=1, ready=1)
+        self.assertEqual(blocked.get("http", 200), 409)
+        # Later the reconcile clears: finalized into history.
+        server.reconcile_dirty = False
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["status"], "PARTIAL")
+
+    def test_matrix_d_replay_terminal_clean_completes_without_reconcile(self):
+        """Matrix D: replay returns FAILED, authoritative status shows
+        cleanup_required=false -> completes normally, no reconcile needed."""
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=1, ready=1, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_out", 1)
+
+        registry.finish(request_id, status="FAILED", current=1, ready=1, failed=1, cleanup_required=False)
+
+        server._lose = 0
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(server.reconcile_calls, [])
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["status"], "FAILED")
+
+    def test_matrix_e_status_failure_keeps_cleanup_unknown_fail_closed(self):
+        """Matrix E: the status endpoint temporarily fails after recovery ->
+        the terminal replay is NOT trusted as cleanup proof: cleanup stays
+        UNKNOWN, the request is retained (no history transition), target
+        removal is rejected and no new scale is allowed; a later working cycle
+        reconciles and completes."""
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=1, ready=1, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_out", 1)
+
+        registry.finish(request_id, status="FAILED", current=1, ready=1, failed=1, cleanup_required=True)
+
+        server._lose = 0
+        server.fail_gets = 99
+        asyncio.run(svc._update_pending_requests(runtime))
+        pending = runtime.state.pending_requests
+        self.assertEqual(
+            [(p["request_id"], p["status"], p["cleanup_required"]) for p in pending],
+            [(request_id, "FAILED", None)],
+        )
+        self.assertEqual(len(runtime.state.scale_history), 0)
+        # Cooldown bookkeeping was still written (P2-2): the operation
+        # happened, recovered or not.
+        self.assertIsNotNone(runtime.state.last_scale_time)
+        self.assertEqual(runtime.state.last_scale_action, _ScalingAction.SCALE_OUT)
+        # Fail closed: the unproven-cleanup request blocks target removal.
+        with self.assertRaises(svc_module.HTTPException) as ctx:
+            asyncio.run(svc.update_config(_ConfigUpdateRequest(service_targets={})))
+        self.assertEqual(ctx.exception.status_code, 409)
+        # And it freezes new scaling decisions (UNKNOWN cleanup != clean).
+        engine = ScalingDecisionEngine(runtime.config)
+        decision = engine.evaluate(_busy_metrics(), 2, None, None, pending)
+        self.assertEqual(decision.action, _ScalingAction.NONE)
+        self.assertIn("pending", decision.reason)
+        # Transport recovers: reconcile then finalize.
+        server.fail_gets = 0
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["request_id"], request_id)
+
+    def test_matrix_f_scale_in_dirty_replay_reconciles(self):
+        """Matrix F: the identical recovery contract holds for scale_in:
+
+        replay terminal + dirty -> authoritative status/reconcile is the
+        cleanup authority, then history.
+        """
+        svc = self._svc()
+        registry = _genrm_registry()
+        server = _RegistryBackedScaleServer(registry, current=2, ready=2, lose_responses=99)
+        svc._http_session = server
+        runtime, request_id = self._ambiguous_submit(svc, server, "scale_in", 2)
+
+        registry.finish(request_id, status="FAILED", current=2, ready=2, failed=1, cleanup_required=True)
+
+        server._lose = 0
+        asyncio.run(svc._update_pending_requests(runtime))
+        self.assertTrue(server.get_calls[0].endswith(f"/scale_in/{request_id}"))
+        self.assertTrue(server.reconcile_calls[0].endswith(f"/scale_in/{request_id}/reconcile"))
+        self.assertEqual(runtime.state.pending_requests, [])
+        self.assertEqual(runtime.state.scale_history[0]["status"], "FAILED")
+        self.assertEqual(runtime.state.last_scale_action, _ScalingAction.SCALE_IN)
+
+    def test_cooldown_parity_normal_vs_recovered_scale_out(self):
+        """P2-2 regression: the SAME operation driven via a normal acceptance
+        and via SUBMIT_UNKNOWN recovery must produce IDENTICAL cooldown
+        outcomes -- last_scale_action set, last_scale_time set, and an
+        immediate evaluation blocked by cooldown (not a second SCALE_OUT)."""
+        # Case Normal: the POST response arrives.
+        svc_n = self._svc()
+        registry_n = _genrm_registry()
+        server_n = _RegistryBackedScaleServer(registry_n, current=1, ready=1)
+        svc_n._http_session = server_n
+        runtime_n = svc_n._services["genrm"]
+        asyncio.run(svc_n._execute_scale_out(_decision(_ScalingAction.SCALE_OUT), 1, runtime_n))
+        registry_n.finish(server_n.admitted_request_id, status="ACTIVE", current=2, ready=2, created=1)
+        asyncio.run(svc_n._update_pending_requests(runtime_n))
+
+        # Case Recovery: every inline response is lost; the operation is
+        # recovered by the background same-key replay.
+        svc_r = self._svc()
+        registry_r = _genrm_registry()
+        server_r = _RegistryBackedScaleServer(registry_r, current=1, ready=1, lose_responses=99)
+        svc_r._http_session = server_r
+        runtime_r, request_id_r = self._ambiguous_submit(svc_r, server_r, "scale_out", 1)
+        registry_r.finish(request_id_r, status="ACTIVE", current=2, ready=2, created=1)
+        server_r._lose = 0
+        asyncio.run(svc_r._update_pending_requests(runtime_r))
+
+        for runtime in (runtime_n, runtime_r):
+            self.assertEqual(runtime.state.pending_requests, [])
+            self.assertIsNotNone(runtime.state.last_scale_time)
+            self.assertEqual(runtime.state.last_scale_action, _ScalingAction.SCALE_OUT)
+            # Immediate evaluation under load that WOULD trigger scale-out:
+            # the cooldown must block it -- identical outcome on both paths.
+            engine = ScalingDecisionEngine(runtime.config)
+            decision = engine.evaluate(
+                _busy_metrics(), 2, runtime.state.last_scale_time, runtime.state.last_scale_action, []
+            )
+            self.assertEqual(decision.action, _ScalingAction.NONE)
+            self.assertIn("cooldown", decision.reason.lower())
+
+    def test_cooldown_parity_normal_vs_recovered_scale_in(self):
+        """P2-2 regression, scale_in variant: a recovered scale-in keeps the
+        same cooldown semantics as a normal acceptance -- no immediate second
+        SCALE_IN."""
+        # Case Normal.
+        svc_n = self._svc()
+        registry_n = _genrm_registry()
+        server_n = _RegistryBackedScaleServer(registry_n, current=2, ready=2)
+        svc_n._http_session = server_n
+        runtime_n = svc_n._services["genrm"]
+        asyncio.run(svc_n._execute_scale_in(_decision(_ScalingAction.SCALE_IN), 2, runtime_n))
+        registry_n.finish(server_n.admitted_request_id, status="COMPLETED", current=1, ready=1, removed=1)
+        asyncio.run(svc_n._update_pending_requests(runtime_n))
+
+        # Case Recovery.
+        svc_r = self._svc()
+        registry_r = _genrm_registry()
+        server_r = _RegistryBackedScaleServer(registry_r, current=2, ready=2, lose_responses=99)
+        svc_r._http_session = server_r
+        runtime_r, request_id_r = self._ambiguous_submit(svc_r, server_r, "scale_in", 2)
+        registry_r.finish(request_id_r, status="COMPLETED", current=1, ready=1, removed=1)
+        server_r._lose = 0
+        asyncio.run(svc_r._update_pending_requests(runtime_r))
+
+        for runtime in (runtime_n, runtime_r):
+            self.assertEqual(runtime.state.pending_requests, [])
+            self.assertIsNotNone(runtime.state.last_scale_time)
+            self.assertEqual(runtime.state.last_scale_action, _ScalingAction.SCALE_IN)
+            # Idle load that WOULD trigger scale-in: blocked by cooldown on
+            # both paths.
+            engine = ScalingDecisionEngine(runtime.config)
+            decision = engine.evaluate(
+                _idle_metrics(), 2, runtime.state.last_scale_time, runtime.state.last_scale_action, []
+            )
+            self.assertEqual(decision.action, _ScalingAction.NONE)
+            self.assertIn("cooldown", decision.reason.lower())
 
 
 if __name__ == "__main__":

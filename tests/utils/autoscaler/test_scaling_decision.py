@@ -125,13 +125,27 @@ def test_scaling_decision_full_coverage_allows_scale_out():
 
 
 def test_scaling_decision_partial_pending_does_not_block():
-    """a PARTIAL scale-out request is terminal and must not block new decisions
+    """a PARTIAL scale-out request is terminal and, once cleanup is PROVEN
+    clean (authoritative cleanup_required=False), must not block new decisions
     via the active_pending gate."""
     engine = _engine()
     agg = _busy_metrics(coverage=1.0)
-    pending = [{"action": "scale_out", "status": "PARTIAL", "delta": 2}]
+    pending = [{"action": "scale_out", "status": "PARTIAL", "delta": 2, "cleanup_required": False}]
     decision = _evaluate(engine, agg, current_engines=4, pending=pending)
     assert decision.action == ScalingAction.SCALE_OUT
+
+
+def test_scaling_decision_terminal_unknown_cleanup_blocks():
+    """Three-state cleanup: a terminal request whose cleanup is UNKNOWN
+    (missing flag -- e.g. adopted from an idempotent replay, whose POST reply
+    carries no cleanup proof) blocks decisions exactly like a dirty one;
+    missing != clean."""
+    engine = _engine()
+    agg = _busy_metrics(coverage=1.0)
+    pending = [{"action": "scale_out", "status": "FAILED", "delta": 2}]
+    decision = _evaluate(engine, agg, current_engines=4, pending=pending)
+    assert decision.action == ScalingAction.NONE
+    assert "pending" in decision.reason.lower()
 
 
 def test_scaling_decision_non_terminal_pending_blocks():
