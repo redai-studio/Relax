@@ -71,9 +71,17 @@ def _megatron_root() -> Optional[str]:
         import megatron
     except Exception:
         return None
-    root = str(Path(megatron.__file__).resolve().parents[1])
-    if (Path(root) / _UTILS_RELATIVE_PATH).is_file():
-        return root
+    # A distribution-installed Megatron can be a namespace package
+    # (``__file__`` is None, e.g. the H20 CI runner); derive candidate roots
+    # from ``__path__`` instead of crashing on ``Path(None)``.
+    candidates: list[str] = []
+    if getattr(megatron, "__file__", None):
+        candidates.append(str(Path(megatron.__file__).resolve().parents[1]))
+    for entry in getattr(megatron, "__path__", []):
+        candidates.append(str(Path(entry).resolve().parent))
+    for root in candidates:
+        if (Path(root) / _UTILS_RELATIVE_PATH).is_file():
+            return root
     return None
 
 

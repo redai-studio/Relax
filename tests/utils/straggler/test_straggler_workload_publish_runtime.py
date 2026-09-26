@@ -16,17 +16,19 @@ import torch
 
 
 # This harness drives the real Megatron actor path, so it needs the training
-# stack. The CPU venv has neither `transfer_queue` nor `megatron`, where the
-# actor module cannot even be imported; skip there rather than fail collection.
+# stack. The CPU CI venv has `transfer_queue` but not `megatron`, and the
+# actor module imports Megatron at collection time; skip there rather than
+# fail collection.
 # Run it with:
 #   PYTHONPATH=$PWD:/root/autodl-tmp/megatron-stack/Megatron-LM \
 #     /root/autodl-tmp/megatron-stack/venv/bin/python -m pytest <this file> -q
 pytest.importorskip("transfer_queue", reason="requires the relaxed training stack (Megatron + transfer_queue)")
+pytest.importorskip("megatron", reason="requires the Megatron training stack")
 
-from relax.backends.megatron import actor as actor_mod
-from relax.backends.megatron.actor import MegatronTrainRayActor
-from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
-from relax.utils.straggler import context as ctx
+from relax.backends.megatron import actor as actor_mod  # noqa: E402 — guarded above
+from relax.backends.megatron.actor import MegatronTrainRayActor  # noqa: E402 — guarded above
+from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions  # noqa: E402 — guarded above
+from relax.utils.straggler import context as ctx  # noqa: E402 — guarded above
 
 
 SAMPLES = [10, 10, 60, 90, 5, 5]
