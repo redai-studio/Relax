@@ -88,10 +88,48 @@ def test_build_metrics_omits_values_that_cannot_be_measured() -> None:
     assert metrics == {}
 
 
-def test_build_metrics_derives_coverage_from_judged_envelopes() -> None:
+def test_judged_fraction_is_not_mislabelled_as_coverage() -> None:
+    """``judged/envelopes`` is a transport ratio, never cohort coverage.
+
+    The collector's real cohort coverage is not in the summary here, so
+    ``coverage`` must be absent; the in-process ratio is published under its own
+    key. Reading it as coverage used to show 1.0 on a run whose cohort coverage
+    was far lower.
+    """
     metrics = reporter.build_metrics(StubRuntime({"envelopes": 10, "judged_packets": 4}))
 
-    assert metrics[_prefixed("coverage")] == 0.4
+    assert _prefixed("coverage") not in metrics
+    assert metrics[_prefixed("judged_fraction")] == 0.4
+
+
+def test_coverage_is_emitted_only_from_an_explicit_cohort_ratio() -> None:
+    metrics = reporter.build_metrics(StubRuntime({"coverage_ratio": 0.75, "envelopes": 10, "judged_packets": 10}))
+
+    assert metrics[_prefixed("coverage")] == 0.75
+    assert metrics[_prefixed("judged_fraction")] == 1.0
+
+
+def test_every_drop_counter_is_published_in_dropped() -> None:
+    """The detector's capped structures must not be invisible.
+
+    ``MAX_SAMPLES_PER_RANK`` and the other caps report their evictions through
+    the detector counters; the aggregate ``dropped`` key used to omit them, so a
+    window that dropped 512 samples published no drop at all.
+    """
+    metrics = reporter.build_metrics(
+        StubRuntime(
+            {
+                "sample_evictions": 512,
+                "pair_evictions": 3,
+                "rank_evictions": 2,
+                "active_evictions": 1,
+                "pending_line_drops": 4,
+                "invalid_samples": 5,
+            }
+        )
+    )
+
+    assert metrics[_prefixed("dropped")] == 512 + 3 + 2 + 1 + 4 + 5
 
 
 def test_build_metrics_never_raises_when_report_fails() -> None:
@@ -111,7 +149,87 @@ def test_build_metrics_includes_the_training_context_when_set() -> None:
 
     assert metrics[_prefixed("rollout_id")] == 5
     assert metrics[_prefixed("optimizer_step")] == 2
-    assert metrics[_prefixed("global_step")] == 22
+    # The monotonic profiler ordinal replaces the fabricated global step.
+    assert metrics[_prefixed("step_ordinal")] == 1
+    assert _prefixed("global_step") not in metrics
+    # The publish counters are now on a surface that runs, not just a test helper.
+    assert metrics[_prefixed("workload_publish_skipped")] == 0
+    assert metrics[_prefixed("workload_publish_errors")] == 0
+
+
+def test_reporter_omits_the_global_step_metric() -> None:
+    """The in-rollout index is never exported as a run-wide step.
+
+    ``record_optimizer_step`` with no run-wide value leaves ``global_step``
+    ``None``; the reporter must omit it (it emits ``optimizer_step`` and the
+    monotonic ``step_ordinal`` instead).
+    """
+    context.set_training_context(4, 9)
+
+    metrics = reporter.build_metrics(StubRuntime({}))
+
+    assert _prefixed("global_step") not in metrics
+    assert metrics[_prefixed("optimizer_step")] == 9
+    assert metrics[_prefixed("step_ordinal")] == 1
+
+
+def test_build_metrics_surfaces_the_workload_counters() -> None:
+    context.set_training_context(4, 9)
+    context.count_workload_publish_skipped()
+    context.count_workload_publish_skipped()
+    context.count_workload_publish_error()
+
+    metrics = reporter.build_metrics(
+        StubRuntime({"workload_incomparable_windows": 3, "workload_missing_windows": 2})
+    )
+
+    assert metrics[_prefixed("workload_publish_skipped")] == 2
+    assert metrics[_prefixed("workload_publish_errors")] == 1
+    assert metrics[_prefixed("workload_incomparable_windows")] == 3
+    assert metrics[_prefixed("workload_missing_windows")] == 2
+
+
+def test_collector_status_available_marks_the_pp_gt_one_exporting_rank() -> None:
+    """The PP>1 mismatch must be an explicit marker, not silence.
+
+    The platform exports straggler metrics only on the Megatron primary rank,
+    which owns the collector only when ``pp_size == 1``. A runtime without a
+    collector (the PP>1 exporting rank) must say so.
+    """
+    from relax.utils.straggler.collector import TimingCollector
+    from relax.utils.straggler.config import StragglerConfig
+    from relax.utils.straggler.identity import RuntimeIdentity
+    from relax.utils.straggler.runtime import StragglerRuntime
+
+    config = StragglerConfig(enabled=True, window_seconds=1.0)
+    sender = StragglerRuntime(
+        config,
+        identity=RuntimeIdentity(run_id="run-1", rank=3, world_size=8),
+        register_atexit=False,
+    )
+    assert sender.collector is None
+
+    metrics = reporter.build_metrics(sender)
+
+    assert metrics[_prefixed("collector_status_available")] == 0.0
+
+    owner = StragglerRuntime(
+        config,
+        identity=RuntimeIdentity(run_id="run-1", rank=0, world_size=8),
+        register_atexit=False,
+    )
+    owner._collector = TimingCollector(config, identity=owner.identity)
+
+    assert reporter.build_metrics(owner)[_prefixed("collector_status_available")] == 1.0
+
+
+def test_report_once_marks_an_enabled_run_without_a_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(straggler_package, "is_straggler_profiler_enabled", lambda: True)
+    monkeypatch.setattr(straggler_package, "get_straggler_runtime", lambda: None)
+
+    metrics = reporter.report_once(Namespace(), 3)
+
+    assert metrics == {_prefixed("collector_status_available"): 0.0}
 
 
 def test_report_once_returns_nothing_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -22,6 +22,25 @@ timer name and its coarse stage group next to each other. The group is derived
 from the stage the verdict already carries, so a reader can localise a
 measurement without the wire envelope growing a field and without any metrics
 backend having to accept a non-numeric value.
+
+Two keys deserve a precise reading:
+
+* ``coverage`` is cohort coverage and is emitted **only** when the summary
+  publishes it. The fallback this module used to compute was
+  ``judged_packets / envelopes`` --- a different quantity --- and is now its own
+  key, ``judged_fraction``, so neither can be misread as the other.
+* ``collector_status_available`` is ``1`` when this process owns the collector
+  and ``0`` when it does not. The platform merges metrics only on the Megatron
+  primary rank (tp0, pipeline-last, dp0), which coincides with the collector
+  rank (global rank 0) only when ``pp_size == 1``; under PP>1 the exporting rank
+  owns no collector, and this ``0`` is the explicit "straggler counters
+  unavailable here" marker instead of silent omission.
+
+Known limits (documented, not fixed here): ``RELAX_STRAGGLER_TOPOLOGY_EPOCH`` is
+inert --- nothing derives or updates it, so a re-shard is invisible to the
+cohort key unless an operator sets the variable by hand --- and there is no
+rollout or topology reset, so a stall spanning a rollout boundary is drained
+into the next rollout's perf log.
 """
 
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -37,29 +56,56 @@ STRAGGLER_METRIC_PREFIX = "perf/straggler/"
 
 #: Emitted metric names without the prefix, in a stable documented order.
 #: ``active_stragglers``/``verdicts``/``windows_closed``/``coverage``/
-#: ``dropped`` come from the runtime summary, ``worst_deviation``/
-#: ``worst_rank`` from the drained verdicts, and the remaining three from the
-#: published training context when one exists.
+#: ``judged_fraction``/``dropped`` come from the runtime summary;
+#: ``worst_deviation``/``worst_rank`` from the drained verdicts;
+#: ``rollout_id``/``optimizer_step``/``step_ordinal`` from the published
+#: training context; ``workload_incomparable_windows``/
+#: ``workload_missing_windows`` from the detector counters in the summary;
+#: ``workload_publish_skipped``/``workload_publish_errors`` from the training
+#: context counters; and ``collector_status_available`` from the runtime's role.
 STRAGGLER_METRIC_KEYS: Tuple[str, ...] = (
     "active_stragglers",
     "verdicts",
     "windows_closed",
     "coverage",
+    "judged_fraction",
     "dropped",
     "worst_deviation",
     "worst_rank",
     "rollout_id",
     "optimizer_step",
-    "global_step",
+    "step_ordinal",
+    "workload_incomparable_windows",
+    "workload_missing_windows",
+    "workload_publish_skipped",
+    "workload_publish_errors",
+    "collector_status_available",
 )
 
 #: Drop reasons summed into ``perf/straggler/dropped``. The first is an
-#: aggregate a runtime may already provide; the rest are per-component counters.
+#: aggregate a runtime may already provide; the rest are per-component
+#: counters. Every bounded structure in the detector reports its evictions, so
+#: they are all published here: a cap that dropped data must never be invisible
+#: behind a ``dropped`` key that stays absent.
 _DROPPED_FIELDS: Tuple[str, ...] = (
     "dropped",
     "dropped_queue_full",
     "dropped_pending_full",
     "dropped_output_full",
+    "pending_line_drops",
+    # Detector caps (``relax/utils/straggler/detector.py``).
+    "sample_evictions",
+    "pair_evictions",
+    "rank_evictions",
+    "verdict_evictions",
+    "streak_evictions",
+    "label_evictions",
+    "epoch_evictions",
+    "cohort_epoch_evictions",
+    "active_evictions",
+    # Malformed input: kept as measurements rather than silently skipped.
+    "invalid_samples",
+    "invalid_device_samples",
 )
 
 _FAILURES = 0
@@ -112,21 +158,67 @@ def _count(value: Any) -> Optional[float]:
 
 
 def _coverage(summary: Mapping[str, Any]) -> Optional[float]:
-    """Return cohort coverage, preferring an explicit ratio.
+    """Return cohort coverage, only when the summary publishes it.
 
-    When the runtime does not publish one, fall back to the fraction of
-    received envelopes the collector actually judged, which is the closest in-
-    process proxy; ``None`` when neither can be measured.
+    The name means the fraction of the expected cohort that reported, so it is
+    emitted only from an explicit ``coverage_ratio``/``coverage``. The
+    ``judged_packets / envelopes`` fallback measures something else entirely and
+    now has its own key; reporting it as coverage read 1.0 on a run whose real
+    cohort coverage was far lower.
     """
     for key in ("coverage_ratio", "coverage"):
         number = _number(summary.get(key))
         if number is not None:
             return number
+    return None
+
+
+def _judged_fraction(summary: Mapping[str, Any]) -> Optional[float]:
+    """Return the fraction of received envelopes the collector judged.
+
+    This is deliberately a separate key from ``coverage``: it is an in-process
+    transport ratio, not cohort coverage.
+    """
     envelopes = _number(summary.get("envelopes"))
     judged = _number(summary.get("judged_packets"))
     if envelopes is not None and judged is not None and envelopes > 0.0:
         return judged / envelopes
     return None
+
+
+def _context_counters() -> Mapping[str, Any]:
+    """Read the training-context counters; empty when unavailable.
+
+    The publish counters live in
+    :mod:`relax.utils.straggler.context`, which used to have no production
+    caller at all. This read is in-process and allocation-light, so it is safe on
+    the training thread; it adds no request, no socket and no collective.
+    """
+    try:
+        from relax.utils.straggler.context import training_context_stats
+    except Exception:
+        _count_failure()
+        return {}
+    try:
+        value = training_context_stats()
+    except Exception:
+        _count_failure()
+        return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _collector_status_available(runtime: Any) -> Optional[float]:
+    """Return 1 when this process owns a collector, 0 when it does not.
+
+    The platform merges metrics only on the Megatron primary rank, which owns
+    the collector only when ``pp_size == 1``. Under PP>1 the exporting rank owns
+    none, and this ``0`` is the explicit unavailable marker. A stub runtime
+    without a ``collector`` attribute cannot be classified, so nothing is
+    emitted for it rather than inventing a ``0``.
+    """
+    if not hasattr(runtime, "collector"):
+        return None
+    return 1.0 if getattr(runtime, "collector", None) is not None else 0.0
 
 
 def _dropped(summary: Mapping[str, Any]) -> Optional[float]:
@@ -263,14 +355,29 @@ def build_metrics(runtime: Any) -> Dict[str, float]:
             "verdicts": _number(summary.get("verdicts")),
             "windows_closed": _number(summary.get("windows_closed")),
             "coverage": _coverage(summary),
+            "judged_fraction": _judged_fraction(summary),
             "dropped": _dropped(summary),
+            # Detector counters that were only reachable through the status
+            # files; surfaced here so the workload gate is observable in the
+            # training log too.
+            "workload_incomparable_windows": _number(summary.get("workload_incomparable_windows")),
+            "workload_missing_windows": _number(summary.get("workload_missing_windows")),
+            "collector_status_available": _collector_status_available(runtime),
         }
         worst_deviation, worst_rank = _worst_verdict(verdicts)
         values["worst_deviation"] = worst_deviation
         values["worst_rank"] = worst_rank
         training_context = _training_context()
-        for key in ("rollout_id", "optimizer_step", "global_step"):
+        for key in ("rollout_id", "optimizer_step", "step_ordinal"):
             values[key] = _number(training_context.get(key))
+        # The publish counters are only meaningful once training has published a
+        # context; before that they are omitted rather than reported as a
+        # reassuring zero.
+        context_counters = _context_counters()
+        updates = _number(context_counters.get("updates"))
+        if updates is not None and updates > 0.0:
+            values["workload_publish_skipped"] = _number(context_counters.get("workload_publish_skipped"))
+            values["workload_publish_errors"] = _number(context_counters.get("workload_publish_errors"))
         metrics: Dict[str, float] = {}
         for key in STRAGGLER_METRIC_KEYS:
             value = values.get(key)
@@ -305,7 +412,9 @@ def report_once(args: Any, rollout_id: int) -> Dict[str, float]:
             return {}
         runtime = get_straggler_runtime()
         if runtime is None:
-            return {}
+            # Enabled but no runtime: say so explicitly instead of returning an
+            # empty mapping that reads as "nothing to report".
+            return {f"{STRAGGLER_METRIC_PREFIX}collector_status_available": 0.0}
         return build_metrics(runtime)
     except Exception:
         _count_failure()

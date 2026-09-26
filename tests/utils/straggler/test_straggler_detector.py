@@ -565,7 +565,7 @@ def test_communication_stage_deviation_yields_no_network_or_fault_cause() -> Non
     assert verdict.candidate_causes == ("undetermined",)
 
 
-# --- workload is reported, never corrected ---------------------------------
+# --- workload: reported, per-rank gated, never silently comparable ----------
 
 
 def test_workload_delta_is_reported_when_both_sides_report_workloads() -> None:
@@ -696,6 +696,126 @@ def test_active_set_and_verdict_deque_stay_bounded() -> None:
     assert stats["active_stragglers"] <= MAX_ACTIVE_ENTRIES
     assert stats["retained_verdicts"] <= stats["caps"]["MAX_VERDICTS"]
     assert stats["streak_entries"] <= MAX_STREAK_ENTRIES
+
+
+def test_a_stall_is_reported_once_even_when_the_active_cap_evicts_it() -> None:
+    """``stragglers_reported`` counts onsets, not re-observations.
+
+    With more distinct slow keys than ``MAX_ACTIVE_ENTRIES``, an evicted entry
+    used to be re-added (and re-counted) on the next window even though the
+    stall never recovered. Onset is now the exact window in which the
+    persistence threshold is first crossed.
+    """
+    detector = make_detector(persist_windows=1)
+    slow_count = MAX_ACTIVE_ENTRIES + 10
+
+    # One pair-window can hold at most MAX_RANKS_PER_WINDOW ranks, so the active
+    # cap is exceeded by many slow ranks of one pair rather than many pairs
+    # (distinct pairs are capped tighter, at MAX_PAIRS_PER_WINDOW).
+    ranks = {0: 100.0}
+    ranks.update({rank: 400.0 for rank in range(1, slow_count + 1)})
+    for window in range(2):
+        feed_window(detector, window, ranks)
+    detector.flush()
+
+    stats = detector.stats()
+    assert stats["active_evictions"] == 10
+    assert stats["stragglers_reported"] == slow_count, "an ongoing stall must not be counted twice"
+
+
+def test_uncertain_judgements_counts_uncertain_verdicts_once_each() -> None:
+    """A sub-floor window emits three uncertain verdicts; the counter says 3.
+
+    ``sub_floor_judgements`` is the sub-floor subset and may equal the total;
+    ``uncertain_judgements`` must no longer stay 0 while verdicts are emitted.
+    """
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 2.1, 1: 2.2, 2: 0.2, 3: 0.25}, stage="params-all-gather")
+    verdicts.extend(detector.flush())
+
+    uncertain = [v for v in verdicts if v.kind == VERDICT_UNCERTAIN]
+    assert len(uncertain) == 3
+    assert all(v.reason == "below_absolute_floor" for v in uncertain)
+    stats = detector.stats()
+    assert stats["sub_floor_judgements"] == 3
+    assert stats["uncertain_judgements"] == 3
+
+
+def test_malformed_input_counts_as_an_observe_error_not_a_judgement() -> None:
+    detector = make_detector()
+
+    class Broken:
+        @property
+        def host_start(self) -> float:
+            raise RuntimeError("boom")
+
+    assert detector.observe(Broken()) == []
+
+    stats = detector.stats()
+    assert stats["observe_errors"] == 1
+    assert stats["uncertain_judgements"] == 0
+
+
+# --- workload absence is degraded evidence ---------------------------------
+
+
+def test_missing_workload_is_recorded_and_never_reads_as_comparable() -> None:
+    """A rank that publishes no workload must not look comparable.
+
+    Detection still runs (a vehicle that never publishes work must still be
+    detectable), but every workload fact records the degraded measurement
+    instead of a false "checked and equal".
+    """
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0})
+    verdicts.extend(detector.flush())
+
+    verdict = next(v for v in verdicts if v.kind == VERDICT_STRAGGLER)
+    facts = verdict.facts
+    assert facts["workload_reported"] is False
+    assert facts["workload_delta"] is None
+    assert facts["workload_delta_beyond_tolerance"] is None
+    assert facts["workload_comparable"] is None
+    assert facts["workload_evidence_degraded"] is True
+    assert detector.stats()["workload_missing_windows"] == 1
+
+
+def test_partially_reported_workload_is_degraded_not_comparable() -> None:
+    """One rank reporting while its peers do not is still an unknown."""
+    detector = make_detector(persist_windows=1)
+
+    verdicts = feed_equal_windows(detector, 1, {0: 100.0, 1: 100.0, 2: 200.0}, workload={2: {"tokens": 200}})
+    verdicts.extend(detector.flush())
+
+    assert verdicts
+    assert all(v.facts["workload_evidence_degraded"] is True for v in verdicts)
+    assert all(v.facts["workload_comparable"] is None for v in verdicts)
+    assert detector.stats()["workload_missing_windows"] == 1
+
+
+def test_cohort_below_min_size_makes_no_workload_comparability_claim() -> None:
+    """The reason and the workload facts must agree in the small-cohort branch.
+
+    With ``min_cohort_size=3`` and two ranks there is no peer median robust
+    enough to judge, so the verdicts must not carry ``comparable=False`` and
+    ``delta_beyond=True`` alongside ``cohort_below_min_size``.
+    """
+    detector = make_detector(persist_windows=1, min_cohort_size=3)
+    workload = {0: {"tokens": 100.0}, 1: {"tokens": 300.0}}
+
+    verdicts: List[Any] = []
+    verdicts.extend(feed_window(detector, 0, {0: 100.0, 1: 100.0}, workload=workload))
+    verdicts.extend(feed_window(detector, 2, {0: 100.0, 1: 100.0}, workload=workload))
+    verdicts.extend(detector.flush())
+
+    uncertain = [v for v in verdicts if v.reason == "cohort_below_min_size"]
+    assert uncertain
+    for verdict in uncertain:
+        assert verdict.facts["workload_comparable"] is None
+        assert verdict.facts["workload_delta_beyond_tolerance"] is None
+        assert verdict.facts["workload_evidence_degraded"] is True
 
 
 def test_sub_millisecond_stage_jitter_is_never_a_straggler() -> None:

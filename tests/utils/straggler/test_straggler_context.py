@@ -31,17 +31,52 @@ def test_set_and_get_round_trip() -> None:
     assert stored.rollout_id == 3
     assert stored.optimizer_step == 5
     assert stored.sample_seq is None
-    assert stored.global_step == 5
+    # The step index is in-rollout only; no run-wide step is fabricated.
+    assert stored.global_step is None
+    assert stored.step_ordinal == 1
     assert stored.updated_at > 0.0
 
 
-def test_global_step_uses_the_rollout_length_when_given() -> None:
+def test_a_rollout_length_never_synthesises_a_global_step() -> None:
+    """The platform arithmetic is not a run-wide identity and is not used.
+
+    ``rollout_id * num_steps_per_rollout + optimizer_step`` is inherited from
+    the platform's ``accumulated_step_id``, which is documented as non-monotonic
+    under dynamic batching. The profiler must not reproduce it.
+    """
     context.set_training_context(2, 3, num_steps_per_rollout=4)
 
     stored = context.get_training_context()
 
     assert stored is not None
-    assert stored.global_step == 11  # 2 * 4 + 3
+    assert stored.global_step is None
+    assert stored.optimizer_step == 3
+
+
+def test_the_varying_rollout_length_case_is_strictly_increasing_and_collision_free() -> None:
+    """A four-step rollout then a one-step rollout must not go backwards.
+
+    The platform scalar for these coordinates would be ``[0, 1, 2, 3, 1]``:
+    ``(0, 3)`` and ``(1, 0)`` do not increase. The profiler assigns its own
+    ``step_ordinal`` per ``(rollout_id, optimizer_step)``, so the sequence is
+    strictly increasing and collision-free.
+    """
+    observed = {}
+    for step in range(4):
+        context.set_training_context(0, step, num_steps_per_rollout=4)
+        observed[(0, step)] = context.get_training_context().step_ordinal
+    context.set_training_context(1, 0, num_steps_per_rollout=1)
+    observed[(1, 0)] = context.get_training_context().step_ordinal
+
+    values = list(observed.values())
+    assert values == [1, 2, 3, 4, 5]
+    assert values == sorted(values)
+    assert len(set(values)) == len(values), "the ordinals must be collision-free"
+
+    # The arithmetic this replaces is retained only as a documented counterexample.
+    platform_arithmetic = [0 * 4 + step for step in range(4)] + [1 * 1 + 0]
+    assert platform_arithmetic == [0, 1, 2, 3, 1]
+    assert platform_arithmetic != sorted(platform_arithmetic)
 
 
 def test_sample_seq_is_recorded_when_given() -> None:
@@ -73,24 +108,40 @@ def test_record_optimizer_step_sets_the_context_when_enabled(monkeypatch: pytest
     assert (stored.rollout_id, stored.optimizer_step) == (4, 9)
 
 
-def test_record_optimizer_step_derives_global_step_from_rollout_length(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_record_optimizer_step_never_derives_a_global_step(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(straggler_package, "is_straggler_profiler_enabled", lambda: True)
 
     context.record_optimizer_step(4, 9, num_steps_per_rollout=12)
 
     stored = context.get_training_context()
     assert stored is not None
-    assert stored.global_step == 4 * 12 + 9
+    assert stored.global_step is None
+    assert stored.optimizer_step == 9
 
 
-def test_record_optimizer_step_without_rollout_length_keeps_the_step_index(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_record_optimizer_step_without_a_length_is_in_rollout_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The no-length case must not emit the bare step index as if it were global.
+
+    The field is typed ``Optional[int]`` and documented as in-rollout only, and
+    the snapshot omits ``global_step`` entirely when no run-wide value exists.
+    """
+    from typing import Optional
+
     monkeypatch.setattr(straggler_package, "is_straggler_profiler_enabled", lambda: True)
 
     context.record_optimizer_step(4, 9)
 
     stored = context.get_training_context()
     assert stored is not None
-    assert stored.global_step == 9
+    assert stored.global_step is None, "the bare optimizer step must not be presented as global"
+    assert stored.optimizer_step == 9
+    assert "global_step" not in context.snapshot()
+
+    # Typed and documented: the annotation is Optional[int] and the hook says
+    # the step index is in-rollout only.
+    assert context.TrainingContext.__annotations__["global_step"] == Optional[int]
+    assert context.TrainingContext.__annotations__["optimizer_step"] is int
+    assert "in-rollout" in (context.record_optimizer_step.__doc__ or "")
 
 
 def test_record_optimizer_step_never_raises_when_the_switch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,7 +175,7 @@ def test_snapshot_is_json_serialisable() -> None:
 
     payload = json.loads(json.dumps(context.snapshot()))
 
-    assert payload == {"rollout_id": 6, "optimizer_step": 1, "sample_seq": 2, "global_step": 19}
+    assert payload == {"rollout_id": 6, "optimizer_step": 1, "sample_seq": 2, "step_ordinal": 1}
 
 
 def test_many_updates_do_not_grow_the_module_state() -> None:
@@ -136,6 +187,7 @@ def test_many_updates_do_not_grow_the_module_state() -> None:
     assert stats["updates"] == 10_000
     assert stats["failures"] == 0
     assert stats["stored"] == 1
+    assert stats["step_ordinal"] == 10_000
 
 
 def test_the_producer_does_no_io_and_no_socket_on_the_training_thread(monkeypatch: pytest.MonkeyPatch) -> None:

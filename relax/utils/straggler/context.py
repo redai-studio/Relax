@@ -11,15 +11,31 @@ synchronises a device or takes a collective.
 A background thread (the observer/collector/sender) may read the value at any
 time, so the slot is guarded by a lock and the stored value is a frozen
 dataclass: a reader sees either the previous context or the next one, never a
-half-written one. Writing allocates exactly one small value object and swaps a
-single module-level slot, so a long run cannot grow memory here; reading
+half-written one. Writing allocates one small value object per update and swaps
+a single module-level slot, so a long run cannot grow memory here; reading
 allocates nothing.
+
+The optimizer-step index is **in-rollout only** and is not a run-wide identity:
+under dynamic batching the rollout length varies, so the platform's
+``accumulated_step_id`` (``rollout_id * num_steps_per_rollout + optimizer_step``)
+is not monotonic (see :mod:`relax.utils.replay.schema` and
+``docs/en/guide/trajectory-replay.md``). This module therefore never
+synthesises a run-wide step from it. It exposes :attr:`TrainingContext.step_ordinal`,
+a monotonically increasing count the profiler assigns itself, and leaves
+``global_step`` ``None`` unless a caller supplies a genuinely run-wide value.
+
+Known limitation (not fixable here): the observer looks the workload up when it
+*builds* an envelope, i.e. on the readout thread after the interval closed, so
+the stamped workload can belong to a later rollout/step than the interval. The
+envelope's only temporal anchor is ``host_start``; the workload stamp is
+advisory. Fixing the stamping point needs ``observer.py``, which this change
+does not own.
 """
 
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
@@ -29,18 +45,26 @@ class TrainingContext:
 
     Attributes:
         rollout_id: Rollout the optimizer step belongs to.
-        optimizer_step: Index of the step inside that rollout.
+        optimizer_step: Index of the step **inside** that rollout. It is not a
+            run-wide identifier: the same index repeats in every rollout.
         sample_seq: Optional sample sequence index, when the caller knows one.
-        global_step: ``rollout_id * num_steps_per_rollout + optimizer_step``
-            when the rollout length is known, otherwise the bare optimizer-step
-            index.
+        step_ordinal: Strictly increasing, collision-free run step ordinal
+            assigned by the profiler in observation order. It is this module's
+            own count of optimizer steps, never the platform's
+            ``accumulated_step_id``: ``rollout_id * num_steps_per_rollout +
+            optimizer_step`` is not monotonic when the rollout length varies.
+        global_step: Optional run-wide step id. It is ``None`` unless a caller
+            explicitly supplies one, because the profiler cannot derive a valid
+            run-wide value from a per-rollout length; consumers must use
+            ``(rollout_id, optimizer_step)`` as the identity.
         updated_at: ``time.monotonic()`` at publication, for staleness checks.
     """
 
     rollout_id: int
     optimizer_step: int
     sample_seq: Optional[int]
-    global_step: int
+    step_ordinal: int
+    global_step: Optional[int]
     updated_at: float
     #: LOCAL per-rank work for this optimizer step, when the data path published
     #: it. These are advisory transport metadata: the detector reports the
@@ -54,6 +78,8 @@ _CONTEXT_LOCK = threading.Lock()
 _CURRENT: Optional[TrainingContext] = None
 _UPDATES = 0
 _FAILURES = 0
+#: Monotonic run step ordinal assigned by this module. A single bounded int.
+_STEP_ORDINAL = 0
 
 #: Per-rollout ``(tokens, sequences, microbatches)`` triples published by the
 #: data path, keyed by rollout so a prefetch that runs ahead cannot hand a step
@@ -135,22 +161,26 @@ def _build_context(
     optimizer_step: int,
     sample_seq: Optional[int],
     num_steps_per_rollout: Optional[int],
+    global_step: Optional[int] = None,
 ) -> TrainingContext:
     """Assemble the frozen value object from the raw loop integers.
 
     Kept separate from :func:`set_training_context` so a test can force a
     failure without touching the public entry point.
+
+    ``num_steps_per_rollout`` is accepted for call-site compatibility but is
+    deliberately **not** used: deriving ``rollout_id * num_steps_per_rollout +
+    optimizer_step`` would fabricate a run-wide step from a per-rollout length
+    that varies under dynamic batching. ``step_ordinal`` is assigned by
+    :func:`set_training_context`, which owns the counter.
     """
-    if num_steps_per_rollout is not None:
-        global_step = int(rollout_id) * int(num_steps_per_rollout) + int(optimizer_step)
-    else:
-        global_step = int(optimizer_step)
     tokens, sequences, microbatches = _step_workload(rollout_id, optimizer_step)
     return TrainingContext(
         rollout_id=int(rollout_id),
         optimizer_step=int(optimizer_step),
         sample_seq=None if sample_seq is None else int(sample_seq),
-        global_step=global_step,
+        step_ordinal=0,
+        global_step=None if global_step is None else int(global_step),
         updated_at=time.monotonic(),
         tokens=tokens,
         sequences=sequences,
@@ -163,22 +193,27 @@ def set_training_context(
     optimizer_step: int,
     sample_seq: Optional[int] = None,
     num_steps_per_rollout: Optional[int] = None,
+    global_step: Optional[int] = None,
 ) -> None:
     """Publish the current training position; O(1) and never raises.
 
-    ``global_step`` is ``rollout_id * num_steps_per_rollout + optimizer_step``
-    when the rollout length is known and falls back to the bare optimizer-step
-    index otherwise. A failure is counted and the previous context is kept,
-    because a profiler must not perturb the loop it observes.
+    ``optimizer_step`` is **in-rollout only**. ``global_step`` is optional and
+    is stored only when the caller passes a genuinely run-wide value; the
+    misleading fallback that emitted the bare optimizer-step index as if it were
+    global is gone. The profiler's own monotonic ``step_ordinal`` is assigned
+    here. ``num_steps_per_rollout`` is accepted for call-site compatibility but
+    is no longer used to derive anything. A failure is counted and the previous
+    context is kept, because a profiler must not perturb the loop it observes.
     """
-    global _CURRENT, _UPDATES
+    global _CURRENT, _UPDATES, _STEP_ORDINAL
     try:
-        context = _build_context(rollout_id, optimizer_step, sample_seq, num_steps_per_rollout)
+        context = _build_context(rollout_id, optimizer_step, sample_seq, num_steps_per_rollout, global_step)
     except Exception:
         _count_failure()
         return
     with _CONTEXT_LOCK:
-        _CURRENT = context
+        _STEP_ORDINAL += 1
+        _CURRENT = replace(context, step_ordinal=_STEP_ORDINAL)
         _UPDATES += 1
 
 
@@ -195,8 +230,9 @@ def get_training_context() -> Optional[TrainingContext]:
 def snapshot() -> Dict[str, Any]:
     """Return a JSON-friendly mapping for the wire protocol.
 
-    Keys: ``rollout_id``, ``optimizer_step``, ``sample_seq``, ``global_step``.
-    An empty mapping means no context has been published yet.
+    Keys: ``rollout_id``, ``optimizer_step`` (in-rollout only),
+    ``sample_seq``, ``step_ordinal`` and, only when a caller supplied one,
+    ``global_step``. An empty mapping means no context has been published yet.
     """
     context = get_training_context()
     if context is None:
@@ -205,8 +241,10 @@ def snapshot() -> Dict[str, Any]:
         "rollout_id": context.rollout_id,
         "optimizer_step": context.optimizer_step,
         "sample_seq": context.sample_seq,
-        "global_step": context.global_step,
+        "step_ordinal": context.step_ordinal,
     }
+    if context.global_step is not None:
+        payload["global_step"] = context.global_step
     # Workload rides the wire only when this rank's data path published it, so a
     # vehicle that does not publish keeps the original lean payload.
     for field in ("tokens", "sequences", "microbatches"):
@@ -216,14 +254,22 @@ def snapshot() -> Dict[str, Any]:
     return payload
 
 
-def record_optimizer_step(rollout_id: int, optimizer_step: int, num_steps_per_rollout: Optional[int] = None) -> None:
+def record_optimizer_step(
+    rollout_id: int,
+    optimizer_step: int,
+    num_steps_per_rollout: Optional[int] = None,
+    global_step: Optional[int] = None,
+) -> None:
     """Cheap hook the Megatron training loop calls once per optimizer step.
 
-    ``num_steps_per_rollout`` is the rollout length the caller is iterating
-    (``len(num_microbatches)`` in the Megatron backend). It lets
-    ``global_step`` be the run-wide step index instead of the bare in-rollout
-    index; when it is omitted the arithmetic in :func:`set_training_context`
-    falls back to ``optimizer_step``.
+    ``optimizer_step`` is the **in-rollout** step index (``step_id``); it is not
+    a run-wide identity. ``num_steps_per_rollout`` is accepted because the
+    training loop already passes ``len(num_microbatches)``, but it is
+    deliberately unused: under dynamic batching it varies per rollout, so the
+    arithmetic ``rollout_id * num_steps_per_rollout + optimizer_step`` is not
+    monotonic (see :mod:`relax.utils.replay.schema`). Callers that own a
+    genuinely run-wide counter may pass it as ``global_step``; otherwise that
+    field stays ``None`` and is omitted from :func:`snapshot`.
 
     The master switch is checked lazily on every call (no cached boolean), so
     enabling the profiler after import, or re-importing this module, behaves
@@ -242,7 +288,12 @@ def record_optimizer_step(rollout_id: int, optimizer_step: int, num_steps_per_ro
         return
     if not enabled:
         return
-    set_training_context(rollout_id, optimizer_step, num_steps_per_rollout=num_steps_per_rollout)
+    set_training_context(
+        rollout_id,
+        optimizer_step,
+        num_steps_per_rollout=num_steps_per_rollout,
+        global_step=global_step,
+    )
 
 
 def training_context_stats() -> Dict[str, int]:
@@ -250,13 +301,15 @@ def training_context_stats() -> Dict[str, int]:
 
     ``stored`` is 0 or 1 by construction: the context lives in a single slot
     and no call appends to a list or dict, so ``updates`` growing over a run
-    does not mean memory grows.
+    does not mean memory grows. ``step_ordinal`` is the monotonic run step
+    ordinal currently published.
     """
     with _CONTEXT_LOCK:
         return {
             "updates": _UPDATES,
             "failures": _FAILURES,
             "stored": 0 if _CURRENT is None else 1,
+            "step_ordinal": _STEP_ORDINAL,
             "workload_rollouts": len(_STEP_WORKLOADS),
             "workload_evictions": _WORKLOAD_EVICTIONS,
             "workload_publish_skipped": _WORKLOAD_PUBLISH_SKIPPED,
@@ -266,12 +319,13 @@ def training_context_stats() -> Dict[str, int]:
 
 def reset_training_context_for_tests() -> None:
     """Drop the stored context and zero the counters."""
-    global _CURRENT, _UPDATES, _FAILURES, _WORKLOAD_EVICTIONS
+    global _CURRENT, _UPDATES, _FAILURES, _WORKLOAD_EVICTIONS, _STEP_ORDINAL
     global _WORKLOAD_PUBLISH_SKIPPED, _WORKLOAD_PUBLISH_ERRORS
     with _CONTEXT_LOCK:
         _CURRENT = None
         _UPDATES = 0
         _FAILURES = 0
+        _STEP_ORDINAL = 0
         _STEP_WORKLOADS.clear()
         _WORKLOAD_EVICTIONS = 0
         _WORKLOAD_PUBLISH_SKIPPED = 0

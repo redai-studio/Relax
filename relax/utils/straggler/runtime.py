@@ -208,6 +208,12 @@ class StragglerRuntime:
             self._collector = TimingCollector(self._collector_config(), self._identity)
             return self._collector.ingest
         parse_address(address)  # validate early so a typo is reported, not guessed
+        # The collector is owned by global rank 0. The platform merges straggler
+        # metrics only on the Megatron primary rank (tp0 and pipeline-last and
+        # dp0), which is global rank 0 only when pp_size == 1. Under PP>1 the
+        # exporting rank is a sender: it has no collector to read, so the
+        # reporter emits an explicit `collector_status_available=0` marker
+        # instead of silently exporting nothing.
         if self._identity.rank == 0:
             self._collector = TimingCollector(self._collector_config(), self._identity)
             self._receiver = EnvelopeReceiver(address, self._ingest_payload)
@@ -222,8 +228,24 @@ class StragglerRuntime:
             return
         self._collector.ingest(TimingEnvelope.from_dict(payload))
 
+    def _context_counters(self) -> Dict[str, Any]:
+        """Read the training-context counters for the status snapshot.
+
+        The publish counters and the monotonic step ordinal live in the context
+        module; embedding them in the status file puts them on the same surface
+        as the other straggler counters. This is an in-process, lock-guarded
+        read, so it adds no request, no socket and no collective.
+        """
+        try:
+            from relax.utils.straggler.context import training_context_stats
+
+            return dict(training_context_stats())
+        except Exception:
+            return {}
+
     def status(self) -> Dict[str, Any]:
         """Return a JSON-friendly snapshot of every component."""
+        context_counters = self._context_counters()
         status: Dict[str, Any] = {
             "role": self.role,
             "identity": self._identity.as_dict(),
@@ -232,12 +254,19 @@ class StragglerRuntime:
             "started": self._started,
             "closed": self._closed,
         }
+        if context_counters:
+            status["training_context"] = context_counters
         if self._timers is not None:
             status["timers"] = self._timers.stats()
         if self._observer is not None:
             status["observer"] = self._observer.stats()
         if self._collector is not None:
-            status["collector"] = self._collector.status()
+            collector_status = self._collector.status()
+            if context_counters:
+                # ``collector_status.json`` is written from this sub-dict, so
+                # the counters a human reads there include the publish ones.
+                collector_status["training_context"] = dict(context_counters)
+            status["collector"] = collector_status
         if self._sender is not None:
             status["sender"] = self._sender.stats()
         if self._receiver is not None:
