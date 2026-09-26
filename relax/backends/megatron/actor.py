@@ -572,11 +572,7 @@ class MegatronTrainRayActor(TrainRayActor):
             logger.info("MTP-only SFT: skipping weight snapshots, rollout updater, and DCS client")
         # Export bootstrap while actor weights are still resident, before
         # colocated rollout processes acquire these devices.
-        self._lora_export_request = lora_export
-        self._lora_export_result = None
-        if lora_export is not None:
-            self._switch_model("actor")
-            self._export_lora_at_boundary(start_rollout_id)
+        self._bootstrap_lora_export(lora_export, start_rollout_id)
         # empty cache after initialization
         clear_memory()
 
@@ -2416,6 +2412,17 @@ class MegatronTrainRayActor(TrainRayActor):
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         if getattr(self.args, "lora_publication_config", None) and self.args.offload_train:
             self.sleep()
+
+    def _bootstrap_lora_export(self, descriptor: dict | None, completed_step: int) -> None:
+        self._lora_export_request = descriptor
+        self._lora_export_result = None
+        if descriptor is not None:
+            # Sync/hybrid initialization may have loaded reference weights.
+            # Pure fully-async actors keep their own actor weights resident
+            # and have no TensorBackuper to restore from.
+            if hasattr(self, "weights_backuper"):
+                self._switch_model("actor")
+            self._export_lora_at_boundary(completed_step)
 
     def _export_lora_at_boundary(self, completed_step: int) -> None:
         descriptor = getattr(self, "_lora_export_request", None)

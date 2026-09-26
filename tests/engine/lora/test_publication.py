@@ -235,15 +235,29 @@ async def test_close_before_bind_idempotent_ref_release_and_metadata_exhaustion(
 
 
 @pytest.mark.parametrize(
-    "changes", [{"resident": False}, {"pinned": False}, {"cohort_id": "old"}, {"native_lora_id": None}]
+    "changes",
+    [
+        {"resident": False},
+        {"pinned": False},
+        {"cohort_id": "old"},
+        {"native_lora_id": None},
+        {"digest": "b" * 64},
+    ],
 )
 async def test_invalid_readiness_never_commits(tmp_path, changes):
     engines = [Engine("E1"), Engine("E2")]
-    engines[1].receipt_changes = changes
     owner = manager(engines)
-    op = (await owner.publish(artifact(tmp_path, "A"), "A"))["operation_id"]
-    await wait_state(owner, op, "ABORTED")
-    assert owner.status()["default"] is None
+    await publish(owner, artifact(tmp_path, "A"))
+    previous_default = owner.status()["default"]
+    engines[1].receipt_changes = changes
+    op = (await owner.publish(artifact(tmp_path, "B"), "B"))["operation_id"]
+    result = await wait_state(owner, op, "ABORTED")
+    assert owner.status()["default"] == previous_default
+    assert owner.status()["occupied"] == 1
+    assert set(result["absent"]) == {"E1", "E2"}
+    assert all(op not in engine.loaded for engine in engines)
+    assert [engine.unloads["B"] for engine in engines] == [1, 1]
+    assert all(engine.unloads["A"] == 0 for engine in engines)
 
 
 async def test_unhealthy_fixed_target_is_still_required_for_cleanup(tmp_path):

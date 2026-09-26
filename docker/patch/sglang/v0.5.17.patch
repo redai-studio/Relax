@@ -2355,13 +2355,15 @@ index a9615a1..160a9e6 100644
                          assert hasattr(decode_req, "kv_cache_cpu")
                          del decode_req.kv_cache_cpu
                          self.ipc_channels.send_to_tokenizer.send_output(
-@@ -4448,21 +4781,33 @@
+@@ -4448,21 +4781,35 @@
          else:
              inflight_batches = [*self.running_mbs, *self.mbs]
 
 +        # A transition/overlap result may still own the Req after it left
 +        # running_batch. Reuse this native abort path for those owners too.
-+        inflight_batches.extend(batch for batch, _ in self.result_queue)
++        inflight_batches.extend(
++            batch for batch, _ in getattr(self, "result_queue", ())
++        )
 +        inflight_batches.append(getattr(self, "cur_batch_for_debug", None))
 +        inflight_batches.extend(getattr(self, "last_mbs", ()))
          inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}

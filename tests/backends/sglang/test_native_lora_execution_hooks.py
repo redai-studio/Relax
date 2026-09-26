@@ -616,3 +616,64 @@ def test_native_unmanaged_embedding_dispatch_needs_no_lora_fields(native, monkey
     )
     manager._send_one_request(obj)
     assert sent == [obj]
+
+
+@pytest.mark.parametrize("mode", ["nonoverlap", "pp", "overlap"])
+@pytest.mark.parametrize("managed", [False, True])
+def test_native_abort_handles_optional_overlap_queue(native, monkeypatch, mode, managed):
+    """Execute Scheduler.abort_request with each event loop's actual queue
+    shape."""
+    _, scheduler, _ = native
+    engine = scheduler.Scheduler.__new__(scheduler.Scheduler)
+    engine.ps = SimpleNamespace(pp_size=2 if mode == "pp" else 1)
+    engine.chunked_req = None
+    engine.waiting_queue = []
+    engine.dllm_config = None
+    engine.disaggregation_mode = scheduler.DisaggregationMode.NULL
+    grammar_calls = []
+    engine.grammar_manager = SimpleNamespace(
+        abort_requests=lambda command, **kwargs: grammar_calls.append((command, kwargs))
+    )
+    if managed:
+        engine.lora_execution_owner = ("cohort", "boot")
+
+    class Request:
+        def __init__(self, rid, finished=False):
+            self.rid = rid
+            self.to_finish = None
+            self.is_finished = finished
+
+        def finished(self):
+            return self.is_finished
+
+    target = Request("attempt")
+    neighbor = Request("attempt-other")
+    completed = Request("attempt", finished=True)
+    batch = SimpleNamespace(reqs=[target, neighbor, completed])
+    if mode == "pp":
+        engine.running_mbs = [None]
+        engine.mbs = [batch]
+        engine.last_mbs = [batch]  # The same Req may have several native owners.
+    else:
+        engine.running_batch = batch if mode == "nonoverlap" else None
+        engine.last_batch = None
+    if mode == "overlap":
+        # Only a pending overlap result owns these requests.
+        engine.result_queue = [(batch, object())]
+    else:
+        assert not hasattr(engine, "result_queue")
+
+    def premature_finish(*args):
+        pytest.fail("abort must not release an in-flight native request")
+
+    monkeypatch.setattr(scheduler, "finish_native_request", premature_finish)
+    command = scheduler.AbortReq(rid="attempt")
+    scheduler.Scheduler.abort_request(engine, command, exact=managed)
+
+    assert isinstance(target.to_finish, scheduler.FINISH_ABORT)
+    # Managed cancellation is exact; unmanaged legacy cancellation keeps prefix semantics.
+    assert (neighbor.to_finish is None) == managed
+    assert completed.to_finish is None
+    assert grammar_calls == [(command, {"exact": managed})]
+    if mode == "overlap":
+        assert engine.result_queue[0][0] is batch

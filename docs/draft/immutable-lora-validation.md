@@ -1,6 +1,8 @@
 # 不可变 LoRA：2026-09-25 验收记录
 
-本次交付的限定验收配置 **通过**。机器摘要：[summary.json](../../tests/engine/lora/evidence/2026-09-25/summary.json)；设计、容量和失败行为：[RFC](./immutable-lora-publication-redesign-rfc.md)。
+2026-09-25 的限定验收配置 **通过**。机器摘要：[summary.json](../../tests/engine/lora/evidence/2026-09-25/summary.json)；设计、容量和失败行为：[RFC](./immutable-lora-publication-redesign-rfc.md)。
+
+> 本文 GPU 数据和源码摘要属于 2026-09-25 的验收版本。后续 PR #377 修复的验证范围见[评审修复记录](./no7-review-fixes.md)，不将历史 GPU 结果视作修复后重新运行的结果。
 
 ## 环境与可复现性
 

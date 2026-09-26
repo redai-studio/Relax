@@ -535,7 +535,8 @@ async def test_native_session_close_scope_proves_in_transit_submit_drained(nativ
     assert h.kv_closes == {"session": 1}
 
 
-async def test_native_session_close_waits_for_gpu_use_and_preserves_other_session(native):
+@pytest.mark.parametrize("scheduler_yields", [0, 3])
+async def test_native_session_close_waits_for_gpu_use_and_preserves_other_session(native, scheduler_yields):
     h = Harness(native)
     version = h.version()
     await h.load(*version)
@@ -551,8 +552,19 @@ async def test_native_session_close_waits_for_gpu_use_and_preserves_other_sessio
     waiter = asyncio.create_task(h.control.close_session(session_identity(h)))
     await wait(h.events["session_close"])
     assert not h.kv_closes and not waiter.done()
-    # Both requests retain ownership until the closing Session's GPU fence completes.
-    assert h.registry.refs == {"uid-A": 2}
+    # An admitted request absent from batches may release its logical reference
+    # before the Session GPU fence. Safety depends on residency and close drain,
+    # not on which runnable release task asyncio happens to execute first.
+    for _ in range(scheduler_yields):
+        await asyncio.sleep(0)
+    h.drive()
+    assert not waiter.done() and not h.kv_closes
+    assert not h.control.sessions["session"].closed
+    assert not h.engine.lora_sessions["session"].completion_event.query()
+    assert h.engine.lora_session_closures
+    assert h.loader.resources["uid-A"] == version[2]
+    assert "uid-A" in h.engine.lora_versions
+    assert not h.loader.unloads and not h.registry.unregisters
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
@@ -560,6 +572,10 @@ async def test_native_session_close_waits_for_gpu_use_and_preserves_other_sessio
     h.drive()
     assert await h.control.close_session(session_identity(h)) == "SESSION_DRAINED"
     assert h.registry.refs == {"uid-A": 1}
+    assert h.registry.releases == {"uid-A": 1}
+    h.drive()
+    assert await h.control.close_session(session_identity(h)) == "SESSION_DRAINED"
+    assert h.registry.releases == {"uid-A": 1}
     assert other_execution in h.engine.running_batch.reqs
     assert h.kv_closes == {"session": 1}
     assert not h.control.sessions["other"].closing
@@ -681,7 +697,8 @@ async def test_native_session_binding_cannot_change_adapter_between_attempts(nat
     assert h.registry.refs == {"uid-A": 1, "uid-B": 0}
 
 
-async def test_native_session_reply_requires_exact_control_and_boot_before_release(native):
+@pytest.mark.parametrize("scheduler_yields", [0, 3])
+async def test_native_session_reply_requires_exact_control_and_boot_before_release(native, scheduler_yields):
     h = Harness(native)
     version = h.version()
     await h.load(*version)
@@ -695,12 +712,24 @@ async def test_native_session_reply_requires_exact_control_and_boot_before_relea
     reply = h.n.session_reply(command, "SESSION_DRAINED")
     assert not h.control.observe_session(replace(reply, control_id="old"))
     assert not h.control.observe_session(replace(reply, identity=replace(reply.identity, engine_boot_id="old")))
-    assert h.registry.refs["uid-A"] == 1 and not close.done()
+    for _ in range(scheduler_yields):
+        await asyncio.sleep(0)
+    h.drive()
+    assert not close.done() and not h.kv_closes
+    assert not h.control.sessions["session"].closed
+    assert not h.control.sessions["session"].reply.done()
+    assert not h.engine.lora_sessions["session"].completion_event.query()
+    assert h.engine.lora_session_closures
+    assert h.loader.resources["uid-A"] == version[2]
+    assert "uid-A" in h.engine.lora_versions
+    assert not h.loader.unloads and not h.registry.unregisters
     done = True
     h.drive()
     assert await close == "SESSION_DRAINED"
     assert not h.control.observe_session(reply)
     assert h.registry.releases == {"uid-A": 1}
+    assert h.registry.refs == {"uid-A": 0}
+    assert h.kv_closes == {"session": 1}
 
 
 async def warmup_execution(h, identity, ref, *, complete=True, resident=True, forward=True, terminal=True):

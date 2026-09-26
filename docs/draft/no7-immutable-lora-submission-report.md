@@ -199,6 +199,8 @@ python -m relax.engine.lora.cli collect --rollout-url "$ROLLOUT_URL"
 
 ## 实验结果
 
+以下 GPU 实验结果对应 2026-09-25 验收版本。PR #377 后续评审修复及新增回归见[评审修复记录](./no7-review-fixes.md)。
+
 测试环境：两张 NVIDIA RTX 6000 Ada Generation、Qwen3-1.7B、BF16、两个 TP=1 目标引擎。
 
 **六项 GPU 实验全部通过，28 项验收检查全部 PASS，缺失证据为空。**
