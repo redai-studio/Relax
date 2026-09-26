@@ -297,6 +297,7 @@ export default defineConfig({
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
+                { text: 'Straggler Analysis', link: '/en/guide/straggler-profiler' },
                 { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
               ]
             },
@@ -417,6 +418,7 @@ export default defineConfig({
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
+                { text: 'Straggler 分析', link: '/zh/guide/straggler-profiler' },
                 { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
               ]
             },

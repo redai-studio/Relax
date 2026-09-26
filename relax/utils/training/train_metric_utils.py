@@ -26,6 +26,7 @@ def log_perf_data_raw(
     is_primary_rank: bool,
     flops_counter: FlopsCounter | None = None,
     world_size: int = 1,
+    extra_metrics: dict[str, float] | None = None,
 ) -> None:
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
@@ -85,6 +86,11 @@ def log_perf_data_raw(
                 log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
+
+    if extra_metrics:
+        # Same call on purpose: with --use-metrics-service every tracking_utils.log is a synchronous
+        # HTTP request on the training thread, so extra scalars must not add a request of their own.
+        log_dict.update(extra_metrics)
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
