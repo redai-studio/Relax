@@ -43,6 +43,7 @@ rollout or topology reset, so a stall spanning a rollout boundary is drained
 into the next rollout's perf log.
 """
 
+import math
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from relax.utils.logging_utils import get_logger
@@ -72,6 +73,8 @@ STRAGGLER_METRIC_KEYS: Tuple[str, ...] = (
     "dropped",
     "worst_deviation",
     "worst_rank",
+    "confirmed_straggler_deviation",
+    "confirmed_straggler_rank",
     "rollout_id",
     "optimizer_step",
     "step_ordinal",
@@ -276,6 +279,27 @@ def _stage_name(verdict: Any) -> Optional[str]:
     return name if isinstance(name, str) and name else None
 
 
+def _confirmed_straggler(verdicts: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Select a confirmed alert, excluding uncertain and recovered
+    measurements."""
+    candidates = []
+    for verdict in verdicts:
+        rank = _number(_verdict_field(verdict, "rank"))
+        deviation = _number(_verdict_field(verdict, "deviation"))
+        if (
+            _verdict_field(verdict, "kind") == "straggler"
+            and rank is not None
+            and math.isfinite(rank)
+            and rank >= 0
+            and rank.is_integer()
+            and deviation is not None
+            and math.isfinite(deviation)
+            and deviation >= 0
+        ):
+            candidates.append(verdict)
+    return _worst_verdict(candidates)
+
+
 def _stage_facts(verdict: Any) -> Mapping[str, Any]:
     """Return a verdict's facts with the raw ``stage`` guaranteed present."""
     facts = _mapping(_verdict_field(verdict, "facts"))
@@ -299,7 +323,17 @@ def _log_stage_groups(verdicts: Any) -> None:
         labelled = with_stage_group(_stage_facts(verdict))
         if "stage" not in labelled:
             continue
-        logger.info("straggler stage: name=%s coarse_stage=%s", labelled["stage"], labelled["stage_group"])
+        logger.info(
+            "straggler stage: name=%s coarse_stage=%s kind=%s rank=%s cohort=%s window=%s reason=%s coverage=%s",
+            labelled["stage"],
+            labelled["stage_group"],
+            _verdict_field(verdict, "kind"),
+            _verdict_field(verdict, "rank"),
+            _verdict_field(verdict, "cohort"),
+            _verdict_field(verdict, "window_index"),
+            _verdict_field(verdict, "reason"),
+            labelled.get("comparable_coverage_ratio"),
+        )
 
 
 def _training_context() -> Mapping[str, Any]:
@@ -367,6 +401,9 @@ def build_metrics(runtime: Any) -> Dict[str, float]:
         worst_deviation, worst_rank = _worst_verdict(verdicts)
         values["worst_deviation"] = worst_deviation
         values["worst_rank"] = worst_rank
+        confirmed_deviation, confirmed_rank = _confirmed_straggler(verdicts)
+        values["confirmed_straggler_deviation"] = confirmed_deviation
+        values["confirmed_straggler_rank"] = confirmed_rank
         training_context = _training_context()
         for key in ("rollout_id", "optimizer_step", "step_ordinal"):
             values[key] = _number(training_context.get(key))

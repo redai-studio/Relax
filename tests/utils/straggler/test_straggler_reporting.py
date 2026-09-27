@@ -88,6 +88,42 @@ def test_build_metrics_omits_values_that_cannot_be_measured() -> None:
     assert metrics == {}
 
 
+def test_confirmed_alert_is_not_hidden_by_uncertain_measurement() -> None:
+    metrics = reporter.build_metrics(
+        StubRuntime(
+            {},
+            verdicts=[
+                {"kind": "uncertain", "rank": 0, "deviation": 30.0},
+                {"kind": "straggler", "rank": 3, "deviation": 0.5},
+                {"kind": "recovered", "rank": 2, "deviation": 0.8},
+            ],
+        )
+    )
+    assert metrics[_prefixed("worst_rank")] == 0  # Preserve the raw measurement contract.
+    assert metrics[_prefixed("confirmed_straggler_rank")] == 3
+    assert metrics[_prefixed("confirmed_straggler_deviation")] == 0.5
+
+
+def test_confirmed_alert_metrics_absent_without_confirmed_evidence() -> None:
+    metrics = reporter.build_metrics(StubRuntime({}, verdicts=[{"kind": "uncertain", "rank": 1, "deviation": 40.0}]))
+    assert _prefixed("confirmed_straggler_rank") not in metrics
+    assert _prefixed("confirmed_straggler_deviation") not in metrics
+
+
+def test_confirmed_alert_ignores_invalid_rank_and_deviation() -> None:
+    metrics = reporter.build_metrics(
+        StubRuntime(
+            {},
+            verdicts=[
+                {"kind": "straggler", "rank": None, "deviation": 100.0},
+                {"kind": "straggler", "rank": 1, "deviation": float("nan")},
+                {"kind": "straggler", "rank": 3, "deviation": 0.5},
+            ],
+        )
+    )
+    assert metrics[_prefixed("confirmed_straggler_rank")] == 3
+
+
 def test_judged_fraction_is_not_mislabelled_as_coverage() -> None:
     """``judged/envelopes`` is a transport ratio, never cohort coverage.
 

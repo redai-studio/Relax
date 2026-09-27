@@ -76,7 +76,9 @@ The reporter emits flat scalar keys under the `perf/straggler/` prefix. A value 
 | `perf/straggler/judged_fraction`               | Fraction of received envelopes the collector judged. This is a transport ratio, not cohort coverage.                                |
 | `perf/straggler/dropped`                       | Sum of every drop counter the runtime reports (queue full, pending full, output full, capped detector structures, malformed input). |
 | `perf/straggler/worst_deviation`               | Relative deviation of the largest measured slowdown among the drained verdicts.                                                     |
-| `perf/straggler/worst_rank`                    | Rank of that largest measured slowdown.                                                                                             |
+| `perf/straggler/worst_rank`                    | Rank of that largest measured slowdown, including uncertain measurements; not necessarily a confirmed alert. |
+| `perf/straggler/confirmed_straggler_rank` | Rank of the largest confirmed straggler in this drained batch. Absent when no confirmed alert is available; not an active-alert snapshot. |
+| `perf/straggler/confirmed_straggler_deviation` | Deviation of that confirmed straggler. Uncertain and recovered measurements cannot replace it. |
 | `perf/straggler/rollout_id`                    | Rollout id from the published training context.                                                                                     |
 | `perf/straggler/optimizer_step`                | In-rollout optimizer-step index from the published training context.                                                                |
 | `perf/straggler/step_ordinal`                  | Monotonic run step ordinal assigned by the profiler.                                                                                |

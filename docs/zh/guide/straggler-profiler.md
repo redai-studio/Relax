@@ -76,7 +76,9 @@ export RELAX_STRAGGLER_OUTPUT_DIR=/path/to/straggler-evidence
 | `perf/straggler/judged_fraction`               | collector 已判定的 envelope 占已接收 envelope 的比例。这是传输比例，不是 cohort 覆盖率。 |
 | `perf/straggler/dropped`                       | 运行时上报的所有丢弃计数之和（队列满、待处理满、输出满、检测器受限结构、畸形输入）。     |
 | `perf/straggler/worst_deviation`               | 已取出判定中最大实测变慢的相对偏差。                                                     |
-| `perf/straggler/worst_rank`                    | 该最大实测变慢对应的 rank。                                                              |
+| `perf/straggler/worst_rank` | 最大实测变慢对应的 rank，包含 uncertain 测量，不一定是已确认告警。 |
+| `perf/straggler/confirmed_straggler_rank` | 本次取出的 verdict 中偏差最大的已确认 straggler 的 rank；没有已确认告警时不输出，不表示全部 active 告警的快照。 |
+| `perf/straggler/confirmed_straggler_deviation` | 该已确认 straggler 的偏差，不会被 uncertain 或 recovered 测量覆盖。 |
 | `perf/straggler/rollout_id`                    | 来自已发布训练上下文的 rollout id。                                                      |
 | `perf/straggler/optimizer_step`                | 来自已发布训练上下文的 rollout 内优化器 step 下标。                                      |
 | `perf/straggler/step_ordinal`                  | 分析器分配的单调递增运行 step 序号。                                                     |
