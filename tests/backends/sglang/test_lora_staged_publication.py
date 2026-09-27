@@ -19,7 +19,15 @@ import hashlib
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+
+pytest.importorskip("sglang.srt.lora.utils", exc_type=ImportError)
+pytest.importorskip("sglang.srt.managers.io_struct", exc_type=ImportError)
+pytest.importorskip("sglang.srt.managers.tokenizer_control_mixin", exc_type=ImportError)
+pytest.importorskip("sglang.srt.model_executor.model_runner", exc_type=ImportError)
+
 from sglang.srt.lora.utils import verify_lora_tensor_checksums
 from sglang.srt.managers.io_struct import (
     LoRAUpdateOutput,

@@ -3870,6 +3870,17 @@ def slime_validate_args(args):
                 "--use-agentic-rollout: immutable versions are bound by Agentic Sessions, so the flag "
                 "is meaningless (and would silently do nothing) without them."
             )
+        rollout_num_gpus = getattr(args, "rollout_num_gpus", 0) or 0
+        rollout_num_gpus_per_engine = getattr(args, "rollout_num_gpus_per_engine", 0) or 0
+        if (
+            rollout_num_gpus_per_engine <= 0
+            or rollout_num_gpus % rollout_num_gpus_per_engine != 0
+            or rollout_num_gpus // rollout_num_gpus_per_engine != 2
+        ):
+            raise ValueError(
+                "--enable-versioned-lora-publication requires exactly two rollout engines "
+                "(E0/E1) in this first version."
+            )
         if getattr(args, "use_slime_router", False) and "RadixTreeMiddleware" in (
             getattr(args, "slime_router_middleware_paths", None) or []
         ):
