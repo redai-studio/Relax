@@ -47,6 +47,9 @@
 #                   differs.
 #   DRY_RUN=1       print the resolved runtime env + command and exit without
 #                   starting Ray or submitting anything
+#   TRAIN_RAY_ADDRESS  optional verified GCS address for workers (not dashboard)
+#   RAY_JOB_SUBMISSION_ID  optional unique ID used to supervise this job only
+# Additional command-line arguments are appended to the training command.
 #
 # ── straggler profiler (OPT-IN, default OFF) ───────────────────────────────
 # Uncomment these six export lines to enable the profiler. The injection block
@@ -169,6 +172,11 @@ runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 env_vars = runtime_env.setdefault("env_vars", {})
 existing = env_vars.get("PYTHONPATH", "")
 env_vars["PYTHONPATH"] = f"{os.environ['TRAIN_SITE']}:{existing}" if existing else os.environ["TRAIN_SITE"]
+if os.environ.get("TRAIN_RAY_ADDRESS"):
+    env_vars["RAY_ADDRESS"] = os.environ["TRAIN_RAY_ADDRESS"]
+for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy", "TENSORBOARD_DIR"):
+    if key in os.environ:
+        env_vars[key] = os.environ[key]
 print(json.dumps(runtime_env, separators=(",", ":")))
 PY
 )"
@@ -296,9 +304,14 @@ TRAIN_ARGS=(
    "${METRICS_ARGS[@]}"
    "${PERF_ARGS[@]}"
    "${MISC_ARGS[@]}"
+   "$@"
 )
 
 RAY_ADDR="${RAY_ADDRESS:-http://127.0.0.1:8265}"
+SUBMISSION_ARGS=()
+if [ -n "${RAY_JOB_SUBMISSION_ID:-}" ]; then
+    SUBMISSION_ARGS+=(--submission-id "${RAY_JOB_SUBMISSION_ID}")
+fi
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
     echo "=== DRY_RUN resolved RUNTIME_ENV_JSON (not submitted) ==="
@@ -309,6 +322,7 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
     fi
     echo "=== DRY_RUN final command line (not submitted) ==="
     printf 'ray job submit'
+    printf ' %q' "${SUBMISSION_ARGS[@]}"
     if [ -n "${RAY_NO_WAIT:-}" ]; then printf ' --no-wait'; fi
     printf ' --address=%q' "${RAY_ADDR}"
     if [ -n "${WORKING_DIR:-}" ]; then printf ' --working-dir %q' "${WORKING_DIR}"; fi
@@ -330,7 +344,7 @@ fi
 
 mkdir -p "${LOG_DIR}" "${SAVE_DIR}"
 
-ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_ADDR}" \
+ray job submit ${RAY_NO_WAIT:+--no-wait} "${SUBMISSION_ARGS[@]}" --address="${RAY_ADDR}" \
    ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- "${TRAIN_PYTHON}" -m relax.entrypoints.train \
