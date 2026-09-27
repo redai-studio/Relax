@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 from collections.abc import Callable
 
 import torch
@@ -282,7 +284,7 @@ def get_cp_local_num_tokens(
     cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
     if cp_size == 1:
         local_mask_sums = torch.clamp_min(local_mask_sums, 1)
-    return local_mask_sums.sum()
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(

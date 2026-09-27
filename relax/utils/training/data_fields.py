@@ -37,12 +37,14 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
             fields.append("multimodal_train_inputs")
         return fields
 
-    is_ppo = getattr(args, "advantage_estimator", None) == "ppo"
+    from relax.algorithms import algorithm_needs_critic
 
-    if is_ppo and consumer == "critic":
+    has_critic = algorithm_needs_critic(args)
+
+    if has_critic and consumer == "critic":
         return _base_rollout_fields(args)
 
-    if is_ppo and consumer == "advantages":
+    if has_critic and consumer == "advantages":
         # PPO colocate never runs actor_fwd, so ref/log_probs are only
         # requested when kl_coef != 0 (i.e. an actor_fwd role is present).
         fields = _base_rollout_fields(args)
@@ -58,7 +60,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
-    if is_ppo:
+    if has_critic:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces
         # ``advantages``/``returns``, actor just pulls the finished tensors.

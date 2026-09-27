@@ -1,5 +1,7 @@
 import taskLists from 'markdown-it-task-lists'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
+import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
@@ -215,6 +217,12 @@ export default defineConfig({
     math: true,
     config(md) {
       md.use(taskLists)
+      md.use(sourceLinks, {
+        repo: 'https://github.com/redai-studio/Relax',
+        branch: 'main',
+        repoRoot: fileURLToPath(new URL('../..', import.meta.url)),
+        docsRoot: 'docs'
+      })
     }
   },
   
@@ -247,6 +255,7 @@ export default defineConfig({
                 { text: 'Installation', link: '/en/guide/installation' },
                 { text: 'Quick Start', link: '/en/guide/quick-start' },
                 { text: 'Customize Training', link: '/en/guide/customize-training' },
+                { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
@@ -297,7 +306,8 @@ export default defineConfig({
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
                 { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
-                { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' }
+                { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' },
+                { text: 'Repetition Diagnostics', link: '/en/guide/repetition-diagnostics' }
               ]
             }
           ],
@@ -365,6 +375,7 @@ export default defineConfig({
                 { text: '安装', link: '/zh/guide/installation' },
                 { text: '快速上手', link: '/zh/guide/quick-start' },
                 { text: '自定义训练', link: '/zh/guide/customize-training' },
+                { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
@@ -415,7 +426,8 @@ export default defineConfig({
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
                 { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
-                { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' }
+                { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' },
+                { text: '重复检测与离线诊断', link: '/zh/guide/repetition-diagnostics' }
               ]
             }
           ],

@@ -1115,10 +1115,135 @@ index 465e83f..232caef 100644
          tensor_recv_prev = None
          tensor_recv_next = None
 diff --git a/megatron/core/ssm/gated_delta_net.py b/megatron/core/ssm/gated_delta_net.py
-index 7e28691..3c19562 100644
+index 7e28691..f1410f8 100644
 --- a/megatron/core/ssm/gated_delta_net.py
 +++ b/megatron/core/ssm/gated_delta_net.py
-@@ -584,16 +584,17 @@ class GatedDeltaNet(MegatronModule):
+@@ -18,6 +18,7 @@ from torch import Tensor
+ from megatron.core import tensor_parallel
+ from megatron.core.context_parallel_layout import (
+     contiguous_to_zigzag_chunks,
++    get_thd_cp_partition_route,
+     zigzag_to_contiguous_chunks,
+ )
+ from megatron.core.fp8_utils import get_fp8_align_size
+@@ -342,6 +343,21 @@ class GatedDeltaNet(MegatronModule):
+
+         inference_context = deprecate_inference_params(inference_context, inference_params)
+
++        # Validate the final post-repack metadata without synchronizing device tensors.
++        if packed_seq_params is not None:
++            dynamic_cp_group = packed_seq_params.cp_group
++            local_cp_size = packed_seq_params.local_cp_size
++            if (dynamic_cp_group is None) != (local_cp_size is None):
++                raise ValueError(
++                    "PackedSeqParams.cp_group and local_cp_size must either both be set "
++                    "or both be None."
++                )
++            if dynamic_cp_group is not None and local_cp_size != dynamic_cp_group.size():
++                raise ValueError(
++                    f"PackedSeqParams.local_cp_size ({local_cp_size}) does not match "
++                    f"cp_group.size() ({dynamic_cp_group.size()})."
++                )
++
+         # Route the CP group to either the headwise (Ulysses-style) path or the
+         # chunkwise CP path according to config.linear_cp_mode. The two paths
+         # are mutually exclusive — whichever one is active owns the full CP
+@@ -350,15 +366,20 @@ class GatedDeltaNet(MegatronModule):
+         # CUDA-graph-unsafe `torch.distributed.new_group` on every forward.
+         base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
++        cp_size = cp_group.size() if cp_group is not None else 1
+         if self.config.linear_cp_mode == "chunkwise":
+             cp_group_chunkwise = cp_group
+             cp_group_headwise = None
+         elif self.config.linear_cp_mode == "headwise":
+             cp_group_chunkwise = None
+             cp_group_headwise = cp_group
+-        elif cp_group.size() == 1:
++        elif cp_size == 1:
+             cp_group_chunkwise = None
+             cp_group_headwise = None
++        elif self.config.linear_cp_mode == "all_gather":
++            raise RuntimeError(
++                "linear_cp_mode='all_gather' with CP>1 requires the Relax GatedDeltaNet wrapper."
++            )
+         else:
+             raise ValueError(
+                 f"Unsupported linear_cp_mode {self.config.linear_cp_mode!r}; "
+@@ -385,31 +406,9 @@ class GatedDeltaNet(MegatronModule):
+                 not self.config.deterministic_mode
+             ), "Packed sequence does not support deterministic mode."
+
+-            # Resolve cu_seqlens with alignment padding handling.
+-            # cu_seqlens in packed_seq_params is the global (pre-CP-split) cu_seqlens, so we
+-            # validate against the global sequence length.
+-            cu_seqlens_q = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_q_padded,
+-                packed_seq_params.cu_seqlens_q,
+-                seq_len_global,
+-                "cu_seqlens_q",
+-                cp_size=self.cp_size,
+-            )
+-            cu_seqlens_kv = self._resolve_cu_seqlens(
+-                packed_seq_params.cu_seqlens_kv_padded,
+-                packed_seq_params.cu_seqlens_kv,
+-                seq_len_global,
+-                "cu_seqlens_kv",
+-                cp_size=self.cp_size,
+-            )
+-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+-            )
+-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
+-            assert num_packed_seqs > 0, (
+-                "Number of packed sequences must be greater than 0, "
+-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++            # Cache validation on the final PackedSeqParams shared by layers/recompute.
++            cu_seqlens_q, cu_seqlens_kv = self._resolve_thd_cu_seqlens(
++                packed_seq_params, seq_len_global, cp_size
+             )
+         else:
+             cu_seqlens_q = None
+@@ -422,7 +421,7 @@ class GatedDeltaNet(MegatronModule):
+                 # tensor and the resulting chunkwise CP context so we don't
+                 # reallocate them on every forward — those reallocations break
+                 # CUDA graph capture.
+-                cache_key = (seq_len_global, batch)
++                cache_key = (seq_len_global, batch, cp_group_chunkwise)
+                 cached = self._chunkwise_cp_context_cache.get(cache_key)
+                 if cached is None:
+                     cached_cu_seqlens = (
+@@ -503,6 +502,18 @@ class GatedDeltaNet(MegatronModule):
+         Returns:
+             Tuple of (output, output_bias).
+         """
++        route_to_contiguous = None
++        route_to_zigzag = None
++        if cp_size_chunkwise > 1 and packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
++            route_to_contiguous = get_thd_cp_partition_route(
++                packed_seq_params, cu_seqlens_q, cp_size_chunkwise,
++                cp_group_chunkwise.rank(), "zigzag", "contiguous", device=hidden_states.device,
++            )
++            route_to_zigzag = get_thd_cp_partition_route(
++                packed_seq_params, cu_seqlens_q, cp_size_chunkwise,
++                cp_group_chunkwise.rank(), "contiguous", "zigzag", device=hidden_states.device,
++            )
++
+         # Input projection
+         nvtx_range_push(suffix="in_proj")
+         qkvzba, _ = self.in_proj(hidden_states)
+@@ -519,7 +530,8 @@ class GatedDeltaNet(MegatronModule):
+             nvtx_range_push(suffix="zigzag_to_contiguous")
+             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                 qkvzba = zigzag_to_contiguous_chunks(
+-                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
++                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q,
++                    thd_cp_partition_route=route_to_contiguous,
+                 )
+             else:
+                 qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
+@@ -584,16 +596,17 @@ class GatedDeltaNet(MegatronModule):
                      "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
                      "chunk-local causal-conv inputs can change later chunk numerics."
                  )
@@ -1144,17 +1269,93 @@ index 7e28691..3c19562 100644
 +                    packed_seq_params=packed_seq_params,
 +                )
              nvtx_range_pop(suffix="pre_gated_delta_rule")
- 
+
          nvtx_range_push(suffix="gated_delta_rule")
-@@ -1211,7 +1212,7 @@ def get_parameter_local_cp_headwise(
+@@ -630,7 +643,8 @@ class GatedDeltaNet(MegatronModule):
+             nvtx_range_push(suffix="contiguous_to_zigzag")
+             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                 norm_out = contiguous_to_zigzag_chunks(
+-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
++                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q,
++                    thd_cp_partition_route=route_to_zigzag,
+                 )
+             else:
+                 norm_out = contiguous_to_zigzag_chunks(
+@@ -984,6 +998,65 @@ class GatedDeltaNet(MegatronModule):
+         beta = beta.sigmoid()
+         return g, beta
+
++    def _resolve_thd_cu_seqlens(self, packed_seq_params, seq_len_global, cp_size):
++        """Resolve and validate this micro-batch's global THD boundaries, once.
++
++        Every GDN layer is handed the same ``PackedSeqParams``, so the checks below --
++        each of which reads a device tensor from Python and therefore stalls on the
++        GPU -- only need to run for the first layer that asks. The result is cached on
++        the ``PackedSeqParams`` instance and reused while it still describes the very
++        same boundary tensors, mirroring how the CP layout routes are cached.
++
++        A cached result is reused only when all four source tensors are still the same
++        objects *and* none of them has been written in place. Identity alone would not
++        notice a caller refilling a preallocated boundary buffer, so autograd's version
++        counter -- which every in-place op bumps, and which costs a plain Python
++        attribute read -- is checked as well. Comparing values instead would reintroduce
++        the device-host sync this cache exists to remove.
++        """
++        sources = (
++            packed_seq_params.cu_seqlens_q_padded,
++            packed_seq_params.cu_seqlens_q,
++            packed_seq_params.cu_seqlens_kv_padded,
++            packed_seq_params.cu_seqlens_kv,
++        )
++        cacheable = all(t is None or not t.is_inference() for t in sources)
++        versions = tuple(None if t is None or t.is_inference() else t._version for t in sources)
++        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
++        if cacheable and cached is not None:
++            cached_meta, cached_sources, cached_versions, cached_value = cached
++            if (
++                cached_meta == (seq_len_global, cp_size)
++                and all(a is b for a, b in zip(cached_sources, sources))
++                and cached_versions == versions
++            ):
++                return cached_value
++
++        cu_seqlens_q = self._resolve_cu_seqlens(
++            sources[0], sources[1], seq_len_global, "cu_seqlens_q", cp_size=cp_size
++        )
++        cu_seqlens_kv = self._resolve_cu_seqlens(
++            sources[2], sources[3], seq_len_global, "cu_seqlens_kv", cp_size=cp_size
++        )
++        assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++            "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++        num_packed_seqs = cu_seqlens_q.shape[0] - 1
++        assert num_packed_seqs > 0, (
++            "Number of packed sequences must be greater than 0, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++
++        resolved = (cu_seqlens_q, cu_seqlens_kv)
++        packed_seq_params._gdn_resolved_cu_seqlens = (
++            (seq_len_global, cp_size),
++            sources,
++            versions,
++            resolved,
++        )
++        return resolved
++
+     def _resolve_cu_seqlens(
+         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+     ) -> torch.Tensor:
+@@ -1211,7 +1284,7 @@ def get_parameter_local_cp_headwise(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
 -    param = param[slices]
 +    param = param[tuple(slices)]
      return param
- 
- 
+
+
 diff --git a/megatron/core/tensor_parallel/random.py b/megatron/core/tensor_parallel/random.py
 index dbecd73..1c52478 100644
 --- a/megatron/core/tensor_parallel/random.py
@@ -1351,13 +1552,13 @@ diff --git a/megatron/core/transformer/multi_token_prediction.py b/megatron/core
          for iteration in range(self.config.mtp_num_layers):
              layer_idx = 0 if self.mtp_use_repeated_layer else iteration
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index 43e45b7..8166f94 100644
+index 43e45b7..2cb8ad6 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -224,6 +224,10 @@ class TransformerConfig(ModelParallelConfig):
+@@ -222,6 +222,10 @@ class TransformerConfig(ModelParallelConfig):
      """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
      is quick_gelu or weighted SwiGLU (MoE only)."""
- 
+
 +    activation_func_clamp_shared_expert: bool = True
 +    """If False, skip activation_func_clamp_value inside SharedExpertMLP so only routed MoE
 +    experts get the clamp."""
@@ -1368,13 +1569,47 @@ index 43e45b7..8166f94 100644
 @@ -283,6 +287,9 @@ class TransformerConfig(ModelParallelConfig):
      num_query_groups >= tp, and under fp8/fp4 a per-partition
      linear_qkv_out_dim aligned to 16/32."""
- 
+
 +    post_self_attn_layernorm: bool = False
 +    post_mlp_layernorm: bool = False
 +
      test_mode: bool = False
      """Whether to run real-time tests."""
- 
+
+@@ -1045,7 +1052,7 @@ class TransformerConfig(ModelParallelConfig):
+     linear_cp_mode: Optional[str] = "chunkwise"
+     """Context-parallel execution mode for linear-attention layers
+     (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
+-    Can be "chunkwise" or "headwise":
++    Can be "chunkwise", "headwise", or "all_gather" (Relax wrapper only):
+     "chunkwise": Keep sequence chunks sharded across CP ranks and use CP-aware linear kernels
+     (e.g. chunk_gated_delta_rule + causal_conv1d with a CP context). This follows the chunkwise
+     DeltaNet idea of storing state at chunk boundaries and doing chunk-local matrix work, avoiding
+@@ -1053,6 +1060,8 @@ class TransformerConfig(ModelParallelConfig):
+     See https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet.
+     "headwise": Scatter heads across the CP group with all-to-all (Ulysses-style); each rank runs
+     the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
++    "all_gather": Relax-only mode that gathers the full sequence and keeps TP-local heads.
++    CP>1 execution requires Relax's GDN wrapper; native Megatron does not implement this mode.
+     """
+
+     ##################
+@@ -1590,11 +1599,11 @@ class TransformerConfig(ModelParallelConfig):
+                         f"got {self.gdn_conv_pad_alignment}."
+                     )
+
++            assert self.linear_cp_mode in ("headwise", "chunkwise", "all_gather"), (
++                "linear_cp_mode must be one of 'headwise', 'chunkwise', or 'all_gather'; "
++                f"got {self.linear_cp_mode!r}. 'auto' must be resolved before construction."
++            )
+             if self.context_parallel_size > 1:
+-                assert self.linear_cp_mode in ("headwise", "chunkwise"), (
+-                    f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
+-                    f"got {self.linear_cp_mode!r}."
+-                )
+                 if self.gdn_conv_pad_alignment is not None:
+                     assert self.linear_cp_mode != "chunkwise", (
+                         "gdn_conv_pad_alignment is incompatible with "
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
 index 34a456b..8182c7c 100644
 --- a/megatron/core/transformer/transformer_layer.py
@@ -1864,3 +2099,629 @@ diff --git a/megatron/bridge/models/conversion/model_bridge.py b/megatron/bridge
              if isinstance(task.param_weight, DTensor):
                  from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
                      uneven_dtensor_to_full_tensor,
+diff --git a/megatron/core/context_parallel_layout.py b/megatron/core/context_parallel_layout.py
+index 4401458..a68dc2c 100644
+--- a/megatron/core/context_parallel_layout.py
++++ b/megatron/core/context_parallel_layout.py
+@@ -2,12 +2,30 @@
+
+ """Context parallel tensor layout helpers."""
+
+-from typing import List, Optional, Tuple
++from contextlib import contextmanager
++from typing import Any, List, NamedTuple, Optional, Tuple
+
+ import torch
+
+ from megatron.core.tensor_parallel import all_to_all
+
++_THD_CP_ROUTE_ATTRS = {
++    ("zigzag", "contiguous"): "cp_partition_route_zigzag_to_contiguous",
++    ("contiguous", "zigzag"): "cp_partition_route_contiguous_to_zigzag",
++}
++
++
++@contextmanager
++def _cp_layout_nvtx_range(message: str):
++    active = torch.cuda.is_available()
++    if active:
++        torch.cuda.nvtx.range_push(message)
++    try:
++        yield
++    finally:
++        if active:
++            torch.cuda.nvtx.range_pop()
++
+
+ def get_thd_context_parallel_rank_indices(
+     cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
+@@ -82,11 +100,391 @@ def get_thd_context_parallel_rank_indices(
+     return rank_positions[torch.argsort(rank_local_pos)]
+
+
++class ThdCpPartitionRoute(NamedTuple):
++    """Everything one THD zigzag<->contiguous all-to-all needs, precomputed.
++
++    ``send_rows`` / ``recv_rows`` are ``None`` when the permutation on that side is
++    the identity, which lets the swap skip the gather/scatter entirely.
++    The first six fields are exactly what #5664's ``decode_thd_cp_partition_route()``
++    returns; see :func:`build_thd_cp_partition_route` for why the encoded tensor form is
++    not used here. ``cu_seqlens``, the layout pair and ``cp_size`` / ``cp_rank`` are
++    Relax-only additions carrying no computation -- they exist so a route cached on a
++    ``PackedSeqParams`` can prove it still describes the conversion being asked for.
++    """
++
++    local_source_length: int
++    local_target_length: int
++    send_rows: Optional[torch.Tensor]
++    recv_rows: Optional[torch.Tensor]
++    input_split_sizes: List[int]
++    output_split_sizes: List[int]
++    cu_seqlens: torch.Tensor
++    cu_seqlens_version: Optional[int]
++    cp_size: int
++    cp_rank: int
++    source_layout: str
++    target_layout: str
++
++
++_ThdLayoutSegment = Tuple[int, int, int]
++
++
++def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
++    if cu_seqlens.dim() != 1:
++        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
++
++    cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
++    if not cu or cu[0] != 0:
++        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
++
++    compact_cu: List[int] = [cu[0]]
++    prev = cu[0]
++    for value in cu[1:]:
++        if value < prev:
++            raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
++        if value != prev:
++            compact_cu.append(value)
++        prev = value
++    return compact_cu
++
++
++def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
++    total_tokens = cu[-1]
++    if total_tokens % cp_size != 0:
++        raise ValueError(
++            f"Contiguous CP partitioning requires total_tokens={total_tokens} "
++            f"to be divisible by cp_size={cp_size}."
++        )
++
++    chunk_divisor = 2 * cp_size
++    bad_seq_lens = [
++        seq_end - seq_start
++        for seq_start, seq_end in zip(cu[:-1], cu[1:])
++        if (seq_end - seq_start) % chunk_divisor != 0
++    ]
++    if bad_seq_lens:
++        raise ValueError(
++            "All packed sequence lengths must be divisible by "
++            f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
++            f"got {bad_seq_lens}."
++        )
++
++
++def _build_thd_layout_segments(
++    cu: List[int], cp_size: int, cp_rank: int, layout: str
++) -> Tuple[List[_ThdLayoutSegment], int]:
++    """Describe a rank's THD partition as (global_start, length, local_start) runs.
++
++    Both layouts are unions of contiguous global spans, so the whole route can be
++    derived by intersecting spans instead of materialising per-token index tensors.
++    """
++    total_tokens = cu[-1]
++    if layout == "contiguous":
++        part_len = total_tokens // cp_size
++        if part_len == 0:
++            return [], 0
++        return [(cp_rank * part_len, part_len, 0)], part_len
++
++    if layout != "zigzag":
++        raise ValueError(
++            f"Unsupported context-parallel layout {layout!r} for THD layout segments "
++            f"with cp_size={cp_size}, rank={cp_rank}."
++        )
++
++    segments: List[_ThdLayoutSegment] = []
++    local_start = 0
++    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
++        seq_len = seq_end - seq_start
++        chunk_len = seq_len // (2 * cp_size)
++        first_chunk = cp_rank
++        second_chunk = 2 * cp_size - cp_rank - 1
++        segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
++        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
++        local_start += 2 * chunk_len
++
++    return segments, local_start
++
++
++def _intersect_thd_layout_segments(
++    source_segments: List[_ThdLayoutSegment], target_segments: List[_ThdLayoutSegment]
++) -> List[Tuple[int, int, int]]:
++    """Overlap two sorted segment lists into (source_row, target_row, length) runs."""
++    intersections: List[Tuple[int, int, int]] = []
++    source_index = 0
++    target_index = 0
++    while source_index < len(source_segments) and target_index < len(target_segments):
++        source_global_start, source_len, source_local_start = source_segments[source_index]
++        target_global_start, target_len, target_local_start = target_segments[target_index]
++        source_global_end = source_global_start + source_len
++        target_global_end = target_global_start + target_len
++
++        overlap_start = max(source_global_start, target_global_start)
++        overlap_end = min(source_global_end, target_global_end)
++        if overlap_start < overlap_end:
++            intersections.append(
++                (
++                    source_local_start + overlap_start - source_global_start,
++                    target_local_start + overlap_start - target_global_start,
++                    overlap_end - overlap_start,
++                )
++            )
++
++        if source_global_end <= target_global_end:
++            source_index += 1
++        else:
++            target_index += 1
++
++    return intersections
++
++
++def _append_range(rows: List[int], start: int, length: int) -> None:
++    rows.extend(range(start, start + length))
++
++
++def _row_list_is_identity(rows: List[int]) -> bool:
++    return all(row == index for index, row in enumerate(rows))
++
++
++def _thd_cp_partition_route_attr_name(source_layout: str, target_layout: str) -> str:
++    try:
++        return _THD_CP_ROUTE_ATTRS[(source_layout, target_layout)]
++    except KeyError as exc:
++        raise ValueError(
++            f"Unsupported CP layout conversion {source_layout!r} -> {target_layout!r} "
++            "for THD route."
++        ) from exc
++
++
++def build_thd_cp_partition_route(
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    *,
++    device: Optional[torch.device] = None,
++) -> ThdCpPartitionRoute:
++    """Precompute one THD CP layout conversion route.
++
++    The route depends only on packed sequence metadata, CP rank/size and the
++    source/target layouts, so it can be reused by every tensor with the same THD
++    sequence axis in the same microbatch. The whole derivation runs on CPU ints
++    after a single ``cu_seqlens`` transfer, which is what keeps the conversion
++    itself free of device-host synchronisation.
++
++    Deviation from #5664: upstream serialises the result into a single flat
++    ``torch.Tensor`` and decodes it again inside every conversion, so that the route
++    can be a CUDA-graph capture input. Decoding costs three device-to-host copies,
++    which on this path (~200 conversions per microbatch under full recompute) puts
++    back the synchronisation this route exists to remove, and Megatron's full-iteration
++    CUDA graph is rejected for THD layout conversion anyway. We therefore return the
++    decoded form directly -- the fields below are exactly upstream's
++    ``decode_thd_cp_partition_route()`` tuple. Revisit if GDN ever needs to run under
++    graph capture: the route tensors would then have to be stable capture inputs again.
++    """
++    _thd_cp_partition_route_attr_name(source_layout, target_layout)
++    if cp_size < 1:
++        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
++    if not 0 <= cp_rank < cp_size:
++        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
++    if device is None:
++        device = cu_seqlens.device
++
++    with _cp_layout_nvtx_range(f"cp_layout/thd/route/{source_layout}_to_{target_layout}"):
++        cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
++        _validate_thd_route_partitioning(cu, cp_size)
++
++        source_segments_by_rank: List[List[_ThdLayoutSegment]] = []
++        source_lengths: List[int] = []
++        target_segments_by_rank: List[List[_ThdLayoutSegment]] = []
++        target_lengths: List[int] = []
++        for rank in range(cp_size):
++            source_segments, source_length = _build_thd_layout_segments(
++                cu, cp_size, rank, source_layout
++            )
++            target_segments, target_length = _build_thd_layout_segments(
++                cu, cp_size, rank, target_layout
++            )
++            source_segments_by_rank.append(source_segments)
++            source_lengths.append(source_length)
++            target_segments_by_rank.append(target_segments)
++            target_lengths.append(target_length)
++
++        local_source_segments = source_segments_by_rank[cp_rank]
++        local_target_segments = target_segments_by_rank[cp_rank]
++
++        send_rows_list: List[int] = []
++        input_split_sizes: List[int] = []
++        for dst_rank in range(cp_size):
++            intersections = _intersect_thd_layout_segments(
++                local_source_segments, target_segments_by_rank[dst_rank]
++            )
++            intersections.sort(key=lambda item: item[1])
++            input_split_size = 0
++            for source_row, _, length in intersections:
++                _append_range(send_rows_list, source_row, length)
++                input_split_size += length
++            input_split_sizes.append(input_split_size)
++
++        recv_rows_list: List[int] = []
++        output_split_sizes: List[int] = []
++        for src_rank in range(cp_size):
++            intersections = _intersect_thd_layout_segments(
++                source_segments_by_rank[src_rank], local_target_segments
++            )
++            intersections.sort(key=lambda item: item[1])
++            output_split_size = 0
++            for _, target_row, length in intersections:
++                _append_range(recv_rows_list, target_row, length)
++                output_split_size += length
++            output_split_sizes.append(output_split_size)
++
++        assert len(send_rows_list) == source_lengths[cp_rank]
++        assert len(recv_rows_list) == target_lengths[cp_rank]
++
++        send_rows = (
++            None
++            if _row_list_is_identity(send_rows_list)
++            else torch.tensor(send_rows_list, device=device, dtype=torch.long)
++        )
++        recv_rows = (
++            None
++            if _row_list_is_identity(recv_rows_list)
++            else torch.tensor(recv_rows_list, device=device, dtype=torch.long)
++        )
++        return ThdCpPartitionRoute(
++            local_source_length=source_lengths[cp_rank],
++            local_target_length=target_lengths[cp_rank],
++            send_rows=send_rows,
++            recv_rows=recv_rows,
++            input_split_sizes=input_split_sizes,
++            output_split_sizes=output_split_sizes,
++            cu_seqlens=cu_seqlens,
++            cu_seqlens_version=None if cu_seqlens.is_inference() else cu_seqlens._version,
++            cp_size=cp_size,
++            cp_rank=cp_rank,
++            source_layout=source_layout,
++            target_layout=target_layout,
++        )
++
++
++def _thd_cp_partition_route_is_reusable(
++    route: Optional[ThdCpPartitionRoute],
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    device: torch.device,
++) -> bool:
++    """A cached route is only valid for the exact packed boundaries it was built from.
++
++    ``cu_seqlens`` is matched on object identity *plus* autograd's version counter,
++    never on value: a value comparison would itself be a device-host synchronisation,
++    which is precisely what the route exists to avoid. Identity alone would not survive
++    a caller that refills a preallocated boundary buffer in place -- a pattern that
++    already exists elsewhere in Megatron -- so the version counter, which every in-place
++    op bumps (views share the counter with their base) and which costs a plain Python
++    attribute read, closes that hole. The one case neither check sees is a write that
++    bypasses the dispatcher entirely, e.g. through ``data_ptr()``.
++    """
++    if route is None:
++        return False
++    if route.cu_seqlens is not cu_seqlens:
++        return False
++    if cu_seqlens.is_inference() or route.cu_seqlens_version != cu_seqlens._version:
++        return False
++    if route.cp_size != cp_size or route.cp_rank != cp_rank:
++        return False
++    if route.source_layout != source_layout or route.target_layout != target_layout:
++        return False
++    rows = route.send_rows if route.send_rows is not None else route.recv_rows
++    return rows is None or rows.device == device
++
++
++def get_thd_cp_partition_route(
++    packed_seq_params: Optional[Any],
++    cu_seqlens: torch.Tensor,
++    cp_size: int,
++    cp_rank: int,
++    source_layout: str,
++    target_layout: str,
++    *,
++    device: Optional[torch.device] = None,
++) -> ThdCpPartitionRoute:
++    """Return this microbatch's route, building and caching it on first use.
++
++    Packed boundaries change every microbatch, so the cache is attached to the
++    ``PackedSeqParams`` instance the forward was handed and is only reused while it
++    still describes the very same ``cu_seqlens`` tensor. Every GDN layer in a
++    microbatch, plus its recompute replay, shares one build.
++
++    Deviation from #5664: upstream expects the routes to have been prebuilt by the data
++    pipeline, so its lookup is a bare ``getattr`` and the build-on-miss path emits a
++    ``FutureWarning``. Here build-on-miss is the intended path -- the object a GDN
++    forward receives is not necessarily the one the data pipeline created, because the
++    Bridge/VLM path can repack ``PackedSeqParams`` after embedding -- so there is
++    nothing to warn about, and the cache instead has to defend itself against reuse
++    across microbatches and against dynamic CP changing ``cp_size``/``cp_rank`` between
++    microbatches on the same module. Callers that do own the final object can still
++    prebuild eagerly via :func:`prebuild_thd_cp_partition_routes`.
++    """
++    if device is None:
++        device = cu_seqlens.device
++    attr_name = _thd_cp_partition_route_attr_name(source_layout, target_layout)
++    cached = getattr(packed_seq_params, attr_name, None) if packed_seq_params is not None else None
++    if _thd_cp_partition_route_is_reusable(
++        cached, cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device
++    ):
++        return cached
++
++    route = build_thd_cp_partition_route(
++        cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device=device
++    )
++    if packed_seq_params is not None:
++        setattr(packed_seq_params, attr_name, route)
++    return route
++
++
++def prebuild_thd_cp_partition_routes(
++    packed_seq_params: Optional[Any],
++    cp_group: Optional[torch.distributed.ProcessGroup] = None,
++    cu_seqlens: Optional[torch.Tensor] = None,
++    *,
++    device: Optional[torch.device] = None,
++) -> None:
++    """Eagerly populate both THD CP layout routes for a packed microbatch."""
++    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
++        return
++    if cp_group is None:
++        cp_group = getattr(packed_seq_params, "cp_group", None)
++    if cp_group is None or cp_group.size() <= 1:
++        return
++    if cu_seqlens is None:
++        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
++        if cu_seqlens is None:
++            cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
++    if cu_seqlens is None:
++        return
++
++    for source_layout, target_layout in _THD_CP_ROUTE_ATTRS:
++        get_thd_cp_partition_route(
++            packed_seq_params,
++            cu_seqlens,
++            cp_group.size(),
++            cp_group.rank(),
++            source_layout,
++            target_layout,
++            device=device,
++        )
++
++
+ def zigzag_to_contiguous_chunks(
+     x: torch.Tensor,
+     cp_group: torch.distributed.ProcessGroup,
+     seq_dim: int = 0,
+     cu_seqlens: Optional[torch.Tensor] = None,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
+ ) -> torch.Tensor:
+     """Permute CP chunks from Megatron zigzag layout to contiguous-time layout.
+
+@@ -96,7 +494,13 @@ def zigzag_to_contiguous_chunks(
+     """
+     if cu_seqlens is not None:
+         return _zigzag_contiguous_thd_swap(
+-            x, cp_group, seq_dim, cu_seqlens, source_layout="zigzag", target_layout="contiguous"
++            x,
++            cp_group,
++            seq_dim,
++            cu_seqlens,
++            source_layout="zigzag",
++            target_layout="contiguous",
++            thd_cp_partition_route=thd_cp_partition_route,
+         )
+     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
+
+@@ -106,15 +510,43 @@ def contiguous_to_zigzag_chunks(
+     cp_group: torch.distributed.ProcessGroup,
+     seq_dim: int = 0,
+     cu_seqlens: Optional[torch.Tensor] = None,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
+ ) -> torch.Tensor:
+     """Inverse of :func:`zigzag_to_contiguous_chunks`."""
+     if cu_seqlens is not None:
+         return _zigzag_contiguous_thd_swap(
+-            x, cp_group, seq_dim, cu_seqlens, source_layout="contiguous", target_layout="zigzag"
++            x,
++            cp_group,
++            seq_dim,
++            cu_seqlens,
++            source_layout="contiguous",
++            target_layout="zigzag",
++            thd_cp_partition_route=thd_cp_partition_route,
+         )
+     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
+
+
++def _pack_thd_cp_route_send_buffer(
++    x: torch.Tensor, local_source_length: int, send_rows: Optional[torch.Tensor]
++) -> torch.Tensor:
++    if local_source_length == 0:
++        return x.narrow(0, 0, 0)
++    if send_rows is None:
++        return x
++    return x.index_select(0, send_rows)
++
++
++def _scatter_thd_cp_route_recv_buffer(
++    recv_buf: torch.Tensor, recv_rows: Optional[torch.Tensor], out_shape: Tuple[int, ...]
++) -> torch.Tensor:
++    if recv_rows is None:
++        return recv_buf
++    out = recv_buf.new_empty(out_shape)
++    if recv_rows.numel() > 0:
++        out.index_copy_(0, recv_rows, recv_buf)
++    return out
++
++
+ def _zigzag_contiguous_thd_swap(
+     x: torch.Tensor,
+     cp_group: Optional[torch.distributed.ProcessGroup],
+@@ -122,95 +554,59 @@ def _zigzag_contiguous_thd_swap(
+     cu_seqlens: torch.Tensor,
+     source_layout: str,
+     target_layout: str,
++    thd_cp_partition_route: Optional[ThdCpPartitionRoute] = None,
+ ) -> torch.Tensor:
+     """Single-all-to-all THD permutation between zigzag and contiguous layouts.
+
+     The packed THD tensor stays packed: we first group local tokens by their
+     target CP rank, exchange those groups once, then scatter received tokens
+-    back into the target rank-local order.
++    back into the target rank-local order. Which rows go where is described by a
++    :class:`ThdCpPartitionRoute` the caller should have precomputed once for the
++    microbatch; without one this rebuilds it, which is correct but pays the build
++    on every conversion.
+     """
+     cp_size = cp_group.size() if cp_group is not None else 1
+     if cp_size == 1:
+         return x
+     cp_rank = cp_group.rank()
+
+-    if seq_dim != 0:
+-        x = x.movedim(seq_dim, 0)
+-    x = x.contiguous()
+-
+-    cu = cu_seqlens.to(device=x.device, dtype=torch.long)
+-    # TODO: Let a future CP layout scheduler precompute this routing once per
+-    # microbatch from immutable cu_seqlens and pass it through both THD swaps.
+-    # Do not cache it across microbatches because packed sequence boundaries change.
+-    source_by_rank = [
+-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_layout)
+-        for rank in range(cp_size)
+-    ]
+-    target_by_rank = [
+-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_layout)
+-        for rank in range(cp_size)
+-    ]
+-
+-    local_source_indices = source_by_rank[cp_rank]
+-    local_target_indices = target_by_rank[cp_rank]
+-    if x.size(0) != local_source_indices.numel():
+-        raise ValueError(
+-            f"Local THD tensor length ({x.size(0)}) does not match {source_layout} "
+-            f"rank-{cp_rank} partition length ({local_source_indices.numel()})."
+-        )
+-
+-    total_tokens = int(cu[-1].item())
+-    target_owner = torch.empty(total_tokens, device=x.device, dtype=torch.long)
+-    target_local_pos = torch.empty(total_tokens, device=x.device, dtype=torch.long)
+-    for rank, indices in enumerate(target_by_rank):
+-        target_owner[indices] = rank
+-        target_local_pos[indices] = torch.arange(indices.numel(), device=x.device)
+-
+-    local_target_owner = target_owner[local_source_indices]
+-    local_target_pos = target_local_pos[local_source_indices]
+-
+-    send_parts: List[torch.Tensor] = []
+-    input_split_sizes: List[int] = []
+-    for dst_rank in range(cp_size):
+-        dst_mask = local_target_owner == dst_rank
+-        dst_rows = dst_mask.nonzero(as_tuple=False).flatten()
+-        if dst_rows.numel() > 0:
+-            dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
+-            send_part = x.index_select(0, dst_rows)
+-        else:
+-            send_part = x.narrow(0, 0, 0)
+-        send_parts.append(send_part)
+-        input_split_sizes.append(send_part.size(0))
+-    send_buf = torch.cat(send_parts, dim=0).contiguous()
+-
+-    output_split_sizes: List[int] = []
+-    recv_target_positions: List[torch.Tensor] = []
+-    for src_rank in range(cp_size):
+-        src_indices = source_by_rank[src_rank]
+-        src_to_this_rank = target_owner[src_indices] == cp_rank
+-        recv_global_indices = src_indices[src_to_this_rank]
+-        if recv_global_indices.numel() > 0:
+-            recv_positions = target_local_pos[recv_global_indices]
+-            recv_positions = recv_positions[torch.argsort(recv_positions)]
+-        else:
+-            recv_positions = local_target_indices.narrow(0, 0, 0)
+-        recv_target_positions.append(recv_positions)
+-        output_split_sizes.append(recv_positions.numel())
+-
+-    recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
+-
+-    out_shape = (local_target_indices.numel(),) + tuple(x.shape[1:])
+-    out = x.new_empty(out_shape)
+-    offset = 0
+-    for recv_positions in recv_target_positions:
+-        recv_len = recv_positions.numel()
+-        if recv_len > 0:
+-            out[recv_positions] = recv_buf[offset : offset + recv_len]
+-            offset += recv_len
+-
+-    if seq_dim != 0:
+-        out = out.movedim(0, seq_dim)
+-    return out.contiguous()
++    conversion_name = f"{source_layout}_to_{target_layout}"
++    with _cp_layout_nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
++        if seq_dim != 0:
++            x = x.movedim(seq_dim, 0)
++        x = x.contiguous()
++
++        route = thd_cp_partition_route
++        if not _thd_cp_partition_route_is_reusable(
++            route, cu_seqlens, cp_size, cp_rank, source_layout, target_layout, x.device
++        ):
++            route = build_thd_cp_partition_route(
++                cu_seqlens, cp_size, cp_rank, source_layout, target_layout, device=x.device
++            )
++
++        if x.size(0) != route.local_source_length:
++            raise ValueError(
++                f"Local THD tensor length ({x.size(0)}) does not match {source_layout} "
++                f"rank-{cp_rank} partition length ({route.local_source_length})."
++            )
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
++            send_buf = _pack_thd_cp_route_send_buffer(x, route.local_source_length, route.send_rows)
++            if not send_buf.is_contiguous():
++                send_buf = send_buf.contiguous()
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
++            recv_buf = all_to_all(
++                cp_group, send_buf, route.output_split_sizes, route.input_split_sizes
++            )
++
++        with _cp_layout_nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
++            out_shape = (route.local_target_length,) + tuple(x.shape[1:])
++            out = _scatter_thd_cp_route_recv_buffer(recv_buf, route.recv_rows, out_shape)
++
++        if seq_dim != 0:
++            out = out.movedim(0, seq_dim)
++        return out.contiguous()
+
+
+ def _zigzag_contiguous_chunk_swap(

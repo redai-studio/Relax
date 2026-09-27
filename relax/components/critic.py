@@ -120,23 +120,25 @@ class Critic(Base):
             self._rollout_barrier.wait_offloaded_sync()
 
     def train(self) -> None:
-        is_ppo = getattr(self.config, "advantage_estimator", None) == "ppo"
+        from relax.algorithms import algorithm_needs_critic
+
+        has_critic = algorithm_needs_critic(self.config)
         while self.step < self.config.num_rollout:
-            if is_ppo:
+            if has_critic:
                 self._wait_for_rollout_data()
             # In PPO colocate the actor waits for ``self.step`` to advance
             # past the current round before waking up, so block on training
             # completion here. Non-PPO critic is not on any live service graph
             # and keeps the historical fire-and-forget.
             train_ref = self.critic_model.async_train(self.step)
-            if is_ppo:
+            if has_critic:
                 ray.get(train_ref)
             # Note: save_model runs inside ``train_critic`` (backend) while the
             # model is still awake, so no explicit save call here.
 
             # In critic-only warmup, actor+advantages never consume the partition,
             # so critic must clear it itself; steady-state clearing stays with actor.
-            if is_ppo and self.step < getattr(self.config, "num_critic_only_steps", 0):
+            if has_critic and self.step < getattr(self.config, "num_critic_only_steps", 0):
                 run(self.data_system_client.async_clear_partition(partition_id=f"train_{self.step}"))
 
             try:
