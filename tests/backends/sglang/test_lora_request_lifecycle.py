@@ -6,6 +6,12 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+
+
+pytest.importorskip("sglang.srt.lora.lora_registry", exc_type=ImportError)
+pytest.importorskip("sglang.srt.managers.io_struct", exc_type=ImportError)
+pytest.importorskip("sglang.srt.managers.tokenizer_manager", exc_type=ImportError)
+
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
