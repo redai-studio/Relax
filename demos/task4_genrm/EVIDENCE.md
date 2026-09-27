@@ -2,7 +2,7 @@
 
 ## Current conclusions (single source; every row names its exact versions)
 
-| Official criterion                                                | Current verdict                                   | Product SHA (exact)                  | Producing run → raw inputs (evidence branch @ [`66f1f78`](https://github.com/shanyulu/Relax/tree/66f1f786f2b04e2fed0d0ae65a1c4554223c78d2/demos/task4_genrm/results))                                                                                   | Superseded by                                                                                    |
+| Official criterion                                                | Current verdict                                   | Product SHA (exact)                  | Producing run → raw inputs (evidence branch @ [`fdf288d`](https://github.com/shanyulu/Relax/tree/fdf288d705ddbefa7f8de9fbad050f7ed3ac4f27/demos/task4_genrm/results))                                                                                   | Superseded by                                                                                    |
 | ----------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | ① Manual scale `1→2→1` under load                                 | PASS (4,163 requests, 0 failures, GPUs returned)  | `a2ca6cb`                            | `e2e_genrm_scale` @ `a2ca6cb` (verdicts + per-request logs)                                                                                                                                                                                             | —                                                                                                |
 | ② Score consistency, no scale-time weight sync                    | PASS — final-code **reconfirmed**                 | `0481701` (PR-head product code)     | `reward_consistency_20260927_final_r6` (greedy identical, official sampling 0/50 instability, 800→attribution both engines) + `sampling_divergence_20260927_final_r4` (adversarial divergent-RNG-history 0/50); driver logs archived alongside verdicts | seed-contract chain @ `945741e` (superseded as final-code evidence, retained as mechanism proof) |
@@ -36,7 +36,7 @@ ______________________________________________________________________
 Raw evidence (full run directories: per-request load logs, event timelines,
 scale histories, charts, TUI screenshots, failed and superseded intermediate
 rounds) is preserved on the
-[`evidence/task4-genrm` branch at commit `66f1f78`](https://github.com/shanyulu/Relax/tree/66f1f786f2b04e2fed0d0ae65a1c4554223c78d2/demos/task4_genrm/results)
+[`evidence/task4-genrm` branch at commit `fdf288d`](https://github.com/shanyulu/Relax/tree/fdf288d705ddbefa7f8de9fbad050f7ed3ac4f27/demos/task4_genrm/results)
 (immutable link; every path below resolves there; later appends extend, never
 rewrite). The PR itself carries only
 the final machine-verdict summaries and the frozen preregistration documents,
