@@ -166,19 +166,22 @@ class StragglerRuntime:
             self._status_thread = None
 
     def _status_writer_loop(self, interval: float) -> None:
-        """Flush the collector and write the status files every ``interval``.
+        """Persist buffered rows and status without closing live windows.
 
         Flushing here rather than only in ``close()`` is what makes the JSONL
-        durable while the run is alive: Ray SIGTERMs the actor at job end, so
+        visible while the run is alive: Ray SIGTERMs the actor at job end, so
         ``close()`` never runs and a completed ON arm kept ``envelopes=132`` in
         the log while ``straggler_envelopes.jsonl`` stayed at zero bytes. This
         is a daemon thread, so the I/O stays off the training thread, and the
         collector's pending buffers are already bounded with counted drops.
+        Window finalization is reserved for normal event-time progression and
+        explicit close. A silent tail can remain pending until that close;
+        periodic persistence is not a tail-verdict guarantee.
         """
         while not self._status_stop.wait(interval):
             try:
                 if self._collector is not None:
-                    self._collector.flush()
+                    self._collector.report(flush=True)
                 self._write_status()
             except Exception:
                 self._errors += 1

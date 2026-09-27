@@ -113,6 +113,25 @@ def feed_equal_windows(
     return verdicts
 
 
+def test_closed_event_window_cannot_recover_an_active_alert() -> None:
+    detector = make_detector(persist_windows=1)
+    feed_window(detector, 0, {0: 100.0, 1: 200.0})
+    assert [v.kind for v in detector.flush()] == [VERDICT_STRAGGLER]
+    feed_window(detector, 0, {0: 100.0, 1: 100.0})
+    assert detector.flush() == []
+    assert detector.stats()["event_time_late_samples"] == 2
+    assert detector.stats()["recoveries_reported"] == 0
+
+
+def test_closed_watermark_does_not_reject_a_new_cohort() -> None:
+    detector = make_detector(persist_windows=1)
+    feed_window(detector, 0, {0: 100.0, 1: 200.0}, cohort="first")
+    detector.flush()
+    feed_window(detector, 10, {2: 100.0, 3: 200.0}, cohort="later")
+    verdicts = detector.flush()
+    assert [(v.kind, v.cohort, v.window_index) for v in verdicts] == [(VERDICT_STRAGGLER, "later", 0)]
+
+
 def test_identical_ranks_produce_no_verdict() -> None:
     """A/A control: equal work must never be reported as a straggler."""
     detector = make_detector()

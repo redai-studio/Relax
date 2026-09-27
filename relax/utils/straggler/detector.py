@@ -554,7 +554,9 @@ class StragglerDetector:
         # even if its public active entry was evicted by the smaller cap.
         self._streak: Dict[Tuple[str, str, int], Tuple[int, int, bool]] = {}
         self._epoch: Dict[int, float] = {}
-        self._cohort_epoch: Dict[str, float] = {}
+        # Alignment anchor and closed-window watermark share the same bound.
+        # A new cohort must not inherit another cohort's event-time watermark.
+        self._cohort_epoch: Dict[str, Tuple[float, int]] = {}
         self._active: Set[Tuple[str, str, int]] = set()
         self._labels: Dict[Tuple[str, str, int], str] = {}
         self._counters: Dict[str, int] = {
@@ -593,6 +595,7 @@ class StragglerDetector:
             "sample_evictions": 0,
             "invalid_samples": 0,
             "invalid_device_samples": 0,
+            "event_time_late_samples": 0,
         }
 
     @property
@@ -621,20 +624,24 @@ class StragglerDetector:
                 _evict_to_cap(self._epoch, MAX_ALIGNED_RANKS, self._counters, "epoch_evictions")
                 first = host_start
                 self._epoch[rank] = first
-            anchor = self._cohort_epoch.get(cohort)
-            if anchor is None:
+            epoch = self._cohort_epoch.get(cohort)
+            if epoch is None:
                 # Windows are anchored to the cohort's first observation, not to
                 # each rank's own: a rank that starts later then lands in the
                 # same wall-clock window as its peers instead of falling a fixed
                 # number of windows behind them and never being compared. The
                 # per-rank ``_epoch`` stays as the warmup baseline.
                 _evict_to_cap(self._cohort_epoch, MAX_COHORT_ANCHORS, self._counters, "cohort_epoch_evictions")
-                anchor = host_start
-                self._cohort_epoch[cohort] = anchor
+                epoch = (host_start, -1)
+                self._cohort_epoch[cohort] = epoch
+            anchor, closed_through = epoch
             # Integer microseconds: `(4.1 - 0.1) / 1.0` floors to 3 in binary
             # floating point, which would silently merge two windows.
             window_us = max(1, int(round(self._config.window_seconds * 1e6)))
             index = int(round(max(0.0, host_start - anchor) * 1e6)) // window_us
+            if index <= closed_through:
+                self._counters["event_time_late_samples"] += 1
+                return []
             window = self._windows.get(index)
             if window is None:
                 window = _Window(index, self._counters)
@@ -694,6 +701,9 @@ class StragglerDetector:
             return []
         verdicts: List[Verdict] = []
         for (cohort, name), per_rank in window.samples.items():
+            epoch = self._cohort_epoch.get(cohort)
+            if epoch is not None:
+                self._cohort_epoch[cohort] = (epoch[0], max(epoch[1], index))
             verdicts.extend(self._judge(cohort, name, window, per_rank))
         return verdicts
 

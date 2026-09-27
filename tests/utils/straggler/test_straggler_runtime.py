@@ -19,6 +19,7 @@ import relax.utils.straggler as straggler
 from relax.utils.straggler.collector import TimingCollector
 from relax.utils.straggler.config import StragglerConfig
 from relax.utils.straggler.identity import RuntimeIdentity
+from relax.utils.straggler.observer import TimingEnvelope
 from relax.utils.straggler.runtime import StragglerRuntime
 
 
@@ -255,6 +256,45 @@ def test_periodic_writer_flushes_the_jsonl_without_a_close(tmp_path: Any) -> Non
     runtime.close()
 
 
+def test_periodic_writer_does_not_finalize_live_windows(tmp_path: Any, monkeypatch: Any) -> None:
+    config = make_config(output_dir=str(tmp_path), persist_windows=3)
+    runtime = StragglerRuntime(config, identity=identity(0), register_atexit=False)
+    collector = TimingCollector(config)
+    runtime._collector = collector
+    monkeypatch.setattr(runtime, "_write_status", lambda: None)
+
+    for sequence, window in enumerate([0, 1, 1, 2]):
+        for rank in range(4):
+            start = window + 0.1
+            collector.ingest(
+                TimingEnvelope(
+                    run_id="run-1",
+                    rank=rank,
+                    cohort="dp",
+                    label=f"rank{rank}",
+                    world_size=4,
+                    name="forward-compute",
+                    log_level=2,
+                    seq=sequence,
+                    host_start=start,
+                    host_end=start + (0.2 if rank == 3 else 0.1),
+                    device_ms=None,
+                    barrier=False,
+                    reason="device",
+                )
+            )
+        tick = iter([False, True])
+        monkeypatch.setattr(runtime._status_stop, "wait", lambda interval: next(tick))
+        runtime._status_writer_loop(0.1)
+        # Only arrival of window 2 may naturally close window 0. A file flush
+        # must not split window 1 or count it twice toward persistence.
+        assert collector.status()["windows_closed"] == (1 if window == 2 else 0)
+
+    verdicts = collector.flush()
+    assert [(v.kind, v.rank, v.window_index, v.consecutive_windows) for v in verdicts] == [("straggler", 3, 2, 3)]
+    assert collector.status()["windows_closed"] == 3
+
+
 def test_output_paths_are_run_scoped_and_per_rank(tmp_path: Any) -> None:
     """Four ranks share one output dir, so no two may write the same file."""
     runtimes = [
@@ -283,7 +323,7 @@ def test_status_writer_never_touches_a_file_on_the_training_thread(tmp_path: Any
     writers: List[int] = []
     flushers: List[int] = []
     original_write = StragglerRuntime._write_status
-    original_flush = TimingCollector.flush
+    original_flush = TimingCollector._flush_writers
 
     def spy_write(self: Any) -> None:
         writers.append(threading.get_ident())
@@ -294,7 +334,7 @@ def test_status_writer_never_touches_a_file_on_the_training_thread(tmp_path: Any
         return original_flush(self)
 
     monkeypatch.setattr(StragglerRuntime, "_write_status", spy_write)
-    monkeypatch.setattr(TimingCollector, "flush", spy_flush)
+    monkeypatch.setattr(TimingCollector, "_flush_writers", spy_flush)
 
     runtime = StragglerRuntime(
         make_config(output_dir=str(tmp_path), report_interval_seconds=0.1),
