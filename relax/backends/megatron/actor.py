@@ -2688,6 +2688,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.num_microbatches,
                 )
             self.prof.step(rollout_id=rollout_id)
+            # [perf] Time actor spent waiting for TQ data (starvation).
+            # Unlike tgd_fetch (per-RPC duration), this is the full wait window per mb.
+            _stream_iters = [it for it in self.data_iterator if isinstance(it, StreamingTQIterator)]
+            if _stream_iters:
+                Timer().add("actor_train_stream_wait", sum(sum(it.tq_wait_times) for it in _stream_iters))
             if len(self.data_iterator) > 1 and all(
                 isinstance(iterator, StreamingTQIterator) for iterator in self.data_iterator
             ):

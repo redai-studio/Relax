@@ -36,6 +36,12 @@ def log_perf_data_raw(
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
 
+    # Pure compute = total train − stream-wait. stream_wait ≈ 0 → rollout sufficient;
+    # large → generation-bound. Absent on non-streaming paths → treated as 0.
+    if "perf/actor_train_time" in log_dict:
+        _stream_wait = log_dict.get("perf/actor_train_stream_wait_time", 0.0)
+        log_dict["perf/actor_train_compute_time"] = max(log_dict["perf/actor_train_time"] - _stream_wait, 0.0)
+
     if timer_instance.seq_lens:
         log_dict["perf/actor_train_tokens"] = sum(timer_instance.seq_lens)
 
