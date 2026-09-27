@@ -1415,8 +1415,9 @@ class DeviceDirectBackend(CommBackend):
             time.sleep(0.1)
         try:
             # The sync sequence identifies the publication, not its content.
-            # Re-driving this sync retains the ID; a later sync gets a new ID
-            # even when training returns to an earlier adapter's exact bytes.
+            # Publisher retries must explicitly reuse this ID. Re-entering
+            # update_weights_for_rollout increments weight_version and starts
+            # a new publication; this entrypoint does not retry failures in place.
             outcome = publisher.publish(snapshot, bucket_sizes, version_id=version_id)
         finally:
             ray.get(self.lock.release.remote())

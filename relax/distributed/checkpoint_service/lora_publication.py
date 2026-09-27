@@ -44,9 +44,9 @@ class LoRAPublicationError(RuntimeError):
     """Publication, cleanup or reclaim failure.
 
     ``kind`` is ``RETRYABLE`` when every engine confirmed the candidate ABSENT
-    (the next sync may retry the same content), and ``FATAL`` when engine or
-    transport state is dirty/ambiguous (the run fails closed and capacity is
-    NOT released).
+    (the caller may explicitly retry the same version), and ``FATAL`` when
+    engine or transport state is dirty/ambiguous (the run fails closed and
+    capacity is NOT released).
     """
 
     def __init__(self, kind: str, message: str = "") -> None:
@@ -661,7 +661,7 @@ class LoRAPublisher:
             raise LoRAPublicationError(
                 "RETRYABLE",
                 f"{message} | all engines confirmed the candidate ABSENT; version "
-                f"{publication.version_id} may be retried on the next sync",
+                f"{publication.version_id} may be explicitly retried with the same version_id and digest",
             )
         self._registry.mark_fatal_failure(publication.version_id, publication.attempt_id)
         raise LoRAPublicationError(

@@ -1066,7 +1066,7 @@ async def test_generate_carries_the_bound_lora_path(monkeypatch: Any) -> None:
         request_id="request-2:0",
     )
     assert "lora_path" not in payloads[-1]
-    assert retry_options == [{"max_retries": 1}, {}]
+    assert retry_options == [{"max_retries": 1, "fallback_to_local": False}, {}]
 
 
 async def test_first_bind_is_shared_and_keeps_the_version() -> None:
@@ -1082,6 +1082,7 @@ async def test_first_bind_is_shared_and_keeps_the_version() -> None:
     assert registry.bind_calls == ["session-1"]
     assert bindings[0].lora_name == bindings[1].lora_name
     assert session.bound_lora_name == bindings[0].lora_name
+    assert session.bound_lora_digest == bindings[0].digest == _DIGEST_A
     assert session.binding_task is None
 
     # A later publication must not move an already-bound Session.
@@ -1089,6 +1090,41 @@ async def test_first_bind_is_shared_and_keeps_the_version() -> None:
     commit_ready(core, second.version_id, second.attempt_id)
     again = await shard._ensure_session_policy_binding(session)
     assert again.lora_name == bindings[0].lora_name
+    assert again == bindings[0] == bindings[1]
+
+
+async def test_versioned_generation_does_not_fallback_after_distributed_reply_loss(monkeypatch: Any) -> None:
+    from relax.utils import http_utils
+
+    submitted = []
+    lost_reply = RuntimeError("Ray reply lost after generation was accepted")
+
+    async def remote(url, payload, max_retries, headers=None):
+        submitted.append(dict(payload))
+        assert max_retries == 1
+        raise lost_reply
+
+    actor = SimpleNamespace(do_post=SimpleNamespace(remote=remote))
+    local_post = AsyncMock()
+    monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
+    monkeypatch.setattr(http_utils, "_post_actors", [actor])
+    monkeypatch.setattr(http_utils, "_next_actor", lambda: actor)
+    monkeypatch.setattr(http_utils, "_post", local_post)
+    monkeypatch.setattr(runtime_mod, "post", http_utils.post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    with pytest.raises(RuntimeError) as error:
+        await adapter.generate(
+            input_ids=[1, 2, 3],
+            sampling_params={"max_new_tokens": 4},
+            session_id="session-1",
+            request_id="request-1:0",
+            lora_path="relax_policy_lora@epoch0-1-aaaa",
+        )
+    assert error.value is lost_reply
+    assert len(submitted) == 1
+    assert submitted[0]["rid"] == "request-1:0"
+    assert submitted[0]["lora_path"] == "relax_policy_lora@epoch0-1-aaaa"
+    local_post.assert_not_awaited()
 
 
 async def test_ir_abort_resume_and_later_turn_keep_version_after_publication(monkeypatch: Any) -> None:
@@ -1210,6 +1246,7 @@ async def test_cancelling_one_waiter_does_not_cancel_the_shared_bind() -> None:
     binding = await second
     assert registry.bind_calls == ["session-1"]
     assert session.bound_lora_name == binding.lora_name
+    assert session.bound_lora_digest == binding.digest == _DIGEST_A
 
 
 async def test_failed_bind_is_retried_by_the_next_turn() -> None:
@@ -1294,6 +1331,7 @@ async def test_cancelled_only_waiter_retains_binding_for_next_ir_and_close() -> 
     binding = await shard._ensure_session_policy_binding(session)
     assert registry.bind_calls == [session.session_id]
     assert binding.lora_name == session.bound_lora_name
+    assert binding.digest == session.bound_lora_digest == _DIGEST_A
     await shard._release_session_lora_ref(session)
     assert core.status().session_bindings == {}
 
@@ -1310,7 +1348,8 @@ async def test_versioned_generation_does_not_retry_lost_http_response(monkeypatc
             calls.append((url, kwargs))
             raise httpx.ReadTimeout("backend may have accepted this request")
 
-    async def real_retry_policy(url, payload, **kwargs):
+    async def real_retry_policy(url, payload, *, fallback_to_local, **kwargs):
+        assert fallback_to_local is False
         return await _post(LostResponseClient(), url, payload, **kwargs)
 
     monkeypatch.setattr(runtime_mod, "post", real_retry_policy)

@@ -616,7 +616,7 @@ class SGLangBackendAdapter:
         try:
             # A lost response does not prove the engine rejected this generation.
             # Versioned requests may only be retried by the IR lifecycle owner.
-            request_options = {"max_retries": 1} if lora_path is not None else {}
+            request_options = {"max_retries": 1, "fallback_to_local": False} if lora_path is not None else {}
             output = await post(f"{self._router_url}/generate", payload, headers=headers, **request_options)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):

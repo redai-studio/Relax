@@ -1467,6 +1467,7 @@ class _SessionRecord:
     #: record (not on an IR) because IRs are per-generation while the record spans them.
     bound_lora_version: Optional[int] = None
     bound_lora_name: Optional[str] = None
+    bound_lora_digest: str = ""
     binding_task: Optional["asyncio.Task[Any]"] = None
 
     @property
@@ -2476,7 +2477,7 @@ class AgenticSessionShard:
 
         async with session.lock:
             if session.bound_lora_name is not None:
-                return VersionBinding(session.bound_lora_version, "", session.bound_lora_name)
+                return VersionBinding(session.bound_lora_version, session.bound_lora_digest, session.bound_lora_name)
             if session.binding_task is None:
                 session.binding_task = asyncio.create_task(
                     self._bind_session_policy(session.session_id),
@@ -2508,6 +2509,7 @@ class AgenticSessionShard:
             if session.phase is SessionPhase.ACTIVE:
                 session.bound_lora_version = binding.version_id
                 session.bound_lora_name = binding.lora_name
+                session.bound_lora_digest = binding.digest
                 return binding
 
         # The Session finished while the bind was in flight: hand the reference back
