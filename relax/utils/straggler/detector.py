@@ -718,38 +718,80 @@ class StragglerDetector:
                 self._counters["incomplete_windows"] += 1
             return []
 
-        host_reference = min(host_medians.values())
-        host_median = _median(list(host_medians.values()))
-        device_values = [value for value in device_medians.values() if value is not None]
-        device_reference = min(device_values) if device_values else None
-
-        # Workload comparability is a PER-RANK test: a rank whose own tokens are
-        # within tolerance of its peer median is judged on its timing even when
-        # some other rank of the same pair is not comparable. Evaluating the
-        # gate pair-wide let one over-worked peer withhold an unrelated
-        # equal-work straggler. Each verdict's reason and its workload facts are
-        # derived from this same ``rank_beyond`` flag, so they always agree.
+        # Speed reference and workload comparability must use the SAME peer
+        # set. The old code judged a rank's timing against the fastest of ALL
+        # ranks while gating comparability against the peer-median workload,
+        # so a peer doing half the work -- fast because under-worked, not
+        # because healthy -- became the speed baseline for everybody else:
+        # four ranks at {500 tokens / 50 ms, 1000 / 100 ms, 1000 / 100 ms,
+        # 1000 / 100 ms}, no injected stall and identical per-token speed,
+        # were reported as three stragglers at ratio 2.0 with
+        # ``workload_comparable=True``. Each rank is now judged only against
+        # the peers whose workload is pairwise comparable with its own; a
+        # rank with no comparable peer is ``workload_incomparable`` and its
+        # timing verdict is withheld (the all-ranks fastest remains available
+        # as labelled evidence, never as a conviction baseline).
         work_tolerance = self._config.work_tolerance
         rank_workload: Dict[int, Optional[float]] = dict(workload_totals)
         peer_work_median: Dict[int, Optional[float]] = {}
         rank_beyond: Dict[int, Optional[bool]] = {}
+        reference_ranks: Dict[int, List[int]] = {}
         for rank in ranks:
-            peers = [workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None]
-            median = float(statistics.median(peers)) if peers else None
-            peer_work_median[rank] = median
             own = workload_totals[rank]
-            if own is None or median is None or median <= 0.0:
-                # No workload to compare against: the measurement is DEGRADED,
-                # which is not the same as comparable. ``None`` records that and
-                # never withholds the timing verdict, because the profiler must
-                # still detect a straggler on a vehicle that publishes no work.
+            peers_all = [
+                workload_totals[other] for other in ranks if other != rank and workload_totals[other] is not None
+            ]
+            if own is None or not peers_all:
+                # No workload on this rank, or no peer reports any workload
+                # at all: the measurement is DEGRADED, which is not the same
+                # as comparable and not the same as incomparable. ``None``
+                # records that and never withholds the timing verdict,
+                # because the profiler must still detect a straggler on a
+                # vehicle that publishes no work. The reference set stays
+                # the whole cohort -- the documented degraded-evidence
+                # tradeoff, unchanged from the median-gate era.
                 rank_beyond[rank] = None
-            else:
-                rank_beyond[rank] = abs(own - median) / median > work_tolerance
+                reference_ranks[rank] = list(ranks)
+                peer_work_median[rank] = float(statistics.median(peers_all)) if peers_all else None
+                continue
+            comparable = [
+                other
+                for other in ranks
+                if other != rank
+                and workload_totals[other] is not None
+                and abs(own - workload_totals[other]) / workload_totals[other] <= work_tolerance
+            ]
+            reference_ranks[rank] = sorted([rank] + comparable)
+            rank_beyond[rank] = not comparable
+            peers_w = [workload_totals[other] for other in comparable] or peers_all
+            peer_work_median[rank] = float(statistics.median(peers_w)) if peers_w else None
         if any(beyond is True for beyond in rank_beyond.values()):
             self._counters["workload_incomparable_windows"] += 1
         if any(workload_totals[rank] is None for rank in ranks):
             self._counters["workload_missing_windows"] += 1
+
+        # Per-rank speed references, computed over each rank's comparable
+        # class. ``host_reference_all`` / ``device_reference_all`` exist only
+        # to label the evidence on verdicts that are already withheld as
+        # incomparable; no rank is ever convicted against them.
+        host_reference_all = min(host_medians.values())
+        device_values = [value for value in device_medians.values() if value is not None]
+        device_reference_all = min(device_values) if device_values else None
+        host_median_by: Dict[int, float] = {}
+        device_reference_by: Dict[int, Optional[float]] = {}
+        effective_host_reference: Dict[int, float] = {}
+        effective_device_reference: Dict[int, Optional[float]] = {}
+        for rank in ranks:
+            members = reference_ranks[rank]
+            host_median_by[rank] = float(_median([host_medians[member] for member in members]))
+            member_devices = [device_medians[member] for member in members if device_medians[member] is not None]
+            device_reference_by[rank] = min(member_devices) if member_devices else None
+            if rank_beyond[rank] is True:
+                effective_host_reference[rank] = host_reference_all
+                effective_device_reference[rank] = device_reference_all
+            else:
+                effective_host_reference[rank] = min(host_medians[member] for member in members)
+                effective_device_reference[rank] = device_reference_by[rank]
 
         def build(
             rank: int,
@@ -769,10 +811,10 @@ class StragglerDetector:
             contradicts.
             """
             rank_device = device_medians[rank]
-            device_available = rank_device is not None and device_reference is not None
+            device_available = rank_device is not None and effective_device_reference[rank] is not None
             device_deviation = (
-                _relative_deviation(rank_device, device_reference)
-                if device_available and rank_device is not None and device_reference is not None
+                _relative_deviation(rank_device, effective_device_reference[rank])
+                if device_available and rank_device is not None and effective_device_reference[rank] is not None
                 else 0.0
             )
             host_grew = deviation > work_tolerance
@@ -794,25 +836,32 @@ class StragglerDetector:
                 "samples_peers": peer_counts,
                 "samples_peers_min": min(peer_counts.values()) if peer_counts else None,
                 "observed_ms": host_medians[rank],
-                "peer_fastest_ms": host_reference,
-                "peer_median_ms": host_median,
-                "ratio": _ratio(host_medians[rank], host_reference),
-                "absolute_delta_ms": host_medians[rank] - host_reference,
+                "peer_fastest_ms": effective_host_reference[rank],
+                "peer_median_ms": host_median_by[rank],
+                "ratio": _ratio(host_medians[rank], effective_host_reference[rank]),
+                "absolute_delta_ms": host_medians[rank] - effective_host_reference[rank],
                 "work_tolerance": work_tolerance,
                 "persistence": streak,
                 "cohort_size": cohort_size,
                 "cohort_expected": window.cohort_expected,
                 "coverage_ratio": (cohort_size / window.cohort_expected if window.cohort_expected else None),
                 "device_ms": rank_device,
-                "peer_device_ms": device_reference,
+                "peer_device_ms": effective_device_reference[rank],
                 "device_available": device_available,
-                "device_ratio": _ratio(rank_device, device_reference) if device_available else None,
+                "device_ratio": _ratio(rank_device, effective_device_reference[rank]) if device_available else None,
+                # The peers this verdict was actually judged against: the
+                # comparable class (self included in the reference minimum)
+                # and the comparable peers alone. An incomparable rank carries
+                # its (empty) class and is labelled by its reason; the
+                # all-ranks figures above are then evidence, not a baseline.
+                "reference_ranks": reference_ranks[rank],
+                "comparable_peers": [other for other in reference_ranks[rank] if other != rank],
                 # Workload is reported next to the timing gap, never divided out.
                 # ``workload_reported`` records absence explicitly instead of
-                # letting it read as comparable, and ``workload_comparable`` is
-                # the two-sided test on this rank's OWN tokens versus its peer
-                # median --- the same test ``workload_delta_beyond_tolerance``
-                # uses, so the pair can never disagree.
+                # letting it read as comparable, and ``workload_comparable``
+                # says whether at least one pairwise-comparable peer existed
+                # for this rank's OWN tokens --- the class the speed reference
+                # is drawn from, so the two can never diverge.
                 "workload_reported": own_workload is not None,
                 "workload_delta": workload_delta,
                 "workload_rank": own_workload,
@@ -839,15 +888,15 @@ class StragglerDetector:
                 deviation=deviation,
                 consecutive_windows=streak,
                 rank_host_ms=host_medians[rank],
-                reference_host_ms=host_reference,
+                reference_host_ms=effective_host_reference[rank],
                 rank_device_ms=rank_device,
-                reference_device_ms=device_reference,
+                reference_device_ms=effective_device_reference[rank],
                 host_only=host_only,
                 cohort_size=cohort_size,
                 reason=reason,
                 facts=facts,
                 candidate_causes=_candidate_causes(host_grew, device_available, device_grew),
-                measurement_kind=_measurement_kind(rank_device, device_reference, cohort_size),
+                measurement_kind=_measurement_kind(rank_device, effective_device_reference[rank], cohort_size),
             )
 
         if cohort_size < self._config.min_cohort_size:
@@ -872,6 +921,8 @@ class StragglerDetector:
         onset_streak = max(1, int(self._config.persist_windows))
         verdicts: List[Verdict] = []
         for rank in ranks:
+            host_reference = effective_host_reference[rank]
+            device_reference = effective_device_reference[rank]
             deviation = _relative_deviation(host_medians[rank], host_reference)
             key = (cohort, name, rank)
             label = window.labels.get(rank, f"rank{rank}")
