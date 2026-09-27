@@ -483,8 +483,15 @@ def test_host_only_ingest_never_writes_on_the_training_thread(
 def test_pool_exhausted_interval_never_writes_on_the_training_thread(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The RT-01 pool-exhausted branch: an interval without events is judged
-    inline."""
+    """The RT-01 pool-exhausted branch: an interval without events never writes
+    on the training thread.
+
+    A host-only interval used to be judged inline on the training thread; it
+    now travels through the pending queue and is delivered by the readout
+    thread, so the invariant is stronger than it was: the ONLY threads that may
+    write are background threads (the readout daemon and an explicit flush),
+    never the training thread.
+    """
     config = StragglerConfig(enabled=True, output_dir=str(tmp_path), window_seconds=3600.0, event_pool=2)
     collector = _collector(tmp_path, event_pool=2)
     writes = _record_writes(monkeypatch)
@@ -504,7 +511,13 @@ def test_pool_exhausted_interval_never_writes_on_the_training_thread(
     off = threading.Thread(target=collector.flush, name="verify-off-thread")
     off.start()
     off.join(timeout=10.0)
-    assert writes and all(name == "verify-off-thread" for name in writes)
+    # Delivery and flushing are background work: the readout daemon may
+    # legitimately have written before the explicit flush, but nothing may
+    # ever have been written from the training (main) thread.
+    assert writes, "no background thread ever wrote"
+    assert all(name in ("verify-off-thread", "straggler-readout") for name in writes), (
+        f"a non-background thread wrote files: {writes}"
+    )
     observer.close()
 
 

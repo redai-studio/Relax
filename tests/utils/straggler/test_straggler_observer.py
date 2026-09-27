@@ -189,7 +189,10 @@ def test_pool_exhausted_host_only_intervals_get_distinct_seq_values() -> None:
     """The degraded path (events exhausted) must allocate sequences too."""
     seen: List[TimingEnvelope] = []
     # Incomplete events keep the first (device) interval pending, so only the
-    # host-only deliveries are observed synchronously.
+    # host-only deliveries are observed. They now travel through the pending
+    # queue to preserve wire sequence order, so arrival is observed once the
+    # readout thread drains them rather than synchronously on the training
+    # thread.
     observer = make_observer(FakeEventBackend(auto_complete=False), consumer=seen.append, event_pool=2)
 
     assert observer.acquire_interval("forward-backward", 1) is not None
@@ -198,7 +201,7 @@ def test_pool_exhausted_host_only_intervals_get_distinct_seq_values() -> None:
         assert token is None  # pool exhausted -> host-only
         observer.complete_interval(token, "forward-compute", 2, start, start + 0.01, False)
 
-    assert len(seen) == 3
+    assert wait_until(lambda: len(seen) == 3)
     assert len({envelope.seq for envelope in seen}) == 3
 
 

@@ -157,6 +157,28 @@ class TorchCudaEventBackend:
         return float(start.elapsed_time(end))
 
 
+class _ReadyEnvelope:
+    """A pre-built envelope queued for ordered delivery.
+
+    A host-only interval (``token is None``: event pool exhausted while the
+    readout thread is live) used to be delivered inline on the training thread,
+    bypassing ``_pending``. With a device interval still waiting for event
+    readback at the head of the queue, the host-only envelope -- which
+    completes later and therefore carries a higher sequence -- was shipped
+    first, the collector saw a sequence regression, and the device envelope was
+    discarded as ``late``: the same failure shape the tail re-queue caused,
+    reached through the degradation path. Routing the finished envelope through
+    the same queue keeps wire delivery in sequence order; the readout thread
+    delivers it as soon as it reaches the head, so no waiting is added beyond
+    the queue's own order.
+    """
+
+    __slots__ = ("envelope",)
+
+    def __init__(self, envelope: "TimingEnvelope") -> None:
+        self.envelope = envelope
+
+
 class IntervalToken:
     """Events and metadata for one in-flight interval.
 
@@ -177,6 +199,7 @@ class IntervalToken:
         "host_end",
         "barrier",
         "seq",
+        "workload",
     )
 
     def __init__(self, start_event: Any, end_event: Any) -> None:
@@ -187,6 +210,11 @@ class IntervalToken:
         self.host_start = 0.0
         self.host_end = 0.0
         self.barrier = False
+        #: Captured by ``StragglerObserver.complete_interval`` on the training
+        #: thread, at interval completion: the readout thread must only READ
+        #: this value. Reading the context at envelope-build time married step
+        #: N's timing to step N+1's workload whenever the readback lagged.
+        self.workload: Optional[Dict[str, Any]] = None
         #: Stamped by ``StragglerObserver.complete_interval``; 0 means the
         #: interval has not completed yet and must never be shipped.
         self.seq = 0
@@ -575,24 +603,52 @@ class StragglerObserver:
             self._counters["intervals"] += 1
             if token is None:
                 self._counters["host_only_intervals"] += 1
-                self._deliver(
-                    self._build_envelope(
-                        name=name,
-                        log_level=log_level,
-                        seq=self._next_seq(),
-                        host_start=host_start,
-                        host_end=host_end,
-                        device_ms=None,
-                        barrier=barrier,
-                        reason="no_event_pair",
-                    )
+                envelope = self._build_envelope(
+                    name=name,
+                    log_level=log_level,
+                    seq=self._next_seq(),
+                    host_start=host_start,
+                    host_end=host_end,
+                    device_ms=None,
+                    barrier=barrier,
+                    reason="no_event_pair",
                 )
+                # Device mode with a live readout thread: the finished
+                # envelope joins ``_pending`` so delivery stays in sequence
+                # order behind intervals that completed earlier and are still
+                # waiting for their event readback. Only the pure host-only
+                # deployment (no device timing at all, so no readout thread)
+                # still delivers inline on the training thread -- that
+                # architecture is documented as such.
+                if (
+                    self._device_enabled
+                    and self._state != STATE_DISABLED
+                    and self._thread is not None
+                    and self._thread.is_alive()
+                ):
+                    with self._cv:
+                        full = len(self._pending) >= self._config.queue_max
+                        if not full:
+                            self._pending.append(_ReadyEnvelope(envelope))
+                            self._cv.notify_all()
+                    if full:
+                        self._counters["dropped_pending_full"] += 1
+                        self._note_name_failure(name)
+                        self._note_failure("pending_full")
+                    return
+                self._deliver(envelope)
                 return
             token.name = name
             token.log_level = log_level
             token.host_start = host_start
             token.host_end = host_end
             token.barrier = barrier
+            # Bind the workload context HERE, on the training thread, at
+            # interval completion: the envelope belongs to the step that
+            # closed this interval. Building it later on the readout thread
+            # read whatever step was current by then and could marry step N's
+            # timing to step N+1's workload.
+            token.workload = self._workload_from_context()
             # Stamp the sequence now, at completion, so the sequence order is
             # the order intervals finish. Megatron's level-1 timer wraps the
             # level-2 ones, so a start-time sequence gives the outer interval the
@@ -619,7 +675,7 @@ class StragglerObserver:
 
     def _release(self, token: Any) -> None:
         """Return a token's events to the pool."""
-        if token is None or self._pool is None:
+        if token is None or self._pool is None or isinstance(token, _ReadyEnvelope):
             return
         try:
             self._pool.release(token.start_event, token.end_event)
@@ -689,8 +745,11 @@ class StragglerObserver:
             if stopping:
                 # Closing: never requeue, so the thread can actually exit.
                 self._counters["readout_timeouts"] += 1
-                self._deliver(self._envelope_from_token(token, None, "closed"))
-                self._release(token)
+                if isinstance(token, _ReadyEnvelope):
+                    self._deliver(token.envelope)
+                else:
+                    self._deliver(self._envelope_from_token(token, None, "closed"))
+                    self._release(token)
                 continue
             if self._process(token):
                 # Retry at the *head*, never the tail. ``_pending`` is filled in
@@ -713,6 +772,12 @@ class StragglerObserver:
 
     def _process(self, token: IntervalToken) -> bool:
         """Read one interval; returns ``True`` when it should be retried."""
+        if isinstance(token, _ReadyEnvelope):
+            # A finished host-only envelope: nothing to read back, no events
+            # to release. It only travelled through the queue to preserve
+            # the sequence order the collector's dedup contract requires.
+            self._deliver(token.envelope)
+            return False
         if self._state == STATE_DISABLED:
             self._release(token)
             return False
@@ -748,6 +813,7 @@ class StragglerObserver:
             device_ms=device_ms,
             barrier=token.barrier,
             reason=reason,
+            workload=token.workload,
         )
 
     def _build_envelope(
@@ -760,8 +826,14 @@ class StragglerObserver:
         device_ms: Optional[float],
         barrier: bool,
         reason: str,
+        workload: Optional[Dict[str, Any]] = None,
     ) -> TimingEnvelope:
-        """Build an envelope carrying this process's identity."""
+        """Build an envelope carrying this process's identity.
+
+        ``workload`` is the step context captured at interval completion (on
+        the training thread); it defaults to ``None`` only for callers that
+        pre-captured it themselves.
+        """
         identity = self._identity
         return TimingEnvelope(
             run_id=identity.run_id,
@@ -778,16 +850,21 @@ class StragglerObserver:
             barrier=barrier,
             reason=reason,
             measurement_kind=MEASUREMENT_HOST_ONLY if device_ms is None else MEASUREMENT_DEVICE,
-            workload=self._workload_from_context(),
+            workload=workload if workload is not None else self._workload_from_context(),
         )
 
     @staticmethod
     def _workload_from_context() -> Optional[Dict[str, Any]]:
         """Read this rank's published local work for the current step.
 
-        Runs on the straggler-readout thread, never the training thread. A
-        missing or malformed context yields ``None`` rather than guessing, so a
-        vehicle whose data path does not publish still ships valid envelopes.
+        Called from :meth:`complete_interval` on the training thread, at
+        interval completion: that is the moment the envelope's step is still
+        the current step, so the value is bound to the interval that closed.
+        (It used to run on the readout thread at envelope-build time, which
+        married step N's timing to step N+1's workload whenever the readback
+        lagged.) A missing or malformed context yields ``None`` rather than
+        guessing, so a vehicle whose data path does not publish still ships
+        valid envelopes.
         """
         try:
             from relax.utils.straggler.context import snapshot
@@ -848,7 +925,10 @@ class StragglerObserver:
         for token in remaining:
             try:
                 self._counters["readout_timeouts"] += 1
-                self._deliver(self._envelope_from_token(token, None, "closed"))
+                if isinstance(token, _ReadyEnvelope):
+                    self._deliver(token.envelope)
+                else:
+                    self._deliver(self._envelope_from_token(token, None, "closed"))
             except Exception:
                 self._counters["observer_errors"] += 1
             finally:
