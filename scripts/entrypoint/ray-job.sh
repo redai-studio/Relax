@@ -36,6 +36,8 @@
 #                         (default: 0 = fail immediately when another job holds it).
 #   RELAX_GPU_LOCK_PROJECT / RELAX_GPU_LOCK_COMMAND - Optional tags recorded in
 #                         the lock's holder sidecar for the other party.
+#   RELAX_RAY_JOB_SAFE_SUBMIT=1 - Refuse a busy/unverifiable cluster and skip
+#                         all process, job, Serve, PG and sysctl cleanup.
 
 # Guard: skip if already sourced by another entrypoint
 if [ -n "${RELAX_ENTRYPOINT_MODE:-}" ]; then
@@ -198,6 +200,16 @@ else
     trap '_relax_gpu_lock_release; trap - EXIT; exit 129' HUP
 fi
 
+if [ "${RELAX_RAY_JOB_SAFE_SUBMIT:-0}" = "1" ]; then
+    # A free submission lock does not establish resource ownership. This
+    # read-only gate fails closed, and this path never cleans another job.
+    if [ -z "${RAY_ADDRESS:-}" ]; then
+        echo "ERROR: safe submission requires an explicit dashboard RAY_ADDRESS." >&2
+        exit 2
+    fi
+    timeout 30s python "${DIR}/../tools/ray_job_preflight.py" --address "${RAY_ADDRESS}"
+    echo "=== Safe submission: cluster idle; global cleanup skipped ==="
+else
 # ── clean up residual Relax/SGLang WORKER processes (NOT ray daemons) ────────
 # IMPORTANT: Do NOT pkill ray or run ray stop — the cluster is managed externally.
 # kill_for_ray.sh was rewritten to a WHITELIST (positive-match) that only kills
@@ -293,6 +305,7 @@ try:
 finally:
     ray.shutdown()
 PY
+fi
 
 set -x
 
