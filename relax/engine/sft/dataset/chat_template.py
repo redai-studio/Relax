@@ -28,6 +28,7 @@ from relax.engine.sft.dataset.deepseek_chat_template_patch import (
 )
 from relax.engine.sft.dataset.gemma4_chat_template_patch import try_patch_gemma4_thinking
 from relax.engine.sft.dataset.qwen_chat_template_patch import try_patch_qwen_chat_template
+from relax.engine.sft.dataset.raw_text import _render_raw_text_concat, raw_text_concat_enabled
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.logging_utils import get_logger
 
@@ -704,7 +705,12 @@ def render_with_loss_mask(
     an assistant turn is kept entirely out of the loss (not just its opener tag).
     Only supported on the per-message fallback path (the ``{% generation %}``
     template path has no think info).
+
+    ``RELAX_SFT_RAW_TEXT_CONCAT=1`` bypasses chat templates for upstream
+    raw-text comparison recipes.
     """
+    if raw_text_concat_enabled():
+        return _render_raw_text_concat(sample, tokenizer=tokenizer)
     patch_result = _resolve_sft_template_kwargs(
         sample,
         tokenizer=tokenizer,
