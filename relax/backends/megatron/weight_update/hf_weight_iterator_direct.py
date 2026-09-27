@@ -8,6 +8,7 @@ from megatron.core import mpu
 from tqdm import tqdm
 
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.types import ParamInfo
 
@@ -67,7 +68,7 @@ def _get_megatron_full_params(
             )
         else:
             params.append(torch.empty(info.shape, dtype=info.dtype, device=device_utils.make_current_torch_device()))
-    device_utils.synchronize()
+    device_module.synchronize()
 
     # broadcast params across pp ranks
     if pp_size > 1:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import logging
 import math
 from typing import Any, Literal
@@ -6,6 +8,7 @@ import numpy as np
 import torch
 
 from relax.algorithms.spec import get_algorithm
+from relax.utils.repetition import detect_repetition
 from relax.utils.types import Sample
 
 
@@ -277,11 +280,8 @@ def compression_ratio(
     return ratio, savings_pct
 
 
-def has_repetition(text: str):
-    if len(text) > 10000 and compression_ratio(text[-10000:])[0] > 10:
-        return True
-    else:
-        return False
+def has_repetition(text: str) -> bool:
+    return detect_repetition(text, stop_after_first_hit=True).has_repetition
 
 
 def compute_rollout_step(args, rollout_id):

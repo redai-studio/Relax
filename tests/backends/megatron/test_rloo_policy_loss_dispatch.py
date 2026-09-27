@@ -167,7 +167,8 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     final_loss = token_sum_loss / normalizer
 
     assert torch.allclose(token_sum_loss, expected_token_sum)
-    assert torch.allclose(normalizer, expected_num_tokens)
+    assert normalizer.dtype == torch.int
+    assert torch.allclose(normalizer.to(expected_num_tokens.dtype), expected_num_tokens)
     assert torch.allclose(final_loss, expected_final_loss)
 
     first_length = response_lengths[0]

@@ -3,13 +3,13 @@ description: Reserve accelerator devices on a shared runner host until the end o
 
 inputs:
   backend:
-    description: Device discovery and visibility backend (currently nvidia)
+    description: Device discovery and visibility backend (nvidia or ascend)
     default: nvidia
   count:
     description: Number of devices to reserve
     default: '1'
   devices:
-    description: Optional candidate pool of comma-separated physical indices or full UUIDs
+    description: Optional candidate pool of NVIDIA indices/UUIDs or Ascend chip physical IDs
     default: ''
   timeout:
     description: Maximum seconds to wait for an allocation (0 means try once)
