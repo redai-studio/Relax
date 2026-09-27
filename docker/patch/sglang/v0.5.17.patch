@@ -1965,7 +1965,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
              logger.info(
                  "Start load Lora adapter from tensors. Lora name=%s",
                  obj.lora_name,
-@@ -738,6 +794,498 @@
+@@ -738,6 +794,528 @@
                  error_message=str(e),
              )
  
@@ -2153,6 +2153,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
 +            self.lora_publications = {}
 +            self.lora_publication_closed = set()
 +            self.lora_publication_unloads = {}
++            self.lora_publication_unloaded = set()
 +            self.lora_publication_controls = {}
 +            self.lora_engine_incarnation = uuid.uuid4().hex
 +
@@ -2198,6 +2199,7 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
 +        if existing is None:
 +            task = asyncio.create_task(handler(obj))
 +            self.lora_publication_controls[key] = (signature, task)
++            task.add_done_callback(lambda done: self._forget_closed_control(key, done))
 +        else:
 +            previous_signature, task = existing
 +            if signature != previous_signature:
@@ -2208,6 +2210,19 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
 +        # cannot cancel its receive/load or allow another control delivery to
 +        # start a second collective while the first is still in flight.
 +        return await asyncio.shield(task)
++
++    def _forget_closed_control(self, key, task):
++        if key[:2] in self.lora_publication_unloaded:
++            current = self.lora_publication_controls.get(key)
++            if current is not None and current[1] is task:
++                self.lora_publication_controls.pop(key)
++
++    def _settle_publication_unload(self, key, task):
++        # Keep failed/unknown unloads owned; only confirmed success is compacted.
++        if task.cancelled() or task.exception() is not None or not task.result().success:
++            return
++        self.lora_publication_unloaded.add(key)
++        self.lora_publication_unloads.pop(key, None)
 +
 +    def _publication_result(self, record):
 +        return UpdateLoRAFromDistributedReqOutput(
@@ -2426,10 +2441,15 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
 +    async def _update_lora_from_distributed_unload(self, obj):
 +        self._ensure_lora_publication_state()
 +        key = (obj.lora_name, obj.attempt_id)
++        if key in self.lora_publication_unloaded:
++            return UpdateLoRAFromDistributedReqOutput(success=True)
 +        task = self.lora_publication_unloads.get(key)
 +        if task is None:
 +            task = asyncio.create_task(self._unload_publication_once(obj))
 +            self.lora_publication_unloads[key] = task
++            task.add_done_callback(
++                lambda done: self._settle_publication_unload(key, done)
++            )
 +        # A disconnected control caller must not cancel wait_for_unload after
 +        # unregister, letting a duplicate request skip the native refcount wait.
 +        return await asyncio.shield(task)
@@ -2459,12 +2479,22 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
 +            result = _merge_lora_update_results(
 +                await self.update_lora_adapter_communicator(obj)
 +            )
++            if result.success and attempt_id is not None:
++                # The closed-attempt fence rejects late Begin/Bucket/End requests;
++                # full manifests, signatures and completed tasks are no longer needed.
++                self.lora_publication_unloaded.add((obj.lora_name, attempt_id))
++                self.lora_publications.pop((obj.lora_name, attempt_id), None)
++                for control_key, (_, task) in tuple(
++                    self.lora_publication_controls.items()
++                ):
++                    if control_key[:2] == (obj.lora_name, attempt_id) and task.done():
++                        self._forget_closed_control(control_key, task)
 +            return result
 +
      async def unload_lora_adapter(
          self: TokenizerManager,
          obj: UnloadLoRAAdapterReqInput,
-@@ -796,6 +1344,19 @@
+@@ -796,6 +1374,19 @@
      ):
          self.auto_create_handle_loop()
          await self.resume_memory_occupation_communicator(obj)
@@ -2935,7 +2965,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
  
          self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
  
-@@ -1183,9 +1184,389 @@
+@@ -1183,9 +1184,382 @@
              lora_ref, tensors, config_dict, added_tokens_config
          )
  
@@ -3060,7 +3090,6 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 +            # local attempt. It only answers RPCs that belong to that very attempt and
 +            # never revives it, so a late bucket is drained and reported rather than
 +            # mistaken for a brand new session.
-+            self.staged_lora_terminal: Optional[Tuple[str, int, str]] = None
 +            self.staged_lora_terminals = {}
 +            self.staged_lora_attempts = {}
 +            self.staged_lora_unloaded = set()
@@ -3068,11 +3097,6 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 +    def _discard_staged_lora(self, state: Optional[str] = None) -> None:
 +        self._ensure_staged_lora_state()
 +        if self.staged_lora_key is not None:
-+            self.staged_lora_terminal = (
-+                self.staged_lora_key[0],
-+                self.staged_lora_key[1],
-+                state or "ABORTED",
-+            )
 +            self.staged_lora_terminals[self.staged_lora_key] = state or "ABORTED"
 +        self.staged_lora_key = None
 +        self.staged_lora_buckets.clear()
@@ -3282,7 +3306,6 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
 +        if attempt_id is not None:
 +            self.staged_lora_attempts[name] = max(attempt_id, latest or attempt_id)
 +            self.staged_lora_terminals[key] = "ABORTED"
-+            self.staged_lora_terminal = (name, attempt_id, "ABORTED")
 +        if self.staged_lora_key is not None and self.staged_lora_key[0] == name:
 +            self._discard_staged_lora()
 +        result = self.lora_manager.unload_lora_adapter_by_name(name)
@@ -3325,7 +3348,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
  
      @property
      def effective_max_total_num_tokens(self):
-@@ -1441,6 +1822,12 @@
+@@ -1441,6 +1815,12 @@
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
  
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -3338,7 +3361,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1448,7 +1835,7 @@
+@@ -1448,7 +1828,7 @@
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -3347,7 +3370,7 @@ diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/sr
                  no_copy_to_cpu=no_copy_to_cpu,
              )
  
-@@ -1456,7 +1843,7 @@
+@@ -1456,7 +1836,7 @@
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,

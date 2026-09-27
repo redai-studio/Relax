@@ -1269,3 +1269,50 @@ async def test_finish_retains_session_after_unconfirmed_lora_release_and_can_ret
     assert await shard._finish_session(session, None) is None
     assert not shard._session_records
     assert not core.session_bindings
+
+
+async def test_background_cleanup_failure_is_visible_and_public_drop_can_retry() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    changes = []
+    shard._notify_state_change = lambda group=None: changes.append(group)
+    shard._session_records = {session.session_id: session}
+    group = session.group
+    group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    # This is the path used by the process watcher for infrastructure failures.
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard._handle_infra_failure(session, RuntimeError("agent failed"))
+    assert group.first_error() is session.cleanup_error
+    assert not group.terminal
+    assert changes[-1] is group
+    health = await shard.health()
+    assert not health["ok"]
+    assert session.session_id in health["cleanup_errors"]
+    with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+        shard._raise_group_error(group)
+
+    # Exercise the public method, including its shared drop_task, not just _finish_session.
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard.drop_group(group.group_id)
+    assert shard._groups[group.group_id] is group
+    assert session.session_id in shard._session_records
+    assert core.session_bindings
+    registry.release = _RegistryCall(registry._release)
+    await asyncio.gather(shard.drop_group(group.group_id), shard.drop_group(group.group_id))
+    assert not shard._groups
+    assert not shard._session_records
+    assert not core.session_bindings
+    assert session.cleanup_error is None
+    assert (await shard.health())["ok"]
+    await shard.drop_group(group.group_id)

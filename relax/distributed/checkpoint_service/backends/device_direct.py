@@ -782,12 +782,9 @@ class DeviceDirectBackend(CommBackend):
             try:
                 if not self._versioned_lora:
                     self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
-                elif self._lora_sync.base_sync_done:
-                    self._publish_lora_adapter_versioned()
                 else:
-                    # Base synchronization is paused during bootstrap; publication still
-                    # uses the same staged identity and READY checks as later versions.
-                    self._bootstrap_lora_adapter_versioned()
+                    # Bootstrap and later versions share the staged publication protocol.
+                    self._publish_lora_adapter_versioned()
             except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
                 logger.exception("LoRA adapter push failed; resuming generation before aborting")
                 push_error = e
@@ -1427,11 +1424,6 @@ class DeviceDirectBackend(CommBackend):
             outcome.bucket_count,
             bucket_cap / 1024**2,
         )
-
-    def _bootstrap_lora_adapter_versioned(self) -> None:
-        """Use the same verified staged protocol for the first immutable
-        version."""
-        self._publish_lora_adapter_versioned()
 
 
 class _StagedEngineFanout:

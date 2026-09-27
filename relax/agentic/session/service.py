@@ -1428,6 +1428,9 @@ class ResidentGroup:
         return all(cell.terminal for cell in self.result_cells.values())
 
     def first_error(self) -> Optional[RuntimeGroupError]:
+        for session in self.sessions:
+            if session.cleanup_error is not None:
+                return session.cleanup_error
         for cell in self.result_cells.values():
             if isinstance(cell.payload, RuntimeGroupError):
                 return cell.payload
@@ -1456,6 +1459,7 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    cleanup_error: Optional[RuntimeGroupError] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
     #: Immutable LoRA version this Session generates with. Bound once, on the first
@@ -1873,7 +1877,9 @@ class AgenticSessionShard:
         if group is None:
             # Driver cancellation may retry after the remote release committed.
             return
-        if group.drop_task is None:
+        if group.drop_task is None or (
+            group.drop_task.done() and (group.drop_task.cancelled() or group.drop_task.exception() is not None)
+        ):
             group.drop_task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
@@ -1974,8 +1980,12 @@ class AgenticSessionShard:
         """Project liveness from the Shard's current Session refs."""
 
         sessions = tuple(self._session_records.values())
+        cleanup_errors = {
+            session.session_id: str(session.cleanup_error) for session in sessions if session.cleanup_error
+        }
         return {
-            "ok": True,
+            "ok": not cleanup_errors,
+            "cleanup_errors": cleanup_errors,
             "active_sessions": len(sessions),
             "active_requests": sum(len(session.live_irs) for session in sessions),
             "forest_nodes": sum(
@@ -2036,6 +2046,9 @@ class AgenticSessionShard:
             "ready_for_lease": group.ownership is GroupOwnership.PREPARE and group.first_request_barrier_crossed,
             "interrupted": group.interrupted,
             "terminal": group.terminal,
+            "cleanup_errors": {
+                session.session_id: str(session.cleanup_error) for session in sessions if session.cleanup_error
+            },
         }
 
     async def _shutdown(self) -> None:
@@ -3020,11 +3033,28 @@ class AgenticSessionShard:
             ):
                 session.phase = SessionPhase.FINALIZING
                 finish_task = asyncio.create_task(
-                    self._finish_session_once(session, outcome),
+                    self._finish_session_with_status(session, outcome),
                     name=f"session-finish:{session.session_id}",
                 )
                 session.finish_task = finish_task
         return await asyncio.shield(finish_task)
+
+    async def _finish_session_with_status(
+        self,
+        session: _SessionRecord,
+        outcome: _SessionResultPayload,
+    ) -> Optional[BaseException]:
+        """Publish cleanup failures from the owner, even if a waiter
+        disconnects."""
+
+        try:
+            return await self._finish_session_once(session, outcome)
+        except Exception as error:
+            session.cleanup_error = RuntimeGroupError(
+                f"Session cleanup failed for {session.session_id}: {type(error).__name__}: {error}"
+            )
+            self._notify_state_change(session.group)
+            raise
 
     async def _finish_session_once(
         self,
@@ -3086,6 +3116,7 @@ class AgenticSessionShard:
         # No future tool turn and no live runner can use this Session's LoRA version:
         # the Registry may now reclaim it once it is retired.
         await self._release_session_lora_ref(session)
+        session.cleanup_error = None
         del self._session_records[session.session_id]
 
         cleanup_error = next(
@@ -3127,11 +3158,11 @@ class AgenticSessionShard:
             return_exceptions=True,
         )
         await asyncio.gather(*watcher_tasks, return_exceptions=True)
-        self._groups.pop(group_id, None)
-        self._notify_state_change()
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
+        self._groups.pop(group_id, None)
+        self._notify_state_change()
 
 
 def create_agentic_session_shards(

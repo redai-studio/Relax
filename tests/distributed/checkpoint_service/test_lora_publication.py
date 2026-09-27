@@ -59,6 +59,7 @@ class _FakeEngines:
         self.events: List[Tuple[str, str, Any]] = []
         self.replies: Dict[Tuple[str, str], EngineReply] = {}
         self.identities = {}
+        self.collective_participants = set()
         self.silent: set = set()  # engines that never answer
 
     def fail(self, op: str, engine_id: str, ambiguous: bool = False, message: str = "nope") -> None:
@@ -66,6 +67,13 @@ class _FakeEngines:
 
     def fire(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         op = payload.get("op", "legacy")
+        if op == "bucket":
+            self.collective_participants = {
+                engine
+                for engine in self.engine_ids
+                if engine not in self.silent
+                and (self.replies.get((engine, op), EngineReply(True)).success or self.replies[(engine, op)].ambiguous)
+            }
         for engine_id in self.engine_ids:
             if op == "begin":
                 self.identities[engine_id] = dict(payload)
@@ -74,6 +82,10 @@ class _FakeEngines:
 
     def broadcast(self, names: Sequence[str], index: int) -> None:
         self.events.append(("broadcast", str(index), tuple(names)))
+        if self.collective_participants != set(self.engine_ids):
+            # A pre-receive refusal means one NCCL participant never enters.
+            # Model its failure instead of allowing an impossible successful broadcast.
+            raise RuntimeError("collective missing a receiver")
 
     def collect(self, pending: Dict[str, Any]) -> Dict[str, EngineReply]:
         replies: Dict[str, EngineReply] = {}
@@ -311,8 +323,9 @@ class TestFailureSemantics:
         assert "engine0:unload" in engines.ops()
         assert registry.status().versions[2]["state"] == VersionState.FAILED_FATAL.value
 
-    def test_bucket_failure_settles_on_the_cleanup_verdict(self, registry):
-        """F7/§13.2: a rejected bucket aborts the attempt, keeping the old default."""
+    def test_bucket_rejected_before_receive_is_fatal_and_keeps_capacity(self, registry):
+        """A receiver that skips NCCL cannot yield a clean, retryable
+        transfer."""
 
         a = _publish_a(registry)
         engines = _FakeEngines()
@@ -320,9 +333,11 @@ class TestFailureSemantics:
 
         with pytest.raises(LoRAPublicationError) as error:
             _publisher(engines, registry).publish(_snapshot(), [1, 1])
-        assert error.value.kind == "RETRYABLE"
+        assert error.value.kind == "FATAL"
         assert "engine0:end" not in engines.ops()
+        assert "engine0:unload" not in engines.ops()
         assert registry.status().default_version == a
+        assert registry.status().capacity_owning == 2
 
     def test_capacity_is_refused_before_any_begin(self, registry):
         """F13: two live versions, so a third never reaches the wire."""

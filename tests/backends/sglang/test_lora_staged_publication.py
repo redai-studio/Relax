@@ -201,7 +201,7 @@ class TestStagedStateMachine(unittest.TestCase):
         self.assertEqual(lora_ref.lora_id, "id-1")
         # READY_LOCAL: the candidate is gone but must not be revivable.
         self.assertIsNone(rank.rank.staged_lora_key)
-        self.assertEqual(rank.rank.staged_lora_terminal, ("v1", 1, "READY_LOCAL"))
+        self.assertEqual(rank.rank.staged_lora_terminals[("v1", 1)], "READY_LOCAL")
 
     def test_buckets_must_arrive_in_bucket_order(self):
         rank = _StagedRank()
@@ -258,7 +258,7 @@ class TestStagedStateMachine(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIsNot(result.clean, False)
         self.assertEqual(rank.lora_manager.loaded, [])
-        self.assertEqual(rank.rank.staged_lora_terminal, ("v1", 1, "ABORTED"))
+        self.assertEqual(rank.rank.staged_lora_terminals[("v1", 1)], "ABORTED")
         self.assertFalse(rank.end("v1", 1, _checksums(tensors)).success)
 
     def test_end_without_manifest_is_refused_before_loading(self):
@@ -716,3 +716,104 @@ def test_cancelled_bucket_waiter_keeps_one_engine_owned_receive():
         assert (await engine.control("end")).success
 
     asyncio.run(run())
+
+
+def test_confirmed_unload_compacts_controls_and_rejects_late_publication():
+    async def run():
+        engine = _ProtocolTokenizer()
+        for attempt in range(1, 6):
+            assert (await engine.control("begin", attempt)).success
+            assert (await engine.control("bucket", attempt)).success
+            assert (await engine.control("end", attempt)).success
+            assert engine.lora_publications
+            assert len(engine.lora_publication_controls) == 3
+            assert (await engine.control("unload", attempt)).success
+            await asyncio.sleep(0)
+            assert not engine.lora_publications
+            assert not engine.lora_publication_controls
+            assert not engine.lora_publication_unloads
+            before = list(engine.operations)
+            assert (await engine.control("unload", attempt)).success
+            for op in ("begin", "bucket", "end"):
+                assert not (await engine.control(op, attempt)).success
+            assert engine.operations == before
+        assert len(engine.worker.lora_manager.unloaded_names) == 5
+
+    asyncio.run(run())
+
+
+def test_unconfirmed_unload_retains_full_publication_record():
+    async def run():
+        engine = _ProtocolTokenizer()
+        assert (await engine.control("begin")).success
+        assert (await engine.control("bucket")).success
+        assert (await engine.control("end")).success
+        original = engine.update_lora_adapter_communicator
+
+        async def fail_unload(obj):
+            if obj.op == "unload":
+                return [LoRAUpdateOutput(success=False, clean=False, error_message="unknown unload")]
+            return await original(obj)
+
+        engine.update_lora_adapter_communicator = fail_unload
+        assert not (await engine.control("unload")).success
+        assert engine.lora_publications
+        assert engine.lora_publication_controls
+        assert engine.lora_publication_unloads
+        assert not engine.lora_publication_unloaded
+
+    asyncio.run(run())
+
+
+def test_receiver_incarnation_change_cannot_complete_source_collective():
+    import pytest
+
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+    from relax.distributed.checkpoint_service.lora_publication import (
+        EngineReply,
+        LoRAPublicationError,
+        LoRAPublisher,
+        materialize_adapter_snapshot,
+    )
+    from tests.agentic.lora_helpers import commit_ready
+
+    registry = LoRAVersionRegistry(deployment_epoch="test")
+    old = registry.allocate("a" * 64)
+    commit_ready(registry, old.version_id, old.attempt_id)
+    engines = {name: _ProtocolTokenizer() for name in ("engine0", "engine1")}
+    pending_bucket = {}
+
+    def fire(endpoint, payload):
+        pending = {name: dict(payload) for name in engines}
+        if payload["op"] == "bucket":
+            engines["engine1"].lora_engine_incarnation = "restarted-engine"
+            pending_bucket.update(pending)
+        return pending
+
+    def collect(pending):
+        replies = {}
+        for name, payload in pending.items():
+            result = asyncio.run(
+                engines[name].update_lora_from_distributed(UpdateLoRAFromDistributedReqInput(**payload))
+            )
+            replies[name] = EngineReply(
+                result.success, ambiguous=result.clean is False, receipt=result.publication_receipt
+            )
+        return replies
+
+    def broadcast(names, index):
+        # Real receiver validation runs here. CPU receives record participation;
+        # the source must not complete when any receiver refused before entry.
+        collect(pending_bucket)
+        counts = [len(engine.worker.receive_calls) for engine in engines.values()]
+        assert counts == [1, 0]
+        raise RuntimeError("collective cannot complete with a missing receiver")
+
+    publisher = LoRAPublisher(fire=fire, collect=collect, broadcast=broadcast, registry=registry)
+    snapshot = materialize_adapter_snapshot(ADAPTER_CONFIG, {"a": torch.ones(2)})
+    with pytest.raises(LoRAPublicationError) as error:
+        publisher.publish(snapshot, [1])
+    assert error.value.kind == "FATAL"
+    assert registry.default_version == old.version_id
+    assert registry.status().capacity_owning == 2
+    assert all("unload" not in engine.operations for engine in engines.values())
