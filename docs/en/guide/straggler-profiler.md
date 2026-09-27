@@ -1,5 +1,7 @@
 # Straggler Profiler
 
+The training metrics path does not emit per-verdict text logs. Configure the straggler output directory to retain detailed verdict JSONL records; stage groups can be derived from the recorded raw stage. Without an output directory, scalar platform metrics remain available, but automatic detailed stage logs are not retained. Status reads still acquire shared locks; this is not a claim of wait-free execution.
+
 The straggler profiler observes Megatron training-timer intervals across data-parallel ranks and reports when one rank is slow relative to equivalent peers.
 
 ## What the straggler profiler is

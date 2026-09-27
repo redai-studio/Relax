@@ -320,7 +320,7 @@ class TimingCollector:
         stay pending until the batch bound, an explicit :meth:`report` or
         :meth:`flush`/close.
         """
-        return self.report(flush=False)
+        return self.status()
 
     def drain_verdicts(self) -> List[Verdict]:
         """Return and clear verdicts not yet consumed by the caller."""

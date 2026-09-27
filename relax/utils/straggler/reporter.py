@@ -423,11 +423,8 @@ def build_metrics(runtime: Any) -> Dict[str, float]:
     except Exception:
         _count_failure()
         return {}
-    try:
-        _log_stage_groups(verdicts)
-    except Exception:
-        # A logging failure must not cost the caller its metrics.
-        _count_failure()
+    # Detailed verdicts are retained by the collector's bounded JSONL buffer.
+    # Never call synchronous logging handlers on the training metrics path.
     return metrics
 
 

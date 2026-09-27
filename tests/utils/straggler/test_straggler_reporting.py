@@ -55,6 +55,16 @@ def _prefixed(name: str) -> str:
     return f"{STRAGGLER_METRIC_PREFIX}{name}"
 
 
+def test_metrics_never_call_synchronous_logging(monkeypatch):
+    log = Mock(side_effect=AssertionError("training path attempted logging"))
+    monkeypatch.setattr(reporter.logger, "info", log)
+    metrics = reporter.build_metrics(
+        StubRuntime({}, [{"kind": "straggler", "rank": 3, "deviation": 1.0, "facts": {"stage": "backward-compute"}}])
+    )
+    assert metrics[_prefixed("confirmed_straggler_rank")] == 3
+    log.assert_not_called()
+
+
 def test_build_metrics_emits_only_prefixed_scalars() -> None:
     runtime = StubRuntime(
         {

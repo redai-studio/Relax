@@ -217,6 +217,8 @@ def test_reporter_logs_the_raw_name_and_coarse_stage_together(
 
     with caplog.at_level("INFO"):
         metrics = reporter.build_metrics(_StubRuntime([verdict]))
+        assert caplog.text == ""
+        reporter._log_stage_groups([verdict])
 
     assert "name=backward-compute coarse_stage=backward" in caplog.text
     # Metrics stay numeric: a string must not leak into a metrics backend.
@@ -234,7 +236,7 @@ def test_reporter_labels_an_unclassified_stage_as_other(
     }
 
     with caplog.at_level("INFO"):
-        reporter.build_metrics(_StubRuntime([verdict]))
+        reporter._log_stage_groups([verdict])
 
     assert "coarse_stage=other" in caplog.text
     assert "coarse_stage=attention" not in caplog.text

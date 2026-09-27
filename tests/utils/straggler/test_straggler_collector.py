@@ -151,11 +151,13 @@ class TestTimingCollector:
         assert collector.status()["write_errors"] >= 1
         assert collector.status()["envelopes"] == 1
 
-    def test_periodic_report_emits_a_summary(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_training_ingest_is_quiet_but_explicit_report_logs(self, caplog: pytest.LogCaptureFixture) -> None:
         collector = make_collector(report_interval_seconds=0.0)
 
         with caplog.at_level("INFO"):
             collector.ingest(make_envelope(0, 100.0))
+            assert caplog.text == ""
+            collector.report()
 
         assert "straggler[" in caplog.text
         assert collector.status()["reports"] >= 1
@@ -502,14 +504,17 @@ class TestBufferedPersistence:
         assert len(lines) == WRITE_BATCH
         assert collector.status()["flushed_lines"] >= WRITE_BATCH
 
-    def test_summary_does_not_flush_but_report_does(self, tmp_path: Path) -> None:
+    def test_summary_does_not_flush_but_report_does(self, tmp_path: Path, caplog) -> None:
         collector = make_collector(output_dir=str(tmp_path))
         envelope_file = tmp_path / "straggler_envelopes.jsonl"
 
         collector.ingest(make_envelope(0, 100.0))
         assert envelope_file.read_text(encoding="utf-8") == ""
 
-        collector.summary()
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            collector.summary()
+        assert caplog.text == ""
         assert envelope_file.read_text(encoding="utf-8") == ""
         assert collector.status()["pending_lines"][str(envelope_file)] == 1
 
