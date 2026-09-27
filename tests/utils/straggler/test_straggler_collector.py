@@ -8,7 +8,7 @@ import threading
 import time
 from itertools import count
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -462,6 +462,32 @@ def _wait_until(predicate: Any, timeout: float = 3.0, interval: float = 0.01) ->
     return predicate()
 
 
+def _call_bounded(fn: Callable[[], Any], timeout_s: float) -> Tuple[bool, Any]:
+    """Run ``fn`` on a helper thread and return ``(completed, value-or-
+    error)``.
+
+    A metrics read that blocks behind a stuck writer or callback never returns,
+    so the isolation regressions cannot call it directly: the wait must be
+    bounded and a block reported instead of hanging the suite.
+    """
+    box: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = fn()
+        except Exception as exc:  # reported to the test, never raised here
+            box["error"] = exc
+
+    helper = threading.Thread(target=runner, daemon=True)
+    helper.start()
+    helper.join(timeout_s)
+    if "value" in box:
+        return True, box["value"]
+    if "error" in box:
+        return True, box["error"]
+    return False, None
+
+
 class TestBufferedPersistence:
     """The consumer can run on the training thread, so writes are batched."""
 
@@ -520,3 +546,121 @@ class TestBufferedPersistence:
 
         collector.report()
         assert envelope_file.read_text(encoding="utf-8").strip()
+
+
+class TestStateLockIsolation:
+    """File writes and verdict callbacks must never run under the state lock.
+
+    ``summary``/``status`` are the training thread's metrics reads and they
+    take the same lock as ``ingest``. The locked section used to also perform
+    the batch flush (``_append`` -> ``_flush_path`` -> ``_write_batch``) and
+    invoke the external ``on_verdict`` callback, so a stuck disk write or a
+    blocked callback froze every metrics read for its whole duration. The
+    regressions pin the isolation: persistence and callbacks are deferred until
+    the lock is released.
+    """
+
+    def test_blocked_batch_write_does_not_block_summary(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A disk write stuck mid-batch must not freeze the metrics read."""
+        from relax.utils.straggler.collector import WRITE_BATCH
+
+        collector = make_collector(output_dir=str(tmp_path))
+        write_entered = threading.Event()
+        release_write = threading.Event()
+        original = collector._write_batch
+
+        def stuck_write_batch(path: str, lines: List[str]) -> None:
+            write_entered.set()
+            release_write.wait(timeout=30.0)
+            original(path, lines)
+
+        monkeypatch.setattr(collector, "_write_batch", stuck_write_batch)
+
+        def ingest_batch() -> None:
+            for _ in range(WRITE_BATCH):
+                collector.ingest(make_envelope(0, 100.0))
+
+        worker = threading.Thread(target=ingest_batch, name="lock-write", daemon=True)
+        worker.start()
+        try:
+            assert write_entered.wait(timeout=5.0), "the batch write never started"
+            completed, summary = _call_bounded(collector.summary, timeout_s=2.0)
+            assert completed, "summary() blocked behind the stuck batch write"
+            assert summary["envelopes"] == WRITE_BATCH
+        finally:
+            release_write.set()
+            worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        lines = (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == WRITE_BATCH
+
+    def test_persistence_failure_is_a_write_error_and_keeps_the_verdicts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A raise inside the batch flush must not unwind the locked section.
+
+        The flush used to run inside ``ingest``'s locked section, so a raise
+        there was misfiled as an ingest error and the packet's detector
+        observation was skipped with it. The deferred flush counts the failure
+        as a write error and returns the verdicts undisturbed.
+        """
+        monkeypatch.setattr("relax.utils.straggler.collector.WRITE_BATCH", 2)
+        collector = make_collector(output_dir=str(tmp_path))
+
+        def exploding_write_batch(path: str, lines: List[str]) -> None:
+            raise OSError("the disk went away")
+
+        monkeypatch.setattr(collector, "_write_batch", exploding_write_batch)
+
+        returned: List[Any] = []
+
+        def feed() -> None:
+            for window in range(3):
+                for rank, host_ms in ((0, 100.0), (1, 100.0), (2, 300.0)):
+                    returned.extend(collector.ingest(make_envelope(rank, host_ms, window_start_s=window)))
+
+        worker = threading.Thread(target=feed, name="lock-write-fail", daemon=True)
+        worker.start()
+        worker.join(timeout=10.0)
+        assert not worker.is_alive(), "ingest did not survive the persistence failure"
+
+        status = collector.status()
+        assert returned, "verdicts were lost to the persistence failure"
+        assert any(verdict.kind == VERDICT_STRAGGLER for verdict in returned)
+        assert status["ingest_errors"] == 0
+        assert status["write_errors"] >= 1
+        assert status["judged_packets"] == 9
+
+    def test_blocked_verdict_callback_does_not_block_summary(self) -> None:
+        """A blocked external callback must not freeze the metrics read."""
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        seen: List[Any] = []
+
+        def blocking_callback(verdict: Any) -> None:
+            seen.append(verdict)
+            callback_entered.set()
+            release_callback.wait(timeout=30.0)
+
+        config = StragglerConfig(enabled=True, window_seconds=1.0, warmup_windows=0, persist_windows=1)
+        collector = TimingCollector(config, identity=None, on_verdict=blocking_callback)
+
+        def feed() -> None:
+            for window in range(3):
+                for rank, host_ms in ((0, 100.0), (1, 100.0), (2, 300.0)):
+                    collector.ingest(make_envelope(rank, host_ms, window_start_s=window))
+
+        worker = threading.Thread(target=feed, name="lock-callback", daemon=True)
+        worker.start()
+        try:
+            assert callback_entered.wait(timeout=5.0), "the verdict callback never ran"
+            completed, summary = _call_bounded(collector.summary, timeout_s=2.0)
+            assert completed, "summary() blocked behind the stuck verdict callback"
+            assert summary["verdicts"] >= 1
+        finally:
+            release_callback.set()
+            worker.join(timeout=10.0)
+        assert not worker.is_alive()
+        assert seen
+        assert collector.status()["verdicts"] == len(seen)
+        assert any(verdict.kind == VERDICT_STRAGGLER for verdict in seen)

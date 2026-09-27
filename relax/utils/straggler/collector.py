@@ -104,7 +104,11 @@ class TimingCollector:
         # so without this the detector's window close could race a concurrent
         # ``_Window.add`` (dropping a window's verdicts with only a log line)
         # and the dedup tracker's expiry walk could raise and silently forget a
-        # key. Re-entrant because ``_maybe_report`` re-enters ``status``.
+        # key. Re-entrant because ``_maybe_report`` re-enters ``status``. The
+        # lock is never held across a file write or an external verdict
+        # callback: both are deferred past the locked section, so a stuck disk
+        # or a blocked callback cannot freeze the training thread's
+        # ``summary``/``status`` reads.
         self._state_lock = threading.RLock()
         #: Thread that constructed the collector (the actor's training thread).
         #: Ingest from this thread must not write files.
@@ -151,11 +155,17 @@ class TimingCollector:
         packet is counted and dropped), and only then the detector. The method
         is the consumer of both the observer thread and the socket reader, so
         it never raises, whatever the input.
+
+        Persistence and verdict callbacks are deferred until the state lock is
+        released: a stuck disk write or a blocked external callback must never
+        hold up the training thread's :meth:`summary`/:meth:`status` reads.
         """
+        dirty_paths: List[str] = []
+        pending_callbacks: List[Verdict] = []
         with self._state_lock:
             self._counters["envelopes"] += 1
             try:
-                verdicts = self._ingest_checked(envelope)
+                verdicts = self._ingest_checked(envelope, dirty_paths, pending_callbacks)
             except Exception:
                 self._counters["ingest_errors"] += 1
                 verdicts = []
@@ -163,9 +173,13 @@ class TimingCollector:
                 self._maybe_report()
             except Exception:
                 self._counters["ingest_errors"] += 1
+        self._flush_dirty(dirty_paths)
+        self._invoke_callbacks(pending_callbacks)
         return verdicts
 
-    def _ingest_checked(self, envelope: Any) -> List[Verdict]:
+    def _ingest_checked(
+        self, envelope: Any, dirty_paths: List[str], pending_callbacks: List[Verdict]
+    ) -> List[Verdict]:
         """Run the validation/dedup gates and judge a packet that passes."""
         ok, _reason = protocol.validate(envelope)
         if not ok:
@@ -179,32 +193,37 @@ class TimingCollector:
             self._counters["late_packets"] += 1
             return []
         self._counters["judged_packets"] += 1
-        self._append(self._envelope_path, getattr(envelope, "to_json", None))
+        self._append(self._envelope_path, getattr(envelope, "to_json", None), dirty_paths)
         verdicts = self._detector.observe(envelope)
-        self._handle(verdicts)
+        self._handle(verdicts, dirty_paths, pending_callbacks)
         return verdicts
 
-    def _handle(self, verdicts: List[Verdict]) -> None:
-        """Retain, persist and forward verdicts."""
+    def _handle(self, verdicts: List[Verdict], dirty_paths: List[str], pending_callbacks: List[Verdict]) -> None:
+        """Retain verdicts, buffer their lines and schedule their callbacks.
+
+        Nothing here touches a file or an external callback directly: a ready
+        batch only marks its path dirty (drained once the caller leaves the
+        locked section), and the verdict callback is collected for the same
+        reason — running it under the state lock would let one blocked callback
+        freeze every :meth:`summary`/:meth:`status` read.
+        """
         for verdict in verdicts:
             self._counters["verdicts"] += 1
             self._verdicts.append(verdict)
-            self._append(self._verdict_path, verdict.to_json)
+            self._append(self._verdict_path, verdict.to_json, dirty_paths)
             if self._on_verdict is not None:
-                try:
-                    self._on_verdict(verdict)
-                except Exception:
-                    self._counters["verdict_callback_errors"] += 1
+                pending_callbacks.append(verdict)
 
-    def _append(self, path: Optional[str], serialiser: Any) -> None:
+    def _append(self, path: Optional[str], serialiser: Any, dirty_paths: List[str]) -> None:
         """Buffer one JSONL line, counting (not raising) a failure.
 
         Appending is safe from any thread: the pending buffer and its counter
         updates are guarded by a lock that is released before any file is
-        touched. A batch is only written when the caller is *not* the training
-        thread, so the training path never performs file I/O; lines that pile
-        up there are capped by :data:`MAX_PENDING_LINES` and drained by the
-        background/close paths.
+        touched. A full batch never writes here — it only marks its path dirty
+        so the caller can flush once the state lock is released; the training
+        thread never marks anything, so its lines stay capped by
+        :data:`MAX_PENDING_LINES` until a background thread or an explicit
+        ``report``/``flush``/close drains them.
         """
         if not self._writers_ready or not path or serialiser is None:
             return
@@ -225,11 +244,43 @@ class TimingCollector:
                 self._counters["pending_line_drops"] += overflow
             batch_ready = len(pending) >= WRITE_BATCH and not self._on_training_thread()
         if batch_ready:
-            self._flush_path(path)
+            dirty_paths.append(path)
 
     def _on_training_thread(self) -> bool:
         """Return whether the caller is the thread that built the collector."""
         return threading.get_ident() == self._training_thread_id
+
+    def _flush_dirty(self, dirty_paths: List[str]) -> None:
+        """Drain the batches that filled up during a locked section.
+
+        Runs with the state lock released, so a slow or stuck disk cannot block
+        the training thread's metrics reads. A failure is counted as a write
+        error instead of raised: ``ingest`` never raises, and the packet has
+        already been judged — re-raising here would only lose the return value
+        for no diagnostic gain.
+        """
+        for path in dirty_paths:
+            try:
+                self._flush_path(path)
+            except Exception:
+                with self._state_lock:
+                    self._counters["write_errors"] += 1
+
+    def _invoke_callbacks(self, pending_callbacks: List[Verdict]) -> None:
+        """Run the verdict callbacks scheduled during a locked section.
+
+        Runs with the state lock released so one blocked external callback
+        cannot freeze every :meth:`summary`/:meth:`status` read; a failing
+        callback is counted, never raised.
+        """
+        if not pending_callbacks or self._on_verdict is None:
+            return
+        for verdict in pending_callbacks:
+            try:
+                self._on_verdict(verdict)
+            except Exception:
+                with self._state_lock:
+                    self._counters["verdict_callback_errors"] += 1
 
     def _flush_path(self, path: str) -> None:
         """Write the buffered lines of one file in a single call.
@@ -315,10 +366,11 @@ class TimingCollector:
     def summary(self) -> Dict[str, Any]:
         """Return the summary without flushing persistence.
 
-        This is the training-thread-safe accessor: it performs no file I/O, so
-        a per-rollout metrics read cannot block the step. The buffered lines
-        stay pending until the batch bound, an explicit :meth:`report` or
-        :meth:`flush`/close.
+        This is the training-thread-safe accessor: it performs no file I/O and
+        cannot be held up by a stuck persistence write or a blocked verdict
+        callback (both run outside the state lock), so a per-rollout metrics
+        read cannot block the step. The buffered lines stay pending until the
+        batch bound, an explicit :meth:`report` or :meth:`flush`/close.
         """
         return self.status()
 
@@ -331,11 +383,16 @@ class TimingCollector:
 
     def flush(self) -> List[Verdict]:
         """Close open windows, handle the verdicts and persist everything."""
+        dirty_paths: List[str] = []
+        pending_callbacks: List[Verdict] = []
         with self._state_lock:
             verdicts = self._detector.flush()
-            self._handle(verdicts)
-        # The file write stays outside the state lock: a training-thread ingest
-        # must never wait behind background I/O.
+            self._handle(verdicts, dirty_paths, pending_callbacks)
+        # The external callback and the file writes stay outside the state
+        # lock: a training-thread ingest must never wait behind background
+        # I/O, and a blocked callback must never freeze metrics reads.
+        self._invoke_callbacks(pending_callbacks)
+        self._flush_dirty(dirty_paths)
         self._flush_writers()
         return verdicts
 
