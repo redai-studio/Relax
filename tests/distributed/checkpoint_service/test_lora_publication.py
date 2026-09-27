@@ -492,3 +492,18 @@ class TestReplaySafety:
             _publisher(engines, registry).publish(_snapshot(), [1, 1])
         assert registry.default_version is None
         assert registry.versions[1].state is VersionState.FAILED_FATAL
+
+
+def test_replaying_reclaimed_snapshot_does_not_broadcast_or_change_default(registry):
+    engines = _FakeEngines()
+    publisher = _publisher(engines, registry)
+    snapshot = _snapshot()
+    a = publisher.publish(snapshot, [1, 1])
+    b = publisher.publish(_snapshot({"changed": torch.ones(2)}), [1])
+    assert registry.versions[a.version_id].state is VersionState.RECLAIMED
+    engines.events.clear()
+    replay = publisher.publish(snapshot, [1, 1])
+    assert replay.status == "NO_OP"
+    assert replay.version_id == a.version_id
+    assert registry.default_version == b.version_id
+    assert engines.events == []

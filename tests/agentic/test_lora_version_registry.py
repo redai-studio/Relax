@@ -307,3 +307,21 @@ def test_direct_retry_cannot_bypass_unconfirmed_other_version(registry):
         registry.retry_publication(a.version_id, DIGEST_A)
     assert error.value.code == "PUBLICATION_BLOCKED"
     assert registry.versions[a.version_id].current_attempt_id == 1
+
+
+@pytest.mark.parametrize("state", ["retired", "reclaiming", "reclaimed"])
+def test_completed_publication_replay_never_rolls_back_default(registry, state):
+    a = publish(registry, DIGEST_A)
+    b = publish(registry, DIGEST_B)
+    if state != "retired":
+        registry.claim_reclaimable()
+    if state == "reclaimed":
+        registry.mark_reclaimed(a.version_id)
+    before = registry.status().capacity_owning
+    for replay in (registry.allocate(DIGEST_A), registry.retry_publication(a.version_id, DIGEST_A)):
+        assert replay.no_op
+        assert replay.version_id == a.version_id
+        assert registry.default_version == b.version_id
+        assert registry.status().capacity_owning == before
+    with pytest.raises(LoRAVersionError, match="digest"):
+        registry.retry_publication(a.version_id, DIGEST_C)

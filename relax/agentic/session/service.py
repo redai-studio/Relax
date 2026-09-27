@@ -2513,10 +2513,19 @@ class AgenticSessionShard:
             # Converge an in-flight first bind before releasing, so the ref cannot be
             # recorded after the release (which would leak it forever).
             await asyncio.gather(binding_task, return_exceptions=True)
-        try:
-            await registry.release.remote(session.session_id)
-        except Exception as error:  # noqa: BLE001 - Registry loss is run-fatal, not Session-fatal
-            logger.warning("Failed to release LoRA version ref for %s: %s", session.session_id, error)
+        # release is idempotent, including when an earlier ACK was lost. Do not
+        # retire the local record until the Registry confirms the release.
+        for attempt in range(3):
+            try:
+                await registry.release.remote(session.session_id)
+                return
+            except Exception as error:  # noqa: BLE001 - retain ownership on an unconfirmed release
+                if attempt == 2:
+                    raise RuntimeGroupError(
+                        f"LoRA reference release unconfirmed for {session.session_id}; Session retained for retry"
+                    ) from error
+                logger.warning("Retrying LoRA version ref release for %s: %s", session.session_id, error)
+                await asyncio.sleep(0.1 * (attempt + 1))
 
     async def _run_ir(
         self,
@@ -3006,7 +3015,9 @@ class AgenticSessionShard:
 
         async with session.lock:
             finish_task = session.finish_task
-            if finish_task is None:
+            if finish_task is None or (
+                finish_task.done() and (finish_task.cancelled() or finish_task.exception() is not None)
+            ):
                 session.phase = SessionPhase.FINALIZING
                 finish_task = asyncio.create_task(
                     self._finish_session_once(session, outcome),

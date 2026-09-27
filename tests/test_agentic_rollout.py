@@ -16,6 +16,7 @@ import pytest
 from relax.agentic.pipeline import (
     GroupExport,
     GroupInput,
+    RuntimeGroupError,
     SampleExport,
     SessionExport,
 )
@@ -1221,3 +1222,50 @@ async def test_versioned_generation_does_not_retry_lost_http_response(monkeypatc
             lora_path="relax_policy_lora@epoch-1-digest",
         )
     assert len(calls) == 1
+
+
+async def test_lora_release_retries_lost_ack_without_leaking_ref() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    calls = 0
+
+    async def release(session_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        core.release(session_id)
+        if calls == 1:
+            raise RuntimeError("lost release ACK")
+
+    registry.release = _RegistryCall(release)
+    await shard._release_session_lora_ref(session)
+    assert calls == 2
+    assert not core.session_bindings
+
+
+async def test_finish_retains_session_after_unconfirmed_lora_release_and_can_retry() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._notify_state_change = lambda group=None: None
+    shard._session_records = {session.session_id: session}
+    session.group.sessions.append(session)
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard._finish_session(session, None)
+    assert session.session_id in shard._session_records
+    assert core.session_bindings
+    registry.release = _RegistryCall(registry._release)
+    assert await shard._finish_session(session, None) is None
+    assert not shard._session_records
+    assert not core.session_bindings

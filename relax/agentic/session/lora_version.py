@@ -241,8 +241,14 @@ class LoRAVersionRegistry:
         self._require_known_fleet()
         live = self._version_by_digest(digest)
 
-        if live is not None and live.state is VersionState.PUBLISHED:
-            # Exact content replay of the live default: no export, no transport, no commit.
+        if live is not None and live.state in {
+            VersionState.PUBLISHED,
+            VersionState.RETIRED,
+            VersionState.RECLAIMING,
+            VersionState.RECLAIMED,
+        }:
+            # Completed publications remain idempotency records after retirement.
+            # A replay must neither reload resources nor roll back the default.
             return self._publication(live, no_op=True)
 
         if live is not None and live.state is VersionState.LOADING:
@@ -272,11 +278,12 @@ class LoRAVersionRegistry:
         return self._publication(entry)
 
     def _version_by_digest(self, digest: str) -> Optional[VersionEntry]:
-        """Newest non-reclaimed version carrying ``digest``."""
+        """Remember content identity even after its resources have been
+        reclaimed."""
 
         for version_id in sorted(self.versions, reverse=True):
             entry = self.versions[version_id]
-            if entry.digest == digest and entry.state is not VersionState.RECLAIMED:
+            if entry.digest == digest:
                 return entry
         return None
 
@@ -294,7 +301,12 @@ class LoRAVersionRegistry:
                 "VERSION_CONFLICT",
                 f"version {version_id} already holds a different digest",
             )
-        if entry.state is VersionState.PUBLISHED:
+        if entry.state in {
+            VersionState.PUBLISHED,
+            VersionState.RETIRED,
+            VersionState.RECLAIMING,
+            VersionState.RECLAIMED,
+        }:
             return self._publication(entry, no_op=True)
         if entry.state is not VersionState.FAILED_RETRYABLE:
             raise LoRAVersionError(

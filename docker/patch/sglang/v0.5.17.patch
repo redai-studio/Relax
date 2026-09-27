@@ -2485,10 +2485,9 @@ diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sgla
      async def check_weights(
          self: TokenizerManager,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 80351f3..965a603 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -96,7 +96,10 @@ from sglang.srt.managers.schedule_batch import (
+@@ -96,7 +96,10 @@
      get_request_return_hidden_states_mode,
  )
  from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -2500,7 +2499,30 @@ index 80351f3..965a603 100644
  from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
  from sglang.srt.managers.utils import (
      compute_num_reserved_tokens,
-@@ -625,6 +628,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -200,6 +203,14 @@
+ 
+ 
+ @dataclasses.dataclass
++class RequestLoRARef:
++    """One native acquire, shared by a logical request and its sampling children."""
++
++    lora_id: str
++    owners: int = 1
++
++
++@dataclasses.dataclass
+ class ReqState:
+     """Store the state a request."""
+ 
+@@ -213,6 +224,7 @@
+     abort_requested: bool = False
+     lifecycle_id: object = dataclasses.field(default_factory=object)
+     dispatched: bool = False
++    lora_ref: Optional[RequestLoRARef] = None
+     last_completion_tokens: int = 1
+     ttft_observed: bool = False
+ 
+@@ -625,6 +637,17 @@
          # Please note that, unlike `model_update_lock`, this does not block inference, allowing
          # LoRA updates and inference to overlap.
          self.lora_update_lock = asyncio.Lock()
@@ -2518,18 +2540,42 @@ index 80351f3..965a603 100644
          # A cache for mapping the lora_name for LoRA adapters that have been loaded at any
          # point to their latest LoRARef objects, so that they can be
          # dynamically loaded if needed for inference
-@@ -2010,6 +2024,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -1645,11 +1668,8 @@
+             # Delete the key to prevent resending abort request to the scheduler and
+             # to ensure aborted request state is cleaned up.
+             if state.obj.rid in self.rid_to_state:
+-                self._remove_req_state(state.obj.rid)
+-
+-            # Mark ongoing LoRA request as finished.
+-            if self.enable_lora and state.obj.lora_path:
+-                await self.lora_registry.release(state.obj.lora_id)
++                self._remove_req_state(state.obj.rid, state.lifecycle_id)
++
+             if not is_stream:
+                 raise fastapi.HTTPException(
+                     status_code=finish_reason["status_code"],
+@@ -2009,6 +2029,10 @@
+         # Immediately update the weights if the engine is in paused state
          async with self.is_pause_cond:
              is_paused = self.is_pause
- 
++
 +        refusal = self._reject_if_staged_lora_pending("full-weight update from disk")
 +        if refusal:
 +            return False, refusal, 0
-+
+ 
          lock_context = (
              self.model_update_lock.writer_lock if not is_paused else nullcontext()
-         )
-@@ -2840,27 +2858,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+@@ -2453,9 +2477,6 @@
+ 
+                 self._remove_req_state(rid)
+ 
+-                # Mark ongoing LoRA request as finished.
+-                if self.enable_lora and state.obj.lora_path:
+-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+ 
+             if out_dict is not None:
+                 state.out_list.append(out_dict)
+@@ -2840,27 +2861,25 @@
              priority = getattr(state.obj, "priority", None)
              if priority is not None:
                  labels["priority"] = str(priority)
@@ -2566,48 +2612,112 @@ index 80351f3..965a603 100644
  
          if state.finished:
              # Get detailed cache breakdown if available
-@@ -3497,6 +3513,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                 for logical_rid in self._logical_rids(obj)
-                 if (state := self.rid_to_state.get(logical_rid)) is not None
-             }
-+        # The LoRA reference acquired for a request is normally released when its
-+        # output arrives (or when the scheduler reports an abort). A request dropped
-+        # here never gets either -- the state is gone before the answer comes back --
-+        # so its reference has to be released now. Otherwise the adapter's refcount
-+        # never reaches zero and `wait_for_unload` blocks an unload forever.
-+        released_lora_ids = []
-         for logical_rid in self._logical_rids(obj):
+@@ -3337,6 +3356,12 @@
+ 
+         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
+         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
++        # Record ownership on the lifecycle, not on the caller's mutable payload.
++        # Sampling children share this acquire until their last terminal reply.
++        lora_ids = obj.lora_id if isinstance(obj.lora_id, list) else [obj.lora_id]
++        for rid, lora_id in zip(self._logical_rids(obj), lora_ids):
++            if lora_id is not None:
++                self.rid_to_state[rid].lora_ref = RequestLoRARef(lora_id)
+         # Propagate lora_id to any sub-objects already cached by __getitem__.
+         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+             sub_obj.lora_id = (
+@@ -3375,6 +3400,10 @@
+             request,
+             lifecycle_id=logical_state.lifecycle_id,
+         )
++        child_state = self.rid_to_state[obj.rid]
++        child_state.lora_ref = logical_state.lora_ref
++        if child_state.lora_ref is not None:
++            child_state.lora_ref.owners += 1
+         try:
+             self._register_child_rid(logical_rid, obj.rid)
+         except BaseException:
+@@ -3393,6 +3422,12 @@
+         ):
+             return None
+         self.rid_to_state.pop(rid)
++        lora_ref = state.lora_ref
++        state.lora_ref = None
++        if lora_ref is not None:
++            lora_ref.owners -= 1
++            if lora_ref.owners == 0:
++                asyncio.create_task(self.lora_registry.release(lora_ref.lora_id))
+         logical_rid = self.child_rid_to_logical_rid.pop(rid, None)
+         if logical_rid is not None:
+             children = self.logical_rid_to_child_rids.get(logical_rid)
+@@ -3485,11 +3520,11 @@
+         obj,
+         lifecycle_ids: Optional[Dict[str, object]] = None,
+     ):
+-        """Drop all logical and child state owned by *obj*.
+-
+-        Safe to call after a partial/failed dispatch: only requests known to have
+-        reached the scheduler are aborted, all owned state is removed, and a later
+-        output for a discarded RID is ignored by the scheduler-response path.
++        """Discard undispatched state; retain dispatched owners until terminal ACK.
++
++        Sending abort is not confirmation of termination. Even if that send fails,
++        the scheduler may still use the adapter, so its state and reference stay
++        live. Keeping the RID reserved also fences reuse before a late response.
+         """
+         if lifecycle_ids is None:
+             lifecycle_ids = {
+@@ -3501,36 +3536,24 @@
              lifecycle_id = lifecycle_ids.get(logical_rid)
              if lifecycle_id is None:
-@@ -3510,6 +3532,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-                 )
-             )
-             logical_state = self.rid_to_state.get(logical_rid)
-+            # The logical state owns the reference; fall back to a child when the logical
-+            # state was already reaped (parallel sampling reaps it after dispatching).
-+            lora_ref_owner = logical_state
-+            if lora_ref_owner is None and child_rids:
-+                lora_ref_owner = self.rid_to_state[child_rids[0]]
-+            if (
-+                self.enable_lora
-+                and lora_ref_owner is not None
-+                and getattr(lora_ref_owner.obj, "lora_path", None)
-+            ):
-+                released_lora_ids.append(lora_ref_owner.obj.lora_id)
-             owns_logical_state = (
-                 logical_state is not None and logical_state.lifecycle_id is lifecycle_id
-             )
-@@ -3531,6 +3564,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
-             for child_rid in child_rids:
-                 self._remove_req_state(child_rid, lifecycle_id)
-             self._remove_req_state(logical_rid, lifecycle_id)
-+        for lora_id in released_lora_ids:
-+            if lora_id is not None:
-+                asyncio.create_task(self.lora_registry.release(lora_id))
+                 continue
+-            child_rids = tuple(
+-                child_rid
+-                for child_rid in self.logical_rid_to_child_rids.get(logical_rid, ())
+-                if (
+-                    (state := self.rid_to_state.get(child_rid)) is not None
+-                    and state.lifecycle_id is lifecycle_id
+-                )
+-            )
+-            logical_state = self.rid_to_state.get(logical_rid)
+-            owns_logical_state = (
+-                logical_state is not None and logical_state.lifecycle_id is lifecycle_id
+-            )
+-            target_rids = tuple(
+-                rid for rid in child_rids if self.rid_to_state[rid].dispatched
+-            )
+-            if not child_rids and owns_logical_state and logical_state.dispatched:
+-                target_rids = (logical_rid,)
+-            for target_rid in target_rids:
++            owned_rids = (
++                logical_rid,
++                *tuple(self.logical_rid_to_child_rids.get(logical_rid, ())),
++            )
++            for rid in owned_rids:
++                state = self.rid_to_state.get(rid)
++                if state is None or state.lifecycle_id is not lifecycle_id:
++                    continue
++                state.abort_requested = True
++                if not state.dispatched:
++                    self._remove_req_state(rid, lifecycle_id)
++                    continue
+                 try:
+-                    self._dispatch_to_scheduler(
+-                        AbortReq(rid=target_rid, abort_all=False)
+-                    )
++                    self._dispatch_to_scheduler(AbortReq(rid=rid, abort_all=False))
+                 except Exception:
+                     logger.exception(
+-                        "Failed to abort request rid=%s",
+-                        target_rid,
++                        "Failed to abort request rid=%s; retaining its reference", rid
+                     )
+-            for child_rid in child_rids:
+-                self._remove_req_state(child_rid, lifecycle_id)
+-            self._remove_req_state(logical_rid, lifecycle_id)
  
      def _should_dispatch_to_encoder(
          self, obj: Union[GenerateReqInput, EmbeddingReqInput]
-@@ -3731,7 +3767,14 @@ def _get_processor_wrapper(server_args):
+@@ -3731,7 +3754,14 @@
  
  
  def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
