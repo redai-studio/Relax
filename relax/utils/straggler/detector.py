@@ -152,6 +152,11 @@ REASON_WITHIN_TOLERANCE = "within_tolerance"
 REASON_COHORT_BELOW_MIN_SIZE = "cohort_below_min_size"
 REASON_BELOW_ABSOLUTE_FLOOR = "below_absolute_floor"
 REASON_WORKLOAD_INCOMPARABLE = "workload_incomparable"
+#: A rank is currently flagged but this window produced no evidence able to
+#: confirm OR clear the flag (workload incomparable, effective class too
+#: small, or below the absolute floor). The flag is held, never silently
+#: converted into a recovery.
+REASON_RECOVERY_EVIDENCE_INSUFFICIENT = "recovery_evidence_insufficient"
 
 #: Which clocks produced a verdict.
 MEASUREMENT_HOST_ONLY = "host_only"
@@ -564,6 +569,11 @@ class StragglerDetector:
             "single_rank_windows": 0,
             "stragglers_reported": 0,
             "recoveries_reported": 0,
+            # Windows in which a flagged rank's evidence was insufficient to
+            # confirm OR clear the flag: the flag was held and the verdict was
+            # the explicit "recovery_evidence_insufficient" uncertain, never a
+            # recovery.
+            "recovery_evidence_withheld": 0,
             # Malformed input and window-close failures are their own thing; they
             # are NOT "uncertain judgements" (which counts uncertain verdicts).
             "observe_errors": 0,
@@ -966,9 +976,30 @@ class StragglerDetector:
             # than the configured minimum (the uncertain verdict for that case
             # is emitted in the branch chain below).
             effective_class_ok = len(reference_ranks[rank]) >= self._config.min_cohort_size
-            judged_slow = slow and not below_floor and rank_beyond[rank] is not True and effective_class_ok
-            streak = self._streak.get(key, 0) + 1 if judged_slow else 0
+            # Recovery requires comparable evidence that is back within
+            # tolerance. ``below_floor`` deliberately does NOT gate this: the
+            # floor exists to keep jitter-level GAPS from convicting (a slow
+            # rank on a short stage), while a rank back at par has no gap at
+            # all — and its absolute delta is ~0, which is always below the
+            # floor, so including it here would make recovery unreachable.
+            # A window without comparable evidence (own workload
+            # incomparable, or the effective class too small) HOLDS the streak
+            # and the active flag instead of clearing them: unobservable is
+            # "unknown", never "recovered". The pre-fix code reset the streak
+            # whenever the rank was not judged slow, so one unusable window
+            # silently cleared an active alert.
+            comparable_evidence = rank_beyond[rank] is not True and effective_class_ok
+            judged_slow = slow and not below_floor and comparable_evidence
+            if comparable_evidence:
+                streak = self._streak.get(key, 0) + 1 if judged_slow else 0
+            else:
+                streak = self._streak.get(key, 0)  # hold: no evidence to change the state
             self._set_streak(key, streak)
+            if key in self._active and not comparable_evidence:
+                # A flagged rank whose evidence went unusable this window: the
+                # flag is held (streak unchanged, alert stays live) whichever
+                # uncertain verdict explains why below.
+                self._counters["recovery_evidence_withheld"] += 1
             if slow and rank_beyond[rank] is True:
                 self._counters["uncertain_judgements"] += 1
                 verdicts.append(
@@ -1003,7 +1034,11 @@ class StragglerDetector:
             # first crossed, not "not currently in the active set": the active
             # set is capped, and an evicted-but-still-slow key used to be
             # counted as a fresh onset (double counting one stall).
-            if streak == onset_streak:
+            if judged_slow and streak == onset_streak:
+                # Onset requires POSITIVE evidence too: a held streak that
+                # happens to equal the onset threshold during an unusable
+                # window must not re-fire (that would double-count one stall
+                # and convict on a window that could not judge).
                 _evict_set_to_cap(self._active, MAX_ACTIVE_ENTRIES, self._counters, "active_evictions")
                 self._active.add(key)
                 self._counters["stragglers_reported"] += 1
@@ -1013,11 +1048,37 @@ class StragglerDetector:
                     else (REASON_GPU_STREAM_STALL if stream_visible else REASON_ATTRIBUTION_UNKNOWN)
                 )
                 verdicts.append(build(rank, VERDICT_STRAGGLER, deviation, streak, host_only, reason, label))
-            elif streak == 0 and key in self._active:
+            elif streak == 0 and key in self._active and comparable_evidence:
+                # streak == 0 with comparable evidence is a real measured
+                # recovery: the rank was judged and is back within tolerance.
+                # The explicit comparable_evidence guard also covers the
+                # cap-eviction edge (streak entry evicted while the active
+                # flag remains): there the held streak reads 0, and an
+                # unusable window must still not convert that into a recovery.
                 self._active.discard(key)
                 self._counters["recoveries_reported"] += 1
                 verdicts.append(
                     build(rank, VERDICT_RECOVERED, deviation, streak, False, REASON_WITHIN_TOLERANCE, label)
+                )
+            elif key in self._active and not comparable_evidence and not slow:
+                # Flagged, this window cannot judge, and the rank is NOT slow
+                # (the slow-and-unusable cases already emitted their uncertain
+                # verdicts in the branch chain above, and must not get a
+                # second one): without this branch, a flagged rank whose
+                # reference class shrank for one window used to lose its alert
+                # with a "within_tolerance" recovery it never earned.
+                self._counters["uncertain_judgements"] += 1
+                self._counters["recovery_evidence_withheld"] += 1
+                verdicts.append(
+                    build(
+                        rank,
+                        VERDICT_UNCERTAIN,
+                        deviation,
+                        streak,
+                        False,
+                        REASON_RECOVERY_EVIDENCE_INSUFFICIENT,
+                        label,
+                    )
                 )
         return verdicts
 
