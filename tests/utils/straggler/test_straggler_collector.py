@@ -178,6 +178,31 @@ class TestTimingCollector:
 
         assert collector.status()["open_windows"] == 0
 
+    def test_tail_window_requires_explicit_flush_after_reporting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        collector = make_collector(output_dir=str(tmp_path), persist_windows=2)
+        for window in range(2):
+            for rank, host_ms in ((0, 100.0), (1, 100.0), (2, 300.0)):
+                assert collector.ingest(make_envelope(rank, host_ms, window_start_s=window)) == []
+
+        # Advancing wall time and exporting a report does not close detector
+        # windows: no later envelope arrives to advance their watermark.
+        later = time.monotonic() + 100.0
+        with monkeypatch.context() as clock:
+            clock.setattr(time, "monotonic", lambda: later)
+            collector.report()
+        assert collector.status()["open_windows"] == 2
+        assert collector.status()["verdicts"] == 0
+
+        verdicts = collector.flush()
+        assert [(v.kind, v.rank, v.consecutive_windows) for v in verdicts] == [(VERDICT_STRAGGLER, 2, 2)]
+        assert collector.status()["open_windows"] == 0
+        assert collector.flush() == []
+        rows = (tmp_path / "straggler_verdicts.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(rows) == 1
+        assert json.loads(rows[0])["rank"] == 2
+
     def test_drain_verdicts_is_destructive(self) -> None:
         collector = make_collector()
         for window in range(3):

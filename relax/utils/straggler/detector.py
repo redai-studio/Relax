@@ -549,7 +549,10 @@ class StragglerDetector:
         self._config = config
         self._windows: Dict[int, _Window] = {}
         self._verdicts: Deque[Verdict] = deque()
-        self._streak: Dict[Tuple[str, str, int], int] = {}
+        # Count, last window and onset marker share one bound. Uncertainty
+        # breaks persistence without forgetting an already announced stall,
+        # even if its public active entry was evicted by the smaller cap.
+        self._streak: Dict[Tuple[str, str, int], Tuple[int, int, bool]] = {}
         self._epoch: Dict[int, float] = {}
         self._cohort_epoch: Dict[str, float] = {}
         self._active: Set[Tuple[str, str, int]] = set()
@@ -976,29 +979,22 @@ class StragglerDetector:
             # than the configured minimum (the uncertain verdict for that case
             # is emitted in the branch chain below).
             effective_class_ok = len(reference_ranks[rank]) >= self._config.min_cohort_size
-            # Recovery requires comparable evidence that is back within
-            # tolerance. ``below_floor`` deliberately does NOT gate this: the
-            # floor exists to keep jitter-level GAPS from convicting (a slow
-            # rank on a short stage), while a rank back at par has no gap at
-            # all — and its absolute delta is ~0, which is always below the
-            # floor, so including it here would make recovery unreachable.
-            # A window without comparable evidence (own workload
-            # incomparable, or the effective class too small) HOLDS the streak
-            # and the active flag instead of clearing them: unobservable is
-            # "unknown", never "recovered". The pre-fix code reset the streak
-            # whenever the rank was not judged slow, so one unusable window
-            # silently cleared an active alert.
+            # Onset persistence and an already active alert are separate:
+            # uncertainty breaks consecutive evidence, but cannot prove a
+            # recovery. The floor suppresses noisy convictions; recovery
+            # still requires a measured deviation within relative tolerance.
             comparable_evidence = rank_beyond[rank] is not True and effective_class_ok
             judged_slow = slow and not below_floor and comparable_evidence
-            if comparable_evidence:
-                streak = self._streak.get(key, 0) + 1 if judged_slow else 0
-            else:
-                streak = self._streak.get(key, 0)  # hold: no evidence to change the state
-            self._set_streak(key, streak)
-            if key in self._active and not comparable_evidence:
-                # A flagged rank whose evidence went unusable this window: the
-                # flag is held (streak unchanged, alert stays live) whichever
-                # uncertain verdict explains why below.
+            recovered = comparable_evidence and not slow
+            previous_streak, previous_window, announced = self._streak.get(key, (0, -1, key in self._active))
+            streak = 0
+            if judged_slow:
+                streak = previous_streak + 1 if previous_window == window.index - 1 else 1
+            onset = judged_slow and streak == onset_streak and not announced
+            self._set_streak(key, streak, window.index, (announced or onset) and not recovered)
+            if key in self._active and not judged_slow and not recovered:
+                # Count each withheld rank/window once, including sub-floor
+                # slow observations; the active flag remains latched.
                 self._counters["recovery_evidence_withheld"] += 1
             if slow and rank_beyond[rank] is True:
                 self._counters["uncertain_judgements"] += 1
@@ -1034,11 +1030,9 @@ class StragglerDetector:
             # first crossed, not "not currently in the active set": the active
             # set is capped, and an evicted-but-still-slow key used to be
             # counted as a fresh onset (double counting one stall).
-            if judged_slow and streak == onset_streak:
-                # Onset requires POSITIVE evidence too: a held streak that
-                # happens to equal the onset threshold during an unusable
-                # window must not re-fire (that would double-count one stall
-                # and convict on a window that could not judge).
+            if onset:
+                # Rebuilding a streak after uncertainty must not re-announce
+                # an alert that never recovered.
                 _evict_set_to_cap(self._active, MAX_ACTIVE_ENTRIES, self._counters, "active_evictions")
                 self._active.add(key)
                 self._counters["stragglers_reported"] += 1
@@ -1048,13 +1042,7 @@ class StragglerDetector:
                     else (REASON_GPU_STREAM_STALL if stream_visible else REASON_ATTRIBUTION_UNKNOWN)
                 )
                 verdicts.append(build(rank, VERDICT_STRAGGLER, deviation, streak, host_only, reason, label))
-            elif streak == 0 and key in self._active and comparable_evidence:
-                # streak == 0 with comparable evidence is a real measured
-                # recovery: the rank was judged and is back within tolerance.
-                # The explicit comparable_evidence guard also covers the
-                # cap-eviction edge (streak entry evicted while the active
-                # flag remains): there the held streak reads 0, and an
-                # unusable window must still not convert that into a recovery.
+            elif recovered and key in self._active:
                 self._active.discard(key)
                 self._counters["recoveries_reported"] += 1
                 verdicts.append(
@@ -1068,7 +1056,6 @@ class StragglerDetector:
                 # reference class shrank for one window used to lose its alert
                 # with a "within_tolerance" recovery it never earned.
                 self._counters["uncertain_judgements"] += 1
-                self._counters["recovery_evidence_withheld"] += 1
                 verdicts.append(
                     build(
                         rank,
@@ -1088,18 +1075,18 @@ class StragglerDetector:
             _evict_to_cap(self._labels, MAX_LABEL_ENTRIES, self._counters, "label_evictions")
         self._labels[key] = label
 
-    def _set_streak(self, key: Tuple[str, str, int], streak: int) -> None:
+    def _set_streak(self, key: Tuple[str, str, int], streak: int, window_index: int, announced: bool) -> None:
         """Update a persistence counter under the streak cap.
 
-        A zero streak is removed rather than stored, so the map holds only
-        ranks that are currently slow.
+        Keep a zero-count entry only while its announced stall has not
+        recovered. Eviction of this map explicitly forgets the whole state.
         """
-        if streak == 0:
+        if streak == 0 and not announced:
             self._streak.pop(key, None)
             return
         if key not in self._streak:
             _evict_to_cap(self._streak, MAX_STREAK_ENTRIES, self._counters, "streak_evictions")
-        self._streak[key] = streak
+        self._streak[key] = (streak, window_index, announced)
 
     def _verdict(self, **kwargs: Any) -> Verdict:
         """Build and retain a verdict under the verdict cap."""
