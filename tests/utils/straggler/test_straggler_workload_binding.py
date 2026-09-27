@@ -153,6 +153,86 @@ def test_envelope_carries_the_workload_of_the_interval_s_step() -> None:
         reset_training_context_for_tests()
 
 
+def test_completion_time_none_stays_none_forever() -> None:
+    """No context at completion: the envelope must stay workload-less even when
+    a context has appeared by the time the readback happens.
+
+    The pre-fix build-time fallback re-read the context on the readout thread,
+    so a ``None`` captured at completion was silently replaced by the LATER
+    step's context — exactly the cross-step contamination the binding fix
+    exists to prevent, reached through the None path.
+    """
+    reset_training_context_for_tests()
+    try:
+        delivered: List[TimingEnvelope] = []
+        backend = _HoldFirstBackend()
+        clock = _ManualClock()
+        observer = StragglerObserver(
+            _config(),
+            identity=_identity(),
+            backend=backend,
+            consumer=delivered.append,
+            poll_interval_s=0.0,
+            clock=clock,
+        )
+        timers = StragglerTimers(_config(), sink=observer, clock=clock)
+        # NO context published yet: completion-time capture is None.
+        timer = timers(STAGE_NAME, log_level=1)
+        clock.now = 0.10
+        timer.start()
+        clock.now = 0.12
+        timer.stop()
+        # A context APPEARS while the event is still unread.
+        publish_step_workload(7, [(100, 1, 1)])
+        set_training_context(7, 0)
+        time.sleep(0.05)
+        backend.released = True
+        _wait_until(lambda: len(delivered) >= 1, timeout=5.0)
+        observer.close()
+        assert delivered, "nothing was delivered"
+        assert delivered[0].workload is None, (
+            f"completion-time None was replaced at build time: {delivered[0].workload}"
+        )
+    finally:
+        reset_training_context_for_tests()
+
+
+def test_captured_value_survives_context_disappearance() -> None:
+    """Context present at completion, gone by readback: the captured value
+    stays."""
+    reset_training_context_for_tests()
+    try:
+        publish_step_workload(5, [(333, 3, 3)])
+        set_training_context(5, 0)
+        delivered: List[TimingEnvelope] = []
+        backend = _HoldFirstBackend()
+        clock = _ManualClock()
+        observer = StragglerObserver(
+            _config(),
+            identity=_identity(),
+            backend=backend,
+            consumer=delivered.append,
+            poll_interval_s=0.0,
+            clock=clock,
+        )
+        timers = StragglerTimers(_config(), sink=observer, clock=clock)
+        timer = timers(STAGE_NAME, log_level=1)
+        clock.now = 0.10
+        timer.start()
+        clock.now = 0.12
+        timer.stop()
+        reset_training_context_for_tests()  # context disappears before readback
+        time.sleep(0.05)
+        backend.released = True
+        _wait_until(lambda: len(delivered) >= 1, timeout=5.0)
+        observer.close()
+        assert delivered, "nothing was delivered"
+        assert delivered[0].workload is not None
+        assert delivered[0].workload.get("tokens") == 333
+    finally:
+        reset_training_context_for_tests()
+
+
 def test_binding_survives_across_distinct_published_steps() -> None:
     """Two intervals of two different steps must not swap their workloads."""
     reset_training_context_for_tests()

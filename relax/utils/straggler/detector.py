@@ -214,13 +214,22 @@ def _field_delta(
 
 
 def _workload_metric(workload: Any, field: str) -> Optional[float]:
-    """Read ONE workload field as a finite number, or ``None``.
+    """Read ONE workload field as a finite POSITIVE number, or ``None``.
 
     Scoring a workload by summing tokens + sequences + microbatches mixed
     incompatible units: a 2 % token difference could be cancelled by a 100 %
     sequence difference and the window would look comparable. Fields are kept
     separate now, and ``tokens`` is the primary measure because tokens dominate
     compute; sequences and microbatches are reported as evidence only.
+
+    A count field is valid only when it is a real number (booleans are rejected
+    even though ``bool`` subclasses ``int``), finite, and strictly positive.
+    Zero, negative, NaN/Inf, boolean and missing values all read as ``None``:
+    a degenerate workload is DEGRADED evidence for its own rank (the timing
+    verdict stands, ``workload_comparable=None``) and never poisons anybody
+    else's comparability — a single anomalous workload must not cost the whole
+    window. This rule also keeps every downstream division safe: peer values
+    that reach the pairwise comparability test are guaranteed ``> 0``.
     """
     if not isinstance(workload, dict):
         return None
@@ -228,7 +237,9 @@ def _workload_metric(workload: Any, field: str) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    return number if math.isfinite(number) else None
+    if not math.isfinite(number) or number <= 0.0:
+        return None
+    return number
 
 
 def _expected_cohort_size(envelope: Any) -> Optional[int]:
@@ -856,6 +867,13 @@ class StragglerDetector:
                 # all-ranks figures above are then evidence, not a baseline.
                 "reference_ranks": reference_ranks[rank],
                 "comparable_peers": [other for other in reference_ranks[rank] if other != rank],
+                # Raw topological coverage vs EFFECTIVE reference coverage are
+                # different quantities: coverage_ratio divides reporting ranks
+                # by the expected cohort; comparable_coverage_ratio divides the
+                # comparable class by the reporting ranks. A window can be
+                # fully reported yet split into small incomparable classes.
+                "comparable_class_size": len(reference_ranks[rank]),
+                "comparable_coverage_ratio": (len(reference_ranks[rank]) / cohort_size if cohort_size else None),
                 # Workload is reported next to the timing gap, never divided out.
                 # ``workload_reported`` records absence explicitly instead of
                 # letting it read as comparable, and ``workload_comparable``
@@ -900,9 +918,11 @@ class StragglerDetector:
             )
 
         if cohort_size < self._config.min_cohort_size:
-            # Too few peers to establish a peer median at all: no workload
-            # comparability claim is made, and each uncertain verdict is counted
-            # once.
+            # Too few REPORTING ranks to establish a peer median at all: no
+            # workload comparability claim is made, and each uncertain verdict
+            # is counted once. (This is the raw topological coverage gate; the
+            # per-rank effective-comparable-class gate runs in the judge loop
+            # below and uses the same configured minimum.)
             self._counters["uncertain_judgements"] += 1
             return [
                 build(
@@ -940,7 +960,13 @@ class StragglerDetector:
             # Only this rank's OWN incomparability withholds its verdict; a
             # peer's does not. A missing workload (``None``) is degraded
             # evidence, not an incomparability, so it does not withhold either.
-            judged_slow = slow and not below_floor and rank_beyond[rank] is not True
+            # The configured minimum cohort applies to the EFFECTIVE comparable
+            # class, not to the raw reporting count: a window fragmented into
+            # small comparable classes must not convict inside a class smaller
+            # than the configured minimum (the uncertain verdict for that case
+            # is emitted in the branch chain below).
+            effective_class_ok = len(reference_ranks[rank]) >= self._config.min_cohort_size
+            judged_slow = slow and not below_floor and rank_beyond[rank] is not True and effective_class_ok
             streak = self._streak.get(key, 0) + 1 if judged_slow else 0
             self._set_streak(key, streak)
             if slow and rank_beyond[rank] is True:
@@ -953,6 +979,17 @@ class StragglerDetector:
                 self._counters["sub_floor_judgements"] += 1
                 verdicts.append(
                     build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_BELOW_ABSOLUTE_FLOOR, label)
+                )
+            elif slow and len(reference_ranks[rank]) < self._config.min_cohort_size:
+                # Effective comparable class too small: the configured minimum
+                # applies to the peers a rank can actually be compared with,
+                # not to the raw number of reporting ranks. Four ranks split
+                # into two comparable pairs with min_cohort_size=4 must not
+                # convict either pair; the raw topological gate above already
+                # handled the too-few-reporting-ranks case.
+                self._counters["uncertain_judgements"] += 1
+                verdicts.append(
+                    build(rank, VERDICT_UNCERTAIN, deviation, 0, False, REASON_COHORT_BELOW_MIN_SIZE, label)
                 )
             rank_device = device_medians[rank]
             stream_visible = rank_device is not None and device_reference is not None

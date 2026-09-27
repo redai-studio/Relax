@@ -612,6 +612,11 @@ class StragglerObserver:
                     device_ms=None,
                     barrier=barrier,
                     reason="no_event_pair",
+                    # Captured HERE, at completion, on the training thread —
+                    # the host-only path builds the envelope immediately, but
+                    # the capture is still explicit so no build-time re-read
+                    # can ever bind a later step's context.
+                    workload=self._workload_from_context(),
                 )
                 # Device mode with a live readout thread: the finished
                 # envelope joins ``_pending`` so delivery stays in sequence
@@ -830,9 +835,13 @@ class StragglerObserver:
     ) -> TimingEnvelope:
         """Build an envelope carrying this process's identity.
 
-        ``workload`` is the step context captured at interval completion (on
-        the training thread); it defaults to ``None`` only for callers that
-        pre-captured it themselves.
+        ``workload`` is the step context the CALLER captured at interval
+        completion (``token.workload``, or the value just captured on the
+        host-only path). This method deliberately NEVER reads the context
+        itself: reading it here would silently re-bind envelopes whose
+        completion-time capture was ``None`` to whatever step is current at
+        build time — marrying step N's timing to step N+1's workload whenever
+        the readback lagged. A completion-time ``None`` stays ``None`` forever.
         """
         identity = self._identity
         return TimingEnvelope(
@@ -850,7 +859,7 @@ class StragglerObserver:
             barrier=barrier,
             reason=reason,
             measurement_kind=MEASUREMENT_HOST_ONLY if device_ms is None else MEASUREMENT_DEVICE,
-            workload=workload if workload is not None else self._workload_from_context(),
+            workload=workload,
         )
 
     @staticmethod
@@ -872,7 +881,15 @@ class StragglerObserver:
             current = snapshot()
         except Exception:
             return None
-        workload = {field: current.get(field) for field in WORKLOAD_FIELDS if isinstance(current.get(field), int)}
+        # Booleans are rejected even though ``bool`` subclasses ``int``: a
+        # ``tokens=True`` reading is a degenerate value, not one token. The
+        # detector independently rejects non-positive and non-finite counts,
+        # so a bad field reads as absent end-to-end.
+        workload = {
+            field: current.get(field)
+            for field in WORKLOAD_FIELDS
+            if isinstance(current.get(field), int) and not isinstance(current.get(field), bool)
+        }
         return workload or None
 
     def _deliver(self, envelope: TimingEnvelope) -> None:
