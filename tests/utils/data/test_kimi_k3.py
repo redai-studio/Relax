@@ -98,6 +98,33 @@ class _SegmentTokenizer:
         return "".join(inverse[token_id] if token_id in inverse else chr(token_id) for token_id in ids)
 
 
+def test_kimi_k3_raw_text_override_preserves_first_target_supervision(monkeypatch):
+    from relax.engine.sft.dataset import chat_template
+
+    class RawTokenizer(_SegmentTokenizer):
+        bos_token_id = 1
+        eos_token_id = 2
+
+        def __call__(self, text):
+            return {"input_ids": [self.bos_token_id, *text.encode()]}
+
+    def unexpected_chat_encoding(*args, **kwargs):
+        raise AssertionError("raw text override must bypass K3 chat encoding")
+
+    tokenizer = RawTokenizer()
+    assert is_kimi_k3_tokenizer(tokenizer)
+    monkeypatch.setenv("RELAX_SFT_RAW_TEXT_CONCAT", "1")
+    monkeypatch.setattr(chat_template, "encode_kimi_k3_sft", unexpected_chat_encoding)
+    sample = CanonicalSample(
+        [CanonicalMessage("user", "", False), CanonicalMessage("assistant", "a", True)],
+        metadata={"source_dataset": "test", "row_index": 0},
+    )
+    tokens, mask = chat_template.render_with_loss_mask(sample, tokenizer=tokenizer)
+    assert tokens.tolist() == [tokenizer.bos_token_id, ord("a")]
+    assert mask.tolist() == [0, 1]
+    assert tokens[1:][mask[1:].bool()].tolist() == [ord("a")]
+
+
 def _sample(messages):
     return CanonicalSample(messages, metadata={"source_dataset": "test", "row_index": 0})
 
