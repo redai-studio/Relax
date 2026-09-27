@@ -1,10 +1,44 @@
 # Task 4 GenRM elastic scaling — evidence manifest
 
+## Current conclusions (single source; every row names its exact versions)
+
+| Official criterion                                                | Current verdict                                   | Product SHA (exact)                  | Producing run → raw inputs (evidence branch @ [`66f1f78`](https://github.com/shanyulu/Relax/tree/66f1f786f2b04e2fed0d0ae65a1c4554223c78d2/demos/task4_genrm/results))                                                                                   | Superseded by                                                                                    |
+| ----------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| ① Manual scale `1→2→1` under load                                 | PASS (4,163 requests, 0 failures, GPUs returned)  | `a2ca6cb`                            | `e2e_genrm_scale` @ `a2ca6cb` (verdicts + per-request logs)                                                                                                                                                                                             | —                                                                                                |
+| ② Score consistency, no scale-time weight sync                    | PASS — final-code **reconfirmed**                 | `0481701` (PR-head product code)     | `reward_consistency_20260927_final_r6` (greedy identical, official sampling 0/50 instability, 800→attribution both engines) + `sampling_divergence_20260927_final_r4` (adversarial divergent-RNG-history 0/50); driver logs archived alongside verdicts | seed-contract chain @ `945741e` (superseded as final-code evidence, retained as mechanism proof) |
+| ③ Control contract (idempotency / 409 / 4xx / initial protection) | PASS (278 task-scoped CPU tests)                  | `0481701`                            | `tests/` in the PR; no GPU run required                                                                                                                                                                                                                 | —                                                                                                |
+| ④ Autoscaler automatic scaling                                    | PASS — final-code **reconfirmed** (14/14 frozen)  | `5c1e2e7`                            | `autoscaler_prereg_v2_20260926_final_r3` (frozen protocol; `_r2` FAIL + A/B isolation retained)                                                                                                                                                         | earlier rounds @ `fa3ca97`/`8b0c6fe` (superseded, retained)                                      |
+| ⑤ Training continuity through scaling                             | PASS as **run-continuity** (no performance claim) | `945741e` (run) + reanalysis tooling | `train_continuity_20260925_r5` → raw job log (sha256 `feb23ecc…`) + `reanalysis_v2.json` + `REANALYSIS_V2.md` (generated)                                                                                                                               | v1 hand analysis (superseded, retained)                                                          |
+| ＋ Failure recovery (drain/abort/kill)                            | PASS                                              | `e7224af`                            | `failure_injection_20260925_r2`                                                                                                                                                                                                                         | —                                                                                                |
+
+Reading rules: "0/50" means *no difference observed on the 50 fixed test inputs under this
+configuration* — it is not a claim over all inputs, hardware, concurrency levels or software
+versions. "No GenRM scale-time weight sync" refers to the **GenRM scaling path only**; the
+normal actor→rollout weight sync during training is pre-existing, required, and verified
+healthy (criterion ⑤). Criterion ⑤ is a continuity claim; no same-config no-scaling control
+run exists, so no performance-impact claim is made. The content-deterministic sampling
+semantics (identical content ⇒ identical stochastic verdict, across replicas AND repeated
+calls) is an implemented product contract pending explicit maintainer acceptance.
+
+## Scope commitments (what "final" promises, per judgment)
+
+| Capability                                                                                                                                                                            | Status                                                                                                                        |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Single-Gateway manual + automatic elastic scaling, single-GPU replicas, initial-engine protection, timeout fail-closed cleanup, Autoscaler integration, content-deterministic scoring | **Delivered in this PR** (criteria ①–⑤ above)                                                                                 |
+| Cross-Gateway / direct-client drain proof                                                                                                                                             | **Not implemented this phase** — interface and responsibility to be negotiated; no complete takeover commitment exists in #71 |
+| Manager-restart recovery of in-flight operations                                                                                                                                      | **Not implemented** (documented limit)                                                                                        |
+| Multi-GPU elastic replicas                                                                                                                                                            | **Not implemented** (documented limit)                                                                                        |
+
+______________________________________________________________________
+
+## Historical detail (per-run records; rows keep their own producing commits)
+
 Raw evidence (full run directories: per-request load logs, event timelines,
 scale histories, charts, TUI screenshots, failed and superseded intermediate
 rounds) is preserved on the
-[`evidence/task4-genrm` branch at commit `6b501a2`](https://github.com/shanyulu/Relax/tree/6b501a2483d84f29afc95b9d9c3c00066d104911/demos/task4_genrm/results)
-(immutable link; every path below resolves there). The PR itself carries only
+[`evidence/task4-genrm` branch at commit `66f1f78`](https://github.com/shanyulu/Relax/tree/66f1f786f2b04e2fed0d0ae65a1c4554223c78d2/demos/task4_genrm/results)
+(immutable link; every path below resolves there; later appends extend, never
+rewrite). The PR itself carries only
 the final machine-verdict summaries and the frozen preregistration documents,
 so the acceptance claims stay verifiable without large artifacts; every
 committed file is hash-pinned below. In the committed summaries, engine
@@ -13,20 +47,17 @@ committed file is hash-pinned below. In the committed summaries, engine
 data on the evidence branch keeps the original values.
 
 **Pinning policy**: each row binds its conclusion to the exact commit that
-produced the evidence (linked in the row; no relative references). The newest
-code exercised by any recorded acceptance run is the final-code Autoscaler
-confirmation head `5c1e2e7` (which includes the deterministic-attention
-fix); the seed-contract chain (score consistency, adversarial divergence,
-training smoke, training continuity) ran at `945741e`; earlier verdicts are
-pinned to their own producing commits. Rows linked to pre-fix commits document the
-review-response journey: every `relax/` change since the squash base
-(`fa3ca97`) is a review fix listed in the PR, and every affected acceptance
+produced the evidence (linked in the row; no relative references). The
+current-conclusions table above is the single authority for what the PR claims
+today; the rows below are the historical record of how each conclusion was
+reached, including superseded rounds. Every `relax/` change since the squash
+base (`fa3ca97`) is a review fix listed in the PR, and every affected acceptance
 dimension was re-run on the fixed code — the re-run verdicts
-(`*_r3`/`*_r5` directories) back the acceptance claims;
+(`*_r3`/`*_r5`/`*_r6`/`_r4` directories) back the acceptance claims;
 `git diff --stat <linked-commit>..<PR head> -- relax/` lists exactly the
 review fixes between a pinned commit and the head.
 
-## Passing runs
+## Passing runs (historical detail; superseded rows say so in-line)
 
 | Run                                                          | Code commit                                                                                                                                                                                                                | Verdict                      | Key checks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
