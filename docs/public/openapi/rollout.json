@@ -959,6 +959,10 @@
               }
             ],
             "title": "Error Message"
+          },
+          "cleanup_required": {
+            "type": "boolean",
+            "title": "Cleanup Required"
           }
         },
         "type": "object",
@@ -1113,6 +1117,10 @@
               }
             ],
             "title": "Weight Version"
+          },
+          "cleanup_required": {
+            "type": "boolean",
+            "title": "Cleanup Required"
           }
         },
         "type": "object",
