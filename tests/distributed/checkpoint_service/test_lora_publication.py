@@ -8,6 +8,7 @@ the version ended up — no engines, NCCL or Megatron involved.
 """
 
 import logging
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 import pytest
@@ -23,6 +24,7 @@ from relax.distributed.checkpoint_service.lora_publication import (
     EngineReply,
     LoRAPublicationError,
     LoRAPublisher,
+    RayLoRAVersionRegistryClient,
     classify_engine_response,
     materialize_adapter_snapshot,
 )
@@ -134,7 +136,7 @@ def _publisher(
 
 
 def _publish_a(registry: LoRAVersionRegistry) -> int:
-    publication = registry.allocate(DIGEST_A)
+    publication = registry.allocate(DIGEST_A, version_id=1)
     commit_ready(registry, publication.version_id, publication.attempt_id)
     return publication.version_id
 
@@ -193,7 +195,7 @@ class TestReplyClassification:
 class TestPublication:
     def test_happy_path_streams_buckets_between_begin_and_end(self, registry):
         engines = _FakeEngines()
-        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
 
         # One request per engine per phase, and the collective sits between fire and collect.
         assert engines.ops() == [
@@ -215,21 +217,21 @@ class TestPublication:
 
     def test_bucket_payload_carries_identity_and_metadata(self, registry):
         engines = _FakeEngines()
-        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         bucket = next(payload for kind, op, payload in engines.events if op == "engine0:bucket")
         assert bucket["lora_name"] == outcome.lora_name
         assert bucket["attempt_id"] == 1
         assert bucket["group_name"] == "slime-pp_0"
         assert len(bucket["names"]) == len(bucket["dtypes"]) == len(bucket["shapes"]) == bucket["bucket_sizes"][0]
 
-    def test_identical_content_is_a_no_op_without_any_transport(self, registry):
-        """F19: the second sync of the same adapter publishes nothing."""
+    def test_same_version_replay_is_a_no_op_without_any_transport(self, registry):
+        """F19: replaying the same publication sends nothing."""
 
         engines = _FakeEngines()
         snapshot = _snapshot()
-        first = _publisher(engines, registry).publish(snapshot, [1, 1])
+        first = _publisher(engines, registry).publish(snapshot, [1, 1], version_id=1)
         engines.events.clear()
-        second = _publisher(engines, registry).publish(snapshot, [1, 1])
+        second = _publisher(engines, registry).publish(snapshot, [1, 1], version_id=1)
 
         assert second.status == "NO_OP" and second.version_id == first.version_id
         assert engines.events == []
@@ -240,12 +242,12 @@ class TestPublication:
         reclaimed first."""
 
         engines = _FakeEngines()
-        a = registry.allocate(DIGEST_A)
+        a = registry.allocate(DIGEST_A, version_id=1)
         commit_ready(registry, a.version_id, a.attempt_id)
-        b = registry.allocate(DIGEST_B)
+        b = registry.allocate(DIGEST_B, version_id=2)
         commit_ready(registry, b.version_id, b.attempt_id)
 
-        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=3)
         assert outcome.status == "PUBLISHED"
         # A was reclaimed before the allocation and B right after the commit, so only C owns a slot.
         assert registry.status().versions[a.version_id]["state"] == VersionState.RECLAIMED.value
@@ -258,7 +260,7 @@ class TestPublication:
 
         engines = _FakeEngines()
         with caplog.at_level(logging.WARNING):
-            _publisher(engines, registry, bucket_cap=1024).publish(_snapshot(), [2])
+            _publisher(engines, registry, bucket_cap=1024).publish(_snapshot(), [2], version_id=1)
         assert "overlap is not structurally guaranteed" in caplog.text
 
 
@@ -271,7 +273,7 @@ class TestFailureSemantics:
         engines.fail("begin", "engine1", message="staged slot busy")
 
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=2)
         assert error.value.kind == "RETRYABLE"
         # No collective was ever started, and the cleanup covered both engines.
         assert "bucket" not in " ".join(engines.ops())
@@ -289,7 +291,7 @@ class TestFailureSemantics:
         publisher = _publisher(engines, registry)
 
         with pytest.raises(LoRAPublicationError) as error:
-            publisher.publish(_snapshot(), [1, 1])
+            publisher.publish(_snapshot(), [1, 1], version_id=2)
         assert error.value.kind == "FATAL"
         assert publisher._registry.status().versions[2]["state"] == VersionState.FAILED_FATAL.value
         with pytest.raises(LoRAVersionError):
@@ -303,7 +305,7 @@ class TestFailureSemantics:
         engines.fail("end", "engine1", message="checksum mismatch")
 
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=2)
         assert error.value.kind == "RETRYABLE"
         assert engines.ops()[-2:] == ["engine0:unload", "engine1:unload"]
         assert registry.status().default_version == a
@@ -317,7 +319,7 @@ class TestFailureSemantics:
         publisher = _publisher(engines, registry)
 
         with pytest.raises(LoRAPublicationError) as error:
-            publisher.publish(_snapshot(), [1, 1])
+            publisher.publish(_snapshot(), [1, 1], version_id=2)
         assert error.value.kind == "FATAL"
         # The healthy engine was still cleaned up (best effort), but nothing is called ABSENT.
         assert "engine0:unload" in engines.ops()
@@ -332,7 +334,7 @@ class TestFailureSemantics:
         engines.fail("bucket", "engine0", message="stale attempt id")
 
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=2)
         assert error.value.kind == "FATAL"
         assert "engine0:end" not in engines.ops()
         assert "engine0:unload" not in engines.ops()
@@ -343,11 +345,11 @@ class TestFailureSemantics:
         """F13: two live versions, so a third never reaches the wire."""
 
         _publish_a(registry)
-        registry.allocate(DIGEST_B)  # a second live version: no slot is free any more
+        registry.allocate(DIGEST_B, version_id=2)  # a second live version: no slot is free any more
         engines = _FakeEngines()
 
         with pytest.raises(LoRAVersionError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=3)
         assert error.value.code == "CAPACITY_ERROR"
         assert engines.events == []
 
@@ -359,7 +361,7 @@ class TestFailureSemantics:
         engines.fail("end", "engine1", message="manifest mismatch")
         snapshot = _snapshot()
         with pytest.raises(LoRAPublicationError):
-            _publisher(engines, registry).publish(snapshot, [1, 1])
+            _publisher(engines, registry).publish(snapshot, [1, 1], version_id=2)
         # The retry reuses the immutable name, so the cleanup must say *which* attempt
         # it is undoing; otherwise a late duplicate could strip the retry's instance.
         unloads = [payload for kind, op, payload in engines.events if kind == "fire" and op == "engine0:unload"]
@@ -367,7 +369,7 @@ class TestFailureSemantics:
 
         engines.replies.clear()
         engines.events.clear()
-        outcome = _publisher(engines, registry).publish(snapshot, [1, 1])
+        outcome = _publisher(engines, registry).publish(snapshot, [1, 1], version_id=2)
         assert outcome.version_id == 2
         begins = [payload for kind, op, payload in engines.events if op == "engine0:begin"]
         assert begins[0]["attempt_id"] == 2
@@ -381,10 +383,10 @@ class TestReclaim:
 
         engines = _FakeEngines()
         publisher = _publisher(engines, registry)
-        a = registry.allocate(DIGEST_A)
+        a = registry.allocate(DIGEST_A, version_id=1)
         commit_ready(registry, a.version_id, a.attempt_id)
         registry.bind_latest("s_old")
-        b = registry.allocate(DIGEST_B)
+        b = registry.allocate(DIGEST_B, version_id=2)
         commit_ready(registry, b.version_id, b.attempt_id)
 
         assert publisher.reclaim_once() is False
@@ -404,9 +406,9 @@ class TestReclaim:
 
         engines = _FakeEngines()
         publisher = _publisher(engines, registry)
-        a = registry.allocate(DIGEST_A)
+        a = registry.allocate(DIGEST_A, version_id=1)
         commit_ready(registry, a.version_id, a.attempt_id)
-        b = registry.allocate(DIGEST_B)
+        b = registry.allocate(DIGEST_B, version_id=2)
         commit_ready(registry, b.version_id, b.attempt_id)
 
         engines.fail("unload", "engine1", ambiguous=True, message="timeout")
@@ -425,7 +427,7 @@ class TestFleetContract:
 
         engines = _FakeEngines(engine_ids=())
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert error.value.kind == "FATAL"
         assert registry.status().default_version is None
 
@@ -433,7 +435,7 @@ class TestFleetContract:
 class TestBootstrap:
     def test_first_sync_uses_the_same_staged_protocol(self, registry):
         engines = _FakeEngines()
-        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1])
+        outcome = _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert outcome.status == "PUBLISHED"
         assert engines.ops()[:2] == ["engine0:begin", "engine1:begin"]
         assert engines.ops()[-2:] == ["engine0:status", "engine1:status"]
@@ -450,20 +452,20 @@ class TestReplaySafety:
         def broadcast(names, index):
             before = list(engines.events)
             with pytest.raises(LoRAVersionError) as error:
-                _publisher(engines, registry).publish(snapshot, [1, 1])
+                _publisher(engines, registry).publish(snapshot, [1, 1], version_id=1)
             assert error.value.code == "PUBLICATION_IN_PROGRESS"
             assert engines.events == before
             original(names, index)
 
         publisher._broadcast = broadcast
-        assert publisher.publish(snapshot, [1, 1]).status == "PUBLISHED"
+        assert publisher.publish(snapshot, [1, 1], version_id=1).status == "PUBLISHED"
         assert sum(event[0] == "broadcast" for event in engines.events) == 2
 
     def test_ambiguous_bucket_cannot_become_retryable_after_cleanup(self, registry):
         engines = _FakeEngines()
         engines.fail("bucket", "engine1", ambiguous=True, message="collective completion unknown")
         with pytest.raises(LoRAPublicationError) as error:
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert error.value.kind == "FATAL"
         assert registry.status().capacity_owning == 1
         assert registry.versions[1].state is VersionState.FAILED_FATAL
@@ -481,14 +483,14 @@ class TestReplaySafety:
 
         engines.collect = lose_bucket_reply
         with pytest.raises(LoRAPublicationError):
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert registry.default_version is None
         assert registry.versions[1].state is VersionState.FAILED_FATAL
 
     def test_single_engine_cannot_publish(self, registry):
         engines = _FakeEngines(engine_ids=("engine0",))
         with pytest.raises(LoRAPublicationError):
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert registry.default_version is None
         assert not any(event[0] == "broadcast" for event in engines.events)
 
@@ -504,7 +506,7 @@ class TestReplaySafety:
 
         engines.collect = restarted
         with pytest.raises(LoRAPublicationError):
-            _publisher(engines, registry).publish(_snapshot(), [1, 1])
+            _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
         assert registry.default_version is None
         assert registry.versions[1].state is VersionState.FAILED_FATAL
 
@@ -513,12 +515,105 @@ def test_replaying_reclaimed_snapshot_does_not_broadcast_or_change_default(regis
     engines = _FakeEngines()
     publisher = _publisher(engines, registry)
     snapshot = _snapshot()
-    a = publisher.publish(snapshot, [1, 1])
-    b = publisher.publish(_snapshot({"changed": torch.ones(2)}), [1])
+    a = publisher.publish(snapshot, [1, 1], version_id=1)
+    b = publisher.publish(_snapshot({"changed": torch.ones(2)}), [1], version_id=2)
     assert registry.versions[a.version_id].state is VersionState.RECLAIMED
     engines.events.clear()
-    replay = publisher.publish(snapshot, [1, 1])
+    replay = publisher.publish(snapshot, [1, 1], version_id=1)
     assert replay.status == "NO_OP"
     assert replay.version_id == a.version_id
     assert registry.default_version == b.version_id
     assert engines.events == []
+
+
+@pytest.mark.parametrize("retain_a", [False, True])
+def test_new_publication_can_restore_identical_historical_adapter(registry, retain_a):
+    engines = _FakeEngines()
+    publisher = _publisher(engines, registry)
+    snapshot = _snapshot()
+    a = publisher.publish(snapshot, [1, 1], version_id=1)
+    if retain_a:
+        registry.bind_latest("old-A")
+    b = publisher.publish(_snapshot({"changed": torch.ones(2)}), [1], version_id=2)
+    registry.bind_latest("old-B")
+    engines.events.clear()
+    if retain_a:
+        with pytest.raises(LoRAVersionError) as error:
+            publisher.publish(snapshot, [1, 1], version_id=3)
+        assert error.value.code == "CAPACITY_ERROR"
+        assert engines.events == []
+        registry.release("old-A")
+    collect = engines.collect
+
+    def check_default_before_commit(pending):
+        assert registry.default_version == b.version_id
+        return collect(pending)
+
+    engines.collect = check_default_before_commit
+    c = publisher.publish(snapshot, [1, 1], version_id=3)
+    assert c.status == "PUBLISHED" and c.version_id == 3
+    assert c.lora_name != a.lora_name
+    assert engines.ops().count("engine0:begin") == 1
+    assert sum(event[0] == "broadcast" for event in engines.events) == 2
+    assert registry.bind_latest("new").version_id == c.version_id
+    assert registry.bind_latest("old-B").version_id == b.version_id
+    assert registry.versions[a.version_id].state is VersionState.RECLAIMED
+    engines.events.clear()
+    for version_id in (1, 3):
+        assert publisher.publish(snapshot, [1, 1], version_id=version_id).status == "NO_OP"
+    assert registry.default_version == 3 and not engines.events
+
+
+def test_conflict_and_completed_replay_do_not_reclaim_unrelated_versions(registry):
+    engines = _FakeEngines()
+    publisher = _publisher(engines, registry)
+    snapshot = _snapshot()
+    publisher.publish(snapshot, [1, 1], version_id=1)
+    registry.bind_latest("old-A")
+    publisher.publish(_snapshot({"changed": torch.ones(2)}), [1], version_id=2)
+    registry.release("old-A")
+    engines.events.clear()
+    before = registry.status()
+    with pytest.raises(LoRAVersionError) as error:
+        publisher.publish(snapshot, [1, 1], version_id=2)
+    assert error.value.code == "VERSION_CONFLICT"
+    assert publisher.publish(snapshot, [1, 1], version_id=1).status == "NO_OP"
+    assert registry.status() == before
+    assert engines.events == []
+
+
+def test_device_direct_uses_sync_identity_for_new_and_replayed_publications(registry, monkeypatch):
+    from relax.distributed.checkpoint_service.backends import device_direct
+
+    backend = object.__new__(device_direct.DeviceDirectBackend)
+    backend.lock = SimpleNamespace(
+        acquire=SimpleNamespace(remote=lambda: True), release=SimpleNamespace(remote=lambda: None)
+    )
+    monkeypatch.setattr(device_direct.ray, "get", lambda result: result)
+    engines = _FakeEngines()
+    snapshots = [_snapshot(), _snapshot({"changed": torch.ones(2)})]
+    backend._lora_publication_bucket_cap = lambda: 8
+    backend._new_lora_publisher = lambda snapshot, cap: _publisher(engines, registry, bucket_cap=cap)
+    for version_id, snapshot in ((11, snapshots[0]), (11, snapshots[0]), (22, snapshots[1]), (33, snapshots[0])):
+        backend.weight_version = version_id
+        backend._materialize_adapter_snapshot = lambda: snapshot
+        backend._publish_lora_adapter_versioned()
+        assert registry.default_version == version_id
+    begins = [payload for kind, op, payload in engines.events if kind == "fire" and op == "engine0:begin"]
+    assert [payload["version_id"] for payload in begins] == [11, 22, 33]
+    assert begins[0]["digest"] == begins[2]["digest"]
+    assert begins[0]["lora_name"] != begins[2]["lora_name"]
+
+
+def test_registry_client_forwards_explicit_publication_identity(registry, monkeypatch):
+    import ray
+
+    handle = SimpleNamespace(allocate=SimpleNamespace(remote=registry.allocate))
+    monkeypatch.setattr(ray, "get", lambda result: result)
+    client = RayLoRAVersionRegistryClient(handle)
+    publication = client.allocate(DIGEST_A, version_id=41)
+    assert publication.version_id == 41
+    assert client.allocate(DIGEST_A, version_id=41) == publication
+    with pytest.raises(LoRAVersionError) as error:
+        client.allocate(DIGEST_B, version_id=41)
+    assert error.value.code == "VERSION_CONFLICT"

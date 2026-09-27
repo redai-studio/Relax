@@ -115,8 +115,8 @@ class VersionBinding:
 class Publication:
     """Result of ``allocate``/``retry_publication``.
 
-    ``no_op`` marks the exact-content case: the requested digest is already the
-    fleet default, so the caller must not re-export, re-transport or re-commit.
+    ``no_op`` marks a completed publication of this exact version identity. It
+    may no longer be the default; replay must not re-transport or re-commit.
     """
 
     version_id: int
@@ -156,7 +156,6 @@ class LoRAVersionRegistry:
         self.closed_sessions: Set[str] = set()
         self.default_version: Optional[int] = None
         self.default_revision = 0
-        self.next_version_id = 1
         self.target_engines = frozenset({"engine0", "engine1"})
 
     # ------------------------------------------------------------------
@@ -228,18 +227,21 @@ class LoRAVersionRegistry:
     # Publication
     # ------------------------------------------------------------------
 
-    def allocate(self, digest: str) -> Publication:
-        """Reserve a logical version for ``digest``.
+    def allocate(self, digest: str, *, version_id: int) -> Publication:
+        """Reserve a caller-selected version identity within this epoch.
 
-        Exact-content replay is idempotent: the digest is remembered for the
-        whole deployment epoch, so the same content maps to the same version id
-        and never occupies a second slot. Capacity is re-checked atomically
-        here, which is what makes a third live version fail *before* any
-        transport is attempted.
+        The caller fixes the ID before its first reservation and reuses it on
+        retries. Digest validates that identity's immutable content; a new ID
+        may carry the same digest as any historical version. Capacity is
+        checked before admitting a new or retryable publication.
         """
 
+        if type(version_id) is not int or version_id <= 0:
+            raise LoRAVersionError("INVALID_VERSION", "version_id must be a positive integer")
+        live = self.versions.get(version_id)
+        if live is not None and live.digest != digest:
+            raise LoRAVersionError("VERSION_CONFLICT", f"version {version_id} already holds a different digest")
         self._require_known_fleet()
-        live = self._version_by_digest(digest)
 
         if live is not None and live.state in {
             VersionState.PUBLISHED,
@@ -252,7 +254,7 @@ class LoRAVersionRegistry:
             return self._publication(live, no_op=True)
 
         if live is not None and live.state is VersionState.LOADING:
-            # Duplicate publication request for the same content: report the state we
+            # Duplicate request for the same version: report the state we
             # already have instead of loading, transferring or committing twice.
             return self._publication(live)
 
@@ -268,24 +270,13 @@ class LoRAVersionRegistry:
         if any(entry.state is VersionState.LOADING for entry in self.versions.values()):
             raise LoRAVersionError("PUBLICATION_IN_PROGRESS", "another publication attempt is unresolved")
         entry = VersionEntry(
-            version_id=self.next_version_id,
+            version_id=version_id,
             digest=digest,
-            lora_name=self._make_name(self.next_version_id, digest),
+            lora_name=self._make_name(version_id, digest),
             expected_default_revision=self.default_revision,
         )
-        self.next_version_id += 1
         self.versions[entry.version_id] = entry
         return self._publication(entry)
-
-    def _version_by_digest(self, digest: str) -> Optional[VersionEntry]:
-        """Remember content identity even after its resources have been
-        reclaimed."""
-
-        for version_id in sorted(self.versions, reverse=True):
-            entry = self.versions[version_id]
-            if entry.digest == digest:
-                return entry
-        return None
 
     def retry_publication(self, version_id: int, digest: str) -> Publication:
         """Start a clean transport attempt for an already-reserved version.

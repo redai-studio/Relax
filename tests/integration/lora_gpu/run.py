@@ -212,7 +212,9 @@ async def main(args: Any, report: Any) -> None:
             current["snapshot"] = snapshots[label]
             tensors = current["snapshot"].tensors.values()
             return publisher.publish(
-                current["snapshot"], bucket_tensor_counts([t.numel() * t.element_size() for t in tensors], 512 << 10)
+                current["snapshot"],
+                bucket_tensor_counts([t.numel() * t.element_size() for t in tensors], 512 << 10),
+                version_id={"A": 1, "B": 2, "C": 3, "D": 4}[label],
             )
 
         outcome_a = await asyncio.to_thread(publish, "A")

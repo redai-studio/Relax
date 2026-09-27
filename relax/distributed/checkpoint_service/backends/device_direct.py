@@ -1403,6 +1403,7 @@ class DeviceDirectBackend(CommBackend):
         closed (ambiguous engine state).
         """
 
+        version_id = self.weight_version
         snapshot = self._materialize_adapter_snapshot()
         if snapshot is None:
             return
@@ -1413,12 +1414,15 @@ class DeviceDirectBackend(CommBackend):
         while not ray.get(self.lock.acquire.remote()):
             time.sleep(0.1)
         try:
-            outcome = publisher.publish(snapshot, bucket_sizes)
+            # The sync sequence identifies the publication, not its content.
+            # Re-driving this sync retains the ID; a later sync gets a new ID
+            # even when training returns to an earlier adapter's exact bytes.
+            outcome = publisher.publish(snapshot, bucket_sizes, version_id=version_id)
         finally:
             ray.get(self.lock.release.remote())
         logger.info(
             "[lora-version] sync v=%d %s: version=%s buckets=%d cap=%.1f MiB",
-            self.weight_version,
+            version_id,
             outcome.status,
             outcome.lora_name,
             outcome.bucket_count,

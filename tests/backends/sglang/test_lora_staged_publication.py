@@ -641,13 +641,13 @@ def test_sender_reentry_and_duplicate_control_keep_collective_counts_matched():
     def broadcast(names, index):
         before = list(sent)
         with pytest.raises(LoRAVersionError) as error:
-            publisher.publish(snapshot, [1, 1])
+            publisher.publish(snapshot, [1, 1], version_id=1)
         assert error.value.code == "PUBLICATION_IN_PROGRESS"
         assert sent == before
         sent.append(tuple(names))
 
     publisher = LoRAPublisher(fire=fire, collect=collect, broadcast=broadcast, registry=registry)
-    assert publisher.publish(snapshot, [1, 1]).status == "PUBLISHED"
+    assert publisher.publish(snapshot, [1, 1], version_id=1).status == "PUBLISHED"
     assert sent == [("a",), ("b",)]
     assert received == {"engine0": sent, "engine1": sent}
 
@@ -778,7 +778,7 @@ def test_receiver_incarnation_change_cannot_complete_source_collective():
     from tests.agentic.lora_helpers import commit_ready
 
     registry = LoRAVersionRegistry(deployment_epoch="test")
-    old = registry.allocate("a" * 64)
+    old = registry.allocate("a" * 64, version_id=1)
     commit_ready(registry, old.version_id, old.attempt_id)
     engines = {name: _ProtocolTokenizer() for name in ("engine0", "engine1")}
     pending_bucket = {}
@@ -812,7 +812,7 @@ def test_receiver_incarnation_change_cannot_complete_source_collective():
     publisher = LoRAPublisher(fire=fire, collect=collect, broadcast=broadcast, registry=registry)
     snapshot = materialize_adapter_snapshot(ADAPTER_CONFIG, {"a": torch.ones(2)})
     with pytest.raises(LoRAPublicationError) as error:
-        publisher.publish(snapshot, [1])
+        publisher.publish(snapshot, [1], version_id=2)
     assert error.value.kind == "FATAL"
     assert registry.default_version == old.version_id
     assert registry.status().capacity_owning == 2

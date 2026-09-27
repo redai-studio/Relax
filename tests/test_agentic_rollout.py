@@ -1006,7 +1006,7 @@ def _published_registry(digest: str = _DIGEST_A, epoch: str = "epoch0") -> Any:
     from relax.agentic.session.lora_version import LoRAVersionRegistry
 
     core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch=epoch)
-    publication = core.allocate(digest)
+    publication = core.allocate(digest, version_id=1)
     commit_ready(core, publication.version_id, publication.attempt_id)
     return core
 
@@ -1085,7 +1085,7 @@ async def test_first_bind_is_shared_and_keeps_the_version() -> None:
     assert session.binding_task is None
 
     # A later publication must not move an already-bound Session.
-    second = core.allocate(_DIGEST_B)
+    second = core.allocate(_DIGEST_B, version_id=2)
     commit_ready(core, second.version_id, second.attempt_id)
     again = await shard._ensure_session_policy_binding(session)
     assert again.lora_name == bindings[0].lora_name
@@ -1163,7 +1163,7 @@ async def test_ir_abort_resume_and_later_turn_keep_version_after_publication(mon
     assert ir.pending_token_delta == [88] and ir in old.queued_irs
     name_a = old.bound_lora_name
 
-    publication_b = core.allocate(_DIGEST_B)
+    publication_b = core.allocate(_DIGEST_B, version_id=2)
     commit_ready(core, publication_b.version_id, publication_b.attempt_id)
     shard._train_generation_open = True
     shard._dispatch_queued_irs_locked(old)
@@ -1225,7 +1225,7 @@ async def test_failed_bind_is_retried_by_the_next_turn() -> None:
     assert error.value.code == "no_published_version"
     assert session.binding_task is None
 
-    publication = core.allocate(_DIGEST_A)
+    publication = core.allocate(_DIGEST_A, version_id=1)
     commit_ready(core, publication.version_id, publication.attempt_id)
     binding = await shard._ensure_session_policy_binding(session)
     assert binding.lora_name == publication.lora_name

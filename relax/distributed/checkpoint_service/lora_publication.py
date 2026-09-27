@@ -191,8 +191,8 @@ class RayLoRAVersionRegistryClient:
 
         return cls(ray.get_actor(LORA_VERSION_REGISTRY_ACTOR_NAME))
 
-    def allocate(self, digest: str) -> Publication:
-        return ray.get(self._handle.allocate.remote(digest))
+    def allocate(self, digest: str, *, version_id: int) -> Publication:
+        return ray.get(self._handle.allocate.remote(digest, version_id=version_id))
 
     def claim_publication(self, version_id: int, attempt_id: int) -> None:
         ray.get(self._handle.claim_publication.remote(version_id, attempt_id))
@@ -271,23 +271,30 @@ class LoRAPublisher:
     # Entry points
     # ------------------------------------------------------------------
 
-    def publish(self, snapshot: AdapterSnapshot, bucket_sizes: Sequence[int]) -> PublicationOutcome:
+    def publish(
+        self, snapshot: AdapterSnapshot, bucket_sizes: Sequence[int], *, version_id: int
+    ) -> PublicationOutcome:
         """Publish ``snapshot`` as a new immutable version (§12).
 
+        ``version_id`` identifies the publication event, independently of its
+        content. The caller must reuse it when retrying that event.
         ``bucket_sizes`` are tensor counts per bucket; the caller builds them
         with the publication-specific soft cap so the adapter travels in
         several buckets.
         """
 
-        # Reclaim first: a retired version whose Sessions have all released still owns a slot,
-        # and the third distinct version of a run would otherwise be refused for capacity that
-        # nobody can use any more.
-        self.reclaim_once()
-
-        publication = self._registry.allocate(snapshot.digest)
+        # Resolve identity before any engine RPC: conflicting content and late
+        # completed replays must not unload unrelated resources. Only capacity
+        # refusal may trigger reclamation followed by a fresh atomic admission.
+        try:
+            publication = self._registry.allocate(snapshot.digest, version_id=version_id)
+        except LoRAVersionError as exc:
+            if exc.code != "CAPACITY_ERROR" or not self.reclaim_once():
+                raise
+            publication = self._registry.allocate(snapshot.digest, version_id=version_id)
         if publication.no_op:
             logger.info(
-                "[lora-version] digest=%s is already published as version %d (%s); exact no-op",
+                "[lora-version] digest=%s version %d (%s) already completed publication; exact no-op",
                 snapshot.digest[:16],
                 publication.version_id,
                 publication.lora_name,
