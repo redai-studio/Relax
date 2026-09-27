@@ -1571,6 +1571,7 @@ class AgenticSessionShard:
                     ),
                     interrupted=group.interrupted,
                     protected=group.protected,
+                    error=str(error) if (error := group.first_error()) is not None else None,
                 )
                 for group in groups
             ),

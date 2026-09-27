@@ -1065,6 +1065,19 @@ class RuntimeDomain:
             stream = shard.group_streams.get(group_progress.group_id)
             if stream is None:
                 continue
+            if group_progress.error is not None:
+                # Cleanup ownership stays on the Shard, but consumers must stop
+                # waiting for an export that the failed Session cannot publish.
+                error = RuntimeGroupError(group_progress.error)
+                stream.interrupted = False
+                stream.protected = False
+                for local_ref in (
+                    stream.first_request_barrier,
+                    *(result.completion for result in stream.session_results),
+                ):
+                    if not local_ref.done():
+                        local_ref.set_exception(error)
+                continue
             # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
             if group_progress.ready_for_lease and not stream.first_request_barrier.done():
                 stream.first_request_barrier.set_result(True)

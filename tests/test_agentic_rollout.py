@@ -1091,6 +1091,108 @@ async def test_first_bind_is_shared_and_keeps_the_version() -> None:
     assert again.lora_name == bindings[0].lora_name
 
 
+async def test_ir_abort_resume_and_later_turn_keep_version_after_publication(monkeypatch: Any) -> None:
+    from relax.agentic.session.service import GroupOwnership
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    shard.args = SimpleNamespace(
+        agentic_admission_scope="all",
+        partial_rollout=False,
+        agentic_reasoning_parser=None,
+        agentic_tool_call_parser=None,
+    )
+    shard._admission_client = None
+    shard._generation_backend = _backend_adapter(lifecycle_enabled=False)
+    shard._acquire_sglang_request_permit = AsyncMock()
+    shard._release_sglang_request_permit = AsyncMock()
+    shard._notify_state_change = lambda group=None: None
+    shard._train_generation_open = True
+    payloads = []
+
+    async def respond(url: str, payload: dict, **kwargs: Any) -> dict:
+        payloads.append(dict(payload))
+        interrupted = len(payloads) == 1
+        if interrupted:
+            shard._train_generation_open = False
+        token = ord("X") if interrupted else ord("Y")
+        return {
+            "output_ids": [token],
+            "meta_info": {
+                "output_token_logprobs": [[-0.1, token, None]],
+                "finish_reason": {"type": "abort" if interrupted else "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", respond)
+
+    def make_session(sid: str) -> tuple[Any, Any]:
+        session = _binding_session(sid)
+        session.group.ownership = GroupOwnership.RUNTIME
+        session.forest, parent = _forest_with_initial_obs(
+            session_id=sid,
+            messages=[{"role": "user", "content": "p"}],
+            train_token_delta=[112],
+            rollout_token_delta=[112],
+        )
+        return session, parent
+
+    def dispatch(session: Any, parent: Any, request_id: str, prefix: list[int]) -> InflightRequest:
+        ir = InflightRequest(
+            request_id=request_id,
+            parent_state_hash=parent.state_hash,
+            rollout_id=0,
+            kind=RequestKind.FRESH,
+            abort_count=0,
+            waiter=asyncio.get_running_loop().create_future(),
+            wall_started_at=time.monotonic(),
+            sampling_params={"max_new_tokens": 4},
+            history_train_token_prefix=prefix,
+            history_rollout_token_prefix=prefix,
+        )
+        session.live_irs.add(ir)
+        session.queued_irs.append(ir)
+        shard._dispatch_queued_irs_locked(session)
+        return ir
+
+    old, parent = make_session("old")
+    ir = dispatch(old, parent, "first", [112])
+    await asyncio.wait_for(ir.runner_task, timeout=5)
+    assert not ir.waiter.done() and ir.abort_count == 1
+    assert ir.pending_token_delta == [88] and ir in old.queued_irs
+    name_a = old.bound_lora_name
+
+    publication_b = core.allocate(_DIGEST_B)
+    commit_ready(core, publication_b.version_id, publication_b.attempt_id)
+    shard._train_generation_open = True
+    shard._dispatch_queued_irs_locked(old)
+    result = await asyncio.wait_for(ir.waiter, timeout=5)
+    assert result["message"]["content"] == "XY"
+    assert payloads[1]["input_ids"] == [112, 88]
+    assert payloads[1]["rid"] == "first:1"
+    assert payloads[1]["sampling_params"]["max_new_tokens"] == 3
+
+    followup = old.forest.append_obs(
+        parent_state_hash=old.resp_state_hash_by_request_id["first"],
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=check_messages([{"role": "user", "content": "next"}]),
+        train_token_delta=[113],
+        rollout_token_delta=[113],
+    )
+    later = dispatch(old, followup, "later", [112, 88, 89, 113])
+    await asyncio.wait_for(later.waiter, timeout=5)
+    new, new_parent = make_session("new")
+    fresh = dispatch(new, new_parent, "fresh", [112])
+    await asyncio.wait_for(fresh.waiter, timeout=5)
+    assert [p["lora_path"] for p in payloads] == [name_a, name_a, name_a, publication_b.lora_name]
+    assert registry.bind_calls == ["old", "new"]
+    assert core.claim_reclaimable() is None
+    await shard._release_session_lora_ref(old)
+    assert core.claim_reclaimable().lora_name == name_a
+
+
 async def test_cancelling_one_waiter_does_not_cancel_the_shared_bind() -> None:
     core = _published_registry()
     registry = _FakeLoraRegistry(core)
@@ -1316,3 +1418,73 @@ async def test_background_cleanup_failure_is_visible_and_public_drop_can_retry()
     assert session.cleanup_error is None
     assert (await shard.health())["ok"]
     await shard.drop_group(group.group_id)
+
+
+@pytest.mark.parametrize("barrier_already_ready", [False, True])
+async def test_cleanup_failure_reaches_runtime_waiters_via_progress(barrier_already_ready: bool) -> None:
+    import pickle
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._state_revision = 0
+    shard._state_changed = asyncio.Event()
+    group = session.group
+    group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+    shard._session_records = {session.session_id: session}
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    binding = runtime_mod._SessionShardBinding(
+        actor_name="test-shard",
+        handle=SimpleNamespace(wait_for_state_change=_RegistryCall(shard.wait_for_state_change)),
+    )
+    runtime = RuntimeDomain(SimpleNamespace(), "train", [binding], 1, None)
+    loop = asyncio.get_running_loop()
+    result = runtime_mod._SessionResultRef(session.session_id, loop.create_future())
+    completed_result = runtime_mod._SessionResultRef("already-completed", loop.create_future())
+    completed_result.completion.set_result(None)
+    stream = runtime_mod.RuntimeGroupStream(
+        group.group_id, binding, loop.create_future(), (result, completed_result), protected=True
+    )
+    binding.group_streams[group.group_id] = stream
+    if barrier_already_ready:
+        stream.first_request_barrier.set_result(True)
+    observer = asyncio.create_task(runtime._watch_shard_progress(binding))
+    try:
+        with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+            await shard._handle_infra_failure(session, RuntimeError("agent failed"))
+        with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+            await asyncio.wait_for(asyncio.shield(result.completion), 1)
+        if barrier_already_ready:
+            assert stream.first_request_barrier.result() is True
+        else:
+            with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+                await stream.first_request_barrier
+        assert completed_result.completion.result() is None
+        assert not stream.protected
+        assert result.take_task is None
+        assert not observer.done()  # A Group failure does not kill the shared Shard observer.
+
+        # Wire payload stays serializable; repeated delivery cannot overwrite terminal futures.
+        progress = pickle.loads(pickle.dumps(shard._current_progress(0)))
+        assert "release unconfirmed" in progress.groups[0].error
+        runtime._apply_shard_progress(binding, progress)
+        assert isinstance(result.completion.exception(), RuntimeGroupError)
+        assert shard._session_records[session.session_id] is session
+        assert core.session_bindings  # Reporting failure must not pretend release succeeded.
+
+        registry.release = _RegistryCall(registry._release)
+        await shard.drop_group(group.group_id)
+        assert not core.session_bindings
+        assert not shard._session_records
+    finally:
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)
