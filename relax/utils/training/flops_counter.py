@@ -32,7 +32,7 @@ _DEVICE_FLOPS = {
     "H20": 148e12,
     "910B": 354e12,
     "Ascend910": 354e12,
-    "RTX 3070 Ti": 21.75e12,
+    "RTX 3070 Ti": 43.5e12,
 }
 
 
@@ -54,9 +54,9 @@ def get_device_peak_flops(unit: str = "T", device_name: str | None = None) -> fl
     """
     if device_name is None:
         try:
-            from relax.utils.device import get_device_properties
+            from relax.utils.device import device_module
 
-            device_name = get_device_properties().name
+            device_name = device_module.get_device_properties().name
         except (AttributeError, ImportError):
             device_name = "CPU"
 
