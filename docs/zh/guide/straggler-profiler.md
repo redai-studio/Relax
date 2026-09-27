@@ -133,7 +133,7 @@ export RELAX_STRAGGLER_OUTPUT_DIR=/path/to/straggler-evidence
 
 - **重启约定。** 运行时是首次使用时构建的进程级单例，在一个进程内不会被重建；observer 的 `disabled` 状态按设计是终态。不存在用于生产环境的重启或重置钩子（重置辅助函数仅供测试使用），因此启动失败或自行禁用的分析器会一直保持关闭，直到进程重启。
 - **迟到的数据包会丢失。** 当来自 `W + 1 + WINDOW_GRACE` 的 envelope 到达时，检测器关闭窗口 `W`，其中 `WINDOW_GRACE` 为一个窗口。延迟超过该宽限的数据包无法被放入其所属窗口，会作为迟到的传输噪声被丢弃而不参与判定。
-- **工作量标记可能过期。** observer 在*构建* envelope 时（即在区间关闭之后、在读出线程上）才查找工作量。因此所标记的工作量可能属于比该区间更晚的 rollout 或优化器 step；envelope 唯一的时间锚点是其主机开始时间，工作量只是建议性的传输元数据。
+- **工作量标记在区间完成时绑定。** observer 在训练线程上、区间关闭的那一刻读取本 rank 已发布的工作量：envelope 属于关闭该区间的那个 step，绝不会属于更晚的 step。若当时尚无（或无格式合法的）已发布工作量，envelope 不携带工作量，且事后不会回填——这类窗口会计入 `workload_missing_windows`、工作量证据降级，但时间判定不受影响。envelope 唯一的时间锚点是其主机开始时间，工作量只是建议性的传输元数据。
 - **topology epoch 是惰性的。** `RELAX_STRAGGLER_TOPOLOGY_EPOCH` 是 cohort key 的一部分，但没有任何逻辑会推导或更新它。除非运维人员手工设置该变量，重新分片对 cohort key 是不可见的。
 - **无 CUDA 路径在训练线程上判定。** 没有 CUDA event 时，observer 没有可轮询读回的 event，因此会把每个已完成的区间直接交给 collector，检测器便在训练线程上运行。文件 I/O 与网络传输仍在各自线程上，但在该模式下判定本身并非在训练线程之外完成。
 - **没有 rollout 或 topology 重置。** 跨越 rollout 边界的窗口会被排入下一个 rollout 的 perf 日志。覆盖率缺口会被计数（`incomplete_windows`）而不是靠猜测；只包含多 rank cohort 中单个 rank 的窗口不会产生判定。

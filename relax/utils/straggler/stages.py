@@ -21,8 +21,8 @@ Its relevant properties, all measured rather than assumed:
   ``moe``, ``router``, ``dispatch`` or ``combine`` timer exists in the tree), so
   attention/MoE costs cannot be split out from ``forward-compute`` without a
   deep hook. That capability is declared here as *schema only* and is not
-  claimed as supported — the mentor already agreed attention/MoE may be reserved
-  behind a flag for the first phase.
+  claimed as supported; whether to reserve it behind a flag is an open scope
+  decision (RFC #357, Decision B), not an agreed one.
 
 Communication naming is deliberately conservative: a CUDA-event interval around a
 send/recv or all-reduce timer measures the *observable interval*. With compute
