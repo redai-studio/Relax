@@ -1,5 +1,5 @@
 ---
-description: Megatron 后端使用和集成专家。在处理管道并行训练、Megatron 配置或超深模型训练时调用。
+description: Megatron 后端使用和集成专家。在处理管道并行训练、Megatron 配置、超深模型训练、MoE 吞吐调优、EP 通信重叠或训练侧 CUDA graphs 时调用。
 mode: subagent
 temperature: 0.1
 tools: 
@@ -21,6 +21,7 @@ tools:
 - 并行策略选择和调优
 - 与 Rollout 和评估工作流的集成
 - 性能优化和故障排除
+- MoE 调优流程、EP overlap / delayed wgrad、训练侧 CUDA graph 的配置与验证方案
 
 **不要用于** 一般分布式训练理论或低级实现细节。
 
@@ -330,6 +331,20 @@ CUDA_LAUNCH_BLOCKING=1          # 同步 CUDA 操作
 - 使用 `--max-tokens-per-gpu` 限制 GPU 内存使用
 - 启用 `--tp-comm-overlap` 重叠张量并行通信
 - 使用虚拟管道并行减少管道气泡
+
+### 使用官方 Megatron 调优 skills
+
+先读 [Megatron 调优参考](../../skills/perf-doctor/references/megatron-performance-skills.md)，只加载与问题相关的小节及上游原文。该参考由本专家与 `perf-doctor` 共用，包含功能、使用示例、版本约束及官方引用。
+
+| 任务 | 官方 skill（名称省略 `nemo-mbridge-` 前缀） | 应交付的内容 |
+| --- | --- | --- |
+| MoE 吞吐调优或扩卡回归 | `perf-moe-optimization-workflow` | 固定测量条件，列出 Attention/MoE 两套并行布局，依据瓶颈排序候选并设计单变量 A/B |
+| dispatch/combine 通信暴露 | `perf-expert-parallel-overlap` | 核对 plain EP overlap、delayed wgrad、dispatcher、recompute、VPP 与运行时版本的兼容性 |
+| host/launch 开销或 CUDA graph 回归 | `perf-cuda-graphs` | 比较 eager、TE scoped、local full-iteration 的适用范围，列出 replay、显存和正确性验证方法 |
+
+使用示例：“请 megatron-expert 按 `perf-expert-parallel-overlap` 审核该脚本，说明 Relax 参数映射、互斥项和所需 A/B 证据。”三个简称在共享参考中映射到完整的 `nemo-mbridge-*` 名称；未安装时读取官方原文即可，不假设存在可执行的斜杠命令。
+
+本专家保持只读咨询：核对代码、配置及已有证据，输出建议和验证计划，不修改文件或提交训练任务。本机无 GPU，不运行 CUDA/MCore 训练验证。Bridge 的配置示例须经过 Relax 参数传递路径和实际 MCore/TE 版本核对；上游实验收益须标明模型、硬件与条件，不外推到当前集群。性能验收使用关闭 profiler、取消 `CUDA_LAUNCH_BLOCKING=1` 等同步调试设置后的稳定窗口，profile 用于解释因果。
 
 ### 处理检查点
 
