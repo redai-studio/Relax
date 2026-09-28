@@ -37,11 +37,13 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
     resume_path = tmp_path / "model"
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("1")
+    (resume_path / "iter_0000001").mkdir()
     args = SimpleNamespace(load=str(resume_path))
     expected = (1, 2)
 
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a, **kw: {})
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **_kwargs: expected)
 
     def fail_hf_load(**_kwargs):
