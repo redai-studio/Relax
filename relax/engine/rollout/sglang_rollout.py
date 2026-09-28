@@ -11,6 +11,7 @@ from contextlib import AbstractAsyncContextManager, contextmanager
 from time import monotonic
 from typing import Any
 
+import httpx
 import numpy as np
 import pybase64
 import ray
@@ -36,7 +37,13 @@ from relax.utils.data.processing_utils import (
     load_tokenizer,
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
-from relax.utils.http_utils import get, post, router_worker_base_urls
+from relax.utils.http_utils import (
+    get,
+    is_expected_sglang_499,
+    is_router_no_available_workers,
+    post,
+    router_worker_base_urls,
+)
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -173,6 +180,7 @@ class GenerateState(metaclass=SingletonMeta):
             set()
         )  # tasks that should not be aborted (abort_count >= partial_rollout_max_aborted_count)
         self.aborted = False
+        self.abort_event = asyncio.Event()
         self.evaluating = getattr(self, "evaluating", 0)  # preserve eval state across resets
         # Pre-fetched data ObjectRef for cross-step overlap.
         # Persisted across reset() calls so the ref submitted at the end of
@@ -321,6 +329,34 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
     return values.reshape(num_rows, values.size // num_rows)
 
 
+async def _post_generation(
+    args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
+) -> Any:
+    router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
+    for attempt in range(2):
+        if attempt and state.abort_event.is_set():
+            raise GenerationAborted
+        try:
+            return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
+        except httpx.HTTPStatusError as error:
+            if not evaluation and is_expected_sglang_499(error):
+                raise GenerationAborted from error
+            if not router_recovery_enabled or not is_router_no_available_workers(error):
+                raise
+            if state.abort_event.is_set():
+                raise GenerationAborted from error
+            if attempt:
+                raise RuntimeError("SGLang router still has no available workers after recovery wait") from error
+            wait_s = float(getattr(args, "router_cb_timeout_duration_secs", 60)) + 2
+            logger.warning("SGLang router has no available workers; retrying generation once after %.1fs", wait_s)
+            try:
+                await asyncio.wait_for(state.abort_event.wait(), timeout=wait_s)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                raise GenerationAborted from error
+
+
 async def generate(
     args: Namespace, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
 ) -> Sample:
@@ -420,7 +456,7 @@ async def generate(
         headers = {"X-SMG-Routing-Key": str(sample.group_index)}
 
     _t_generate_start = monotonic()
-    output = await post(url, payload, headers=headers)
+    output = await _post_generation(args, state, url, payload, headers, evaluation)
     _t_generate = monotonic() - _t_generate_start
 
     _t_post_generate_start = monotonic()
@@ -708,8 +744,13 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
+    # A group with any aborted member (e.g. a weight-sync pre-dispatch 499) is
+    # incomplete: skip group reward for it in training so it is not scored on a
+    # partial trajectory. The group is carried to the resume buffer and finished
+    # under the next weight version. Eval is unaffected — it never converts a 499.
+    group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
-    if (not state.aborted or evaluation) and args.group_rm:
+    if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
@@ -756,6 +797,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
 
     # Step 2: Now abort the remaining (non-protected) pending tasks.
     state.aborted = True
+    state.abort_event.set()
 
     if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
         response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
@@ -837,6 +879,7 @@ async def generate_rollout_async(
     num_old_samples = state.last_step_current_deficit if args.fully_async else 0
 
     is_final_backfill = args.fully_async and rollout_id >= args.num_rollout
+    strict_fill_current = args.fully_async and getattr(args, "max_staleness", 1) == 0
 
     # target_data_size = how many groups this step COMMITS to the transfer queue:
     # current-partition target (rollout_batch_size) + previous-partition backfill
@@ -892,9 +935,9 @@ async def generate_rollout_async(
     loop = asyncio.get_running_loop()
 
     def target_reached() -> bool:
-        if is_final_backfill:
+        if is_final_backfill or strict_fill_current:
             return total_transfer_samples >= target_data_size
-        return len(data) >= target_data_size
+        return len(data) >= target_data_size and total_transfer_samples >= num_old_samples
 
     # Outer loop stops once we've COMMITTED target_data_size groups; inner loop tops up
     # submissions whenever in-flight admitted groups drop below the commit target, each
@@ -930,25 +973,36 @@ async def generate_rollout_async(
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
-                state.remaining_batch_size -= 1
-                continue
+
+            # An aborted group (e.g. a weight-sync pre-dispatch 499) is incomplete:
+            # recognize it BEFORE the dynamic filter so it is never dropped as
+            # "filtered out" and lost. It is carried to the resume buffer below and
+            # finished under the next weight version. Only completed groups are filtered.
+            group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
+            if not group_aborted:
+                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+                if not dynamic_filter_output.keep:
+                    metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                    state.remaining_batch_size -= 1
+                    continue
 
             # Classify each finished group. Nothing is dropped: aborted groups carry to
             # the buffer for partial resume; completed groups beyond target_data_size are
             # over-sampling surplus carried to the buffer (reused next step); completed
             # groups within target are committed to the transfer queue.
-            group_aborted = any(sample.status == Sample.Status.ABORTED for sample in group)
             should_commit = (
-                total_transfer_samples < target_data_size if is_final_backfill else len(data) < target_data_size
+                total_transfer_samples < target_data_size
+                if is_final_backfill or strict_fill_current
+                else (total_transfer_samples < num_old_samples or len(data) < target_data_size)
             )
             if group_aborted:
                 for sample in group:
+                    if sample.status == Sample.Status.ABORTED:
+                        sample.abort_count += 1
                     if sample.response and "start_rollout_id" not in sample.metadata:
                         sample.metadata["start_rollout_id"] = rollout_id
                 aborted_samples.append(group)
+                state.remaining_batch_size -= 1
             elif should_commit:
                 batch_to_transfer.append(group)
                 total_transfer_samples += 1
@@ -957,9 +1011,11 @@ async def generate_rollout_async(
                 # (added back to the buffer after this step) instead of dropping it.
                 oversample_surplus.append(group)
 
-            if (is_final_backfill and should_commit and not group_aborted) or (
-                not is_final_backfill and len(data) < target_data_size
-            ):
+            if is_final_backfill or strict_fill_current:
+                append_to_data = should_commit and not group_aborted
+            else:
+                append_to_data = len(data) < target_data_size
+            if append_to_data:
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 
@@ -1053,24 +1109,38 @@ async def generate_rollout_async(
             batch_to_transfer = []
             logger.info(f"Total yielded: {committed_prev}/{num_old_samples} for step: {rollout_id - 1}")
         else:
-            # Tail flush to the current partition: last only if it completes this step's target.
-            curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
-            transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
-                    args,
-                    batch_to_transfer,
-                    n,
-                    rollout_id,
-                    data_system_client,
-                    is_last=curr_is_last,
+            n_prev = min(n, num_old_samples - committed_prev)
+            if n_prev:
+                transfer_tasks.append(
+                    asyncio.create_task(
+                        transfer_batch_to_data_system(
+                            args,
+                            batch_to_transfer[:n_prev],
+                            n_prev,
+                            rollout_id - 1,
+                            data_system_client,
+                            is_last=args.fully_async and committed_prev + n_prev >= prev_target,
+                        )
+                    )
                 )
-            )
-            committed_curr += n
-            transfer_tasks.append(transfer_task)
+                committed_prev += n_prev
+                batch_to_transfer = batch_to_transfer[n_prev:]
+                n -= n_prev
+            if n:
+                transfer_tasks.append(
+                    asyncio.create_task(
+                        transfer_batch_to_data_system(
+                            args,
+                            batch_to_transfer,
+                            n,
+                            rollout_id,
+                            data_system_client,
+                            is_last=args.fully_async and committed_curr + n >= curr_target,
+                        )
+                    )
+                )
+                committed_curr += n
             batch_to_transfer = []
-            logger.info(
-                f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
-            )
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete

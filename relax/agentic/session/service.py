@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tuple, cast
 from uuid import uuid4
 
+import httpx
 import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -66,6 +67,7 @@ from relax.agentic.session.state import (
     normalize_template_kwargs,
     normalize_tools,
 )
+from relax.utils.http_utils import is_router_no_available_workers
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import get_spec_token_counts
 
@@ -2377,6 +2379,11 @@ class AgenticSessionShard:
 
         group = session.group
         runner_task = asyncio.current_task()
+        router_recovery_enabled = (
+            group.rollout_mode == "train"
+            and (self.args.fully_async or self.args.partial_rollout)
+            and not self.args.use_slime_router
+        )
 
         def is_current() -> bool:
             return session.phase is SessionPhase.ACTIVE and ir in session.live_irs and ir.runner_task is runner_task
@@ -2391,40 +2398,66 @@ class AgenticSessionShard:
                 return
 
         try:
-            async with self._admission_lease(session, ir):
-                async with self._sglang_request_permit():
-                    async with session.lock:
-                        if not is_current():
-                            return
-                        if not self._group_generation_open(group) and not session.protected_until_finalize:
-                            ir.runner_task = None
-                            session.queued_irs.appendleft(ir)
-                            self._notify_state_change(group)
-                            return
-                        backend_request_id = _backend_request_id(ir)
-                        ir.backend_started = True
-                        remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
-                        mark_agentic_event(
-                            agentic_trace_events(ir.pending_export_metadata_patch),
-                            "generation_start_at",
-                        )
+            for attempt in range(2):
+                router_unavailable = False
+                async with self._admission_lease(session, ir):
+                    async with self._sglang_request_permit():
+                        async with session.lock:
+                            if not is_current():
+                                return
+                            if not self._group_generation_open(group) and not session.protected_until_finalize:
+                                ir.runner_task = None
+                                session.queued_irs.appendleft(ir)
+                                self._notify_state_change(group)
+                                return
+                            backend_request_id = _backend_request_id(ir)
+                            ir.backend_started = True
+                            remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
+                            mark_agentic_event(
+                                agentic_trace_events(ir.pending_export_metadata_patch),
+                                "generation_start_at",
+                            )
 
-                    try:
-                        result = await self._generation_backend.generate(
-                            input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
-                            sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
-                            session_id=session.session_id,
-                            request_id=backend_request_id,
-                            image_data=ir.history_backend_image_data,
-                            audio_data=ir.history_backend_audio_data,
-                            video_data=ir.history_backend_video_data,
-                            return_logprob=group.rollout_mode == "train" or ir.logprobs,
-                        )
-                    finally:
-                        mark_agentic_event(
-                            agentic_trace_events(ir.pending_export_metadata_patch),
-                            "generation_end_at",
-                        )
+                        try:
+                            result = await self._generation_backend.generate(
+                                input_ids=ir.history_rollout_token_prefix + ir.pending_token_delta,
+                                sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
+                                session_id=session.session_id,
+                                request_id=backend_request_id,
+                                image_data=ir.history_backend_image_data,
+                                audio_data=ir.history_backend_audio_data,
+                                video_data=ir.history_backend_video_data,
+                                return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                fail_fast_no_workers=router_recovery_enabled,
+                            )
+                        except httpx.HTTPStatusError as error:
+                            router_unavailable = router_recovery_enabled and is_router_no_available_workers(error)
+                            if not router_unavailable:
+                                raise
+                            # The router rejected this attempt before dispatch. Clear
+                            # backend ownership before context cleanup can await, so a
+                            # concurrent pause treats the runner as cancellable waiting.
+                            ir.backend_started = False
+                        finally:
+                            mark_agentic_event(
+                                agentic_trace_events(ir.pending_export_metadata_patch),
+                                "generation_end_at",
+                            )
+                if not router_unavailable:
+                    break
+                async with session.lock:
+                    if not is_current():
+                        return
+                    if not self._group_generation_open(group) and not session.protected_until_finalize:
+                        ir.runner_task = None
+                        session.queued_irs.appendleft(ir)
+                        self._notify_state_change(group)
+                        return
+                if attempt:
+                    raise RuntimeGroupError("SGLang router still has no available workers after recovery wait")
+                wait_s = float(getattr(self.args, "router_cb_timeout_duration_secs", 60)) + 2
+                logger.warning("SGLang router has no available workers; retrying generation once after %.1fs", wait_s)
+                await asyncio.sleep(wait_s)
         except asyncio.CancelledError:
             async with session.lock:
                 expected_runtime_cancel = session.phase is not SessionPhase.ACTIVE or ir.runner_task is not runner_task
@@ -2488,6 +2521,10 @@ class AgenticSessionShard:
                 return
 
             if finish_type == "abort":
+                if group.rollout_mode == "eval":
+                    self._fail_ir_locked(session, ir, RuntimeGroupError("SGLang aborted an evaluation request"))
+                    self._notify_state_change(group)
+                    return
                 ir.abort_count += 1
                 protected_abort_count_threshold = (
                     self.args.partial_rollout_max_aborted_count if self.args.partial_rollout else None

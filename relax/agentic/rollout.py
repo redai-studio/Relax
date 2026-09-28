@@ -407,9 +407,11 @@ class AgenticResidentPipeline:
             return True
 
         # Fully async may close with unfinished physical debt only when the
-        # same number of resident Groups is confirmed interrupted.
+        # same number of resident Groups is confirmed interrupted. Debt from
+        # the older partition must finish first: only two physical partitions
+        # can be active, so carrying it again would make the next open fail.
         if self.args.fully_async and not context.final_backfill:
-            return debt <= len(self.runtime_domain.interrupted_group_ids)
+            return self.transfer_domain.previous_debt == 0 and debt <= len(self.runtime_domain.interrupted_group_ids)
         return False
 
     async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
