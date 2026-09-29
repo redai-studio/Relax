@@ -10,8 +10,8 @@ This module owns the rollout side of native generative RL (design doc 8.2):
   memory while recording only lightweight references on each ``Sample``.
 * :func:`convert_samples_to_train_data` — the ``--custom-convert-…`` hook. It
   emits the numeric-only TransferQueue row of design doc 5.4 (group index +
-  trajectory slot + advantage + raw reward), so the TQ never carries pixels,
-  latents or prompt strings.
+  trajectory slot + advantage), so the TQ never carries pixels, latents or
+  prompt strings.
 * :func:`hydrate_micro_batches` — the actor-side inverse: it reads those numeric
   rows and rehydrates the referenced Ray objects (or legacy sidecars) into the tensor batches the
   FlowGRPO update consumes, joining each row's advantage to its candidate by
@@ -500,6 +500,7 @@ def generate_rollout(args, rollout_id, data_source, data_system_client=None, eva
         )
         reward_time = time.time() - reward_t0
 
+    _log_raw_reward(args, rollout_id, out_groups)
     _log_rollout_perf(args, rollout_id, gen_time, reward_time, sum(len(g) for g in out_groups))
     return RolloutFnTrainOutput(samples=out_groups)
 
@@ -738,6 +739,19 @@ def _read_eval_prompts(args, cfg) -> List[Sample]:
     return samples
 
 
+def _log_raw_reward(args, rollout_id: int, sample_groups: List[List[Sample]]) -> None:
+    """Log the rollout's raw reward distribution from the produced Samples."""
+    rewards = [
+        sample.get_reward_value(args) for group in sample_groups for sample in group if sample.reward is not None
+    ]
+    if not rewards:
+        return
+    logger.info(
+        f"[rollout {rollout_id}] raw_reward n={len(rewards)} mean={sum(rewards) / len(rewards):.4f} "
+        f"min={min(rewards):.4f} max={max(rewards):.4f}"
+    )
+
+
 def _log_rollout_perf(args, rollout_id: int, gen_time: float, reward_time: float, num_samples: int) -> None:
     """Emit the diffusion rollout-stage perf metrics (design doc 11.2).
 
@@ -847,21 +861,13 @@ def convert_samples_to_train_data(args, samples):
     Deliberately narrow: only the columns something actually reads.
     ``group_indices`` + ``trajectory_slots`` are the JOIN KEY that binds an
     advantage to its candidate in the group sidecar (see
-    :func:`hydrate_micro_batches`); ``raw_reward`` is the un-normalized scorer
-    output, kept for logging because ``advantages`` has already been
-    group-centered by the reward post-process and can no longer be read as a
-    reward. ``total_lengths`` and ``sample_indices`` are required by the
-    TransferQueue metadata contract.
+    :func:`hydrate_micro_batches`). ``total_lengths`` and ``sample_indices``
+    are required by the TransferQueue metadata contract.
     """
     from relax.utils.utils import dict_to_tensordict, post_process_rewards
 
     flat: List[Sample] = _flatten(samples)
-    processed_rewards = post_process_rewards(args, flat)
-    if isinstance(processed_rewards, tuple):
-        raw_rewards, rewards = processed_rewards
-    else:
-        raw_rewards = [sample.get_reward_value(args) for sample in flat]
-        rewards = processed_rewards
+    rewards = post_process_rewards(args, flat)
 
     group_indices, trajectory_slots = [], []
     for s in flat:
@@ -895,7 +901,6 @@ def convert_samples_to_train_data(args, samples):
         # without serializing it through the TransferQueue.
         "trajectory_refs": trajectory_refs,
         "advantages": [float(r) for r in rewards],
-        "raw_reward": [float(r) for r in raw_rewards],
         "total_lengths": [1 for _ in flat],
         # Degenerate-round flag (post_process sets it when the group advantage
         # variance collapses below the floor): the actor skips optimizer.step so a
@@ -976,8 +981,6 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
             )
         group_slots[int(slot)] = i
 
-    _log_raw_reward(rows, dp_rank)
-
     micro_batches: List[Dict[str, Any]] = []
     # Deterministic group order so every rank iterates identically (lockstep).
     for group_index in sorted(by_group):
@@ -1020,24 +1023,6 @@ def hydrate_micro_batches(args, adapter, rollout_id, rollout_data_ref, *, dp_ran
                 }
             )
     return micro_batches
-
-
-def _log_raw_reward(rows, dp_rank: int) -> None:
-    """Log the round's un-normalized reward once per step (rank 0 only).
-
-    ``advantages`` has already been group-centered by the reward post-process,
-    so its mean is ~0 by construction and says nothing about whether the policy
-    is improving. ``raw_reward`` is the scorer's actual output and is the only
-    column on the actor side that answers that — it exists purely for this
-    line, so if this ever goes away, drop the column too.
-    """
-    if dp_rank != 0 or "raw_reward" not in rows:
-        return
-    raw = rows["raw_reward"].float()
-    logger.info(
-        f"native hydrate: n={raw.numel()} raw_reward mean={float(raw.mean()):.4f} "
-        f"min={float(raw.min()):.4f} max={float(raw.max()):.4f}"
-    )
 
 
 def _expand_shared_conditions(batch: Dict[str, torch.Tensor], num_candidates: int) -> Dict[str, torch.Tensor]:

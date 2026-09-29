@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="agentic-reward-advantage-zh-title agentic-reward-advantage-zh-desc" id="agentic-reward-advantage-zh-root">
+      <title id="agentic-reward-advantage-zh-title">Agentic 训练打分方式</title>
+      <desc id="agentic-reward-advantage-zh-desc">根据 advantage 粒度、一个 Session 导出的训练 context 数量，以及分数来自环境还是奖励函数，选择打分方式。</desc>
+      <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #agentic-reward-advantage-zh-root { --paper: #f5f5f5;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #7a8399;
+      --rule: rgba(45, 49, 66, 0.12);
+      --font-sans: 'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      --font-serif: 'Instrument Serif', 'Songti SC', serif;
+      --font-mono: 'Geist Mono', 'Noto Sans Mono CJK SC', monospace; }
+      #agentic-reward-advantage-zh-root { color: var(--ink); font-family: var(--font-sans); }</style>
+        <marker id="agentic-reward-advantage-zh-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+        </marker>
+      </defs>
+
+      <rect width="960" height="530" fill="#f5f5f5"/>
+
+      <!-- Connectors -->
+      <line x1="540" y1="104" x2="680" y2="104" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="420" y1="160" x2="420" y2="176" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+
+      <path d="M 300 232 H 266 Q 260 232 260 226 V 226 Q 260 220 254 220 H 240" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="420" y1="288" x2="420" y2="312" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="540" y1="368" x2="620" y2="368" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="420" y1="424" x2="420" y2="448" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="700" y1="400" x2="700" y2="448" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+      <line x1="520" y1="476" x2="660" y2="476" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-zh-arrow)"/>
+
+      <!-- Connector labels -->
+      <rect x="584" y="80" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="612" y="89" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">按回合</text>
+
+      <rect x="436" y="164" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="472" y="173" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">按上下文</text>
+
+      <rect x="272" y="200" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="292" y="209" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">多个</text>
+
+      <rect x="436" y="292" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="456" y="301" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">一个</text>
+
+      <rect x="548" y="344" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="580" y="353" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">环境</text>
+
+      <rect x="436" y="432" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="464" y="441" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">奖励函数</text>
+
+      <!-- Decisions and outcomes -->
+      <polygon points="420,48 540,104 420,160 300,104" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="100" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Advantage 按什么粒度分配？</text>
+      <text x="420" y="117" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">按上下文 / 按回合</text>
+
+      <rect x="680" y="68" width="220" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="790" y="96" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">使用 custom advantage</text>
+      <text x="790" y="114" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">每个上下文的 advantage 为 list</text>
+      <text x="790" y="130" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">长度等于 assistant 回合数</text>
+
+      <polygon points="420,176 540,232 420,288 300,232" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="228" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">一个 Session 导出几个</text>
+      <text x="420" y="245" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">训练 context？</text>
+
+      <rect x="40" y="188" width="200" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="140" y="216" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">使用 custom advantage</text>
+      <text x="140" y="234" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">每个上下文的 advantage 为 scalar</text>
+
+      <polygon points="420,312 540,368 420,424 300,368" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="364" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">分数从哪里来？</text>
+      <text x="420" y="381" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">环境 / 奖励函数</text>
+
+      <rect x="620" y="336" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="700" y="354" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">环境</text>
+      <text x="700" y="372" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">RELAX_OUTPUT_JSON</text>
+      <text x="700" y="387" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">中的 reward 字段</text>
+
+      <rect x="320" y="448" width="200" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="472" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">使用奖励函数</text>
+      <text x="420" y="490" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">--custom-rm-path</text>
+
+      <rect x="660" y="448" width="220" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="770" y="472" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">使用 --advantage-estimator</text>
+      <text x="770" y="490" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">reward 后处理为 advantage</text>
+
+    </svg>

@@ -24,7 +24,6 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "rewards",
         "sample_indices",
         "sample_index_mask_sums",
-        "raw_reward",
         "group_index",
     ]
     if getattr(args, "use_rollout_routing_replay", False):

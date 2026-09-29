@@ -104,7 +104,8 @@ agent process's Runtime active time to contain agent-side hangs. Use
 ## Export contract
 
 Use implicit export only after verifying that the model-visible history is strictly linear. Intentional forks, multiple
-agents, deleted thinking, changing tools, or any other nonlinear history require explicit export.
+agents, deleted thinking, changing tools, or any other nonlinear history require explicit export. Custom advantage uses
+named explicit export records.
 
 One explicit record may be a JSON object containing `messages`; several records use JSONL. A single JSON object without
 `messages` is an implicit output payload that only contributes top-level metadata/reward. Every JSONL explicit record
@@ -117,14 +118,14 @@ unique name
 complete messages
 exact tools when used
 exact chat_template_kwargs when used
-metadata needed for credit
+metadata needed for custom advantage
 optional reward
 ```
 
 Explicit records always use canonical Chat-shaped `messages`, nested function `tools`, and `chat_template_kwargs`,
 including for Sessions whose agent used Responses or Messages.
 
-Every record must resolve to a committed SessionForest state. A JSON array is not the explicit export format. Keep task outcome reporting separate from per-context training credit.
+Every record must resolve to a committed SessionForest state. A JSON array is not the explicit export format. Keep task outcome reporting separate from per-context advantage.
 
 ## Multimodal boundary
 
@@ -150,7 +151,7 @@ Before experiment preflight, verify:
 6. configured reasoning/tool-call parsers produce the expected structured assistant messages, call IDs, and
    protocol-specific finish reasons;
 7. implicit or explicit export resolves to committed state;
-8. export count and training credit match `agentic-training-contract.md`;
+8. export count and advantage match `agentic-training-contract.md`;
 9. agent, tool, sandbox, and external resources clean up.
 
 Source anchors: `docs/en/guide/agentic-rollout.md`, `relax/agentic/runner/ipc.py`,

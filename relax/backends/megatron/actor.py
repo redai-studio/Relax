@@ -2467,7 +2467,6 @@ class MegatronTrainRayActor(TrainRayActor):
                     "rewards",
                     "sample_indices",
                     "sample_index_mask_sums",
-                    "raw_reward",
                     "group_index",
                 ]
                 data_fields += ["rollout_routed_experts"] if self.args.use_rollout_routing_replay else []
@@ -2655,7 +2654,6 @@ class MegatronTrainRayActor(TrainRayActor):
             "rewards",
             "sample_indices",
             "sample_index_mask_sums",
-            "raw_reward",
             "group_index",
         ]
         # In true on-policy mode, actor_fwd is absent and old_log_probs is

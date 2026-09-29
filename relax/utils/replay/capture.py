@@ -35,7 +35,7 @@ from relax.utils.replay.schema import (
     StageContract,
     StageId,
 )
-from relax.utils.replay.stages import REIMPLEMENTED_STAGES, V1_STAGE_VERSIONS, capability_for
+from relax.utils.replay.stages import V2_STAGE_VERSIONS, capability_for
 
 
 logger = get_logger(__name__)
@@ -85,15 +85,14 @@ class CaptureRecord:
     # only) sets this explicitly so the manifest does not promise stages whose
     # payloads are absent.
     stages: set[StageId] | None = None
-    # Raw per-sample metadata used to build SampleRecord on the writer
-    # thread. The mask/reward/group tensors stay detached through the hot path;
+    # Per-sample metadata used to build SampleRecord on the writer thread. The
+    # mask/reward/group tensors stay detached through the hot path;
     # their GPU→CPU conversion happens only in build_bundle_from_record.
     response_lengths: list[int] | None = None
     total_lengths: list[int] | None = None
     loss_masks_tensor: torch.Tensor | None = None
     group_indices_tensor: torch.Tensor | None = None
-    raw_rewards_tensor: torch.Tensor | None = None
-    rewards_tensor: torch.Tensor | None = None
+    rewards: list[float | list[float] | torch.Tensor] | None = None
     # Per-sample DataIterator micro-batch ids (mb-0000, ...). Parallel to
     # response_lengths. captured_micro_batch_ids is the first-writer-wins set
     # used to ignore activation-checkpoint recomputes of the same micro-batch.
@@ -140,8 +139,7 @@ def _snapshot_record(record: CaptureRecord) -> CaptureRecord:
         expected=_snapshot_value(record.expected),
         loss_masks_tensor=_snapshot_value(record.loss_masks_tensor),
         group_indices_tensor=_snapshot_value(record.group_indices_tensor),
-        raw_rewards_tensor=_snapshot_value(record.raw_rewards_tensor),
-        rewards_tensor=_snapshot_value(record.rewards_tensor),
+        rewards=_snapshot_value(record.rewards),
         sample_micro_batch_ids=(
             list(record.sample_micro_batch_ids) if record.sample_micro_batch_ids is not None else None
         ),
@@ -151,7 +149,7 @@ def _snapshot_record(record: CaptureRecord) -> CaptureRecord:
 
 
 def build_manifest_for_record(record: CaptureRecord) -> Manifest:
-    """Derive the manifest from the frozen V1 capability matrix.
+    """Derive the manifest from the frozen V2 capability matrix.
 
     Each stage in STAGE_ORDER is declared with the capability the matrix grants
     for the bundle's topology (record.config.advantage_estimator and
@@ -173,9 +171,8 @@ def build_manifest_for_record(record: CaptureRecord) -> Manifest:
         )
         stage_contracts[stage] = StageContract(
             stage=stage,
-            version=V1_STAGE_VERSIONS[stage],
+            version=V2_STAGE_VERSIONS[stage],
             capability=capability,
-            implementation="reimplemented" if stage in REIMPLEMENTED_STAGES else "reuse",
         )
     return Manifest(
         format_version=FORMAT_VERSION,
@@ -208,17 +205,24 @@ def _normalize_expected(expected: dict[str, Any]) -> dict[str, Any]:
     return {key: _convert(value) for key, value in expected.items()}
 
 
-def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
-    """Build the SampleRecord list from raw per-sample metadata.
+def _reward_to_python(value: float | list[float] | torch.Tensor) -> float | list[float]:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().tolist()
+    if isinstance(value, list):
+        return [float(item) for item in value]
+    return float(value)
+
+
+def _build_sample_records(record: CaptureRecord) -> list[SampleRecord]:
+    """Build SampleRecords from deferred per-sample metadata.
 
     Runs on the writer thread; the flat loss_masks_tensor is split back per
     sample using response_lengths, and the optional group/reward tensors are
     converted here so their GPU→CPU sync never happens in the hot path. When
-    the group/reward tensors are absent (loss-only capture) placeholders are
-    used.
+    those tensors are absent (loss-only capture) placeholders are used.
     """
     if record.response_lengths is None or record.total_lengths is None or record.loss_masks_tensor is None:
-        raise ValueError("capture record has no samples and incomplete raw sample metadata")
+        raise ValueError("capture record has no samples and incomplete per-sample metadata")
 
     count = len(record.response_lengths)
     flat_masks = record.loss_masks_tensor.detach().cpu().tolist()
@@ -233,16 +237,10 @@ def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
         if record.group_indices_tensor is not None
         else [0] * count
     )
-    raw_rewards = (
-        [float(value) for value in record.raw_rewards_tensor.detach().cpu().tolist()]
-        if record.raw_rewards_tensor is not None
-        else [0.0] * count
-    )
-    rewards = (
-        [float(value) for value in record.rewards_tensor.detach().cpu().tolist()]
-        if record.rewards_tensor is not None
-        else raw_rewards
-    )
+    rewards = record.rewards if record.rewards is not None else [0.0] * count
+    if len(rewards) != count:
+        raise ValueError(f"reward count {len(rewards)} != sample count {count}")
+    rewards = [_reward_to_python(reward) for reward in rewards]
     return [
         SampleRecord(
             sample_id=f"s-{index}",
@@ -250,7 +248,6 @@ def _build_samples_from_raw(record: CaptureRecord) -> list[SampleRecord]:
             response_length=int(record.response_lengths[index]),
             total_length=int(record.total_lengths[index]),
             loss_mask=masks[index],
-            raw_reward=raw_rewards[index],
             reward=rewards[index],
             label_hash="",
             micro_batch_id=_sample_micro_batch_id(record, index),
@@ -339,27 +336,16 @@ def build_bundle_from_record(record: CaptureRecord, output_dir: str | Path) -> P
     cohort_dir = output_dir / record.bundle_id
 
     manifest = build_manifest_for_record(record)
-    samples = record.samples if record.samples else _build_samples_from_raw(record)
+    samples = record.samples if record.samples else _build_sample_records(record)
     identity = record.identity
     micro_batch_ids = _identity_micro_batch_ids(record, samples)
-    # When samples are reconstructed from raw step metadata, stamp matching
+    # When samples are reconstructed from deferred step metadata, stamp matching
     # identity.micro_batch_ids so --batch selection agrees with SampleRecord.
     if not record.samples and micro_batch_ids:
         identity = replace(identity, micro_batch_ids=micro_batch_ids)
     index = BundleIndex(bundle_id=record.bundle_id, identity=identity, samples=samples, config=record.config)
 
     expected_outputs = _normalize_expected(record.expected)
-    # Derive per-sample reward expectations from the deferred tensors (writer
-    # thread), so the reward adapters have JSON-serializable lists to compare.
-    if record.raw_rewards_tensor is not None:
-        expected_outputs.setdefault(StageId.REWARD_RAW.value, {})["raw_rewards"] = [
-            float(value) for value in record.raw_rewards_tensor.detach().cpu().tolist()
-        ]
-    if record.rewards_tensor is not None:
-        expected_outputs.setdefault(StageId.REWARD_POST_PROCESS.value, {})["rewards"] = [
-            float(value) for value in record.rewards_tensor.detach().cpu().tolist()
-        ]
-
     rank_path = (cohort_dir / f"rank-{rank}") if multi else cohort_dir
     writer = BundleWriter(rank_path, manifest, index, expected_outputs, rank=rank)
     for name, tensor in record.tensors.items():

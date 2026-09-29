@@ -7,8 +7,7 @@ been generated (design doc 11.2): it reads each candidate's artifact manifest,
 batch-scores the media through the configured scorer(s), centers every reward
 component within its prompt group, applies the configured advantage std divisor,
 weight-combines the components into one advantage, and returns
-``(raw_rewards, advantages)`` in the ``(list, list)`` shape the Relax reward
-pipeline expects.
+the advantages consumed by training.
 
 A missing required component or a non-finite reward fails the whole group
 (design doc 6.3), and if the final advantage's global variance collapses below
@@ -245,7 +244,7 @@ def score_samples(args, samples) -> Dict[str, List[float]]:
     return component_rewards
 
 
-def post_process(args, samples) -> Tuple[List[float], List[float]]:
+def post_process(args, samples) -> List[float]:
     """``custom_reward_post_process_path`` entry point (design doc 11.2)."""
     import time
 
@@ -312,7 +311,7 @@ def post_process(args, samples) -> Tuple[List[float], List[float]]:
     metrics["reward/score_time"] = float(score_time)
     metrics["reward/score_samples_per_s"] = float(len(flat)) / score_time if score_time > 0 else 0.0
     _log_reward_metrics(args, flat, metrics)
-    return raw_rewards, advantages
+    return advantages
 
 
 def _log_reward_metrics(args, flat: List[Sample], metrics: Dict[str, float]) -> None:

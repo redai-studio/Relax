@@ -155,7 +155,6 @@ def test_convert_samples_to_train_data_numeric_row_only():
         "trajectory_slots",
         "trajectory_refs",
         "advantages",
-        "raw_reward",
         "total_lengths",
         "skip_optimizer_step",
     }
@@ -164,11 +163,10 @@ def test_convert_samples_to_train_data_numeric_row_only():
     assert row["trajectory_slots"] == [0, 1, 0, 1]
     assert row["trajectory_refs"] == [[0] * 4] * 4
     assert row["advantages"] == [1.0, 2.0, 3.0, 4.0]
-    assert row["raw_reward"] == [1.0, 2.0, 3.0, 4.0]
     assert row["skip_optimizer_step"] == [0, 0, 0, 0]
 
 
-def test_convert_samples_to_train_data_preserves_raw_rewards_after_normalization():
+def test_convert_samples_to_train_data_uses_normalized_advantages():
     args = SimpleNamespace(
         debug_train_only=True,
         custom_reward_post_process_path=None,
@@ -183,20 +181,18 @@ def test_convert_samples_to_train_data_preserves_raw_rewards_after_normalization
     row = ng.convert_samples_to_train_data(args, samples)
 
     assert row["advantages"] == [-1.0, 1.0]
-    assert row["raw_reward"] == [1.0, 3.0]
 
 
-def test_convert_samples_to_train_data_accepts_generative_reward_pair(monkeypatch):
+def test_convert_samples_to_train_data_accepts_processed_rewards(monkeypatch):
     from relax.utils import utils
 
-    monkeypatch.setattr(utils, "post_process_rewards", lambda _args, _samples: ([1.0, 3.0], [-1.0, 1.0]))
+    monkeypatch.setattr(utils, "post_process_rewards", lambda _args, _samples: [-1.0, 1.0])
     args = SimpleNamespace(debug_train_only=True)
     samples = [_sample(0, 0, 7, 1.0), _sample(0, 1, 7, 3.0)]
 
     row = ng.convert_samples_to_train_data(args, samples)
 
     assert row["advantages"] == [-1.0, 1.0]
-    assert row["raw_reward"] == [1.0, 3.0]
 
 
 def test_adapter_pack_group_stacks_candidates():

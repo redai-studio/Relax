@@ -58,35 +58,25 @@ class _Sample:
 
 
 @pytest.mark.parametrize("estimator", ["grpo", "rloo"])
-def test_returns_raw_and_normalized(utils_mod, estimator):
+def test_returns_normalized_rewards(utils_mod, estimator):
     args = _args(estimator)
     samples = [_Sample(0, r) for r in (0.0, 1.0, 2.0, 3.0)]
-    raw, normalized = utils_mod.post_process_rewards(args, samples)
-    assert raw == [0.0, 1.0, 2.0, 3.0]
-    assert normalized != raw
+    normalized = utils_mod.post_process_rewards(args, samples)
+    assert normalized != [0.0, 1.0, 2.0, 3.0]
     assert abs(sum(normalized)) < 1e-5
 
 
 @pytest.mark.parametrize("estimator", ["ppo", "reinforce_plus_plus", "m2po"])
-def test_identity_path_returns_raw_twice(utils_mod, estimator):
+def test_identity_path_returns_raw_rewards(utils_mod, estimator):
     args = _args(estimator)
     samples = [_Sample(0, r) for r in (0.0, 1.0, 2.0, 3.0)]
-    raw, normalized = utils_mod.post_process_rewards(args, samples)
-    assert normalized is raw
+    assert utils_mod.post_process_rewards(args, samples) == [0.0, 1.0, 2.0, 3.0]
 
 
-def test_rewards_normalization_off_returns_raw_twice(utils_mod):
+def test_rewards_normalization_off_returns_raw_rewards(utils_mod):
     args = _args("grpo", rewards_normalization=False)
     samples = [_Sample(0, r) for r in (0.0, 1.0, 2.0, 3.0)]
-    raw, normalized = utils_mod.post_process_rewards(args, samples)
-    assert normalized is raw
-
-
-def test_custom_path_still_short_circuits(utils_mod, monkeypatch):
-    sentinel = (["raw"], ["norm"])
-    monkeypatch.setattr(utils_mod, "load_function", lambda path: lambda a, s: sentinel)
-    args = _args("grpo", custom_reward_post_process_path="pkg.mod.fn")
-    assert utils_mod.post_process_rewards(args, []) is sentinel
+    assert utils_mod.post_process_rewards(args, samples) == [0.0, 1.0, 2.0, 3.0]
 
 
 def test_custom_path_may_return_only_processed_rewards(utils_mod, monkeypatch):
@@ -94,16 +84,13 @@ def test_custom_path_may_return_only_processed_rewards(utils_mod, monkeypatch):
     monkeypatch.setattr(utils_mod, "load_function", lambda path: lambda a, s: processed)
     args = _args("grpo", custom_reward_post_process_path="pkg.mod.fn")
     samples = [_Sample(0, 1.0), _Sample(0, 2.0)]
-    raw, actual = utils_mod.post_process_rewards(args, samples)
-    assert raw == [1.0, 2.0]
-    assert actual is processed
+    assert utils_mod.post_process_rewards(args, samples) is processed
 
 
 def test_reward_key_selects_from_dict(utils_mod):
-    args = _args("grpo", reward_key="score")
+    args = _args("grpo", reward_key="score", rewards_normalization=False)
     samples = [_Sample(0, {"score": r, "other": 99.0}) for r in (0.0, 1.0, 2.0, 3.0)]
-    raw, _ = utils_mod.post_process_rewards(args, samples)
-    assert raw == [0.0, 1.0, 2.0, 3.0]
+    assert utils_mod.post_process_rewards(args, samples) == [0.0, 1.0, 2.0, 3.0]
 
 
 def test_unknown_estimator_raises_from_the_registry(utils_mod):
