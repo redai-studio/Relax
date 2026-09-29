@@ -1,8 +1,8 @@
 # Trajectory Replay
 
-> Status: the offline replay core (PR A) and production capture (PR B — `loss.policy` hot-path hook, async `CaptureManager` and GPU smoke) are implemented; the distributed layout (PR C) is landed. Capture is split into two bundle types: **rollout-level** (`reward.raw → reward.post_process → advantage.kl → advantage.estimate`, identity = `rollout_id`) and **step-level** (`loss.policy`, identity = `(rollout_id, step_id)`); `advantage.kl` uses rollout-vs-reference semantics and requires a `ref_log_probs` payload. Bundles are produced by the training side or built programmatically via `BundleWriter`.
+> Status: the offline replay core, production capture (`loss.policy` hot-path hook, async `CaptureManager` and GPU smoke), and distributed layout are implemented. Capture is split into two bundle types: **rollout-level** (`advantage.kl → advantage.estimate`, identity = `rollout_id`) and **step-level** (`loss.policy`, identity = `(rollout_id, step_id)`); `advantage.kl` uses rollout-vs-reference semantics and requires a `ref_log_probs` payload. Bundles are produced by the training side or built programmatically via `BundleWriter`.
 
-Trajectory Replay is a verifiable offline reproduction tool for async training. It packs the data, stage outputs and identity information that one training step actually consumed into a **self-describing, verifiable replay bundle**, then — on a plain CPU host without Ray Serve, SGLang, a rollout worker or a GPU — recomputes the reward, advantage, return and loss stages with the same stage semantics and reports the **first verifiable divergence**.
+Trajectory Replay is a verifiable offline reproduction tool for async training. It packs the recorded post-processed rewards, such as GRPO's group-normalized rewards, together with stage outputs and identity information that one training step actually consumed into a **self-describing, verifiable replay bundle**. On a plain CPU host without Ray Serve, SGLang, a rollout worker or a GPU, it recomputes advantage, return and loss stages with the same stage semantics and reports the **first verifiable divergence**.
 
 Model forward, backward, gradient and optimizer steps are outside the replay boundary. The system stores the compact post-forward statistics the loss actually consumes (current/old log-probabilities, entropy, values, masks, advantages, returns), not full logits or a checkpoint.
 
@@ -15,7 +15,7 @@ In synchronous training a rollout step and an Actor update are roughly one-to-on
 - dynamic batching changes micro-batch boundaries;
 - one Actor update may consume samples from multiple rollout partitions.
 
-Replay therefore treats "generated together", "normalized together" and "consumed together" as independent identities. The historical PR #65 bug (streamed prompt groups normalized against the physical batch) is the canonical case of "physical batch ≠ semantic cohort": the final loss changes, but the **first faulty stage is `reward.post_process`**. Replay exists to locate that kind of error, not just to compare the final scalar.
+Replay therefore keeps logical sample/group identity separate from the physical rollout partition, consumer batch and micro-batch that carried it. Reward production and post-processing remain production concerns; replay starts from the scalar or per-token post-processed rewards actually consumed by the Actor.
 
 ## Bundle layout
 
@@ -35,7 +35,7 @@ A bundle is a directory:
 └── COMPLETE         # completion sentinel (COMPLETE.<rank> + final COMPLETE for multi-rank)
 ```
 
-- **Text goes through JSON**: `index.json` holds only JSON-compatible metadata (sample_id, group_index, lengths, loss_mask, raw_reward, ...). Raw prompt/response text is replaced by hash/truncation per the redaction policy.
+- **Text goes through JSON**: `index.json` holds only JSON-compatible metadata (sample_id, group_index, lengths, loss_mask, recorded rewards, ...). Raw prompt/response text is replaced by hash/truncation per the redaction policy.
 - **Tensors use `weights_only=True`**: `payloads/` accepts only `torch.Tensor`; loading is `weights_only=True` and recursively rejects Python objects.
 - **Integrity**: the writer stages into a temp directory, writes payloads and manifest hashes, then atomically renames. A missing `COMPLETE`, payload, rank shard, or a checksum mismatch fails before any stage runs.
 
@@ -43,19 +43,19 @@ A bundle is a directory:
 
 Replay identity is two-layered:
 
-- **Logical identity**: sample, semantic group, normalization cohort, actor step.
+- **Logical identity**: sample, semantic group, actor step.
 - **Physical provenance**: rollout partition, consumer batch, micro-batch, rank shard, weight lineage.
 
 The training-step identity anchor is the **cohort an Actor update actually consumed**. `actor_step_id` is the `(rollout_id, step_id)` tuple (the `train_one_step` coordinate). The derived `accumulated_step_id` scalar is **not** a persisted identity: under dynamic batching and streaming schedules `num_steps_per_rollout` can vary per rollout.
 
-Selectors fail closed when a membership mapping is missing instead of inferring a semantic group from a physical batch size — the root cause of PR #65.
+Selectors fail closed when a membership mapping is missing instead of inferring a semantic group from a physical batch size.
 
-## Stage contracts and the V1 capability matrix
+## Stage contracts and the V2 capability matrix
 
 The pipeline is split into independently versioned stages:
 
 ```text
-sample -> reward.raw -> reward.post_process -> advantage.kl -> advantage.estimate -> loss.policy
+sample -> advantage.kl -> advantage.estimate -> loss.policy
 ```
 
 Each stage declares a capability:
@@ -67,9 +67,9 @@ Each stage declares a capability:
 | `inspect-only` | partial inputs or summaries are viewable; contract incomplete |
 | `unsupported` | the stage is not supported by capture or reader |
 
-**Frozen V1 capability matrix**: only **GRPO with `CP=1`** declares `recompute` for `sample / reward.raw / reward.post_process / advantage.kl / advantage.estimate / loss.policy`. Every other topology (`CP>1`, PPO, SAPO/CISPO, OPD, agentic flattened) is `unsupported` and fails loudly in the runner — no best-effort guessing or silent downgrade.
+**Frozen V2 capability matrix**: only **GRPO with `CP=1`** declares `recompute` for `sample / advantage.kl / advantage.estimate / loss.policy`. Every other topology (`CP>1`, PPO, SAPO/CISPO, OPD, agentic flattened) is `unsupported` and fails loudly in the runner.
 
-The advantage/loss adapters **reuse the production kernels** (`compute_approx_kl` / `get_grpo_returns` / `compute_policy_loss` in `relax/utils/training/ppo_utils.py`) as the single source of truth. `reward.post_process` is reimplemented offline (the production function lives in a module that imports Ray at module scope) and is marked `implementation="reimplemented"`, pinned by the PR #65 fixture.
+The advantage/loss adapters **reuse the production kernels** (`compute_approx_kl` / `get_grpo_returns` / `compute_policy_loss` in `relax/utils/training/ppo_utils.py`) as the single source of truth. The recorded per-sample `reward` field is the post-processed scalar or per-token reward consumed by training, including custom advantages.
 
 ## CLI usage
 
@@ -90,16 +90,15 @@ python -m relax.tools.trajectory_replay replay <bundle> \
 
 The `replay` report gives the first divergent stage, sample, field, token offset, expected/actual values and max absolute error. Skipped stages (`recorded-only` / `inspect-only` / `unsupported`) never count toward the first-divergence determination.
 
-**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure (reward/advantage normalization is group-level) and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` accepts an exact `actor_step_id=(rollout_id, step_id)` match only; use `--rollout ROLLOUT_ID` for a rollout-level bundle. The two flags are mutually exclusive. If the path is a capture directory (several bundles or `rank-*` children) it picks the matching one. `--batch` selects by DataIterator micro-batch index (`mb-0000`, `mb-0001`, …), not by actor `step_id`.
+**Selection granularity**: `--sample` / `--group` / `--batch` may be combined. Selecting any sample or micro-batch expands to its full semantic-group closure and fails closed on missing membership. Under a partial selection, per-sample/per-token stages (sample → advantage.estimate) recompute normally while the cohort-level `loss.policy` stage is skipped — a subset scalar cannot be compared to a full-cohort expected value. `--step ROLLOUT_ID:STEP_ID` accepts an exact `actor_step_id=(rollout_id, step_id)` match only; use `--rollout ROLLOUT_ID` for a rollout-level bundle. The two flags are mutually exclusive. If the path is a capture directory (several bundles or `rank-*` children) it picks the matching one. `--batch` selects by DataIterator micro-batch index (`mb-0000`, `mb-0001`, …), not by actor `step_id`.
 
-Example (the PR #65 bug):
+Example (a recorded reward mismatch):
 
 ```text
-bundle b-00001 — first divergent stage: reward.post_process
+bundle b-00001 — first divergent stage: advantage.estimate
 [   pass] sample
-[   pass] reward.raw
-[   fail] reward.post_process — normalized reward mismatch in 4 sample(s)
-          reward s-0: expected=-5.5 actual=-1.0 abs_err=4.5
+[   pass] advantage.kl
+[   fail] advantage.estimate — 2 advantage token(s) diverged
           ...
 ```
 
@@ -154,19 +153,18 @@ index = BundleIndex(
     bundle_id="b-00001",
     identity=Identity(actor_step_id=ActorStepId(rollout_id=120, step_id=0), rank={"cp": 1}),
     samples=[SampleRecord(sample_id="s-0", group_index=0, response_length=2, total_length=3,
-                          loss_mask=[1, 1], raw_reward=1.0, reward=1.0), ...],
-    config=RecomputeConfig(advantage_estimator="grpo", n_samples_per_prompt=2),
+                          loss_mask=[1, 1], reward=-1.0), ...],
+    config=RecomputeConfig(advantage_estimator="grpo"),
 )
 manifest = Manifest(
-    format_version="1.0.0", bundle_id="b-00001",
+    format_version="2.0.0", bundle_id="b-00001",
     producer=ProducerInfo(commit="...", torch_version=torch.__version__),
-    stage_contracts={stage: StageContract(stage=stage, version="v1", capability=StageCapability.RECOMPUTE)
-                     for stage in (StageId.SAMPLE, StageId.REWARD_RAW, StageId.REWARD_POST_PROCESS,
-                                   StageId.ADVANTAGE_KL, StageId.ADVANTAGE_ESTIMATE, StageId.LOSS_POLICY)},
+    stage_contracts={stage: StageContract(stage=stage, version="v2", capability=StageCapability.RECOMPUTE)
+                     for stage in (StageId.SAMPLE, StageId.ADVANTAGE_KL,
+                                   StageId.ADVANTAGE_ESTIMATE, StageId.LOSS_POLICY)},
     payloads={}, comparison_policy=..., redaction={"prompt": "hash"},
 )
-expected = {"reward.raw": {"raw_rewards": [...]}, "reward.post_process": {"rewards": [...]},
-            "loss.policy": {"loss": ...}}
+expected = {"loss.policy": {"loss": ...}}
 
 writer = BundleWriter("<path>", manifest, index, expected)
 writer.write_payload("old_log_probs", old_log_probs)
@@ -186,8 +184,8 @@ writer.finalize(ranks=[0])
 ## Current limitations
 
 - Does **not** replay model forward/backward/gradient/optimizer; does not guarantee re-sampling the same trajectory; does not require bitwise identity across hardware/compilers.
-- **V1 supports GRPO `CP=1` only**; `CP>1`, PPO value loss, OPD and agentic flattened are `unsupported`.
+- **V2 supports GRPO `CP=1` only**; `CP>1`, PPO value loss, OPD and agentic flattened are `unsupported`.
 - Production capture is split into two bundle types: rollout-level (reward/advantage, identity `rollout_id`, instrumented in `train_actor`) and step-level (loss, identity `(rollout_id, step_id)`, instrumented in `train_one_step`); cross-bundle propagation of the "first divergent stage" is not yet unified. Enable with `RELAX_REPLAY_CAPTURE=1` and `RELAX_REPLAY_CAPTURE_DIR`.
-- Remote RM/GenRM results are treated as `recorded-only` and are not recomputed offline.
+- Reward production and post-processing are outside the V2 replay boundary.
 
 See [Task 34 RFC #171](https://github.com/redai-studio/Relax/issues/171) for the design discussion.

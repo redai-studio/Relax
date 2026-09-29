@@ -399,7 +399,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
                     ],
                     layout=torch.jagged,
                 ),
-                "raw_reward": torch.nested.nested_tensor(
+                "rewards": torch.nested.nested_tensor(
                     [
                         torch.tensor([1.5]),
                         torch.tensor([2.5]),
@@ -411,7 +411,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     rollout_data, batch_meta = stream_module.get_data_from_transfer_queue(
         args=Namespace(),
         tq_client=_TQClient(),
-        data_fields=["response_lengths", "total_lengths", "raw_reward"],
+        data_fields=["response_lengths", "total_lengths", "rewards"],
         batch_size=2,
         partition_id="train_0",
         task_name="ref_log_probs",
@@ -423,7 +423,7 @@ def test_get_data_from_transfer_queue_converts_nested_length_and_reward_fields(m
     assert batch_meta.size == 2
     assert rollout_data["response_lengths"] == [512, 135]
     assert rollout_data["total_lengths"] == [1309, 842]
-    assert rollout_data["raw_reward"] == [1.5, 2.5]
+    assert rollout_data["rewards"] == [1.5, 2.5]
 
 
 def test_tensor_to_python_values_dense_tensor(monkeypatch):

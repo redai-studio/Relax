@@ -9,15 +9,15 @@ Agent 既可以 standalone 运行，也可以由集中式平台统一执行。**
 
 ::: tip 推荐工作流
 评估和接入 agent app (harness)、检查启动配置或开展实验时，建议使用仓库 `skills/agentic-rollout/` 下的
-`agentic-rollout` skill。该 skill 会检查当前 checkout，并按阶段检查 context topology、parser、export 与 credit、
+`agentic-rollout` skill。该 skill 会检查当前 checkout，并按阶段检查 context topology、parser、export 与 advantage、
 timeout、并发容量和 runtime 证据。实验仍需用户明确授权；本文继续说明 model API 请求与响应格式、API 和 export
 契约。
 
 手动阅读时：
 
 - 从已有 agent 开始：先读[准备 Agent](#准备-agent)，再读[用户接入](#用户接入)。
-- Multi-agent training、导出多个 context 或定义 per-context credit：
-  [选择训练 Context 与 Credit](#选择训练-context-与-credit)。
+- 多 Agent 训练、导出多个上下文或为不同上下文分配 advantage：
+  [选择训练 Context 与分数](#选择训练-context-与分数)。
 - 调整并发或跨 step 执行：[配置 Runtime 行为](#配置-runtime-行为)。
 - 理解 SessionForest 与调度原理：[理解 Agentic Rollout 原理](#理解-agentic-rollout-原理)。
 :::
@@ -346,21 +346,27 @@ Model、dataset、parallelism 和 algorithm 配置可参考 `examples/` 下的�
 AGENTIC ROLLOUT event=accounting_end rollout=0 ...
 ```
 
-Progress bar 使用 `scored` 表示已完成的 session。把最终 conversation 导出为一个训练 context 的 application
-至此已经可以训练。
+进度条中的 `scored` 表示 sample 的打分已经完成。下一节说明不同场景下如何生成 reward、分配 advantage。
 
-## 选择训练 Context 与 Credit
+## 选择训练 Context 与分数
 
-| 每个 session 导出的 Context 数量 | 必需的训练 Credit |
-| --- | --- |
-| 一个 context | 写入 `reward`，或省略并配置 `--custom-rm-path` |
-| 多个 context | 配置 `--agentic-custom-advantage-path`；一般不鼓励 custom RM，使用前需要明确审查 Group RM |
+Agent 完成任务后，需要确定哪些 context 进入训练，以及 reward/advantage 如何产生。最常见的情况是，一个
+sample 对应一个 reward/advantage，其数值来自环境或奖励函数。
 
-### 导出最终 Conversation
+![如何选择 Agentic reward 与 advantage](/agentic/agentic-reward-advantage-zh.svg)
 
-导出一个最终训练 context 时，可以不创建 `RELAX_OUTPUT_JSON`、写入空文件，或写入包含可选 `metadata` 与
-`reward` 的 object。Relax 会导出唯一的 committed conversation context。Output 不包含 `reward` 时，训练命令
-必须配置 `--custom-rm-path`。
+| Example | 任务分数 | 训练 Context | Advantage |
+| --- | --- | --- | --- |
+| [`mini_swe_agent`](../../../examples/mini_swe_agent/README.md) | 分数来自环境自带的测试脚本，并保存在 `reward` 中 | 一个 context | Reward 后处理方式由 `--advantage-estimator` 决定 |
+| [DeepEyes Agentic](../../../examples/deepeyes_agentic/run_deepeyes_agentic.sh) | 通过 `--custom-rm-path` 调用 [`reward_deepeyes.reward_func`](../../../examples/deepeyes_agentic/reward_deepeyes.py) | 一个 context | Reward 后处理方式由 `--advantage-estimator` 决定 |
+| [Search-R1 multiagent](../../../examples/search_r1/app/multiagent.py) | Agent 计算 exact-match 分数并写入 export metadata | `main + searcher_*` | [Custom advantage](../../../examples/search_r1/advantage_search_r1.py) 为每个 export 分配 scalar advantage |
+
+### 一个训练 Context
+
+一个 Session 只导出最终 context 时，Relax 会直接使用已记录的 conversation。环境负责打分时，把结果写入
+`RELAX_OUTPUT_JSON` 的 `reward` 字段；使用奖励函数时，配置 `--custom-rm-path`。需要记录其他信息时，把它们
+写入同一 JSON object 的 `metadata` 字段。Relax 会在 rollout dump 中保留完整 metadata，并把其中的顶层数值字段
+作为 metrics 上报到 ClearML、TensorBoard 等已启用的观测平台。
 
 ```json
 {
@@ -369,21 +375,28 @@ Progress bar 使用 `scored` 表示已完成的 session。把最终 conversation
 }
 ```
 
+`reward` 只有一个值时，直接写 number。需要同时记录多个打分结果时，写成 JSON object，并通过下面的参数指定
+其中哪个字段作为 reward 参与训练；其他顶层数值字段会作为 reward metrics 上报：
+
+```bash
+--reward-key <primary-key>
+```
+
 隐式导出仅用于经过审查的严格线性历史。任何非线性历史都必须显式导出，即使当前只有一个 exportable leaf。
 
 ### 显式导出一个或多个 Context
 
-Multi-agent training 是显式导出的常见场景。例如，一个 session 可以导出一个 `main` context 和多个 `searcher`
-context，使它们分别获得训练 credit。单个 agent 存在多个 conversation branch 时，也可以使用显式导出。每条
-JSONL record 表示一个训练 context，而不是一个 agent process。导出多个 context 时必须配置
-`--agentic-custom-advantage-path`。
+当一个 Session 的对话上下文不再是严格线性拼接的，例如 multi-agent 协作或历史压缩，其中可能存在多个线性
+context。显式导出允许用户选择其中哪些 context 用于训练，并通过
+`--agentic-custom-advantage-path` 为每个 export 分配 advantage。
 
-每个选中用于训练的 context 写一条 JSONL record：
+每个选中的 context 各占一条 JSONL record，全部写入 `RELAX_OUTPUT_JSON` 指向的文件。例如，一个 Session
+选择 `main` 和两个 `searcher` context 时，写成：
 
 ```jsonl
-{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"main","outcome":1.0},"reward":1.0}
-{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"searcher","outcome":1.0}}
-{"name":"searcher_1","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"role":"searcher","outcome":1.0}}
+{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"outcome":1.0}}
+{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.6}}
+{"name":"searcher_1","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.4}}
 ```
 
 | 字段 | 是否必需 | 含义 |
@@ -392,131 +405,90 @@ JSONL record 表示一个训练 context，而不是一个 agent process。导出
 | `messages` | 是 | Generation 实际使用的完整 message history |
 | `tools` | 使用时必需 | 该 context 使用的准确 tools |
 | `chat_template_kwargs` | 使用时必需 | 该 context 使用的准确 template arguments |
-| `metadata` | 否 | Per-context metric 与 custom credit 输入 |
+| `metadata` | 否 | Per-context metric 与 custom advantage 输入 |
 | `reward` | 否 | Per-context 任务 outcome，可以是 number、object 或 `null` |
 
-每条 record 必须匹配一个 committed SessionForest state。完整保留 generation 使用的 assistant message、reasoning
-content、tool call、tools 与 template arguments。Relax 训练 JSONL 中出现的 record；未写入的 context 不参与训练。
+Relax 训练 JSONL 中出现的 record；未写入的 context 不参与训练。需要显式导出时，建议 agent 全程使用 Chat
+Completions，并在 export record 中复用 generation 的完整 `messages`、`tools` 和 `chat_template_kwargs`，以匹配
+Relax 记录的 SessionForest state。
 
-即使 agent 调用 Responses 或 Messages，显式 export record 仍使用上文 canonical Chat-shaped `messages`、嵌套
-function `tools` 和 `chat_template_kwargs`。请复用能够匹配 committed SessionForest state 的 normalized value；
-raw Responses `input` list 或 Anthropic block list 不是显式 export record。
-
-Context 数量与 process 数量无关。一个 process 可以导出多个 context。Multi-agent application 可以导出一个或
-多个 context。Eval 可以仅导出 `main`，training 则可以导出更多 context。
-
-### Standard Reward
-
-每个 session 导出一个 context 时支持 standard reward。可以在 output 中写入 `reward`；也可以省略 `reward`，并
-配置 `--custom-rm-path`。Numeric reward 表示 scalar outcome。Reward object 可以同时保存 primary reward 与
-numeric helper metric。使用 reward object 时配置：
+::: warning 多 Context 训练参数
+一个 Session 导出多个 context 时，训练命令还需要：
 
 ```bash
---reward-key <primary-key>
+--use-dynamic-batch-size
+--max-tokens-per-gpu <token-budget>
 ```
 
-### 用 Custom Advantage 分配 Multi-Agent Credit
+这是多个物理训练行的 batching 约束，与 reward 来源或 advantage 粒度无关。
+:::
 
-一个 session 导出多个 context 后，单个任务 outcome 无法说明每个 context 应获得多少训练 credit。Custom
-advantage 把 export metadata 转换成每个 context 的一个数值。
+::: warning Eval 只导出一个 Context
+默认 Eval 会把每个 export 当作一个 sample 统计。一个 Session 导出多个 context 会改变平均 reward 的分母，也会
+打乱 `--log-passrate` 按 `n_samples_per_eval_prompt` 进行的分组。因此 Eval 应只导出一个代表 context，通常是
+`main`。Search-R1 multiagent 已按此方式实现：training 导出 `main + searcher_*`，Eval 只导出 `main`。只有自定义
+Eval logger 明确按 Session 重新聚合时，才应在 Eval 中导出多个 context。
+:::
 
-函数需要的所有输入都应写入每个 export 的 `metadata`，然后配置：
+### Custom Advantage
+
+Search-R1 multiagent 展示了 scalar advantage：它导出 `main` 和 `searcher_*`，在 sampled Group 内归一化 main
+分数，并为每个 export 分配一个 scalar。
+
+Custom advantage 使用具名的显式 export record，即使一个 Session 只导出一个 context。
+
+配置方式：
 
 ```bash
 --agentic-custom-advantage-path my_package.advantage.advantage_func
 ```
 
-假设第一个 sampled session 向 `RELAX_OUTPUT_JSON` 写入以下显式 record：
-
-```jsonl
-{"name":"main","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"outcome":1.0},"reward":1.0}
-{"name":"searcher_0","messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}],"metadata":{"usefulness":0.6}}
-```
-
-再假设第二个 sampled session 导出相同 name，`outcome=0.0`，`usefulness=0.2`。
-
-Relax 直接根据前面导出的 context 构造函数输入：
-
-- 每个 export 的 `name` 成为 mapping key；
-- 该 export 最终的 metadata 成为 mapping value；
-- 外层 list 保持 sampled Group 中的 session 顺序。
-
-该 mapping 仅传入 export metadata。函数签名为：
+`advantage_func` 会收到当前 Group 中所有 Session 的导出信息。前面每条 JSONL record 里的 `name` 和
+`metadata`，在这里会变成 `{name: metadata}`。下面的最小例子读取前面 JSONL 中的 `outcome` 和 `usefulness`，
+先在当前 Group 内对 main outcome 做中心化，再为每个 export 生成 scalar advantage：
 
 ```python
+import statistics
 from typing import Any
 
 
 def advantage_func(
-    metadata_by_slot: list[dict[str | None, dict[str, Any]]],
-) -> list[dict[str | None, float]] | None:
-    ...
+    metadata_by_slot: list[dict[str, dict[str, Any]]],
+) -> list[dict[str, float | list[float]]] | None:
+    main_scores = [float(exports["main"]["outcome"]) for exports in metadata_by_slot]
+    mean = statistics.fmean(main_scores)
+    return [
+        {
+            name: (score - mean) * float(metadata.get("usefulness", 1.0))
+            for name, metadata in exports.items()
+        }
+        for exports, score in zip(metadata_by_slot, main_scores)
+    ]
 ```
 
-这两个 sampled session 会转换成以下 hook input：
+`advantage_func` 返回 `None`，或返回一个与输入 Session 一一对应的 list。List 中第 i 项属于第 i 个 Session，
+并沿用显式导出时填写的 export name。
 
-```python
-[
-    {"main": {"outcome": 1.0}, "searcher_0": {"usefulness": 0.6}},
-    {"main": {"outcome": 0.0}, "searcher_0": {"usefulness": 0.2}},
-]
-```
+每个 export 对应的 advantage 可以是：
 
-返回值保持相同的外层顺序和 context name：
+- 一个 scalar：所有 assistant 回合共用这个分数；
+- 一个 list：每个 assistant 回合对应一个分数，list 长度必须等于 assistant 回合数。
 
-```python
-[
-    {"main": 1.0, "searcher_0": 0.6},
-    {"main": 0.0, "searcher_0": 0.0},
-]
-```
+Relax 会把每个回合的分数应用到该回合的 token，observation token 的分数为零。如果整个函数返回 `None`，Relax
+会丢弃并补采整个 Group。Eval 不调用 `advantage_func`。
 
-该例中，`main` 使用任务 outcome，`searcher_0` 使用 `outcome × usefulness`。不同 context 可以使用不同的
-metadata field 和 credit 公式。
+::: warning
+Custom advantage 会跳过 GRPO Group normalization 等标准 reward 后处理。需要在 Group 内比较或归一化时，
+应在 `advantage_func` 中完成。
 
-输出第 `i` 项始终对应输入第 `i` 个 session；函数不能改变外层 list 顺序。一个 mapping 内通过 name 匹配 context，
-因此 dict 展示顺序不重要。每个 exported name 都需要一个 numeric value，该值是整个 context 的训练 credit。
-`0.0` 会保留该 context，并给它零 credit。返回顶层 `None` 会过滤完整 sampled Group，不会过滤单个 context。
-隐式导出的单 context 使用 `None` 作为 context name。Eval 不调用该函数。
-
-::: warning 在 Custom Advantage 函数内完成 Normalization
-Custom path 会跳过标准 GRPO reward normalization。标准 GRPO normalization 以每条 trajectory 的一个 scalar
-reward 为输入，无法表达 context role 或 turn-level credit structure。所有比较、centering、scaling 和
-normalization 都必须在该函数内完成，包括 sampled Group 内不同 trajectory 之间、不同 context 或 role 之间，
-以及 metadata 中 turn-level signal 的 normalization。当前函数为每个 exported context 返回一个 scalar，因此
-turn-level signal 需要先归约成该 scalar。
-
-`--normalize-advantages` 是后续独立的 whitening step，不能替代该函数内 role-aware 或 turn-aware 的
-normalization。
+`--normalize-advantages` 与 GRPO normalization 无关。该开关在 advantage 生成后，对 data-parallel group 中所有
+有效 token 的 advantage 做 masked whitening。GRPO normalization 属于更早的 reward 后处理，按同一 prompt 的
+sampled Group 处理 reward；它是否执行不由 `--normalize-advantages` 控制。
 :::
 
-#### Custom Advantage 之后的训练步骤
-
-虽然参数名包含 advantage，函数返回的 scalar 是一个 context 的基础 credit。训练侧随后才会构造 token
-advantage，并应用 policy loss correction。该返回值不是最终 loss weight。
-
-```text
-export metadata
-→ custom advantage and task-specific normalization
-→ one base scalar per exported context
-→ returns and token advantages, with estimator-specific KL shaping when used
-→ optional generic advantage whitening
-→ policy ratio and estimator-specific clipping
-→ OPSM, TIS, or other off-policy masks
-→ entropy, independent KL, and optional distillation terms
-→ loss reduction and backpropagation
-```
-
-KL 在后续训练中可能表示三种不同操作：
-
-- Estimator 构造 return 时使用的 reference-policy KL；仅在该 estimator 支持 KL reward shaping 时生效；
-- old-policy/current-policy log ratio，指标名为 `ppo_kl`，用于 policy clipping；
-- 通过 `--use-kl-loss` 启用的独立 reference-policy KL loss。
-
-::: warning Custom advantage 的 Reward 配置
-一般不建议同时使用 `--custom-rm-path` 与 `--agentic-custom-advantage-path`。未启用 `--group-rm` 时，ordinary
-custom RM path 会被跳过。经过明确审查的 Group RM 仍可为指标或过滤写入 reward，训练 credit 由 custom
-advantage 提供。Advantage 函数使用的每项信号都应写入 export metadata。
+::: warning
+训练使用 custom advantage 返回的值。函数需要的值都要写进 export metadata。Eval 或 reward 指标还需要
+`reward` 时，在 `RELAX_OUTPUT_JSON` 中保留相应的 `reward` 字段。
 :::
 
 ### Metrics 与 Passrate
@@ -526,21 +498,10 @@ advantage 提供。Advantage 函数使用的每项信号都应写入 export meta
 - Output metadata 的顶层 numeric field 使用 `<field>/mean|median|max|min`，不带 `rollout/` 前缀。
 - Rollout dump 保留完整 metadata。
 
-启用 `--log-passrate` 时，multi-context Session 使用显式导出，并且只有一个代表 context 携带 reward，通常是
+启用 `--log-passrate` 时，multi-context Session 使用显式导出，并且由一个代表 context 携带 reward，通常是
 `main`。选中的 primary reward value 成功时设为 `1`，其他情况设为 `0`；reward object 通过 `--reward-key` 选择该
-值。Sibling context 不设置 reward。Custom advantage 需要同一 outcome 时，其他 context 可以在 metadata 中保存
-该值。Group RM 如果为每个 exported row 写入 reward，则需要 custom logger 恢复 logical Session 分组。
-Multi-context training 中，reward 用于上报 outcome，训练 credit 由 custom advantage 提供。
-
-### 多 Context Dynamic Batching
-
-任何可能从一个 session 导出多个 context 的 recipe 都**必须**配置 `--agentic-custom-advantage-path`，并且
-**必须**启用 dynamic batching。一般不鼓励 custom RM；仅在经过明确审查后，将 Group RM 用于上报或过滤。
-
-```bash
---use-dynamic-batch-size
---max-tokens-per-gpu <token-budget>
-```
+值。Sibling context 不设置 reward。Custom advantage 需要的 outcome 可以保存在各 context 的 metadata 中。
+Multi-context training 中，reward 用于上报任务结果，custom advantage 决定每个 export 的 advantage。
 
 ## 配置 Runtime 行为
 
@@ -603,7 +564,7 @@ Session KV lifecycle 与 program-aware admission 是长时间 Agentic workload �
 
 一个 dataset sample 创建一个 Session。Session 拥有一个 agent process、一个 SessionForest、rollout mode
 和 active-time budget。Process 可以顺序或并发调用 model API。Process 退出后，Relax 选择指定 Forest
-state、计算训练 credit，并把 sample 发送到训练侧。
+state、计算 advantage，并把 sample 发送到训练侧。
 
 主要 runtime 路径是：
 

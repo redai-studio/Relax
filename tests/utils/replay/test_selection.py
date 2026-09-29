@@ -49,7 +49,7 @@ def test_replay_single_batch_passes(tmp_path):
     bundle, _, _ = build_grpo_bundle(tmp_path / "b")
     report = replay(bundle, batch_ids=["mb-0008"])
     assert report.passed is True
-    assert _stage(report, "reward.post_process").status == StageStatus.PASS
+    assert _stage(report, "advantage.estimate").status == StageStatus.PASS
 
 
 def test_replay_full_selection_still_replays_loss(tmp_path):
@@ -84,4 +84,4 @@ def test_select_bundle_slices_tensors_and_expected(tmp_path):
     subset = select_bundle(loaded, sample_ids=["s-0"])
     assert len(subset.index.samples) == 2
     assert subset.tensors["old_log_probs"].numel() == 4
-    assert len(subset.expected["reward.raw"]["raw_rewards"]) == 2
+    assert [sample.reward for sample in subset.index.samples] == [-1.0, 1.0]
