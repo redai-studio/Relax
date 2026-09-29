@@ -1119,8 +1119,6 @@ def train_one_step(
                 args.allgather_cp,
                 is_vl_model,
             )
-        if mpu.is_pipeline_last_stage():
-            packing_metrics.add(batch, mpu.get_context_parallel_world_size())
         if args.ci_test and args.enable_mtp_training:
             main_loss_has_tokens = main_loss_has_tokens or _main_loss_has_tokens(batch)
 
@@ -1237,7 +1235,17 @@ def train_one_step(
         # Always dispatch via loss_function. MTP-only consumes the bypassed
         # hidden states directly; chunked SFT uses lm_head_forward to compute
         # the regular language loss in bounded chunks.
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+        loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+
+        def loss_callback_with_packing_metrics(
+            logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
+            # Megatron invokes the loss callback only on the final physical and
+            # virtual pipeline stage, so VPP chunks count each microbatch once.
+            packing_metrics.add(batch, mpu.get_context_parallel_world_size())
+            return loss_callback(logits)
+
+        return output_tensor, loss_callback_with_packing_metrics
 
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
     # save the original static CP group here and restore after forward+backward.
