@@ -6,8 +6,8 @@ Accepts the baseline exporter's CLI. Requires PP=1, expert-TP=1 and EP=world
 size. Non-expert mappings, source checkpoint loading, native schema validation
 and atomic publication reuse the baseline exporter. Install patches only inside
 this export's dedicated workers; never modify the installed Megatron package.
---gpus-per-node packs workers onto whole nodes with the driver node first, so
-rank 0 keeps hosting the Gloo store. --expert-gather-backend nccl stages the
+--gpus-per-node packs workers onto eligible GPU nodes, preferring the driver
+when eligible. Rank 0 hosts the Gloo store. --expert-gather-backend nccl stages the
 quantized expert payloads on the worker GPU for an NCCL all-gather instead of
 CPU Gloo; gathered values stay bit-identical.
 """
@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import socket
 import sys
 import time
 import uuid
@@ -303,30 +302,26 @@ def _pin_nodes(ray: Any, driver_node_id: str, args: argparse.Namespace) -> list[
     """Return the target node id per rank; None leaves a rank to ordinary Ray
     scheduling.
 
-    With --gpus-per-node, ranks are packed onto whole nodes, driver node first,
-    so rank 0 keeps hosting the Gloo store. Node GPU totals decide eligibility;
-    free capacity is still resolved by Ray at scheduling time, and workers stay
-    pending when a chosen node runs out.
+    With --gpus-per-node, ranks are packed onto whole eligible nodes,
+    preferring the driver when eligible. Node resource totals decide
+    eligibility; free capacity is still resolved by Ray at scheduling time, and
+    workers stay pending when a chosen node runs out.
     """
+    import convert_kimi_k3_torch_dist_to_hf as baseline
+
     per_node = args.gpus_per_node
+    candidates = baseline._eligible_nodes(
+        ray, driver_node_id, gpus=per_node or 1, cpus=(per_node or 1) * args.cpus_per_worker
+    )
     if per_node is None:
-        return [driver_node_id] + [None] * (args.world_size - 1)
-    candidates = [
-        node["NodeID"]
-        for node in ray.nodes()
-        if node.get("Alive") and node.get("Resources", {}).get("GPU", 0.0) >= per_node
-    ]
-    if driver_node_id not in candidates:
-        raise RuntimeError(
-            f"Driver node reports fewer than {per_node} GPUs; rank 0 hosts the Gloo store and must stay there"
-        )
-    candidates.remove(driver_node_id)
+        return [candidates[0]] + [None] * (args.world_size - 1)
     chunks = args.world_size // per_node
-    if len(candidates) < chunks - 1:
+    if len(candidates) < chunks:
         raise RuntimeError(
-            f"Need {chunks} alive nodes with at least {per_node} GPUs each; found {len(candidates) + 1} eligible"
+            f"Need {chunks} alive nodes with at least {per_node} GPUs and "
+            f"{per_node * args.cpus_per_worker} CPUs each; found {len(candidates)} eligible"
         )
-    nodes = [driver_node_id] + candidates[: chunks - 1]
+    nodes = candidates[:chunks]
     return [nodes[rank // per_node] for rank in range(args.world_size)]
 
 
@@ -351,12 +346,9 @@ def main() -> None:
     ray.init(address=args.ray_address)
     if ray.cluster_resources().get("GPU", 0) < args.world_size:
         raise RuntimeError(f"Cluster has fewer than {args.world_size} GPUs")
-    with socket.socket() as listener:
-        listener.bind(("", 0))
-        port = listener.getsockname()[1]
     worker = ray.remote(num_gpus=1, num_cpus=args.cpus_per_worker, max_retries=0)(_worker)
-    master = ray.util.get_node_ip_address()
     nodes = _pin_nodes(ray, ray.get_runtime_context().get_node_id(), args)
+    master, port = baseline._rendezvous_on_node(ray, nodes[0])
     futures = []
     for rank, node_id in enumerate(nodes):
         task = (
