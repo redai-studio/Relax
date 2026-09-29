@@ -113,6 +113,16 @@ def convert_expert(
         key = name.removesuffix("_scale_inv") + "_scale" if name.endswith("_scale_inv") else name + "_packed"
         if key not in layout.weight_map:
             raise ValueError(f"Unexpected quantized expert key: {key}")
+        if name.endswith("_scale_inv"):
+            shape = tuple(layout.spec(key)["shape"])
+            if tuple(tensor.shape) != shape:
+                # Older Bridge EP gather uses squeeze().unsqueeze(-1),
+                # dropping singleton block axes and adding a trailing axis.
+                # Restore only that known layout, never arbitrary equal-numel shapes.
+                legacy_shape = tuple(dim for dim in shape if dim != 1) + (1,)
+                if len(shape) != 2 or tuple(tensor.shape) != legacy_shape:
+                    raise ValueError(f"HF scale shape mismatch for {key}: {tuple(tensor.shape)} != {shape}")
+                tensor = tensor.reshape(shape)
         result[key] = tensor
     return result
 
