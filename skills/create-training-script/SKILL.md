@@ -1,6 +1,6 @@
 ---
 name: create-training-script
-description: 新增 Relax 训练启动脚本或模型、数据集、卡数、训练模式变体时使用。覆盖 scripts/training 和 examples 下的脚本位置、模板选择、MODEL_DIR/DATA_DIR/SAVE_DIR、可恢复 checkpoint、ClearML 实验命名和 Ray 非阻塞提交。
+description: 新增 Relax 训练启动脚本或模型、数据集、卡数、训练模式变体时使用。覆盖 scripts/training 和 examples 下的脚本位置、模板选择、MODEL_DIR/DATA_DIR/SAVE_DIR、可恢复 checkpoint、ClearML 实验命名和 Ray 默认阻塞提交。
 ---
 
 # 新增训练脚本
@@ -66,10 +66,10 @@ WANDB_ARGS=(
 
 最终命令传入 `"${WANDB_ARGS[@]}"`。日志使用 `mkdir -p "${SCRIPT_DIR}/log"` 和 `tee "${SCRIPT_DIR}/log/${EXP_NAME}-${now}.log"`，保留 `set -o pipefail`。ClearML task 和日志可以每次启动新建；**训练 resume 由稳定 checkpoint 路径决定**。当前 ClearML adapter 不会自动续写上一次 task，不要承诺恢复 checkpoint 就会续用同一 ClearML task。
 
-## 4. Ray 提交默认非阻塞
+## 4. Ray 提交默认阻塞
 
-- 脚本设置 `export RAY_NO_WAIT="${RAY_NO_WAIT-1}"`，最终提交保留 `ray job submit ${RAY_NO_WAIT:+--no-wait}`，使 AI 提交后能继续查看日志。调试命令显式带 `RAY_NO_WAIT=1`。
-- `${RAY_NO_WAIT:+--no-wait}` 按“非空”判断，`RAY_NO_WAIT=0` **仍然启用** no-wait；用户需要等待时显式传空值 `RAY_NO_WAIT=`。此处默认表达式使用 `${RAY_NO_WAIT-1}`，不能用会覆盖空值的 `${RAY_NO_WAIT:-1}`。
+- 脚本设置 `export RAY_NO_WAIT="${RAY_NO_WAIT-}"`，最终提交保留 `ray job submit ${RAY_NO_WAIT:+--no-wait}`。默认不传 `--no-wait`，阻塞等待任务结束并跟随日志；仅在明确需要非阻塞时显式设置 `RAY_NO_WAIT=1`，不能因为由 AI 执行或用于调试就自动启用。
+- `${RAY_NO_WAIT:+--no-wait}` 按“非空”判断，`RAY_NO_WAIT=0` **仍然启用** no-wait；阻塞运行时保持未设置或显式传空值 `RAY_NO_WAIT=`。禁止使用 `${RAY_NO_WAIT-1}` 或 `${RAY_NO_WAIT:-1}` 将非阻塞设为默认。
 - 保留 `--runtime-env-json="${RUNTIME_ENV_JSON}"` 和 `${WORKING_DIR:+--working-dir "${WORKING_DIR}"}`。新增 worker 环境变量时确认已进入 runtime env，不能只在提交机 export。
 - 使用已确认的 Ray Jobs HTTP 地址，不能把 GCS 地址直接当作 Jobs 地址。本地模板的 loopback dashboard 地址只适用于相应本地提交场景。
 - 保留提交返回的 job ID，随后用 `ray job logs --address="<Jobs HTTP 地址>" <job-id>` 检查训练进展。no-wait 下 `tee` 只保存提交阶段输出，**提交命令成功不等于训练成功**。
