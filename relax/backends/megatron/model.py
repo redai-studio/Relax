@@ -45,6 +45,7 @@ from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
+from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
@@ -1113,6 +1114,7 @@ def train_one_step(
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     main_loss_has_tokens = False
+    packing_metrics = PackingMetrics()
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1281,7 +1283,17 @@ def train_one_step(
         # Always dispatch via loss_function. MTP-only consumes the bypassed
         # hidden states directly; chunked SFT uses lm_head_forward to compute
         # the regular language loss in bounded chunks.
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+        loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+
+        def loss_callback_with_packing_metrics(
+            logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
+            # Megatron invokes the loss callback only on the final physical and
+            # virtual pipeline stage, so VPP chunks count each microbatch once.
+            packing_metrics.add(batch, mpu.get_context_parallel_world_size())
+            return loss_callback(logits)
+
+        return output_tensor, loss_callback_with_packing_metrics
 
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
     # save the original static CP group here and restore after forward+backward.
@@ -1403,7 +1415,7 @@ def train_one_step(
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
-        loss_reduced = {}
+        loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
         is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
         num_samples_or_tokens = (
@@ -1674,7 +1686,9 @@ def train(
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
             log_dict["train/step"] = accumulated_step_id
-            num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
+            num_per_epoch = getattr(args, "num_rollout_per_epoch_for_metrics", None)
+            if num_per_epoch is None:
+                num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
             if num_per_epoch:
                 log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
                     num_per_epoch * num_steps_per_rollout

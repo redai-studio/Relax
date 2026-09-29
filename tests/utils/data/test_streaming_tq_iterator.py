@@ -497,3 +497,36 @@ def test_tensor_to_python_values_mixed_ragged_rows(monkeypatch):
         [1],
         [2, 3],
     ]
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_sft_token_lengths_count_raw_masks_on_cpu(monkeypatch, as_tensor):
+    stream_module = _load_stream_module(monkeypatch)
+    masks = [[0, 1, 1, 0, 1, 0], [0, 0, 0], [1, 1]]
+    batch = {
+        "total_lengths": [6, 3, 2],
+        "response_lengths": [6, 3, 2],
+        "loss_masks": [torch.tensor(mask) for mask in masks] if as_tensor else masks,
+    }
+    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    assert batch["learn_lengths"] == [3, 0, 2]
+    assert batch["non_learn_lengths"] == [3, 3, 0]
+    assert batch["response_lengths"] == batch["total_lengths"]  # Keep internal alignment semantics.
+    assert all(
+        total == learn + non_learn
+        for total, learn, non_learn in zip(
+            batch["total_lengths"], batch["learn_lengths"], batch["non_learn_lengths"], strict=True
+        )
+    )
+    # Subsequent postprocessing must reuse CPU counts after masks move to a device.
+    batch["loss_masks"] = [torch.empty(6, device="meta")]
+    stream_module._add_sft_token_lengths(Namespace(loss_type="sft"), batch)
+    assert batch["learn_lengths"] == [3, 0, 2]
+
+
+def test_sft_token_lengths_leave_rl_batch_unchanged(monkeypatch):
+    stream_module = _load_stream_module(monkeypatch)
+    batch = {"total_lengths": [6], "loss_masks": [[1, 1]]}
+    stream_module._add_sft_token_lengths(Namespace(loss_type="policy_loss"), batch)
+    assert "learn_lengths" not in batch
+    assert "non_learn_lengths" not in batch
