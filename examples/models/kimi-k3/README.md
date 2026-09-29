@@ -1,0 +1,103 @@
+# Kimi K3 Training and Export
+
+[中文](./README.zh-CN.md)
+
+## Overview
+
+Relax provides full-parameter and LoRA SFT for Kimi K3, with image inputs, packing, fixed CP, PP and EP. The model configuration is `scripts/models/kimi-k3.sh`; public recipes live in `examples/models/kimi-k3/scripts/`.
+
+Use a training image built with the pinned Megatron/Bridge, FLA and NVRx dependencies in `docker/Dockerfile` or `docker/Dockerfile_Blackwell`. Model and dataset directories must be readable from every training node. These recipes are reference configurations; validate memory use and numerical behavior on the target cluster before a long run.
+
+## Training
+
+Run commands from the repository root on an existing Ray cluster. `MODEL_DIR` points directly to the original HF model directory; `DATA_DIR` points to the prepared dataset directory. Existing `HF_CHECKPOINT`, `HELLASWAG_DATA_DIR`, `OPENR1MM_DATA_DIR`, `POKEMON_DATA_DIR` and `LLAVA_DATA_DIR` overrides remain supported.
+
+```bash
+export MODEL_DIR=/shared/models/Kimi-K3
+export DATA_DIR=/shared/data/openr1mm
+export SAVE_DIR=/shared/checkpoints
+export EXP_NAME=kimi-k3-openr1mm-full
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+bash scripts/entrypoint/ray-job.sh \
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300.sh
+```
+
+| Recipe filename                             |     GPUs | Input                                              |
+| ------------------------------------------- | -------: | -------------------------------------------------- |
+| `run-kimi-k3-hellaswag-128xb300.sh`         | 128 B300 | `train.jsonl`, `validation.jsonl`                  |
+| `run-kimi-k3-hellaswag-128xb300-rawtext.sh` | 128 B300 | Same files; raw context/target baseline comparison |
+| `run-kimi-k3-openr1mm-128xb300.sh`          | 128 B300 | `train.parquet`                                    |
+| `run-kimi-k3-llava-onevision-128xb300.sh`   | 128 B300 | `train/` JSONL shards and `READY.json`             |
+| `run-kimi-k3-pokemon-64xb300.sh`            |  64 B300 | `pokemon_gpt4o_zh.parquet`                         |
+| `run-kimi-k3-pokemon-128xb300.sh`           | 128 B300 | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-192xgpu-b300.sh`       | 192 B300 | Same Parquet file                                  |
+| `run-kimi-k3-pokemon-lora-64xb300.sh`       |  64 B300 | Same Parquet file; language-backbone LoRA          |
+
+`SAVE_DIR` enables saving to the stable `${SAVE_DIR}/${EXP_NAME}` directory and loading from the same directory. Without it, recipes do not save checkpoints. OpenR1-MM and OneVision save **model weights only** by default; optimizer and scheduler state are not preserved. `SAVE_OPTIMIZER=1` enables full-state saving, which needs substantially more host memory and storage. A model-only checkpoint is not an exact training resume.
+
+OpenR1-MM and OneVision default to frozen vision; set `FREEZE_VISION_TOWER=0` for joint vision training and revalidate memory use. `FLA_TILELANG=0` is passed to training actors by default; an explicit environment override is supported. ClearML uses the existing runtime configuration. Ray submission waits for completion and streams logs by default; set `RAY_NO_WAIT=1` to submit in the background, where submission success does not establish training success.
+
+## OneVision Data Preparation
+
+The processing tool remains at `scripts/tools/prepare_llavaonevision.py`.
+
+```bash
+python -m scripts.tools.prepare_llavaonevision prepare \
+  --output-dir /shared/data/onevision --workers 8
+export DATA_DIR=/shared/data/onevision/sft
+```
+
+Preparation pins the dataset revision in a manifest, extracts embedded images into shared files and publishes `READY.json` only after all shards complete. Re-running resumes completed shards. `--subsets` produces `SUBSET_READY.json` for smoke preparation; it is not a complete dataset readiness marker.
+
+The `sample` subcommand can instead select a fixed number of valid rows from locally cached Parquet shards. Its images are inline data URIs. For a complete dataset, use `prepare` and make the extracted image paths accessible from every training node.
+
+## Export
+
+Run conversion inside the compatible training image, connected to a Ray cluster. `CKPT_PATH` must point to one `iter_*` directory. The original HF directory supplies model configuration, tokenizer and native quantization layout.
+
+```bash
+export CKPT_PATH=/shared/checkpoints/experiment/iter_0000100
+python examples/models/kimi-k3/tools/convert_kimi_k3_torch_dist_to_hf_parallel.py \
+  --input-dir "${CKPT_PATH}" --origin-hf-dir "${MODEL_DIR}" \
+  --output-dir "${CKPT_PATH}_hf" \
+  --world-size 16 --tp 4 --pp 1 --ep 16 --expert-tp 1 \
+  --cpus-per-worker 16
+```
+
+The parallel exporter requires PP=1, expert-TP=1 and EP=world-size. It validates the output before publishing. Existing output is rejected unless `--replace-output` is explicitly supplied.
+
+For a language LoRA checkpoint, use the **exact original model used for training**:
+
+```bash
+python examples/models/kimi-k3/tools/merge_kimi_k3_lora_to_hf.py \
+  --input-dir "${CKPT_PATH}" --origin-hf-dir "${MODEL_DIR}" \
+  --output-dir "${CKPT_PATH}_hf" --workers 8 --cpus-per-worker 4
+```
+
+This produces full HF weights with LoRA merged before native MXFP4 quantization. Vision adapters are not supported by this merge path. `compare_kimi_k3_hf_exports.py` and `validate_kimi_k3_parallel_export.py` in the same tools directory provide shard comparison and quantization checks.
+
+## Validation and Serving
+
+The temporary SGLang validator requires a log directory:
+
+```bash
+python examples/models/kimi-k3/tools/validate_kimi_k3_sglang.py \
+  --model-path "${CKPT_PATH}_hf" --log-dir "${CKPT_PATH}_serve_logs" \
+  --tp-size 8 -- \
+  --weight-loader-prefetch-checkpoints --context-length 16384 \
+  --max-running-requests 16 --cuda-graph-max-bs 16 --disable-decode-cuda-graph
+```
+
+Its built-in checks are text-only. Use `scripts/tools/eval_openr1mm.py` for image evaluation; inspect `--help` for endpoint, dataset and output arguments.
+
+## Limits
+
+- MTP, dynamic CP, all-gather CP and VPP are not supported for Kimi K3. Fixed CP uses zigzag partitioning; TP greater than one requires sequence parallelism.
+- Large context lengths, joint vision training and full-state checkpoint saves require separate capacity validation. These scripts do not establish 256k-context readiness.
+- CPU unit tests and Gloo tests do not validate NCCL, multi-node Ray export, CUDA quantization or actual image serving. Run those checks in the target image and cluster before merging for production use.
+
+## Next Steps
+
+- [SFT Training](../../../docs/en/guide/sft-training.md)
+- [Model Checkpoint Conversion](../../../docs/en/guide/model-conversion.md)
+- [LoRA Training](../../../docs/en/guide/low-rank-adaptation-training.md)
