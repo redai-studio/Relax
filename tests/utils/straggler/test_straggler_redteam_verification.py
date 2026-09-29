@@ -496,29 +496,41 @@ def test_pool_exhausted_interval_never_writes_on_the_training_thread(
     collector = _collector(tmp_path, event_pool=2)
     writes = _record_writes(monkeypatch)
     observer = StragglerObserver(config, identity=IDENTITY, backend=_SmallPoolBackend(), consumer=collector.ingest)
+    try:
+        tokens = [observer.acquire_interval("forward-compute", 2) for _ in range(3)]
+        # event_pool=2 is exactly one interval pair, so the second acquire exhausts.
+        assert tokens[0] is not None
+        assert tokens[1] is None and tokens[2] is None, "the event pool did not exhaust as expected"
 
-    tokens = [observer.acquire_interval("forward-compute", 2) for _ in range(3)]
-    # event_pool=2 is exactly one interval pair, so the second acquire exhausts.
-    assert tokens[0] is not None
-    assert tokens[1] is None and tokens[2] is None, "the event pool did not exhaust as expected"
+        expected_envelopes = WRITE_BATCH + 20
+        for i in range(expected_envelopes):
+            observer.complete_interval(None, "forward-compute", 2, 500.0 + i, 500.1 + i, False)
 
-    for i in range(WRITE_BATCH + 20):
-        observer.complete_interval(None, "forward-compute", 2, 500.0 + i, 500.1 + i, False)
+        assert writes == [], f"training thread wrote files: {writes}"
+        assert (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8") == ""
 
-    assert writes == [], f"training thread wrote files: {writes}"
-    assert (tmp_path / "straggler_envelopes.jsonl").read_text(encoding="utf-8") == ""
+        # ``complete_interval`` only enqueues host-only envelopes when the
+        # device-backed readout thread is live.  Do not race an explicit flush
+        # against that daemon: first wait until the collector has accepted every
+        # envelope, then verify that all persistence happened off-thread.
+        deadline = time.monotonic() + 10.0
+        while collector.status()["envelopes"] < expected_envelopes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert collector.status()["envelopes"] == expected_envelopes, "readout did not deliver every envelope"
 
-    off = threading.Thread(target=collector.flush, name="verify-off-thread")
-    off.start()
-    off.join(timeout=10.0)
-    # Delivery and flushing are background work: the readout daemon may
-    # legitimately have written before the explicit flush, but nothing may
-    # ever have been written from the training (main) thread.
-    assert writes, "no background thread ever wrote"
-    assert all(name in ("verify-off-thread", "straggler-readout") for name in writes), (
-        f"a non-background thread wrote files: {writes}"
-    )
-    observer.close()
+        off = threading.Thread(target=collector.flush, name="verify-off-thread")
+        off.start()
+        off.join(timeout=10.0)
+        assert not off.is_alive(), "off-thread flush did not finish"
+        # Delivery and flushing are background work: the readout daemon may
+        # legitimately have written before the explicit flush, but nothing may
+        # ever have been written from the training (main) thread.
+        assert writes, "no background thread ever wrote"
+        assert all(name in ("verify-off-thread", "straggler-readout") for name in writes), (
+            f"a non-background thread wrote files: {writes}"
+        )
+    finally:
+        observer.close()
 
 
 # --- conservation after the locking lands ---------------------------------------
