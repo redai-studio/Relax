@@ -5,6 +5,8 @@ export."""
 
 from __future__ import annotations
 
+import copy
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -33,7 +35,15 @@ def _union_keys(keys: set[str]) -> set[str]:
 
 
 def build_spec(input_dir: str, patch: Any) -> dict[str, Any] | None:
-    metadata = patch._read_checkpoint_metadata(input_dir)
+    metadata = copy.copy(patch._read_checkpoint_metadata(input_dir))
+    # Model-space optimizer tensors reuse the model's adapter suffixes.
+    # Exclude them before both namespace validation and Bridge reconstruction,
+    # without modifying the metadata used to load the actual checkpoint.
+    metadata.state_dict_metadata = {
+        key: value
+        for key, value in metadata.state_dict_metadata.items()
+        if not re.match(r"^(?:chained_\d+\.)?optimizer(?:\.|$)", key)
+    }
     unknown = [
         key
         for key, value in metadata.state_dict_metadata.items()

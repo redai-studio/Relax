@@ -475,7 +475,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpus-per-node",
         type=int,
-        help="Parallel exporter only: pack workers onto whole nodes with at least this many GPUs, driver node first",
+        help="Parallel exporter only: pack workers onto eligible GPU nodes, preferring the driver node when eligible",
     )
     parser.add_argument(
         "--expert-gather-backend",
@@ -511,6 +511,39 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _eligible_nodes(ray: Any, driver_node_id: str, *, gpus: int, cpus: int) -> list[str]:
+    """Prefer the driver only if it can host the requested export workers."""
+    nodes = [
+        node["NodeID"]
+        for node in ray.nodes()
+        if node.get("Alive")
+        and node.get("Resources", {}).get("GPU", 0) >= gpus
+        and node.get("Resources", {}).get("CPU", 0) >= cpus
+    ]
+    if not nodes:
+        raise RuntimeError(f"No alive export node has at least {gpus} GPUs and {cpus} CPUs")
+    if driver_node_id in nodes:
+        nodes.remove(driver_node_id)
+        nodes.insert(0, driver_node_id)
+    return nodes
+
+
+def _rendezvous_address() -> tuple[str, int]:
+    import ray
+
+    with socket.socket() as listener:
+        listener.bind(("", 0))
+        return ray.util.get_node_ip_address(), listener.getsockname()[1]
+
+
+def _rendezvous_on_node(ray: Any, node_id: str) -> tuple[str, int]:
+    """Choose the TCP store address on the node that will host rank zero."""
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    probe = ray.remote(num_cpus=0, max_retries=0)(_rendezvous_address)
+    return ray.get(probe.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)).remote())
+
+
 def main() -> None:
     args = _parse_args()
     sys.path.insert(0, args.repo_root)
@@ -525,17 +558,13 @@ def main() -> None:
     ray.init(address=args.ray_address)
     if ray.cluster_resources().get("GPU", 0) < args.world_size:
         raise RuntimeError(f"Cluster has fewer than {args.world_size} GPUs")
-    with socket.socket() as listener:
-        listener.bind(("", 0))
-        port = listener.getsockname()[1]
+    node_id = _eligible_nodes(ray, ray.get_runtime_context().get_node_id(), gpus=1, cpus=args.cpus_per_worker)[0]
+    master, port = _rendezvous_on_node(ray, node_id)
     worker = ray.remote(num_gpus=1, num_cpus=args.cpus_per_worker, max_retries=0)(_worker)
-    master = ray.util.get_node_ip_address()
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     # The Gloo TCP store is hosted by rank zero at MASTER_ADDR.
-    rank_zero = worker.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(ray.get_runtime_context().get_node_id(), soft=False)
-    )
+    rank_zero = worker.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False))
     futures = [rank_zero.remote(0, master, port, args)]
     futures.extend(worker.remote(rank, master, port, args) for rank in range(1, args.world_size))
     _logger().info("Scheduled %d export workers; staging=%s", args.world_size, args.staging_dir)

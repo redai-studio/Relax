@@ -140,3 +140,45 @@ def test_unknown_saved_tensor_namespace_is_rejected() -> None:
     )
     with pytest.raises(ValueError, match="Unsupported saved tensor namespaces"):
         export.build_spec("unused", patch)
+
+
+@pytest.mark.parametrize("optimizer_prefix", [None, "optimizer", "chained_0.optimizer", "chained_1.optimizer"])
+def test_lora_spec_ignores_optimizer_tensors_in_real_dcp(tmp_path: Path, optimizer_prefix: str | None) -> None:
+    import torch.distributed.checkpoint as dcp
+
+    path = Path(__file__).resolve().parents[2] / "scripts/tools/convert_torch_dist_to_hf_bridge.py"
+    spec = importlib.util.spec_from_file_location("lora_checkpoint_reader", path)
+    patch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(patch)
+    target = "language_model.decoder.layers.self_attention.linear_qkv"
+    adapters = {
+        target + ".adapter.linear_in.weight": torch.ones(2, 4),
+        target + ".adapter.linear_out.weight": torch.ones(4, 2),
+    }
+    saved = dict(adapters)
+    if optimizer_prefix is not None:
+        saved.update(
+            {
+                f"{optimizer_prefix}.state.{state}.{key}": torch.zeros_like(value)
+                for state in ("exp_avg", "exp_avg_sq", "fp32_param")
+                for key, value in adapters.items()
+            }
+        )
+    dcp.save(saved, checkpoint_id=tmp_path, no_dist=True)
+    metadata = patch._read_checkpoint_metadata(str(tmp_path))
+    original_keys = set(metadata.state_dict_metadata)
+    patch._read_checkpoint_metadata = lambda _: metadata
+    result = export.build_spec(str(tmp_path), patch)
+    assert result["rank"] == 2
+    assert result["target_modules"] == [target]
+    assert result["adapter_keys"] == set(adapters)
+    assert set(metadata.state_dict_metadata) == original_keys
+
+
+@pytest.mark.parametrize("key", ["vision_tower.x.adapter.linear_in.weight", "chained_bad.optimizer.x.weight"])
+def test_optimizer_filter_does_not_hide_unsupported_model_tensors(key: str) -> None:
+    patch = SimpleNamespace(
+        _read_checkpoint_metadata=lambda _: SimpleNamespace(state_dict_metadata={key: SimpleNamespace(size=(2, 2))})
+    )
+    with pytest.raises(ValueError, match="language adapters only|Unsupported saved tensor namespaces"):
+        export.build_spec("unused", patch)
