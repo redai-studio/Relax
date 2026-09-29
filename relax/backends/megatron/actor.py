@@ -680,8 +680,6 @@ class MegatronTrainRayActor(TrainRayActor):
             unsupported.append("virtual pipeline parallelism")
         if getattr(self.args, "dynamic_context_parallel", False):
             unsupported.append("dynamic context parallelism")
-        if getattr(self.args, "calculate_per_token_loss", False):
-            unsupported.append("per-token loss")
         if device_utils.get_device_name() != "cuda":
             unsupported.append(f"device={device_utils.get_device_name()}")
         if self.args.qkv_format != "thd":
@@ -2563,6 +2561,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.num_microbatches,
                 )
             self.prof.step(rollout_id=rollout_id)
+            # [perf] Time actor spent waiting for TQ data (starvation).
+            # Unlike tgd_fetch (per-RPC duration), this is the full wait window per mb.
+            _stream_iters = [it for it in self.data_iterator if isinstance(it, StreamingTQIterator)]
+            if _stream_iters:
+                Timer().add("actor_train_stream_wait", sum(sum(it.tq_wait_times) for it in _stream_iters))
             if len(self.data_iterator) > 1 and all(
                 isinstance(iterator, StreamingTQIterator) for iterator in self.data_iterator
             ):
@@ -2650,7 +2653,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             maybe_finalize_async_save(blocking=True)
 
-        if dist.get_rank() == 0:
+        if self.args.async_save and dist.get_rank(group=get_gloo_group()) == 0:
             rotate_ckpt(self.args, global_step=rollout_id)
 
         dist.barrier(group=get_gloo_group())
@@ -2665,6 +2668,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
+
+        # A synchronous save has committed before returning. Prune afterwards
+        # so max_actor_ckpt_to_keep includes the newly written checkpoint.
+        if not self.args.async_save and dist.get_rank(group=get_gloo_group()) == 0:
+            rotate_ckpt(self.args, global_step=rollout_id)
 
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model

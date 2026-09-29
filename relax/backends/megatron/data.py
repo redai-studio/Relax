@@ -718,14 +718,18 @@ def get_batch(
         multimodal_data = {}  # key -> concatenated tensor
         multimodal_num_items = {}  # key -> list of item counts per sequence
         tensor_dict_list = {}
+        input_key_map = getattr(get_args(), "multimodal_input_key_map", {})
 
         for mm_input_dict in multimodal_train_inputs:
             if mm_input_dict is None:
                 continue
             for key, mm_tensor in mm_input_dict.items():
+                mapped_key = input_key_map.get(key, key)
+                if mapped_key != key and mapped_key in mm_input_dict:
+                    raise ValueError(f"Multimodal inputs contain both {key!r} and its mapped key {mapped_key!r}.")
                 if isinstance(mm_tensor, list):
                     mm_tensor = torch.tensor(mm_tensor)
-                tensor_dict_list.setdefault(key, []).append(mm_tensor)
+                tensor_dict_list.setdefault(mapped_key, []).append(mm_tensor)
 
         for key, tensor_list in tensor_dict_list.items():
             if key in PAD_RULES:

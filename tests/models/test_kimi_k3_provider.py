@@ -66,6 +66,7 @@ def test_kimi_k3_provider_preserves_hf_architecture_and_overrides_runtime(monkey
     assert provider.fp8 == "hybrid"
     assert provider.params_dtype is torch.bfloat16
     assert provider.finalized
+    assert args.multimodal_input_key_map == {"image_grid_thw": "grid_thws"}
 
 
 @pytest.mark.parametrize(
@@ -94,11 +95,13 @@ def test_non_kimi_k3_provider_keeps_architecture_override_behavior(monkeypatch):
     provider.kv_lora_rank = 512
     module, _ = _load_model_provider(monkeypatch, provider)
 
-    module.get_model_provider_func(_bridge_args(num_layers=2, moe_layer_freq=1, kv_lora_rank=32))
+    args = _bridge_args(num_layers=2, moe_layer_freq=1, kv_lora_rank=32)
+    module.get_model_provider_func(args)
 
     assert provider.num_layers == 2
     assert provider.moe_layer_freq == 1
     assert provider.kv_lora_rank == 32
+    assert not hasattr(args, "multimodal_input_key_map")
 
 
 def test_kimi_k3_provider_accepts_cp_pp_and_full_uniform_recompute(monkeypatch):
