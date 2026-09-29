@@ -49,7 +49,7 @@ def test_layout_compute_offsets_padding():
 
 
 def test_layout_dp_completeness_ok():
-    validate_dp_completeness(StageId.REWARD_POST_PROCESS, required_ranks=[0, 1], present_ranks=[1, 0])
+    validate_dp_completeness(StageId.ADVANTAGE_ESTIMATE, required_ranks=[0, 1], present_ranks=[1, 0])
 
 
 def test_layout_dp_completeness_missing():
@@ -102,7 +102,7 @@ def test_layout_reconstruct_overlap():
 def test_layout_cp_capability_frozen():
     assert cp_capability(StageId.ADVANTAGE_ESTIMATE, cp=1, reconstructable=True) == StageCapability.RECOMPUTE
     assert cp_capability(StageId.ADVANTAGE_ESTIMATE, cp=1, reconstructable=False) == StageCapability.UNSUPPORTED
-    # V1 freezes CP>1 as unsupported even when the layout is reconstructable.
+    # V2 freezes CP>1 as unsupported even when the layout is reconstructable.
     assert cp_capability(StageId.ADVANTAGE_ESTIMATE, cp=2, reconstructable=True) == StageCapability.UNSUPPORTED
 
 

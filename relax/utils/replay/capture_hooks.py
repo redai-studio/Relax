@@ -20,8 +20,6 @@ def build_config_from_args(args: Any) -> RecomputeConfig:
     """Build a RecomputeConfig from the runtime args namespace."""
     return RecomputeConfig(
         advantage_estimator=str(getattr(args, "advantage_estimator", "grpo")),
-        n_samples_per_prompt=int(getattr(args, "n_samples_per_prompt", 1)),
-        grpo_std_normalization=bool(getattr(args, "grpo_std_normalization", False)),
         kl_loss_type=str(getattr(args, "kl_loss_type", "k1")),
         kl_coef=float(getattr(args, "kl_coef", 0.0)),
         eps_clip=float(getattr(args, "eps_clip", 0.2)),
@@ -163,8 +161,6 @@ def capture_rollout_advantage(*, rollout_data: Any, args: Any) -> None:
     kl_coef = float(getattr(args, "kl_coef", 0.0))
 
     step.stages = {
-        StageId.REWARD_RAW,
-        StageId.REWARD_POST_PROCESS,
         StageId.ADVANTAGE_KL,
         StageId.ADVANTAGE_ESTIMATE,
     }
@@ -174,8 +170,7 @@ def capture_rollout_advantage(*, rollout_data: Any, args: Any) -> None:
     if rollout_data.get("loss_masks"):
         step.loss_masks_tensor = _cat(list(rollout_data["loss_masks"]))
     step.group_indices_tensor = _detach_1d(_group_indices_from_rollout(rollout_data, args), torch.long)
-    step.raw_rewards_tensor = _detach_1d(rollout_data["raw_reward"], torch.float32)
-    step.rewards_tensor = _detach_1d(rollout_data["rewards"], torch.float32)
+    step.rewards = list(rollout_data["rewards"])
 
     log_probs_key = "rollout_log_probs" if use_rollout else "log_probs"
     old_log_probs = list(rollout_data[log_probs_key])

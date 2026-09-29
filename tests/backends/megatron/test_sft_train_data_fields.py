@@ -54,7 +54,7 @@ def test_sequence_classification_sft_requests_classification_labels():
 
 
 def test_rl_data_fields_include_replay_metadata():
-    """RL training exposes sample identity and reward metadata for replay."""
+    """RL training exposes sample and group identity for replay."""
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
@@ -67,7 +67,6 @@ def test_rl_data_fields_include_replay_metadata():
         "rewards",
         "sample_indices",
         "sample_index_mask_sums",
-        "raw_reward",
         "group_index",
     ):
         assert required in fields

@@ -47,11 +47,11 @@ bypasses admission.
 
 ## Conditional export fanout
 
-Read this section only when the agent uses explicit export, nonlinear history, multiple contexts, or custom credit.
+Read this section only when the agent uses explicit export, nonlinear history, multiple contexts, or custom advantage.
 
 | Parameters | Required check | Detection |
 | --- | --- | --- |
-| `--agentic-custom-advantage-path` | Required for multiple exports; ordinarily avoid custom RM | Export fanout is not validated at startup; failures or silent ownership changes appear during rollout/training |
+| `--agentic-custom-advantage-path` | Requires explicit export. Every export name needs a scalar or list; a list must match that export's assistant-turn count | Export names, fanout, and any list lengths are runtime evidence |
 | Dynamic batch and token budget | Required for multiple physical rows per Session | Token-budget dependency is checked at startup only after dynamic batching is enabled; actual fanout is runtime evidence |
 | Response length fields | `max_completion_tokens` takes precedence over legacy `max_tokens`; either overrides the turn default | Request validation |
 

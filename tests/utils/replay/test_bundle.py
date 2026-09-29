@@ -76,7 +76,7 @@ def test_bundle_unsupported_version(tmp_path):
     bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
 
     def mutate(manifest):
-        manifest["format_version"] = "2.0.0"
+        manifest["format_version"] = "1.0.0"
 
     _rewrite_manifest(bundle, mutate)
     with pytest.raises(ValueError):

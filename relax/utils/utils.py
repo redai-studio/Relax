@@ -96,9 +96,8 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         custom_convert_func = load_function(custom_convert_path)
         return custom_convert_func(args, samples)
 
-    raw_rewards, rewards = post_process_rewards(args, samples)
+    rewards = post_process_rewards(args, samples)
 
-    assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
     if any(isinstance(reward, list) for reward in rewards):
@@ -116,9 +115,6 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         # some reward model, e.g. remote rm, may return multiple rewards,
         # we could use key to select the reward.
         "rewards": rewards,
-        "raw_reward": raw_rewards,
-        # Semantic group index (prompt group for GRPO reward normalization); needed
-        # by the per-rollout replay capture to recompute reward.post_process.
         "group_index": [sample.group_index if sample.group_index is not None else 0 for sample in samples],
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": sample_indices,
@@ -207,33 +203,31 @@ def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
-    """Return raw rewards and post-processed rewards consumed by training.
+    """Return post-processed rewards consumed by training.
 
     Returns:
-        Tuple[List[float], List[float]]
+        List[float | List[float]]
     """
+    # NOTE(wulumeng): Keep this single-return contract. This function previously returned
+    # (raw_rewards, post_processed_rewards); it now intentionally returns only
+    # post_processed_rewards.
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        processed_rewards = custom_reward_post_process_func(args, samples)
-        if isinstance(processed_rewards, tuple) and len(processed_rewards) == 2:
-            return processed_rewards
-        raw_rewards = [sample.get_reward_value(args) for sample in samples]
-        return raw_rewards, processed_rewards
+        return custom_reward_post_process_func(args, samples)
+
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        return [sample.custom_advantage for sample in samples]
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    # This explicit custom-advantage hook replaces the registered reward
-    # normalizer wholesale by design.
-    if getattr(args, "agentic_custom_advantage_path", None) is not None:
-        return raw_rewards, [sample.custom_advantage for sample in samples]
 
     if not args.rewards_normalization:
-        return raw_rewards, raw_rewards
+        return raw_rewards
 
     # Which normalization to apply is declared by the algorithm registry rather
     # than by a whitelist of estimator names maintained here.
     spec = get_algorithm(args.advantage_estimator)
     normalizer = REWARD_NORMALIZERS[spec.reward_normalizer]
-    return raw_rewards, normalizer(args, samples, raw_rewards)
+    return normalizer(args, samples, raw_rewards)
 
 
 def dict_to_tensordict(

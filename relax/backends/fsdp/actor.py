@@ -2312,7 +2312,6 @@ class FSDPTrainRayActor(TrainRayActor):
             "trajectory_slots",
             "trajectory_refs",
             "advantages",
-            "raw_reward",
             "total_lengths",
             "skip_optimizer_step",
         ]

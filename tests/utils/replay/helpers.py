@@ -1,14 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Test helpers that build small, hand-checkable GRPO replay bundles.
-
-The fixture is deliberately tiny and deterministic: 4 samples in 2 semantic
-groups of 2 (n_samples_per_prompt=2), each with 2 response tokens. Expected
-outputs are computed from pristine inputs with reference implementations that
-are independent of the adapters under test; a corrupt=... option then tampers
-only the inputs written to the bundle, so replay must detect the divergence
-against the pristine expected outputs.
-"""
+"""Test helpers that build small, hand-checkable GRPO replay bundles."""
 
 from __future__ import annotations
 
@@ -21,6 +13,7 @@ import torch
 from relax.utils.replay.bundle import BundleWriter, metadata_checksums
 from relax.utils.replay.capture import CaptureRecord
 from relax.utils.replay.schema import (
+    FORMAT_VERSION,
     ActorStepId,
     BundleIndex,
     ComparisonPolicy,
@@ -38,7 +31,6 @@ from relax.utils.training.ppo_utils import compute_approx_kl, compute_policy_los
 
 
 GROUP_INDICES = [0, 0, 1, 1]
-RAW_REWARDS = [1.0, 3.0, 10.0, 12.0]
 RESPONSE_LENGTHS = [2, 2, 2, 2]
 TOTAL_LENGTHS = [3, 3, 3, 3]
 LOSS_MASKS = [[1, 1], [1, 1], [1, 1], [1, 1]]
@@ -46,32 +38,12 @@ LOSS_MASKS = [[1, 1], [1, 1], [1, 1], [1, 1]]
 # also a complete semantic group, so batch selection has a well-defined closure).
 MICRO_BATCH_IDS = ["mb-0007", "mb-0007", "mb-0008", "mb-0008"]
 
-# Hand-derived ground truth for the default fixture (ratio == 1, no std norm).
-# group0 rewards [1, 3] -> mean 2 -> [-1, 1]; group1 [10, 12] -> mean 11 -> [-1, 1].
+# Recorded normalized rewards.
 NORMALIZED_REWARDS = [-1.0, 1.0, -1.0, 1.0]
 # get_grpo_returns broadcasts each reward to its response length (2 tokens).
 ADVANTAGES = [-1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0]
 # ratio == 1 => pg_loss == -advantage, per-sample mean sums to 0; entropy_loss == 2.0.
 DEFAULT_LOSS = -0.01 * 2.0
-
-
-def _group_normalize(
-    raw_rewards: list[float], group_indices: list[int], n_samples_per_prompt: int, std_norm: bool
-) -> list[float]:
-    """Reference group normalization, independent of the reward adapter."""
-    rewards = torch.tensor(raw_rewards, dtype=torch.float)
-    positions: dict[int, list[int]] = {}
-    for position, group_index in enumerate(group_indices):
-        positions.setdefault(group_index, []).append(position)
-    normalized = torch.empty_like(rewards)
-    for group_index, group_positions in positions.items():
-        assert len(group_positions) == n_samples_per_prompt, group_index
-        group_rewards = rewards[group_positions]
-        group_rewards = group_rewards - group_rewards.mean()
-        if std_norm:
-            group_rewards = group_rewards / (group_rewards.std() + 1e-6)
-        normalized[group_positions] = group_rewards
-    return normalized.tolist()
 
 
 def _reduce(x: torch.Tensor, response_lengths: list[int], loss_masks: list[list[int]]) -> float:
@@ -87,14 +59,12 @@ def _build_manifest(bundle_id: str) -> Manifest:
     stage_contracts = {
         stage: StageContract(
             stage=stage,
-            version="v1",
+            version="v2",
             capability=StageCapability.RECOMPUTE,
-            implementation="reimplemented" if stage == StageId.REWARD_POST_PROCESS else "reuse",
+            implementation="reuse",
         )
         for stage in (
             StageId.SAMPLE,
-            StageId.REWARD_RAW,
-            StageId.REWARD_POST_PROCESS,
             StageId.ADVANTAGE_KL,
             StageId.ADVANTAGE_ESTIMATE,
             StageId.LOSS_POLICY,
@@ -102,11 +72,11 @@ def _build_manifest(bundle_id: str) -> Manifest:
     }
     stage_contracts[StageId.LOSS_VALUE] = StageContract(
         stage=StageId.LOSS_VALUE,
-        version="v1",
+        version="v2",
         capability=StageCapability.UNSUPPORTED,
     )
     return Manifest(
-        format_version="1.0.0",
+        format_version=FORMAT_VERSION,
         bundle_id=bundle_id,
         producer=ProducerInfo(commit="test", dirty_patch_digest="", torch_version=torch.__version__),
         stage_contracts=stage_contracts,
@@ -120,7 +90,7 @@ def _build_manifest(bundle_id: str) -> Manifest:
 
 
 def _make_index(
-    bundle_id: str, config: RecomputeConfig, raw_rewards: list[float], loss_masks: list[list[int]]
+    bundle_id: str, config: RecomputeConfig, rewards: list[float | list[float]], loss_masks: list[list[int]]
 ) -> BundleIndex:
     samples = [
         SampleRecord(
@@ -129,12 +99,11 @@ def _make_index(
             response_length=RESPONSE_LENGTHS[index],
             total_length=TOTAL_LENGTHS[index],
             loss_mask=list(loss_masks[index]),
-            raw_reward=raw_rewards[index],
-            reward=raw_rewards[index],
+            reward=rewards[index],
             label_hash="hash:label",
             micro_batch_id=MICRO_BATCH_IDS[index],
         )
-        for index in range(len(raw_rewards))
+        for index in range(len(rewards))
     ]
     return BundleIndex(
         bundle_id=bundle_id,
@@ -144,7 +113,6 @@ def _make_index(
             consumer_batch_ids=["tq-7"],
             micro_batch_ids=["mb-0007"],
             semantic_group_ids=["g-0", "g-1"],
-            normalization_cohort_ids=["g-0", "g-1"],
             weight_lineage=WeightLineage(rollout_weight="w-119", actor_weight="w-120"),
             rank={"dp": 0, "tp": 0, "pp": 0, "cp": 1},
         ),
@@ -158,18 +126,15 @@ def build_grpo_bundle(
     *,
     bundle_id: str = "b-00001",
     ratio_one: bool = True,
-    pr65_bug: bool = False,
     kl_coef: float = 0.1,
     entropy_coef: float = 0.01,
     corrupt: str | None = None,
-    raw_rewards: list[float] | None = None,
     old_log_probs: torch.Tensor | None = None,
     log_probs: torch.Tensor | None = None,
     ref_log_probs: torch.Tensor | None = None,
     loss_masks: list[list[int]] | None = None,
 ) -> tuple[Path, BundleIndex, dict[str, Any]]:
     """Build a GRPO CP=1 bundle and return (path, index, expected)."""
-    raw_rewards = list(raw_rewards) if raw_rewards is not None else list(RAW_REWARDS)
     loss_masks = [list(mask) for mask in (loss_masks or LOSS_MASKS)]
 
     num_tokens = sum(RESPONSE_LENGTHS)
@@ -185,8 +150,6 @@ def build_grpo_bundle(
 
     config = RecomputeConfig(
         advantage_estimator="grpo",
-        n_samples_per_prompt=2,
-        grpo_std_normalization=False,
         kl_loss_type="k1",
         kl_coef=kl_coef,
         eps_clip=0.2,
@@ -194,24 +157,15 @@ def build_grpo_bundle(
         entropy_coef=entropy_coef,
     )
 
-    # Compute expected outputs from PRISTINE inputs.
-    if pr65_bug:
-        # Historical bug: normalize all samples as one physical batch.
-        rewards_tensor = torch.tensor(raw_rewards, dtype=torch.float)
-        rewards_tensor = rewards_tensor - rewards_tensor.mean()
-        normalized_rewards = rewards_tensor.tolist()
-    else:
-        normalized_rewards = _group_normalize(
-            raw_rewards, GROUP_INDICES, config.n_samples_per_prompt, config.grpo_std_normalization
-        )
+    normalized_rewards = list(NORMALIZED_REWARDS)
 
     kl = (
         torch.zeros_like(old_log_probs, dtype=torch.float32)
         if config.kl_coef == 0
         else compute_approx_kl(old_log_probs, ref_log_probs, kl_loss_type=config.kl_loss_type)
     )
-    rewards_tensor = torch.tensor(normalized_rewards, dtype=torch.float32)
-    returns = get_grpo_returns(rewards_tensor, list(torch.split(kl, RESPONSE_LENGTHS)))
+    rewards = [torch.as_tensor(reward, dtype=torch.float32) for reward in normalized_rewards]
+    returns = get_grpo_returns(rewards, list(torch.split(kl, RESPONSE_LENGTHS)))
     advantages = torch.cat(returns)
 
     ppo_kl = old_log_probs - log_probs
@@ -224,15 +178,11 @@ def build_grpo_bundle(
         "pg_clipfrac": _reduce(clipfrac, RESPONSE_LENGTHS, loss_masks),
         "ppo_kl": _reduce(ppo_kl, RESPONSE_LENGTHS, loss_masks),
     }
-    expected = {
-        StageId.REWARD_RAW.value: {"raw_rewards": list(raw_rewards)},
-        StageId.REWARD_POST_PROCESS.value: {"rewards": normalized_rewards},
-        StageId.LOSS_POLICY.value: expected_loss,
-    }
+    expected = {StageId.LOSS_POLICY.value: expected_loss}
 
     # Tamper only the INPUTS written to the bundle, keeping expected pristine.
     if corrupt == "reward":
-        raw_rewards[0] = 2.0
+        normalized_rewards[0] = 2.0
     elif corrupt == "mask_token":
         loss_masks[1][0] = 0
     elif corrupt == "old_log_probability":
@@ -241,7 +191,7 @@ def build_grpo_bundle(
     elif corrupt == "nan":
         advantages[0] = float("nan")
 
-    index = _make_index(bundle_id, config, raw_rewards, loss_masks)
+    index = _make_index(bundle_id, config, normalized_rewards, loss_masks)
     manifest = _build_manifest(bundle_id)
 
     writer = BundleWriter(path, manifest, index, expected)
@@ -281,8 +231,6 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
     """
     config = RecomputeConfig(
         advantage_estimator="grpo",
-        n_samples_per_prompt=2,
-        grpo_std_normalization=False,
         kl_loss_type="k1",
         kl_coef=0.1,
         eps_clip=0.2,
@@ -295,9 +243,7 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
     ref_log_probs = torch.full((num_tokens,), 0.25)
     entropy = torch.full((num_tokens,), 0.5)
 
-    normalized_rewards = _group_normalize(
-        RAW_REWARDS, GROUP_INDICES, config.n_samples_per_prompt, config.grpo_std_normalization
-    )
+    normalized_rewards = list(NORMALIZED_REWARDS)
     kl = compute_approx_kl(old_log_probs, ref_log_probs, kl_loss_type=config.kl_loss_type)
     rewards_tensor = torch.tensor(normalized_rewards, dtype=torch.float32)
     returns = get_grpo_returns(rewards_tensor, list(torch.split(kl, RESPONSE_LENGTHS)))
@@ -306,8 +252,6 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
     ppo_kl = old_log_probs - log_probs
     pg_loss, clipfrac = compute_policy_loss(ppo_kl, advantages, config.eps_clip, config.eps_clip_high)
     expected = {
-        StageId.REWARD_RAW.value: {"raw_rewards": list(RAW_REWARDS)},
-        StageId.REWARD_POST_PROCESS.value: {"rewards": normalized_rewards},
         StageId.LOSS_POLICY.value: {
             "loss": _reduce(pg_loss, RESPONSE_LENGTHS, LOSS_MASKS)
             - config.entropy_coef * _reduce(entropy, RESPONSE_LENGTHS, LOSS_MASKS),
@@ -318,7 +262,7 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
         },
     }
 
-    index = _make_index(bundle_id, config, RAW_REWARDS, LOSS_MASKS)
+    index = _make_index(bundle_id, config, normalized_rewards, LOSS_MASKS)
     actor_step_id = index.identity.actor_step_id
     return CaptureRecord(
         actor_step_id=(actor_step_id.rollout_id, actor_step_id.step_id),
@@ -341,16 +285,14 @@ def make_capture_record(bundle_id: str = "b-capture", ratio_one: bool = True) ->
 
 
 def make_rollout_capture_record(bundle_id: str = "b-rollout-capture") -> CaptureRecord:
-    """Build a pristine rollout-level (reward → advantage) CaptureRecord.
+    """Build a pristine rollout-level reward CaptureRecord.
 
     Mirrors the production capture_hooks.capture_rollout_advantage payload: an
-    identity anchored by rollout_id, raw per-sample metadata as deferred
-    tensors, and only the reward/advantage stages declared (no loss stage).
+    identity anchored by rollout_id, per-sample metadata as deferred tensors,
+    and only the advantage stages declared (no loss stage).
     """
     config = RecomputeConfig(
         advantage_estimator="grpo",
-        n_samples_per_prompt=2,
-        grpo_std_normalization=False,
         kl_loss_type="k1",
         kl_coef=0.1,
         eps_clip=0.2,
@@ -361,9 +303,7 @@ def make_rollout_capture_record(bundle_id: str = "b-rollout-capture") -> Capture
     old_log_probs = torch.zeros(num_tokens)
     ref_log_probs = torch.full((num_tokens,), 0.25)
 
-    normalized_rewards = _group_normalize(
-        RAW_REWARDS, GROUP_INDICES, config.n_samples_per_prompt, config.grpo_std_normalization
-    )
+    normalized_rewards = list(NORMALIZED_REWARDS)
     kl = compute_approx_kl(old_log_probs, ref_log_probs, kl_loss_type=config.kl_loss_type)
     rewards_tensor = torch.tensor(normalized_rewards, dtype=torch.float32)
     returns = get_grpo_returns(rewards_tensor, list(torch.split(kl, RESPONSE_LENGTHS)))
@@ -386,8 +326,6 @@ def make_rollout_capture_record(bundle_id: str = "b-rollout-capture") -> Capture
         rollout_id=120,
         producer=ProducerInfo(commit="test", torch_version=torch.__version__),
         stages={
-            StageId.REWARD_RAW,
-            StageId.REWARD_POST_PROCESS,
             StageId.ADVANTAGE_KL,
             StageId.ADVANTAGE_ESTIMATE,
         },
@@ -395,6 +333,5 @@ def make_rollout_capture_record(bundle_id: str = "b-rollout-capture") -> Capture
         total_lengths=list(TOTAL_LENGTHS),
         loss_masks_tensor=torch.tensor(flat_masks, dtype=torch.float32),
         group_indices_tensor=torch.tensor(GROUP_INDICES, dtype=torch.long),
-        raw_rewards_tensor=torch.tensor(RAW_REWARDS, dtype=torch.float32),
-        rewards_tensor=rewards_tensor,
+        rewards=list(NORMALIZED_REWARDS),
     )
