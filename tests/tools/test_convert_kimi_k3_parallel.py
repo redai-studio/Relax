@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,6 +90,48 @@ def _distributed_worker(rank: int, init_file: str) -> None:
 
 def test_two_rank_ep_quantization_matches_gather_then_quantize(tmp_path: Path) -> None:
     torch.multiprocessing.spawn(_distributed_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize(
+    "native_shape,gathered_shape,valid",
+    [
+        ((32, 2), (32, 2), True),
+        ((32, 2), (32, 2, 1), True),
+        ((64, 1), (64, 1), True),
+        ((1, 2), (1, 2), True),
+        ((1, 2), (2, 1), True),
+        ((1, 1), (1, 1), True),
+        ((1, 1), (1,), True),
+        ((32, 2), (2, 32), False),
+        ((32, 2), (64, 1), False),
+        ((32, 2), (1, 32, 2), False),
+        ((32, 2), (32, 3, 1), False),
+    ],
+)
+def test_expert_scale_restores_only_known_bridge_layout(
+    native_shape: tuple[int, int], gathered_shape: tuple[int, ...], valid: bool
+) -> None:
+    name = "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight"
+    scale = torch.arange(math.prod(gathered_shape), dtype=torch.uint8).reshape(gathered_shape)
+    packed = torch.zeros((native_shape[0], native_shape[1] * 16), dtype=torch.int8)
+    layout = ExpertLayout()
+    layout.spec = lambda key: {"dtype": "U8", "shape": list(native_shape)}
+    mapping = SimpleNamespace(
+        tp_size=1,
+        pp_size=1,
+        is_expert=True,
+        hf_param=name,
+        megatron_to_hf_quant=lambda *args: {name: packed, name + "_scale_inv": scale},
+    )
+    if not valid:
+        with pytest.raises(ValueError, match="HF scale shape mismatch"):
+            parallel.convert_expert(mapping, None, None, None, layout)
+        return
+    result = parallel.convert_expert(mapping, None, None, None, layout)
+    assert result[name + "_packed"] is packed
+    assert tuple(result[name + "_scale"].shape) == native_shape
+    assert result[name + "_scale"].dtype == torch.uint8
+    assert torch.equal(result[name + "_scale"].flatten(), scale.flatten())
 
 
 def test_invalid_local_geometry_is_rejected() -> None:
