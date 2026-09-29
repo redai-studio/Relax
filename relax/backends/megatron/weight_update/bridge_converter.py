@@ -262,12 +262,16 @@ class BridgeConverter:
         """
         if self._configs_broadcast_done:
             return
-        self._configs_broadcast_done = True
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size > 1:
+            from megatron.bridge.models.conversion.utils import remove_non_pickleables
+
+            # Keep live configs local: they can contain process groups that
+            # all_gather_object cannot pickle. Bridge cleans a copy for PP transfer.
+            local_config_map = {prefix: remove_non_pickleables(config) for prefix, config in self._config_map.items()}
             all_config_maps: list[dict[str, Any] | None] = [None] * pp_size
             dist.all_gather_object(
-                obj=self._config_map,
+                obj=local_config_map,
                 object_list=all_config_maps,
                 group=mpu.get_pipeline_model_parallel_group(),
             )
@@ -284,6 +288,8 @@ class BridgeConverter:
                     self._bridge_task_map[name] = dataclasses.replace(
                         task, megatron_module=SimpleNamespace(config=config)
                     )
+
+        self._configs_broadcast_done = True
 
     # ------------------------------------------------------------------
     # Mapping collection

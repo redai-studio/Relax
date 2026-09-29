@@ -108,11 +108,12 @@ class StreamingReader:
         logger.info(f"Building index for {self.path}...")
         self._line_offsets = []
 
-        with open(self.path, "rb") as f:
+        # Multimodal JSONL rows can contain large inline images. Read in larger
+        # blocks and avoid copying each entire row just to detect blank lines.
+        with open(self.path, "rb", buffering=1024 * 1024) as f:
             offset = 0
             for line in f:
-                line_stripped = line.strip()
-                if line_stripped:  # Skip empty lines
+                if not line.isspace():  # Skip empty lines
                     self._line_offsets.append(offset)
                 offset += len(line)
 
@@ -227,6 +228,19 @@ class CompositeStreamingReader:
         self.row_slice = row_slice
         self.readers = [StreamingReader(path) for path in paths]
         self._cumulative_lengths: list[int] = []
+
+        # JSONL indexing only retains offsets and can overlap shared-filesystem
+        # I/O. Keep Parquet loading serial: it materializes full rows in memory.
+        jsonl_readers = [reader for reader in self.readers if not reader._is_parquet]
+        if len(jsonl_readers) > 1:
+            num_workers = min(16, len(jsonl_readers))
+            started = time.monotonic()
+            logger.info(f"Building indices for {len(jsonl_readers)} JSONL files with {num_workers} workers...")
+            with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="jsonl-index") as executor:
+                # Consume results to propagate errors before exposing the reader.
+                for _ in executor.map(len, jsonl_readers):
+                    pass
+            logger.info(f"JSONL indices built in {time.monotonic() - started:.2f}s")
 
         total = 0
         for reader in self.readers:

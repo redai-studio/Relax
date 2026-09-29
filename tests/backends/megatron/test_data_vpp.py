@@ -8,6 +8,15 @@ import torch
 
 
 def _load_data_module(monkeypatch):
+    # Importing a module also assigns attributes on its parent package. Restore
+    # both caches so fake process groups cannot leak into later integration tests.
+    parent = importlib.import_module("relax.backends.megatron")
+    for leaf in ("data", "cp_utils"):
+        name = f"relax.backends.megatron.{leaf}"
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
+        sys.modules.pop(name)
+        monkeypatch.setattr(parent, leaf, None, raising=False)
+
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
     mpu = types.ModuleType("megatron.core.mpu")
@@ -37,6 +46,35 @@ def _load_data_module(monkeypatch):
 
     sys.modules.pop("relax.backends.megatron.data", None)
     return importlib.import_module("relax.backends.megatron.data")
+
+
+@pytest.mark.parametrize("already_imported", [False, True])
+def test_data_module_loader_restores_import_caches(monkeypatch, already_imported):
+    parent = importlib.import_module("relax.backends.megatron")
+    originals = {}
+    for leaf in ("data", "cp_utils"):
+        name = f"relax.backends.megatron.{leaf}"
+        if already_imported:
+            originals[leaf] = types.ModuleType(name)
+            monkeypatch.setitem(sys.modules, name, originals[leaf])
+            monkeypatch.setattr(parent, leaf, originals[leaf], raising=False)
+        else:
+            monkeypatch.delitem(sys.modules, name, raising=False)
+            monkeypatch.delattr(parent, leaf, raising=False)
+
+    with pytest.MonkeyPatch.context() as isolated:
+        data_module = _load_data_module(isolated)
+        assert data_module.mpu is sys.modules["megatron.core.mpu"]
+        assert parent.cp_utils.mpu is data_module.mpu
+
+    for leaf in ("data", "cp_utils"):
+        name = f"relax.backends.megatron.{leaf}"
+        if already_imported:
+            assert sys.modules[name] is originals[leaf]
+            assert getattr(parent, leaf) is originals[leaf]
+        else:
+            assert name not in sys.modules
+            assert not hasattr(parent, leaf)
 
 
 def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):

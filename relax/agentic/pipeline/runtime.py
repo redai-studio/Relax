@@ -36,7 +36,7 @@ from relax.agentic.pipeline import (
 )
 from relax.agentic.profile import mark_sample_agentic_event
 from relax.agentic.session.state import check_messages
-from relax.utils.http_utils import get, init_http_client, post, router_worker_base_urls
+from relax.utils.http_utils import get, init_http_client, is_expected_sglang_499, post, router_worker_base_urls
 from relax.utils.logging_utils import get_logger
 from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
@@ -585,6 +585,7 @@ class SGLangBackendAdapter:
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
         return_logprob: bool = True,
+        fail_fast_no_workers: bool = False,
     ) -> BackendGenerateResult:
         payload = {
             "input_ids": input_ids,
@@ -609,10 +610,23 @@ class SGLangBackendAdapter:
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            output = await post(
+                f"{self._router_url}/generate",
+                payload,
+                headers=headers,
+                fail_fast_no_workers=fail_fast_no_workers,
+            )
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
+            if is_expected_sglang_499(error):
+                return BackendGenerateResult(
+                    new_tokens=[],
+                    new_log_probs=[],
+                    finish_type="abort",
+                    meta_info={},
+                    elapsed=time.monotonic() - started,
+                )
             raise
         elapsed = time.monotonic() - started
         meta_info = dict(output["meta_info"])

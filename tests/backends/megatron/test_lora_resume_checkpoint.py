@@ -172,6 +172,7 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(monkeypatch, tmp_path)
     resume_path = tmp_path / "checkpoint"
     resume_path.mkdir()
     (resume_path / "latest_checkpointed_iteration.txt").write_text("7")
+    (resume_path / "iter_0000007").mkdir()
     args = SimpleNamespace(
         load=str(resume_path), hf_checkpoint="/models/base", dist_ckpt_strictness="assume_ok_unexpected"
     )
@@ -180,7 +181,7 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(monkeypatch, tmp_path)
 
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda _path: marker)
+    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda _path, **_kwargs: marker)
     monkeypatch.setattr(checkpoint, "_validate_lora_model_state_load", lambda _model: nullcontext())
     monkeypatch.setattr(
         checkpoint,
@@ -256,6 +257,33 @@ def test_lightweight_save_syncs_hybrid_optimizer_checkpoint_step():
 
     assert optimizer.param_groups[0]["step"] == 7
     assert optimizer.cpu_optimizers[0].param_groups[0]["step"] == 7
+
+
+def test_lightweight_save_syncs_all_hybrid_steps_in_chained_optimizer() -> None:
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    children = []
+    for step in (7, 11):
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = object.__new__(HybridDeviceOptimizer)
+        optimizer.state = {parameter: {"step": torch.tensor(float(step))}}
+        optimizer.param_groups = [{"params": [parameter], "step": 1}]
+        optimizer.cpu_optimizers = [SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])]
+        optimizer.gpu_optimizer = SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])
+        children.append(SimpleNamespace(optimizer=optimizer))
+
+    # Use MCore's real property contract: .optimizer asserts for multiple children.
+    # Bypass initialization because this only tests traversal, not GPU optimizer setup.
+    chained = object.__new__(ChainedOptimizer)
+    chained.chained_optimizers = children
+
+    checkpoint._sync_hybrid_optimizer_checkpoint_steps(SimpleNamespace(optimizer=chained))
+
+    for child, step in zip(children, (7, 11), strict=True):
+        assert child.optimizer.param_groups[0]["step"] == step
+        assert child.optimizer.cpu_optimizers[0].param_groups[0]["step"] == step
+        assert child.optimizer.gpu_optimizer.param_groups[0]["step"] == step
 
 
 def test_lightweight_resume_restores_step_after_distributed_parameter_load(monkeypatch):
