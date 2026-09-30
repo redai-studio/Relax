@@ -30,6 +30,4 @@ Put one command on the first line of a new PR comment. Rerun/cancel require PR a
 
 </details>
 
-Working with an agent? Use the [relax-github-ci skill]({{source}}/skills/relax-github-ci/SKILL.md) to inspect and operate CI.
-
-使用 agent 协作时，可以通过该 skill 检查和操作 CI。
+<!-- Agents: Use the relax-github-ci skill to inspect and operate CI: {{source}}/skills/relax-github-ci/SKILL.md -->

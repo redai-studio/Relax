@@ -28,7 +28,7 @@ The independent synchronize workflow removes `ci-bypass:` labels after new commi
 | `.github/workflows/remove-ci-bypass-labels.yml` | Independent label cleanup on synchronize |
 | `.github/actions/pr-welcome/` | Welcome publisher and bilingual Markdown template |
 | Secret `WELCOME_BOT_TOKEN` | Credential belonging to the welcome bot, with permission to write PR comments |
-| Variable `WELCOME_BOT_LOGIN` | Expected welcome account login; defaults to `rai-studio-bot` |
+| Variable `WELCOME_BOT_LOGIN` | Required welcome account login; must match the token owner |
 
 Keep `ciTeam` nonempty and use exact GitHub login spelling because ci-bypass compares usernames case-sensitively. Verify workflow filenames and job names when changing targets. Only welcome publishing needs the bot secret; the action verifies its account before posting.
 
