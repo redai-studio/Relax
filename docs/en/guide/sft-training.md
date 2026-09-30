@@ -403,7 +403,6 @@ Pokemon 8 GPU script:
 --tensor-model-parallel-size 2
 --pipeline-model-parallel-size 1
 --context-parallel-size 1
---per-rank-fetch
 --num-data-storage-units 8
 --resource '{"sft": [1, 0], "actor": [1, 8], "rollout": [1, 8]}'
 ```
@@ -431,15 +430,13 @@ env_vars:
   RELAX_SFT_TQ_SHARDS: "2"
 ```
 
-Enable async prepacking in the training arguments as well:
+Configure the in-flight step budget in the training arguments:
 
 ```bash
---per-rank-fetch
---sft-async-prepack
 --sft-max-in-flight-steps 4
 ```
 
-`--sft-max-in-flight-steps 4` is an example; async prepacking requires at least 2, or equivalently `--max-staleness >= 1`. The environment variable does not enable prepacking by itself and is ignored without `--loss-type sft --sft-async-prepack`.
+Megatron SFT automatically enables per-rank fetch. With at least two in-flight steps, NCCL, THD, PP=1, CP=1, no VPP, no dynamic CP, and no routing/indexer replay, async prepacking is selected automatically. Image data takes the image-prefetch path; other unsupported configurations use raw prefetch. A single-step budget remains synchronous. `--sft-max-in-flight-steps 4` is only a budget example; the environment variable takes effect only when async prepacking is selected.
 
 For `N` shards, both `--global-batch-size` and the per-DP-rank local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`. For example, with global batch size 32 and DP size 8, the local batch is 4, so 2 or 4 shards are valid but 3 is not.
 
@@ -533,7 +530,7 @@ If GPUs wait on SFT data:
 | `--sft-prefetch-buffer-size` | Increase from 256 | Keeps more rendered samples ready. |
 | `--sft-prefetch-num-workers` | Increase | Improves image decode and multimodal I/O parallelism. |
 | `--sft-prefetch-chunk-size` | Increase | Dispatches larger prefetch chunks, with higher memory pressure. |
-| `--per-rank-fetch` | Enable for multi-GPU | Lets TP/PP ranks pull from TransferQueue directly. Pair with enough `--num-data-storage-units`. |
+| per-rank fetch | Automatic for Megatron SFT | Lets TP/PP ranks pull from TransferQueue directly. Pair with enough `--num-data-storage-units`. |
 | `--max-staleness` | Increase for I/O-heavy SFT | Lets the producer run ahead. The Pokemon 8 GPU script uses `--max-staleness 4`. |
 | `RELAX_SFT_TQ_SHARDS` | Start from 2 | Parallelizes eligible async-prepack producers. Increase only when data preparation is the bottleneck and batch divisibility constraints are met. |
 

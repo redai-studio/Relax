@@ -12,8 +12,10 @@ from pathlib import Path
 
 import pytest
 import torch
+from PIL import Image
 
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
+from relax.utils.data import image_rebuild
 from relax.utils.data.kimi_k3 import encode_kimi_k3_sft, is_kimi_k3_tokenizer, make_kimi_k3_sft_request
 
 
@@ -517,3 +519,99 @@ def test_kimi_k3_streaming_preserves_reasoning_content():
     ids, mask = encode_kimi_k3_sft(_SegmentTokenizer(), make_kimi_k3_sft_request(_sample(messages)))
     learned = _SegmentTokenizer().decode([token for token, learn in zip(ids, mask) if learn])
     assert "reason" in learned and "answer" in learned
+
+
+def test_kimi_k3_rank_side_rebuild_matches_producer_contract(monkeypatch):
+    from concurrent.futures import Future
+
+    from relax.utils.data import processor_pool
+    from relax.utils.data.kimi_k3 import build_kimi_k3_image_features
+
+    processor = _RebuildProcessor()
+    monkeypatch.setattr(processor_pool, "_worker_processor", processor)
+    monkeypatch.setattr(image_rebuild, "_worker_threads_limited", True)
+    # The worker must normalize images exactly like the producer IPC path
+    # (numpy round-trip) so the processor sees identical inputs.
+    seen_arrays = []
+
+    def fake_load_image(ref):
+        seen_arrays.append(ref)
+        return Image.new("RGB", (8, 12)) if ref == "/data/a.jpg" else Image.new("RGB", (10, 16))
+
+    monkeypatch.setattr(image_rebuild, "load_image", fake_load_image)
+
+    features, timings = image_rebuild.build_image_features_in_worker(_rebuild_descriptor())
+
+    assert seen_arrays == ["/data/a.jpg", "/data/b.jpg"]
+    assert features["pixel_values"].dtype == torch.bfloat16
+    assert features["pixel_values"].is_shared()
+    assert features["image_grid_thw"].tolist() == [[1, 2, 4], [1, 4, 6]]
+    assert set(timings) == {"read_s", "process_s"}
+    # The pixel-only rebuild shares the producer's pipeline.
+    shared = build_kimi_k3_image_features(processor, [Image.new("RGB", (8, 12))])
+    assert shared["pixel_values"].dtype == torch.bfloat16
+
+    class _StubPool:
+        def __init__(self):
+            self.executor = self
+
+        def submit(self, fn, *args):
+            future: Future = Future()
+            future.set_result(fn(*args))
+            return future
+
+    batch, _ = image_rebuild.build_batch_image_features(_StubPool(), [None, _rebuild_descriptor()])
+    assert batch[0] is None
+    assert batch[1]["image_grid_thw"].tolist() == [[1, 2, 4], [1, 4, 6]]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kind": "unknown_model_v1"},
+        {"pixel_shape": [8, 3]},
+        {"image_grid_thw": [[1, 2, 4]]},
+    ],
+)
+def test_kimi_k3_rank_side_rebuild_fails_on_descriptor_mismatch(monkeypatch, overrides):
+    from relax.utils.data import processor_pool
+
+    monkeypatch.setattr(processor_pool, "_worker_processor", _RebuildProcessor())
+    monkeypatch.setattr(image_rebuild, "_worker_threads_limited", True)
+    monkeypatch.setattr(image_rebuild, "load_image", lambda ref: Image.new("RGB", (8, 12)))
+
+    with pytest.raises(RuntimeError):
+        image_rebuild.build_image_features_in_worker(_rebuild_descriptor(**overrides))
+
+
+def test_kimi_k3_rank_side_rebuild_resizes_like_producer(monkeypatch):
+    class _SizedProcessor(_RebuildProcessor):
+        def __init__(self):
+            super().__init__()
+            self.image_processor = self
+            self.patch_size = 14
+            self.received_sizes = []
+
+        def preprocess(self, medias, return_tensors):
+            self.received_sizes = [media["image"].size for media in medias]
+            return {"pixel_values": self.pixel_values, "grid_thws": self.grid_thws}
+
+    from relax.utils.data import processor_pool
+    from relax.utils.multimodal.config import MultimodalConfig
+    from relax.utils.multimodal.image_utils import fetch_image
+
+    processor = _SizedProcessor()
+    monkeypatch.setattr(processor_pool, "_worker_processor", processor)
+    monkeypatch.setattr(image_rebuild, "_worker_threads_limited", True)
+    monkeypatch.setattr(processor_pool, "_worker_multimodal_config", MultimodalConfig(image_max_token_num=4))
+    monkeypatch.setattr(image_rebuild, "load_image", lambda ref: Image.new("RGB", (200, 100)))
+
+    features, _ = image_rebuild.build_image_features_in_worker(_rebuild_descriptor())
+
+    expected = fetch_image(
+        {"image": Image.new("RGB", (200, 100))},
+        image_patch_size=14,
+        config=MultimodalConfig(image_max_token_num=4),
+    )
+    assert processor.received_sizes == [expected.size, expected.size]
+    assert features["image_grid_thw"].tolist() == [[1, 2, 4], [1, 4, 6]]

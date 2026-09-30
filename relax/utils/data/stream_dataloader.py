@@ -15,6 +15,7 @@ from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
 from relax.utils import device as device_utils
+from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
@@ -1018,7 +1019,7 @@ def get_data_from_transfer_queue(
             # including NestedTensor values reconstructed by TransferQueue.
             if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
                 new_rollout_data[k] = _tensor_to_python_values(v)
-            elif k == "multimodal_train_inputs":
+            elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
                 # list of tensordicts / dicts; some entries may be None for
