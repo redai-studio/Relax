@@ -259,6 +259,31 @@ Users need flexibility to define custom reward logic for their tasks
 - Verified backward compatibility
 ```
 
+## CI
+
+PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
+
+| Command | Usage |
+| --- | --- |
+| `/rerun` | Retry failed jobs in the latest failed or timed-out workflows for the current commit |
+| `/rerun <target>` | Rerun one workflow or check; use `all` for all completed CI workflows |
+| `/cancel <workflow>` | Cancel an entire workflow, including its matrix jobs; `all` cancels all active CI workflows |
+| `/help` | Show commands and targets |
+| `/review` | Request a code review |
+
+| Target | Workflow / check |
+| --- | --- |
+| `ci` | All pre-commit and CPU checks |
+| `pre-commit` | Pre-commit checks |
+| `cpu-310`, `cpu-311`, `cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
+| `gpu-unit` | GPU unit tests |
+| `integration` | All GPU/NPU integration tests |
+| `gpu-async` | Qwen3-4B GPU async training |
+| `gpu-vl` | Qwen3-VL-4B GPU training |
+| `npu-async` | Qwen3-4B NPU async training |
+
+Cancellation accepts workflow targets (`ci`, `gpu-unit`, `integration`, or `all`). Rerun operates on existing runs for the current commit; wait for an active run to finish or cancel it before rerunning.
+
 ## Communication and Feedback
 
 Keep discussions focused on the topic and respect different opinions. When offering criticism or suggestions, explain the specific issue and your reasoning. Be patient with contributors who are new to the project.

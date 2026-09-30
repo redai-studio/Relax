@@ -304,7 +304,6 @@ export default defineConfig({
               text: 'Development',
               items: [
                 { text: 'How to Contribute', link: '/en/guide/how-to-contribute' },
-                { text: 'GitHub CI', link: '/en/guide/github-ci' },
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
                 { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
                 { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' },
@@ -425,7 +424,6 @@ export default defineConfig({
               text: '开发指南',
               items: [
                 { text: '如何贡献', link: '/zh/guide/how-to-contribute' },
-                { text: 'GitHub CI', link: '/zh/guide/github-ci' },
                 { text: '调试指南', link: '/zh/guide/debugging' },
                 { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
                 { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' },

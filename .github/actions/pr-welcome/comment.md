@@ -12,30 +12,20 @@ Describe the problem, your changes, and how you validated them. Keep each PR foc
 </details>
 
 <details>
-<summary>CI guide and commands / CI 指南与指令</summary>
+<summary>CI commands / CI 指令</summary>
 
-| Command / 指令       | Usage / 用途                                                  |
-| -------------------- | ------------------------------------------------------------- |
-| `/rerun`             | Rerun failed CI on the current commit / 重跑当前提交失败的 CI |
-| `/rerun <target>`    | Rerun a workflow or check / 重跑指定 workflow 或检查          |
-| `/cancel <workflow>` | Cancel an entire workflow / 取消整个 workflow                 |
-| `/bypass <workflow>` | CI team exemption via ci-bypass / CI team 通过 ci-bypass 豁免 |
-| `/help`              | Show commands and targets / 查看指令和 target                 |
-| `/review`            | Request Nyanpasu review / 请求 Nyanpasu review                |
+| Command / 指令       | Usage / 用途                                         |
+| -------------------- | ---------------------------------------------------- |
+| `/rerun`             | Retry failed CI / 重跑失败的 CI                      |
+| `/rerun <target>`    | Rerun a workflow or check / 重跑指定 workflow 或检查 |
+| `/cancel <workflow>` | Cancel an entire workflow / 取消整个 workflow        |
+| `/help`              | Show commands and targets / 查看指令和 target        |
+| `/review`            | Request a code review / 请求代码 review              |
 
-Post one command per comment. Workflow targets are `ci`, `gpu-unit`, `integration`, or `all`. Rerun/cancel require PR authorship or repository write access. Bypass is restricted to the configured CI team; a reason is optional. After requesting bypass, rerun the entire workflow to evaluate the gate.
+Put one command on the first line of a new PR comment. Rerun/cancel require PR authorship or repository write access.
 
-每条评论只写一条指令。Workflow target 为 `ci`、`gpu-unit`、`integration` 或 `all`。PR 作者或有仓库写权限的成员可重跑、取消 CI。豁免仅限配置的 CI team，理由可省略；提交豁免后重跑整个 workflow，让 gate 重新判断。
+在新 PR 评论的首行写一条指令。PR 作者或有仓库写权限的贡献者可以重跑、取消 CI。
 
-[English CI guide]({{docs}}/en/guide/github-ci) · [中文 CI 指南]({{docs}}/zh/guide/github-ci)
-
-</details>
-
-<details>
-<summary>CI configuration and maintenance / CI 配置与维护</summary>
-
-CI team members and targets are configured in [`.github/ci/config.json`]({{source}}/.github/ci/config.json). Welcome comments and CI commands have separate [actions]({{source}}/.github/actions). Exemptions use [ShigureLab/ci-bypass](https://github.com/ShigureLab/ci-bypass); new commits automatically remove `ci-bypass:` labels. `/review` is handled by Nyanpasu.
-
-CI team 和 target 集中配置在 [`.github/ci/config.json`]({{source}}/.github/ci/config.json)。欢迎评论和 CI 指令由独立的 [actions]({{source}}/.github/actions) 处理。豁免使用 ShigureLab/ci-bypass；新提交自动清除 `ci-bypass:` 标签。`/review` 由 Nyanpasu 处理。
+[CI usage and targets]({{docs}}/en/guide/how-to-contribute#ci) · [CI 用法与 target]({{docs}}/zh/guide/how-to-contribute#ci)
 
 </details>

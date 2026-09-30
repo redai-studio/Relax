@@ -259,6 +259,31 @@ make docs-preview
 - 验证向后兼容性
 ```
 
+## CI
+
+PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI 时，在新 PR 评论的首行写一条指令。PR 作者及拥有仓库写权限的贡献者可以重跑、取消 CI。
+
+| 指令 | 用途 |
+| --- | --- |
+| `/rerun` | 重跑当前提交对应的最新失败或超时 workflow 中失败的 job |
+| `/rerun <target>` | 重跑单个 workflow 或检查；`all` 表示所有已完成的 CI workflow |
+| `/cancel <workflow>` | 取消整个 workflow，包括其矩阵 job；`all` 表示所有运行中的 CI workflow |
+| `/help` | 查看指令和 target |
+| `/review` | 请求代码 review |
+
+| Target | Workflow / 检查 |
+| --- | --- |
+| `ci` | 全部 pre-commit 与 CPU 检查 |
+| `pre-commit` | Pre-commit 检查 |
+| `cpu-310`、`cpu-311`、`cpu-312` | Python 3.10 / 3.11 / 3.12 CPU 测试 |
+| `gpu-unit` | GPU 单元测试 |
+| `integration` | 全部 GPU/NPU 集成测试 |
+| `gpu-async` | Qwen3-4B GPU 异步训练 |
+| `gpu-vl` | Qwen3-VL-4B GPU 训练 |
+| `npu-async` | Qwen3-4B NPU 异步训练 |
+
+取消操作接受 workflow target（`ci`、`gpu-unit`、`integration` 或 `all`）。重跑只操作当前提交已有的 run；若 run 仍在运行，请等待结束或取消后再重跑。
+
 ## 交流与反馈
 
 讨论时请就事论事，尊重不同意见。提出批评或建议时，尽量说明具体问题和理由；对刚接触项目的贡献者，也请多一些耐心。
