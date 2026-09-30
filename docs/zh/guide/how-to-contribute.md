@@ -288,6 +288,8 @@ Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑
 
 `/rerun` 仅针对已结束的 CI 记录：只能重跑当前 commit 已有的任务；若任务仍在运行中，需等待其结束或先将其取消后再重跑。
 
+使用 agent 检查和操作 CI 时，可使用 [relax-github-ci skill](../../../skills/relax-github-ci/SKILL.md)。
+
 ## 交流与反馈
 
 讨论时请就事论事，尊重不同意见。提出批评或建议时，尽量说明具体问题和理由；对刚接触项目的贡献者，也请多一些耐心。

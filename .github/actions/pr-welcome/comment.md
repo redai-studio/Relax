@@ -29,3 +29,7 @@ Put one command on the first line of a new PR comment. Rerun/cancel require PR a
 [CI usage and targets]({{docs}}/en/guide/how-to-contribute#ci) · [CI 用法与 target]({{docs}}/zh/guide/how-to-contribute#ci)
 
 </details>
+
+Working with an agent? Use the [relax-github-ci skill]({{source}}/skills/relax-github-ci/SKILL.md) to inspect and operate CI.
+
+使用 agent 协作时，可以通过该 skill 检查和操作 CI。

@@ -288,6 +288,8 @@ Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns 
 
 `/rerun` applies only to completed CI runs: it can only rerun jobs that already exist for the current commit. If a run is still in progress, wait for it to finish or cancel it before rerunning.
 
+For agent-assisted CI operations, use the [relax-github-ci skill](../../../skills/relax-github-ci/SKILL.md).
+
 ## Communication and Feedback
 
 Keep discussions focused on the topic and respect different opinions. When offering criticism or suggestions, explain the specific issue and your reasoning. Be patient with contributors who are new to the project.
