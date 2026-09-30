@@ -6,7 +6,7 @@ import json
 import os
 import re
 from argparse import Namespace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,7 +28,7 @@ from relax.utils.training.ppo_utils import (
 )
 
 from .checkpoint_metadata import _checkpoint_has_optimizer_state, _collective_checkpoint_probe
-from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load
+from .compat import patch_hybrid_optimizer_native_fp32_checkpoint_load, preserve_hdo_dp_reshardable_steps_on_load
 
 
 try:
@@ -698,13 +698,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         )
         try:
             if lora_metadata is None:
-                return _load_checkpoint_megatron(
-                    ddp_model=ddp_model,
-                    optimizer=optimizer,
-                    opt_param_scheduler=opt_param_scheduler,
-                    checkpointing_context=checkpointing_context,
-                    skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                step_context = (
+                    preserve_hdo_dp_reshardable_steps_on_load()
+                    if optimizer is not None
+                    and getattr(args, "optimizer_cpu_offload", False)
+                    and not getattr(args, "no_load_optim", False)
+                    and not skip_load_to_model_and_opt
+                    else nullcontext()
                 )
+                with step_context:
+                    return _load_checkpoint_megatron(
+                        ddp_model=ddp_model,
+                        optimizer=optimizer,
+                        opt_param_scheduler=opt_param_scheduler,
+                        checkpointing_context=checkpointing_context,
+                        skip_load_to_model_and_opt=skip_load_to_model_and_opt,
+                    )
 
             _validate_lora_checkpoint_metadata(args, ddp_model, lora_metadata)
             if not skip_load_to_model_and_opt:

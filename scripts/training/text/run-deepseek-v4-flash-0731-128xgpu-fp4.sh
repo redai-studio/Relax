@@ -81,6 +81,9 @@ FP8_ARGS=(
    --bf16
    --fp8-format e4m3
    --fp8-recipe blockwise
+   # MXFP4 expert QAT with the original TE FP8 compute and scales.
+   --custom-model-provider-path relax.models.deepseek_v4.provider.model_provider
+   --train-env-vars '{"RELAX_DSV4_FP4_MODE": "stock_fp8"}'
 )
 
 EVAL_ARGS=(
@@ -193,7 +196,7 @@ MISC_ARGS=(
    --attention-softmax-in-fp32
    --use-health-check
    --trust-remote-code
-   --update-weight-buffer-size $(( 1024 * 1024 * 1024 ))
+   --update-weight-buffer-size $(( 2 * 1024 * 1024 * 1024 ))
 )
 
 RUNTIME_ENV_JSON=$(python3 -c '
