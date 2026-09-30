@@ -15,7 +15,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bypass:
+    name: Check CI bypass
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/check-bypass.yml
+    with:
+      target: integration
+
   integration:
+    needs: bypass
+    # A failed gate must run the tests, never grant an exemption.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: ${{ matrix.case }}
     runs-on: [self-hosted, linux, x64, h20, gpu]
     # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
@@ -145,6 +158,9 @@ jobs:
           retention-days: 14
 
   npu-integration:
+    needs: bypass
+    # A failed gate must run the tests, never grant an exemption.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Qwen3-4B-4xnpu-async
     runs-on: [self-hosted, linux, ARM64, 910c, npu]
     timeout-minutes: 185
