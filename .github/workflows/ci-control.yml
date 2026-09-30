@@ -34,6 +34,7 @@ jobs:
               return;
             }
             const bot = new github.constructor({ auth: process.env.WELCOME_BOT_TOKEN });
-            await require('./.github/ci/control.js').control({
+            const { control } = await import(`${process.env.GITHUB_WORKSPACE}/.github/ci/control.js`);
+            await control({
               github, bot, context, core, botLogin: process.env.WELCOME_BOT_LOGIN || undefined,
             });

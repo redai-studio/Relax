@@ -40,8 +40,17 @@ repos:
     rev: v15.0.6
     hooks:
       - id: clang-format
+        exclude_types: [javascript]
+        exclude: ^\.github/ci/
   - repo: local
     hooks:
+      - id: oxfmt
+        name: oxfmt
+        entry: oxfmt
+        language: python
+        types_or: [javascript, json]
+        files: ^\.github/ci/
+        additional_dependencies: ["oxfmt==0.69.0"]
       - id: docformatter
         name: docformatter
         entry: python .pre-commit-hooks/docformatter_compat.py --in-place --wrap-descriptions 79
