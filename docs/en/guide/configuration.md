@@ -31,7 +31,7 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--num-data-storage-units` | int | 1 | Number of TransferQueue SimpleStorageUnit actors |
-| `--per-rank-fetch` | flag | False | Let every TP/PP rank pull its own copy from TransferQueue in parallel instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank consistency relies on the TQ sampler's `(partition_id, task_name, dp_rank, batch_index)` cache, which is PP/TP-invariant. Auto-disabled when `rollout_routed_experts` is in `data_fields` (jagged NestedTensor broadcast path is incompatible). Recommended for multi-GPU training together with `--num-data-storage-units >= TP world size`. Wins when pickle dominates `tgd_bcast_tp_time`. |
+| `--per-rank-fetch` (RL compatibility; automatic for SFT) | flag | RL: False / Megatron SFT: True | Let every TP/PP rank pull its own copy from TransferQueue in parallel instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank consistency relies on the TQ sampler's `(partition_id, task_name, dp_rank, batch_index)` cache, which is PP/TP-invariant. Auto-disabled when `rollout_routed_experts` is in `data_fields` (jagged NestedTensor broadcast path is incompatible). Recommended for multi-GPU training together with `--num-data-storage-units >= TP world size`. Wins when pickle dominates `tgd_bcast_tp_time`. |
 | `--max-staleness` | int | 0 | Maximum staleness for TransferQueue data system (0=on-policy) |
 | `--polling-mode` | bool | True | Whether to use polling mode when fetching metadata |
 | `--num-iters-per-train-update` | int | 1 | Number of iterations per global batch in fully async pipeline |
@@ -444,7 +444,7 @@ The offline producer uses its own `PrefetchBuffer` for SFT samples or preference
 | `RELAX_SFT_TQ_SHARDS` | int | 1 | Number of SFT TransferQueue shards. Values less than or equal to 0 are treated as 1. |
 
 ::: warning Activation requirement
-This variable does not enable prepacking. It is effective only with `--loss-type sft --sft-async-prepack`; otherwise Relax uses one partition. Async prepacking also requires `--per-rank-fetch`, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, VPP=1, and THD QKV format.
+This variable takes effect only when SFT automatically selects async prepacking; otherwise Relax uses one partition. Selection requires Megatron, NCCL, THD, at least two in-flight steps (`--max-staleness >= 1` or `--sft-max-in-flight-steps >= 2`), PP=1, CP=1, no VPP, no dynamic CP, no routing/indexer replay, and no image data. Per-rank fetch is automatic and needs no extra switch.
 :::
 
 With `N > 1`, step `K` uses partitions `sft_K_shard_0_of_N` through `sft_K_shard_<N-1>_of_N`; the existing `sft_K` name is used only when `N == 1`. The consumer waits until all shard partitions are ready, then reads an equal slice from each. Consequently, both `global_batch_size` and each DP-local batch (`global_batch_size / data_parallel_size`) must be divisible by `N`.

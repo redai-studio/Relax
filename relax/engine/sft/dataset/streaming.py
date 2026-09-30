@@ -15,10 +15,12 @@ import torch
 
 from relax.engine.sft.dataset.chat_template import render_to_text, render_with_loss_mask
 from relax.engine.sft.dataset.cpt import build_cpt_sample, render_cpt, truncate_qwen3_5_cpt
+from relax.engine.sft.dataset.image_transport import ImageReferenceTransport
 from relax.engine.sft.dataset.multimodal import (
     has_multimodal_content,
     preprocess_multimodal,
     preprocess_multimodal_async,
+    take_preprocess_stats,
 )
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.utils.data.data_utils import (
@@ -27,6 +29,7 @@ from relax.utils.data.data_utils import (
     count_message_multimodal_items,
     resolve_path_plan,
 )
+from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
 from relax.utils.data.kimi_k3 import (
     KIMI_K3_SFT_LOSS_MASK,
     KIMI_K3_SFT_REQUEST,
@@ -56,6 +59,9 @@ class ProcessedSample:
     multimodal_train_inputs: dict[str, Any] | None
     source_idx: int
     classification_label: torch.Tensor | None = None
+    # --sft-image-preprocess-on-rank: ordered image-ref descriptor replacing
+    # the dropped pixel_values; None keeps the pixel-shipping default mode.
+    image_refs_descriptor: dict[str, Any] | None = None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -451,6 +457,7 @@ class SFTStreamingDataset:
         loss_ignore_empty_think: bool = False,
         training_mode: str = "sft",
         cpt_template: str = "raw",
+        image_preprocess_on_rank: bool = False,
     ) -> None:
         if training_mode not in {"sft", "cpt"}:
             raise ValueError(f"Unknown SFT training mode: {training_mode!r}")
@@ -521,6 +528,7 @@ class SFTStreamingDataset:
                 raise ValueError("SFTStreamingDataset seq_cls capacity must be >= 2")
         self.loss_last_turn_only = loss_last_turn_only
         self.loss_ignore_empty_think = loss_ignore_empty_think
+        self._image_transport = ImageReferenceTransport(image_preprocess_on_rank)
 
         valid_strategies = {"skip", "keep", "truncate_left", "truncate_right", "custom"}
         if oversize_strategy not in valid_strategies:
@@ -825,6 +833,12 @@ class SFTStreamingDataset:
                 f"SFTStreamingDataset.get_batch_async (prefetch): returned {len(samples)}/{n} samples "
                 f"after {attempts} attempts."
             )
+        stats = take_preprocess_stats()
+        if stats["samples"]:
+            logger.info(
+                f"SFT batch preprocess: {int(stats['samples'])} samples — pool {stats['pool_s']:.1f}s "
+                f"(worker-side media load + processor, wall for {len(samples)} samples)"
+            )
         return samples, crossed_epoch
 
     def _get_batch_inline(self, n: int) -> tuple[list[ProcessedSample], bool]:
@@ -940,6 +954,7 @@ class SFTStreamingDataset:
             return None
         rendered_text = None
         processor_kwargs = None
+        image_refs, image_fallback = self._image_transport.capture(sample.images, idx, self.source_name)
         if has_multimodal_content(sample):
             if is_kimi_k3_tokenizer(self.tokenizer):
                 # Image dimensions are only known inside the processor worker.
@@ -969,6 +984,8 @@ class SFTStreamingDataset:
             total_length=effective_n,
             classification_label=self.get_classification_label(idx, row=row),
             processor_kwargs=processor_kwargs,
+            image_refs=image_refs,
+            image_fallback=image_fallback,
         )
 
     async def _finalize_async(self, rendered: "_RenderedSample") -> ProcessedSample | None:
@@ -1076,6 +1093,7 @@ class SFTStreamingDataset:
         n = int(tokens.shape[0])
         if self.training_mode == "cpt" and n < 2:
             raise ValueError(f"CPT row idx={rendered.idx} has fewer than two tokens after truncation")
+        mm_inputs, image_refs_descriptor = self._image_transport.split(mm_inputs, rendered, self.source_name)
         return ProcessedSample(
             tokens=tokens,
             loss_mask=loss_mask,
@@ -1083,6 +1101,7 @@ class SFTStreamingDataset:
             classification_label=rendered.classification_label,
             multimodal_train_inputs=mm_inputs,
             source_idx=rendered.idx,
+            image_refs_descriptor=image_refs_descriptor,
         )
 
     def _apply_oversize_strategy(
@@ -1132,6 +1151,10 @@ class _RenderedSample:
     total_length: int
     classification_label: torch.Tensor | None
     processor_kwargs: dict[str, Any] | None = None
+    image_refs: list[str] | None = None
+    # Inline payload could not be expressed as file references and the
+    # pixel_payload fallback is enabled: this sample ships its pixels.
+    image_fallback: bool = False
 
 
 def _to_long_tensor(ids: Any) -> torch.Tensor:
@@ -1198,6 +1221,8 @@ def pack_samples_for_tq(
     samples: list[ProcessedSample],
     force_multimodal_field: bool = False,
     sample_weights: list[float] | None = None,
+    *,
+    force_image_refs_field: bool = False,
 ) -> Optional[dict]:
     if not samples:
         return None
@@ -1225,6 +1250,8 @@ def pack_samples_for_tq(
         batch["sample_weights"] = sample_weights
     if has_mm:
         batch["multimodal_train_inputs"] = [s.multimodal_train_inputs for s in samples]
+    if force_image_refs_field or any(s.image_refs_descriptor is not None for s in samples):
+        batch[SFT_IMAGE_REFS_FIELD] = [s.image_refs_descriptor for s in samples]
     batch_size = len(samples)
     for key, value in batch.items():
         if len(value) != batch_size:

@@ -13,6 +13,7 @@ from tensordict import TensorDict
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
+from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
@@ -332,7 +333,9 @@ def dict_to_tensordict(
         if depth == 0:  # empty list []
             tensor = torch.empty(0)
         elif depth == 1:
-            if key == "multimodal_train_inputs":
+            if key in MULTIMODAL_PAYLOAD_FIELDS:
+                # Per-sample dicts (or image-ref descriptors) must stay Python
+                # objects; tensorizing them would lose the nested structure.
                 tensor = value
             else:
                 tensor = _to_tensor_1d(

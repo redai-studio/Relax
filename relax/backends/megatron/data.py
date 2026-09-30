@@ -205,6 +205,18 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
     )
 
 
+def _get_micro_batch_token_capacity(args: Namespace, max_tokens: int, cp_size: int) -> int:
+    if getattr(args, "allgather_cp", False):
+        pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
+        if pad_size <= 0 or max_tokens < pad_size:
+            raise ValueError(
+                "allgather CP padding must fit within max_tokens_per_gpu: "
+                f"max_tokens_per_gpu={max_tokens}, local_pad_size={pad_size}"
+            )
+        return cp_size * (max_tokens // pad_size) * pad_size
+    return max_tokens * cp_size
+
+
 def _get_first_fit_partitions(total_lengths: Sequence[int], capacity: int) -> list[list[int]]:
     partitions: list[list[int]] = []
     partition_token_counts: list[int] = []
@@ -1204,15 +1216,7 @@ def get_data_iterator(
     else:
         _max_tokens = max_tokens_per_gpu if max_tokens_per_gpu is not None else args.max_tokens_per_gpu
         assert _max_tokens is not None
-        micro_batch_token_capacity = _max_tokens * cp_size
-        if getattr(args, "allgather_cp", False):
-            pad_size = mpu.get_tensor_model_parallel_world_size() * args.data_pad_size_multiplier
-            if pad_size <= 0 or _max_tokens < pad_size:
-                raise ValueError(
-                    "allgather CP padding must fit within max_tokens_per_gpu: "
-                    f"max_tokens_per_gpu={_max_tokens}, local_pad_size={pad_size}"
-                )
-            micro_batch_token_capacity = cp_size * (_max_tokens // pad_size) * pad_size
+        micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples

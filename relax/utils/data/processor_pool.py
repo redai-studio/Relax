@@ -28,6 +28,7 @@ import torch
 import torch.multiprocessing as mp
 from PIL import Image
 
+from relax.utils.data.image_refs import SFT_HF_IMAGE_REBUILD_SUPPORTED
 from relax.utils.data.kimi_k3 import KIMI_K3_SFT_REQUEST, process_kimi_k3_sft_images
 from relax.utils.data.processing_utils import (
     adapt_processor_kwargs,
@@ -61,6 +62,15 @@ def _init_worker(
     """Initialize the HuggingFace processor in each worker process (called
     once)."""
     global _worker_multimodal_config, _worker_processor
+    # Cap intra-op threads: a pool runs one worker per in-flight sample next to
+    # the training ranks (plus, on vision ranks, the rank-side rebuild pool), so
+    # torch's per-core default plus the job's OMP_NUM_THREADS oversubscribes the
+    # node — a 32-worker pool measured ~700 threads and its batch time stopped
+    # scaling with the pool.
+    try:
+        torch.set_num_threads(1)
+    except RuntimeError as exc:
+        logger.debug(f"Could not cap torch intra-op threads in pool worker: {exc}")
     _worker_processor = load_processor(model_path, trust_remote_code=trust_remote_code)
     _worker_multimodal_config = multimodal_config
     logger.info(f"ProcessorPool worker initialized (pid={os.getpid()})")
@@ -92,6 +102,89 @@ def _resize_images_for_processor(
     if not isinstance(patch_size, int) or patch_size <= 0:
         patch_size = 14
     return [fetch_image({"image": image}, image_patch_size=patch_size, config=multimodal_config) for image in images]
+
+
+def get_worker_processor() -> Any:
+    """Return the processor initialized in this pool worker."""
+    if _worker_processor is None:
+        raise RuntimeError("Processor not initialized in worker process")
+    return _worker_processor
+
+
+def prepare_worker_images(images: list[np.ndarray]) -> list[Image.Image]:
+    """Restore IPC images and apply the shared producer/rebuild resize
+    rules."""
+    processor = get_worker_processor()
+    restored_images = [Image.fromarray(arr) for arr in images]
+    if _is_qwen_vl_processor(processor):
+        resized_images = []
+        for image in restored_images:
+            resized = resize_qwen_vl_extreme_aspect_ratio(image)
+            if resized is not image:
+                logger.warning(
+                    f"Qwen-VL image aspect ratio exceeded 200; resized from {image.size} to {resized.size}."
+                )
+            resized_images.append(resized)
+        restored_images = resized_images
+    return _resize_images_for_processor(processor, restored_images, _worker_multimodal_config)
+
+
+class MediaLoadError(RuntimeError):
+    """A sample's media file could not be read in a pool worker."""
+
+
+def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    """Load image/video/audio sources inside the worker.
+
+    The producer used to decode media in the parent and pickle it into the
+    pool: a 20-image sample is an ~86 MiB IPC payload and ~90 ms of parent-side
+    GIL pickling, which capped the pool at ~5 samples/s no matter how many
+    workers it had. Sending file paths (~3 KB) lets every worker read in
+    parallel — the same path-fed pipeline the rank-side rebuild already proved
+    bitwise identical to the decoded-array one.
+    """
+    from relax.utils.multimodal.audio_utils import load_audio
+    from relax.utils.multimodal.image_utils import load_image
+    from relax.utils.multimodal.video_utils import load_video
+
+    loaded: dict[str, list[Any]] = {}
+    for kind, loader in (("image", load_image), ("video", load_video), ("audio", load_audio)):
+        sources = media_paths.get(kind) or []
+        if not sources:
+            continue
+        items: list[Any] = []
+        for position, source in enumerate(sources):
+            try:
+                items.append(loader(source))
+            except Exception as exc:  # noqa: BLE001 - re-raised with position context
+                raise MediaLoadError(f"failed to load {kind} position={position}: {source!r}") from exc
+        loaded[f"{kind}s"] = items
+    return loaded
+
+
+def process_sample_from_paths_in_worker(
+    text: str,
+    media_paths: dict[str, list[Any]],
+    processor_kwargs: dict[str, Any],
+) -> tuple[list[int], dict[str, Any] | None]:
+    """``process_sample_in_worker`` with the media read inside the worker.
+
+    The load and the IPC-shaped conversion mirror the parent-side chain exactly
+    (same loaders, same ``prepare_mm_inputs_for_ipc``), so the processor sees the
+    same inputs it did when the parent shipped decoded arrays.
+
+    Raises:
+        MediaLoadError: A referenced media file could not be read (the dataset
+            maps this to its invalid-multimodal skip policy).
+    """
+    media = _load_media_for_worker(media_paths)
+    prompt_ids, train_inputs = process_sample_in_worker(text, prepare_mm_inputs_for_ipc(media), processor_kwargs)
+    if train_inputs is not None:
+        processor = get_worker_processor()
+        train_inputs[SFT_HF_IMAGE_REBUILD_SUPPORTED] = getattr(
+            processor, "image_processor", None
+        ) is not None and not hasattr(processor, "media_processor")
+    return prompt_ids, train_inputs
 
 
 def prepare_mm_inputs_for_ipc(multimodal_inputs: dict) -> dict:
@@ -143,25 +236,9 @@ def process_sample_in_worker(
         if _worker_processor is None:
             raise RuntimeError("Processor not initialized in worker process")
 
-        # Restore PIL Images from numpy arrays (HF processor expects PIL for some code paths)
         restored = dict(multimodal_inputs)
         if images := restored.get("images"):
-            restored_images = [Image.fromarray(arr) for arr in images]
-            if _is_qwen_vl_processor(_worker_processor):
-                resized_images = []
-                for image in restored_images:
-                    resized = resize_qwen_vl_extreme_aspect_ratio(image)
-                    if resized is not image:
-                        logger.warning(
-                            f"Qwen-VL image aspect ratio exceeded 200; resized from {image.size} to {resized.size}."
-                        )
-                    resized_images.append(resized)
-                restored_images = resized_images
-            restored["images"] = _resize_images_for_processor(
-                _worker_processor,
-                restored_images,
-                _worker_multimodal_config,
-            )
+            restored["images"] = prepare_worker_images(images)
         # Videos arrive as shared-memory torch.Tensors — usable directly by the processor.
         # Audio arrives as numpy arrays — usable directly by the processor.
 

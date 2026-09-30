@@ -195,7 +195,7 @@ def test_sft_init_data_pipeline_resolves_s3_path(monkeypatch, sft_module):
     sft_module.AutoTokenizer.from_pretrained.assert_called_once_with(resolved, trust_remote_code=True)
     sft_module.ProcessorPool.assert_called_once_with(
         resolved,
-        pool_size=None,
+        pool_size=sft_module._PRODUCER_POOL_SIZE,
         trust_remote_code=True,
         multimodal_config=sft_module.MultimodalConfig.from_args(config),
     )

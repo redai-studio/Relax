@@ -5,6 +5,7 @@
 import asyncio
 import json
 import sys
+from concurrent.futures import Future
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from relax.engine.sft.dataset.streaming import (
     _expand_loss_mask_via_alignment,
     pack_samples_for_tq,
 )
+from relax.utils.data.processor_pool import MediaLoadError
 from relax.utils.utils import dict_to_tensordict
 
 
@@ -501,6 +503,17 @@ def test_pack_samples_for_tq_forces_multimodal_field_for_text_only_batch():
     assert batch["multimodal_train_inputs"] == [None]
 
 
+def test_pack_samples_for_tq_forces_image_refs_field_for_text_only_batch():
+    from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+
+    batch = pack_samples_for_tq([_make_text_only_sample()], force_image_refs_field=True)
+
+    assert batch is not None
+    assert batch[SFT_IMAGE_REFS_FIELD] == [None]
+    payload = dict_to_tensordict(batch, batch_size=1)
+    assert list(payload[SFT_IMAGE_REFS_FIELD]) == [None]
+
+
 def test_streaming_dataset_builds_messages_from_prompt_and_label_keys(tmp_path: Path):
     path = tmp_path / "train.jsonl"
     _write_jsonl(path, [{"prompt": "What is 2+2?", "answer": "4"}])
@@ -839,6 +852,25 @@ def test_streaming_dataset_media_fetch_error_defaults_to_error(tmp_path: Path):
         ds.stop()
 
 
+class _MissingMediaPool:
+    """Stands in for ProcessorPool when the media file cannot be read.
+
+    The load now happens inside the pool worker, so an unreadable file comes
+    back as a MediaLoadError from the future; the dataset maps that to its
+    invalid-multimodal skip policy.
+    """
+
+    class _Executor:
+        def submit(self, _fn, *_args, **_kwargs):
+            # A real Future: the async path goes through loop.run_in_executor.
+            future = Future()
+            future.set_exception(MediaLoadError("failed to load image position=0: '/data/missing.png'"))
+            return future
+
+    def __init__(self):
+        self.executor = self._Executor()
+
+
 @pytest.mark.parametrize("batch_mode", ["inline", "async", "prefetch"])
 def test_streaming_dataset_media_fetch_error_skip_refills_batch(tmp_path: Path, caplog, batch_mode: str):
     path = tmp_path / "train.jsonl"
@@ -949,7 +981,7 @@ def test_streaming_dataset_missing_media_skip_refills_batch(tmp_path: Path, monk
     ds = SFTStreamingDataset(
         path=str(path),
         tokenizer=_FakeTokenizer(),
-        processor_pool=object(),
+        processor_pool=_MissingMediaPool(),
         capacity=None,
         prompt_key="messages",
         label_key=None,

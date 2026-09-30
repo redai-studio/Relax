@@ -13,6 +13,7 @@ from sglang_router.launch_router import RouterArgs
 from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
+from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
@@ -222,15 +223,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--per-rank-fetch",
                 action="store_true",
                 default=False,
-                help=(
-                    "Let every TP/PP rank pull its own copy from TransferQueue in parallel "
-                    "instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank "
-                    "consistency relies on the TQ sampler's (partition_id, task_name, dp_rank, "
-                    "batch_index) cache, which is PP/TP-invariant. Auto-disabled when "
-                    "'rollout_routed_experts' is in data_fields (jagged NestedTensor bcast "
-                    "path is incompatible). Recommended for multi-GPU training together with "
-                    "--num-data-storage-units >= TP world size."
-                ),
+                help=argparse.SUPPRESS,
             )
             parser.add_argument(
                 "--max-staleness",
@@ -659,13 +652,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sft-train-data-prefetch",
                 action="store_true",
-                default=False,
-                help=(
-                    "For offline training, while training step N, prefetch the next step's raw "
-                    "TransferQueue payload on a CPU worker. Requires --per-rank-fetch "
-                    "and at least two SFT partitions in flight; collective agreement and "
-                    "GPU transfer remain on the main training thread."
-                ),
+                default=None,
+                help=argparse.SUPPRESS,
             )
             parser.add_argument(
                 "--sft-prefetch-buffer-size",
@@ -693,17 +681,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--sft-async-prepack",
                 action="store_true",
                 default=False,
-                help=(
-                    "Enable the SFT prepack pipeline: TQ fetch + seqlen-balanced "
-                    "micro-batch partitioning + THD packing + pinned-memory H2D "
-                    "are all offloaded to a background worker, keeping only "
-                    "fwd/bwd on the training thread. Data / batch / loss-scaling "
-                    "semantics match the standard SFT path exactly (same K, same "
-                    "get_seqlen_balanced_partitions, same __loss_scale__). Requires "
-                    "--per-rank-fetch and at least two in-flight steps "
-                    "(--max-staleness >= 1 or --sft-max-in-flight-steps >= 2); "
-                    "PP=1, CP=1, VPP=1 and THD qkv format only."
-                ),
+                help=argparse.SUPPRESS,
             )
             parser.add_argument(
                 "--sft-training-mode",
@@ -3045,6 +3023,8 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
+    configure_sft_data_pipeline(args)
+
     if not args.debug_train_only:
         sglang_validate_args(args)
 
@@ -3265,37 +3245,13 @@ def _validate_cpt_args(args) -> None:
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
     sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
     if sft_max_in_flight_steps is None:
-        if is_offline and getattr(args, "sft_async_prepack", False) and args.max_staleness < 1:
-            raise ValueError("--sft-async-prepack requires --max-staleness >= 1 or --sft-max-in-flight-steps >= 2.")
         return
 
     if not is_offline:
         raise ValueError("--sft-max-in-flight-steps is only meaningful for offline training.")
-    minimum_steps = 2 if getattr(args, "sft_async_prepack", False) else 1
-    if sft_max_in_flight_steps < minimum_steps:
-        if minimum_steps == 2:
-            raise ValueError("--sft-async-prepack requires --sft-max-in-flight-steps >= 2.")
+    if sft_max_in_flight_steps < 1:
         raise ValueError("--sft-max-in-flight-steps must be >= 1.")
     args.max_staleness = sft_max_in_flight_steps - 1
-
-
-def _validate_sft_train_data_prefetch(args, is_offline: bool) -> None:
-    if not getattr(args, "sft_train_data_prefetch", False):
-        return
-    if getattr(args, "sft_async_prepack", False):
-        raise ValueError(
-            "--sft-train-data-prefetch and --sft-async-prepack are mutually exclusive; "
-            "async prepack already includes raw TransferQueue lookahead."
-        )
-    if not is_offline:
-        raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
-    if not args.per_rank_fetch:
-        raise ValueError("--sft-train-data-prefetch requires --per-rank-fetch.")
-    if args.max_staleness < 1:
-        raise ValueError(
-            "--sft-train-data-prefetch requires at least two SFT partitions in flight; "
-            "set --sft-max-in-flight-steps >= 2."
-        )
 
 
 def _normalize_sft_tq_timeout(args, is_offline: bool) -> None:
@@ -3985,8 +3941,6 @@ def slime_validate_args(args):
                 f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
             )
 
-    _normalize_sft_max_in_flight_steps(args, is_offline)
-    _validate_sft_train_data_prefetch(args, is_offline)
     _normalize_sft_tq_timeout(args, is_offline)
     _validate_agentic_rollout_args(args)
     validate_save_hf_fp8_args(args)
@@ -4286,16 +4240,6 @@ def slime_validate_args(args):
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:
             raise ValueError(f"--loss-type {args.loss_type} requires --prompt-data.")
-        if getattr(args, "sft_async_prepack", False):
-            if not args.per_rank_fetch:
-                raise ValueError(
-                    "--sft-async-prepack enables background prepacking and requires --per-rank-fetch; "
-                    "background prefetch workers must not execute CP/TP/PP collectives."
-                )
-            if args.use_routing_replay or args.use_rollout_routing_replay:
-                raise ValueError(
-                    "--sft-async-prepack does not support routing replay because its iterator is single-pass."
-                )
         if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # Offline training does not compute advantages.
@@ -4610,6 +4554,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    _normalize_sft_max_in_flight_steps(args, is_offline)
+    if not is_offline and getattr(args, "sft_train_data_prefetch", False):
+        raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
     # Custom YAML is applied late and may override any checkpoint option, so
     # validate this mutually exclusive mode only after those overrides settle.

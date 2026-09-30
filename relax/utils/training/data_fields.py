@@ -2,6 +2,8 @@
 
 from argparse import Namespace
 
+from relax.utils.data.image_refs import sft_multimodal_data_fields
+
 
 PREFERENCE_DATA_FIELDS = (
     "pair_ids",
@@ -45,8 +47,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
-        if args.multimodal_keys is not None:
-            fields.append("multimodal_train_inputs")
+        fields.extend(sft_multimodal_data_fields(args))
         return fields
 
     from relax.algorithms import algorithm_needs_critic

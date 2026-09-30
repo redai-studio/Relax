@@ -108,6 +108,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     from relax.backends.megatron.data import get_data_iterator
     from relax.backends.megatron.initialize import is_megatron_main_rank
     from relax.backends.megatron.model import forward_only
+    from relax.utils.data.image_refs import sft_multimodal_data_fields
 
     is_classification = getattr(actor.args, "task_type", "causal_lm") == "seq_cls"
     if is_classification:
@@ -126,8 +127,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     data_fields = ["tokens", "loss_masks", "total_lengths", "response_lengths"]
     if is_classification:
         data_fields.extend(["classification_labels", "sample_weights"])
-    if args.multimodal_keys is not None:
-        data_fields.append("multimodal_train_inputs")
+    data_fields.extend(sft_multimodal_data_fields(args))
 
     n_chunks, _ = _wait_for_eval_plan(actor, rollout_id)
 

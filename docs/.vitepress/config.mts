@@ -291,6 +291,10 @@ export default defineConfig({
                   link: '/en/guide/low-rank-adaptation-training',
                 },
                 { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' },
+                {
+                  text: 'Multimodal Training Optimizations',
+                  link: '/en/guide/multimodal-training',
+                },
               ],
             },
             {
@@ -415,6 +419,7 @@ export default defineConfig({
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
                 { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
                 { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' },
+                { text: '多模态训练优化', link: '/zh/guide/multimodal-training' },
               ],
             },
             {

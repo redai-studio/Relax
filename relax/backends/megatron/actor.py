@@ -31,11 +31,13 @@ from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
+from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
     evaluation_step_for_rollout,
     is_offline_mode,
     is_preference_mode,
+    is_sft_mode,
     sft_partition_id,
     sft_partition_ids,
     sft_task_name,
@@ -53,7 +55,6 @@ from relax.utils.data.micro_batch_ring import (
     SFTWindowPrefetcher,
     is_sft_async_prepack_enabled,
 )
-from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.data.stream_dataloader import (
     MicroBatchListIterator,
     StreamingTQIterator,
@@ -116,6 +117,8 @@ from .data import (
     ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
     DataIterator,
     PrepackedBatch,
+    _get_capacity_safe_balanced_partitions,
+    _get_micro_batch_token_capacity,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     expand_preference_rollout_data,
@@ -405,6 +408,15 @@ class MegatronTrainRayActor(TrainRayActor):
                 max_workers=1,
                 thread_name_prefix="sft-tq-prefetch",
             )
+        # --sft-image-preprocess-on-rank: vision ranks rebuild pixel tensors
+        # from image references inside the prefetch above. The CPU pool is
+        # created lazily (it needs the built model chunks for the vision check).
+        self._sft_image_preprocess_on_rank = is_sft_mode(self.args) and getattr(
+            self.args, "sft_image_preprocess_on_rank", False
+        )
+        self._sft_image_prefetch = SFTImagePrefetch(
+            self.args, partial(fetch_data_from_transfer_queue, tq_client=self.data_system_client)
+        )
         if is_megatron_main_rank():
             init_tracking(args, primary=False)
 
@@ -1519,8 +1531,11 @@ class MegatronTrainRayActor(TrainRayActor):
         if local_k < max_k:
             try:
                 first_ready_event.synchronize()
-                micro_batch_indices = get_seqlen_balanced_partitions(
-                    window.rollout_data["total_lengths"], max_k, equal_size=False
+                capacity = _get_micro_batch_token_capacity(
+                    self.args, self.args.max_tokens_per_gpu, mpu.get_context_parallel_world_size()
+                )
+                micro_batch_indices = _get_capacity_safe_balanced_partitions(
+                    window.rollout_data["total_lengths"], max_k, capacity
                 )
                 packed_micro_batches = [
                     (
@@ -1685,9 +1700,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # CP=1 by _validate_sft_prepack_pipeline; cp_size factor is a no-op
         # but kept explicit to mirror get_data_iterator's formula.
         cp_size = mpu.get_context_parallel_world_size()
-        max_tokens = self.args.max_tokens_per_gpu * cp_size
+        max_tokens = _get_micro_batch_token_capacity(self.args, self.args.max_tokens_per_gpu, cp_size)
         k_local = get_minimum_num_micro_batch_size(samples, max_tokens)
-        micro_batch_indices = get_seqlen_balanced_partitions(samples, k_local, equal_size=False)
+        micro_batch_indices = _get_capacity_safe_balanced_partitions(samples, k_local, max_tokens)
         packed_cpu = [
             (prepack_sft_micro_batch_cpu(self.args, _select_rollout_samples(rollout_data, indices)), None)
             for indices in micro_batch_indices
@@ -3403,16 +3418,31 @@ class MegatronTrainRayActor(TrainRayActor):
             "task_name": task_name,
         }
         self._sft_train_prefetch_rollout_id = next_rollout_id
-        self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
-            fetch_data_from_transfer_queue,
-            tq_client=self.data_system_client,
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            task_name=task_name,
-            sampling_config=sampling_config,
-            batch_index=0,
-        )
+        if getattr(self, "_sft_image_preprocess_on_rank", False):
+            # The TQ payload carries image references instead of pixels; the
+            # same background worker continues with the file read + pixel
+            # rebuild so the CPU tensors are ready before step N+1 starts.
+            self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
+                self._sft_image_prefetch.fetch,
+                next_rollout_id,
+                model=self.model,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+            )
+        else:
+            self._sft_train_prefetch = self._sft_train_prefetch_executor.submit(
+                fetch_data_from_transfer_queue,
+                tq_client=self.data_system_client,
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                task_name=task_name,
+                sampling_config=sampling_config,
+                batch_index=0,
+            )
         if is_megatron_main_rank():
             logger.info("Started CPU-only TQ prefetch for SFT rollout_id=%d", next_rollout_id)
 
@@ -3440,6 +3470,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     future.result()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Discarded SFT train-data prefetch also failed: %s", exc)
+                if getattr(self, "_sft_image_prefetch", None) is not None:
+                    self._sft_image_prefetch.discard(prefetched_rollout_id)
             elif not future.cancel():
                 fatal = True
                 local_error = RuntimeError(
@@ -3459,9 +3491,11 @@ class MegatronTrainRayActor(TrainRayActor):
         return agreed_fetch
 
     def _shutdown_sft_train_prefetch(self) -> None:
-        """Release the optional raw-prefetch slot and executor once."""
+        """Release the optional raw-prefetch slot, image worker and executor
+        once."""
         future = self._sft_train_prefetch
         executor = self._sft_train_prefetch_executor
+        image_prefetch = getattr(self, "_sft_image_prefetch", None)
         self._sft_train_prefetch = None
         self._sft_train_prefetch_rollout_id = None
         self._sft_train_prefetch_executor = None
@@ -3469,6 +3503,8 @@ class MegatronTrainRayActor(TrainRayActor):
             future.cancel()
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        if image_prefetch is not None:
+            image_prefetch.close()
 
     def _get_data_from_transfer_queue(
         self,
@@ -3528,6 +3564,15 @@ class MegatronTrainRayActor(TrainRayActor):
             prefetched_rollout_data=prefetched_rollout_data,
             prefetched_fetch_time_s=prefetched_fetch_time_s,
         )
+        if self._sft_image_preprocess_on_rank:
+            # Swap image-ref descriptors for the CPU pixel tensors rebuilt by
+            # the prefetch worker (or synchronously on paused/eval steps),
+            # keeping the get_batch entry format identical to the pixel path.
+            # ``resolve`` logs only when it actually attached pixels, i.e. on the
+            # vision ranks — ``is_megatron_main_rank`` is the last PP stage and
+            # never owns vision, so it would hide the rebuild entirely.
+            if not self._sft_image_prefetch.resolve_across_ranks(rollout_data, rollout_id, model=self.model, log=True):
+                rollout_data = None
 
         return rollout_data, batch_meta
 
