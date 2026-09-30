@@ -288,7 +288,8 @@ export default defineConfig({
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
                 { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
-                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' }
+                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' },
+                { text: 'Multimodal Training Optimizations', link: '/en/guide/multimodal-training' }
               ]
             },
             {
@@ -408,7 +409,8 @@ export default defineConfig({
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
                 { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
-                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' }
+                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' },
+                { text: '多模态训练优化', link: '/zh/guide/multimodal-training' }
               ]
             },
             {
