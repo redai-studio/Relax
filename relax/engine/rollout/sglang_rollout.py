@@ -371,8 +371,6 @@ async def generate(
         f"Sample status is {sample.status}"
     )
 
-    tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
-
     _t_image_processor: float | None = None
     # K2.x ships a multimodal AutoProcessor even for text-only fine-tunes; the
     # data loader always populates multimodal_inputs with empty-list placeholders
@@ -382,6 +380,14 @@ async def generate(
     _has_media = sample.multimodal_inputs is not None and any(
         sample.multimodal_inputs.get(k) for k in ("images", "videos", "audio")
     )
+    from relax.utils.data.kimi_k3 import encode_kimi_k3_rollout_prompt, is_kimi_k3_tokenizer
+
+    if is_kimi_k3_tokenizer(state.tokenizer):
+        tokenizer_prompt_ids = encode_kimi_k3_rollout_prompt(
+            state.tokenizer, sample.prompt, len((sample.multimodal_inputs or {}).get("images") or [])
+        )
+    else:
+        tokenizer_prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
     if state.processor and _has_media:
         processor_prompt_ids, sample.multimodal_train_inputs, _t_image_processor = await _run_image_processor(
             state, args, sample.prompt, sample.multimodal_inputs
@@ -1232,12 +1238,12 @@ async def generate_rollout_async(
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH
+    filter_metrics = metric_gatherer.collect()
     if CURRENT_ROLLOUT_BATCH:
         save_debug_rollout_data(
             args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
-        rollout_metrics = dict(timing_metrics)
-        rollout_metrics.update(metric_gatherer.collect())
+        rollout_metrics = {**timing_metrics, **filter_metrics}
         if args.partial_rollout and not args.fully_async:
             assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
                 f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
@@ -1251,7 +1257,7 @@ async def generate_rollout_async(
 
     state.reset()
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    return RolloutFnTrainOutput(samples=data, metrics=filter_metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}

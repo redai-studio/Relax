@@ -4,7 +4,8 @@ import dataclasses
 import re
 from argparse import Namespace
 from collections.abc import Collection, Sequence
-from types import SimpleNamespace
+from contextlib import contextmanager
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 import torch
@@ -37,6 +38,51 @@ _HC_ALPHA_ORDER = ("pre", "post", "res")
 # selected against the checkpoint key set instead of pinning the fast path to
 # whichever spelling a particular Bridge version happens to use.
 _HF_NAME_ALIAS_PAIRS = ((".indexer.scorer.weights_proj.", ".indexer.weights_proj."),)
+
+# Kimi K3 routed experts (latent MoE): Bridge maps them 1:1 onto the native
+# HF names ``...block_sparse_moe.experts.<id>.w[123].weight``. The hf_param
+# spelling varies with the bridge flavor (VL wrapping adds a ``language_model.``
+# megatron-side prefix but leaves the HF name unprefixed), so accept both.
+_MXFP4_ROUTED_EXPERT_HF_NAME = re.compile(
+    r"(?:language_model\.)?(?:model\.)?layers\.\d+\.(?:block_sparse_moe|mlp)\.experts\.\d+\.w[123]\.weight"
+)
+
+
+def _is_mxfp4_routed_expert(mapping) -> bool:
+    """Whether ``mapping`` converts a Kimi K3 routed-expert w1/w2/w3 weight."""
+    if not getattr(mapping, "is_expert", False) or getattr(mapping, "is_adapter", False):
+        return False
+    names = list(mapping.hf_param.values()) if isinstance(mapping.hf_param, dict) else [mapping.hf_param]
+    return bool(names) and all(isinstance(n, str) and _MXFP4_ROUTED_EXPERT_HF_NAME.fullmatch(n) for n in names)
+
+
+class _Mxfp4OnlineQuantizer:
+    """Quantizer callable for Bridge's ``megatron_to_hf_quant`` protocol.
+
+    Input: a 2-D BF16 expert weight (already TP/EP-gathered) and the block
+    size ``(1, 32)``. Output: ``(packed, scale)`` using the bridge's reference
+    MXFP4 arithmetic — the same kernel as the offline export
+    (``examples/models/kimi-k3/tools/convert_kimi_k3_torch_dist_to_hf_parallel.py``),
+    so online pushes stay byte-compatible with the original release.
+    """
+
+    def __call__(self, weight, block_size):
+        from megatron.bridge.models.conversion.quantization_utils import quantize_mxfp4_e2m1_like_scale
+
+        if block_size != (1, 32) or weight.ndim != 2 or weight.shape[1] % 32:
+            raise ValueError(f"Unsupported online MXFP4 geometry: {tuple(weight.shape)}, {block_size}")
+        template = torch.empty(
+            (weight.shape[0], weight.shape[1] // block_size[1]), dtype=torch.uint8, device=weight.device
+        )
+        packed, scale = quantize_mxfp4_e2m1_like_scale(weight, template, block_size=block_size[1])
+        # Same output contract as the offline export's LocalExpertQuantizer:
+        # fail loud here, because a numeric cast downstream (e.g. float8 scale
+        # -> uint8) would silently corrupt the exponent grid.
+        if packed.dtype != torch.int8 or tuple(packed.shape) != (weight.shape[0], weight.shape[1] // 2):
+            raise ValueError(f"Invalid packed MXFP4 output from quantizer: {packed.dtype} {tuple(packed.shape)}")
+        if scale.dtype != torch.uint8 or tuple(scale.shape) != tuple(template.shape):
+            raise ValueError(f"Invalid E8M0 scale output from quantizer: {scale.dtype} {tuple(scale.shape)}")
+        return packed, scale
 
 
 def _resolve_hf_name_against_checkpoint(hf_name: str, checkpoint_keys: Collection[str]) -> str:
@@ -126,6 +172,12 @@ class BridgeConverter:
         # DeepSeek-V4 mHC alpha buffering, see _convert_hc_alpha.
         self._hc_alpha_buf: dict[str, dict[str, torch.Tensor]] = {}
         self._hc_alpha_hf_name: dict[str, str] = {}
+        # Kimi K3 mxfp4-pack-quantized releases: routed experts are quantized
+        # inside Bridge's quantized mappings, everything else passes through.
+        self._mxfp4_pack_format = bool(
+            quantization_config and quantization_config.get("format") == "mxfp4-pack-quantized"
+        )
+        self._mxfp4_quantizer = _Mxfp4OnlineQuantizer() if self._mxfp4_pack_format else None
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -288,7 +340,6 @@ class BridgeConverter:
                     self._bridge_task_map[name] = dataclasses.replace(
                         task, megatron_module=SimpleNamespace(config=config)
                     )
-
         self._configs_broadcast_done = True
 
     # ------------------------------------------------------------------
@@ -314,6 +365,43 @@ class BridgeConverter:
                     if isinstance(attr_val, MegatronParamMapping):
                         stack.append(attr_val)
         return result
+
+    @contextmanager
+    def _disable_mapping_collectives(self, mapping):
+        """Null every process group on ``mapping`` (and inner sub-mappings) and
+        replace ``gather_from_ep_ranks`` with a local passthrough.
+
+        ``convert`` runs only on the src rank of each PP/EP group (expert
+        weights) or after the caller has already gathered (TP), so any
+        collective a mapping tries internally would silently run on the WORLD
+        group once its group handle is None — deadlocking or gathering garbage.
+        Group nulling alone is therefore not enough; the EP gather must be
+        patched out as well. Patch only the participating instances so other
+        mappings of the same class retain their collective implementations.
+        """
+        all_mappings = self.collect_all_mappings(mapping)
+        saved_groups: list[tuple] = [(m.pp_group, m._tp_group, m._etp_group, m.ep_group) for m in all_mappings]
+        missing = object()
+        saved_gathers = [vars(m).get("gather_from_ep_ranks", missing) for m in all_mappings]
+        try:
+            for m in all_mappings:
+                m.pp_group = None
+                m._tp_group = None
+                m._etp_group = None
+                m.ep_group = None
+                m.gather_from_ep_ranks = MethodType(_noop_gather_from_ep_ranks, m)
+            yield
+        finally:
+            for m, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
+                m.pp_group = pp
+                m._tp_group = tp
+                m._etp_group = etp
+                m.ep_group = ep
+            for m, original in zip(all_mappings, saved_gathers):
+                if original is missing:
+                    vars(m).pop("gather_from_ep_ranks", None)
+                else:
+                    m.gather_from_ep_ranks = original
 
     def _lookup_task(self, global_name: str) -> tuple[str, Any]:
         """Find the bridge's own ``WeightConversionTask`` for ``global_name``.
@@ -392,6 +480,56 @@ class BridgeConverter:
         scale = torch.cat([buf[k] for k in _HC_ALPHA_ORDER])
         return quantize_params(self._args, name, [(hf_name, scale)], self._quantization_config)
 
+    def _convert_mxfp4_expert(
+        self, global_name: str, name: str, param: torch.Tensor, task: Any, mapping: Any
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Routed experts of an mxfp4-pack-quantized release (Kimi K3).
+
+        Bridge's quantized mapping converts the gathered BF16 expert weight
+        into the native packed pair — ``w*.weight_packed`` plus E8M0
+        ``w*.weight_scale`` — via the reference
+        ``quantize_mxfp4_e2m1_like_scale`` kernel, so the rollout engine
+        receives tensors byte-compatible with the original release. All other
+        namespaces of such a release are ignored per config and flow through
+        the plain path below.
+        """
+        with self._disable_mapping_collectives(mapping):
+            try:
+                converted_dict = mapping.megatron_to_hf_quant(
+                    param, task.megatron_module, lambda _hf_name: True, self._mxfp4_quantizer, (1, 32)
+                )
+            except Exception:
+                logger.error(
+                    "megatron_to_hf_quant failed: name=%s mapping=%s param.shape=%s module=%s",
+                    global_name,
+                    type(mapping).__name__,
+                    tuple(param.shape),
+                    type(task.megatron_module).__name__ if task.megatron_module else "None",
+                )
+                raise
+
+        weights = {hf_name for hf_name in converted_dict if not hf_name.endswith("_scale_inv")}
+        scales = {hf_name[: -len("_scale_inv")] for hf_name in converted_dict if hf_name.endswith("_scale_inv")}
+        if weights != scales:
+            raise ValueError(
+                f"Quantized mapping returned unpaired weights/scales for {global_name}: {sorted(weights ^ scales)}"
+            )
+
+        named_tensors = []
+        for hf_name, tensor in converted_dict.items():
+            if hf_name.endswith("_scale_inv"):
+                if tensor.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Expected uint8 E8M0 scale for {hf_name}, got {tensor.dtype}; "
+                        "refusing a numeric cast that would corrupt the exponent grid"
+                    )
+                named_tensors.append((hf_name[: -len("_scale_inv")] + "_scale", tensor))
+            else:
+                # Bridge returns the packed code stream as int8; the release
+                # schema (and SGLang's loader) store it as uint8.
+                named_tensors.append((hf_name + "_packed", tensor.view(torch.uint8)))
+        return named_tensors
+
     def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.
 
@@ -445,27 +583,11 @@ class BridgeConverter:
             return self._convert_hc_alpha(name, global_name, param, task, hc_alpha)
 
         mapping = task.mapping
-        all_mappings = self.collect_all_mappings(mapping)
 
-        saved_groups: list[tuple] = []
-        for m in all_mappings:
-            saved_groups.append((m.pp_group, m._tp_group, m._etp_group, m.ep_group))
+        if self._mxfp4_pack_format and _is_mxfp4_routed_expert(mapping):
+            return self._convert_mxfp4_expert(global_name, name, param, task, mapping)
 
-        patched_classes: set[type] = set()
-
-        try:
-            for m in all_mappings:
-                m.pp_group = None
-                m._tp_group = None
-                m._etp_group = None
-                m.ep_group = None
-
-            for m in all_mappings:
-                cls = type(m)
-                if cls not in patched_classes:
-                    cls.gather_from_ep_ranks = _noop_gather_from_ep_ranks
-                    patched_classes.add(cls)
-
+        with self._disable_mapping_collectives(mapping):
             param = remove_padding(name, param, self._args.vocab_size)
             try:
                 converted_dict = mapping.megatron_to_hf(param, task.megatron_module)
@@ -478,15 +600,6 @@ class BridgeConverter:
                     type(task.megatron_module).__name__ if task.megatron_module else "None",
                 )
                 raise
-        finally:
-            for m, (pp, tp, etp, ep) in zip(all_mappings, saved_groups):
-                m.pp_group = pp
-                m._tp_group = tp
-                m._etp_group = etp
-                m.ep_group = ep
-            for cls in patched_classes:
-                if "gather_from_ep_ranks" in cls.__dict__:
-                    del cls.gather_from_ep_ranks
 
         converted_named_tensors = []
         for hf_name, tensor in converted_dict.items():
