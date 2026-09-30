@@ -8,6 +8,12 @@ inputs:
   build-args:
     description: Optional Docker build arguments, one KEY=VALUE per line; included in the cache key
     default: ''
+  dockerfile:
+    description: Dockerfile used to build the relax target
+    default: docker/Dockerfile
+  platform:
+    description: Target image platform
+    default: linux/amd64
   lock-dir:
     description: Shared directory for per-cache-key locks on the same Docker daemon
     default: /tmp/relax-ci-image-build
@@ -27,6 +33,8 @@ runs:
         IMAGE_LOCK_DIR: ${{ inputs.lock-dir }}
         IMAGE_KEY: ${{ inputs.hash-key }}
         BUILD_ARGS: ${{ inputs.build-args }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
+        PLATFORM: ${{ inputs.platform }}
       run: |
         set -euo pipefail
         [[ "$IMAGE_KEY" =~ ^[0-9a-f]{64}$ ]]
@@ -39,7 +47,7 @@ runs:
           fi
           build_args+=(--build-arg "$argument")
         done <<< "$BUILD_ARGS"
-        cache_key="$(printf '%s\0' "$IMAGE_KEY" "${build_args[@]}" | sha256sum)"
+        cache_key="$(printf '%s\0' "$IMAGE_KEY" "$DOCKERFILE" "$PLATFORM" "${build_args[@]}" | sha256sum)"
         cache_key="${cache_key%% *}"
         tag="relaxrl:ci-$cache_key"
         image_id="$(docker image ls --quiet --no-trunc --filter "reference=$tag")"
@@ -59,9 +67,9 @@ runs:
             export HTTPS_PROXY="${HTTPS_PROXY:-${https_proxy:-}}"
             export NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
             DOCKER_BUILDKIT=1 docker build \
-              --builder default --load --platform linux/amd64 \
+              --builder default --load --platform "$PLATFORM" \
               --progress plain --target relax \
-              --file docker/Dockerfile --tag "$tag" \
+              --file "$DOCKERFILE" --tag "$tag" \
               "${build_args[@]}" \
               .
             image_id="$(docker image inspect --format '{{.Id}}' "$tag")"
