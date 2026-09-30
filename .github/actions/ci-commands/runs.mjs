@@ -13,7 +13,7 @@ function resolveTarget(args, config, command) {
   const target = Object.hasOwn(config.targets, name) && config.targets[name];
   if (!target) throw new Error(`Unknown target. Use /help for /${command} syntax.`);
   if (command === 'cancel' && target.job) {
-    throw new Error('/cancel accepts workflow targets only: ci, gpu-unit, integration, all.');
+    throw new Error('/cancel accepts workflow targets only. Use /help to list targets.');
   }
   return { name, ...target };
 }
@@ -53,42 +53,58 @@ async function currentRuns(github, repo, pr, config, target) {
   return runs;
 }
 
-async function changeRun({ github, repo, pr, run, command, target }) {
-  const label = `[${run.name} #${run.run_number}](${run.html_url})`;
-  const { data: latest } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: run.id });
-  if (latest.head_sha !== pr.head.sha) throw new Error('Run head no longer matches the PR.');
+function skipReason(run, command, target) {
+  if (command === 'cancel') return run.status === 'completed' ? 'already completed.' : null;
+  if (run.status !== 'completed') return `still ${run.status}; wait before rerunning.`;
+  if (target.name === 'failed' && !['failure', 'timed_out'].includes(run.conclusion)) {
+    return 'no failed run to rerun.';
+  }
+  return null;
+}
+
+async function findJob(github, repo, run, name) {
+  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+    ...repo,
+    run_id: run.id,
+    filter: 'latest',
+    per_page: 100,
+  });
+  const job = jobs.find((item) => item.name === name);
+  if (!job) throw new Error(`Check \`${name}\` was not found in the latest attempt.`);
+  return job;
+}
+
+function operation(command, target, run, job) {
   if (command === 'cancel') {
-    if (latest.status === 'completed') return `${label}: already completed.`;
-    await assertHead(github, repo, pr.number, pr.head.sha);
-    await github.rest.actions.cancelWorkflowRun({ ...repo, run_id: run.id });
-    return `${label}: cancellation requested for the entire workflow.`;
+    return {
+      method: 'cancelWorkflowRun',
+      params: { run_id: run.id },
+      message: 'cancellation requested for the entire workflow.',
+    };
   }
-  if (latest.status !== 'completed')
-    return `${label}: still ${latest.status}; wait before rerunning.`;
-  if (target.name === 'failed' && !['failure', 'timed_out'].includes(latest.conclusion)) {
-    return `${label}: no failed run to rerun.`;
-  }
-  let job;
-  if (target.job) {
-    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-      ...repo,
-      run_id: run.id,
-      filter: 'latest',
-      per_page: 100,
-    });
-    job = jobs.find((item) => item.name === target.job);
-    if (!job) return `${label}: check \`${target.job}\` was not found in the latest attempt.`;
-    if (job.status !== 'completed') return `${label}: check is still ${job.status}.`;
-  }
-  await assertHead(github, repo, pr.number, pr.head.sha);
   if (job) {
-    await github.rest.actions.reRunJobForWorkflowRun({ ...repo, job_id: job.id });
-  } else if (target.name === 'failed') {
-    await github.rest.actions.reRunWorkflowFailedJobs({ ...repo, run_id: run.id });
-  } else {
-    await github.rest.actions.reRunWorkflow({ ...repo, run_id: run.id });
+    return {
+      method: 'reRunJobForWorkflowRun',
+      params: { job_id: job.id },
+      message: `rerun requested for \`${job.name}\` and dependent jobs.`,
+    };
   }
-  return `${label}: rerun requested${job ? ` for \`${job.name}\` and dependent jobs` : ''}.`;
+  return {
+    method: target.name === 'failed' ? 'reRunWorkflowFailedJobs' : 'reRunWorkflow',
+    params: { run_id: run.id },
+    message: 'rerun requested.',
+  };
+}
+
+async function changeRun({ github, repo, pr, run, command, target }) {
+  const { data: latest } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: run.id });
+  const skipped = skipReason(latest, command, target);
+  if (skipped) return skipped;
+  const job = target.job ? await findJob(github, repo, latest, target.job) : null;
+  const request = operation(command, target, latest, job);
+  await assertHead(github, repo, pr.number, pr.head.sha);
+  await github.rest.actions[request.method]({ ...repo, ...request.params });
+  return request.message;
 }
 
 export async function runCommand({ github, repo, pr, config, command, args }) {
@@ -98,13 +114,13 @@ export async function runCommand({ github, repo, pr, config, command, args }) {
     return 'No matching PR workflow run exists for the current head. Rerun cannot start missing workflows.';
   const messages = [];
   for (const run of runs) {
+    const label = `[${run.name} #${run.run_number}](${run.html_url})`;
     try {
-      messages.push(await changeRun({ github, repo, pr, run, command, target }));
+      const message = await changeRun({ github, repo, pr, run, command, target });
+      messages.push(`${label}: ${message}`);
     } catch (error) {
       // A failed response can follow a successful POST. Never automatically repeat a write.
-      messages.push(
-        `[${run.name}](${run.html_url}): ${error.message}. Inspect the run before retrying.`,
-      );
+      messages.push(`${label}: ${error.message}. Inspect the run before retrying.`);
     }
   }
   return `Head: \`${pr.head.sha}\`\n\n${messages.map((message) => `- ${message}`).join('\n')}`;
