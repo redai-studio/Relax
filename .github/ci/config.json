@@ -1,12 +1,5 @@
 {
-  "botLogin": "rai-studio-bot",
-  "commands": {
-    "help": {
-      "usage": "/help",
-      "description": "Show CI commands and targets.",
-      "permission": "any"
-    }
-  },
+  "ciTeam": ["SigureMo", "NINGBENZHE", "Yangruipis"],
   "targets": {
     "ci": {
       "workflow": "ci.yml"

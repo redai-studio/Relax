@@ -41,15 +41,16 @@ repos:
     hooks:
       - id: clang-format
         exclude_types: [javascript]
-        exclude: ^\.github/actions/ci-control/
+        exclude: ^\.github/ci/
   - repo: local
     hooks:
       - id: oxfmt
         name: oxfmt
         entry: oxfmt
+        args: ["--config", ".github/ci/.oxfmtrc.json"]
         language: python
         types_or: [javascript, json]
-        files: ^\.github/actions/ci-control/
+        files: ^\.github/(ci/|actions/(ci-commands|pr-welcome)/)
         additional_dependencies: ["oxfmt==0.69.0"]
       - id: docformatter
         name: docformatter
