@@ -45,10 +45,15 @@ async function currentRuns(github, repo, pr, config, target) {
       head_sha: pr.head.sha,
       per_page: 100,
     });
-    const latest = candidates
+    const matching = candidates
       .filter((run) => belongsToPR(run, pr, workflow))
-      .sort((a, b) => b.run_number - a.run_number)[0];
-    if (latest) runs.push(latest);
+      .sort((a, b) => b.run_number - a.run_number);
+    // Concurrency can cancel a higher-numbered duplicate before another run starts.
+    const selected =
+      matching.find((run) => run.status !== 'completed') ||
+      matching.find((run) => run.conclusion !== 'cancelled') ||
+      matching[0];
+    if (selected) runs.push(selected);
   }
   return runs;
 }
