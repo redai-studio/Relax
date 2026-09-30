@@ -40,7 +40,7 @@ jobs:
             if (!config.ciTeam.length) throw new Error('Configure at least one CI team member.');
             core.setOutput('ci-team', JSON.stringify(config.ciTeam));
       - id: check-bypass
-        uses: ShigureLab/ci-bypass@90514c0e2142af309ec7b44a9255318a2d6a2ecb # v2.0.1
+        uses: ShigureLab/ci-bypass@v2
         with:
           github-token: ${{ github.token }}
           non-pull-request-event-strategy: never-skipped
