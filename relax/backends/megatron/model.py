@@ -969,10 +969,10 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
     advance the LR scheduler, despite there being no training signal. This
     computes the globally reduced token count on the last pipeline stage and
     broadcasts the decision to every rank so they agree on skipping the
-    optimizer and scheduler updates.
+    optimizer and scheduler updates. The decision stays on device until the
+    single host read that the Python-side skip branch requires.
     """
     signal = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
-    pp_size = mpu.get_pipeline_model_parallel_world_size()
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Sum the per-microbatch CP-local token counts, then reduce over DP+CP so
         # every last-stage TP rank observes the same global count (mirrors the
@@ -982,21 +982,14 @@ def _is_global_zero_token_step(losses_reduced: list[dict[str, object]]) -> bool:
             num_tokens_local,
             group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
-        signal[0] = 1 if num_tokens_local.item() == 0 else 0
-        if pp_size > 1:
-            # Non-last stages did not join the all-reduce; propagate the
-            # decision across the pipeline group so every rank agrees.
-            torch.distributed.broadcast(
-                signal,
-                src=pp_size - 1,
-                group=mpu.get_pipeline_model_parallel_group(),
-            )
-    elif pp_size > 1:
-        # Non-last stages must enter the broadcast so the collective completes;
-        # they keep the sentinel value overwritten by the last-stage decision.
+        signal.copy_((num_tokens_local == 0).reshape(1))
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        # Non-last stages did not join the all-reduce; every pipeline stage
+        # enters this broadcast so the last-stage decision reaches all ranks.
+        # ``src`` is a global rank, not the pipeline-local stage index.
         torch.distributed.broadcast(
             signal,
-            src=pp_size - 1,
+            src=mpu.get_pipeline_model_parallel_last_rank(),
             group=mpu.get_pipeline_model_parallel_group(),
         )
     return bool(signal.item())
@@ -1273,7 +1266,9 @@ def train_one_step(
             "Training step %d has zero effective loss tokens globally; skipping optimizer and LR scheduler updates.",
             step_id,
         )
-        update_successful = True
+        # No parameter update happened, so critic movement checks must not count
+        # this step as a successful update.
+        update_successful = False
         grad_norm = 0.0
         num_zeros_in_grad = None
     else:

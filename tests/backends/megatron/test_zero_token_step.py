@@ -2,6 +2,7 @@
 
 """Zero-token no-signal step handling for the shared Megatron trainer."""
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,54 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
+
+
+def _zero_token_process_group_worker(rank: int, world_size: int, init_method: str, tp: int, pp: int) -> None:
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from relax.backends.megatron.model import _is_global_zero_token_step
+
+        parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+        # Gloo collectives need CPU tensors for the decision signal.
+        torch.cuda.current_device = lambda: "cpu"
+        is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        is_first_dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+
+        def losses(num_tokens: int) -> list[dict[str, object]]:
+            return [{"num_tokens": torch.tensor(num_tokens, dtype=torch.int)}] if is_last_stage else []
+
+        assert _is_global_zero_token_step(losses(0)) is True
+        # Only one DP replica sees tokens: every rank of every pipeline must still train.
+        assert _is_global_zero_token_step(losses(3 if is_first_dp_rank else 0)) is False
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(("tp", "pp"), [(2, 2), (1, 2)], ids=["tp2-pp2", "dp2-pp2"])
+def test_is_global_zero_token_step_real_process_groups_agree(tmp_path, tp, pp):
+    """Real Gloo groups: with PP combined with TP/DP, pipeline-local stage
+    indices differ from global ranks, so the broadcast source must be the
+    pipeline group's global last rank."""
+    import torch.multiprocessing as mp
+
+    world_size = 4
+    init_method = f"file://{tmp_path / 'gloo-init'}"
+    mp.spawn(
+        _zero_token_process_group_worker,
+        args=(world_size, init_method, tp, pp),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @pytest.fixture()
@@ -42,6 +91,7 @@ def _patch_mpu(
     is_last_stage: bool,
     all_reduce_impl,
     broadcast_impl,
+    pipeline_last_rank: int = 0,
 ):
     mpu = model_module.mpu
     dist = model_module.torch.distributed
@@ -49,6 +99,7 @@ def _patch_mpu(
     monkeypatch.setattr(mpu, "get_data_parallel_group", lambda with_context_parallel=False: object())
     monkeypatch.setattr(mpu, "get_pipeline_model_parallel_world_size", lambda: pp_size)
     monkeypatch.setattr(mpu, "get_pipeline_model_parallel_group", lambda: object())
+    monkeypatch.setattr(mpu, "get_pipeline_model_parallel_last_rank", lambda: pipeline_last_rank)
     monkeypatch.setattr(dist, "all_reduce", all_reduce_impl)
     monkeypatch.setattr(dist, "broadcast", broadcast_impl)
 
@@ -110,7 +161,8 @@ def test_is_global_zero_token_step_last_stage_pp2_broadcasts(model_module, monke
 
     def broadcast(tensor, src=0, group=None):
         calls["broadcast"] += 1
-        assert src == 1  # pp_size - 1
+        # TP=2, PP=2 pipeline [1, 3]: the global last rank, not stage index 1.
+        assert src == 3
 
     _patch_mpu(
         monkeypatch,
@@ -119,6 +171,7 @@ def test_is_global_zero_token_step_last_stage_pp2_broadcasts(model_module, monke
         is_last_stage=True,
         all_reduce_impl=all_reduce,
         broadcast_impl=broadcast,
+        pipeline_last_rank=3,
     )
     assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is True
     assert calls == {"all_reduce": 1, "broadcast": 1}
@@ -134,7 +187,7 @@ def test_is_global_zero_token_step_non_last_stage_pp2_enters_broadcast(model_mod
 
     def broadcast(tensor, src=0, group=None):
         calls["broadcast"] += 1
-        assert src == 1
+        assert src == 3
 
     _patch_mpu(
         monkeypatch,
@@ -143,9 +196,41 @@ def test_is_global_zero_token_step_non_last_stage_pp2_enters_broadcast(model_mod
         is_last_stage=False,
         all_reduce_impl=all_reduce,
         broadcast_impl=broadcast,
+        pipeline_last_rank=3,
     )
     assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is False
     assert calls == {"all_reduce": 0, "broadcast": 1}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to observe host synchronizations")
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_is_global_zero_token_step_single_host_sync(monkeypatch, pp_size):
+    """The zero-token decision runs every step, so it may only materialize the
+    final decision on the host once."""
+    import warnings
+
+    from relax.backends.megatron import model as model_module
+
+    _patch_mpu(
+        monkeypatch,
+        model_module,
+        pp_size=pp_size,
+        is_last_stage=True,
+        all_reduce_impl=lambda tensor, group=None: None,
+        broadcast_impl=lambda tensor, src=0, group=None: None,
+    )
+    losses = [{"num_tokens": torch.tensor(n, dtype=torch.int, device="cuda")} for n in (0, 0)]
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert model_module._is_global_zero_token_step(losses) is True
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    sync_warnings = [w for w in caught if "synchronizing CUDA operation" in str(w.message)]
+    assert len(sync_warnings) == 1
 
 
 def _make_args() -> SimpleNamespace:
@@ -217,7 +302,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
 ):
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
-    calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0}
+    calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
     numerator = 0.0 if zero_tokens else 12.0
     losses = [
@@ -235,7 +320,11 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     scheduler = SimpleNamespace(step=lambda increment: calls["scheduler"].append(increment))
     monkeypatch.setattr(model_module, "get_args", lambda: args)
     monkeypatch.setattr(model_module, "get_forward_backward_func", lambda: lambda **_kwargs: losses)
-    monkeypatch.setattr(model_module, "maybe_verify_critic_value_head_movement", lambda *a, **k: None)
+    monkeypatch.setattr(
+        model_module,
+        "maybe_verify_critic_value_head_movement",
+        lambda model, optimizer, update_successful: calls["critic_update_successful"].append(update_successful),
+    )
     monkeypatch.setattr(model_module.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None)
     _patch_mpu(
         monkeypatch,
@@ -271,5 +360,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert calls["optimizer"] == (0 if zero_tokens else 1)
     assert calls["scheduler"] == ([] if zero_tokens else [2])
     assert calls["capture_begin"] == calls["capture_end"] == 1
+    # A skipped zero-token step is not a successful update for critic movement checks.
+    assert calls["critic_update_successful"] == [not zero_tokens]
     assert metrics == {"loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0)}
     assert grad_norm == (0.0 if zero_tokens else 1.0)
