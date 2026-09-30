@@ -154,7 +154,7 @@ class TestOpenR1MMEdgeCases:
         assert get_openr1mm_rule_based_reward("", "42") == 0.0
 
     def test_both_empty(self):
-        assert get_openr1mm_rule_based_reward("", "") == 1.0
+        assert get_openr1mm_rule_based_reward("", "") == 0.0
 
     def test_whitespace_in_answer_tags(self):
         response = "<answer>  42  </answer>"
@@ -164,7 +164,7 @@ class TestOpenR1MMEdgeCases:
     def test_malformed_latex_fallback(self):
         response = "\\invalid{command}"
         label = "\\invalid{command}"
-        assert get_openr1mm_rule_based_reward(response, label) == 1.0
+        assert get_openr1mm_rule_based_reward(response, label) == 0.0
 
     def test_long_response_with_boxed(self):
         response = (

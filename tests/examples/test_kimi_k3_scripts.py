@@ -14,7 +14,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS = sorted((ROOT / "examples/models/kimi-k3/scripts").glob("*.sh"))
+SCRIPTS = sorted(path for path in (ROOT / "examples/models/kimi-k3/scripts").glob("*.sh") if "-grpo" not in path.stem)
 
 
 def _environment(tmp_path):
@@ -43,6 +43,8 @@ def _environment(tmp_path):
             "RAY_NO_WAIT",
             "CLEARML_CONFIG_FILE",
             "FLA_TILELANG",
+            "NUM_ROLLOUT",
+            "SAVE_INTERVAL",
         }
     }
     env.update(

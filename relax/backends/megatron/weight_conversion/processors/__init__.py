@@ -15,6 +15,12 @@ __all__ = ["remove_padding", "quantize_params", "quantize_params_fp8", "quantize
 def quantize_params(args, megatron_name, converted_named_params, quantization_config):
     if quantization_config is None:
         return converted_named_params
+    # Kimi K3-style mxfp4-pack-quantized releases: routed experts are already
+    # packed by Bridge's quantized mappings inside BridgeConverter, and every
+    # other namespace is ignored per config. The INT4 packer below must not
+    # touch the emitted _packed/_scale pairs (or the BF16 router gate).
+    if quantization_config.get("format") == "mxfp4-pack-quantized":
+        return converted_named_params
     quant_method = quantization_config["quant_method"]
     if quant_method == "fp8":
         if quantize_params_fp8 is None:
