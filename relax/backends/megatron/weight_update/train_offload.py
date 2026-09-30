@@ -33,6 +33,7 @@ from typing import ContextManager, Iterator, List, Optional, Protocol
 import torch
 
 from relax.utils import device as device_utils
+from relax.utils.device import device_module
 from relax.utils.logging_utils import get_logger
 
 
@@ -271,7 +272,7 @@ class _SelectiveOffloadStrategy:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to("cpu", non_blocking=False)
 
         gc.collect()
-        device_utils.empty_cache()
+        device_module.empty_cache()
 
     @torch.no_grad()
     def reload(self) -> None:
@@ -305,7 +306,7 @@ class _SelectiveOffloadStrategy:
         if _NON_BLOCKING:
             # The H2D copies above are async; make them observable to non-stream code
             # (and to the optimizer-state moves below) before returning.
-            device_utils.synchronize()
+            device_module.synchronize()
 
         if not self._skip_optimizer:
             # 2. Optimizer fp32 master params.
@@ -329,7 +330,7 @@ class _SelectiveOffloadStrategy:
                         state["exp_avg_sq"] = state["exp_avg_sq"].to(device, non_blocking=False)
 
         gc.collect()
-        device_utils.empty_cache()
+        device_module.empty_cache()
 
     def disable_during_update(self) -> ContextManager:
         # Selective offload doesn't hook the allocator, so nothing to disable.
