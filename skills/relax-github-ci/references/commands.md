@@ -9,7 +9,9 @@ gh run view <RUN_ID> --repo redai-studio/Relax --json headSha,event,status,concl
 gh run view <RUN_ID> --repo redai-studio/Relax --log-failed
 ```
 
-Choose the latest run number for the selected workflow on the current head, rather than the most recently updated run. Confirm the PR association; for fork runs with an empty `pull_requests` array, match both head branch and head repository. Deployment workflows are outside the configured CI targets.
+For the selected workflow on the current head, prefer an active run, then a non-cancelled run; use a cancelled run only when none survive. Within each group, choose the highest run number. Concurrency can cancel a higher-numbered duplicate while a lower-numbered run continues, so the largest run number alone does not identify the surviving run.
+
+Confirm the PR association; for fork runs with an empty `pull_requests` array, match both head branch and head repository. Deployment workflows are outside the configured CI targets.
 
 | Operation | GitHub CLI |
 | --- | --- |
