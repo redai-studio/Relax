@@ -1,0 +1,39 @@
+name: CI Control
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-command-${{ github.event.comment.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  command:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Comment events must never execute scripts from the contributor's branch.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        env:
+          WELCOME_BOT_TOKEN: ${{ secrets.WELCOME_BOT_TOKEN }}
+          WELCOME_BOT_LOGIN: ${{ vars.WELCOME_BOT_LOGIN }}
+        with:
+          script: |
+            if (!process.env.WELCOME_BOT_TOKEN) {
+              core.setFailed('Configure WELCOME_BOT_TOKEN before enabling CI comments.');
+              return;
+            }
+            const bot = new github.constructor({ auth: process.env.WELCOME_BOT_TOKEN });
+            await require('./.github/ci/control.js').control({
+              github, bot, context, core, botLogin: process.env.WELCOME_BOT_LOGIN || undefined,
+            });
