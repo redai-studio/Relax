@@ -36,6 +36,6 @@ Comment commands and welcome publishing load trusted default-branch code. Config
 
 ## Validation
 
-Use Node.js 24 for ESM checks and run `pre-commit run --all-files`. Validate changed workflows and render the welcome template after editing it. The oxfmt hook currently uses the pinned PyPI package configured in `.pre-commit-config.yaml`.
+Use Node.js 24 for ESM checks and run `pre-commit run --all-files`. Validate changed workflows and render the welcome template after editing it. The oxfmt hook uses `ShigureLab/oxfmt-pre-commit-mirror`; its version and file scope are configured in `.pre-commit-config.yaml`.
 
 After deploying to the default branch, verify welcome publishing, command permissions, rerun/cancel, bypass and label cleanup on a disposable draft PR. Local checks do not establish live token permissions or GPU/NPU execution.
