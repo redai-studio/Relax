@@ -282,7 +282,7 @@ def get_cp_local_num_tokens(
         dynamic_cp_size,
         dynamic_cp_rank,
     )
-    return local_mask_sums.sum()
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(
