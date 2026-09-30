@@ -2010,12 +2010,11 @@ index 2916f8c6..32b81c49 100644
          return DecLockRefResult(delta=delta)
  
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 8e957f66..1bd46d38 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -376,9 +376,10 @@ class ModelRunner:
+@@ -376,9 +376,10 @@
          self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
- 
+
          # CPU offload
 -        set_offloader(
 -            create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
@@ -2024,13 +2023,13 @@ index 8e957f66..1bd46d38 100644
 +            set_offloader(
 +                create_offloader_from_server_args(server_args, dp_rank=self.ps.dp_rank)
 +            )
- 
+
          self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
- 
-@@ -1183,10 +1184,130 @@ class ModelRunner:
+
+@@ -1183,9 +1184,134 @@
              lora_ref, tensors, config_dict, added_tokens_config
          )
- 
+
 +    def update_lora_from_distributed(
 +        self,
 +        lora_ref: LoRARef,
@@ -2121,7 +2120,7 @@ index 8e957f66..1bd46d38 100644
      def unload_lora_adapter(self, lora_ref: LoRARef):
          """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
          return self.lora_manager.unload_lora_adapter(lora_ref)
- 
++
 +    def post_process_weights(
 +        self,
 +        restore_weights_before_load: bool = False,
@@ -2136,6 +2135,8 @@ index 8e957f66..1bd46d38 100644
 +            target_device = torch.device(self.device)
 +
 +        if restore_weights_before_load:
++            if hasattr(self.model, "begin_weight_update"):
++                self.model.begin_weight_update()
 +            for _, module in self.model.named_modules():
 +                quant_method = getattr(module, "quant_method", None)
 +                if quant_method is not None and hasattr(
@@ -2153,14 +2154,16 @@ index 8e957f66..1bd46d38 100644
 +                    with device_loading_context(module, target_device):
 +                        quant_method.process_weights_after_loading(module)
 +
-+        return True, "Success"
++        if post_process_quantization and hasattr(self.model, "end_weight_update"):
++            self.model.end_weight_update()
 +
++        return True, "Success"
+
      @property
      def effective_max_total_num_tokens(self):
-         """Return the max token pool size considering hybrid swa settings."""
-@@ -1441,6 +1562,12 @@ class ModelRunner:
+@@ -1441,6 +1567,12 @@
          output.expert_distribution_metrics = recorder_outputs.get("metrics")
- 
+
          no_copy_to_cpu = not get_schedule().disable_overlap_schedule
 +        cuda_graph_num_tokens = None
 +        decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
@@ -2171,7 +2174,7 @@ index 8e957f66..1bd46d38 100644
          if (
              not self.is_draft_worker
              and (experts_capturer := get_global_experts_capturer()) is not None
-@@ -1448,7 +1575,7 @@ class ModelRunner:
+@@ -1448,7 +1580,7 @@
              output.routed_experts_output = experts_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -2179,8 +2182,8 @@ index 8e957f66..1bd46d38 100644
 +                cuda_graph_batch=cuda_graph_num_tokens,
                  no_copy_to_cpu=no_copy_to_cpu,
              )
- 
-@@ -1456,7 +1583,7 @@ class ModelRunner:
+
+@@ -1456,7 +1588,7 @@
              output.indexer_topk_output = indexer_capturer.on_forward_end(
                  forward_batch=forward_batch,
                  can_run_graph=output.can_run_graph,
@@ -2891,3 +2894,293 @@ index 15b84ed239..670ecd3ea6 100644
      return getattr(config, "num_indexer_layers", 0)
  
  
+
+diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
+--- a/python/sglang/srt/layers/quantization/mxfp4.py
++++ b/python/sglang/srt/layers/quantization/mxfp4.py
+@@ -554,7 +554,133 @@
+             layer.register_parameter("w2_weight_bias", w2_weight_bias)
+             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+ 
++    @torch.no_grad()
++    def restore_weights_before_loading(self, layer):
++        """Restore serialized buffers without changing captured runtime storage."""
++        pristine = getattr(layer, "_mxfp4_pristine_params", None)
++        if pristine is None or layer._mxfp4_loading:
++            return
++        # Both caches can hold GPU indices allocated in the weights region.
++        # Colocated sleep discards that region without CPU backup; reusing
++        # those indices would silently corrupt the next FlashInfer repack.
++        if self.use_flashinfer:
++            _flashinfer_mxfp4_permute_indices_cache.clear()
++            _flashinfer_mxfp4_permute_indices_device_cache.clear()
++        for name, param in pristine.items():
++            # Sleep may discard serialized storage. Full weight pushes do not
++            # overwrite padding or the synthetic zero biases used by K3.
++            if name in layer._mxfp4_bias_values:
++                param.copy_(layer._mxfp4_bias_values[name])
++            else:
++                param.fill_(_UE8M0_ONE if "scale" in name else 0)
++            layer.register_parameter(name, param)
++        layer._mxfp4_loading = True
++
++    @staticmethod
++    def _copy_mxfp4_runtime_tensor(target, source):
++        if (
++            target.shape != source.shape
++            or target.dtype != source.dtype
++            or target.device != source.device
++            or target.stride() != source.stride()
++        ):
++            raise RuntimeError("MXFP4 runtime layout changed during weight update")
++        target.copy_(source)
++
++    def _reuse_mxfp4_loading_storage(self, layer):
++        # Generation is paused throughout restore/load/repack. Reuse the
++        # captured allocations as upload buffers instead of retaining a second
++        # full expert copy (especially costly for DeepGEMM/MegaMoE).
++        for name, param in layer._mxfp4_pristine_params.items():
++            target = layer._mxfp4_runtime_params.get(name)
++            if target is None and self.use_triton_kernels and name in (
++                "w13_weight", "w2_weight"
++            ):
++                target = getattr(self, f"{name}_triton_tensor").storage.data
++            if target is None or not param.is_contiguous():
++                continue
++            if target.numel() * target.element_size() < param.numel() * param.element_size():
++                continue
++            offset_bytes = target.storage_offset() * target.element_size()
++            if offset_bytes % param.element_size():
++                continue
++            storage = target.untyped_storage()
++            if storage.nbytes() < offset_bytes + param.numel() * param.element_size():
++                continue
++            param.data = torch.empty(0, dtype=param.dtype, device=target.device).set_(
++                storage,
++                offset_bytes // param.element_size(),
++                param.shape,
++                param.stride(),
++            )
++
++    @torch.no_grad()
+     def process_weights_after_loading(self, layer):
++        if getattr(layer, "_mxfp4_pristine_params", None) is None:
++            layer._mxfp4_pristine_params = dict(layer.named_parameters(recurse=False))
++            layer._mxfp4_bias_values = {
++                name: param.detach().cpu().clone()
++                for name, param in layer._mxfp4_pristine_params.items()
++                if name.endswith("_bias")
++            }
++            layer._mxfp4_loading = True
++        if not layer._mxfp4_loading:
++            return
++
++        # Backends may replace Parameters, reassign .data (DeepGEMM), or
++        # shuffle bytes in place (AITER). None may mutate the loader buffers.
++        for name, param in layer._mxfp4_pristine_params.items():
++            staging = Parameter(param.detach().clone(), requires_grad=False)
++            staging.__dict__.update(param.__dict__)
++            layer.register_parameter(name, staging)
++        self._process_mxfp4_weights_after_loading(layer)
++
++        params = dict(layer.named_parameters(recurse=False))
++        runtime = getattr(layer, "_mxfp4_runtime_params", None)
++        if runtime is None:
++            layer._mxfp4_runtime_params = params
++            layer._mxfp4_runtime_workspace = getattr(layer, "workspace", None)
++            if self.use_triton_kernels:
++                self._mxfp4_runtime_triton = tuple(
++                    (
++                        getattr(self, f"{prefix}_weight_triton_tensor"),
++                        getattr(self, f"{prefix}_precision_config"),
++                    )
++                    for prefix in ("w13", "w2")
++                )
++            self._reuse_mxfp4_loading_storage(layer)
++        else:
++            if params.keys() != runtime.keys():
++                raise RuntimeError("MXFP4 runtime parameters changed during weight update")
++            for name, target in runtime.items():
++                self._copy_mxfp4_runtime_tensor(target, params[name])
++                layer.register_parameter(name, target)
++            workspace = layer._mxfp4_runtime_workspace
++            if workspace is not None:
++                self._copy_mxfp4_runtime_tensor(workspace, layer.workspace)
++                layer.workspace = workspace
++            if self.use_triton_kernels:
++                for prefix, (weight, precision) in zip(
++                    ("w13", "w2"), self._mxfp4_runtime_triton
++                ):
++                    self._copy_mxfp4_runtime_tensor(
++                        weight.storage.data,
++                        getattr(self, f"{prefix}_weight_triton_tensor").storage.data,
++                    )
++                    self._copy_mxfp4_runtime_tensor(
++                        precision.weight_scale.storage.data,
++                        getattr(self, f"{prefix}_precision_config").weight_scale.storage.data,
++                    )
++                    setattr(self, f"{prefix}_weight_triton_tensor", weight)
++                    setattr(self, f"{prefix}_precision_config", precision)
++
++        # MegaMoE also reads these aliases outside named_parameters().
++        if self.use_deep_gemm and get_moe_a2a_backend().is_megamoe():
++            layer.mega_l1_weights = (layer.w13_weight.data, layer.w13_weight_scale.data)
++            layer.mega_l2_weights = (layer.w2_weight.data, layer.w2_weight_scale.data)
++        layer._mxfp4_loading = False
++
++    def _process_mxfp4_weights_after_loading(self, layer):
+         if self.use_marlin:
+             from sglang.srt.layers.quantization.marlin_utils import (
+                 check_moe_marlin_supports_layer,
+diff --git a/python/sglang/srt/models/kimi_k3.py b/python/sglang/srt/models/kimi_k3.py
+--- a/python/sglang/srt/models/kimi_k3.py
++++ b/python/sglang/srt/models/kimi_k3.py
+@@ -174,7 +174,7 @@
+
+
+ def _merge_weights_as_views(
+-    mods: list, pad_rows_to: int = 1
++    mods: list, pad_rows_to: int = 1, merged: torch.Tensor | None = None
+ ) -> tuple[torch.Tensor, list[int]]:
+     """Cat module weights along dim 0; re-point each module's weight to a view
+     of the merged buffer so the original storage is freed (net extra memory ~0).
+@@ -187,7 +187,11 @@
+     pad = (-sum(sizes)) % pad_rows_to
+     if pad:
+         ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
+-    merged = torch.cat(ws, dim=0).contiguous()
++    if merged is None:
++        merged = torch.cat(ws, dim=0).contiguous()
++    else:
++        # CUDA graphs retain this storage across RL weight reloads.
++        merged.copy_(torch.cat(ws, dim=0))
+     off = 0
+     for m, n in zip(mods, sizes):
+         m.weight.data = merged[off : off + n]
+@@ -623,7 +627,9 @@
+         dtypes = {m.weight.dtype for m in mods}
+         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
+             return
+-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
++        self._front_w, self._front_sizes = _merge_weights_as_views(
++            mods, merged=getattr(self, "_front_w", None)
++        )
+         self._front_is_ep_pair = len(mods) == 2
+         # Invalidate the cached properties.
+         for prop in (
+@@ -1536,7 +1542,9 @@
+         if not self.use_full_rank_gate:
+             return
+         self._bfa_w, sizes = _merge_weights_as_views(
+-            [self.f_a_proj, self.b_proj], pad_rows_to=8
++            [self.f_a_proj, self.b_proj],
++            pad_rows_to=8,
++            merged=getattr(self, "_bfa_w", None),
+         )
+         self._bfa_fa_size, self._bfa_b_size = sizes
+
+@@ -1582,7 +1590,7 @@
+             if bias is not None
+             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
+         )
+-        layer._k3_fused_decode_args = (
++        fused_args = (
+             wt[:, :seg].contiguous(),
+             wt[:, seg : 2 * seg].contiguous(),
+             wt[:, 2 * seg :].contiguous(),
+@@ -1591,6 +1599,12 @@
+             self.o_norm.weight.data.float().contiguous(),
+             float(self.o_norm.eps),
+         )
++        previous = getattr(layer, "_k3_fused_decode_args", None)
++        if previous is None:
++            layer._k3_fused_decode_args = fused_args
++        else:
++            for target, value in zip(previous[:-1], fused_args[:-1]):
++                target.copy_(value)
+         self._kda_fused_decode_ready = True
+
+     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
+@@ -2852,7 +2866,15 @@
+                     weight_loader(param, loaded_weight, **kwargs)
+             loaded_params.add(name)
+
++        if not getattr(self, "_relax_defer_post_load", False):
++            self.post_load_weights()
++
++    def begin_weight_update(self):
++        self._relax_defer_post_load = True
++
++    def end_weight_update(self):
+         self.post_load_weights()
++        self._relax_defer_post_load = False
+
+     def post_load_weights(self):
+         # Also invoked by loader post-load hooks (DummyModelLoader,
+@@ -2870,8 +2892,13 @@
+             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
++            w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
++            w_vc = w_vc.contiguous().transpose(1, 2)
++            if getattr(self_attn, "w_kc", None) is None:
++                self_attn.w_kc, self_attn.w_vc = w_kc, w_vc
++            else:
++                self_attn.w_kc.copy_(w_kc)
++                self_attn.w_vc.copy_(w_vc)
+             if hasattr(self_attn.kv_b_proj, "weight_scale"):
+                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+
+@@ -2880,8 +2907,9 @@
+         # multiply into every captured graph replay otherwise). Warm both
+         # dtypes: the fast kernel consumes bf16, the triton fallback fp32.
+         def _warm_cw(proj, norm):
+-            get_cw(proj, norm, dtype=torch.bfloat16)
+-            get_cw(proj, norm)
++            value = norm.weight.float() * proj.weight.squeeze().float()
++            for dtype in (torch.bfloat16, torch.float32):
++                get_cw(proj, norm, dtype=dtype).copy_(value.to(dtype))
+
+         for layer in self.model.layers:
+             if isinstance(layer, PPMissingLayer):
+@@ -2921,12 +2949,17 @@
+                 precompile_k3_recompute_w_u_kernel,
+             )
+
+-            if precompile_k3_recompute_w_u_kernel(
+-                num_heads=layer.self_attn.local_num_heads,
+-                dtype=layer.self_attn.o_proj.weight.dtype,
+-                device=layer.self_attn.dt_bias.device,
+-            ):
+-                rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
++            key = (
++                layer.self_attn.local_num_heads,
++                layer.self_attn.o_proj.weight.dtype,
++                layer.self_attn.dt_bias.device,
++            )
++            if getattr(self, "_relax_kda_prefill_key", None) != key:
++                if precompile_k3_recompute_w_u_kernel(
++                    num_heads=key[0], dtype=key[1], device=key[2]
++                ):
++                    self._relax_kda_prefill_key = key
++                    rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
+             break
+
+
+@@ -2982,6 +3015,14 @@
+         if name == "model":
+             return
+         super().__setattr__(name, value)
++
++    def begin_weight_update(self):
++        if self.language_model is not None:
++            self.language_model.begin_weight_update()
++
++    def end_weight_update(self):
++        if self.language_model is not None:
++            self.language_model.end_weight_update()
+
+     def post_load_weights(self):
+         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.

@@ -754,6 +754,42 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def update_weight_version(self, weight_version: str) -> dict:
+        """Publish a completed routed update while generation is still
+        paused."""
+        return self._make_request(
+            "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
+        )
+
+    def get_expert_weight_sync_layout(self) -> dict:
+        """Return resolved layout settings for opt-in colocated expert
+        routing."""
+        from relax.utils.misc import get_hf_config
+
+        if self.node_rank != 0 or self.worker_type != "regular":
+            raise ValueError("Expert routing requires a regular node-0 rollout engine")
+        response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
+        response.raise_for_status()
+        info = response.json()
+        keys = (
+            "tp_size",
+            "ep_size",
+            "pp_size",
+            "moe_dp_size",
+            "enable_eplb",
+            "ep_num_redundant_experts",
+            "init_expert_location",
+            "ep_join_mode",
+            "speculative_algorithm",
+            "moe_runner_backend",
+            "json_model_override_args",
+        )
+        layout = {key: info[key] for key in keys if key in info}
+        config = get_hf_config(info["model_path"])
+        text_config = getattr(config, "text_config", None) or config
+        layout["num_experts"] = getattr(text_config, "num_experts", None)
+        return layout
+
     def load_lora_adapter_from_tensors(
         self,
         lora_name: str,

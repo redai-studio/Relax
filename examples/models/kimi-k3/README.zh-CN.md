@@ -6,7 +6,7 @@
 
 Relax 支持 Kimi K3 的全参和 LoRA SFT，包括图片输入、packing、固定 CP、PP 和 EP。模型配置位于 `scripts/models/kimi-k3.sh`，公开示例位于 `examples/models/kimi-k3/scripts/`。
 
-请使用按照 `docker/Dockerfile` 或 `docker/Dockerfile_Blackwell` 中固定的 Megatron/Bridge、FLA 和 NVRx 依赖构建的训练镜像。所有训练节点都必须能读取模型和数据目录。这些脚本是参考配置；长跑前需要在目标集群验证内存占用和数值行为。
+请使用按照 `docker/Dockerfile` 或 `docker/Dockerfile.cu13` 中固定的 Megatron/Bridge、FLA 和 NVRx 依赖构建的训练镜像。所有训练节点都必须能读取模型和数据目录。这些脚本是参考配置；长跑前需要在目标集群验证内存占用和数值行为。
 
 ## 训练
 
@@ -89,6 +89,52 @@ python examples/models/kimi-k3/tools/validate_kimi_k3_sglang.py \
 ```
 
 内置检查仅覆盖文本。图片评估使用 `scripts/tools/eval_openr1mm.py`；通过 `--help` 查看服务地址、数据和输出参数。
+
+## 强化学习
+
+Kimi K3 支持共卡 GRPO，rollout 使用原生 MXFP4 权重。训练保留 BF16 专家参数；每次更新后，Bridge 将路由专家转换为成对的 `weight_packed` / E8M0 `weight_scale` 张量。Dense、共享专家和视觉权重保留配置要求的未量化格式。量化配置同时支持顶层和 `text_config` 嵌套结构。
+
+**所有 rollout 节点**都必须安装仓库提供的 SGLang v0.5.17 patch。重载钩子在更新 MXFP4 重打包、融合 decode buffer、MLA 投影和 AttnRes 缓存时保持已捕获的运行时存储地址。Router 支持注销和重新注册 worker，旧请求和健康检查不会影响同 URL 的新 worker。PP 权重转换广播清理后的配置副本，避免权重已收集后再次执行 TP/EP 集合通信。
+
+| 脚本                                                                    | 布局                                 | 用途                                                    |
+| ----------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------------- |
+| `scripts/training/text/run-kimi-k3-5l-8xgpu-grpo.sh`                    | 训练 TP2/EP4/ETP1，rollout TP8；8 卡 | 5 层/128 专家减配 checkpoint，纯文本 DAPO math 冒烟验证 |
+| `examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh` | 训练 TP4/PP4/CP2/EP32/ETP1；128 B300 | 包含视觉联合训练的全参多模 OpenR1-MM GRPO               |
+
+全参脚本使用 PP 层数 21/24/24/24、8 个各占 16 卡的 rollout engine（attention TP8/DP2、MoE EP16）、CPU optimizer offload（默认比例 0.9），通过 dummy 初始化 rollout 后完整推送权重，不加载参考模型。它清空继承的 allocator 设置、限制编译线程，并在权重同步时保持 Ray Serve 探针可响应。默认训练 200 个 rollout，每 200 个 rollout 保存一次 model-only checkpoint，只保留一份。未设置 `LOAD_DIR` 时从 HF 初始化；仅模型 checkpoint **不能恢复 optimizer 状态**。
+
+```bash
+export MODEL_DIR=/shared/models/Kimi-K3
+export DATA_DIR=/shared/data/openr1mm
+export SAVE_DIR=/shared/checkpoints
+export EXP_NAME=kimi-k3-openr1mm-grpo
+export HF_CHECKPOINT="${MODEL_DIR}"
+export PROMPT_SET="${DATA_DIR}/train.parquet"
+DRY_RUN=1 bash examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+bash scripts/entrypoint/ray-job.sh \
+  examples/models/kimi-k3/scripts/run-kimi-k3-openr1mm-128xb300-grpo.sh
+```
+
+全参脚本默认从 `${MODEL_DIR}/Kimi-K3` 读取模型，从 `${DATA_DIR}/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet` 读取数据，字段为 `prompt`、`label` 和 `image`。上例显式设置 `HF_CHECKPOINT` 和 `PROMPT_SET`，以复用 SFT 的目录布局。减配脚本读取 `DATA_DIR` 下的 `dapo-math-17k.jsonl`，`MODEL_DIR` 直接指向减配 checkpoint。其 entropy 系数 0.01 用于在未经重训的冒烟模型 reward 为零时保持梯度，并不构成效果基线。减配脚本可选设置 `SAVE_DIR` 启用完整状态保存和恢复。实验名与 checkpoint 路径固定，时间戳仅用于日志和任务名。ClearML 沿用现有运行环境配置。
+
+全参脚本默认开启按专家路由的权重更新，设置 `COLOCATE_EXPERT_WEIGHT_ROUTING=0` 可使用广播。动态采样过滤默认关闭，可通过显式 CLI 参数开启。
+
+两个脚本都通过 `--train-env-vars` 启用 `OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1` 和 `FLA_TILELANG=0`。Fake QAT 使用直通梯度估计：路由专家前向使用与在线 MXFP4 导出相同的量化/反量化网格，梯度回到 BF16 master。其他启动方式默认不启用此钩子。Rollout 每张图片只发送一个原始媒体 token；训练 processor 保留原始 prompt，并独立展开图像特征占位。
+
+### 有界同步 Checkpoint 保存
+
+两个 Dockerfile 都在主 Megatron patch 后应用 `docker/patch/megatron/sync-save-bounded-staging.patch`。全参 GRPO 脚本显式启用；设置 `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=0` 可让该脚本回到原同步 writer。其他启动方式默认关闭此优化。异步保存行为不变。
+
+- `MEGATRON_SYNC_SAVE_BOUNDED_STAGING=1`：分批暂存并顺序写入，避免将整个 checkpoint 预载到 CPU。
+- `MEGATRON_SYNC_SAVE_STAGE_BYTES`：每个 rank 的活跃暂存预算，默认 1 GiB。窗口为空时允许一个超过预算的大张量，因此边界为 `max(budget, largest_tensor)`。
+- 预算 `0` 表示逐张量暂存和写入，**不表示**切回原 writer。
+- 预算只约束活跃暂存张量，不约束总 RSS、optimizer/offload 内存、序列化临时空间或文件系统页缓存。降低暂存内存可能牺牲写入吞吐，需在目标存储上测量。
+
+脚本会把两个环境变量传递到训练 actor。旧镜像没有此 patch 时，即使设置变量，也仍使用原保存实现；要获得优化，需要统一重建镜像或给所有节点安装 patch。已运行的任务不会自动加载新 patch。Checkpoint 格式和加载方式不变。异常处理与验证边界见 `docker/patch/megatron/sync-save-bounded-staging.md`。
+
+### 训推差异诊断
+
+`examples/models/kimi-k3/tools/probe_mxfp4_mismatch_floor.py` 在相同 token IDs 和相同 SGLang 引擎下，对比原生 MXFP4 与 BF16 反量化副本的 prompt logprob。提供 `--mxfp4-dir`、`--bf16-dir`、`--data`，可选 `--n-prompts`。该工具使用 TP1，因此被测 checkpoint 必须能放入单卡。这是诊断参照，不能独立证明在线推权正确：还需在目标镜像中检查重载存储地址、loss/梯度有限值及多次更新。CPU 测试不构成 CUDA Graph、量化 kernel 或多机保存恢复的正确性证明。
 
 ## 边界
 

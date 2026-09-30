@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
 from megatron.core import mpu
@@ -35,6 +36,7 @@ from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import should_bypass_main_output_layer
+from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
@@ -42,7 +44,7 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
-from relax.utils.memory_utils import clear_memory
+from relax.utils.memory_utils import available_memory, clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
@@ -72,6 +74,16 @@ from .model_provider import (
 
 
 logger = get_logger(__name__)
+
+
+def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+    # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
+    # router bias reduction), before forward_backward_func returns to the
+    # optimizer. Make unused activation cache available at that boundary too.
+    memory_before = available_memory()
+    device_utils.empty_cache()
+    logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
+    finalize_model_grads(*args, **kwargs)
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -1313,6 +1325,13 @@ def train_one_step(
     # clip, and inner step in one shot — avoids the double prepare_grads/unscale and
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
+    # Match Megatron's memory-level control. Reloaded NCCL groups may allocate
+    # their buffers for the first time during gradient-norm reduction; release
+    # unused forward/backward cache before those allocations, not after an OOM.
+    if getattr(args, "empty_unused_memory_level", 0) >= 1:
+        memory_before = available_memory()
+        device_utils.empty_cache()
+        logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
     valid_step = True
     if _is_global_zero_token_step(losses_reduced):
         # No effective loss tokens anywhere in the global batch. Gradients are
@@ -1357,6 +1376,9 @@ def train_one_step(
             opt_param_scheduler.step(increment=step_global_batch_size)
         else:
             grad_norm = float("nan")
+
+    if getattr(args, "empty_unused_memory_level", 0) >= 2:
+        device_utils.empty_cache()
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
@@ -1476,7 +1498,11 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = (
+        _finalize_model_grads_with_memory_release
+        if getattr(args, "empty_unused_memory_level", 0) >= 1
+        else finalize_model_grads
+    )
 
     pre_hook_enabled = False
     param_sync_func = None

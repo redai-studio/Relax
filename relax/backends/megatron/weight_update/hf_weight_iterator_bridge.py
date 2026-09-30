@@ -4,7 +4,7 @@ import dataclasses
 import re
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,7 @@ from relax.utils.types import ParamInfo
 
 from .bridge_converter import BridgeConverter
 from .common import all_gather_param, named_params_and_buffers
+from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -100,6 +101,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             collect_adapters=collect_adapters,
         )
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
+        self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
+        self._expert_router: ExpertRouter | None = None
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
             self.lora_dim = self.args.lora_rank
@@ -116,13 +119,111 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
             )
 
+    def configure_expert_routing(
+        self, layout: ExpertLayout, *, payload_group: dist.ProcessGroup, metadata_group: dist.ProcessGroup
+    ) -> None:
+        if (
+            mpu.get_expert_tensor_parallel_world_size() != 1
+            or mpu.get_expert_model_parallel_world_size() * mpu.get_pipeline_model_parallel_world_size()
+            != layout.world_size
+        ):
+            raise ValueError("Expert routing requires ETP=1 and unique owners across PP*EP=world")
+        # Derive owners from actual local backup keys, not a PP/EP relay rank.
+        # Exchange once so every rank has exactly the same source buckets.
+        rank = dist.get_rank(metadata_group)
+        owned = [
+            dataclasses.replace(info, src_rank=rank)
+            for bucket in self._expert_buckets
+            for info in bucket
+            if info.name in self._vanilla_key_map
+        ]
+        all_owned = [None] * layout.world_size
+        dist.all_gather_object(all_owned, owned, group=metadata_group)
+        infos = sorted((info for entries in all_owned for info in entries), key=lambda info: info.name)
+        if not infos or len({info.name for info in infos}) != len(infos):
+            raise ValueError("Expert routing requires nonempty, globally unique expert owners")
+        self._expert_buckets = _bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, layout)
+        self._expert_router = ExpertRouter(layout, payload_group=payload_group, metadata_group=metadata_group)
+        if rank == 0:
+            logger.info("[Bridge Expert Routing] configured %d parallel source rounds", len(self._expert_buckets))
+
+    def _iter_routed_expert_chunks(
+        self, megatron_local_weights: Mapping[str, torch.Tensor]
+    ) -> Iterator[list[tuple[str, torch.Tensor]]]:
+        router = self._expert_router
+        router.reset_metrics()
+        self._bridge_converter.init_tasks()
+        self._bridge_converter.broadcast_and_apply_configs()
+        device = device_utils.make_current_torch_device()
+        convert_seconds = route_seconds = 0.0
+        pending = []
+        pending_bytes = [0] * router.layout.world_size
+        rounds = 0
+        ipc_chunks = 0
+        # Reserve space for the route packing buffer and previous in-flight IPC.
+        ipc_budget = max(1, self.args.update_weight_buffer_size // 3)
+        for bucket_index, bucket_infos in enumerate(self._expert_buckets):
+            start = time.monotonic()
+            converted = []
+            error = None
+            # ETP=1: only owners load weights; copies and quantization run in
+            # stream order, without non-owner allocations or a device sync.
+            try:
+                for info in bucket_infos:
+                    if info.src_rank == router.rank:
+                        tensor = megatron_local_weights[self._vanilla_key_map[info.name]].to(
+                            device=device, non_blocking=_NON_BLOCKING
+                        )
+                        converted.extend(self._bridge_converter.convert(info.name, tensor))
+                        del tensor
+                raw_bytes = sum(info.size for info in bucket_infos if info.src_rank == router.rank)
+                if sum(t.numel() * t.element_size() for _, t in converted) > raw_bytes:
+                    raise ValueError("Routed MXFP4 tensors exceed their source-byte budget")
+            except Exception as exc:
+                error = str(exc)
+            convert_seconds += time.monotonic() - start
+            start = time.monotonic()
+            result = router.exchange(bucket_index, converted, device, error=error, receive_budget=ipc_budget)
+            route_seconds += time.monotonic() - start
+            # Every rank has the same destination vector from the schema plan.
+            # Accumulate per destination before taking the maximum: summing
+            # individual bucket maxima overcounts buckets sent to different EP
+            # shards and creates many mostly empty IPC requests.
+            combined_bytes = [a + b for a, b in zip(pending_bytes, router.destination_bytes, strict=True)]
+            if rounds and max(combined_bytes) > ipc_budget:
+                yield pending
+                pending = []
+                combined_bytes = list(router.destination_bytes)
+                rounds = 0
+                ipc_chunks += 1
+            pending.extend(result)
+            pending_bytes = combined_bytes
+            rounds += 1
+            del converted, result
+        if rounds:
+            yield pending
+            ipc_chunks += 1
+        if router.rank == 0:
+            logger.info(
+                "[Bridge Expert Routing] buckets=%d ipc_chunks=%d convert=%.2fs route=%.2fs "
+                "payload_bytes=%d full_replica_bytes=%d",
+                len(self._expert_buckets),
+                ipc_chunks,
+                convert_seconds,
+                route_seconds,
+                router.payload_bytes,
+                router.replicated_bytes,
+            )
+
     def get_hf_weight_chunks(self, megatron_local_weights):
+        if self._expert_router is not None:
+            yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
-            self._iter_hf_params(megatron_local_weights),
+            self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
             chunk_size=self.args.update_weight_buffer_size,
         )
 
-    def _iter_hf_params(self, megatron_local_weights):
+    def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.
 
         Expert weights: load → TP gather + convert (src_rank only) →
@@ -147,7 +248,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         merge_fn = self._merge_base_with_adapter if self.lora_merge_mode else None
 
         # --- Expert weights: quantize-before-broadcast path ---
-        for bucket_infos in self._expert_buckets:
+        expert_buckets = self._expert_buckets if include_experts else []
+        caches = self._expert_broadcast_caches if include_experts else []
+        for bucket_infos, phase_caches in zip(expert_buckets, caches, strict=True):
             t_c0 = time.monotonic()
             params = _load_to_gpu(
                 bucket_infos, megatron_local_weights, self._vanilla_key_map, device, rank, merge_fn=merge_fn
@@ -164,7 +267,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_convert_total += time.monotonic() - t_c0
 
             t_b0 = time.monotonic()
-            results = _broadcast_converted_bucket(bucket_infos, all_converted, device)
+            results = _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_caches=phase_caches)
             t_bcast_total += time.monotonic() - t_b0
             param_count += len(results)
             yield from results
@@ -380,9 +483,46 @@ def _build_param_info_buckets(args, model, buffer_is_mapped: Callable[[str], boo
     return expert_buckets, non_expert_buckets, vanilla_key_map, adapter_map
 
 
-def _bucket_by_size(infos, args):
+def _bucket_experts_by_owner(infos: list[ParamInfo], buffer_size: int, layout: ExpertLayout) -> list[list[ParamInfo]]:
+    """Run owner-local buckets concurrently with conservative BF16 byte
+    bounds."""
+    by_owner: dict[int, list[ParamInfo]] = {}
+    destination_owners: dict[int, set[int]] = {}
+    for info in infos:
+        match = re.search(r"\.experts\.linear_fc[12]\.weight(\d+)$", info.name)
+        if match is None or not 0 <= info.src_rank < layout.world_size:
+            raise ValueError(f"Unsupported routed Megatron expert: {info.name}")
+        name = f"model.layers.0.block_sparse_moe.experts.{match[1]}.w1.weight_packed"
+        for destination in layout.destinations(name):
+            destination_owners.setdefault(destination, set()).add(info.src_rank)
+        by_owner.setdefault(info.src_rank, []).append(info)
+    fanin = max(len(owners) for owners in destination_owners.values())
+    # MXFP4 packed+scale bytes must not exceed the original BF16 bytes (checked
+    # during conversion). Each destination receives at most `fanin` such buckets.
+    budget = min(buffer_size // len(layout.engine_offsets), buffer_size // 3 // fanin)
+    owner_buckets = []
+    for owner in sorted(by_owner):
+        buckets: list[list[ParamInfo]] = [[]]
+        used = 0
+        for info in sorted(by_owner[owner], key=lambda item: item.name):
+            if not 0 < info.size <= budget:
+                raise ValueError(f"Expert {info.name} has {info.size} bytes, exceeding owner budget {budget}")
+            if used + info.size > budget:
+                buckets.append([])
+                used = 0
+            buckets[-1].append(info)
+            used += info.size
+        owner_buckets.append(buckets)
+    return [
+        [info for buckets in owner_buckets if index < len(buckets) for info in buckets[index]]
+        for index in range(max(map(len, owner_buckets)))
+    ]
+
+
+def _bucket_by_size(infos, args, *, buffer_size: int | None = None):
     if not infos:
         return []
+    buffer_size = args.update_weight_buffer_size if buffer_size is None else buffer_size
     buckets: list[list[ParamInfo]] = [[]]
     bucket_bytes = 0
     for info in infos:
@@ -392,7 +532,7 @@ def _bucket_by_size(infos, args):
             tp_size = mpu.get_tensor_model_parallel_world_size()
         param_size = info.size * tp_size
 
-        if bucket_bytes + param_size > args.update_weight_buffer_size and buckets[-1]:
+        if bucket_bytes + param_size > buffer_size and buckets[-1]:
             buckets.append([])
             bucket_bytes = 0
         buckets[-1].append(info)
@@ -473,7 +613,7 @@ def _load_and_broadcast(bucket_infos, megatron_local_weights, vanilla_key_map, d
     return params
 
 
-def _broadcast_converted_bucket(bucket_infos, all_converted, device):
+def _broadcast_converted_bucket(bucket_infos, all_converted, device, phase_caches: tuple[dict, dict] | None = None):
     """Broadcast converted expert tensors across PP and EP groups.
 
     ``all_converted[i]`` is ``bridge_converter.convert()`` output for
@@ -491,6 +631,7 @@ def _broadcast_converted_bucket(bucket_infos, all_converted, device):
             device,
             rank,
             group=mpu.get_pipeline_model_parallel_group(),
+            plan_cache=phase_caches[0] if phase_caches is not None else None,
         )
 
     ep_size = mpu.get_expert_model_parallel_world_size()
@@ -501,6 +642,7 @@ def _broadcast_converted_bucket(bucket_infos, all_converted, device):
             device,
             rank,
             group=mpu.get_expert_model_parallel_group(),
+            plan_cache=phase_caches[1] if phase_caches is not None else None,
         )
 
     out: list[tuple[str, torch.Tensor]] = []
@@ -620,46 +762,67 @@ def _decode_metadata(meta_tensor, slot_size):
     return slots
 
 
-def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group):
+def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group, plan_cache: dict | None = None):
     """Single-group broadcast of converted tensors using only NCCL.
 
-    1. Each rank encodes its owned tensors' metadata into an int64 tensor.
-    2. Two allreduce calls exchange metadata: one for sizes (MAX), one
-       for the content (SUM).  Empty slots are encoded as zeros so the
-       SUM correctly merges non-overlapping contributions.
-    3. Data tensors are broadcast from their owners.
+    1. MAX agrees on slot size and (when caching) whether any rank needs a refresh.
+    2. On refresh, SUM merges non-overlapping metadata contributions. Warm
+       caches skip this large exchange and reuse CPU descriptors and byte sizes.
+    3. Fresh data buffers are broadcast from their owners on every call.
     """
     group_ranks = dist.get_process_group_ranks(group)
     group_ranks_set = set(group_ranks)
 
-    slot_size = _compute_slot_size(all_converted, bucket_infos)
+    # Cache only CPU descriptors, never tensors, process groups or Work handles.
+    # Ownership/schema/topology changes must invalidate on EVERY group member;
+    # piggyback the miss bit on the existing size MAX, keeping collective order.
+    signature = (
+        tuple(group_ranks),
+        rank,
+        tuple(
+            (
+                info.src_rank,
+                None if converted is None else tuple((name, tuple(t.shape), t.dtype) for name, t in converted),
+            )
+            for info, converted in zip(bucket_infos, all_converted, strict=True)
+        ),
+    )
+    cache_hit = plan_cache is not None and plan_cache.get("signature") == signature
+    local_size = plan_cache["local_size"] if cache_hit else _compute_slot_size(all_converted, bucket_infos)
+    if plan_cache is None:
+        slot_size_t = torch.tensor([local_size], dtype=torch.int64, device=device)
+        dist.all_reduce(slot_size_t, op=dist.ReduceOp.MAX, group=group)
+        slot_size = slot_size_t.item()
+        refresh = True
+    else:
+        agreement = torch.tensor([local_size, int(not cache_hit)], dtype=torch.int64, device=device)
+        dist.all_reduce(agreement, op=dist.ReduceOp.MAX, group=group)
+        # Replaces the pre-existing scalar D2H synchronization; no extra sync.
+        slot_size, refresh = agreement.cpu().tolist()
 
-    # Step 1: allreduce(MAX) to agree on slot_size across the group
-    slot_size_t = torch.tensor([slot_size], dtype=torch.int64, device=device)
-    dist.all_reduce(slot_size_t, op=dist.ReduceOp.MAX, group=group)
-    slot_size = slot_size_t.item()
-
-    local_meta_tensor = _encode_metadata(all_converted, bucket_infos, group_ranks_set, rank, slot_size)
-
-    # Step 2: allreduce(SUM) to merge metadata from all ranks.
-    # Each param slot has data from at most one rank; the rest contribute zeros.
-    meta_buf = local_meta_tensor.to(device)
-    dist.all_reduce(meta_buf, op=dist.ReduceOp.SUM, group=group)
-
-    merged_slots = _decode_metadata(meta_buf.cpu(), slot_size)
-    merged: dict[int, tuple[int, list]] = {}
-    for i, slot in enumerate(merged_slots):
-        if slot is not None:
-            merged[i] = slot
-
-    # Group param slots by broadcast source and pack into one buffer per src.
-    # This reduces N×M individual broadcasts to one per unique src rank.
-    src_to_slots: dict[int, list[tuple[int, list]]] = {}
-    for i in range(len(bucket_infos)):
-        if i not in merged:
-            continue
-        src, param_meta = merged[i]
-        src_to_slots.setdefault(src, []).append((i, param_meta))
+    if refresh:
+        local_meta_tensor = _encode_metadata(all_converted, bucket_infos, group_ranks_set, rank, slot_size)
+        meta_buf = local_meta_tensor.to(device)
+        dist.all_reduce(meta_buf, op=dist.ReduceOp.SUM, group=group)
+        merged_slots = _decode_metadata(meta_buf.cpu(), slot_size)
+        src_to_slots: dict[int, list] = {}
+        src_bytes: dict[int, int] = {}
+        element_sizes = {dtype: torch.empty(0, dtype=dtype).element_size() for dtype in _DTYPE_TO_CODE}
+        for i, slot in enumerate(merged_slots):
+            if slot is None:
+                continue
+            src, param_meta = slot
+            sized_meta = [
+                (name, shape, dtype, element_sizes[dtype] * torch.Size(shape).numel())
+                for name, shape, dtype in param_meta
+            ]
+            src_to_slots.setdefault(src, []).append((i, sized_meta))
+            src_bytes[src] = src_bytes.get(src, 0) + sum(entry[3] for entry in sized_meta)
+        if plan_cache is not None:
+            plan_cache.update(signature=signature, local_size=local_size, slots=src_to_slots, sizes=src_bytes)
+    else:
+        src_to_slots = plan_cache["slots"]
+        src_bytes = plan_cache["sizes"]
 
     result = list(all_converted)
     handles = []
@@ -667,22 +830,19 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group)
 
     for src, slot_list in src_to_slots.items():
         is_owner = rank == src
-        # Compute total bytes for this src's tensors
-        total_bytes = 0
-        for _i, param_meta in slot_list:
-            for _name, shape, dtype in param_meta:
-                total_bytes += torch.tensor([], dtype=dtype).element_size() * torch.Size(shape).numel()
+        total_bytes = src_bytes[src]
 
         if is_owner:
             parts = []
             for i, param_meta in slot_list:
-                for j, (_name, _shape, _dtype) in enumerate(param_meta):
+                for j, (_name, _shape, _dtype, _n_bytes) in enumerate(param_meta):
                     parts.append(all_converted[i][j][1].contiguous().flatten().view(torch.uint8))
-            buf = torch.cat(parts).to(device)
+            buf = torch.cat(parts).to(device) if parts else torch.empty(0, dtype=torch.uint8, device=device)
         else:
             buf = torch.empty(total_bytes, dtype=torch.uint8, device=device)
 
-        handles.append(dist.broadcast(buf, src=src, group=group, async_op=True))
+        if total_bytes:
+            handles.append(dist.broadcast(buf, src=src, group=group, async_op=True))
         unpack_tasks.append((src, buf, slot_list))
 
     for h in handles:
@@ -694,8 +854,7 @@ def _broadcast_converted_phase(bucket_infos, all_converted, device, rank, group)
         offset = 0
         for i, param_meta in slot_list:
             tensors: list[tuple[str, torch.Tensor]] = []
-            for j, (name, shape, dtype) in enumerate(param_meta):
-                n_bytes = torch.tensor([], dtype=dtype).element_size() * torch.Size(shape).numel()
+            for j, (name, shape, dtype, n_bytes) in enumerate(param_meta):
                 if is_owner:
                     tensor = all_converted[i][j][1]
                 else:

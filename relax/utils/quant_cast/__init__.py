@@ -2,12 +2,30 @@
 
 """Utilities for quantized checkpoint casting and metadata handling."""
 
+import json
 import os
 
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def read_quantization_config(hf_dir: str | os.PathLike) -> dict | None:
+    """Read ``quantization_config`` from config.json, falling back to
+    ``text_config``.
+
+    VLM checkpoints like Kimi K3 nest the compressed-tensors config under the
+    text backbone, leaving the top-level block null — so callers that read
+    ``hf_config.quantization_config`` see ``None`` even though the release is
+    quantized.
+    """
+    config_path = os.path.join(hf_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path) as f:
+        cfg = json.load(f)
+    return cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config") or None
 
 
 def derive_extra_ignore_namespaces(hf_dir: str | os.PathLike) -> list[str]:
@@ -52,7 +70,11 @@ def augment_compressed_tensors_ignore(quantization_config: dict | None, hf_dir: 
     embedding layers, and head layers.
 
     Pass-through if ``quantization_config`` is None or not compressed-tensors.
+    When it is None (Kimi K3-style VLM nesting), resolve it from config.json
+    first.
     """
+    if quantization_config is None:
+        quantization_config = read_quantization_config(hf_dir)
     if not quantization_config or quantization_config.get("quant_method") != "compressed-tensors":
         return quantization_config
     extra = derive_extra_ignore_namespaces(hf_dir)

@@ -419,6 +419,11 @@ def get_model_provider_func(
 
         if is_kimi_k3:
             configure_runtime(provider, args)
+            # Fake-QAT aligns the training forward with the MXFP4 grid the
+            # rollout engine serves; gated by OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG.
+            from relax.backends.megatron.fake_qat_mxfp4 import maybe_install_mxfp4_fake_qat
+
+            maybe_install_mxfp4_fake_qat()
 
         # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
         # the vision encoder input before its CP all-gather.  Relax's public

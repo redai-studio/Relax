@@ -37,6 +37,28 @@ def is_kimi_k3_tokenizer(tokenizer: Any) -> bool:
     return _segment_builder(tokenizer) is not None
 
 
+def encode_kimi_k3_rollout_prompt(tokenizer: Any, prompt: str, image_count: int) -> list[int]:
+    """Encode one raw SGLang media slot per image, without HF image framing.
+
+    Keep the original prompt for the training processor: it replaces the HF
+    placeholder with dimensions and expands the feature span. SGLang performs
+    that expansion itself on the single media token sent here.
+    """
+    placeholder = "<|kimi_image_placeholder|>"
+    found = prompt.count(placeholder)
+    if found != image_count:
+        raise ValueError(f"Kimi K3 rollout expects {image_count} image placeholders, found {found}.")
+    # Use the HF call path directly: K3's encode(**kwargs) delegates to it
+    # after emitting a warning for every request.
+    ids = tokenizer(prompt.replace(placeholder, "<|media_pad|>"), add_special_tokens=False)["input_ids"]
+    media_id = tokenizer.convert_tokens_to_ids("<|media_pad|>")
+    if ids.count(media_id) != image_count:
+        raise ValueError(
+            "Kimi K3 rollout requires exactly one media token per image; ambiguous media tokens in prompt."
+        )
+    return ids
+
+
 def make_kimi_k3_sft_request(
     sample: "CanonicalSample",
     apply_chat_template_kwargs: dict | None = None,

@@ -139,6 +139,10 @@ RUN python /tmp/ensure_sgl_kernel_sm103.py
 # TE 2.18 replaces the old 2.14.1 attention selector. Do not apply the old tuple sed patch.
 RUN python -c "import importlib.metadata as m; \
 assert m.version('transformer-engine') == '2.18.0'"
+# Avoid host scalar synchronization when clearing context-parallel gradient padding.
+COPY docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch /tmp/te-cp-padding-no-host-sync.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-cp-padding-no-host-sync.patch
 
 ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
@@ -155,7 +159,7 @@ RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatro
 # MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
 # Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
 RUN sed -i '/^nvidia-resiliency-ext==/d' "$PIP_CONSTRAINT" && \
-    printf '%s\n' 'nvidia-resiliency-ext==0.6.0' >> "$PIP_CONSTRAINT" && \
+    printf '%s\n' 'nvidia-resiliency-ext==0.6.0' 'grpcio-tools==1.81.1' >> "$PIP_CONSTRAINT" && \
     pip install --no-cache-dir \
         "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
 
@@ -201,6 +205,7 @@ RUN pip install --no-cache-dir --force-reinstall --no-deps \
     python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
     patch --batch --forward -p1 < /root/Megatron-LM/megatron.patch && \
@@ -208,8 +213,9 @@ RUN cd Megatron-LM && \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
+    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
     python -m compileall -q megatron && \
-    rm megatron.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch && \
     apt-get update && apt-get install -y --no-install-recommends jq && \
     rm -rf /var/lib/apt/lists/*
 

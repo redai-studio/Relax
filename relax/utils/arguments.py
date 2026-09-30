@@ -1036,6 +1036,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--colocate-expert-weight-routing",
+                action="store_true",
+                help=(
+                    "Experimental Kimi K3 MXFP4 expert routing for colocated Bridge weight sync. "
+                    "Requires unique expert owners (ETP=1, PP*EP=world), rollout TP=EP and static EP. "
+                    "Default: use the existing full broadcast path."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,
@@ -3027,6 +3036,11 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
 
     if not args.debug_train_only:
         sglang_validate_args(args)
+
+    if getattr(args, "colocate_expert_weight_routing", False) and (
+        args.train_backend != "megatron" or not args.colocate or args.megatron_to_hf_mode != "bridge"
+    ):
+        raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
     if getattr(args, "fully_async", False):

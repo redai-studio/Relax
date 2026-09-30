@@ -35,6 +35,7 @@ _MEGATRON_MODULES = [
     "megatron.bridge.models",
     "megatron.bridge.peft",
     "megatron.bridge.peft.lora",
+    "megatron.bridge.peft.lora_merge",
 ]
 
 _MISSING = object()
@@ -518,3 +519,81 @@ class TestPPxEPIntegration:
             "layer1.experts.1.gate_proj.weight_scale",
         }
         assert set(all_names) == expected_names
+
+
+def _cached_gloo_worker(rank: int, rendezvous: str) -> None:
+    """Exercise real PP->EP collectives locally, without Ray or CUDA."""
+    from datetime import timedelta
+
+    import torch.distributed as distributed
+
+    distributed.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60)
+    )
+    try:
+        pp_groups = [distributed.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+        ep_groups = [distributed.new_group(ranks) for ranks in ([0, 2], [1, 3])]
+        pp, ep = pp_groups[rank // 2], ep_groups[rank % 2]
+        infos = [_make_param_info(f"expert{i}", i) for i in range(4)]
+        caches = ({}, {})
+        previous = None
+        actual_reduce = distributed.all_reduce
+        module = "relax.backends.megatron.weight_update.hf_weight_iterator_bridge"
+        for step in range(5):
+            # Only rank 3 changes schema. Both PP and EP must refresh together.
+            expected = []
+            for owner in range(4):
+                name = f"expert{owner}" if step < 2 or owner != 3 else "renamed_expert3"
+                values = _make_converted(name, value=10 * step + owner)
+                if step >= 2 and owner == 3:
+                    values[0] = (values[0][0], torch.full((2, 3), step, dtype=torch.int64).t())
+                if step == 4 and owner == 2:
+                    values = []
+                expected.append(values)
+            local = [values if owner == rank else None for owner, values in enumerate(expected)]
+            if step == 3 and rank == 1:
+                # A local eviction must not desynchronize the collective sequence.
+                caches[0].clear()
+            with (
+                patch(f"{module}.mpu.get_pipeline_model_parallel_world_size", return_value=2),
+                patch(f"{module}.mpu.get_expert_model_parallel_world_size", return_value=2),
+                patch(f"{module}.mpu.get_pipeline_model_parallel_group", return_value=pp),
+                patch(f"{module}.mpu.get_expert_model_parallel_group", return_value=ep),
+                patch(f"{module}.dist.all_reduce", wraps=actual_reduce) as reduce,
+            ):
+                result = _broadcast_converted_bucket(infos, local, "cpu", phase_caches=caches)
+                expected_calls = {0: 4, 1: 2, 2: 3 + (rank >= 2), 3: 2 + (rank < 2), 4: 3 + (rank >= 2)}
+                assert reduce.call_count == expected_calls[step]
+            assert [name for name, _ in result] == [name for values in expected for name, _ in values]
+            for (_, actual), (_, target) in zip(result, [pair for values in expected for pair in values], strict=True):
+                torch.testing.assert_close(actual, target)
+            if previous is not None:
+                for (_, tensor), saved in zip(previous[0], previous[1], strict=True):
+                    torch.testing.assert_close(tensor, saved)
+            previous = result, [tensor.clone() for _, tensor in result]
+
+            # The retained plan must not keep payload tensors or process groups.
+            def check_cpu_metadata(value):
+                assert not isinstance(value, (torch.Tensor, distributed.ProcessGroup))
+                if isinstance(value, dict):
+                    for item in value.values():
+                        check_cpu_metadata(item)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        check_cpu_metadata(item)
+
+            check_cpu_metadata(caches)
+    finally:
+        distributed.destroy_process_group()
+
+
+def test_cached_broadcast_pp_ep_values_and_collective_invalidation(tmp_path):
+    import torch.multiprocessing as multiprocessing
+
+    multiprocessing.start_processes(
+        _cached_gloo_worker,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
+    )
