@@ -23,18 +23,9 @@ jobs:
           # Comment events must never execute scripts from the contributor's branch.
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      - uses: actions/github-script@v8
-        env:
-          WELCOME_BOT_TOKEN: ${{ secrets.WELCOME_BOT_TOKEN }}
-          WELCOME_BOT_LOGIN: ${{ vars.WELCOME_BOT_LOGIN }}
+      - uses: ./.github/actions/ci-control
+        # During stack review, the action may not exist on the default branch yet.
+        if: hashFiles('.github/actions/ci-control/action.yml') != ''
         with:
-          script: |
-            if (!process.env.WELCOME_BOT_TOKEN) {
-              core.setFailed('Configure WELCOME_BOT_TOKEN before enabling CI comments.');
-              return;
-            }
-            const bot = new github.constructor({ auth: process.env.WELCOME_BOT_TOKEN });
-            const { control } = await import(`${process.env.GITHUB_WORKSPACE}/.github/ci/control.js`);
-            await control({
-              github, bot, context, core, botLogin: process.env.WELCOME_BOT_LOGIN || undefined,
-            });
+          bot-token: ${{ secrets.WELCOME_BOT_TOKEN }}
+          bot-login: ${{ vars.WELCOME_BOT_LOGIN }}
