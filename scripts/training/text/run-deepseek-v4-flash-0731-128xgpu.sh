@@ -57,7 +57,7 @@ ROLLOUT_ARGS=(
    --label-key label
    --apply-chat-template
    # Enable DeepSeek thinking mode consistently for rollout and evaluation.
-   --apply-chat-template-kwargs '{"enable_thinking": true}'
+   --apply-chat-template-kwargs '{"thinking": true}'
    --rollout-shuffle
    --num-rollout "${NUM_ROLLOUT}"
    --use-fault-tolerance
@@ -121,7 +121,6 @@ PERF_ARGS=(
    --max-tokens-per-gpu 6144
    --log-probs-chunk-size 4096
 
-   --moe-flex-dispatcher-backend deepep
    --moe-token-dispatcher-type alltoall
    --moe-router-dtype fp32
 )
