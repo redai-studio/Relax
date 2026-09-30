@@ -52,7 +52,7 @@ import logging
 
 import torch
 
-from relax.utils import device as device_utils
+from relax.utils.device import device_module
 
 
 logger = logging.getLogger(__name__)
@@ -97,8 +97,8 @@ def apply_patch():
         self._pinned_loc = torch.zeros(max_batch, dtype=torch.int64, device="cpu", pin_memory=True)
 
         # Dedicated copy stream + event.
-        self._copy_stream = device_utils.Stream(device=dev_buf.device)
-        self._copy_event = device_utils.Event()
+        self._copy_stream = device_module.Stream(device=dev_buf.device)
+        self._copy_event = device_module.Event()
 
         # Pending scatter state.
         self._pending_n = 0  # 0 means nothing pending
@@ -144,7 +144,7 @@ def apply_patch():
         # In overlap-scheduler mode this is the *forward_stream*; without
         # overlap it is the default stream.  We need this reference so that
         # copy_stream can order itself after the GPU→GPU staging copy below.
-        active_stream = device_utils.current_stream(self.device_cache.buffer.device)
+        active_stream = device_module.current_stream(self.device_cache.buffer.device)
 
         # 1) GPU→GPU snapshot on the active stream — fast, no sync.
         self._staging_buffer[:n_tok].copy_(self.device_cache.buffer[local_start_pos:local_end_pos])
@@ -152,7 +152,7 @@ def apply_patch():
         # 2) On copy stream: async copies to pinned CPU buffers.
         #    copy_stream waits on active_stream so the staging snapshot
         #    above completes before we start reading it.
-        with device_utils.stream_context(self._copy_stream):
+        with device_module.stream_context(self._copy_stream):
             self._copy_stream.wait_stream(active_stream)
             # 2a) Routing data: staging[:n_tok, :, :topk] → pinned_staging
             self._pinned_staging[:n_tok, :, :topk].copy_(self._staging_buffer[:n_tok, :, :topk], non_blocking=True)

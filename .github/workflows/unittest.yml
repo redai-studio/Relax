@@ -18,15 +18,23 @@ jobs:
   unittest:
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 60
+    # Allow 120 minutes for image preparation plus the existing 60-minute test job budget.
+    timeout-minutes: 180
     env:
-      CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
 
       - name: Acquire test devices
         id: devices
@@ -39,6 +47,7 @@ jobs:
 
       - name: Create test container
         env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
           HOST_UV_CACHE_DIR: /home/relax-ci/.cache/uv
           UV_CACHE_DIR: /uv-cache
@@ -50,7 +59,7 @@ jobs:
 
           # Keep network, IPC and /tmp private for parallel Ray/NCCL tests.
           # Create before starting so cancellation during a pull cannot start tests.
-          docker create --pull always --rm --init \
+          docker create --pull never --rm --init \
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \
@@ -81,6 +90,7 @@ jobs:
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run unittest
+        timeout-minutes: 10
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \
