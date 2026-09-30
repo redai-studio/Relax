@@ -1,4 +1,4 @@
-name: GPU Integration Tests
+name: Integration Tests
 
 on:
   push:
@@ -18,7 +18,8 @@ jobs:
   integration:
     name: ${{ matrix.case }}
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    timeout-minutes: 65
+    # Allow 120 minutes for image preparation plus the existing 65-minute test job budget.
+    timeout-minutes: 185
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +31,6 @@ jobs:
             script: scripts/training/multimodal/run-qwen3-vl-4B-2xgpu.sh
             gpus: 2
     env:
-      CI_IMAGE: ghcr.io/redai-studio/relaxrl:latest
       CI_CONTAINER_NAME: relax-integration-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       TRAINING_SCRIPT: ${{ matrix.script }}
       ARTIFACT_NAME: integration-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -39,6 +39,14 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          # Include patch targets as well as the symlinks under patch/latest.
+          hash-key: ${{ hashFiles('docker/Dockerfile', '.dockerignore', 'requirements.txt', 'docker/patch/**', 'relax/backends/megatron/kernels/int4_qat/**', '.github/actions/prepare-image/action.yml') }}
 
       - name: Acquire test devices
         id: devices
@@ -51,6 +59,7 @@ jobs:
 
       - name: Create test container
         env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
           CI_DEVICES: ${{ steps.devices.outputs.devices }}
           NUM_GPUS: ${{ matrix.gpus }}
           UV_CACHE_DIR: /uv-cache
@@ -63,7 +72,7 @@ jobs:
 
           # Each runner provisions the cases' model and dataset files in ~/model and ~/data.
           # Keep Ray processes, network, IPC and /tmp private to this container.
-          docker create --pull always --rm --init \
+          docker create --pull never --rm --init \
             --name "$CI_CONTAINER_NAME" \
             --gpus "\"device=$CI_DEVICES\"" \
             --shm-size=32g \
@@ -102,9 +111,125 @@ jobs:
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run integration test
-        timeout-minutes: 25
+        timeout-minutes: 10
         run: |
           docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -euo pipefail -c '
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+            unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
+            export no_proxy="*" NO_PROXY="*"
+            bash "$TRAINING_SCRIPT" 2>&1 | tee /artifacts/training.log
+          '
+
+      - name: Collect Ray logs
+        if: always()
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR/ray"
+          docker cp "$CI_CONTAINER_NAME:/tmp/ray/session_latest/logs/." "$ARTIFACT_DIR/ray/" || true
+
+      - name: Remove test container
+        if: always()
+        run: |
+          if docker inspect "$CI_CONTAINER_NAME" >/dev/null 2>&1; then
+            docker rm --force "$CI_CONTAINER_NAME"
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+  npu-integration:
+    name: Qwen3-4B-4xnpu-async
+    runs-on: [self-hosted, linux, ARM64, 910c, npu]
+    timeout-minutes: 185
+    env:
+      CI_CONTAINER_NAME: relax-npu-integration-${{ github.run_id }}-${{ github.run_attempt }}
+      TRAINING_SCRIPT: scripts/training/text/run-qwen3-4B-4xgpu-async-npu.sh
+      ARTIFACT_NAME: integration-Qwen3-4B-4xnpu-async-${{ github.run_id }}-${{ github.run_attempt }}
+      CLEARML_TAGS: branch=${{ github.head_ref || github.ref_name }},commit=${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare local test image
+        id: image
+        uses: ./.github/actions/prepare-image
+        timeout-minutes: 120
+        with:
+          dockerfile: docker/Dockerfile.npu
+          platform: linux/arm64
+          build-args: |
+            NO_PROXY=localhost,127.0.0.1,::1,mirrors.tuna.tsinghua.edu.cn
+            SOC_VERSION=ascend910_9362
+            SOC_VERSION_FOR_SGL_BUILD=Ascend910_9362
+          hash-key: ${{ hashFiles('docker/Dockerfile.npu', '.dockerignore', 'requirements.txt', 'docker/npu_patch/**', '.github/actions/prepare-image/action.yml') }}
+
+      - name: Acquire test devices
+        id: devices
+        uses: ./.github/actions/acquire-devices
+        timeout-minutes: 35
+        with:
+          backend: ascend
+          # Four compute chips; paired chips occupy two dual-chip 910C cards.
+          count: 4
+          timeout: 1800
+
+      - name: Create test container
+        env:
+          CI_IMAGE: ${{ steps.image.outputs.image-id }}
+          CI_DEVICES: ${{ steps.devices.outputs.devices }}
+          ARTIFACT_DIR: ${{ runner.temp }}/${{ env.ARTIFACT_NAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+
+          # Same model/data layout as GPU runners; Ascend Runtime mounts the host driver.
+          # Runtime selects host physical chips; CANN sees container-local IDs 0..3.
+          docker create --pull never --rm --init \
+            --name "$CI_CONTAINER_NAME" \
+            --runtime ascend \
+            --shm-size=32g \
+            -v "$GITHUB_WORKSPACE:/source:ro" \
+            -v "$ARTIFACT_DIR:/artifacts" \
+            --mount "type=bind,source=$HOME/model,target=/models,readonly" \
+            --mount "type=bind,source=$HOME/data,target=/data,readonly" \
+            --workdir /workspace/Relax \
+            --env "ASCEND_VISIBLE_DEVICES=$CI_DEVICES" \
+            --env ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+            --env CLEARML_TAGS \
+            --env NUM_ROLLOUT=4 \
+            --env MODEL_DIR=/models \
+            --env DATA_DIR=/data \
+            --env EXP_DIR=/artifacts \
+            --env CLEARML_OFFLINE_MODE=1 \
+            --entrypoint /bin/bash "$CI_IMAGE" -c 'sleep infinity'
+          docker inspect --format 'Test image: {{.Config.Image}} ({{.Image}})' "$CI_CONTAINER_NAME"
+          docker start "$CI_CONTAINER_NAME"
+
+      - name: Prepare workspace
+        run: |
+          docker exec "$CI_CONTAINER_NAME" bash -euc '
+            cp -a --no-preserve=ownership /source/. /workspace/Relax/
+          '
+
+      - name: Run integration test
+        timeout-minutes: 15
+        run: |
+          docker exec --env TRAINING_SCRIPT "$CI_CONTAINER_NAME" bash -eo pipefail -c '
+            source /usr/local/Ascend/ascend-toolkit/set_env.sh
+            source /usr/local/Ascend/nnal/atb/set_env.sh
+            source /usr/local/Ascend/cann-9.0.0/share/info/ascendnpu-ir/bin/set_env.sh
+            export LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}
+            npu-smi info
+            python3 -c "import torch, torch_npu; assert torch.npu.device_count() == 4, torch.npu.device_count()"
             unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
             unset RAY_NO_WAIT RAY_ADDRESS RELAX_ENTRYPOINT_MODE
             export no_proxy="*" NO_PROXY="*"

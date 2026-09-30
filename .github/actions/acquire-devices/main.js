@@ -31,9 +31,9 @@ async function main() {
     lock_dir : input('lock-dir', '/tmp/acquire-devices'),
     parent_pid : process.pid,
   };
-  if (config.backend !== 'nvidia')
+  if (!['nvidia', 'ascend'].includes(config.backend))
     throw new Error(
-        `Unsupported backend: ${config.backend}; supported: nvidia`);
+        `Unsupported backend: ${config.backend}; supported: nvidia, ascend`);
   if (!path.isAbsolute(config.lock_dir))
     throw new Error('lock-dir must be an absolute host path');
   for (const name of ['GITHUB_STATE', 'GITHUB_OUTPUT', 'GITHUB_ENV']) {
