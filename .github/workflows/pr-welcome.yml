@@ -25,4 +25,4 @@ jobs:
         if: hashFiles('.github/actions/pr-welcome/action.yml') != ''
         with:
           bot-token: ${{ secrets.WELCOME_BOT_TOKEN }}
-          bot-login: ${{ vars.WELCOME_BOT_LOGIN || 'rai-studio-bot' }}
+          bot-login: ${{ vars.WELCOME_BOT_LOGIN }}

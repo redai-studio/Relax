@@ -6,7 +6,7 @@ inputs:
     required: true
   bot-login:
     description: Expected GitHub login of the welcome bot
-    default: rai-studio-bot
+    required: true
   docs-url:
     description: Published Relax documentation URL
     default: https://redai-studio.github.io/Relax

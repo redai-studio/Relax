@@ -11,6 +11,7 @@ export function renderWelcome({ author, repositoryUrl, defaultBranch, docsUrl })
 }
 
 export async function run({ github, context, botLogin, docsUrl }) {
+  if (!botLogin) throw new Error('Configure WELCOME_BOT_LOGIN before posting welcome comments.');
   const pr = context.payload.pull_request;
   const { data: identity } = await github.rest.users.getAuthenticated();
   if (identity.login.toLowerCase() !== botLogin.toLowerCase()) {
