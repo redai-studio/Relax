@@ -129,7 +129,7 @@ git push origin feat/your-change
 
 After pushing, open a PR on GitHub. Select your working branch in your fork as the source and **`main` in `redai-studio/Relax`** as the target, then fill out the [PR template](https://github.com/redai-studio/Relax/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
 
-Address any CI failures and review feedback on the same branch. Validate, commit, and push your changes to update the PR.
+Address any [CI failures](#ci) and review feedback on the same branch. Validate, commit, and push your changes to update the PR.
 
 ## Code Style Guidelines
 
@@ -258,6 +258,35 @@ Users need flexibility to define custom reward logic for their tasks
 - Tested with DeepEyes example
 - Verified backward compatibility
 ```
+
+## CI
+
+PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI, put one command on the first line of a new PR comment. Rerun and cancel are available to the PR author and contributors with repository write access.
+
+| Command | Usage |
+| --- | --- |
+| `/rerun` | Retry failed jobs in the latest failed or timed-out workflows for the current commit |
+| `/rerun <target>` | Rerun one workflow or check; use `all` for all completed CI workflows |
+| `/cancel <workflow>` | Cancel an entire workflow, including its matrix jobs; `all` cancels all active CI workflows |
+| `/help` | Show commands and targets |
+| `/review` | Request a code review |
+
+Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
+
+| Target | Workflow / check |
+| --- | --- |
+| `ci` | All pre-commit and CPU checks |
+| `ci/pre-commit` | Pre-commit checks |
+| `ci/cpu-310`, `ci/cpu-311`, `ci/cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
+| `gpu-unit` | GPU unit tests |
+| `integration` | All GPU/NPU integration tests |
+| `integration/gpu-async` | Qwen3-4B GPU async training |
+| `integration/gpu-vl` | Qwen3-VL-4B GPU training |
+| `integration/npu-async` | Qwen3-4B NPU async training |
+
+`/cancel` supports workflow-level cancellation only: it cancels an entire workflow (`ci`, `gpu-unit`, `integration`, or `all`), not an individual job (such as `integration/gpu-vl`).
+
+`/rerun` applies only to completed CI runs: it can only rerun jobs that already exist for the current commit. If a run is still in progress, wait for it to finish or cancel it before rerunning.
 
 ## Communication and Feedback
 
