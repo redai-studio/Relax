@@ -274,13 +274,15 @@ PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI
 | Target | Workflow / check |
 | --- | --- |
 | `ci` | All pre-commit and CPU checks |
-| `pre-commit` | Pre-commit checks |
-| `cpu-310`, `cpu-311`, `cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
+| `ci/pre-commit` | Pre-commit checks |
+| `ci/cpu-310`, `ci/cpu-311`, `ci/cpu-312` | CPU tests on Python 3.10 / 3.11 / 3.12 |
 | `gpu-unit` | GPU unit tests |
 | `integration` | All GPU/NPU integration tests |
-| `gpu-async` | Qwen3-4B GPU async training |
-| `gpu-vl` | Qwen3-VL-4B GPU training |
-| `npu-async` | Qwen3-4B NPU async training |
+| `integration/gpu-async` | Qwen3-4B GPU async training |
+| `integration/gpu-vl` | Qwen3-VL-4B GPU training |
+| `integration/npu-async` | Qwen3-4B NPU async training |
+
+Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
 
 Cancellation accepts workflow targets (`ci`, `gpu-unit`, `integration`, or `all`). Rerun operates on existing runs for the current commit; wait for an active run to finish or cancel it before rerunning.
 

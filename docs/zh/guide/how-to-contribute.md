@@ -274,13 +274,15 @@ PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI �
 | Target | Workflow / 检查 |
 | --- | --- |
 | `ci` | 全部 pre-commit 与 CPU 检查 |
-| `pre-commit` | Pre-commit 检查 |
-| `cpu-310`、`cpu-311`、`cpu-312` | Python 3.10 / 3.11 / 3.12 CPU 测试 |
+| `ci/pre-commit` | Pre-commit 检查 |
+| `ci/cpu-310`、`ci/cpu-311`、`ci/cpu-312` | Python 3.10 / 3.11 / 3.12 CPU 测试 |
 | `gpu-unit` | GPU 单元测试 |
 | `integration` | 全部 GPU/NPU 集成测试 |
-| `gpu-async` | Qwen3-4B GPU 异步训练 |
-| `gpu-vl` | Qwen3-VL-4B GPU 训练 |
-| `npu-async` | Qwen3-4B NPU 异步训练 |
+| `integration/gpu-async` | Qwen3-4B GPU 异步训练 |
+| `integration/gpu-vl` | Qwen3-VL-4B GPU 训练 |
+| `integration/npu-async` | Qwen3-4B NPU 异步训练 |
+
+Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit/CPU workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
 
 取消操作接受 workflow target（`ci`、`gpu-unit`、`integration` 或 `all`）。重跑只操作当前提交已有的 run；若 run 仍在运行，请等待结束或取消后再重跑。
 
