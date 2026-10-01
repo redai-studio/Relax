@@ -284,7 +284,9 @@ Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑
 | `integration/gpu-vl` | Qwen3-VL-4B GPU 训练 |
 | `integration/npu-async` | Qwen3-4B NPU 异步训练 |
 
-取消操作接受 workflow target（`ci`、`gpu-unit`、`integration` 或 `all`）。重跑只操作当前提交已有的 run；若 run 仍在运行，请等待结束或取消后再重跑。
+`/cancel` 仅支持工作流级别：只能取消整个工作流（可选 `ci`、`gpu-unit`、`integration` 或 `all`），不支持单独取消某一个子 Job（如 `integration/gpu-vl`）。
+
+`/rerun` 仅针对已结束的 CI 记录：只能重跑当前 commit 已有的任务；若任务仍在运行中，需等待其结束或先将其取消后再重跑。
 
 ## 交流与反馈
 

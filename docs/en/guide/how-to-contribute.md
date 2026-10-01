@@ -284,7 +284,9 @@ Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns 
 | `integration/gpu-vl` | Qwen3-VL-4B GPU training |
 | `integration/npu-async` | Qwen3-4B NPU async training |
 
-Cancellation accepts workflow targets (`ci`, `gpu-unit`, `integration`, or `all`). Rerun operates on existing runs for the current commit; wait for an active run to finish or cancel it before rerunning.
+`/cancel` supports workflow-level cancellation only: it cancels an entire workflow (`ci`, `gpu-unit`, `integration`, or `all`), not an individual job (such as `integration/gpu-vl`).
+
+`/rerun` applies only to completed CI runs: it can only rerun jobs that already exist for the current commit. If a run is still in progress, wait for it to finish or cancel it before rerunning.
 
 ## Communication and Feedback
 
