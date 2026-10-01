@@ -59,6 +59,6 @@
 ## #401 合入后的第二轮复测
 
 - 默认分支修复 PR 评论写入权限后，用新的评论事件重测 T02～T08、T10～T15；保留第一轮记录并链接新证据。
-- 临时 `test_000_ci_command_smoke_probe.py` 仅在本仓库、本 draft 分支、CI workflow 的 CPU job 生效。Python 3.10 产生明确的预期失败；Python 3.11/3.12 提前退出成功，作为重跑选择的合成控制组，不代表完整单测通过。
+- 临时 `tests/000_ci_command_smoke/test_ci_command_smoke_probe.py` 仅在本仓库、本 draft 分支、CI workflow 的 CPU job 生效。Python 3.10 产生明确的预期失败；Python 3.11/3.12 提前退出成功，作为重跑选择的合成控制组，不代表完整单测通过。
 - 以日志确认探针确实执行；测试收集错误或依赖安装失败不能冒充探针失败。复测结束后删除探针。
 - T17 补充检查豁免后的 required contexts；当前 job 级豁免使 matrix 未展开，缺少 5 个具名检查，保持失败。该缺陷独立于 #401 的权限修复。
