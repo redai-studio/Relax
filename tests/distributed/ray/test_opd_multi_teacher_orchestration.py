@@ -14,6 +14,8 @@ import sys
 from argparse import Namespace
 from types import ModuleType
 
+import pytest
+
 
 def _install_fake_teacher_manager(monkeypatch, captured):
     teacher_manager_module = ModuleType("relax.distributed.ray.teacher_manager")
@@ -72,7 +74,8 @@ def _base_args(**overrides):
     return Namespace(**defaults)
 
 
-def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monkeypatch):
+@pytest.mark.parametrize("colocate", [True, False])
+def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monkeypatch, colocate):
     """Two teachers with equal GPU shares (the only shape MOPD currently
     supports, since it enforces an even split) must land at non-overlapping,
     monotonically increasing bundle offsets starting after the rollout
@@ -83,8 +86,9 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     from relax.utils.opd import opd_utils
 
     captured = {"calls": [], "ctor_calls": {}}
+    monkeypatch.setattr(opd_utils, "_publish_teacher_gateway", lambda args, managers: None)
     _install_fake_teacher_manager(monkeypatch, captured)
-    monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: True)
+    monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: colocate)
     full_pg = ("pg", list(range(16)), list(range(16)))
     monkeypatch.setattr(
         "relax.core.service.create_placement_group",
@@ -98,7 +102,7 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
 
     shared_pg, managers = opd_utils._start_managed_multi_teacher(args, routes_json)
 
-    assert shared_pg == full_pg
+    assert shared_pg == (full_pg if colocate else None)
     assert isinstance(managers, list) and len(managers) == 2
 
     # TeacherManager adds rollout_num_gpus itself, so these offsets are
@@ -107,8 +111,8 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 4
     assert captured["ctor_calls"]["/ckpt/math"]["num_replicas"] == 1
     assert captured["ctor_calls"]["/ckpt/math"]["gpus_per_replica"] == 4
-    assert captured["ctor_calls"]["/ckpt/math"]["shared_pg"] is True
-    assert captured["ctor_calls"]["/ckpt/math"]["pg"] == full_pg
+    assert captured["ctor_calls"]["/ckpt/math"]["shared_pg"] is colocate
+    assert captured["ctor_calls"]["/ckpt/math"]["pg"] == (full_pg if colocate else None)
 
     assert args.opd_teacher_routes_map == {
         "math": ["http://math/generate"],
@@ -116,22 +120,7 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     }
 
 
-def test_multi_teacher_requires_colocate(monkeypatch):
-    import pytest
-
-    from relax.utils.opd import opd_utils
-
-    monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: False)
-    args = _base_args()
-    routes_json = json.dumps({"math": "/ckpt/math"})
-
-    with pytest.raises(ValueError, match="requires colocate mode"):
-        opd_utils._start_managed_multi_teacher(args, routes_json)
-
-
 def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
-    import pytest
-
     from relax.utils.opd import opd_utils
 
     monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: True)

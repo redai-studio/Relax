@@ -11,7 +11,7 @@ import logging
 
 import ray
 
-from relax.backends.sglang.sglang_engine import GenRMEngine
+from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -29,7 +29,7 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"discovery": 4})
 class GenRMManager(MultiEngineManager):
     """Manager for GenRM engines.
 
@@ -55,10 +55,14 @@ class GenRMManager(MultiEngineManager):
             args,
             num_slots=num_slots,
             nodes_per_engine=nodes_per_engine,
-            engine_actor_cls=GenRMEngine,
-            skip_init=args.debug_train_only,
+            engine_actor_cls=SGLangEngine,
+            skip_init=args.debug_train_only or getattr(args, "defer_reward_to_post_process", False),
             log_prefix="GenRM",
         )
+        if getattr(args, "defer_reward_to_post_process", False):
+            self._onloaded = False
+            self.inference.state = "sleeping"
+            self.inference.phase = "genrm"
         self.num_new_engines = len(self.engines)
         self.genrm_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
@@ -99,12 +103,23 @@ class GenRMManager(MultiEngineManager):
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank):
-        gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        if not self.args.fully_async and not shared_with_rollout:
-            gpu_idx += self.args.rollout_num_gpus
+        default_start = (
+            self.args.rollout_num_gpus
+            if getattr(self.args, "colocate", False)
+            and not self.args.fully_async
+            and not getattr(self.args, "_genrm_colocate_with_rollout", False)
+            else 0
+        )
+        gpu_idx = (
+            rank * self.num_gpu_per_engine
+            + self.bundle_offset
+            + getattr(self.args, "_genrm_bundle_start", default_start)
+        )
 
         return self.pg, False, gpu_idx
+
+    def _build_engine_ctor_kwargs(self, rank: int) -> dict:
+        return {"role": "genrm", "num_gpus_per_engine": self.args.genrm_num_gpus_per_engine}
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with
@@ -112,6 +127,7 @@ class GenRMManager(MultiEngineManager):
         # rejection).
         shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
         default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
+        default_ray_num_gpus = getattr(self.args, "_inference_ray_gpu_fraction", default_ray_num_gpus)
         num_gpus = getattr(self.args, "genrm_ray_num_gpus", default_ray_num_gpus)
         return {"num_cpus": num_gpus, "num_gpus": num_gpus}
 
@@ -162,6 +178,18 @@ def _allocate_genrm_engine_addr_and_ports(*, args, new_engines, port_window_inde
             f"GenRM port window index {port_window_index} is out of range; "
             f"at most {(_MAX_PORT - _GENRM_PORT_BASE + 1) // _GENRM_PORT_WINDOW_SIZE} instances are supported."
         )
+
+    if getattr(args, "_inference_placement", None):
+        from relax.distributed.ray.inference_ports import allocate_inference_ports
+
+        addresses, _ = allocate_inference_ports(
+            new_engines,
+            nodes_per_engine=max(1, args.genrm_num_gpus_per_engine // args.num_gpus_per_node),
+            base_port=window_start,
+            max_port=window_end,
+            dp_size=args.genrm_engine_config.get("dp_size", 1),
+        )
+        return addresses
 
     num_engines_per_node = max(1, min(args.num_gpus_per_node, args.genrm_num_gpus) // args.genrm_num_gpus_per_engine)
     addr_and_ports = {}

@@ -320,6 +320,11 @@ class TestEngineGroupProperties:
 
 
 class TestRolloutServerProperties:
+    def test_model_path_is_preserved(self):
+        server = make_rollout_server(model_path="/models/qwen3-0.6b")
+
+        assert server.model_path == "/models/qwen3-0.6b"
+
     def test_engines_across_groups(self):
         args = type("A", (), {"num_gpus_per_node": 8})()
         g1 = make_engine_group(args=args, engines=[make_mock_engine(), make_mock_engine()])

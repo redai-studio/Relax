@@ -33,6 +33,8 @@ Rollout 运行后台循环：
 3. Actor 推送新权重
 4. Actor 调用 `/end_update_weight` 恢复 rollout
 
+三类推理角色共用的路由、discovery 和生命周期见[统一推理服务](./inference.md)。
+
 ## HTTP 端点
 
 <SwaggerUI specUrl="/Relax/openapi/rollout.json" />

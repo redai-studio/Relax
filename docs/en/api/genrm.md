@@ -37,6 +37,8 @@ Two colocate sub-modes are auto-detected from the GPU allocation:
 - **Split** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy disjoint bundles.
 - **Shared** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy the same bundles, splitting each GPU's memory via SGLang `mem_fraction_static`. GenRM reads its `mem_fraction_static` from `--genrm-engine-config`. GenRM never sources weights from the Actor; onload only resumes its KV cache and CUDA graphs.
 
+See [Unified inference service](./inference.md) for shared APIs, placement, and deferred execution.
+
 See [GenRM example](/en/examples/generative-reward-model) for full configuration.
 
 ### Multiple Instances (`route_key`)

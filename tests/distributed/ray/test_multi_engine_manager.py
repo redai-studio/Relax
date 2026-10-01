@@ -25,6 +25,7 @@ try:
     HAS_DEPS = True
 except ImportError:
     HAS_DEPS = False
+    MultiEngineManager = object
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="requires ray")
@@ -44,9 +45,16 @@ class _RemoteCall:
 
 
 class _FakeEngine:
-    def __init__(self, name: str, *, dead_methods: frozenset = frozenset()):
+    def __init__(
+        self,
+        name: str,
+        *,
+        dead_methods: frozenset = frozenset(),
+        actor_dead_methods: frozenset = frozenset(),
+    ):
         self.name = name
         self.dead_methods = dead_methods
+        self.actor_dead_methods = actor_dead_methods
         self.calls: list[str] = []
 
     def __getattr__(self, method: str):
@@ -120,6 +128,8 @@ def _patch_ray(monkeypatch):
         if isinstance(handle_or_list, list):
             return [fake_get(h) for h in handle_or_list]
         engine, method = handle_or_list
+        if method in engine.actor_dead_methods:
+            raise RuntimeError(f"{engine.name} actor is gone")
         if method in engine.dead_methods:
             raise ConnectionError(f"{engine.name} is dead for {method}")
         engine.calls.append(method)
@@ -203,6 +213,28 @@ def test_retire_engines_kills_and_nulls_the_slot(_patch_ray):
     assert dead_engine in _patch_ray.killed
 
 
+def test_dead_ray_actor_is_acknowledged_and_recoverable(_patch_ray, monkeypatch):
+    placement_group = sys.modules["ray.util.placement_group"]
+    removed = []
+    monkeypatch.setattr(placement_group, "remove_placement_group", removed.append)
+    manager = _FakeManager(num_slots=1, owns_pg=True)
+    dead_engine = manager.all_engines[0]
+    dead_engine.actor_dead_methods = frozenset({"shutdown"})
+
+    # The fixture represents RayActorError as RuntimeError so this remains a
+    # dependency-light test while exercising the real dead-actor branch.
+    manager._cleanup_slots([0])
+
+    assert manager.all_engines == [None]
+    assert not manager._cleanup_pending
+    assert removed == ["pg-0"]
+    assert dead_engine in _patch_ray.killed
+
+    rebuilt = manager.recover()
+    assert rebuilt == {0}
+    assert manager.all_engines[0] is not dead_engine
+
+
 def test_recover_rebuilds_only_the_dead_slot(_patch_ray):
     manager = _FakeManager(num_slots=2)
     original_engine_1 = manager.all_engines[1]
@@ -235,8 +267,27 @@ def test_recover_raises_on_total_wipeout(_patch_ray, monkeypatch):
 
     monkeypatch.setattr(mem.ray, "remote", lambda cls: _FailingActor)
 
-    with pytest.raises(RuntimeError, match="could not be rebuilt"):
+    with pytest.raises(RuntimeError, match="scheduling failed"):
         manager.recover()
+
+
+def test_recover_failure_with_live_peer_closes_discovery(_patch_ray, monkeypatch):
+    manager = _FakeManager(num_slots=2)
+    manager.all_engines[0] = None
+
+    def fail_ports(self, *, new_engines):
+        raise RuntimeError("replacement placement unavailable")
+
+    monkeypatch.setattr(_FakeManager, "_allocate_engine_addr_and_ports", fail_ports)
+
+    with pytest.raises(RuntimeError, match="replacement placement unavailable"):
+        manager.recover()
+
+    assert manager.all_engines[1] is not None
+    assert manager.inference.state == "failed"
+    snapshot = manager.get_inference_snapshot()
+    assert snapshot["models"]["default"]["state"] == "failed"
+    assert all(not engine["direct_eligible"] for engine in snapshot["models"]["default"]["engines"])
 
 
 def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray, monkeypatch):
@@ -255,3 +306,163 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+def test_startup_port_failure_rolls_back_all_candidates(_patch_ray, monkeypatch):
+    def failed_ports(self, **kwargs):
+        raise RuntimeError("port allocation failed")
+
+    monkeypatch.setattr(_FakeManager, "_allocate_engine_addr_and_ports", failed_ports)
+    with pytest.raises(RuntimeError, match="port allocation"):
+        _FakeManager(num_slots=3)
+    assert _patch_ray.killed == _patch_ray.created
+    assert all(e.calls == ["shutdown"] for e in _patch_ray.created)
+
+
+def test_multinode_discovery_exposes_heads_and_shutdown_kills_followers(_patch_ray):
+    manager = _FakeManager(num_slots=4)
+    manager.nodes_per_engine = 2
+    first = manager.get_inference_snapshot()
+    assert len(first["models"]["default"]["engines"]) == 2
+    manager.offload()
+    sleeping = manager.get_inference_snapshot()
+    assert all(not e["direct_eligible"] for e in sleeping["models"]["default"]["engines"])
+    assert sleeping["topology_revision"] > first["topology_revision"]
+    manager.shutdown()
+    manager.shutdown()
+    assert len(_patch_ray.killed) == 4
+    assert all(e is None for e in manager.all_engines)
+
+
+def test_partial_onload_full_resume_and_rollback(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    manager.offload()
+    manager.onload(tags=["weights"])
+    assert manager.get_inference_snapshot()["models"]["default"]["state"] == "onloading"
+    manager.onload()
+    assert engine.calls.count("resume_memory_occupation") == 2
+    manager.offload()
+    manager.onload(tags=["weights"])
+    manager.offload()
+    assert engine.calls.count("release_memory_occupation") == 3
+
+
+@pytest.mark.parametrize("failed_operation", ["shutdown", "kill"])
+def test_failed_retirement_preserves_handle_and_owned_pg_until_retry(_patch_ray, monkeypatch, failed_operation):
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    removed = []
+    monkeypatch.setattr(sys.modules["ray.util.placement_group"], "remove_placement_group", removed.append)
+    manager = _FakeManager(num_slots=1, owns_pg=True)
+    engine = manager.all_engines[0]
+    engine.dead_methods = frozenset({"release_memory_occupation", "shutdown"})
+    if failed_operation == "kill":
+        engine.dead_methods = frozenset({"release_memory_occupation"})
+        monkeypatch.setattr(mem.ray, "kill", lambda actor: (_ for _ in ()).throw(OSError("kill failed")))
+
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.offload()
+    assert manager.inference.state == "failed"
+    assert manager.all_engines == [engine]
+    assert manager._cleanup_pending == {0}
+    assert manager._engine_placements and not removed
+    assert not _patch_ray.killed
+    with pytest.raises(RuntimeError, match="cleanup pending"):
+        manager.onload()
+    with pytest.raises(RuntimeError, match="cleanup pending"):
+        manager.recover()
+
+    engine.dead_methods = frozenset()
+    monkeypatch.setattr(mem.ray, "kill", _patch_ray.killed.append)
+    manager.offload()
+    assert manager.inference.state == "sleeping"
+    assert manager.all_engines == [None]
+    assert not manager._cleanup_pending
+    assert removed == ["pg-0"]
+
+
+def test_offload_retries_pending_follower_after_head_is_removed(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    manager.nodes_per_engine = 2
+    head, follower = manager.all_engines
+    head.dead_methods = frozenset({"release_memory_occupation"})
+    follower.dead_methods = frozenset({"shutdown"})
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.offload()
+    assert manager.all_engines == [None, follower]
+    assert manager._cleanup_pending == {1}
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.offload()
+    assert manager.inference.state == "failed"
+    follower.dead_methods = frozenset()
+    manager.offload()
+    assert manager.inference.state == "sleeping"
+    assert not manager._cleanup_pending
+    assert _patch_ray.killed == [head, follower]
+
+
+async def test_failed_manager_cleanup_retains_phase_and_blocks_next_model(_patch_ray):
+    from relax.inference.lifecycle import LifecycleCoordinator
+
+    manager = _FakeManager(num_slots=1)
+    manager.all_engines[0].dead_methods = frozenset({"release_memory_occupation", "shutdown"})
+    coordinator = LifecycleCoordinator()
+
+    async def idle():
+        return None
+
+    async def release():
+        manager.offload()
+
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        await coordinator.run_phase("teacher", idle, release, idle)
+    assert coordinator.phase == "teacher"
+    with pytest.raises(RuntimeError, match="lease retained"):
+        await coordinator.run_phase("genrm", idle, idle, idle)
+
+
+def test_failed_pg_removal_keeps_ownership_for_shutdown_retry(_patch_ray, monkeypatch):
+    placement = sys.modules["ray.util.placement_group"]
+    manager = _FakeManager(num_slots=1, owns_pg=True)
+    monkeypatch.setattr(placement, "remove_placement_group", lambda pg: (_ for _ in ()).throw(OSError("PG failed")))
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.shutdown()
+    assert manager.all_engines == [None]
+    assert 0 in manager._engine_placements
+    assert manager._cleanup_pending == {0}
+    removed = []
+    monkeypatch.setattr(placement, "remove_placement_group", removed.append)
+    manager.shutdown()
+    assert manager.inference.state == "dead"
+    assert not manager._engine_placements and not manager._cleanup_pending
+    assert removed == ["pg-0"]
+
+
+def test_startup_cleanup_failure_does_not_skip_other_candidates(_patch_ray, monkeypatch):
+    def fail_ports(self, *, new_engines):
+        new_engines[0][1].dead_methods = frozenset({"shutdown"})
+        raise RuntimeError("port allocation failed")
+
+    monkeypatch.setattr(_FakeManager, "_allocate_engine_addr_and_ports", fail_ports)
+    manager = _FakeManager.__new__(_FakeManager)
+    with pytest.raises(RuntimeError, match="cleanup unconfirmed"):
+        manager.__init__(num_slots=3)
+    assert manager.all_engines == [_patch_ray.created[0], None, None]
+    assert _patch_ray.killed == _patch_ray.created[1:]
+    assert manager._cleanup_pending == {0}
+
+
+def test_recovery_never_counts_uncleaned_startup_as_rebuilt(_patch_ray, monkeypatch):
+    manager = _FakeManager(num_slots=1)
+    manager._retire_engines([0])
+
+    def fail_ports(self, *, new_engines):
+        new_engines[0][1].dead_methods = frozenset({"shutdown"})
+        raise RuntimeError("port allocation failed")
+
+    monkeypatch.setattr(_FakeManager, "_allocate_engine_addr_and_ports", fail_ports)
+    with pytest.raises(RuntimeError, match="cleanup pending"):
+        manager.recover()
+    assert manager.inference.state == "failed"
+    assert manager._cleanup_pending == {0}

@@ -41,7 +41,6 @@ from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
-    shutdown_managed_opd_teacher,
 )
 from relax.utils.s3_model_loader import (
     cleanup_s3_model_weights_from_shm,
@@ -166,6 +165,7 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._startup_shared_pg = None
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -221,6 +221,7 @@ class Controller:
         try:
             self.register_all_serve()
         except Exception as e:
+            self._rollback_inference_startup()
             self._report_error_to_metrics_service(e)
             raise
 
@@ -476,6 +477,7 @@ class Controller:
         """
         if actor_rollout_pg_roles is None:
             actor_rollout_pg_roles = ACTOR_ROLLOUT_PG_ROLES
+        service = None
         try:
             service = Service(
                 cls,
@@ -485,14 +487,16 @@ class Controller:
                 num_gpus=num_gpus,
                 data_source=data_source,
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
-                defer_deploy=defer_deploy,
+                defer_deploy=True,
                 runtime_env=self.runtime_env,
             )
+            if not defer_deploy:
+                service.deploy()
             logger.info(f"Service {role} has been created successfully")
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to create service {role}: {e}")
-            return (role, None, str(e))
+            return (role, service, str(e))
 
     @staticmethod
     def _deploy_service_task(role, service):
@@ -501,7 +505,7 @@ class Controller:
             return (role, service, None)
         except Exception as e:
             logger.exception(f"Failed to deploy service {role}: {e}")
-            return (role, None, str(e))
+            return (role, service, str(e))
 
     def _run_service_phase(
         self,
@@ -523,6 +527,7 @@ class Controller:
             results = [task(*args) for args in task_args]
 
         failed_roles = [(role, error) for role, _service, error in results if error is not None]
+        self.serve_dict.update({role: service for role, service, _error in results if service is not None})
         if failed_roles:
             error_msg = "; ".join(f"{role}: {error}" for role, error in failed_roles)
             raise RuntimeError(f"Failed to {phase.value} {len(failed_roles)} services: {error_msg}")
@@ -678,6 +683,11 @@ class Controller:
         else:
             total_required = sum(num_gpus for _, _, num_gpus, _ in roles_to_create)
 
+        if not colocate or getattr(self.config, "hybrid", False):
+            from relax.utils.opd.opd_utils import is_managed_opd_teacher_enabled
+
+            if is_managed_opd_teacher_enabled(self.config):
+                total_required += self.config.resource["teacher"][1]
         cluster_resources = ray.cluster_resources()
         accel_resource = device_utils.get_ray_accelerator_name()
         total_available = int(cluster_resources.get(accel_resource, 0))
@@ -727,10 +737,9 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
-        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
-            self.config,
-            runtime_env=self.runtime_env,
-        )
+        from relax.inference.placement import PlacementPlanner
+
+        PlacementPlanner.apply(self.config)
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -780,6 +789,12 @@ class Controller:
         actor_rollout_pg_roles = _actor_rollout_pg_roles(self.config)
         self._validate_gpu_resources(roles_to_create, colocate, actor_rollout_pg_roles)
 
+        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+            self.config,
+            runtime_env=self.runtime_env,
+        )
+        self._startup_shared_pg = actor_rollout_pgs
+
         if colocate and not self.config.hybrid:
             # Sync colocate: actor and rollout share GPUs via time-sharing (offload/onload)
             if actor_rollout_pgs is None:
@@ -788,6 +803,7 @@ class Controller:
                     num_gpus=num_gpus,
                     node_group_affinity=self.config.enable_affinity,
                 )
+                self._startup_shared_pg = actor_rollout_pgs
         else:
             # fully_async (pure or hybrid): actor and rollout use separate GPUs
             actor_rollout_pgs = None
@@ -813,6 +829,58 @@ class Controller:
             logger.info(f"S3 model prefetch completed on {len(model_prefetch_refs)} consumer nodes")
 
         logger.info(f"All {len(self.serve_dict)} services registered successfully: {list(self.serve_dict.keys())}")
+
+    def _shutdown_static_inference(self) -> None:
+        managers = self._teacher_manager if isinstance(self._teacher_manager, list) else [self._teacher_manager]
+        managers = [manager for manager in managers if manager is not None]
+        genrm = self.serve_dict.get(GENRM_ROLE)
+        if genrm is not None and getattr(genrm, "_deployed", False):
+            for key in getattr(self.config, "_genrm_instances_resolved", {}):
+                try:
+                    managers.append(run(asyncio.wait_for(genrm.get_genrm_manager(key), timeout=30)))
+                except Exception:
+                    logger.exception("Cannot retrieve GenRM manager during cleanup")
+        for manager in managers:
+            try:
+                ray.get(manager.shutdown.remote(), timeout=60)
+            except Exception:
+                logger.exception("Cannot shut down static inference manager")
+            try:
+                ray.kill(manager)
+            except Exception:
+                logger.exception("Cannot kill static inference manager")
+        if getattr(self.config, "opd_teacher_gateway_url", None):
+            try:
+                serve.delete("teacher")
+            except Exception:
+                logger.exception("Cannot remove Teacher gateway")
+
+    def _rollback_inference_startup(self) -> None:
+        """Release only resources owned by this failed startup transaction."""
+        rollout = self.serve_dict.get(ROLES.rollout)
+        if rollout is not None and getattr(rollout, "_deployed", False):
+            try:
+                manager = run(asyncio.wait_for(rollout.get_rollout_manager(), timeout=30))
+                ray.get(manager.dispose.remote(), timeout=60)
+                ray.kill(manager)
+            except Exception:
+                logger.exception("Cannot dispose Rollout during startup rollback")
+        self._shutdown_static_inference()
+        owned_pgs = []
+        for role, service in self.serve_dict.items():
+            try:
+                serve.delete(str(role))
+            except Exception:
+                logger.exception("Cannot remove failed service %s", role)
+            if service.pgs is not None and not service._is_shared_pgs:
+                owned_pgs.append(service.pgs[0])
+        if self._startup_shared_pg is not None:
+            owned_pgs.append(self._startup_shared_pg[0])
+        for pg in dict.fromkeys(owned_pgs):
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                logger.exception("Cannot release owned placement group")
 
     def _report_error_to_metrics_service(self, error: Exception):
         """Report error to metrics service for Apprise notification.
@@ -854,6 +922,13 @@ class Controller:
         # Start all services in parallel without blocking on their completion
         # Each service runs independently: rollout, actor, critic, etc.
         async def run_all_services(*, resume_existing: bool = False):
+            if not resume_existing and not self.config.debug_train_only and GENRM_ROLE in self.serve_dict:
+                genrm_managers = [
+                    await self.serve_dict[GENRM_ROLE].get_genrm_manager(key)
+                    for key in self.config._genrm_instances_resolved
+                ]
+                rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
+                await rollout_manager.set_inference_genrm_managers.remote(genrm_managers)
             if not resume_existing and not (self.config.debug_train_only or self.config.debug_rollout_only):
                 # Pass genRM manager(s) to actor for coordinated offload/onload
                 if GENRM_ROLE in self.serve_dict and not self.config.fully_async:
@@ -909,12 +984,21 @@ class Controller:
                     # Pure fully_async: actor sends weights to separate actor_fwd/reference services
                     # via checkpoint engine. Hybrid mode skips this because the actor handles
                     # ref/actor_fwd internally via _switch_model.
-                    handles = [self.serve_dict[ROLES.actor].update_weights_fully_async()]
+                    # A decoupled actor+rollout deployment has no actor_fwd or reference
+                    # consumer.  Skip the actor-fwd metadata/broadcast path in that
+                    # topology; there is no receiver for it and it can leave the initial
+                    # rollout weight transaction waiting before the training loops start.
+                    has_forward_consumers = ROLES.actor_fwd in self.serve_dict or ROLES.reference in self.serve_dict
+                    handles = [
+                        self.serve_dict[ROLES.actor].update_weights_fully_async(
+                            rollout_only=not has_forward_consumers,
+                        )
+                    ]
                     if ROLES.actor_fwd in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                    await asyncio.gather(*handles)
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
@@ -1002,7 +1086,7 @@ class Controller:
             except Exception as e:
                 logger.warning(f"Failed to dispose RolloutManager: {e}")
 
-        shutdown_managed_opd_teacher(self._teacher_manager)
+        self._shutdown_static_inference()
 
         self._shutdown_agentic_rollout_services()
 

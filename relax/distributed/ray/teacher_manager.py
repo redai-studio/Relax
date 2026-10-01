@@ -6,10 +6,8 @@ import ray
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
-from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
-from relax.utils.http_utils import find_available_port
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_overrides
 
@@ -30,7 +28,9 @@ def _resolve_teacher_gpu_index(
     # teachers occupy the bundles after it. ``bundle_offset`` is this teacher's
     # slice start within the teacher region so multiple teachers (MOPD) sharing the
     # one actor PG do not collide.
-    return int(args.rollout_num_gpus) + bundle_offset + replica * gpus_per_replica
+    return (
+        int(getattr(args, "_teacher_bundle_start", args.rollout_num_gpus)) + bundle_offset + replica * gpus_per_replica
+    )
 
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
@@ -55,7 +55,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
     return env_vars
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"discovery": 4})
 class TeacherManager(MultiEngineManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
@@ -73,7 +73,11 @@ class TeacherManager(MultiEngineManager):
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
-            required = int(args.rollout_num_gpus) + bundle_offset + gpus_per_replica * num_replicas
+            required = (
+                int(getattr(args, "_teacher_bundle_start", args.rollout_num_gpus))
+                + bundle_offset
+                + gpus_per_replica * num_replicas
+            )
             assert len(bundle_indices) >= required and len(gpu_ids) >= required, (
                 f"shared teacher PG too small: bundles={len(bundle_indices)}, "
                 f"gpu_ids={len(gpu_ids)}, required={required} (rollout_num_gpus={args.rollout_num_gpus} + "
@@ -81,6 +85,9 @@ class TeacherManager(MultiEngineManager):
             )
 
         self.gpus_per_replica = gpus_per_replica
+        self._replica_pgs: dict[int, tuple] = {}
+        nodes_per_engine = max(1, gpus_per_replica // args.num_gpus_per_node)
+        self.num_gpu_per_engine = min(gpus_per_replica, args.num_gpus_per_node)
         self._shared_pg = shared_pg
         self._shared_pg_tuple = pg
         self._bundle_offset = bundle_offset
@@ -96,11 +103,17 @@ class TeacherManager(MultiEngineManager):
 
         super().__init__(
             args,
-            num_slots=num_replicas,
-            nodes_per_engine=1,
+            num_slots=num_replicas * nodes_per_engine,
+            nodes_per_engine=nodes_per_engine,
             engine_actor_cls=SGLangEngine,
             log_prefix="[OPD teacher]",
+            role="teacher",
+            skip_init=getattr(args, "opd_teacher_defer", False),
         )
+        if getattr(args, "opd_teacher_defer", False):
+            self._onloaded = False
+            self.inference.state = "sleeping"
+            self.inference.phase = "teacher"
 
     def get_urls(self) -> list[str]:
         urls = []
@@ -111,26 +124,9 @@ class TeacherManager(MultiEngineManager):
             urls.append(f"{base_url}/generate")
         return urls
 
-    def recover(self) -> set:
-        """Recover in place only when the teacher's endpoint can stay
-        stable."""
-        dead = [rank for rank, engine in enumerate(self.all_engines) if engine is None]
-        if dead and not self._shared_pg:
-            # A dedicated replacement PG may land on another node. OPD callers
-            # hold URLs captured at startup, so rebuilding here could advertise
-            # success while every caller keeps targeting the old host. Escalate
-            # to Controller restart, which rebuilds and re-injects the routes.
-            raise RuntimeError(
-                f"Dedicated OPD teacher engines died at ranks={dead}; global restart is required to refresh URLs."
-            )
-        return super().recover()
-
-    # ------------------------------------------------------------------
-    # MultiEngineManager hooks.
-    # ------------------------------------------------------------------
-
     def _resolve_placement(self, rank: int):
-        replica = rank
+        replica = rank // self.nodes_per_engine
+        node_offset = (rank % self.nodes_per_engine) * self.num_gpu_per_engine
         if self._shared_pg:
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
@@ -141,23 +137,25 @@ class TeacherManager(MultiEngineManager):
                 shared_pg=True,
                 bundle_offset=self._bundle_offset,
             )
-            return self._shared_pg_tuple, False, gpu_index
+            return self._shared_pg_tuple, False, gpu_index + node_offset
 
         # Dedicated: this replica creates and owns its own placement group.
-        pg_tuple = create_placement_group(
-            num_gpus=self.gpus_per_replica,
-            node_group_affinity=getattr(self.args, "enable_affinity", True),
-        )
-        gpu_index = _resolve_teacher_gpu_index(
-            args=self.args,
-            replica=replica,
-            gpus_per_replica=self.gpus_per_replica,
-            shared_pg=False,
-        )
-        return pg_tuple, True, gpu_index
+        if replica not in self._replica_pgs:
+            self._replica_pgs[replica] = create_placement_group(
+                num_gpus=self.gpus_per_replica,
+                node_group_affinity=getattr(self.args, "enable_affinity", True),
+            )
+        return self._replica_pgs[replica], True, node_offset
+
+    def _remove_owned_pg(self, rank: int) -> None:
+        super()._remove_owned_pg(rank)
+        replica = rank // self.nodes_per_engine
+        if not any(i // self.nodes_per_engine == replica for i in self._engine_placements):
+            self._replica_pgs.pop(replica, None)
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
-        return {"num_cpus": 0.2, "num_gpus": 0.2}
+        fraction = getattr(self.args, "_inference_ray_gpu_fraction", 0.2)
+        return {"num_cpus": fraction, "num_gpus": fraction}
 
     def _build_engine_env_vars(self) -> dict[str, str]:
         return _build_teacher_engine_env(self.args)
@@ -167,6 +165,7 @@ class TeacherManager(MultiEngineManager):
 
     def _build_engine_ctor_kwargs(self, rank: int) -> dict:
         return {
+            "role": "teacher",
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
             "register_sigterm_handler": False,
@@ -184,22 +183,28 @@ class TeacherManager(MultiEngineManager):
         }
 
     def _allocate_engine_addr_and_ports(self, *, new_engines: list[tuple]) -> dict[int, dict]:
-        addr_and_ports: dict[int, dict] = {}
-        for rank, engine in new_engines:
-            # OPD consumers receive teacher URLs once during startup. Preserve
-            # the original endpoint across recovery instead of silently moving
-            # a rebuilt engine to a port those consumers never learn about.
-            if self._shared_pg and rank in self._engine_addr_and_ports:
-                addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
-                continue
-            base_port = find_available_port(15000)
-            per_engine_addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
-                args=self._teacher_args,
-                rollout_engines=[(0, engine)],
-                worker_type="regular",
-                num_gpus_per_engine=self.gpus_per_replica,
-                rank_offset=0,
-                base_port=base_port,
-            )
-            addr_and_ports[rank] = per_engine_addr_and_ports[0]
-        return addr_and_ports
+        from relax.distributed.ray.inference_ports import allocate_inference_ports
+
+        # Legacy clients cache raw URLs. Planned deployments use discovery and
+        # may safely publish a replacement endpoint after recovery.
+        if not getattr(getattr(self, "args", None), "_inference_placement", None):
+            cached = getattr(self, "_engine_addr_and_ports", {})
+            if self._shared_pg and all(rank in cached for rank, _ in new_engines):
+                return {rank: dict(cached[rank]) for rank, _ in new_engines}
+        addresses, _ = allocate_inference_ports(
+            new_engines,
+            nodes_per_engine=self.nodes_per_engine,
+            base_port=30000 + getattr(self.args, "_teacher_port_window", 0) * 1000,
+            max_port=30999 + getattr(self.args, "_teacher_port_window", 0) * 1000,
+            dp_size=self._teacher_args.sglang_dp_size,
+        )
+        return addresses
+
+    def recover(self) -> set:
+        if (
+            not getattr(getattr(self, "args", None), "_inference_placement", None)
+            and not self._shared_pg
+            and any(engine is None for engine in self.all_engines)
+        ):
+            raise RuntimeError("Legacy dedicated Teacher URLs require a global restart after engine failure")
+        return super().recover()
