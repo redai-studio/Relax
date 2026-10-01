@@ -29,9 +29,9 @@
 | T03  | `/rerun unknown-target`、`/cancel ci/pre-commit` | 明确拒绝无效 target 和 job 级取消，CI attempt 不变                                                         | 待测试      |
 | T04  | CI 运行中执行 `/rerun ci`                        | 提示仍在运行，不创建新 attempt                                                                             | 待测试      |
 | T05  | `/cancel gpu-unit`、`/cancel integration`        | 只取消本 PR 对应的完整 workflow，状态进入终态                                                              | 待测试      |
-| T06  | 确认失败探针执行后评论 `/rerun failed`           | 同一 head 的失败 job 得到新 job ID，成功的 sibling job 不重跑                                              | 待测试      |
+| T06  | 确认失败探针执行后评论 `/rerun failed`           | 同一 head 的失败 job 实际重跑，成功的 sibling 不重跑；核对执行时间和 step 记录                             | 待测试      |
 | T07  | CPU 重跑开始后评论 `/cancel ci`                  | 整个 CI workflow 进入 cancelled 终态                                                                       | 待测试      |
-| T08  | CI 完成后评论 `/rerun ci/pre-commit`             | 只重跑指定 job 及其依赖后继；其他 job ID 不变                                                              | 待测试      |
+| T08  | CI 完成后评论 `/rerun ci/pre-commit`             | 只重跑指定 job 及其依赖后继；按执行时间和 step 记录确认其他 job 未重跑                                     | 待测试      |
 | T09  | 创建普通评论，再编辑为 `/help`                   | 编辑不触发命令执行，无对应回复或新 command job                                                             | 待测试      |
 | T10  | 重跑 T08 对应的 CI Commands workflow             | 同一 source comment 的回复 ID 和数量不变，目标 CI attempt 不增加                                           | 待测试      |
 | T11  | 添加 `ci-bypass: ci`，再 `/rerun ci`             | gate 重新计算且成功，CI 下游检查 skipped                                                                   | 待测试      |
@@ -53,4 +53,5 @@
 - 依赖该入口的 T06、T07、T08、T10、T14 标为阻塞，等待修复部署后重测。
 - T11～T13 改用直接 Actions API 重跑整个 workflow，仅验证豁免 gate；原计划中的评论重跑链路仍为阻塞，因此整体状态记为部分通过。
 - T15 分别记录 synchronize 标签清理、新 head gate 的实际结果，以及尚未验证的评论路由。
+- 单 job 重跑可能复制其他 job 的历史记录，因此不能仅用 job ID 或 workflow attempt 判断实际执行次数。
 - 每项的最终状态和证据链接以 PR 描述、独立测试评论为准。
