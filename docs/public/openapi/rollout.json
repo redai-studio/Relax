@@ -664,13 +664,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "succeeded",
-          "skipped",
-          "total_count",
-          "dry_run",
-          "filters"
-        ],
+        "required": ["succeeded", "skipped", "total_count", "dry_run", "filters"],
         "title": "CancelAllScaleOutRequestsResponse",
         "description": "Response model for cancel all scale-out requests."
       },
@@ -690,11 +684,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "request_id",
-          "status",
-          "message"
-        ],
+        "required": ["request_id", "status", "message"],
         "title": "CancelResponse",
         "description": "Response model for cancel operation."
       },
@@ -751,10 +741,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "requests",
-          "total_count"
-        ],
+        "required": ["requests", "total_count"],
         "title": "ListScaleInRequestsResponse",
         "description": "Response model for list scale-in requests endpoint."
       },
@@ -798,10 +785,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "requests",
-          "total_count"
-        ],
+        "required": ["requests", "total_count"],
         "title": "ListScaleOutRequestsResponse",
         "description": "Response model for list scale-out requests endpoint."
       },
@@ -875,10 +859,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "request_id",
-          "status"
-        ],
+        "required": ["request_id", "status"],
         "title": "ScaleInResponse",
         "description": "Response model for scale-in operation."
       },
@@ -1038,10 +1019,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "request_id",
-          "status"
-        ],
+        "required": ["request_id", "status"],
         "title": "ScaleOutResponse",
         "description": "Response model for scale-out operation."
       },
@@ -1165,11 +1143,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
+        "required": ["loc", "msg", "type"],
         "title": "ValidationError"
       }
     }

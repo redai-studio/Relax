@@ -45,10 +45,10 @@ repos:
     rev: v0.69.0
     hooks:
       - id: oxfmt
-        args: ["--config", ".oxfmtrc.json"]
-        types_or: [javascript, json]
-        # Existing files move to oxfmt in the dedicated formatting layer.
-        exclude: ^(\.github/actions/acquire-devices/|docs/)
+        args: ["--config", ".oxfmtrc.json", "--no-error-on-unmatched-pattern"]
+        # Let oxfmt detect supported formats while leaving YAML and TOML unchanged.
+        types_or: [text]
+        exclude_types: [yaml, toml]
   - repo: local
     hooks:
       - id: docformatter
