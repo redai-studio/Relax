@@ -7,15 +7,15 @@ sglang:
   - name: default
     num_gpus_per_engine: 2
     engine_groups:
-      - worker_type: prefill
-        num_gpus: 2
-        overrides:
-          mamba_radix_cache_strategy: extra_buffer
-          chunked_prefill_size: 8192
-          mem_fraction_static: 0.80
-      - worker_type: decode
-        num_gpus: 2
-        overrides:
-          mamba_radix_cache_strategy: extra_buffer
-          chunked_prefill_size: 8192
-          mem_fraction_static: 0.70
+    - worker_type: prefill
+      num_gpus: 2
+      overrides:
+        mamba_radix_cache_strategy: extra_buffer
+        chunked_prefill_size: 8192
+        mem_fraction_static: 0.80
+    - worker_type: decode
+      num_gpus: 2
+      overrides:
+        mamba_radix_cache_strategy: extra_buffer
+        chunked_prefill_size: 8192
+        mem_fraction_static: 0.70

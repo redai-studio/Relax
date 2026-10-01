@@ -14,13 +14,13 @@ env:
   domain_randomization: False
   task_types: [1, 2, 3, 4, 5, 6]
   expert_timeout_steps: 150
-  expert_type: 'handcoded'
+  expert_type: "handcoded"
   goal_desc_human_anns_prob: 0.0
 
   hybrid:
     start_eps: 100000
     thor_prob: 0.5
-    eval_mode: 'tw'
+    eval_mode: "tw"
 
   thor:
     screen_width: 300
@@ -59,7 +59,7 @@ general:
     run_eval: True
     batch_size: 10
     env:
-      type: 'AlfredTWEnv'
+      type: "AlfredTWEnv"
 
   checkpoint:
     report_frequency: 1000
@@ -78,7 +78,7 @@ general:
     recurrent: True
 
 rl:
-  action_space: 'admissible'
+  action_space: "admissible"
   max_target_length: 20
   beam_width: 10
   generate_top_k: 3
@@ -89,7 +89,7 @@ rl:
     target_net_update_frequency: 500
 
 dagger:
-  action_space: 'generation'
+  action_space: "generation"
   max_target_length: 20
   beam_width: 10
   generate_top_k: 5

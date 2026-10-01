@@ -21,11 +21,11 @@ reasoning_gym_claude_code_agent_model_server:
         name: policy_model
       concurrency: ${oc.env:REASONING_GYM_CC_MAX_CONCURRENCY,64}
       model: claude-sonnet-4-5
-      anthropic_api_key: EMPTY # pragma: allowlist secret
+      anthropic_api_key: EMPTY  # pragma: allowlist secret
       anthropic_base_url: null
       max_turns: ${oc.env:REASONING_GYM_CC_MAX_TURNS,30}
       timeout: ${oc.env:REASONING_GYM_CC_AGENT_TIMEOUT,300}
-      claude_code_version: '2.1.237'
+      claude_code_version: "2.1.237"
       thinking: enabled
       bare: true
       settings: ${oc.env:REASONING_GYM_CC_SETTINGS}
@@ -35,7 +35,7 @@ reasoning_gym_claude_code_agent_model_server:
         Wrap the final answer in <answer>...</answer> tags on its own line,
         using the exact format requested by the question.
       datasets:
-        - name: train
-          type: train
-          jsonl_fpath: ${oc.env:REASONING_GYM_CC_DATA_JSONL}
-          license: Creative Commons Attribution 4.0 International
+      - name: train
+        type: train
+        jsonl_fpath: ${oc.env:REASONING_GYM_CC_DATA_JSONL}
+        license: Creative Commons Attribution 4.0 International

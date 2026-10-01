@@ -1,7 +1,7 @@
 max_turns: 9
 code_timeout_s: 200
 ensure_sandbox_timeout_s: 240
-sandbox_backend: apptainer_jupyter # only backend in Phase 1
+sandbox_backend: apptainer_jupyter  # only backend in Phase 1
 
 # Single-token stops bypass the detokenizer entirely — SGLang matches them
 # on the GPU side against generated token ids, no subprocess round-trip.
@@ -18,5 +18,5 @@ sandbox_backend: apptainer_jupyter # only backend in Phase 1
 # extract_answer() (env_deepeyes_v2.py) regex-matches <answer>...</answer>
 # anywhere in the text, so trailing chat-template tokens don't hurt.
 stop_token_ids:
-  - 248059 # </tool_call>
-  - 248046 # <|im_end|>
+  - 248059  # </tool_call>
+  - 248046  # <|im_end|>
