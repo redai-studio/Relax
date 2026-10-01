@@ -4,19 +4,19 @@
     "ci": {
       "workflow": "ci.yml"
     },
-    "pre-commit": {
+    "ci/pre-commit": {
       "workflow": "ci.yml",
       "job": "Pre-commit Checks"
     },
-    "cpu-310": {
+    "ci/cpu-310": {
       "workflow": "ci.yml",
       "job": "Tests (Python 3.10)"
     },
-    "cpu-311": {
+    "ci/cpu-311": {
       "workflow": "ci.yml",
       "job": "Tests (Python 3.11)"
     },
-    "cpu-312": {
+    "ci/cpu-312": {
       "workflow": "ci.yml",
       "job": "Tests (Python 3.12)"
     },
@@ -26,15 +26,15 @@
     "integration": {
       "workflow": "integration-test.yml"
     },
-    "gpu-async": {
+    "integration/gpu-async": {
       "workflow": "integration-test.yml",
       "job": "Qwen3-4B-4xgpu-async"
     },
-    "gpu-vl": {
+    "integration/gpu-vl": {
       "workflow": "integration-test.yml",
       "job": "Qwen3-VL-4B-2xgpu"
     },
-    "npu-async": {
+    "integration/npu-async": {
       "workflow": "integration-test.yml",
       "job": "Qwen3-4B-4xnpu-async"
     }
