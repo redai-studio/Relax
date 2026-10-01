@@ -47,6 +47,8 @@ repos:
       - id: oxfmt
         args: ["--config", ".oxfmtrc.json"]
         types_or: [javascript, json]
+        # Existing files move to oxfmt in the dedicated formatting layer.
+        exclude: ^(\.github/actions/acquire-devices/|docs/)
   - repo: local
     hooks:
       - id: docformatter
