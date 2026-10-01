@@ -10,7 +10,7 @@ description: Inspect and operate Relax GitHub PR CI. Use when checking required 
 Identify the repository and PR from the request or current branch. Capture the current head and required checks before choosing an operation:
 
 ```bash
-gh pr view <PR> --repo redai-studio/Relax --json number,url,headRefOid,headRefName,baseRefName,state
+gh pr view <PR> --repo redai-studio/Relax --json number,url,headRefOid,headRefName,headRepository,headRepositoryOwner,baseRefName,state
 gh pr checks <PR> --repo redai-studio/Relax --required
 ```
 
@@ -28,7 +28,7 @@ For an explicitly requested exemption, read [bypass and CI maintenance](referenc
 
 ## PR comment interface
 
-Use comment commands when direct Actions access is unavailable and the actor is eligible. Rerun/cancel comments are available to the PR author and users with repository write/maintain/admin permission. Put a command on the first line of a new PR comment; later lines are ordinary comment text.
+Use comment commands when direct Actions access is unavailable and the actor is eligible. Rerun/cancel comments are available to the PR author and users with repository write/maintain/admin permission. The command action silently ignores `/rerun`, `/cancel`, and `/help` comments whose GitHub `user.type` is `Bot`, without replying. Put a command on the first line of a new PR comment; later lines are ordinary comment text.
 
 | Command | Scope |
 | --- | --- |
