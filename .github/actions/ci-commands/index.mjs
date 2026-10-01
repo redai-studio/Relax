@@ -20,6 +20,8 @@ function help(targets) {
     '- `/review`: request Nyanpasu review.',
     '',
     'Rerun/cancel require PR authorship or repository write access. Put the command on the first line.',
+    'Targets use workflow or workflow/job names, such as ci or ci/pre-commit. Job targets support rerun only.',
+    '`ci` covers pre-commit and CPU checks; `all` covers every configured workflow.',
     '',
     '| Target | Check / workflow |',
     '| --- | --- |',
