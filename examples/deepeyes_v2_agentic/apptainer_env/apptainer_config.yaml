@@ -48,15 +48,15 @@ bind_paths:
 # 透传给 kernel 进程的环境变量 (会变成 apptainer --env KEY=VAL)。
 # 因为我们用了 --cleanenv，host 的环境变量默认 不会 进容器，需要的得在这里列。
 env:
-  PYTHONUNBUFFERED: "1"
+  PYTHONUNBUFFERED: '1'
   MPLBACKEND: Agg
 
 # ─── 资源 / 行为开关 ─────────────────────────────────────────────────────────
-nv: false                       # --nv: NVIDIA GPU 透传 (deepeyes_v2 sandbox 不需要 GPU，false 即可)
-writable_tmpfs: true            # --writable-tmpfs: 容器 rootfs 可写 (临时 overlay)
-cleanenv: true                  # --cleanenv: 不继承 host 环境变量
-pid_isolation: true             # --pid: 独立 PID namespace
-home_dir: /root                 # --home: 容器内 $HOME (apptainer 1.4+ 必须用 --home 而不是 --env HOME=)
+nv: false # --nv: NVIDIA GPU 透传 (deepeyes_v2 sandbox 不需要 GPU，false 即可)
+writable_tmpfs: true # --writable-tmpfs: 容器 rootfs 可写 (临时 overlay)
+cleanenv: true # --cleanenv: 不继承 host 环境变量
+pid_isolation: true # --pid: 独立 PID namespace
+home_dir: /root # --home: 容器内 $HOME (apptainer 1.4+ 必须用 --home 而不是 --env HOME=)
 
 # ─── 超时 / 重试 ────────────────────────────────────────────────────────────
 # 第一次 docker:// 拉镜像可能要几分钟，把这个调大才不会假死在 wait_for_ready

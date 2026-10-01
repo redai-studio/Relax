@@ -65,7 +65,7 @@ reward:
   runtime: colocate
   scorer_path: relax.engine.rewards.pickscore.PickScoreScorer
   required_components: [pickscore]
-  component_weights: {pickscore: 1.0}
+  component_weights: { pickscore: 1.0 }
 
 weight_sync:
   mode: adapter

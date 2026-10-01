@@ -15,18 +15,18 @@ select = ["C", "E", "F", "I", "W"]
 lines-after-imports = 2
 known-first-party = ["relax"]
 known-third-party = [
-    "accelerate",
-    "datasets",
-    "diffusers",
-    "gradio",
-    "numpy",
-    "peft",
-    "ray",
-    "sglang",
-    "soundfile",
-    "torch",
-    "transformers",
-    "trl"
+  "accelerate",
+  "datasets",
+  "diffusers",
+  "gradio",
+  "numpy",
+  "peft",
+  "ray",
+  "sglang",
+  "soundfile",
+  "torch",
+  "transformers",
+  "trl",
 ]
 
 [tool.ruff.format]

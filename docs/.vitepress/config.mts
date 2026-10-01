@@ -12,20 +12,16 @@ export default defineConfig({
         output: {
           // Sanitize chunk filenames: replace `.md.` / trailing `.md` to avoid WAF 403
           chunkFileNames: (chunkInfo) => {
-            const name = (chunkInfo.name || 'chunk')
-              .replace(/\.md\./g, '-')
-              .replace(/\.md$/g, '')
+            const name = (chunkInfo.name || 'chunk').replace(/\.md\./g, '-').replace(/\.md$/g, '')
             return `assets/${name}.[hash].js`
           },
           assetFileNames: (assetInfo) => {
-            const name = (assetInfo.name || 'asset')
-              .replace(/\.md\./g, '-')
-              .replace(/\.md\b/g, '')
+            const name = (assetInfo.name || 'asset').replace(/\.md\./g, '-').replace(/\.md\b/g, '')
             return `assets/${name}.[hash][extname]`
-          }
-        }
-      }
-    }
+          },
+        },
+      },
+    },
   },
 
   /**
@@ -35,7 +31,8 @@ export default defineConfig({
    */
   async buildEnd() {
     // Use dynamic import to access Node built-ins inside the ESM config
-    const { existsSync, readdirSync, renameSync, readFileSync, writeFileSync } = await import('node:fs')
+    const { existsSync, readdirSync, renameSync, readFileSync, writeFileSync } =
+      await import('node:fs')
     const { join, dirname, basename } = await import('node:path')
     const { fileURLToPath } = await import('node:url')
 
@@ -203,12 +200,12 @@ export default defineConfig({
     }
   },
 
-  title: "Relax",
-  description: "Towards Async, Omni-Modal RL at Scale, Just Relax.",
+  title: 'Relax',
+  description: 'Towards Async, Omni-Modal RL at Scale, Just Relax.',
 
   // Base path for deployment under a sub-directory
   base: '/Relax/',
-  
+
   // Ignore dead links for source code references and placeholder pages
   ignoreDeadLinks: true,
 
@@ -221,11 +218,11 @@ export default defineConfig({
         repo: 'https://github.com/redai-studio/Relax',
         branch: 'main',
         repoRoot: fileURLToPath(new URL('../..', import.meta.url)),
-        docsRoot: 'docs'
+        docsRoot: 'docs',
       })
-    }
+    },
   },
-  
+
   // 多语言配置
   locales: {
     en: {
@@ -242,9 +239,9 @@ export default defineConfig({
             text: 'Resources',
             items: [
               { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
-              { text: 'Paper', link: 'https://arxiv.org/abs/2604.11554' }
-            ]
-          }
+              { text: 'Paper', link: 'https://arxiv.org/abs/2604.11554' },
+            ],
+          },
         ],
         sidebar: {
           '/en/guide/': [
@@ -260,10 +257,13 @@ export default defineConfig({
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
-                { text: 'REINFORCE++ Report', link: '/en/guide/reinforce-plus-plus-training-report' },
+                {
+                  text: 'REINFORCE++ Report',
+                  link: '/en/guide/reinforce-plus-plus-training-report',
+                },
                 { text: 'Model Checkpoint Conversion', link: '/en/guide/model-conversion' },
-                { text: 'Configuration', link: '/en/guide/configuration' }
-              ]
+                { text: 'Configuration', link: '/en/guide/configuration' },
+              ],
             },
             {
               text: 'Core Concepts',
@@ -271,8 +271,8 @@ export default defineConfig({
                 { text: 'Architecture', link: '/en/guide/architecture' },
                 { text: 'Dataset Design', link: '/en/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/en/guide/distributed-checkpoint' },
-                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' }
-              ]
+                { text: 'Health Check Manager', link: '/en/guide/health-check-manager' },
+              ],
             },
             {
               text: 'Advanced',
@@ -286,9 +286,12 @@ export default defineConfig({
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
                 { text: 'Update Weights Pipeline', link: '/en/guide/update-weights-pipeline' },
-                { text: 'Low-Rank Adaptation (LoRA) Training', link: '/en/guide/low-rank-adaptation-training' },
-                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' }
-              ]
+                {
+                  text: 'Low-Rank Adaptation (LoRA) Training',
+                  link: '/en/guide/low-rank-adaptation-training',
+                },
+                { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' },
+              ],
             },
             {
               text: 'Best Practices',
@@ -297,8 +300,11 @@ export default defineConfig({
                 { text: 'Compiler Cache Reuse', link: '/en/guide/compiler-cache' },
                 { text: 'Accelerated S3 Model Loading', link: '/en/guide/s3-model-loading' },
                 { text: 'OOM Troubleshooting', link: '/en/guide/oom-troubleshooting' },
-                { text: 'External Model Integration', link: '/en/guide/external-model-integration' }
-              ]
+                {
+                  text: 'External Model Integration',
+                  link: '/en/guide/external-model-integration',
+                },
+              ],
             },
             {
               text: 'Development',
@@ -307,16 +313,14 @@ export default defineConfig({
                 { text: 'Debugging Guide', link: '/en/guide/debugging' },
                 { text: 'Trajectory Replay', link: '/en/guide/trajectory-replay' },
                 { text: 'Rollout Result Viewer', link: '/en/guide/rollout-result-viewer' },
-                { text: 'Repetition Diagnostics', link: '/en/guide/repetition-diagnostics' }
-              ]
-            }
+                { text: 'Repetition Diagnostics', link: '/en/guide/repetition-diagnostics' },
+              ],
+            },
           ],
           '/en/api/': [
             {
               text: 'API Reference',
-              items: [
-                { text: 'Overview', link: '/en/api/overview' }
-              ]
+              items: [{ text: 'Overview', link: '/en/api/overview' }],
             },
             {
               text: 'Service HTTP APIs',
@@ -324,9 +328,9 @@ export default defineConfig({
                 { text: 'Actor', link: '/en/api/actor' },
                 { text: 'Rollout', link: '/en/api/rollout' },
                 { text: 'GenRM', link: '/en/api/genrm' },
-                { text: 'ActorFwd', link: '/en/api/actor-fwd' }
-              ]
-            }
+                { text: 'ActorFwd', link: '/en/api/actor-fwd' },
+              ],
+            },
           ],
           '/en/examples/': [
             {
@@ -337,16 +341,16 @@ export default defineConfig({
                 { text: 'Generative Reward Model', link: '/en/examples/generative-reward-model' },
                 { text: 'Low-Precision Training', link: '/en/examples/low-precision-training' },
                 { text: 'Elastic Rollout', link: '/en/examples/elastic-rollout' },
-                { text: 'Algorithms', link: '/en/examples/algorithms' }
-              ]
-            }
-          ]
+                { text: 'Algorithms', link: '/en/examples/algorithms' },
+              ],
+            },
+          ],
         },
         footer: {
           message: 'Released under the Apache 2.0 License.',
-          copyright: 'Copyright © 2026 Relax Team'
-        }
-      }
+          copyright: 'Copyright © 2026 Relax Team',
+        },
+      },
     },
     zh: {
       label: '简体中文',
@@ -362,9 +366,9 @@ export default defineConfig({
             text: '资源',
             items: [
               { text: 'GitHub', link: 'https://github.com/redai-studio/Relax' },
-              { text: '论文', link: 'https://arxiv.org/abs/2604.11554' }
-            ]
-          }
+              { text: '论文', link: 'https://arxiv.org/abs/2604.11554' },
+            ],
+          },
         ],
         sidebar: {
           '/zh/guide/': [
@@ -380,10 +384,13 @@ export default defineConfig({
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
-                { text: 'REINFORCE++ 训练与数值验证报告', link: '/zh/guide/reinforce-plus-plus-training-report' },
+                {
+                  text: 'REINFORCE++ 训练与数值验证报告',
+                  link: '/zh/guide/reinforce-plus-plus-training-report',
+                },
                 { text: '模型 Checkpoint 转换', link: '/zh/guide/model-conversion' },
-                { text: '配置说明', link: '/zh/guide/configuration' }
-              ]
+                { text: '配置说明', link: '/zh/guide/configuration' },
+              ],
             },
             {
               text: '核心概念',
@@ -391,8 +398,8 @@ export default defineConfig({
                 { text: '架构设计', link: '/zh/guide/architecture' },
                 { text: '数据集设计', link: '/zh/guide/dataset-design' },
                 { text: 'Distributed Checkpoint', link: '/zh/guide/distributed-checkpoint' },
-                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' }
-              ]
+                { text: '健康检查管理器', link: '/zh/guide/health-check-manager' },
+              ],
             },
             {
               text: '进阶指南',
@@ -407,8 +414,8 @@ export default defineConfig({
                 { text: '通知系统', link: '/zh/guide/notification-system' },
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
                 { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
-                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' }
-              ]
+                { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' },
+              ],
             },
             {
               text: '最佳实践',
@@ -417,8 +424,8 @@ export default defineConfig({
                 { text: '编译缓存复用', link: '/zh/guide/compiler-cache' },
                 { text: 'S3 模型加载加速', link: '/zh/guide/s3-model-loading' },
                 { text: 'OOM 排查', link: '/zh/guide/oom-troubleshooting' },
-                { text: '外部模型接入', link: '/zh/guide/external-model-integration' }
-              ]
+                { text: '外部模型接入', link: '/zh/guide/external-model-integration' },
+              ],
             },
             {
               text: '开发指南',
@@ -427,16 +434,14 @@ export default defineConfig({
                 { text: '调试指南', link: '/zh/guide/debugging' },
                 { text: '轨迹重放', link: '/zh/guide/trajectory-replay' },
                 { text: 'Rollout 结果可视化', link: '/zh/guide/rollout-result-viewer' },
-                { text: '重复检测与离线诊断', link: '/zh/guide/repetition-diagnostics' }
-              ]
-            }
+                { text: '重复检测与离线诊断', link: '/zh/guide/repetition-diagnostics' },
+              ],
+            },
           ],
           '/zh/api/': [
             {
               text: 'API 参考',
-              items: [
-                { text: '概览', link: '/zh/api/overview' }
-              ]
+              items: [{ text: '概览', link: '/zh/api/overview' }],
             },
             {
               text: '服务 HTTP API',
@@ -444,9 +449,9 @@ export default defineConfig({
                 { text: 'Actor', link: '/zh/api/actor' },
                 { text: 'Rollout', link: '/zh/api/rollout' },
                 { text: 'GenRM', link: '/zh/api/genrm' },
-                { text: 'ActorFwd', link: '/zh/api/actor-fwd' }
-              ]
-            }
+                { text: 'ActorFwd', link: '/zh/api/actor-fwd' },
+              ],
+            },
           ],
           '/zh/examples/': [
             {
@@ -457,51 +462,49 @@ export default defineConfig({
                 { text: '生成式奖励模型', link: '/zh/examples/generative-reward-model' },
                 { text: '低精度训练', link: '/zh/examples/low-precision-training' },
                 { text: '弹性 Rollout', link: '/zh/examples/elastic-rollout' },
-                { text: '算法参考', link: '/zh/examples/algorithms' }
-              ]
-            }
-          ]
+                { text: '算法参考', link: '/zh/examples/algorithms' },
+              ],
+            },
+          ],
         },
         footer: {
           message: '基于 Apache 2.0 许可发布',
-          copyright: 'Copyright © 2026 Relax 团队'
+          copyright: 'Copyright © 2026 Relax 团队',
         },
         docFooter: {
           prev: '上一页',
-          next: '下一页'
+          next: '下一页',
         },
         outline: {
           level: [2, 4],
-          label: '页面导航'
+          label: '页面导航',
         },
         lastUpdated: {
           text: '最后更新于',
           formatOptions: {
             dateStyle: 'short',
-            timeStyle: 'medium'
-          }
+            timeStyle: 'medium',
+          },
         },
         langMenuLabel: '多语言',
         returnToTopLabel: '回到顶部',
         sidebarMenuLabel: '菜单',
         darkModeSwitchLabel: '主题',
         lightModeSwitchTitle: '切换到浅色模式',
-        darkModeSwitchTitle: '切换到深色模式'
-      }
-    }
+        darkModeSwitchTitle: '切换到深色模式',
+      },
+    },
   },
 
   themeConfig: {
     logo: '/rednote-logo.png',
-    socialLinks: [
-      { icon: 'github', link: 'https://github.com/redai-studio/Relax' }
-    ],
+    socialLinks: [{ icon: 'github', link: 'https://github.com/redai-studio/Relax' }],
     search: {
-      provider: 'local'
+      provider: 'local',
     },
     outline: {
-      level: [2, 4]
-    }
+      level: [2, 4],
+    },
   },
 
   head: [
@@ -509,12 +512,18 @@ export default defineConfig({
     ['link', { rel: 'icon', type: 'image/png', sizes: '16x16', href: '/Relax/favicon-16.png' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
-    ['link', { href: 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap', rel: 'stylesheet' }]
+    [
+      'link',
+      {
+        href: 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Manrope:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap',
+        rel: 'stylesheet',
+      },
+    ],
   ],
 
   lastUpdated: true,
   cleanUrls: false,
 
   // Default to dark mode to match ASCII art background
-  appearance: 'dark'
+  appearance: 'dark',
 })

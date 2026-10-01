@@ -24,9 +24,9 @@ environment:
     # tests that do not need multi-threaded BLAS; with 128 concurrent sandboxes,
     # the library default (one thread per core, ~192) creates tens of thousands
     # of idle BLAS threads -> context-switch storm on the colocated node.
-    OMP_NUM_THREADS: "2"
-    MKL_NUM_THREADS: "2"
-    OPENBLAS_NUM_THREADS: "2"
+    OMP_NUM_THREADS: '2'
+    MKL_NUM_THREADS: '2'
+    OPENBLAS_NUM_THREADS: '2'
   exec_args:
     - --contain
     - --cleanenv

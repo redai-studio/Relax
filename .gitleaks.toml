@@ -10,8 +10,8 @@ id = "internal-domain-xiaohongshu"
 description = "Detects references to internal domain xiaohongshu.com"
 regex = '''(?i)(xiaohongshu\.com|xhs\.cn)'''
 tags = ["internal", "domain"]
-  [rules.allowlist]
-  paths = ['''scripts/ci/benchmark\.sh$''']
+[rules.allowlist]
+paths = ['''scripts/ci/benchmark\.sh$''']
 
 # Custom rule: Internal path - /mnt/
 [[rules]]
@@ -26,18 +26,15 @@ id = "platform-env-qs"
 description = "Detects platform injected environment variables with QS_ prefix"
 regex = '''\bQS_[A-Z][A-Z0-9_]*\b'''
 tags = ["internal", "env"]
-  [rules.allowlist]
-  regexTarget = "match"
-  regexes = [
-    # QS_USER alone is just an env var name reference, not a leaked value
-    '''^QS_USER$''',
-  ]
-  # The internal Quicksilver upload hook and its tests intentionally reference
-  # QS_* env var names; those are identifiers, not secrets.
-  paths = [
-    '''scripts/tools/model_upload_hook\.py$''',
-    '''tests/tools/test_model_upload_hook\.py$''',
-  ]
+[rules.allowlist]
+regexTarget = "match"
+regexes = [
+  # QS_USER alone is just an env var name reference, not a leaked value
+  '''^QS_USER$''',
+]
+# The internal Quicksilver upload hook and its tests intentionally reference
+# QS_* env var names; those are identifiers, not secrets.
+paths = ['''scripts/tools/model_upload_hook\.py$''', '''tests/tools/test_model_upload_hook\.py$''']
 
 # Custom rule: MAAS token (MAAS prefix)
 [[rules]]
@@ -59,12 +56,12 @@ id = "token-lta"
 description = "Detects LTA token with LTA prefix"
 regex = '''\bLTA[a-zA-Z0-9-]{16,}\b'''
 tags = ["internal", "token"]
-  [rules.allowlist]
-  regexTarget = "match"
-  regexes = [
-    # GatedDeltaNetContextParallel etc. are Megatron class names, not LTA tokens
-    '''(?i)lta[Nn]et''',
-  ]
+[rules.allowlist]
+regexTarget = "match"
+regexes = [
+  # GatedDeltaNetContextParallel etc. are Megatron class names, not LTA tokens
+  '''(?i)lta[Nn]et''',
+]
 
 # Custom rule: Private IP - 10.0.0.0/8 (Class A)
 [[rules]]
@@ -72,15 +69,15 @@ id = "private-ip-10-range"
 description = "Detects hardcoded private IP addresses in 10.0.0.0/8 range (RFC 1918)"
 regex = '''\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b(?:/\d{1,2}\b)?'''
 tags = ["internal", "ip", "private"]
-  [rules.allowlist]
-  regexTarget = "match"
-  regexes = [
-    # 10.0.0.1 is a conventional placeholder IP in examples and tests.
-    '''^10\.0\.0\.1$''',
-    # The full RFC 1918 network is public, not a deployment-specific endpoint.
-    '''^10\.0\.0\.0/8$''',
-  ]
-  paths = ['''scripts/ci/benchmark\.sh$''']
+[rules.allowlist]
+regexTarget = "match"
+regexes = [
+  # 10.0.0.1 is a conventional placeholder IP in examples and tests.
+  '''^10\.0\.0\.1$''',
+  # The full RFC 1918 network is public, not a deployment-specific endpoint.
+  '''^10\.0\.0\.0/8$''',
+]
+paths = ['''scripts/ci/benchmark\.sh$''']
 
 # Custom rule: Private IP - 172.16.0.0/12 (Class B)
 [[rules]]
@@ -95,12 +92,12 @@ id = "private-ip-192-168-range"
 description = "Detects hardcoded private IP addresses in 192.168.0.0/16 range (RFC 1918)"
 regex = '''\b192\.168\.\d{1,3}\.\d{1,3}\b'''
 tags = ["internal", "ip", "private"]
-  [rules.allowlist]
-  regexTarget = "match"
-  regexes = [
-    # 192.168.1.100 is used as a conventional example endpoint in docs.
-    '''^192\.168\.1\.100$''',
-  ]
+[rules.allowlist]
+regexTarget = "match"
+regexes = [
+  # 192.168.1.100 is used as a conventional example endpoint in docs.
+  '''^192\.168\.1\.100$''',
+]
 
 # Allowlist: Ignore scanner metadata and generated docs artifacts
 [allowlist]
