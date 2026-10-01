@@ -285,3 +285,24 @@ def test_error_message_is_bounded_and_scrubbed():
     assert "and 3 more" in msg
     # Stable category prefixes are surfaced.
     assert "weight sync failed" in msg
+
+
+@pytest.mark.asyncio
+async def test_external_finalize_records_replica_url_and_external_ownership():
+    server = make_rollout_server(engine_groups=[])
+    manager = create_test_manager(servers={"default": server})
+    manager.args.use_fault_tolerance = False
+    engine = make_mock_engine(url="http://external.example:30001")
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+
+    result = await manager._finalize_engine_group_registration(
+        request=request,
+        srv=server,
+        engines=[engine],
+    )
+
+    assert result.success is True
+    assert result.group.external_engines is True
+    assert result.group.replica_urls == {0: "external.example:30001"}

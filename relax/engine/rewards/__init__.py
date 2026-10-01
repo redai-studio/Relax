@@ -451,6 +451,8 @@ async def async_rm(args, sample: Sample, **kwargs):
     Delegates to RewardExecutor which handles concurrency control and process
     isolation for CPU-bound / thread-unsafe reward functions.
     """
+    if "genrm" in (getattr(args, "inference_defer_roles", None) or []):
+        return await _dummy_reward(args)
     return await _get_reward_executor(args).execute(args, sample, **kwargs)
 
 

@@ -1,86 +1,48 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import importlib
-import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from relax.utils.http_utils import router_worker_base_url
+from tests.backends.sglang.engine_module_stub import stubbed_sglang_engine_module
 
 
 @pytest.fixture()
 def sglang_engine_module(monkeypatch):
-    ray = ModuleType("ray")
-    ray.get_runtime_context = lambda: SimpleNamespace()
-    monkeypatch.setitem(sys.modules, "ray", ray)
-
-    sglang_router = ModuleType("sglang_router")
-    sglang_router.__version__ = "0.3.2"
-    monkeypatch.setitem(sys.modules, "sglang_router", sglang_router)
-
-    sglang = ModuleType("sglang")
-    sglang_srt = ModuleType("sglang.srt")
     server_args = ModuleType("sglang.srt.server_args")
     server_args.ServerArgs = object
-    sglang_utils = ModuleType("sglang.srt.utils")
-    sglang_utils.kill_process_tree = lambda _pid: None
-    monkeypatch.setitem(sys.modules, "sglang", sglang)
-    monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
-    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
-    monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
+    with stubbed_sglang_engine_module(
+        monkeypatch, server_args=server_args, router_worker_base_url=router_worker_base_url
+    ) as module:
+        yield module
 
-    checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
-    checkpoint_client.create_client = lambda **_kwargs: None
-    monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
 
-    ray_actor = ModuleType("relax.distributed.ray.ray_actor")
-    ray_actor.RayActor = object
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.ray_actor", ray_actor)
+@pytest.mark.parametrize("cached", [False, True])
+def test_engine_fixture_restores_import_cache(monkeypatch, cached):
+    from relax.backends import sglang as parent
 
-    device = ModuleType("relax.utils.device")
-    device.get_visible_devices_env_var = lambda: "CUDA_VISIBLE_DEVICES"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    async_utils = ModuleType("relax.utils.async_utils")
-    async_utils.run = lambda value: value
-    monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
-
-    env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace(
-        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
-        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
-        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
-    )
-    monkeypatch.setitem(sys.modules, "relax.utils.env", env)
-
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
-    http_utils.router_worker_base_url = router_worker_base_url
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
-
-    logging_utils = ModuleType("relax.utils.logging_utils")
-    logging_utils.get_logger = logging.getLogger
-    monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
-
-    megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
-    megatron_peft_utils.convert_megatron_to_sglang_target_modules = lambda value: value
-    megatron_peft_utils.is_lora_enabled = lambda _args: False
-    monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
-
-    # Force a fresh import so the module binds to the stubbed dependencies above,
-    # but restore the original module object on teardown. Leaving the key popped
-    # corrupts sys.modules for any later test that patches this module: their
-    # patch() re-imports a *new* module object distinct from the one already
-    # bound in other test files' top-level imports, so the patch silently misses.
-    original_module = sys.modules.pop("relax.backends.sglang.sglang_engine", None)
-    module = importlib.import_module("relax.backends.sglang.sglang_engine")
-    yield module
-    if original_module is not None:
-        sys.modules["relax.backends.sglang.sglang_engine"] = original_module
+    module_name = "relax.backends.sglang.sglang_engine"
+    original = ModuleType(module_name)
+    if cached:
+        monkeypatch.setitem(sys.modules, module_name, original)
+        monkeypatch.setattr(parent, "sglang_engine", original, raising=False)
     else:
-        sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.delattr(parent, "sglang_engine", raising=False)
+    server_args = ModuleType("sglang.srt.server_args")
+    server_args.ServerArgs = object
+    with stubbed_sglang_engine_module(
+        monkeypatch, server_args=server_args, router_worker_base_url=router_worker_base_url
+    ) as module:
+        assert sys.modules[module_name] is parent.sglang_engine is module
+        assert module is not original
+    if cached:
+        assert sys.modules[module_name] is parent.sglang_engine is original
+    else:
+        assert module_name not in sys.modules
+        assert not hasattr(parent, "sglang_engine")
 
 
 class _Response:

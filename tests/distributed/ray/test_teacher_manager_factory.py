@@ -46,7 +46,7 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
     monkeypatch.setattr(
         ray,
         "get",
-        lambda ref: ["http://teacher/generate"] if ref == "get_urls-ref" else None,
+        lambda ref, timeout=None: ["http://teacher/generate"] if ref == "get_urls-ref" else None,
     )
 
     autoscaler_config = tmp_path / "autoscaler.yaml"

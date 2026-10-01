@@ -12,20 +12,19 @@ fall back to the sole "__default__" instance (the legacy single-model config).
 """
 
 import asyncio
-import time
 from argparse import Namespace
-from itertools import cycle
-from typing import Any, List, Optional, Union
+from typing import Any, Optional
 
 import httpx
 import ray
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.inference.compat import RoleDiscovery
+from relax.inference.gateway import InferenceGatewayHandler
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -39,73 +38,11 @@ app = FastAPI()
 GENRM_SERVE_MAX_ONGOING_REQUESTS = Envs.GENRM_SERVE_MAX_ONGOING_REQUESTS
 
 # NOTE: GENRM_SERVE_MAX_ONGOING_REQUESTS above must stay module-level — it feeds
-# the @serve.deployment decorator, which runs at import. The retry count has no
-# such constraint, so it is read at the call site to stay lazy.
+# the @serve.deployment decorator, which runs at import.
 
 # Sentinel instance key for the legacy single-model config (--genrm-model-path)
 # and for requests that don't pass a route_key.
 _DEFAULT_INSTANCE_KEY = "__default__"
-
-
-class Message(BaseModel):
-    """Single chat message."""
-
-    role: str
-    content: str
-
-
-class GenerateRequest(BaseModel):
-    """Request model for genRM generation (OpenAI chat format).
-
-    Accepts a list of messages in OpenAI format with optional sampling params.
-    """
-
-    messages: Union[List[Message], List[dict]]
-    sampling_params: Optional[dict] = None
-    route_key: Optional[str] = None
-
-
-class GenerateResponse(BaseModel):
-    """Response model for genRM generation.
-
-    Returns the raw model response text.
-    """
-
-    response: str
-
-
-class _EngineCacheState:
-    """Per-instance round-robin cache over a GenRMManager's live engine list.
-
-    Isolated per route_key so a dead/rebuilt engine on one instance never
-    perturbs another instance's cycle.
-    """
-
-    def __init__(self) -> None:
-        self.hosts_ports: Optional[list] = None
-        self.cycle: Optional[Any] = None
-        self.refreshed_at: float = 0.0
-
-    def invalidate(self) -> None:
-        now = time.monotonic()
-        if now - self.refreshed_at < Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S:
-            return
-        self.hosts_ports = None
-
-    def needs_refresh(self) -> bool:
-        if self.hosts_ports is None:
-            return True
-        if self.hosts_ports:
-            return False
-        return time.monotonic() - self.refreshed_at >= Envs.GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S
-
-    def refresh(self, hosts_ports: list) -> None:
-        self.refreshed_at = time.monotonic()
-        # Swap the list and its cycle together: the manager compacts the list
-        # over dead engines, so a cycle built for the old length would hand
-        # back an out-of-range index.
-        self.cycle = cycle(range(len(hosts_ports)))
-        self.hosts_ports = hosts_ports
 
 
 @serve.deployment(
@@ -153,7 +90,6 @@ class GenRM(Base):
         self.genrm_managers = create_genrm_managers(config, pg, runtime_env=runtime_env)
         self.instance_specs = config._genrm_instances_resolved
 
-        self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
         self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
@@ -181,29 +117,28 @@ class GenRM(Base):
         return None
 
     @app.post("/generate")
-    async def generate(self, request: GenerateRequest) -> GenerateResponse:
-        """Generate response for given chat messages.
+    async def generate(self, request: Request):
+        """Forward generation payloads through the shared inference gateway."""
+        return await self._get_inference_gateway().handle_generate(request)
 
-        Takes OpenAI-style messages as input, sends to SGLang engine,
-        and returns the raw model response. The caller is responsible
-        for formatting the prompt and parsing the response.
+    def _get_inference_gateway(self):
+        if not hasattr(self, "_inference_gateway"):
+            self._inference_gateway = InferenceGatewayHandler(
+                "genrm", self.get_engines, http_client=self._http_client, genrm_render=self._render_inference_payload
+            )
+        return self._inference_gateway
 
-        Args:
-            request: GenerateRequest containing messages list, optional
-                sampling_params, and an optional route_key selecting which
-                genRM instance to use (defaults to the sole instance).
+    @app.post("/v1/chat/completions")
+    async def chat_completions(self, request: Request):
+        return await self._get_inference_gateway().handle_chat(request)
 
-        Returns:
-            GenerateResponse containing raw model response text
-        """
-        try:
-            output = await self._call_engine(request.route_key, request.messages, request.sampling_params)
-            response = output.get("text", "").strip()
-            return GenerateResponse(response=response)
+    @app.post("/chat/completions")
+    async def chat_completions_alias(self, request: Request):
+        return await self._get_inference_gateway().handle_chat(request)
 
-        except Exception as e:
-            self._logger.error(f"GenRM generation failed (route_key={request.route_key}): {e}")
-            raise
+    @app.get("/v1/models")
+    async def list_models(self) -> dict:
+        return await self._get_inference_gateway().models()
 
     def _resolve_instance_key(self, route_key: Optional[str]) -> str:
         if route_key is None and len(self.genrm_managers) == 1:
@@ -215,43 +150,17 @@ class GenRM(Base):
             )
         return key
 
-    def _pick_engine(self, route_key: Optional[str]) -> tuple[str, int, str, int]:
-        """Round-robin one live engine of the instance selected by
-        ``route_key``, refreshing that instance's cache if it was dropped."""
-        key = self._resolve_instance_key(route_key)
-        cache = self._engine_caches[key]
-        if cache.needs_refresh():
-            hosts_ports = ray.get(self.genrm_managers[key].get_engine_hosts_ports.remote())
-            cache.refresh(hosts_ports)
+    @app.get("/engines")
+    async def get_engines(self, schema: int = 2) -> dict:
+        if schema != 2:
+            raise HTTPException(status_code=400, detail="Unsupported discovery schema")
+        if not hasattr(self, "_inference_discovery"):
+            self._inference_discovery = RoleDiscovery("genrm", lambda: self.genrm_managers)
+        return await self._inference_discovery.snapshot()
 
-        hosts_ports = cache.hosts_ports
-        if not hosts_ports:
-            raise RuntimeError(f"No genRM engines available for instance '{key}'")
-
-        # Thread-safe round-robin via itertools.cycle (next() is atomic in CPython).
-        # Re-read the local alias, not cache.*, so a concurrent invalidation
-        # can't make the index and the list disagree.
-        idx = next(cache.cycle) % len(hosts_ports)
-        host, port = hosts_ports[idx]
-        return key, idx, host, port
-
-    async def _call_engine(
-        self, route_key: Optional[str], messages: list, sampling_params: Optional[dict] = None
+    async def _render_inference_payload(
+        self, key: str, messages: list, sampling_params: Optional[dict] = None
     ) -> dict:
-        """Call an SGLang engine for text generation.
-
-        Uses the engine addresses obtained from the selected instance's
-        GenRMManager to send HTTP requests to the underlying SGLang server.
-
-        Args:
-            route_key: Selects which genRM instance to use.
-            messages: List of chat messages in OpenAI format.
-            sampling_params: Optional per-request sampling params that override defaults.
-
-        Returns:
-            Dict containing at least {"text": str} from the SGLang server.
-        """
-        key, idx, host, port = self._pick_engine(route_key)
         spec = self.instance_specs[key]
         # ensure plain list — some tokenizers return BatchEncoding which is not JSON-serializable
         # Tokenization (chat-template render + encode) is synchronous CPU work; run it in a
@@ -294,38 +203,15 @@ class GenRM(Base):
             "input_ids": input_ids,
             "sampling_params": default_sampling,
         }
-
-        # Retry transient resets (transport-level or 5xx) with short backoff so
-        # bursty colocate contention doesn't surface as a 500; 4xx is a client bug
-        # (terminal) and a cancellation (caller timeout) is never retried.
-        # Serve→engine retry attempts for transient resets (ReadError / 5xx under
-        # bursty colocate contention), absorbing them before they surface as a 500
-        # to the client. Set 1 to disable.
-        retry_attempts = Envs.GENRM_ENGINE_RETRY_ATTEMPTS
-        for _attempt in range(1, retry_attempts + 1):
-            try:
-                resp = await self._http_client.post(f"http://{host}:{port}/generate", json=payload)
-                resp.raise_for_status()
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                status = int(getattr(getattr(e, "response", None), "status_code", 0) or 0)
-                if (status == 0 or status >= 500) and _attempt < retry_attempts:
-                    # A transport error means this engine may be gone and its
-                    # replacement will come back on a different port, so drop the
-                    # cache and re-pick — retrying the same dead host is useless.
-                    if status == 0:
-                        self._engine_caches[key].invalidate()
-                    key, idx, host, port = self._pick_engine(route_key)
-                    await asyncio.sleep(0.3 * _attempt)
-                    continue
-                raise
-        return resp.json()
+        return payload
 
     @app.get("/health")
-    async def health(self) -> dict:
+    async def health(self, schema: int = 1) -> dict:
         """Health check endpoint; reports per-instance status."""
+        if schema == 2:
+            return await self._get_inference_gateway().health()
+        if schema != 1:
+            raise HTTPException(status_code=400, detail="Unsupported health schema")
         instances = {}
         for key, manager in self.genrm_managers.items():
             try:

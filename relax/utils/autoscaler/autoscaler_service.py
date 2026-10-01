@@ -369,7 +369,7 @@ class AutoscalerService(Base):
         if self._http_session is None:
             return []
 
-        url = f"{self.config.rollout_service_url}/engines"
+        url = f"{self.config.rollout_service_url}/engines?schema=1"
 
         try:
             async with self._http_session.get(url) as response:

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import importlib
-import logging
 import os
 import sys
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from relax.utils import s3_model_loader as m
+from tests.backends.sglang.engine_module_stub import stubbed_sglang_engine_module
 
 
 @pytest.fixture(autouse=True)
@@ -46,16 +46,6 @@ def arguments_module(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def sglang_engine_module(monkeypatch):
-    ray = ModuleType("ray")
-    ray.get_runtime_context = lambda: SimpleNamespace()
-    monkeypatch.setitem(sys.modules, "ray", ray)
-
-    sglang_router = ModuleType("sglang_router")
-    sglang_router.__version__ = "0.3.2"
-    monkeypatch.setitem(sys.modules, "sglang_router", sglang_router)
-
-    sglang = ModuleType("sglang")
-    sglang_srt = ModuleType("sglang.srt")
     server_args = ModuleType("sglang.srt.server_args")
 
     @dataclass
@@ -84,63 +74,19 @@ def sglang_engine_module(monkeypatch):
 
     server_args.LOAD_FORMAT_CHOICES = ("auto", "runai_streamer", "remote", "dummy")
     server_args.ServerArgs = ServerArgs
-    sglang_utils = ModuleType("sglang.srt.utils")
-    sglang_utils.kill_process_tree = lambda _pid: None
-    monkeypatch.setitem(sys.modules, "sglang", sglang)
-    monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
-    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
-    monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
-
-    checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
-    checkpoint_client.create_client = lambda **_kwargs: None
-    monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
-
-    ray_actor = ModuleType("relax.distributed.ray.ray_actor")
-    ray_actor.RayActor = object
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.ray_actor", ray_actor)
-
-    device = ModuleType("relax.utils.device")
-    device.get_visible_devices_env_var = lambda: "CUDA_VISIBLE_DEVICES"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    async_utils = ModuleType("relax.utils.async_utils")
-    async_utils.run = lambda value: value
-    monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
-
-    env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace(
-        RELAX_OPTIMIZE_ROUTING_REPLAY=False,
-        RELAX_OPD_PREEXPANDED_PATCH=False,
-        RELAX_OPD_PER_POS_TOKEN_IDS=False,
-        RELAX_OPD_TOKEN_IDS_LOGPROB_K="0",
-        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
-        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
-        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
-        RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES=512 * 1024**2,
-    )
-    monkeypatch.setitem(sys.modules, "relax.utils.env", env)
-
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
-    http_utils.router_worker_base_url = lambda host, port, worker_id: f"http://{host}:{port}/workers/{worker_id}"
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
-
-    logging_utils = ModuleType("relax.utils.logging_utils")
-    logging_utils.get_logger = logging.getLogger
-    monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
-
-    megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
-    megatron_peft_utils.convert_megatron_to_sglang_target_modules = lambda value: value
-    megatron_peft_utils.is_lora_enabled = lambda _args: False
-    monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
-
-    module_name = "relax.backends.sglang.sglang_engine"
-    sys.modules.pop(module_name, None)
-    module = importlib.import_module(module_name)
-    try:
+    with stubbed_sglang_engine_module(
+        monkeypatch,
+        server_args=server_args,
+        router_worker_base_url=lambda host, port, worker_id: f"http://{host}:{port}/workers/{worker_id}",
+        extra_env={
+            "RELAX_OPTIMIZE_ROUTING_REPLAY": False,
+            "RELAX_OPD_PREEXPANDED_PATCH": False,
+            "RELAX_OPD_PER_POS_TOKEN_IDS": False,
+            "RELAX_OPD_TOKEN_IDS_LOGPROB_K": "0",
+            "RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MIN_FREE_BYTES": 512 * 1024**2,
+        },
+    ) as module:
         yield module
-    finally:
-        sys.modules.pop(module_name, None)
 
 
 @pytest.fixture(autouse=True)
