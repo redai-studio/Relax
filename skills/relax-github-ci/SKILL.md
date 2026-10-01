@@ -16,6 +16,8 @@ gh pr checks <PR> --repo redai-studio/Relax --required
 
 Read `.github/ci/config.json` for workflow/job targets. Match runs to the PR, head SHA, workflow and head repository; an old run can have a recent update time after a rerun. Inspect logs for failed required or specifically requested checks.
 
+Use exact target keys: a workflow name such as `ci`, or `workflow/job` such as `ci/pre-commit` or `integration/gpu-async`. `ci` selects the pre-commit/CPU workflow; `all` selects every configured workflow. Job targets have no unqualified aliases.
+
 For the selected workflow on the current head, prefer an active run, then a non-cancelled run; use a cancelled run only when none survive. Within each group, choose the highest run number. Concurrency can cancel a higher-numbered duplicate while a lower-numbered run continues. For fork runs with an empty `pull_requests` array, match both head branch and head repository. Deployment workflows are outside the configured CI targets.
 
 ## Choose the operation

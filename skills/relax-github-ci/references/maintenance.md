@@ -10,7 +10,7 @@ Prefer a workflow label for authorized maintenance operations:
 gh pr edit <PR> --repo redai-studio/Relax --add-label 'ci-bypass: gpu-unit'
 ```
 
-Workflow targets are entries without a `job` in `config.json`. Use `ci-bypass: <workflow>` or `ci-bypass: all`; create needed labels in repository settings before use. ShigureLab/ci-bypass checks the label actor against the configured team.
+Workflow targets are entries without a `job` in `config.json`: `ci`, `gpu-unit`, and `integration`. Job targets such as `integration/gpu-async` are not valid bypass targets. Use `ci-bypass: <workflow>` or `ci-bypass: all`; create needed labels in repository settings before use. ShigureLab/ci-bypass checks the label actor against the configured team.
 
 A comment alternative is `/bypass <workflow>` or `/bypass all`, with an optional reason after the target. The gate reads comments directly; this command creates no status reply, label or automatic rerun. The current pattern accepts the command at the start of the comment, a target followed by whitespace or end of input, and optional trailing text.
 
