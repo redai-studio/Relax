@@ -1216,7 +1216,12 @@ def log_perf_data_fwd(args, rollout_id):
     tracking_utils.log(args, log_dict, step_key="actor_fwd/step")
 
 
-def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter | None = None) -> None:
+def log_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    flops_counter: FlopsCounter | None = None,
+    extra_metrics: dict[str, float] | None = None,
+) -> None:
     train_metric_utils.log_perf_data_raw(
         rollout_id=rollout_id,
         args=args,
@@ -1227,6 +1232,7 @@ def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter 
         ),
         flops_counter=flops_counter,
         world_size=dist.get_world_size(),
+        extra_metrics=extra_metrics,
     )
 
 

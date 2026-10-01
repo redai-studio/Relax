@@ -8,7 +8,7 @@ import time
 from argparse import Namespace
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from typing import Any, List
+from typing import Any, List, Sequence
 
 import ray
 import requests
@@ -98,6 +98,7 @@ from relax.utils.utils import (
 )
 
 from ...utils.profile_utils import TrainProfiler
+from ...utils.straggler import install_straggler_profiler
 from ...utils.training.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .collective_utils import _agree_drained
@@ -384,6 +385,8 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         self.prof = TrainProfiler(args)
+        # Must precede initialize_model_and_optimizer: the optimizer config takes its timers from the profiler.
+        self.straggler = install_straggler_profiler(role, args)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -1752,7 +1755,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+        self._log_perf_data(rollout_id, total_lengths)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2211,7 +2214,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+        self._log_perf_data(rollout_id, total_lengths)
 
         is_train_done = (rollout_id + 1) == self.args.num_rollout
         if self.args.save is not None and (
@@ -2372,8 +2375,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 all_audio_seqlens, audio_seqlens, group=mpu.get_data_parallel_group(with_context_parallel=False)
             )
             Timer().audio_seqlens = sum(all_audio_seqlens, [])
-        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter)
+        self._log_perf_data(rollout_id, total_lengths)
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
+
+    def _log_perf_data(self, rollout_id: int, total_lengths: Sequence[int]) -> None:
+        """``log_perf_data`` plus the straggler scalars of any analysed window;
+        every rank must call it (the profiler gathers once per window)."""
+        extra = None
+        if self.straggler is not None:
+            extra = self.straggler.step_metrics(rollout_id, int(sum(total_lengths)))
+        log_perf_data(rollout_id, self.args, flops_counter=self.flops_counter, extra_metrics=extra)
+        if self.straggler is not None:
+            self.straggler.delivered(rollout_id)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
