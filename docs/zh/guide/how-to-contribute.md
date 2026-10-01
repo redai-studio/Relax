@@ -129,7 +129,7 @@ git push origin feat/your-change
 
 推送后，在 GitHub 上创建 PR：来源分支选择你 fork 中的工作分支，目标分支选择 **`redai-studio/Relax` 的 `main` 分支**，并填写 [PR 模板](https://github.com/redai-studio/Relax/blob/main/.github/PULL_REQUEST_TEMPLATE.md)。
 
-根据 CI 结果和审查意见，在同一分支继续修改、验证、提交并推送，PR 会自动更新。
+根据 [CI 结果](#ci)和审查意见，在同一分支继续修改、验证、提交并推送，PR 会自动更新。
 
 ## 代码风格指南
 
@@ -271,6 +271,8 @@ PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI �
 | `/help` | 查看指令和 target |
 | `/review` | 请求代码 review |
 
+Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit/CPU workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
+
 | Target | Workflow / 检查 |
 | --- | --- |
 | `ci` | 全部 pre-commit 与 CPU 检查 |
@@ -281,8 +283,6 @@ PR 会运行 CPU 检查、GPU 单元测试和 GPU/NPU 集成测试。操作 CI �
 | `integration/gpu-async` | Qwen3-4B GPU 异步训练 |
 | `integration/gpu-vl` | Qwen3-VL-4B GPU 训练 |
 | `integration/npu-async` | Qwen3-4B NPU 异步训练 |
-
-Target 使用 `workflow` 或 `workflow/job` 命名。例如，`/rerun ci` 重跑整个 pre-commit/CPU workflow，`/rerun ci/pre-commit` 选择其中的 pre-commit 检查；`all` 表示所有已配置的 workflow。
 
 取消操作接受 workflow target（`ci`、`gpu-unit`、`integration` 或 `all`）。重跑只操作当前提交已有的 run；若 run 仍在运行，请等待结束或取消后再重跑。
 

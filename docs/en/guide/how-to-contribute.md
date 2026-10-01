@@ -129,7 +129,7 @@ git push origin feat/your-change
 
 After pushing, open a PR on GitHub. Select your working branch in your fork as the source and **`main` in `redai-studio/Relax`** as the target, then fill out the [PR template](https://github.com/redai-studio/Relax/blob/main/.github/PULL_REQUEST_TEMPLATE.md).
 
-Address any CI failures and review feedback on the same branch. Validate, commit, and push your changes to update the PR.
+Address any [CI failures](#ci) and review feedback on the same branch. Validate, commit, and push your changes to update the PR.
 
 ## Code Style Guidelines
 
@@ -271,6 +271,8 @@ PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI
 | `/help` | Show commands and targets |
 | `/review` | Request a code review |
 
+Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
+
 | Target | Workflow / check |
 | --- | --- |
 | `ci` | All pre-commit and CPU checks |
@@ -281,8 +283,6 @@ PRs run CPU checks, GPU unit tests, and GPU/NPU integration tests. To operate CI
 | `integration/gpu-async` | Qwen3-4B GPU async training |
 | `integration/gpu-vl` | Qwen3-VL-4B GPU training |
 | `integration/npu-async` | Qwen3-4B NPU async training |
-
-Targets use `workflow` or `workflow/job` names. For example, `/rerun ci` reruns the whole pre-commit/CPU workflow, while `/rerun ci/pre-commit` selects its pre-commit check. Use `all` to select all configured workflows.
 
 Cancellation accepts workflow targets (`ci`, `gpu-unit`, `integration`, or `all`). Rerun operates on existing runs for the current commit; wait for an active run to finish or cancel it before rerunning.
 
