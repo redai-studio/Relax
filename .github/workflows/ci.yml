@@ -12,8 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bypass:
+    name: Check CI bypass
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/check-bypass.yml
+    with:
+      target: ci
+
   # ── Pre-commit checks (ruff check/format, copyright, gitleaks, trailing-whitespace etc.) ──
   pre-commit:
+    needs: bypass
+    # A failed gate must run the tests, never grant an exemption.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Pre-commit Checks
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +43,9 @@ jobs:
 
   # ── Unit tests (matrix: Python 3.10 / 3.11 / 3.12) ────────────────────────
   test:
+    needs: bypass
+    # A failed gate must run the tests, never grant an exemption.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:

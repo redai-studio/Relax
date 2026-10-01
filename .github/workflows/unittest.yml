@@ -15,7 +15,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bypass:
+    name: Check CI bypass
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    uses: ./.github/workflows/check-bypass.yml
+    with:
+      target: gpu-unit
+
   unittest:
+    needs: bypass
+    # A failed gate must run the tests, never grant an exemption.
+    if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
     # Allow 120 minutes for image preparation plus the existing 60-minute test job budget.
