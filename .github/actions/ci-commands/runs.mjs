@@ -116,7 +116,7 @@ export async function runCommand({ github, repo, pr, config, command, args }) {
   const target = resolveTarget(args, config, command);
   const runs = await currentRuns(github, repo, pr, config, target);
   if (!runs.length)
-    return 'No matching PR workflow run exists for the current head. Rerun cannot start missing workflows.';
+    return `No matching PR workflow run exists for the current head. /${command} requires an existing run.`;
   const messages = [];
   for (const run of runs) {
     const label = `[${run.name} #${run.run_number}](${run.html_url})`;
@@ -125,7 +125,9 @@ export async function runCommand({ github, repo, pr, config, command, args }) {
       messages.push(`${label}: ${message}`);
     } catch (error) {
       // A failed response can follow a successful POST. Never automatically repeat a write.
-      messages.push(`${label}: ${error.message}. Inspect the run before retrying.`);
+      messages.push(
+        `${label}: ${error.message.replace(/\.+$/, '')}. Inspect the run before retrying.`,
+      );
     }
   }
   return `Head: \`${pr.head.sha}\`\n\n${messages.map((message) => `- ${message}`).join('\n')}`;
