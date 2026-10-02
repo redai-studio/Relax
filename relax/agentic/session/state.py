@@ -14,6 +14,7 @@ from typing import Any, Literal
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
+from relax.utils.speculative import SpeculativeCounts, SpeculativeGeneration
 from relax.utils.types import Sample
 
 
@@ -385,6 +386,7 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    pending_spec_counts: SpeculativeCounts | None = None
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
@@ -413,6 +415,9 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
+    committed_generations: dict[str, SpeculativeGeneration] = field(default_factory=dict)
+    generation_ids_by_state: dict[str, list[str]] = field(default_factory=dict)
+    untracked_generation_states: set[str] = field(default_factory=set)
 
     @classmethod
     def create_empty(
@@ -625,6 +630,7 @@ class SessionForest:
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
         spec_delta: dict[str, int] | None = None,
+        spec_counts: SpeculativeCounts | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
@@ -638,7 +644,27 @@ class SessionForest:
             tools=None,
             chat_template_kwargs=None,
         )
-        return self._register_node(
+        patch = export_metadata_patch or {}
+        generation_id = patch.get("request_id")
+        generation = None
+        if isinstance(generation_id, str) and generation_id:
+            generation = SpeculativeGeneration(
+                session_id=self.session_id,
+                generation_id=generation_id,
+                state_hash=state_hash,
+                counts=spec_counts if spec_counts is not None else SpeculativeCounts(),
+            )
+            existing = self.committed_generations.get(generation_id)
+            if existing is not None and existing != generation:
+                raise ValueError(f"Generation ID {generation_id!r} was committed with conflicting data")
+        if spec_delta is None and spec_counts is not None:
+            spec_delta = {
+                "spec_accept_token_num": spec_counts.accepted or 0,
+                "spec_draft_token_num": spec_counts.proposed or 0,
+                "spec_verify_ct": spec_counts.verify or 0,
+                "completion_token_num": spec_counts.completion or 0,
+            }
+        node = self._register_node(
             MsgNode(
                 kind="resp",
                 state_hash=state_hash,
@@ -661,6 +687,14 @@ class SessionForest:
                 export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
             )
         )
+        if generation is None:
+            self.untracked_generation_states.add(node.state_hash)
+        else:
+            self.committed_generations[generation_id] = generation
+            state_ids = self.generation_ids_by_state.setdefault(node.state_hash, [])
+            if generation_id not in state_ids:
+                state_ids.append(generation_id)
+        return node
 
     @staticmethod
     def _agentic_trace_turn_from_node(node: MsgNode, turn_idx: int) -> dict[str, Any]:
@@ -708,6 +742,8 @@ class SessionForest:
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
         first_response_node: MsgNode | None = None
+        generation_records: list[dict[str, Any]] = []
+        has_untracked_generation = False
 
         for idx, node in enumerate(lineage):
             tokens.extend(node.train_token_delta)
@@ -718,6 +754,10 @@ class SessionForest:
             if node.multimodal_train_inputs_delta is not None:
                 multimodal_train_inputs_buffer.append(node.multimodal_train_inputs_delta)
             if node.kind == "resp":
+                if node.state_hash in self.untracked_generation_states:
+                    has_untracked_generation = True
+                for generation_id in self.generation_ids_by_state.get(node.state_hash, []):
+                    generation_records.append(self.committed_generations[generation_id].to_dict())
                 if first_response_node is None:
                     first_response_node = node
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
@@ -790,5 +830,6 @@ class SessionForest:
             non_generation_time=wall_elapsed_s - generation_elapsed_s,
         )
         sample.spec_info = Sample.SpecInfo.from_dict(spec_info)
+        sample.spec_generations = None if has_untracked_generation else generation_records
         sample.prefix_cache_info = Sample.PrefixCacheInfo.from_dict(prefix_cache_info)
         return sample
