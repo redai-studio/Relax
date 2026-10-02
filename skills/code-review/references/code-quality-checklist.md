@@ -1,5 +1,9 @@
 # Code Quality Checklist (Relax Project)
 
+Contents: [Error handling](#error-handling), [resources](#resource-management), [performance](#performance), [boundaries](#boundary-conditions), [types](#type-safety), [readability](#code-readability).
+
+Use these as investigation prompts. Establish the input contract and a reachable impact before recommending defensive code, abstraction, or optimization.
+
 ## Error Handling
 
 ### Anti-patterns to Flag
@@ -26,8 +30,9 @@ except ValueError as e:
 ```
 
 - Overly broad `except Exception` hiding real bugs
-- Missing error handling around I/O, Ray remote calls, distributed ops
-- Unhandled coroutine exceptions (`asyncio.create_task` without awaiting)
+- I/O, Ray, or distributed failures that bypass the intended retry, propagation, or cleanup contract; check the owning layer before adding a local handler
+- Detached tasks whose exceptions or lifetime are not managed by their owner; not every task must be awaited immediately
+- Fallbacks that turn an invalid internal state into a success-shaped result, or repeated validation after a trusted boundary has already established the contract
 
 ______________________________________________________________________
 
@@ -52,9 +57,8 @@ ______________________________________________________________________
 
 ### Hot Path Issues
 
-- Regex compiled inside loops — compile once outside
-- Redundant computation — same calculation repeated without caching
-- String concatenation in loops — use `"".join()`
+- Repeated work on a demonstrated hot path; establish its cost before introducing caching or new state
+- String building or repeated setup with material cost at the actual input size
 
 ### Memory
 
@@ -64,8 +68,9 @@ ______________________________________________________________________
 
 ### Caching
 
-- `@lru_cache` / `@functools.cache` for pure expensive functions
-- Cache without TTL → stale data
+- A cache key or invalidation policy that omits changing inputs or model versions
+- Unbounded cache retention; identify lifetime and memory cost
+- TTL is only one policy: immutable inputs, versioned keys, explicit invalidation, or request-scoped lifetime can also establish correctness
 
 ______________________________________________________________________
 
@@ -83,8 +88,8 @@ if value is not None:
     process(value)
 ```
 
-- Division by zero: `total / count` → `total / max(count, 1)`
-- Empty collection access: `items[0]` without length check
+- Division by zero: trace whether zero is reachable and what the operation should mean. Reject invalid external input or preserve an internal invariant failure; do not silently replace the denominator with `max(count, 1)` or an arbitrary epsilon
+- Empty collection access when an empty input is permitted; do not add a guard if the producer already guarantees a nonempty value
 - Off-by-one in slicing / ranges
 
 ______________________________________________________________________
@@ -94,7 +99,7 @@ ______________________________________________________________________
 - Missing type hints on public functions
 - Excessive `Any` usage
 - Missing `Optional[]` for nullable values
-- `isinstance` cascades (often a design smell — prefer polymorphism)
+- Type dispatch that duplicates or contradicts supported behavior; an explicit dispatch over a closed set of types can be clearer than polymorphism
 
 ______________________________________________________________________
 
@@ -103,5 +108,5 @@ ______________________________________________________________________
 - **Magic numbers/strings** → extract named constants
 - **Complex nested conditionals** → extract to named booleans
 - **Deep nesting** → use early returns / `continue`
-- **Long functions** (>50 lines) → split by responsibility
+- **Mixed responsibilities** → identify a meaningful boundary; length alone does not justify splitting
 - Public functions missing docstrings
