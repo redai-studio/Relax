@@ -142,6 +142,101 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
+    def init_and_wait(
+        self,
+        args: Any,
+        role: str,
+        with_ref: bool = False,
+        with_opd_teacher: bool = False,
+    ) -> list[Any]:
+        """Initialize every train actor, destroying the group on any failure.
+
+        ``MegatronTrainRayActor.init`` attaches the process-global
+        TransferQueue client from a regular actor method. If its bounded
+        ``tq.init`` times out, the method raises while the native daemon thread
+        may still be running. A failed distributed group cannot be reused
+        safely, so all actor processes are force-killed and confirmed terminal
+        before the initialization error is propagated.
+        """
+        try:
+            # Submission itself can fail after one or more actor calls were
+            # already queued.  Keep it inside the same cleanup boundary as
+            # asynchronous task failures so no partially initialized group is
+            # left reusable.
+            refs = self.async_init(args, role, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
+            pending = list(refs)
+            results: dict[Any, Any] = {}
+            # ``ray.get(refs)`` may wait for every ref before surfacing one
+            # failure. A rank blocked in native initialization would then
+            # prevent cleanup forever, so consume whichever ref finishes first.
+            while pending:
+                ready, pending = ray.wait(pending, num_returns=1)
+                if not ready:
+                    raise RuntimeError("Ray returned no completed train-actor initialization task")
+                ref = ready[0]
+                results[ref] = ray.get(ref)
+            return [results[ref] for ref in refs]
+        except Exception:
+            self._terminate_failed_init()
+            raise
+
+    def _terminate_failed_init(self, timeout: float = 10.0) -> None:
+        """Force-kill a failed train group and confirm its actor tasks
+        ended."""
+        probe_refs = []
+        control_errors: list[str] = []
+
+        # Queue a task that can never return normally before issuing the force
+        # kill. Each ref must later fail with RayActorError, proving that Ray
+        # processed the actor death instead of merely accepting a kill request.
+        for actor in self._actor_handlers:
+            try:
+                probe_refs.append(actor.termination_probe.remote())
+            except ray.exceptions.RayActorError:
+                # The actor was already dead before cleanup reached it.
+                continue
+            except Exception as error:
+                control_errors.append(f"termination probe submission ({type(error).__name__})")
+
+        for actor in self._actor_handlers:
+            try:
+                ray.kill(actor, no_restart=True)
+            except ray.exceptions.RayActorError:
+                continue
+            except Exception as error:
+                control_errors.append(f"actor kill ({type(error).__name__})")
+
+        pending = []
+        ready = []
+        if probe_refs:
+            try:
+                ready, pending = ray.wait(
+                    probe_refs,
+                    num_returns=len(probe_refs),
+                    timeout=timeout,
+                )
+            except Exception as error:
+                control_errors.append(f"termination wait ({type(error).__name__})")
+
+        for ref in ready:
+            try:
+                ray.get(ref)
+            except ray.exceptions.RayActorError:
+                continue
+            except Exception as error:
+                control_errors.append(f"termination probe result ({type(error).__name__})")
+            else:
+                control_errors.append("termination probe returned normally")
+
+        if control_errors or pending:
+            detail = ", ".join(control_errors)
+            if pending:
+                detail = f"{detail}, " if detail else ""
+                detail += f"{len(pending)} task(s) remained pending"
+            raise RuntimeError(f"Failed to confirm train actor cleanup after initialization error: {detail}") from None
+
+        self._actor_handlers = []
+
     def async_train(self, rollout_id):
         """Do one rollout training."""
         return [actor.train.remote(rollout_id) for actor in self._actor_handlers]

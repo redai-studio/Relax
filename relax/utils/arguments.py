@@ -39,7 +39,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -248,6 +248,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=1,
                 help="Fully async pipeline num of iters every global batch.",
+            )
+            # ── RDMA transport (MooncakeStore backend) ──────────────────────────
+            # The default selects the existing SimpleStorage data path. These
+            # expose *intent* only; Mooncake internals (endpoint,
+            # buffer, segment, timeout, master strategy) are handled via internal
+            # defaults / deployment environment, not CLI flags.
+            parser.add_argument(
+                "--tq-rdma-mode",
+                choices=["off", "auto", "required"],
+                default="off",
+                help=(
+                    "TransferQueue data-plane transport. 'off' (default) uses "
+                    "SimpleStorage/ZMQ with bounded worker attach and cleanup. "
+                    "'auto' attempts MooncakeStore over host RDMA and falls back "
+                    "to SimpleStorage when it is unavailable (with a WARNING). "
+                    "'required' fails fast instead of falling back."
+                ),
+            )
+            parser.add_argument(
+                "--tq-rdma-device",
+                type=str,
+                default="",
+                help=(
+                    "RDMA device name for MooncakeStore (e.g. mlx5_bond_0). Empty "
+                    "(default) lets Mooncake auto-select. On multi-NIC hosts the "
+                    "auto-selected device may fail cross-node; specify explicitly if "
+                    "needed."
+                ),
             )
             return parser
 

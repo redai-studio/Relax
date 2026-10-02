@@ -84,7 +84,7 @@ RUN pip_install() { pip install "$@" || pip install --index-url https://pypi.org
     pip_install tensordict==0.10.0 pyvers==0.1.0 --no-deps
 RUN git clone https://github.com/redai-studio/TransferQueue.git /root/TransferQueue && \
     cd /root/TransferQueue && \
-    git checkout 58054a33834aadbcf76aacd6b1e32e25c030f2c9 && \
+    git checkout 9784ad0d8a5f0db93ff8326379ab2a6d06e640a0 && \
     pip install /root/TransferQueue --no-deps --no-build-isolation && \
     cd /root && \
     rm -rf /root/TransferQueue

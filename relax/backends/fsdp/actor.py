@@ -27,6 +27,7 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.models import flow_grpo
 from relax.models.generative import GenerativeModelAdapter
 from relax.utils.logging_utils import get_logger
+from relax.utils.tq.lifecycle import attach_tq_client, detach_tq_client
 from relax.utils.utils import load_function
 
 
@@ -2201,15 +2202,35 @@ class FSDPTrainRayActor(TrainRayActor):
         except Exception as exc:
             raise WeightSyncError(version, str(exc)) from exc
 
-    def _tq_client(self):
-        """Lazily create this actor's TransferQueue client (mirrors megatron
-        actor)."""
-        if self._data_system_client is None:
-            import transfer_queue as tq
+    def __del__(self) -> None:
+        # Best-effort detach on graceful teardown; ray.kill / fate-sharing
+        # kills skip destructors, in which case the Mooncake master TTL
+        # reclaims the segment.
+        if getattr(self, "_data_system_client", None) is None:
+            return
+        try:
+            detach_tq_client()
+            self._data_system_client = None
+        except Exception:  # destructor must never raise (interpreter shutdown)
+            return
 
-            if getattr(self.args, "tq_config", None) is not None:
-                tq.init(self.args.tq_config)
-            self._data_system_client = tq.get_client()
+    def _tq_client(self):
+        """Lazily attach this actor's TransferQueue client (mirrors megatron
+        actor).
+
+        A configured job goes through the bounded lifecycle helper so the
+        attach cannot poll the controller forever and the Mooncake runtime
+        contract is validated before use; a missing ``tq_config`` keeps
+        upstream's behavior of reusing the client this process already holds.
+        """
+        if self._data_system_client is None:
+            conf = getattr(self.args, "tq_config", None)
+            if conf is None:
+                import transfer_queue as tq
+
+                self._data_system_client = tq.get_client()
+            else:
+                self._data_system_client = attach_tq_client(conf, role="fsdp_actor")
         return self._data_system_client
 
     def _load_train_batches(self, rollout_id: int, rollout_data_ref) -> List[Dict[str, Any]]:
