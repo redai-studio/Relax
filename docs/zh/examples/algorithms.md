@@ -64,7 +64,7 @@ $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$
 
 $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
 
-这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
+这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。空 response 或全 mask response 仍参与所属 prompt group 的 leave-one-out reward baseline，但贡献零个 policy-loss token，且不会计入 $N_{\mathrm{eff}}$。如果整个 global batch 都没有有效 token，则将其作为 no-signal step 并报告零 loss 指标，而不是执行除零。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
 
 ### 约束与参数
 

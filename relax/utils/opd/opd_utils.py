@@ -1377,6 +1377,7 @@ def compute_policy_opd_loss(
     *,
     args: Namespace,
     batch: RolloutBatch,
+    metric_reducer: Callable[[torch.Tensor], torch.Tensor],
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     log_probs_and_entropy: dict[str, list[torch.Tensor]],
@@ -1448,7 +1449,7 @@ def compute_policy_opd_loss(
         before_clip = opd_per_token_kl
         opd_per_token_kl = torch.clamp(opd_per_token_kl, max=tau)
         with torch.no_grad():
-            reported_loss["opd_per_token_clip_frac"] = (before_clip > tau).float().mean().clone().detach()
+            reported_loss["opd_per_token_clip_frac"] = metric_reducer((before_clip > tau).float()).detach()
 
     is_clip = getattr(args, "opd_is_clip", None)
     if is_clip is not None:
@@ -1457,7 +1458,7 @@ def compute_policy_opd_loss(
         ratio_clipped = torch.clamp(ratio, max=clip)
         opd_per_token_kl = opd_per_token_kl * ratio_clipped.to(dtype=opd_per_token_kl.dtype)
         with torch.no_grad():
-            reported_loss["opd_is_clip_frac"] = (ratio > clip).float().mean().clone().detach()
+            reported_loss["opd_is_clip_frac"] = metric_reducer((ratio > clip).float()).detach()
 
     opd_loss = reduce_opd_loss(batch, opd_per_token_kl)
     return opd_loss_coef * opd_loss, reported_loss
