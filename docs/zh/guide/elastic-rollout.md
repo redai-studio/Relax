@@ -62,23 +62,32 @@ ______________________________________________________________________
                                        │ HTTP REST API
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              Rollout Service (relax/components/rollout.py)          │
-│                    Ray Serve Ingress + FastAPI                      │
+│     Rollout Gateway (relax/components/inference_gateway.py)         │
+│                    Ray Serve Ingress, route /rollout                │
 │                                                                     │
-│    POST /scale_out        GET /engines       POST /scale_in         │
-│    GET  /scale_out/{id}                      GET  /scale_in/{id}    │
-│    POST /scale_out/{id}/cancel                                      │
+│    GET /engines (v2 discovery)     other paths → Rollout Service    │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │
+                               │ /rollout/backend/...
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│      RolloutManager (relax/distributed/ray/rollout.py)              │
-│                  Ray Actor                                          │
+│              Rollout Service (relax/components/rollout.py)          │
+│                    Ray Serve Deployment + FastAPI                   │
 │                                                                     │
-│    scale_out()          scale_in()          get_engines_info()      │
+│    POST /scale_out                            POST /scale_in        │
+│    GET  /scale_out/{id}                       GET  /scale_in/{id}   │
+│    POST /scale_out/{id}/cancel                                      │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ InferenceManager.rollout_operation()
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│   InferenceManager (relax/distributed/ray/inference_manager.py)     │
+│     └─ RolloutEnginePool (relax/distributed/ray/rollout.py)         │
+│                  CPU Ray Actor on the head node                     │
+│                                                                     │
+│    scale_out()          scale_in()          observe()               │
 │    ┌──────────┐         ┌──────────┐        ┌──────────────┐        │
-│    │Create    │         │Select    │        │Query engine  │        │
-│    │EngineGrp │         │targets   │        │status        │        │
+│    │Create    │         │Select    │        │Replica state │        │
+│    │EngineGrp │         │targets   │        │→ discovery   │        │
 │    │Health chk│         │Drain     │        └──────────────┘        │
 │    │DCS reg   │         │Remove    │                                │
 │    │Router reg│         │Cleanup   │                                │
@@ -96,10 +105,12 @@ ______________________________________________________________________
 
 **关键组件职责：**
 
-| 组件                | 职责                                                       |
-|---------------------|------------------------------------------------------------|
-| **Rollout Service** | FastAPI 层，接收 HTTP 请求，转发给 RolloutManager          |
-| **RolloutManager**  | 核心执行层，管理引擎生命周期、权重同步、状态机             |
+| 组件                  | 职责                                                                           |
+|-----------------------|--------------------------------------------------------------------------------|
+| **Rollout Gateway**   | 对外的 `/rollout` 入口，提供 `GET /engines` 服务发现，并把扩缩容 API 转发给 Rollout Service |
+| **Rollout Service**   | FastAPI 层，校验扩缩容请求，经 `InferenceManager.rollout_operation()` 转发      |
+| **InferenceManager**  | 任务级控制面，持有 Rollout/GenRM/Teacher 的引擎池、服务发现快照和请求准入       |
+| **RolloutEnginePool** | InferenceManager 内的 Rollout 引擎池，管理引擎生命周期、权重同步、扩缩容状态机 |
 | **SGLang Router**   | 请求路由层，负责将推理请求分发到各引擎（cache-aware 策略） |
 | **SGLang Engine**   | 推理引擎，执行 LLM 生成任务                                |
 | **DCS Coordinator** | 权重分发服务，仅管理初始引擎的拓扑信息和权重广播           |
@@ -245,7 +256,7 @@ curl -X POST http://<rollout-host>/rollout/scale_out_cancel \
 
 1. **引擎启动时跳过 DCS 注册**：Scaled-out 引擎设置 `skip_dcs_registration=True`，不注册到 DCS Coordinator
 2. **引擎立即注册到 Router**：健康检查通过后立即注册到 SGLang Router，可开始接收请求（使用旧权重）
-3. **Actor 触发权重同步**：在 Actor 的 `update_weights_fully_async()` 完成后，调用 `RolloutManager.sync_weights_for_scaled_out_engines()`
+3. **Actor 触发权重同步**：在 Actor 的 `update_weights_fully_async()` 完成后，调用 `RolloutEnginePool.sync_weights_for_scaled_out_engines()`
 4. **权重同步**：从 seed engine（初始引擎）通过 NCCL Broadcast 直接传输权重到 scaled-out 引擎
 
 **前提条件**：
@@ -412,27 +423,45 @@ curl http://<rollout-host>/rollout/engines
 
 ```json
 {
+  "schema_version": 2,
+  "role": "rollout",
+  "manager_epoch": "5b0c3f0e9d2a4e1f8a6b7c9d0e1f2a3b",
+  "topology_revision": 1,
+  "phase": "inference",
+  "routing": {"default_model": "default", "route_key_to_model": {}, "config_version": 0},
   "models": {
     "default": {
+      "state": "ready",
+      "admission": true,
+      "router_url": "http://198.51.100.1:30010",
+      "required_weight_version": "12",
       "engines": [
         {
-          "engine_id": "engine_0",
-          "url": "http://198.51.100.10:30000",
-          "status": "ACTIVE",
-          "is_healthy": true
+          "engine_id": "default/replica-0",
+          "base_url": "http://198.51.100.10:30000",
+          "state": "ready",
+          "weight_version": "12",
+          "direct_eligible": false
         },
         {
-          "engine_id": "engine_1",
-          "url": "http://198.51.100.11:30000",
-          "status": "ACTIVE",
-          "is_healthy": true
+          "engine_id": "default/replica-1",
+          "base_url": "http://198.51.100.11:30000",
+          "state": "ready",
+          "weight_version": "12",
+          "direct_eligible": false
         }
-      ]
+      ],
+      "pd_workers": []
     }
-  },
-  "total_engines": 2
+  }
 }
 ```
+
+响应默认使用 v2 服务发现格式。每个引擎的 `state` 取值为
+`starting` / `ready` / `draining` / `sleeping` / `onloading` / `dead`；只有 `state` 为 `ready`
+且 `admission: true` 的模型才接收请求。`status_filter=active|dead` 分别保留非 `dead` / `dead`
+的引擎。仍按 `engine_groups` / `total_engines` 解析的旧客户端需要请求
+`GET /rollout/engines?schema_version=1`，拿到旧格式投影（只反映存活，`active` 不代表 `ready`）。
 
 ______________________________________________________________________
 
@@ -474,8 +503,8 @@ ______________________________________________________________________
 
 ```bash
 # 1. 查看当前引擎状态
-curl http://localhost:8000/rollout/engines
-# 返回：total_engines = 4
+curl -s http://localhost:8000/rollout/engines | jq '[.models[].engines[]] | length'
+# 返回：4
 
 # 2. 扩容到 8 个引擎
 curl -X POST http://localhost:8000/rollout/scale_out \
@@ -488,8 +517,8 @@ curl http://localhost:8000/rollout/scale_out/abc-123
 # 状态流转：PENDING → CREATING → HEALTH_CHECKING → WEIGHT_SYNCING → READY
 
 # 4. 确认扩容完成
-curl http://localhost:8000/rollout/engines
-# 返回：total_engines = 8
+curl -s http://localhost:8000/rollout/engines | jq '[.models[].engines[]] | length'
+# 返回：8
 ```
 
 ### 场景二：接入跨集群引擎

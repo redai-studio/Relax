@@ -189,6 +189,9 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     service.num_gpus = 0
     service.role = "rollout" if has_data_source else "actor"
     service.data_source = MagicMock() if has_data_source else None
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
@@ -210,6 +213,9 @@ def test_service_deploy_is_unconstrained_without_autoscaler():
     service.num_gpus = 0
     service.role = "actor"
     service.data_source = None
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)

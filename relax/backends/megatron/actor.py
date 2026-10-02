@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.phase_plans import deferred_genrm_enabled
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
@@ -355,7 +356,7 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist(args)
         from relax.utils.checkpoint_write_patch import patch_checkpoint_write
 
-        patch_checkpoint_write()
+        patch_checkpoint_write(blocking_staging=args.offload_train and not getattr(args, "async_save", False))
         if role == "reference" or role == "actor_fwd":
             process_args(args, role)
         super().init(args, role, with_ref, with_opd_teacher)
@@ -861,7 +862,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
         is_sft = is_sft_mode(self.args)
-        has_rollout = getattr(self, "rollout_manager", None) is not None
+        has_rollout = getattr(self, "rollout_worker", None) is not None
 
         if not is_sft and dist.get_rank() != 0:
             return
@@ -926,7 +927,7 @@ class MegatronTrainRayActor(TrainRayActor):
             pre_train_offload_handles = []
             if self.genrm_manager is not None:
                 # A list of one or more GenRM manager handles (one per instance).
-                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
+                pre_train_offload_handles.extend(m.deactivate.remote() for m in self.genrm_manager)
             append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
             if pre_train_offload_handles:
                 ray.get(pre_train_offload_handles)
@@ -975,7 +976,7 @@ class MegatronTrainRayActor(TrainRayActor):
             else:
                 dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
                 if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-                    dynamic_size = ray.get(self.rollout_manager.get_dynamic_global_batch_size.remote())
+                    dynamic_size = ray.get(self.rollout_worker.get_dynamic_global_batch_size.remote())
                     batch_size = dynamic_size // dp_size
                     num_rollout_minis = 1
                 else:
@@ -1761,14 +1762,14 @@ class MegatronTrainRayActor(TrainRayActor):
             and ((rollout_id + 1) % self.args.save_interval == 0 or is_train_done)
         ):
             self.save_model(rollout_id, force_sync=is_train_done)
-        has_rollout = getattr(self, "rollout_manager", None) is not None
+        has_rollout = getattr(self, "rollout_worker", None) is not None
         if self._per_step_rollout:
             if self.args.offload_train:
                 self.sleep()
             if has_rollout:
                 self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
-        # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
+        # RL-only generative eval (uses SGLang via rollout_worker.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
         self._run_step_evaluation(rollout_id)
@@ -2420,6 +2421,10 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        if dist.get_rank(group=get_gloo_group()) == 0:
+            # Close rollout admission until the new policy weights are published.
+            ray.get(self.inference_manager.rollout_operation.remote("invalidate_inference_state"))
+
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
             # completed sleep() (and released GPU memory via tms.pause()) before
@@ -2433,17 +2438,21 @@ class MegatronTrainRayActor(TrainRayActor):
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
             # temp buffers and OOM. See onload_kv below (post_sync_handles).
-            onload_handles = [self.rollout_manager.onload_weights.remote()]
+            from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
+            from relax.engine.inference.types import Role
+
+            onload_handles = [self.inference_manager.activate.remote(Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_WEIGHTS])]
             append_managed_opd_teacher_onload_handle(onload_handles, self)
             ray.get(onload_handles)
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.recover_rollout_engines.remote())
+                ray.get(self.inference_manager.rollout_operation.remote("recover_rollout_engines"))
             dist.barrier(group=get_gloo_group())
 
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
-            self.rollout_manager.get_rollout_engines_and_lock.remote()
+            self.inference_manager.rollout_operation.remote("get_rollout_engines_and_lock")
         )
 
         # Disaggregate PPO tears down the actor↔rollout NCCL groups on sleep(),
@@ -2465,7 +2474,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
-                ray.get(self.rollout_manager.clear_num_new_engines.remote())
+                ray.get(self.inference_manager.rollout_operation.remote("clear_num_new_engines"))
 
         with self._train_state_offloader.disable_during_update():
             print_memory("before update_weights")
@@ -2498,19 +2507,29 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
-        # When --defer-reward-to-post-process is set the userland
-        # custom_reward_post_process function owns GenRM lifecycle, so skip
-        # onloading GenRM here (it must stay offloaded for rollout to have
-        # all GPUs during generate in shared-bundles mode).
+        # A deferred GenRM (shared bundles + --defer-reward-to-post-process)
+        # is woken by its own scoring phase, so skip onloading it here (it
+        # must stay offloaded for rollout to have all GPUs during generate).
         if self.args.offload_rollout and dist.get_rank() == 0:
+            from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE
+
+            from relax.engine.inference.types import Role
+
             post_sync_handles = []
             if self._per_step_rollout:
-                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
+                post_sync_handles.append(
+                    self.inference_manager.activate.remote(
+                        Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+                    )
+                )
+            if self.genrm_manager is not None and not deferred_genrm_enabled(self.args):
                 # A list of one or more GenRM manager handles (one per instance).
-                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
+                post_sync_handles.extend(m.activate.remote() for m in self.genrm_manager)
             if post_sync_handles:
                 ray.get(post_sync_handles)
+
+        if dist.get_rank(group=get_gloo_group()) == 0:
+            ray.get(self.inference_manager.rollout_operation.remote("complete_inference_weight_update"))
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

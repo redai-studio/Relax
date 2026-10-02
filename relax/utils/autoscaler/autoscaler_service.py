@@ -362,7 +362,8 @@ class AutoscalerService(Base):
     async def _fetch_engines(self) -> List[Dict[str, str]]:
         """Fetch active engine list from Rollout service.
 
-        Only engines with ``status == "active"`` and a usable URL are returned.
+        Reads the common discovery schema; every engine that is not DEAD and
+        has a usable URL is returned.
         Returns:
             List of dicts with 'id', 'url', and 'model_name' keys.
         """
@@ -381,20 +382,17 @@ class AutoscalerService(Base):
                 engines = []
 
                 for model_name, model_info in data.get("models", {}).items():
-                    for engine_group in model_info.get("engine_groups", []):
-                        for engine in engine_group.get("engines", []):
-                            if engine.get("status") != "active":
-                                continue
-                            if not engine.get("url"):
-                                continue
-                            engines.append(
-                                {
-                                    "id": f"engine_{engine.get('rank', 'unknown')}",
-                                    "url": engine.get("url", ""),
-                                    "model_name": model_name,
-                                    "status": engine.get("status", "unknown"),
-                                }
-                            )
+                    for engine in model_info.get("engines", []):
+                        if engine.get("state") == "dead" or not engine.get("base_url"):
+                            continue
+                        engines.append(
+                            {
+                                "id": engine.get("engine_id", "unknown"),
+                                "url": engine["base_url"],
+                                "model_name": model_name,
+                                "status": engine.get("state", "unknown"),
+                            }
+                        )
 
                 return engines
 

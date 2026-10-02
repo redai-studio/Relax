@@ -17,7 +17,8 @@
 # scheduler with a bounded per-iteration prefill budget (chunked-prefill-size),
 # so a step's requests queue up behind it; splitting the same GPUs into more
 # engines gives independent schedulers and divides per-engine concurrency.
-# Requests round-robin across a teacher's replicas (_pick_teacher_url).
+# The Teacher Gateway sends each teacher's requests to its SGLang Router, which
+# balances them across that teacher's replicas.
 # chunked-prefill-size is raised to 16384 (sglang's max_prefill_tokens ceiling)
 # for student and teachers alike: long multi-image prompts overflow the default
 # budget, which pins prefill at one sequence per iteration and needs many more

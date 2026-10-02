@@ -62,7 +62,7 @@ configs/env.yaml         运行时环境配置
 | Service 类  | `@serve.deployment`     | `Actor`, `Rollout`, `Critic`, `GenRM` |
 | 后端 Actor  | `XxxTrainRayActor`      | `MegatronTrainRayActor`               |
 | Actor 组    | `RayTrainGroup`         | 管理一组训练 Ray Actor                |
-| Manager     | `XxxManager`            | `RolloutManager`, `GenRMManager`      |
+| Manager     | `XxxManager`            | `InferenceManager`, `OpdManager`      |
 | Reward 函数 | `engine/rewards/xxx.py` | `deepscaler.py`, `math_utils.py`      |
 | 数据源      | `XxxDataSource`         | `RolloutDataSource`                   |
 

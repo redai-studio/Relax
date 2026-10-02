@@ -18,7 +18,7 @@ The Rollout service generates training samples using SGLang engines. It is deplo
 
 The Rollout runs a background loop that:
 
-1. Generates samples via `RolloutManager.generate()` using SGLang engines
+1. Generates samples via `RolloutWorker.generate()` using SGLang engines
 2. Computes rewards via pluggable reward functions (`rm_hub/`)
 3. Publishes data to `TransferQueue` for the Actor to consume
 4. Optionally triggers evaluation at configured intervals

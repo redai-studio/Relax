@@ -31,6 +31,7 @@ except ImportError:
 
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.ray_actor import RayActor
+from relax.engine.inference.types import Role, WeightSource
 from relax.utils import device as device_utils
 from relax.utils import scale_utils
 from relax.utils.async_utils import run
@@ -49,6 +50,9 @@ from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
+
+# Bound on waiting for the Router to finish a queued worker addition.
+_ROUTER_JOIN_TIMEOUT_S = 30.0
 
 
 # GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
@@ -336,6 +340,16 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
 
 
 class SGLangEngine(RayActor):
+    """One SGLang server process group for any inference role.
+
+    ``role`` selects the only role-specific behaviour left in the engine: how
+    GenRM builds its server arguments and how it drains before releasing GPU
+    memory. Everything else is shared by Rollout, GenRM and Teacher.
+    """
+
+    weight_source = WeightSource.DCS
+    role = Role.ROLLOUT
+
     def __init__(
         self,
         args,
@@ -345,8 +359,12 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        weight_source: WeightSource | str = WeightSource.DCS,
+        role: Role | str = Role.ROLLOUT,
     ):
         self.args = args
+        self.weight_source = WeightSource(weight_source)
+        self.role = Role(role)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -355,6 +373,10 @@ class SGLangEngine(RayActor):
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
+        self._router_registered = False
+        # Memory types released and not yet resumed. A generation probe while
+        # any of them is missing (e.g. weights back, KV cache not) crashes SGLang.
+        self._released_memory: set[str] = set()
         if register_sigterm_handler:
             self._register_sigterm_handler()
 
@@ -400,6 +422,7 @@ class SGLangEngine(RayActor):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
+        self._disaggregation_bootstrap_port = disaggregation_bootstrap_port
 
         host = host or get_host_info()[1]
 
@@ -417,7 +440,7 @@ class SGLangEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict, external_engine_need_check_fields = _compute_server_args(
+        server_args_dict, external_engine_need_check_fields = self._compute_engine_server_args(
             self.args,
             self.rank,
             dist_init_addr,
@@ -445,15 +468,43 @@ class SGLangEngine(RayActor):
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
         else:
-            self._init_normal(server_args_dict)
+            if self.weight_source == WeightSource.DCS:
+                self._init_normal(server_args_dict)
+            else:
+                self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
         # Done after engine startup so the coordinator can immediately reach the server.
-        if not skip_dcs_registration:
+        if not skip_dcs_registration and self.weight_source == WeightSource.DCS:
             self.register_dcs()
 
+    def _compute_engine_server_args(self, *args, **kwargs) -> tuple[dict, list]:
+        if self.role == Role.GENRM:
+            kwargs.pop("sglang_overrides", None)
+            kwargs.pop("num_gpus_per_engine", None)
+            server_args, check_fields = _compute_genrm_server_args(*args, **kwargs)
+        else:
+            server_args, check_fields = _compute_server_args(*args, **kwargs)
+        from relax.engine.inference.phase_plans import deferred_opd_enabled
+
+        preserve_weights = self.weight_source == WeightSource.STATIC or (
+            self.role == Role.ROLLOUT and deferred_opd_enabled(self.args)
+        )
+        if preserve_weights and server_args.get("enable_memory_saver"):
+            # Static models and deferred OPD's student second pass resume without
+            # a weight sync after offload discards GPU pages.
+            server_args["enable_weights_cpu_backup"] = True
+            if "enable_weights_cpu_backup" not in check_fields:
+                check_fields.append("enable_weights_cpu_backup")
+        return server_args, check_fields
+
+    def _require_policy_weights(self) -> None:
+        if self.weight_source != WeightSource.DCS:
+            raise RuntimeError(f"Policy weight updates are forbidden for {self.weight_source.value} engines")
+
     def register_dcs(self):
+        self._require_policy_weights()
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
@@ -546,7 +597,8 @@ class SGLangEngine(RayActor):
         )
         # Only register to router if skip_router_registration=False
         if not self._skip_router_registration:
-            self.register_to_router(bootstrap_port=bootstrap_port)
+            if not self.register_to_router(bootstrap_port=bootstrap_port):
+                raise RuntimeError("SGLang engine initialization failed to register with its Router")
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
@@ -609,6 +661,7 @@ class SGLangEngine(RayActor):
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
+        self._require_policy_weights()
         payload = {
             "serialized_named_tensors": serialized_named_tensors,
             "load_format": load_format,
@@ -655,6 +708,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request(
             "load_lora_adapter_from_tensors",
             {
@@ -703,6 +757,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request(
             "update_lora_from_distributed",
             {
@@ -729,6 +784,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_policy_weights()
         return self._make_request("unload_lora_adapter", {"lora_name": lora_name})
 
     def abort_requests(self, timeout: float = _SGLANG_HTTP_ATTEMPT_TIMEOUT_S):
@@ -840,6 +896,7 @@ class SGLangEngine(RayActor):
             return True
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
+        self._router_registered = False
         try:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
@@ -853,6 +910,14 @@ class SGLangEngine(RayActor):
                     timeout=30,
                 )
             else:
+                if self._router_lists_worker(worker_url):
+                    # An addition queued by an earlier attempt has completed.
+                    self._router_unregister_submitted = False
+                    self._router_registered = True
+                    logger.info(
+                        f"Engine {worker_url} is already registered to router {self.router_ip}:{self.router_port}"
+                    )
+                    return True
                 payload = {
                     "url": worker_url,
                     "worker_type": self.worker_type,
@@ -888,28 +953,36 @@ class SGLangEngine(RayActor):
                         self._router_worker_id = worker_id
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+                # The Router only queues the addition; the worker serves once it
+                # is listed, which fails silently if the Router cannot reach it.
+                if not self._wait_for_router_membership(worker_url, _ROUTER_JOIN_TIMEOUT_S, present=True):
+                    return False
             self._router_unregister_submitted = False
+            self._router_registered = True
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
             logger.warning(f"Failed to register engine to router: {e}")
             return False
 
-    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+    def _router_lists_worker(self, worker_url: str, timeout: float = 5.0) -> bool:
+        response = requests.get(f"http://{self.router_ip}:{self.router_port}/workers", timeout=timeout)
+        response.raise_for_status()
+        workers = response.json().get("workers", [])
+        return any(
+            isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
+            for worker in workers
+        )
+
+    def _wait_for_router_membership(self, worker_url: str, timeout: float, *, present: bool) -> bool:
         deadline = time.monotonic() + timeout
         last_error = None
         while True:
             try:
-                response = requests.get(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    timeout=min(5.0, max(1.0, deadline - time.monotonic())),
-                )
-                response.raise_for_status()
-                workers = response.json().get("workers", [])
-                if not any(
-                    isinstance(worker, dict) and router_worker_base_url(worker.get("url", "")) == worker_url
-                    for worker in workers
-                ):
+                if self._router_lists_worker(worker_url, timeout=min(5.0, max(1.0, deadline - time.monotonic()))):
+                    if present:
+                        return True
+                elif not present:
                     return True
                 last_error = None
             except Exception as e:
@@ -917,11 +990,16 @@ class SGLangEngine(RayActor):
 
             if time.monotonic() >= deadline:
                 error_suffix = f": {last_error}" if last_error is not None else ""
-                logger.warning(f"Timed out waiting for worker {worker_url} to leave the router{error_suffix}")
+                action = "join" if present else "leave"
+                logger.warning(f"Timed out waiting for worker {worker_url} to {action} the router{error_suffix}")
                 return False
             time.sleep(0.5)
 
+    def _wait_for_router_removal(self, worker_url: str, timeout: float) -> bool:
+        return self._wait_for_router_membership(worker_url, timeout, present=False)
+
     def unregister_from_router(self, wait_for_removal: bool = False, timeout: float = 30.0) -> bool:
+        self._router_registered = False
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
         worker_url = f"http://{self.server_host}:{self.server_port}"
@@ -1008,26 +1086,80 @@ class SGLangEngine(RayActor):
     def get_weight_version(self) -> Optional[str]:
         if self.node_rank != 0:
             return
-        url = f"http://{self.server_host}:{self.server_port}/get_weight_version"
+        # Upstream sglang deprecated /get_weight_version (404); /model_info carries it on every build.
+        url = f"http://{self.server_host}:{self.server_port}/model_info"
         response = requests.get(url)
         response.raise_for_status()
-        return response.json()["weight_version"]
+        return response.json().get("weight_version")
+
+    def get_inference_observation(self, ensure_router: bool = False) -> dict:
+        """Return bounded runtime evidence for Manager topology publication.
+
+        A partially resumed engine is reported unhealthy without a generation
+        probe; it is checked once all its memory is back.
+        """
+        healthy = not getattr(self, "_released_memory", None) and self.health_generate(timeout=5.0)
+        version = None
+        if healthy and self.node_rank == 0 and self.weight_source == WeightSource.DCS:
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/model_info", timeout=5.0)
+            response.raise_for_status()
+            version = response.json().get("weight_version")
+        if (
+            ensure_router
+            and healthy
+            and self.node_rank == 0
+            and (self.weight_source != WeightSource.DCS or version not in (None, "", "default"))
+            and not getattr(self, "_router_registered", False)
+        ):
+            self.register_to_router(bootstrap_port=getattr(self, "_disaggregation_bootstrap_port", None))
+        return {
+            "base_url": self.get_url(),
+            "healthy": healthy,
+            "router_registered": getattr(self, "_router_registered", False),
+            "weight_version": version,
+        }
 
     def release_memory_occupation(self):
+        # Marked before the request: a release that fails half-way leaves the
+        # memory state unknown, so the engine must not be probed either.
+        from sglang.srt.constants import GPU_MEMORY_ALL_TYPES
+
+        self._released_memory = set(GPU_MEMORY_ALL_TYPES)
+        if self.role in (Role.GENRM, Role.TEACHER):
+            if self.node_rank == 0:
+                deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
+                self._pause_generation_for_offload(deadline)
+            if self.node_rank == 0 and not self.unregister_from_router(wait_for_removal=True):
+                raise RuntimeError(f"Cannot offload {self.role.value} while its Router worker is still registered")
+            return self._release_genrm_memory_occupation()
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        self._released_memory = set() if tags is None else getattr(self, "_released_memory", set()) - set(tags)
+        # Re-open admission that the GenRM/teacher release closed via
+        # /pause_generation. Only after a full resume (weights + KV cache back):
+        # Static models normally full-resume, but the ``not tags`` guard prevents
+        # re-enabling generation before KV cache exists if a partial
+        # (weights-only) resume is ever introduced. Not swallowed — if the
+        # engine stays paused, the model silently stops serving, so fail loudly.
+        if self.role in (Role.GENRM, Role.TEACHER) and self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+            if not self.register_to_router():
+                self.pause_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+                raise RuntimeError(f"Cannot register resumed {self.role.value} engine with its Router")
+        return result
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+        self._require_policy_weights()
         return self._make_request(
             "init_weights_update_group",
             {
@@ -1055,6 +1187,7 @@ class SGLangEngine(RayActor):
     def update_weights_from_distributed(
         self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
     ):
+        self._require_policy_weights()
         payload = {
             "names": names,
             "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
@@ -1072,6 +1205,7 @@ class SGLangEngine(RayActor):
     def init_weights_send_group_for_remote_instance(
         self, master_address, ports, group_rank, world_size, group_name="weight_send_group", backend="nccl"
     ):
+        self._require_policy_weights()
         return self._make_request(
             "init_weights_send_group_for_remote_instance",
             {
@@ -1085,6 +1219,7 @@ class SGLangEngine(RayActor):
         )
 
     def send_weights_to_remote_instance(self, master_address, ports, group_name="weight_send_group"):
+        self._require_policy_weights()
         return self._make_request(
             "send_weights_to_remote_instance",
             {
@@ -1293,7 +1428,15 @@ class SGLangEngine(RayActor):
                         parsed = json.loads(line)
                         break
                     except json.JSONDecodeError:
-                        continue
+                        # NCCL writes to stderr concurrently with the probe's
+                        # stdout, so its last log line can prefix the JSON.
+                        json_start = line.find('{"device_id":')
+                        if json_start >= 0:
+                            try:
+                                parsed = json.loads(line[json_start:])
+                                break
+                            except json.JSONDecodeError:
+                                pass
                 # Category is derived from structured signals only: the manager
                 # deadline, the subprocess exit code, and its JSON — never by
                 # scanning the NCCL log text.
@@ -1373,6 +1516,7 @@ class SGLangEngine(RayActor):
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
 
+        self._require_policy_weights()
         return self._make_request(
             "post_process_weights",
             {
@@ -1397,74 +1541,22 @@ class SGLangEngine(RayActor):
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
             run(self.checkpoint_engine_client.unregister())
 
-
-class GenRMEngine(SGLangEngine):
-    """GenRM Engine for Generative Reward Model.
-
-    Inherits from SGLangEngine and overrides initialization to use genrm-
-    specific arguments (model path, GPU count, sampling parameters, etc.).
-    """
-
-    def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
-        """Initialize the genRM engine with genrm-specific arguments."""
-        self.router_ip = ""
-        self.router_port = 0
-        self._skip_router_registration = True
-
-        host = host or get_host_info()[1]
-
-        def _format_v6_uri(addr):
-            if not addr or addr.startswith("["):
-                return addr
-            try:
-                if ipaddress.ip_address(addr).version == 6:
-                    return f"[{addr}]"
-            except ValueError:
-                pass
-            return addr
-
-        host = _format_v6_uri(host)
-        ip_part, port_part = dist_init_addr.rsplit(":", 1)
-        dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
-
-        server_args_dict, external_engine_need_check_fields = _compute_genrm_server_args(
-            self.args,
-            self.rank,
-            dist_init_addr,
-            nccl_port,
-            host,
-            port,
-            self.worker_type,
-            disaggregation_bootstrap_port,
-            base_gpu_id=self.base_gpu_id,
-        )
-
-        self.node_rank = server_args_dict["node_rank"]
-        self.server_host = server_args_dict["host"]  # with [] if ipv6
-        self.server_port = server_args_dict["port"]
-
-        if self.args.rollout_external:
-            self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
-        else:
-            self._init_normal(server_args_dict, apply_policy_load_plan=False)
-
-    def release_memory_occupation(self):
-        # GenRM is colocated on the training GPUs, so it must offload at the
-        # rollout->train transition. Two failure modes are defended against here:
+    def _release_genrm_memory_occupation(self):
+        # Static inference models can be offloaded while their raw SGLang ports
+        # remain reachable. Two failure modes are defended against here:
         #
         # 1. Admission race. SGLang's release_memory_occupation asserts the
         #    scheduler is idle (``_is_no_request``); a straggler agentic
         #    /generate admitted between our flush and the release crashes the
-        #    scheduler. relax has no hard barrier guaranteeing all agentic
-        #    sessions are quiesced before offload, so /pause_generation
+        #    scheduler. Even after Manager admission closes, raw ports can
+        #    receive requests, so /pause_generation
         #    (mode="abort", the default) is issued first: it stops the scheduler
         #    from admitting new requests for the whole offloaded window AND
         #    aborts everything in flight. Admission is re-opened by
         #    continue_generation in resume_memory_occupation, after weights + KV
         #    cache are back. We still abort on each retry as a fallback in case
-        #    the pause did not take (best-effort). Safe because the batch's
-        #    reward/judge is already computed by offload time — no in-flight
-        #    GenRM request needs to survive.
+        #    the pause did not take (best-effort). The lifecycle manager has
+        #    already drained admitted requests before offloading.
         #
         # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
         #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
@@ -1476,7 +1568,7 @@ class GenRMEngine(SGLangEngine):
             connect_errors = 0
             while True:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("Timeout while draining GenRM before release.")
+                    raise TimeoutError(f"Timeout while draining {self.role.value} before release.")
                 self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
                 try:
                     resp = requests.get(
@@ -1493,31 +1585,19 @@ class GenRMEngine(SGLangEngine):
                     connect_errors += 1
                     logger.warning(
                         f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
-                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                        f"draining {self.role.value} ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
                     )
                     if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
                         raise ConnectionError(
-                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
+                            f"{self.role.value} engine {self.server_host}:{self.server_port} unreachable while "
                             f"draining before release ({connect_errors} consecutive connection "
                             f"errors) — the server process is most likely dead."
                         ) from e
                 except Exception as e:  # noqa: BLE001
                     connect_errors = 0
-                    logger.info(f"Error flushing GenRM cache: {e}")
+                    logger.info(f"Error flushing {self.role.value} cache: {e}")
                 time.sleep(1)
         return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
-
-    def resume_memory_occupation(self, tags: list[str] = None):
-        result = super().resume_memory_occupation(tags=tags)
-        # Re-open admission that release_memory_occupation closed via
-        # /pause_generation. Only after a full resume (weights + KV cache back):
-        # GenRM always full-resumes, but the ``not tags`` guard prevents
-        # re-enabling generation before KV cache exists if a partial
-        # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, GenRM silently stops serving, so fail loudly.
-        if self.node_rank == 0 and not tags:
-            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
-        return result
 
     def _pause_generation_for_offload(self, deadline: float) -> None:
         """Best-effort /pause_generation (abort mode) before draining for
@@ -1530,7 +1610,7 @@ class GenRMEngine(SGLangEngine):
         try:
             self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
+            logger.warning(f"{self.role.value} pause_generation before offload failed (continuing to drain): {e}")
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
@@ -1541,6 +1621,67 @@ def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None)
     if sglang_overrides and "speculative_algorithm" in sglang_overrides:
         speculative_algorithm = sglang_overrides["speculative_algorithm"]
     return speculative_algorithm is not None
+
+
+def _finalize_server_args(
+    args,
+    kwargs: dict,
+    *,
+    rank,
+    worker_type: str,
+    overrides: dict | None,
+    overrides_label: str,
+) -> tuple[dict, list]:
+    """Turn a role's base server arguments into the final ServerArgs kwargs.
+
+    Every role builds its own base ``kwargs`` -- the model, the parallel sizes
+    and the memory policy genuinely differ -- but from here on the assembly is
+    the same: inherit the ``--sglang-*`` defaults for anything the role left
+    open, apply that role's overrides on top, then drop whatever the installed
+    SGLang does not know about.
+
+    An override naming a field this SGLang has no idea about is dropped with a
+    warning instead of reaching ``ServerArgs(**kwargs)``, where it would be a
+    TypeError at engine startup.
+    """
+    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
+
+    server_arg_fields = dataclasses.fields(ServerArgs)
+    server_arg_field_names = {attr.name for attr in server_arg_fields}
+    unused_keys = set(kwargs.keys())
+    for attr in server_arg_fields:
+        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
+            continue
+        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
+            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
+        unused_keys.discard(attr.name)
+
+    for key, value in (overrides or {}).items():
+        if key not in server_arg_field_names:
+            logger.info(
+                f"Warning: {overrides_label} key {key!r} is not a ServerArgs field in the installed SGLang; dropping."
+            )
+            continue
+        if key in kwargs and kwargs[key] != value:
+            logger.info(f"{overrides_label}: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
+        kwargs[key] = value
+        unused_keys.discard(key)
+
+    if (
+        "cuda_graph_backend_prefill" in server_arg_field_names
+        and kwargs.get("enable_memory_saver")
+        and kwargs.get("cuda_graph_backend_prefill") is None
+    ):
+        # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
+        kwargs["cuda_graph_backend_prefill"] = "disabled"
+
+    # for compatibility with old args
+    if len(unused_keys) > 0:
+        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
+        for key in unused_keys:
+            kwargs.pop(key)
+
+    return kwargs, external_engine_need_check_fields
 
 
 def _compute_genrm_server_args(
@@ -1626,40 +1767,15 @@ def _compute_genrm_server_args(
         kwargs["enable_return_routed_experts"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
-    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-            continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
-
-    # Per-genrm overrides from --genrm-engine-config. Applied after base args
-    # and sglang_* defaults so user-supplied keys take highest priority. Keys
-    # not recognized by the installed SGLang ServerArgs are dropped with a
-    # warning rather than causing a TypeError at ServerArgs(**kwargs).
-    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
-    for key, value in (args.genrm_engine_config or {}).items():
-        if key not in server_arg_fields:
-            logger.info(
-                f"Warning: --genrm-engine-config key {key!r} is not a ServerArgs field in the "
-                f"installed SGLang; dropping."
-            )
-            continue
-        if key in kwargs and kwargs[key] != value:
-            logger.info(f"genrm_engine_config: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
-        kwargs[key] = value
-        unused_keys.discard(key)
-
-    # for compatibility with old args
-    if len(unused_keys) > 0:
-        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
-        for key in unused_keys:
-            kwargs.pop(key)
-
-    return kwargs, external_engine_need_check_fields
+    return _finalize_server_args(
+        args,
+        kwargs,
+        rank=rank,
+        worker_type=worker_type,
+        overrides=args.genrm_engine_config,
+        overrides_label="--genrm-engine-config",
+    )
 
 
 def _compute_server_args(
@@ -1744,42 +1860,15 @@ def _compute_server_args(
         kwargs["enable_return_routed_experts"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
-    external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
-    server_arg_field_names = {attr.name for attr in server_arg_fields}
-    unused_keys = set(kwargs.keys())
-    for attr in server_arg_fields:
-        if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
-            continue
-        if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
-            kwargs[attr.name] = getattr(args, f"sglang_{attr.name}")
-        unused_keys.discard(attr.name)
-
-    # Per-engine-group overrides from --sglang-config YAML.
-    # Applied after base args so they take highest priority.
-    if sglang_overrides:
-        for key, value in sglang_overrides.items():
-            if key in kwargs:
-                logger.info(f"sglang_overrides: overriding {key}={kwargs[key]} -> {value} (rank={rank})")
-            kwargs[key] = value
-            unused_keys.discard(key)
-
-    if (
-        "cuda_graph_backend_prefill" in server_arg_field_names
-        and kwargs.get("enable_memory_saver")
-        and kwargs.get("cuda_graph_backend_prefill") is None
-    ):
-        # Breakable is SGLang's default prefill backend on CUDA, but it is incompatible with memory saver mode.
-        kwargs["cuda_graph_backend_prefill"] = "disabled"
-
-    # for compatibility with old args
-    if len(unused_keys) > 0:
-        logger.info(f"Warning: The following arguments is not supported in the current sglang: {unused_keys}.")
-        for key in unused_keys:
-            kwargs.pop(key)
-
-    return kwargs, external_engine_need_check_fields
+    return _finalize_server_args(
+        args,
+        kwargs,
+        rank=rank,
+        worker_type=worker_type,
+        overrides=sglang_overrides,
+        overrides_label="sglang_overrides",
+    )
 
 
 _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS = [

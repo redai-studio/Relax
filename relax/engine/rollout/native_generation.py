@@ -1192,29 +1192,32 @@ def _get_engines(args, data_system_client):
 
     The driver dispatches to the engines' ``generate_batch`` (a Ray method that
     POSTs to the diffusion HTTP server). ``generate_rollout`` runs inside the
-    RolloutManager actor's worker thread (``generate`` →
-    ``asyncio.to_thread``), so the manager handle is
-    ``ray.get_runtime_context().current_actor``; its
+    RolloutWorker actor's worker thread (``RolloutWorkload.generate`` →
+    ``asyncio.to_thread``), so the task InferenceManager handle comes from
+    ``get_local_inference_manager()``; its rollout pool's
     ``get_rollout_engines_and_lock`` returns the node-0 engine handles. Falls
     back to a ``data_system_client`` getter (unit tests), then empty (CPU
     tests).
 
-    Only the "we are not running inside a Ray actor" probe is caught. A failure
-    of the manager CALL is a real distributed fault and propagates: swallowing it
-    used to downgrade e.g. a dead RolloutManager to a debug line and then report
-    the generic "no generation engines available", which points the investigation
-    at configuration instead of at the actor that actually died.
+    Only the "we are not running inside a RolloutWorker" probe is caught. A
+    failure of the manager CALL is a real distributed fault and propagates:
+    swallowing it used to downgrade e.g. a dead InferenceManager to a debug line
+    and then report the generic "no generation engines available", which points
+    the investigation at configuration instead of at the actor that actually
+    died.
     """
     manager = None
     try:
+        from relax.distributed.ray.rollout_worker import get_local_inference_manager
+
+        manager = get_local_inference_manager()
+    except (ImportError, RuntimeError) as e:
+        # No ray/transfer_queue installed, or not inside an initialized RolloutWorker (driver / unit tests).
+        logger.debug(f"native generate_rollout: no local inference manager ({e}); trying the data client.")
+    if manager is not None:
         import ray
 
-        manager = ray.get_runtime_context().current_actor
-    except (ImportError, RuntimeError, AssertionError, AttributeError) as e:
-        # No ray installed, or no current actor (driver process / unit tests).
-        logger.debug(f"native generate_rollout: not inside a Ray actor ({e}); trying the data client.")
-    if manager is not None:
-        engines, *_rest = ray.get(manager.get_rollout_engines_and_lock.remote())
+        engines, *_rest = ray.get(manager.rollout_operation.remote("get_rollout_engines_and_lock"))
         if engines:
             return list(engines)
 

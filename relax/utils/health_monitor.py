@@ -217,6 +217,9 @@ class RolloutHealthMonitor:
             logger.debug(f"Skipping kill for engine {rollout_engine_id} (intentionally removed)")
             return
         logger.info(f"Killing engine group {rollout_engine_id}...")
+        notify = getattr(self._engine_group, "notify_topology_change", None)
+        if notify is not None:
+            notify()
         for i in range(
             rollout_engine_id * self._engine_group.nodes_per_engine,
             (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,

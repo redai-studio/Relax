@@ -1,5 +1,7 @@
 # Case: Rollout Eval 等待 onload 状态导致 Hang
 
+> 历史案例：下文代码片段来自统一推理重构之前的 `RolloutManager`，该类已删除。现在 eval 由 `RolloutWorker.eval` 执行，引擎状态归 `InferenceManager`（`RolloutEnginePool`）管理。排查思路（条件等待必须有可满足的退出条件）仍然适用，但不要按片段里的行号或方法名去找代码。
+
 ## 环境
 
 - Ray 集群: 1 节点, 8 GPU

@@ -194,8 +194,10 @@ class RayTrainGroup:
     def clear_memory(self):
         ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
 
-    def set_rollout_manager(self, rollout_manager: Any):
-        ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+    def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any):
+        ray.get(
+            [actor.set_rollout_handles.remote(rollout_worker, inference_manager) for actor in self._actor_handlers]
+        )
 
     def set_genrm_manager(self, genrm_manager: Any):
         """Set the genRM manager for coordinated offload/onload.

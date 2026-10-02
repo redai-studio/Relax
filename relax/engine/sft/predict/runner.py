@@ -9,7 +9,7 @@ Two halves, both extracted from existing inline code:
   timings logged to the tracking backend. Previously lived inside
   ``MegatronTrainRayActor.train_actor``.
 * ``handle_predict(rollout, train_step)`` — the Rollout-side handler that
-  drives ``rollout_manager.run_predict`` and ensures a post-predict full
+  drives ``rollout_worker.run_predict`` and ensures a post-predict full
   offload so the next cycle's onload paths see a clean slate. Previously
   lived inside ``components/rollout.py::predict``.
 
@@ -99,7 +99,7 @@ def run_sft_predict(actor, rollout_id: int) -> None:
 async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
     """Rollout-side handler for the /predict HTTP endpoint.
 
-    Awaits ``rollout_manager.run_predict`` (renders + generates + writes
+    Awaits ``rollout_worker.run_predict`` (renders + generates + writes
     predictions JSONL) then unconditionally re-offloads on SFT so the next
     predict cycle's ``onload_weights`` / ``onload_kv`` resume cleanly.
 
@@ -107,7 +107,7 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
     """
     rollout._logger.info(f"Received request to predict train_step {train_step}")
     try:
-        await rollout.rollout_manager.run_predict.remote(train_step)
+        await rollout.rollout_worker.run_predict.remote(train_step)
         return {"status": "ok", "rollout_id": train_step}
     except Exception as e:
         error_msg = f"Predict failed for train_step {train_step}: {type(e).__name__}: {str(e)}"
@@ -126,6 +126,8 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         # skip here.
         if getattr(rollout.config, "loss_type", None) == "sft" and rollout.config.offload_rollout:
             try:
-                await rollout.rollout_manager.offload.remote()
+                from relax.engine.inference.types import Role
+
+                await rollout.inference_manager.deactivate.remote(Role.ROLLOUT)
             except Exception as exc:
                 rollout._logger.warning(f"Post-predict offload failed at step {train_step}: {exc}")

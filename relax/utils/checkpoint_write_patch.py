@@ -32,6 +32,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from time import time
 
 import torch
@@ -44,6 +45,7 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _patched = False
+_blocking_staging_patched = False
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +192,7 @@ def _write_buckets_threaded(transform_list, use_msc, write_buckets):
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-def patch_checkpoint_write():
+def patch_checkpoint_write(*, blocking_staging: bool = False) -> None:
     """Monkey-patch Megatron checkpoint writing to avoid ``fork()`` with CUDA.
 
     Two patches are applied:
@@ -206,11 +208,27 @@ def patch_checkpoint_write():
        tensors to CPU, so the async function only performs disk I/O and does
        not need GPU access.
 
+    ``blocking_staging`` avoids pinned asynchronous D2H staging for synchronous
+    saves with train-state offload. It must remain disabled for async saves.
+    The staging policy is fixed for the lifetime of each training actor process.
     This function is idempotent — calling it multiple times is safe.
     """
     from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 
-    global _patched
+    global _patched, _blocking_staging_patched
+    # Modern Megatron still stages asynchronously even when execute_sync is
+    # used. Keep this independent of the legacy fork-writer compatibility fix.
+    if blocking_staging and not _blocking_staging_patched and hasattr(FileSystemWriterAsync, "preload_tensors"):
+        original_preload = FileSystemWriterAsync.preload_tensors
+
+        @wraps(original_preload)
+        def preload_tensors(write_buckets: list, non_blocking: bool = True) -> list:
+            return original_preload(write_buckets, non_blocking=False)
+
+        FileSystemWriterAsync.preload_tensors = staticmethod(preload_tensors)
+        _blocking_staging_patched = True
+        logger.info("Using blocking CPU staging for synchronous checkpoints with train-state offload")
+
     # NOTE(wuhuan): the latest Megatron-LM of 20260506 use write_preloaded_data_multithread instead of
     # write_preloaded_data_multiproc, which has solved this issue.
     can_patch = hasattr(FileSystemWriterAsync, "write_preloaded_data_multiproc")

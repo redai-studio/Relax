@@ -333,7 +333,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # IN THIS process. Only rank 0 emits metrics, so only it inits. Without this
         # ``tracking_utils.log`` finds no adapter and every train metric is silently
         # dropped ("Metrics service adapter not initialized") — the visualization
-        # backends then show only the RolloutManager's reward/rollout metrics, never
+        # backends then show only the RolloutWorker's reward/rollout metrics, never
         # the training curves.
         if self._rank == 0:
             from relax.utils.tracking_utils import init_tracking
@@ -403,8 +403,8 @@ class FSDPTrainRayActor(TrainRayActor):
         self._data_system_client = None  # lazy TransferQueue client for reading train partitions
         self._base_model_sha256 = self._hash_base_model(args)
         self._assert_sync_plan_aligned()
-        # Publish the parallel config so TrainRayActor.set_rollout_manager (called
-        # by the Controller after init) can forward it to the RolloutManager.
+        # Publish the parallel config so TrainRayActor.set_rollout_handles (called
+        # by the Controller after init) can forward it to the RolloutWorker.
         self._get_parallel_config()
 
         # Torch / memory profiler (backend-agnostic; honours --use-pytorch-profiler,
@@ -418,7 +418,7 @@ class FSDPTrainRayActor(TrainRayActor):
         start_rollout_id = self._maybe_resume()
 
         # Vacate the GPU after init so the first rollout's engine onload has room.
-        # The Controller calls update_weights() right after set_rollout_manager
+        # The Controller calls update_weights() right after set_rollout_handles
         # (components/actor.py), which wakes the model back up; without this the
         # full-FT model + AdamW stay resident from init through that first weight
         # sync (which also onloads the engine transformer) → OOM on a tight card.
@@ -970,7 +970,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self._sync_save_and_release(rollout_id)
 
         # Held-out evaluation (mirrors the megatron actor's _run_step_evaluation):
-        # rank 0 asks the RolloutManager to run its eval pass; the rollout side owns
+        # rank 0 asks the RolloutWorker to run its eval pass; the rollout side owns
         # the --eval-interval / --eval-prompt-data gating. Without this hook
         # --eval-interval never fires on the generative path.
         self._run_step_evaluation(rollout_id)
@@ -990,7 +990,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self._log_train_metrics(rollout_id, agg, skips, len(micro_batches))
 
     def _run_step_evaluation(self, rollout_id: int) -> None:
-        """Trigger the RolloutManager's held-out eval pass (rank 0, best-
+        """Trigger the RolloutWorker's held-out eval pass (rank 0, best-
         effort).
 
         Mirrors ``backends/megatron/actor.py::_run_step_evaluation`` for the RL
@@ -1000,7 +1000,7 @@ class FSDPTrainRayActor(TrainRayActor):
         real generation and can legitimately take minutes. Failures are logged,
         never fatal.
         """
-        if self._rank != 0 or getattr(self, "rollout_manager", None) is None:
+        if self._rank != 0 or getattr(self, "rollout_worker", None) is None:
             return
         if getattr(self.args, "eval_interval", None) is None:
             return
@@ -1127,7 +1127,7 @@ class FSDPTrainRayActor(TrainRayActor):
         # actor sleep until after checkpointing so DCP reads real FSDP2 parameter
         # storage.
         post_sync_offload_engine = False
-        if getattr(self, "rollout_manager", None) is not None:
+        if getattr(self, "rollout_worker", None) is not None:
             post_sync_offload_engine = self.update_weights(offload_after_sync=False)
 
         # Checkpoint / resume: the sync-colocate Controller path
@@ -1392,15 +1392,17 @@ class FSDPTrainRayActor(TrainRayActor):
         # actor + the engine's TRANSFORMER (the IPC dest) do — so onload only the
         # weight modules for the sync.
         offload_engine = (
-            getattr(self.args, "offload_rollout", False) and getattr(self, "rollout_manager", None) is not None
+            getattr(self.args, "offload_rollout", False) and getattr(self, "rollout_worker", None) is not None
         )
         if offload_engine:
             import ray
             from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 
+            from relax.engine.inference.types import Role
+
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+                ray.get(self.inference_manager.activate.remote(Role.ROLLOUT, tags=[GPU_MEMORY_TYPE_WEIGHTS]))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1428,7 +1430,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 self.policy_version -= 1
                 self._weight_sync_failures += 1
                 # With fault tolerance, rebuild the engines from the last committed
-                # disk checkpoint (RolloutManager.recover_rollout_engines) and let
+                # disk checkpoint (InferenceManager's rollout recovery) and let
                 # the Controller retry the whole round; otherwise fail the job.
                 # Re-raise on every rank so no rank proceeds to the post-sync
                 # offload/onload as if the sync succeeded.
@@ -1442,7 +1444,7 @@ class FSDPTrainRayActor(TrainRayActor):
                         def _recover() -> None:
                             import ray
 
-                            ray.get(self.rollout_manager.recover_rollout_engines.remote())
+                            ray.get(self.inference_manager.rollout_operation.remote("recover_rollout_engines"))
 
                         self._rank0_then_agree(_recover, what="rollout-engine recovery")
                 finally:
@@ -1478,9 +1480,11 @@ class FSDPTrainRayActor(TrainRayActor):
         if offload_engine:
             import ray
 
+            from relax.engine.inference.types import Role
+
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote())
+                ray.get(self.inference_manager.activate.remote(Role.ROLLOUT))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1786,7 +1790,7 @@ class FSDPTrainRayActor(TrainRayActor):
         IPC.
 
         Mirrors the text ``UpdateWeightFromTensor`` colocate mapping generalized to
-        rollout TP>1: the RolloutManager creates ``world / tp`` diffusion engines,
+        rollout TP>1: the engine pool creates ``world / tp`` diffusion engines,
         each spanning ``tp`` physical GPUs. The ``tp`` FSDP ranks co-located on an
         engine's GPUs form a Gloo gather group; each all-gathers its full tensors
         (the iterator calls DTensor ``full_tensor()`` — identical data on every
@@ -1813,7 +1817,7 @@ class FSDPTrainRayActor(TrainRayActor):
         engine_state = None
         local_error = None
         try:
-            engine_state = ray.get(self.rollout_manager.get_rollout_engines_and_lock.remote())
+            engine_state = ray.get(self.inference_manager.rollout_operation.remote("get_rollout_engines_and_lock"))
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
         _raise_weight_sync_errors(

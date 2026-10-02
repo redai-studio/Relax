@@ -201,8 +201,15 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
         Tuple[List[float], List[float]]
     """
     if args.custom_reward_post_process_path is not None:
+        from relax.engine.inference.phase_plans import PHASE_GENRM
+        from relax.engine.rollout.scoring_phase import scoring_phase
+
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        processed_rewards = custom_reward_post_process_func(args, samples)
+        # Deferred GenRM scoring runs in its own activation phase, so the hook
+        # only has to score: the framework offloads generation, wakes the judge
+        # and puts it back to sleep with a confirmed release.
+        with scoring_phase(args, PHASE_GENRM):
+            processed_rewards = custom_reward_post_process_func(args, samples)
         if isinstance(processed_rewards, tuple) and len(processed_rewards) == 2:
             return processed_rewards
         raw_rewards = [sample.get_reward_value(args) for sample in samples]

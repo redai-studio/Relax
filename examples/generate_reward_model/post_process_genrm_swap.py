@@ -1,35 +1,35 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Post-rollout GenRM scorer with rollout/genrm sleep-wake swap.
+"""Post-rollout GenRM scorer for the deferred (verl-style "colocate") reward.
 
-Enables verl-style "colocate mode" reward on Relax: rollout owns all GPUs
-during generation (GenRM asleep), then this function fires once per rollout
-batch to offload rollout, wake GenRM, batch-score all samples, and put GenRM
-back to sleep.
+Rollout owns the GPUs during generation with GenRM asleep; after generation this
+function scores the whole batch through the GenRM Gateway.
+
+The sleep/wake swap is *not* done here. The framework runs this hook inside the
+``genrm`` activation phase: it closes rollout admission, drains it, offloads it,
+confirms the release, wakes GenRM, and puts GenRM back to sleep afterwards. A
+user script has no GenRM handle to swap with -- the well-known
+``relax_genrm_manager`` actor is gone -- and could not drain in-flight
+generation or confirm that GPU memory was really freed anyway; the task's
+inference control plane can.
 
 Wire-up (in the training script):
   --rm-type dummy                        # inline reward is a no-op
-  --defer-reward-to-post-process         # actor.update_weights skips GenRM onload
+  --defer-reward-to-post-process         # GenRM scores in its own phase
   --custom-reward-post-process-path <path to this file>
 
 Assumptions:
 - Shared-bundles colocate: rollout_num_gpus == genrm_num_gpus == actor_total.
-- GenRMManager is created with name="relax_genrm_manager" (see
-  relax/distributed/ray/placement_group.py::create_genrm_manager).
-- We run inside the RolloutManager Ray actor's process, so rollout offload
-  goes through the in-process singleton (get_local_rollout_manager) to avoid
-  a self-remote-call deadlock. GenRM offload/onload goes through the Ray
-  handle (cross-actor call).
+- GenRM is reached over HTTP through its Gateway, so this hook does not care
+  which process owns the engines.
 """
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-import ray
 import torch
 
-from relax.distributed.ray.rollout import get_local_rollout_manager
 from relax.engine.rewards.dapo_genrm import (
     MAX_ANSWER_LEN,
     _extract_answer,
@@ -137,14 +137,11 @@ def _grpo_normalize(args, raw_rewards):
 def custom_reward_post_process(args, samples):
     """Sync entry called by relax.utils.utils.post_process_rewards.
 
-    Flow (one call per rollout batch):
-      1. Offload rollout (in-process direct call — same actor).
-      2. Onload GenRM (Ray handle — different actor).
-      3. Batch-score every sample via GenRM HTTP.
-      4. Offload GenRM.
-      5. Return normalized rewards — leave rollout offloaded (update_weights
-         re-onloads it next iteration; skipping the redundant onload here
-         saves one full weights+KV round trip).
+    The caller has already entered the ``genrm`` phase, so GenRM is awake and
+    rollout is offloaded with its release confirmed. This function only scores
+    the batch; leaving the phase is the caller's job too, and it deliberately
+    does not restore rollout -- ``update_weights`` onloads it next iteration,
+    so restoring here would cost a redundant weights + KV round trip.
     """
     # Flatten if grouped
     if samples and isinstance(samples[0], list):
@@ -152,15 +149,7 @@ def custom_reward_post_process(args, samples):
     else:
         flat_samples = list(samples)
 
-    rollout = get_local_rollout_manager()
-    rollout._offload_local()
-
-    genrm = ray.get_actor("relax_genrm_manager")
-    ray.get(genrm.onload.remote())
-    try:
-        raw_rewards = _run_async(_score_all(flat_samples))
-    finally:
-        ray.get(genrm.offload.remote())
+    raw_rewards = _run_async(_score_all(flat_samples))
 
     reward_key = getattr(args, "reward_key", None)
     for sample, score in zip(flat_samples, raw_rewards, strict=True):
