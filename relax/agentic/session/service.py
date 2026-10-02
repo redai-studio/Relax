@@ -68,7 +68,6 @@ from relax.agentic.session.state import (
     normalize_tools,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import get_spec_token_counts
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -1642,11 +1641,7 @@ class AgenticSessionShard:
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
-        spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-        request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
-        request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
-        request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
-        request.pending_spec_delta["completion_token_num"] += int(meta_info.get("completion_tokens", 0) or 0)
+        request.pending_spec_info.add(meta_info)
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
         request.pending_prefix_cache_delta["total_prompt_tokens"] += int(meta_info.get("prompt_tokens", 0) or 0)
 
@@ -2612,7 +2607,7 @@ class AgenticSessionShard:
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
             weight_version_delta=ir.pending_weight_version_delta,
-            spec_delta=ir.pending_spec_delta,
+            spec_delta=ir.pending_spec_info.to_dict(),
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
             generation_elapsed_s=ir.pending_generation_elapsed_s,
