@@ -44,6 +44,8 @@ from relax.utils.megatron_peft_utils import is_lora_enabled
 from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
+from relax.utils.straggler import get_straggler_timers
+from relax.utils.straggler.context import record_optimizer_step
 from relax.utils.timer import timer
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
@@ -429,7 +431,11 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    # Optimizer config: Megatron's optimizer reads its own `timers`, separately
+    # from the model's TransformerConfig, so both must be set. Task 11: this is
+    # `None` unless the straggler profiler is enabled, leaving the default path
+    # unchanged.
+    config.timers = get_straggler_timers()
     _validate_vit_lr_trainable_params(args, model)
 
     optimizer = get_megatron_optimizer(
@@ -1355,7 +1361,12 @@ def train(
     # Setup some training config params.
     config = get_model_config(model[0])
     config.grad_scale_func = optimizer.scale_loss
-    config.timers = None
+    # Task 11: replacing the hard-coded `None` with the profiler's timers is a
+    # no-op unless RELAX_STRAGGLER_ENABLE is set. Assigning here (rather than at
+    # config construction) is required: Megatron's attention/MoE modules
+    # `copy.deepcopy(self.config)` during construction, which must not see the
+    # profiler's events and threads.
+    config.timers = get_straggler_timers()
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
@@ -1452,6 +1463,12 @@ def train(
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        # Task 11 straggler profiler: record the step context here rather than
+        # inside train_one_step, so the profiler does not widen the low-level
+        # training API with a parameter it alone needs. `global_step` mirrors the
+        # platform identity this function already derives as
+        # `accumulated_step_id`; the profiler never replaces it.
+        record_optimizer_step(rollout_id, step_id, num_steps_per_rollout)
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):

@@ -82,6 +82,18 @@ from relax.utils.reloadable_process_group import destroy_process_groups, monkey_
 from relax.utils.replay import capture_hooks
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.s3_model_loader import prepare_model_maybe_update_args
+
+# Imported at module level on purpose: the publish handler must not be able to
+# raise. When these were imported INSIDE the try, a failed import left the except
+# handler raising UnboundLocalError into train(), which would break the profiler's
+# headline failure-isolation invariant. The straggler context module is inert
+# (no side effects) so importing it here costs nothing.
+from relax.utils.straggler.context import (
+    count_workload_publish_error,
+    count_workload_publish_skipped,
+    publish_step_workload,
+)
+from relax.utils.straggler.workload import step_workloads
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
@@ -325,6 +337,27 @@ class _SFTPrepackedDeviceIterator:
         self._packed_cpu = []
         self._next_device_micro_batch = None
         self._next_ready_event = None
+
+
+_STRAGGLER_PUBLISH_ENABLED: "bool | None" = None
+
+
+def _straggler_publish_enabled() -> bool:
+    """Whether the straggler workload publisher is active, read once.
+
+    Cached because the answer cannot change within a training process while the
+    point of the cache is that a DISABLED profiler costs a boolean check on the
+    training path instead of a partition computation.
+    """
+    global _STRAGGLER_PUBLISH_ENABLED
+    if _STRAGGLER_PUBLISH_ENABLED is None:
+        try:
+            from relax.utils.straggler import is_straggler_profiler_enabled
+
+            _STRAGGLER_PUBLISH_ENABLED = bool(is_straggler_profiler_enabled())
+        except Exception:
+            _STRAGGLER_PUBLISH_ENABLED = False
+    return _STRAGGLER_PUBLISH_ENABLED
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -1201,6 +1234,48 @@ class MegatronTrainRayActor(TrainRayActor):
             dp_group=dp_group,
         )
         local_k = max_k
+
+        # Task 11 straggler profiler: publish this rank's LOCAL per-step work from
+        # the FINAL partition. Publishing earlier (inside the prefetch worker)
+        # described the rank-local k partition, but training executes the
+        # DP-wide max_k partition and REPACKS when local_k < max_k, so that
+        # metadata could describe a partition that was thrown away. The partition
+        # is re-derived here with the same pure function and the same inputs.
+        #
+        # The whole block is gated on a CACHED enablement read. Without the gate
+        # this partition work would run on the training path of every step even
+        # when the profiler is off, so an OFF arm would pay it too, an OFF/ON
+        # paired delta could not measure it, and the feature's "zero cost when
+        # disabled" property would be false. Disabled => this costs one cached
+        # boolean.
+        if _straggler_publish_enabled():
+            try:
+                samples = window.rollout_data["total_lengths"]
+                # The executed K is `max_k`: `local_k = max_k` above normalises
+                # both branches, so this is never the rank-local k. The payload
+                # itself is derived by the pure, megatron-free `step_workloads`,
+                # which returns one entry per OPTIMIZER STEP -- one step consumes
+                # this whole window, so the entry carries the step totals.
+                if len(samples) >= max_k:
+                    # The literal 1 is the number of OPTIMIZER STEPS that consume
+                    # this window. It is 1 because `_get_prefetched_sft_window`
+                    # has exactly one caller, which passes
+                    # `prepared_num_microbatches=[num_microbatches]` -- a
+                    # single-element list -- and `train()` derives
+                    # `num_steps_per_rollout = len(num_microbatches)` in
+                    # model.py. A second caller, or a window consumed by several
+                    # optimizer steps, would make this literal wrong: the argument
+                    # must then be that real per-rollout step count, which is why
+                    # `step_workloads` already takes it as a parameter.
+                    publish_step_workload(rollout_id, step_workloads(samples, max_k, 1))
+                else:
+                    # Cheap defence only: `step_workloads` would raise here and
+                    # the balancing helper asserts the same condition. This is
+                    # not observability of the P0 -- that is the detector-side
+                    # missing-workload counter.
+                    count_workload_publish_skipped()
+            except Exception:
+                count_workload_publish_error()
 
         next_rollout_id = rollout_id + 1
         should_pause_lookahead = _should_pause_sft_lookahead(self.args, rollout_id)

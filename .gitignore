@@ -54,3 +54,7 @@ tensorboard_log
 # .github
 .github/copilot-instructions.md
 env.sh
+
+# Generated SFT payloads (regenerate with tools/straggler/make_sft_dataset.py);
+# keeps the generator and recipes tracked while ignoring derived data.
+scripts/training/**/data/*.jsonl
