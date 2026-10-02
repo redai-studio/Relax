@@ -1,0 +1,230 @@
+{
+  "text": {
+    "system": [
+      {
+        "type": "text",
+        "text": "You are concise."
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "你好"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "Hello."
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Use tools when needed."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "search",
+        "input_schema": {
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "type": "object",
+          "required": [
+            "query"
+          ]
+        }
+      }
+    ],
+    "thinking": {
+      "type": "disabled"
+    },
+    "max_tokens": 32
+  },
+  "text_blocks": {
+    "max_tokens": 32,
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is "
+          },
+          {
+            "type": "text",
+            "text": "2 + 3?"
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "thinking": {
+      "type": "disabled"
+    }
+  },
+  "tool_round_trip": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather and time in 北京?"
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "I'll check both."
+          },
+          {
+            "type": "tool_use",
+            "id": "call_weather",
+            "name": "weather",
+            "input": {
+              "unit": "celsius",
+              "city": "北京"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "call_time",
+            "name": "clock",
+            "input": {
+              "city": "北京"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_weather",
+            "content": "18°C"
+          },
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_time",
+            "content": [
+              {
+                "type": "text",
+                "text": "09:30"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "It is 18°C at 09:30."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "weather",
+        "description": "Get weather",
+        "input_schema": {
+          "required": [
+            "city"
+          ],
+          "properties": {
+            "unit": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            },
+            "city": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      {
+        "name": "clock",
+        "input_schema": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        }
+      }
+    ],
+    "thinking": {
+      "type": "disabled"
+    },
+    "max_tokens": 32
+  },
+  "images": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Compare "
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "url",
+              "url": "https://example.com/one.png"
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          },
+          {
+            "type": "text",
+            "text": " with "
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "aGVsbG8="
+            }
+          },
+          {
+            "type": "text",
+            "text": "."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "thinking": {
+      "type": "disabled"
+    },
+    "max_tokens": 32
+  }
+}

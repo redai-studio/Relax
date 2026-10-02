@@ -671,7 +671,7 @@ class SGLangBackendAdapter:
         self._resources.shutdown()
 
 
-def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:
+def _normalize_prompt(prompt: Any, *, transport_dataset_media: bool = False) -> list[dict[str, Any]]:
     if prompt is None or (isinstance(prompt, (dict, list)) and not prompt):
         return []
     if isinstance(prompt, str):
@@ -691,6 +691,8 @@ def _normalize_prompt(prompt: Any) -> list[dict[str, Any]]:
             content in (None, []) or (isinstance(content, str) and not content.strip())
         ):
             return []
+    if transport_dataset_media:
+        messages = _transport_dataset_message_media(messages)
     return check_messages(messages)
 
 
@@ -738,7 +740,7 @@ def _transport_dataset_message_media(messages: list[dict[str, Any]]) -> list[dic
 
 
 def _sample_messages(sample: Sample) -> list[dict[str, Any]]:
-    return _transport_dataset_message_media(_normalize_prompt(sample.prompt))
+    return _normalize_prompt(sample.prompt, transport_dataset_media=True)
 
 
 def _build_session_specs(

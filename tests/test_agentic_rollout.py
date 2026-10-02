@@ -22,7 +22,7 @@ from relax.agentic.pipeline import (
 from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.prepare import PrepareDomain
 from relax.agentic.pipeline.reward import RewardDomain
-from relax.agentic.pipeline.runtime import RuntimeDomain, SGLangBackendAdapter, _build_session_specs
+from relax.agentic.pipeline.runtime import RuntimeDomain, SGLangBackendAdapter, _build_session_specs, _sample_messages
 from relax.agentic.pipeline.transfer import TransferBatch, TransferDomain
 from relax.agentic.session.admission import (
     AdmissionAction,
@@ -93,6 +93,30 @@ def _runtime_args(**overrides):
     if base["over_sampling_batch_size"] is None:
         base["over_sampling_batch_size"] = base["rollout_batch_size"]
     return SimpleNamespace(**base)
+
+
+def test_sample_messages_transports_dataset_images_before_validation() -> None:
+    sample = Sample(
+        prompt=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    {"type": "image", "image": "https://example.com/image.png"},
+                ],
+            }
+        ]
+    )
+
+    assert _sample_messages(sample) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this image"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
+            ],
+        }
+    ]
 
 
 async def test_reward_domain_delegates_sample_reward_to_executor(monkeypatch) -> None:

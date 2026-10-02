@@ -1,0 +1,213 @@
+{
+  "text": {
+    "instructions": "You are concise.",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "你好"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Hello."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Use tools when needed."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "search",
+        "parameters": {
+          "required": [
+            "query"
+          ],
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "text_blocks": {
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "What is "
+          },
+          {
+            "type": "input_text",
+            "text": "2 + 3?"
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "tool_round_trip": {
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Weather and time in 北京?"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "I'll check both."
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_weather",
+        "name": "weather",
+        "arguments": "{\"city\":\"北京\",\"unit\":\"celsius\"}"
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_time",
+        "name": "clock",
+        "arguments": "{\"city\":\"北京\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_weather",
+        "output": "18°C"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_time",
+        "output": "09:30"
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "It is 18°C at 09:30."
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "weather",
+        "description": "Get weather",
+        "parameters": {
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object",
+          "required": [
+            "city"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "clock",
+        "parameters": {
+          "type": "object",
+          "required": [
+            "city"
+          ],
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "reasoning": {
+      "effort": "none"
+    }
+  },
+  "images": {
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Compare "
+          },
+          {
+            "type": "input_image",
+            "image_url": "https://example.com/one.png",
+            "detail": "auto"
+          },
+          {
+            "type": "input_text",
+            "text": " with "
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,aGVsbG8="
+          },
+          {
+            "type": "input_text",
+            "text": "."
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "reasoning": {
+      "effort": "none"
+    }
+  }
+}

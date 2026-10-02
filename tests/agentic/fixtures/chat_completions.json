@@ -1,0 +1,194 @@
+{
+  "text": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "你好"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello."
+      },
+      {
+        "role": "user",
+        "content": "Use tools when needed."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "parameters": {
+            "type": "object",
+            "required": [
+              "query"
+            ],
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            }
+          },
+          "name": "search"
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "text_blocks": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What is "
+          },
+          {
+            "type": "text",
+            "text": "2 + 3?"
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "tool_round_trip": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Weather and time in 北京?"
+      },
+      {
+        "role": "assistant",
+        "content": "I'll check both.",
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "call_weather",
+            "function": {
+              "arguments": "{\"unit\": \"celsius\", \"city\": \"北京\"}",
+              "name": "weather"
+            }
+          },
+          {
+            "id": "call_time",
+            "type": "function",
+            "function": {
+              "arguments": "{\"city\":\"北京\"}",
+              "name": "clock"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_weather",
+        "content": "18°C"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_time",
+        "content": "09:30"
+      },
+      {
+        "role": "assistant",
+        "content": "It is 18°C at 09:30."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "description": "Get weather",
+          "name": "weather",
+          "parameters": {
+            "required": [
+              "city"
+            ],
+            "type": "object",
+            "properties": {
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              },
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          },
+          "name": "clock"
+        }
+      }
+    ],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "images": {
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "text": "Compare ",
+            "type": "text"
+          },
+          {
+            "image_url": {
+              "url": "https://example.com/one.png",
+              "detail": "auto"
+            },
+            "type": "image_url"
+          },
+          {
+            "type": "text",
+            "text": " with "
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,aGVsbG8="
+            }
+          },
+          {
+            "text": ".",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "tools": [],
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }
+}

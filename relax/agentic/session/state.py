@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -48,7 +50,7 @@ def _canonical_json_value(value: Any, *, field: str) -> Any:
     if isinstance(value, dict):
         if any(not isinstance(key, str) for key in value):
             raise TypeError(f"{field} JSON object keys must be strings")
-        return {key: _canonical_json_value(item, field=field) for key, item in value.items()}
+        return {key: _canonical_json_value(value[key], field=field) for key in sorted(value)}
     if isinstance(value, list):
         return [_canonical_json_value(item, field=field) for item in value]
     if isinstance(value, float):
@@ -116,7 +118,7 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}] must be a dict, got {type(tool_call)}"
             )
         call_id = tool_call.get("id")
-        if call_id is not None and (not isinstance(call_id, str) or not call_id):
+        if not isinstance(call_id, str) or not call_id:
             raise ValueError(f"messages[{message_index}].tool_calls[{call_index}].id must be a non-empty string")
         function = tool_call.get("function")
         if not isinstance(function, dict):
@@ -124,16 +126,52 @@ def _normalize_tool_calls(message: dict[str, Any], *, message_index: int) -> lis
                 f"messages[{message_index}].tool_calls[{call_index}].function must be a dict, got {type(function)}"
             )
         function_name = function.get("name")
-        if function_name is not None and not isinstance(function_name, str):
-            raise TypeError(
-                f"messages[{message_index}].tool_calls[{call_index}].function.name must be a string, "
-                f"got {type(function_name)}"
+        if not isinstance(function_name, str) or not function_name:
+            raise ValueError(
+                f"messages[{message_index}].tool_calls[{call_index}].function.name must be a non-empty string"
             )
         arguments_field = f"messages[{message_index}].tool_calls[{call_index}].function.arguments"
         arguments = function.get("arguments")
         normalized_tool_call = copy.deepcopy(tool_call)
         normalized_tool_call["function"]["arguments"] = _canonical_tool_arguments(arguments, field=arguments_field)
         normalized.append(normalized_tool_call)
+    return normalized
+
+
+def _normalize_content_blocks(content: list[Any], *, message_index: int) -> list[dict[str, Any]]:
+    if not content:
+        raise ValueError(f"messages[{message_index}].content must not be empty")
+    normalized: list[dict[str, Any]] = []
+    for item_index, item in enumerate(content):
+        field = f"messages[{message_index}].content[{item_index}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{field} must be a dict, got {type(item)}")
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise TypeError(f"{field}.text must be a string, got {type(text)}")
+            if not text:
+                raise ValueError(f"{field}.text must not be empty")
+            normalized.append({"type": "text", "text": text})
+        elif item_type == "image_url":
+            image_url = item.get("image_url")
+            if not isinstance(image_url, dict):
+                raise TypeError(f"{field}.image_url must be a dict, got {type(image_url)}")
+            url = image_url.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError(f"{field}.image_url.url must be a non-empty string")
+            if url.startswith("data:"):
+                header, separator, data = url.partition(",")
+                if not separator or not header.startswith("data:image/") or not header.endswith(";base64") or not data:
+                    raise ValueError(f"{field}.image_url.url must be a valid base64 image data URL")
+                try:
+                    base64.b64decode(data, validate=True)
+                except (binascii.Error, ValueError) as error:
+                    raise ValueError(f"{field}.image_url.url must be a valid base64 image data URL") from error
+            normalized.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            raise ValueError(f"{field}.type must be one of: image_url, text")
     return normalized
 
 
@@ -145,6 +183,8 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
 
     system_chunks: list[str] = []
     ensured: list[dict[str, Any]] = []
+    seen_tool_call_ids: set[str] = set()
+    unresolved_tool_call_ids: set[str] = set()
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise TypeError(f"messages[{index}] must be a dict, got {type(message)}")
@@ -157,15 +197,24 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
             allowed_roles = ", ".join(sorted(_ALLOWED_MESSAGE_ROLES))
             raise ValueError(f"messages[{index}].role must be one of: {allowed_roles}")
         tool_calls = _normalize_tool_calls(message, message_index=index) if role == "assistant" else []
+        for call_index, tool_call in enumerate(tool_calls):
+            call_id = tool_call["id"]
+            if call_id in seen_tool_call_ids:
+                raise ValueError(f"messages[{index}].tool_calls[{call_index}].id must be unique")
+            seen_tool_call_ids.add(call_id)
+            unresolved_tool_call_ids.add(call_id)
         reasoning_content = message.get("reasoning_content")
         if reasoning_content is not None and not isinstance(reasoning_content, str):
             raise TypeError(f"messages[{index}].reasoning_content must be a string, got {type(reasoning_content)}")
         has_reasoning_content = isinstance(reasoning_content, str) and bool(reasoning_content)
         assistant_allows_empty_content = role == "assistant" and (tool_calls or has_reasoning_content)
-        if role == "tool" and "tool_call_id" in message:
-            tool_call_id = message["tool_call_id"]
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
             if not isinstance(tool_call_id, str) or not tool_call_id:
                 raise ValueError(f"messages[{index}].tool_call_id must be a non-empty string")
+            if tool_call_id not in unresolved_tool_call_ids:
+                raise ValueError(f"messages[{index}].tool_call_id must reference a preceding unresolved tool call")
+            unresolved_tool_call_ids.remove(tool_call_id)
         else:
             tool_call_id = None
         if "content" not in message and not assistant_allows_empty_content:
@@ -179,13 +228,9 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
             if not content and role != "tool" and not assistant_allows_empty_content:
                 raise ValueError(f"messages[{index}].content must not be empty")
         elif isinstance(content, list):
-            if not content:
-                raise ValueError(f"messages[{index}].content must not be empty")
-            for item_index, item in enumerate(content):
-                if not isinstance(item, dict):
-                    raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
-                if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
-                    raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
+            content = _normalize_content_blocks(content, message_index=index)
+            if all(block["type"] == "text" for block in content):
+                content = "".join(str(block["text"]) for block in content)
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
         if role == "system":
@@ -199,7 +244,7 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
             rendered_message["reasoning_content"] = reasoning_content
         if tool_calls:
             rendered_message["tool_calls"] = tool_calls
-        if role == "tool" and tool_call_id is not None:
+        if role == "tool":
             rendered_message["tool_call_id"] = tool_call_id
         ensured.append(rendered_message)
     if system_chunks:
@@ -217,14 +262,25 @@ def normalize_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if not isinstance(tool, dict):
             raise TypeError(f"tools[{index}] must be a dict, got {type(tool)}")
         function = tool.get("function")
-        if tool.get("type") != "function" or not isinstance(function, dict):
+        if tool.get("type") != "function":
             continue
+        if not isinstance(function, dict):
+            raise TypeError(f"tools[{index}].function must be a dict, got {type(function)}")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"tools[{index}].function.name must be a non-empty string")
+        parameters = function.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise TypeError(f"tools[{index}].function.parameters must be a dict, got {type(parameters)}")
         normalized_function = {
-            "name": function.get("name"),
-            "parameters": function.get("parameters"),
+            "name": name,
+            "parameters": _canonical_json_value(parameters, field=f"tools[{index}].function.parameters"),
         }
         if function.get("description") is not None:
-            normalized_function["description"] = function["description"]
+            description = function["description"]
+            if not isinstance(description, str):
+                raise TypeError(f"tools[{index}].function.description must be a string, got {type(description)}")
+            normalized_function["description"] = description
         normalized.append({"type": "function", "function": normalized_function})
     return normalized
 
@@ -235,14 +291,7 @@ def normalize_template_kwargs(template_kwargs: dict[str, Any] | None) -> dict[st
     if not isinstance(template_kwargs, dict):
         raise TypeError(f"chat_template_kwargs must be a dict, got {type(template_kwargs)}")
 
-    def _normalize(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {str(key): _normalize(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
-        if isinstance(value, list):
-            return [_normalize(item) for item in value]
-        return value
-
-    return _normalize(template_kwargs)
+    return _canonical_json_value(template_kwargs, field="chat_template_kwargs")
 
 
 def _messages_tools_template_state_hash(
@@ -259,7 +308,7 @@ def _messages_tools_template_state_hash(
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
-        default=str,
+        allow_nan=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
