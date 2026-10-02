@@ -11,6 +11,7 @@ pydantic
 blobfile
 datasets
 httpx[http2]
+openai
 mcp[cli]
 memray  # needed for debugging (but is lightweight), we can put it to dev mode when using pyproject.toml
 omegaconf

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-set -ex
+set -e
+set +x
 set -o pipefail
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
@@ -9,9 +10,7 @@ echo "当前时间: $now"
 ###############################################################################
 #                                 klx args                                    #
 ###############################################################################
-set +x
-export WANDB_API_KEY="${WANDB_API_KEY:=YOUR-KEY}"
-set -x
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WORKDIR="${WORKDIR:-/workspace}"
 export MODEL_DIR="${MODEL_DIR:-/workspace/deepeyes}"
 export DATA_DIR="${DATA_DIR:-/workspace/deepeyes}"
@@ -45,11 +44,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+set +x
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
 fi
+set +x
 source "${MODEL_CONFIG_DIR}/qwen36-35B-A3B.sh"
+set +x
 
 ###############################################################################
 #                                    DIRS                                     #
@@ -63,7 +65,7 @@ if [ -z "${MODEL_DIR:-}" ] || [ -z "${DATA_DIR:-}" ] || [ -z "${SAVE_DIR:-}" ]; 
     echo "Example: MODEL_DIR=/path/to/models DATA_DIR=/path/to/data SAVE_DIR=/path/to/save bash $0"
     exit 1
 fi
-mkdir -p ${SAVE_DIR}
+mkdir -p "${SAVE_DIR}"
 
 ###############################################################################
 #                             STARTUP CLEANUP                                 #
@@ -88,18 +90,29 @@ if [ ! -f "${APPTAINER_IMAGE_PATH}" ]; then
     echo "Run: DATA_DIR=${DATA_DIR} bash ${SCRIPT_DIR}/scripts/prepare.sh"
     exit 1
 fi
-DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
+export DEEPEYES_V2_APP_PYTHON="${DEEPEYES_V2_APP_ENV_ROOT:-/tmp/deepeyes-v2-app-env}/.venv/bin/python"
 if [ ! -x "${DEEPEYES_V2_APP_PYTHON}" ]; then
     echo "ERROR: DeepEyes V2 app environment not found at ${DEEPEYES_V2_APP_PYTHON}."
     echo "Run: bash ${SCRIPT_DIR}/scripts/prepare_app_env.sh"
     exit 1
 fi
 
+SEARCH_RUNTIME_HELPER="${SCRIPT_DIR}/app/search_runtime.py"
+DEEPEYES_V2_SEARCH_CONFIG_PATH=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" prepare)
+export DEEPEYES_V2_SEARCH_CONFIG_PATH
+# 保留已有 Ray runtime 配置，服务变量由统一 helper 合并。
+export DEEPEYES_V2_BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
+if [ -z "${DEEPEYES_V2_BASE_RUNTIME_ENV_JSON}" ]; then
+    DEEPEYES_V2_BASE_RUNTIME_ENV_JSON='{}'
+fi
+unset RUNTIME_ENV_JSON
+
 ###############################################################################
 #                              JUDGE MODEL API                                #
 ###############################################################################
 
 source "${SCRIPT_DIR}/sglang_judge_service_klx.sh"
+set +x
 
 ###############################################################################
 #                                  MODEL CONFIG                               #
@@ -135,21 +148,13 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
-# Sandbox env vars propagated into every Ray worker so the per-session
-# agent process can find apptainer / search cache.
-# SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
-# to find the apptainer backend YAML config (image path, bind paths, etc).
-EXTRA_ENV_VARS_JSON="\"SANDBOX_BACKEND\": \"apptainer_jupyter\",
-    \"SANDBOX_CONFIG_PATH\": \"${SCRIPT_DIR}/apptainer_env/apptainer_config.yaml\",
-    \"APPTAINER_IMAGE_PATH\": \"${APPTAINER_IMAGE_PATH}\",
-    \"DEEPEYES_V2_APP_PYTHON\": \"${DEEPEYES_V2_APP_PYTHON}\",
-    \"DEEPEYES_V2_SEARCH_CACHE_PATHS\": \"${DEEPEYES_V2_SEARCH_CACHE_PATHS:-}\",
-    \"DEEPEYES_JUDGE_BASE_URL\": \"${DEEPEYES_JUDGE_BASE_URL:-}\",
-    \"DEEPEYES_JUDGE_MODELS\": \"${DEEPEYES_JUDGE_MODELS:-}\",
-    \"DEEPEYES_JUDGE_API_KEY\": \"${DEEPEYES_JUDGE_API_KEY:-}\",
-    \"XMLIR_ENABLE_H2D_SSE_COPY\": \"${XMLIR_ENABLE_H2D_SSE_COPY:-1}\",
-    \"USE_CAST_FC_FUSION\": \"${USE_CAST_FC_FUSION:-1}\""
+# 核心配置提供 KLX 环境，示例配置由 JSON helper 合并。
+EXTRA_ENV_VARS_JSON=""
 source "${SCRIPT_DIR}/../../scripts/entrypoint/runtime-env-klx.sh"
+set +x
+RUNTIME_ENV_JSON=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" runtime --profile klx)
+export RUNTIME_ENV_JSON
+AGENT_COMMAND=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" agent-command)
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -160,13 +165,14 @@ ROLLOUT_ARGS=(
     --metadata-key extra_info
     --custom-rm-path examples.deepeyes_v2_agentic.reward_deepeyes_v2.reward_func
     --use-agentic-rollout
-    --agent-command ". ${SCRIPT_DIR}/run_agent_app.sh"
+    --agent-command "${AGENT_COMMAND}"
     --agent-cwd "${SCRIPT_DIR}"
     # Per-run agent log dir: every session's stdout/stderr is tee'd to
     # ${dir}/${session_id}.log (run_agent_app.sh). Successful AND failed
     # sessions are both kept, which is what makes hang/timeout diagnosis
     # possible — Relax's own tmpdir-based capture drops both.
-    --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}"
+    --agent-env "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${TIMESTAMP}" \
+        "DEEPEYES_V2_SEARCH_CONFIG_PATH=${DEEPEYES_V2_SEARCH_CONFIG_PATH}"
     # 30-min default is too generous: normal sessions take 1-3 min, a
     # zombie session still burning chat completions after 10 min is
     # ~always doomed. Faster session-level SIGKILL clears prepare-gate
@@ -309,28 +315,6 @@ RAY_RESOURCE_ARGS=(
 
 mkdir -p logs
 
-# xtrace off for the submit command: --runtime-env-json embeds EXTRA_ENV_VARS_JSON
-# (may carry DEEPEYES_JUDGE_API_KEY etc.) and, after the merge below, WANDB_API_KEY;
-# the whole line would otherwise be echoed by `set -x` into logs/${EXP_NAME}.log.
-set +x
-# Merge WANDB_API_KEY into the job runtime_env. `ray job submit` runs the entrypoint
-# on the (possibly pre-existing) cluster, whose workers do NOT inherit this submit
-# shell's exports — so wandb online init can't authenticate unless the key travels
-# via runtime_env. Read from os.environ (no shell interpolation) and keep xtrace off
-# so the value never hits the log. NOTE: the key still lands in Ray's job runtime_env
-# metadata (dashboard / `ray job list`); use a cluster-preset env or `wandb login`
-# (~/.netrc) instead if that surface is unacceptable.
-if [ -n "${WANDB_API_KEY}" ] && [ "${WANDB_API_KEY}" != "YOUR-KEY" ]; then
-    RUNTIME_ENV_JSON=$(python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ["RUNTIME_ENV_JSON"])
-payload.setdefault("env_vars", {})["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
-print(json.dumps(payload))
-PY
-)
-fi
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
     -- python3 relax/entrypoints/train.py \
@@ -346,4 +330,3 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MEGATRON_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     2>&1 | tee logs/${EXP_NAME}.log
-set -x
