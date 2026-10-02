@@ -73,6 +73,21 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+_STOP_REASON_METRIC_CATEGORIES = (
+    "budget_exhausted",
+    "completed",
+    "context_exhausted",
+    "discarded_by_pipeline",
+    "env_done",
+    "env_error",
+    "finish_abort",
+    "finish_length",
+    "format_error",
+    "llm_unavailable",
+    "max_turns",
+    "other",
+    "unknown",
+)
 
 
 def _resolve_rollout_engine_class(args):
@@ -4836,6 +4851,9 @@ def compute_metrics_from_samples(
     rollout_id: int | None = None,
     include_rloo_diagnostics: bool = True,
 ):
+    if not samples:
+        return {}
+
     rewarded_samples = [sample for sample in samples if sample.reward is not None]
     reward_cat_key = args.log_reward_category
     reward_category_samples = (
@@ -4864,11 +4882,11 @@ def compute_metrics_from_samples(
     log_dict |= compute_mopd_metrics(args, rewarded_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
-    log_dict["num_turn/mean"] = np.mean([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/max"] = np.max([s.metadata.get("rollout_turns", 1) for s in samples]).item()
-    log_dict["num_turn/min"] = np.min([s.metadata.get("rollout_turns", 1) for s in samples]).item()
+    log_dict |= _compute_rollout_metadata_stats(samples)
     if rollout_id is not None and args.partial_rollout and not args.fully_async:
-        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
+        staleness_gaps = [
+            rollout_id - (sample.metadata or {}).get("start_rollout_id", rollout_id) for sample in samples
+        ]
         log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
         log_dict["staleness/max"] = np.max(staleness_gaps).item()
         log_dict["staleness/min"] = np.min(staleness_gaps).item()
@@ -4884,6 +4902,47 @@ def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, flo
         f"{prefix}max": np.max(values).item(),
         f"{prefix}min": np.min(values).item(),
     }
+
+
+def _compute_rollout_metadata_stats(samples: list[Sample]) -> dict[str, float]:
+    """Aggregate stop reasons and turns without modifying samples."""
+    if not samples:
+        return {}
+
+    # Keep metric names bounded and emit zeros for absent categories each batch.
+    reason_counts = dict.fromkeys(_STOP_REASON_METRIC_CATEGORIES, 0)
+    turns: list[int] = []
+    for sample in samples:
+        metadata = sample.metadata or {}
+        reason = "unknown"
+        for key in ("rollout_stop_reason", "stop_reason"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                reason = value.strip()
+                break
+        if reason.startswith("env_error:"):
+            reason = "env_error"
+        elif reason not in reason_counts:
+            reason = "other"
+        reason_counts[reason] += 1
+
+        value = metadata.get("rollout_turns", 1)
+        if isinstance(value, (int, np.integer)) and not isinstance(value, bool) and value >= 0:
+            turns.append(int(value))
+        elif isinstance(value, (float, np.floating)) and np.isfinite(value) and value >= 0 and value.is_integer():
+            turns.append(int(value))
+        else:
+            # Keep the existing single-turn default for absent or invalid values.
+            turns.append(1)
+
+    metrics = _compute_min_mean_max_stats(turns, "num_turn/")
+    percentiles = (50, 90, 95, 99)
+    for percentile, value in zip(percentiles, np.percentile(turns, percentiles), strict=True):
+        metrics[f"num_turn/p{percentile}"] = float(value)
+    for reason, count in sorted(reason_counts.items()):
+        metrics[f"stop_reason/{reason}/count"] = float(count)
+        metrics[f"stop_reason/{reason}/ratio"] = count / len(samples)
+    return metrics
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
