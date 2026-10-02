@@ -682,9 +682,39 @@ def test_device_direct_keeps_bootstrap_and_protocol_errors_fatal(registry, monke
     assert raised.value.__cause__ is error
     assert backend._lora_sync.base_sync_done is base_sync_done
     assert backend._lora_sync.adapter_loaded is base_sync_done
+    assert [call.args[0] for call in backend._batch_request.call_args_list] == (
+        [] if base_sync_done else ["/pause_generation", "/continue_generation"]
+    )
     backend.lock.release.remote.assert_called_once()
     device_direct.dist.all_reduce.assert_called_once()
     assert device_direct.dist.all_reduce.call_args.args[0].item() == 1
+
+
+@pytest.mark.parametrize("base_sync_done", [False, True])
+def test_device_direct_only_pauses_and_flushes_during_bootstrap(registry, monkeypatch, base_sync_done):
+    backend, engines = _device_direct_backend(registry, monkeypatch, base_sync_done=base_sync_done)
+    if base_sync_done:
+        _publisher(engines, registry).publish(_snapshot(), [1, 1], version_id=1)
+        backend.weight_version = 1
+    timeline = []
+    backend._batch_request.side_effect = lambda endpoint: timeline.append(endpoint)
+    for rank, engine in backend.rollout_engines.items():
+        engine.flush_cache.remote.side_effect = lambda rank=rank: timeline.append(f"flush:{rank}")
+
+    def snapshot():
+        timeline.append("snapshot")
+        return _snapshot()
+
+    backend._materialize_adapter_snapshot = snapshot
+    backend.update_weights_for_rollout(rollout_only=True)
+
+    assert timeline == (
+        ["snapshot"]
+        if base_sync_done
+        else ["/pause_generation", "flush:0", "flush:1", "snapshot", "/continue_generation"]
+    )
+    assert registry.default_version == backend.weight_version
+    assert backend._lora_sync.base_sync_done and backend._lora_sync.adapter_loaded
 
 
 def test_registry_client_forwards_explicit_publication_identity(registry, monkeypatch):

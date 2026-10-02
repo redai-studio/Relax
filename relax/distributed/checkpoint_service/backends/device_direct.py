@@ -643,8 +643,9 @@ class DeviceDirectBackend(CommBackend):
     def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights used by rollout nodes.
 
-        Sequence: pause rollout generation, flush caches, gather and broadcast
-        model parameters (non-expert then expert), then resume generation.
+        Bootstrap and legacy syncs pause generation and flush caches around the
+        broadcast. Later versioned adapter publications keep generation
+        running.
         """
         self.weight_version += 1
 
@@ -772,8 +773,8 @@ class DeviceDirectBackend(CommBackend):
         # same NCCL group (no disk). Must run on ALL ranks (the export/gather inside are
         # collective); only rank 0 issues the HTTP fan-out and drives the broadcast.
         #
-        # The failure is captured rather than propagated on the spot: generation is currently
-        # PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
+        # The failure is captured rather than propagated on the spot: bootstrap/legacy generation
+        # is PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
         # raise would strand the engines paused forever AND leave every other rank blocked in
         # the barrier below waiting for a rank that already unwound. The verdict is shared
         # across ranks first, generation is resumed, and only then does everyone raise together.
@@ -786,7 +787,7 @@ class DeviceDirectBackend(CommBackend):
                     # Bootstrap and later versions share the staged publication protocol.
                     self._publish_lora_adapter_versioned()
             except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
-                logger.exception("LoRA adapter push failed; resuming generation before aborting")
+                logger.exception("LoRA adapter push failed; completing rank synchronization before aborting")
                 push_error = e
             else:
                 self._lora_sync.adapter_loaded = True
@@ -801,7 +802,7 @@ class DeviceDirectBackend(CommBackend):
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
                 push_failed = bool(flag.item())
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and not versioned_staged:
                 # Continue generation on all rollout nodes
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
@@ -812,8 +813,7 @@ class DeviceDirectBackend(CommBackend):
                 # policy silently stops tracking the trained one.
                 raise RuntimeError(
                     "LoRA adapter push to the rollout engines failed; aborting the weight update "
-                    "instead of generating with a stale or missing adapter. Generation has been "
-                    "resumed so the engines are not left paused."
+                    "instead of generating with a stale or missing adapter. The engines are not left paused."
                 ) from push_error
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
