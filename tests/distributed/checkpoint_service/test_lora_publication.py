@@ -10,6 +10,7 @@ the version ended up — no engines, NCCL or Megatron involved.
 import logging
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Sequence, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -582,18 +583,41 @@ def test_conflict_and_completed_replay_do_not_reclaim_unrelated_versions(registr
     assert engines.events == []
 
 
-def test_device_direct_uses_sync_identity_for_new_and_replayed_publications(registry, monkeypatch):
+def _device_direct_backend(registry, monkeypatch, *, base_sync_done=True, rank=0):
     from relax.distributed.checkpoint_service.backends import device_direct
 
     backend = object.__new__(device_direct.DeviceDirectBackend)
     backend.lock = SimpleNamespace(
-        acquire=SimpleNamespace(remote=lambda: True), release=SimpleNamespace(remote=lambda: None)
+        acquire=SimpleNamespace(remote=Mock(return_value=True)), release=SimpleNamespace(remote=Mock())
     )
     monkeypatch.setattr(device_direct.ray, "get", lambda result: result)
+    monkeypatch.setattr(device_direct.dist, "get_rank", lambda: rank)
+    group = object()
+    monkeypatch.setattr(device_direct, "get_gloo_group", lambda: group)
+    monkeypatch.setattr(device_direct.dist, "barrier", Mock())
+    monkeypatch.setattr(device_direct.dist, "all_reduce", Mock())
+    monkeypatch.setattr(device_direct.device_module, "empty_cache", Mock())
+    backend.args = SimpleNamespace()
+    backend.model = []
+    backend.weight_version = 0
+    backend._lora_merge_mode = False
+    backend._lora_adapter_mode = True
+    backend._versioned_lora = True
+    backend._is_pp_src_rank = False
+    backend._lora_sync = SimpleNamespace(base_sync_done=base_sync_done, adapter_loaded=base_sync_done)
+    backend._megatron = SimpleNamespace(named_params_and_buffers=lambda *args: ())
+    backend.rollout_engines = {rank: SimpleNamespace(flush_cache=SimpleNamespace(remote=Mock())) for rank in (0, 1)}
+    backend._batch_request = Mock(return_value=[])
     engines = _FakeEngines()
-    snapshots = [_snapshot(), _snapshot({"changed": torch.ones(2)})]
     backend._lora_publication_bucket_cap = lambda: 8
     backend._new_lora_publisher = lambda snapshot, cap: _publisher(engines, registry, bucket_cap=cap)
+    backend._materialize_adapter_snapshot = lambda: _snapshot() if rank == 0 else None
+    return backend, engines
+
+
+def test_device_direct_uses_sync_identity_for_new_and_replayed_publications(registry, monkeypatch):
+    backend, engines = _device_direct_backend(registry, monkeypatch)
+    snapshots = [_snapshot(), _snapshot({"changed": torch.ones(2)})]
     for version_id, snapshot in ((11, snapshots[0]), (11, snapshots[0]), (22, snapshots[1]), (33, snapshots[0])):
         backend.weight_version = version_id
         backend._materialize_adapter_snapshot = lambda: snapshot
@@ -603,6 +627,64 @@ def test_device_direct_uses_sync_identity_for_new_and_replayed_publications(regi
     assert [payload["version_id"] for payload in begins] == [11, 22, 33]
     assert begins[0]["digest"] == begins[2]["digest"]
     assert begins[0]["lora_name"] != begins[2]["lora_name"]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_device_direct_skips_capacity_and_publishes_after_session_release(registry, monkeypatch, caplog, rank):
+    from relax.distributed.checkpoint_service.backends import device_direct
+
+    backend, engines = _device_direct_backend(registry, monkeypatch, rank=rank)
+    publisher = _publisher(engines, registry)
+    publisher.publish(_snapshot(), [1, 1], version_id=1)
+    old = registry.bind_latest("old-session")
+    publisher.publish(_snapshot({"changed": torch.ones(2)}), [1], version_id=2)
+    before = registry.status()
+    engines.events.clear()
+    backend.weight_version = 2
+
+    with caplog.at_level(logging.WARNING):
+        backend.update_weights_for_rollout(rollout_only=True)
+
+    assert backend.weight_version == 3
+    assert registry.status() == before
+    assert registry.bind_latest("old-session") == old
+    assert engines.events == []  # No Begin or NCCL for the refused candidate.
+    assert backend._lora_sync.base_sync_done and backend._lora_sync.adapter_loaded
+    device_direct.dist.all_reduce.assert_called_once()
+    assert device_direct.dist.all_reduce.call_args.args[0].item() == 0
+    device_direct.device_module.empty_cache.assert_called_once()
+    if rank == 0:
+        assert "sync v=3 SKIPPED: CAPACITY_ERROR" in caplog.text
+        backend.lock.release.remote.assert_called_once()
+        registry.release("old-session")
+        backend.update_weights_for_rollout(rollout_only=True)
+        assert registry.default_version == 4
+        assert 3 not in registry.versions
+        assert registry.versions[1].state is VersionState.RECLAIMED
+
+
+@pytest.mark.parametrize(
+    ("base_sync_done", "error"),
+    [
+        (False, LoRAVersionError("CAPACITY_ERROR")),
+        (True, LoRAVersionError("PUBLICATION_BLOCKED")),
+        (True, LoRAVersionError("VERSION_CONFLICT")),
+        (True, LoRAPublicationError("FATAL", "ambiguous engine state")),
+    ],
+)
+def test_device_direct_keeps_bootstrap_and_protocol_errors_fatal(registry, monkeypatch, base_sync_done, error):
+    from relax.distributed.checkpoint_service.backends import device_direct
+
+    backend, _ = _device_direct_backend(registry, monkeypatch, base_sync_done=base_sync_done)
+    backend._new_lora_publisher = lambda snapshot, cap: SimpleNamespace(publish=Mock(side_effect=error))
+    with pytest.raises(RuntimeError, match="LoRA adapter push.*failed") as raised:
+        backend.update_weights_for_rollout(rollout_only=True)
+    assert raised.value.__cause__ is error
+    assert backend._lora_sync.base_sync_done is base_sync_done
+    assert backend._lora_sync.adapter_loaded is base_sync_done
+    backend.lock.release.remote.assert_called_once()
+    device_direct.dist.all_reduce.assert_called_once()
+    assert device_direct.dist.all_reduce.call_args.args[0].item() == 1
 
 
 def test_registry_client_forwards_explicit_publication_identity(registry, monkeypatch):

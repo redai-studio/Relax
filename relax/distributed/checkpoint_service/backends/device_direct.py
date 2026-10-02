@@ -33,7 +33,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 from urllib3.exceptions import NewConnectionError
 
-from relax.agentic.session.lora_version import versioned_lora_publication_enabled
+from relax.agentic.session.lora_version import LoRAVersionError, versioned_lora_publication_enabled
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
@@ -1400,7 +1400,8 @@ class DeviceDirectBackend(CommBackend):
         Begins the candidate on every engine, streams it bucket by bucket while generation keeps
         running on the previous version, then commits fleet-wide. Failure keeps the old default
         and either leaves a retryable version (every engine confirmed absent) or fails the run
-        closed (ambiguous engine state).
+        closed (ambiguous engine state). After bootstrap, capacity refusal skips this update;
+        the next sync tries a new version ID while Sessions keep using the published policy.
         """
 
         version_id = self.weight_version
@@ -1419,6 +1420,20 @@ class DeviceDirectBackend(CommBackend):
             # update_weights_for_rollout increments weight_version and starts
             # a new publication; this entrypoint does not retry failures in place.
             outcome = publisher.publish(snapshot, bucket_sizes, version_id=version_id)
+        except LoRAVersionError as error:
+            if error.code != "CAPACITY_ERROR" or not (
+                self._lora_sync.base_sync_done and self._lora_sync.adapter_loaded
+            ):
+                raise
+            # Admission was refused before Begin/NCCL. Only a running policy may
+            # stay stale; bootstrap and unconfirmed engine state must still fail.
+            logger.warning(
+                "[lora-version] sync v=%d SKIPPED: CAPACITY_ERROR; keeping the published policy "
+                "and retrying on the next weight sync: %s",
+                version_id,
+                error,
+            )
+            return
         finally:
             ray.get(self.lock.release.remote())
         logger.info(
