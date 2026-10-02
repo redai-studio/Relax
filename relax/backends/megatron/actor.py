@@ -63,6 +63,7 @@ from relax.utils.data.stream_dataloader import (
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.env import Envs
+from relax.utils.inference_sync import notify_inference_weight_update
 from relax.utils.megatron_peft_utils import (
     is_lora_adapter_mode,
     is_lora_adapter_param,
@@ -2420,6 +2421,8 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        inference_sync = notify_inference_weight_update(self.rollout_manager, get_gloo_group())
+
         if self.args.offload_train:
             # CRITICAL: Barrier before onload_weights to ensure ALL ranks have
             # completed sleep() (and released GPU memory via tms.pause()) before
@@ -2490,6 +2493,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
+        notify_inference_weight_update(self.rollout_manager, get_gloo_group(), inference_sync, engines=rollout_engines)
         if reconnect_rollout_engines:
             self.sleep()
         elif self.args.offload_train:
@@ -2660,9 +2664,19 @@ class MegatronTrainRayActor(TrainRayActor):
                     time.sleep(1)
 
         try:
+            if not actor_fwd_only:
+                inference_sync = notify_inference_weight_update(self.rollout_manager, get_gloo_group())
             if not rollout_only:
                 run(self.checkpoint_engine_client.init_process_groups_for_actor_fwd_ref(rollout_id))
-            run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            updated_urls = run(self.checkpoint_engine_client.update_weights_for_rollout(rollout_only, actor_fwd_only))
+            if not actor_fwd_only:
+                notify_inference_weight_update(
+                    self.rollout_manager,
+                    get_gloo_group(),
+                    inference_sync,
+                    confirm_topology=True,
+                    participating_urls=updated_urls,
+                )
         finally:
             if weight_sync_lock is not None and dist.get_rank() == 0:
                 ray.get(weight_sync_lock.release.remote())

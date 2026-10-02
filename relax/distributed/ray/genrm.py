@@ -29,7 +29,7 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote
+@ray.remote(concurrency_groups={"discovery": 1})
 class GenRMManager(MultiEngineManager):
     """Manager for GenRM engines.
 

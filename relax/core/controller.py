@@ -39,6 +39,7 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
+    is_managed_opd_teacher_enabled,
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
@@ -166,6 +167,7 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._teacher_gateway = None
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -727,10 +729,26 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
-        actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
-            self.config,
-            runtime_env=self.runtime_env,
-        )
+        if is_managed_opd_teacher_enabled(self.config) and not getattr(self.config, "debug_train_only", False):
+            from relax.core.inference import bind_inference_gateway, deploy_inference_gateway
+
+            self._teacher_gateway = deploy_inference_gateway("teacher", self.config, self.runtime_env)
+        try:
+            actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
+                self.config,
+                runtime_env=self.runtime_env,
+            )
+            if self._teacher_manager is not None:
+                managers = (
+                    self._teacher_manager if isinstance(self._teacher_manager, list) else [self._teacher_manager]
+                )
+                bind_inference_gateway(self._teacher_gateway, [{"manager": manager} for manager in managers])
+        except Exception:
+            if self._teacher_gateway is not None:
+                serve.delete("inference_teacher")
+                self._teacher_gateway = None
+            shutdown_managed_opd_teacher(self._teacher_manager)
+            raise
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -982,6 +1000,17 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _quiesce_inference_gateways(self) -> None:
+        from relax.core.inference import quiesce_inference_gateway
+
+        handles = [getattr(service, "inference_gateway", None) for service in self.serve_dict.values()]
+        handles.append(getattr(self, "_teacher_gateway", None))
+        for handle in handles:
+            try:
+                quiesce_inference_gateway(handle)
+            except Exception as exc:
+                logger.warning("Failed to quiesce inference gateway: %s", exc)
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -991,6 +1020,7 @@ class Controller:
         instead of being orphaned.
         """
         logger.info("Controller shutting down — cleaning up engine processes...")
+        self._quiesce_inference_gateways()
         self.stop_health_check()
 
         # Shut down rollout engines via RolloutManager.dispose()
@@ -1025,6 +1055,14 @@ class Controller:
             self._cleanup_s3_model_weights_after_init(force=True)
         except Exception as e:
             logger.warning(f"Failed to clean S3 model SHM cache during shutdown: {e}")
+
+        for role, service in self.serve_dict.items():
+            if getattr(service, "inference_gateway", None) is not None:
+                serve.delete(f"inference_{role}")
+                service.inference_gateway = None
+        if getattr(self, "_teacher_gateway", None) is not None:
+            serve.delete("inference_teacher")
+            self._teacher_gateway = None
 
         logger.info("Controller shutdown complete.")
 
@@ -1193,6 +1231,7 @@ class Controller:
             os._exit(1)
 
         # Save references needed after __init__ overwrites them
+        self._quiesce_inference_gateways()
         config = self.config
         recovery_load_path(config)  # Ensure config has the correct checkpoint paths after restart
         runtime_env = self.runtime_env

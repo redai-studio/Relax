@@ -255,3 +255,28 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+def test_discovery_requires_full_onload_and_tracks_health_results(_patch_ray):
+    manager = _FakeManager(num_slots=1)
+    engine = manager.all_engines[0]
+    engine._actor_id = None
+
+    def state():
+        return manager.get_inference_snapshot()["models"]["default"]["state"]
+
+    assert state() == "ready"
+    manager.offload()
+    assert state() == "sleeping"
+    manager.onload(tags=["weights"])
+    assert state() == "onloading"
+    count = engine.calls.count("resume_memory_occupation")
+    manager.onload()
+    assert engine.calls.count("resume_memory_occupation") == count + 1
+    assert state() == "ready"
+    engine.dead_methods = frozenset({"health_generate"})
+    assert not manager.health_check()
+    assert state() == "unavailable"
+    engine.dead_methods = frozenset()
+    assert manager.health_check()
+    assert state() == "ready"

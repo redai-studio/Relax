@@ -388,6 +388,14 @@ class Rollout(Base):
     def get_rollout_manager(self) -> Any:
         return self.rollout_manager
 
+    def get_inference_bindings(self) -> list[dict[str, Any]]:
+        return [{"manager": self.rollout_manager}]
+
+    async def inference_legacy_http(self, method: str, path: str, query: str, body: bytes) -> dict[str, Any]:
+        from relax.engine.inference_http import legacy_http
+
+        return await legacy_http(self.app, method, path, query, body)
+
     def set_barriers(
         self,
         *,

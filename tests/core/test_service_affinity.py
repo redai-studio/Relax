@@ -188,6 +188,7 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     service.healthy = MagicMock()
     service.num_gpus = 0
     service.role = "rollout" if has_data_source else "actor"
+    service.inference_gateway = None
     service.data_source = MagicMock() if has_data_source else None
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
@@ -240,3 +241,37 @@ def test_service_deferred_deploy_keeps_placement_group_ownership():
 
     with pytest.raises(RuntimeError, match="already been deployed"):
         service.deploy()
+
+
+@pytest.mark.parametrize("role", ["rollout", "genrm"])
+def test_service_gateway_keeps_original_handle_and_survives_backend_rebind(role):
+    backend, gateway = MagicMock(), MagicMock()
+    bindings = [{"manager": "manager"}]
+    backend.get_inference_bindings.remote.return_value.result.return_value = bindings
+    with (
+        patch("relax.core.inference.deploy_inference_gateway", return_value=gateway) as deploy_gateway,
+        patch("relax.core.service.serve.run", return_value=backend) as deploy_backend,
+    ):
+        service = Service(MagicMock(), role, MagicMock(), Namespace(enable_affinity=False), num_gpus=0)
+        assert service.handle is backend
+        assert service.inference_gateway is gateway
+        assert deploy_backend.call_args.kwargs == {"name": role, "route_prefix": None}
+        gateway.rebind_sources.remote.assert_called_once_with(bindings, backend)
+        service.quiesce_inference()
+        service._deploy()
+        assert deploy_gateway.call_count == 1
+        assert gateway.rebind_sources.remote.call_count == 2
+        gateway.quiesce.remote.assert_called_once_with()
+
+
+def test_service_failed_backend_deployment_removes_new_gateway():
+    gateway = MagicMock()
+    with (
+        patch("relax.core.inference.deploy_inference_gateway", return_value=gateway),
+        patch("relax.core.service.serve.run", side_effect=RuntimeError("backend failed")),
+        patch("relax.core.service.serve.delete") as delete,
+    ):
+        with pytest.raises(RuntimeError, match="backend failed"):
+            Service(MagicMock(), "rollout", MagicMock(), Namespace(enable_affinity=False), num_gpus=0)
+        delete.assert_called_once_with("inference_rollout")
+        gateway.quiesce.remote.assert_called_once_with()

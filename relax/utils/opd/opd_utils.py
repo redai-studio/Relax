@@ -337,6 +337,7 @@ def _start_managed_multi_teacher(
     def _build_teacher_manager_args(base_args: Any, data_source: str, spec: dict) -> Any:
         teacher_args = copy.copy(base_args)
         teacher_args.teacher_hf_checkpoint = spec["checkpoint_path"]
+        teacher_args._inference_model_name = data_source
         return teacher_args
 
     def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:

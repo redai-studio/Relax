@@ -279,7 +279,7 @@ class CheckpointEngineClient:
             return
         self._backend.recv_weight()
 
-    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
+    async def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> set[str] | None:
         """Update weights for rollout role from trainer."""
         response = await self._http_client.get(f"{self.coordinator_url}/topology")
         response.raise_for_status()
@@ -289,6 +289,9 @@ class CheckpointEngineClient:
             self._backend.init_process_group_for_rollout(data)
         self._backend.update_weights_for_rollout(rollout_only, actor_fwd_only)
         logger.info("Weights updated for rollout role.")
+        if not actor_fwd_only:
+            return self._backend.updated_rollout_urls()
+        return None
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeat signals to coordinator."""

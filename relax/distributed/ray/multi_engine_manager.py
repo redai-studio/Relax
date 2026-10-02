@@ -22,6 +22,7 @@ import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.engine.inference_discovery import initialize_discovery, static_snapshot
 from relax.utils.logging_utils import get_logger
 
 
@@ -86,6 +87,7 @@ class MultiEngineManager:
         skip_init: bool = False,
         log_prefix: str = "",
     ) -> None:
+        initialize_discovery(self)
         self.args = args
         self.engine_actor_cls = engine_actor_cls
         self.nodes_per_engine = max(1, nodes_per_engine)
@@ -102,6 +104,11 @@ class MultiEngineManager:
 
         if not skip_init:
             self._init_engines(list(range(num_slots)))
+        self._inference_state = "ready"
+
+    @ray.method(concurrency_group="discovery")
+    def get_inference_snapshot(self) -> dict[str, Any]:
+        return static_snapshot(self)
 
     @property
     def engines(self) -> list[Any]:
@@ -171,6 +178,8 @@ class MultiEngineManager:
         On failure, kill any newly created engines and leave their slots None
         so the caller sees them as still-dead rather than silently healthy.
         """
+        previous_state = self._inference_state
+        self._inference_state = "starting"
         EngineActor = ray.remote(self.engine_actor_cls)
         new_engines: list[tuple[int, Any]] = []
         for rank in ranks:
@@ -203,6 +212,7 @@ class MultiEngineManager:
 
         num_new_engines = len(new_engines)
         if num_new_engines == 0:
+            self._inference_state = previous_state
             return num_new_engines
 
         addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
@@ -227,6 +237,9 @@ class MultiEngineManager:
                 self._remove_owned_pg(rank)
             raise
 
+        self._inference_blocked.difference_update(ranks)
+        self._inference_unhealthy.difference_update(ranks)
+        self._inference_state = previous_state
         return num_new_engines
 
     def _remove_owned_pg(self, rank: int) -> None:
@@ -250,15 +263,20 @@ class MultiEngineManager:
     def health_check(self) -> bool:
         """Perform a health check on every engine."""
         health_results = []
-        for engine in self.engines:
+        for rank, engine in enumerate(self.engines):
+            healthy = False
             if engine is not None:
                 try:
-                    health_results.append(ray.get(engine.health_generate.remote(), timeout=5.0))
+                    healthy = bool(ray.get(engine.health_generate.remote(), timeout=5.0))
                 except Exception as e:
                     logger.warning(f"{self._log_prefix} engine health check failed: {e}")
-                    health_results.append(False)
-            else:
-                health_results.append(False)
+            health_results.append(healthy)
+            slot = rank * self.nodes_per_engine
+            if self.all_engines[slot] is engine:
+                if healthy:
+                    self._inference_unhealthy.discard(slot)
+                else:
+                    self._inference_unhealthy.add(slot)
         return all(health_results)
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
@@ -268,8 +286,11 @@ class MultiEngineManager:
         freshly built engine comes up onloaded, which is exactly the state this
         phase wants.
         """
+        fully_onloaded = self._onloaded and self._inference_state == "ready"
+        self._inference_state = "onloading"
         rebuilt = self.recover()
-        if self._onloaded and tags is None:
+        if fully_onloaded and tags is None:
+            self._inference_state = "ready"
             logger.info(f"{self._log_prefix} engines already onloaded; skipping")
             return
         logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
@@ -284,6 +305,7 @@ class MultiEngineManager:
             self._retire_engines(dead)
             self.recover()
         self._onloaded = True
+        self._inference_state = "ready" if tags is None else "onloading"
         logger.info(f"{self._log_prefix} engines onload completed")
 
     def offload(self) -> None:
@@ -296,12 +318,14 @@ class MultiEngineManager:
         if not self._onloaded:
             logger.info(f"{self._log_prefix} engines already offloaded; skipping")
             return
+        self._inference_state = "draining"
         logger.info(f"{self._log_prefix} engines offload started")
         dead = self._fanout("release_memory_occupation")
         self._retire_engines(dead)
         # Unconditional: the surviving engines did release, so the manager
         # must not claim to still be onloaded just because one engine died.
         self._onloaded = False
+        self._inference_state = "sleeping"
         logger.info(f"{self._log_prefix} engines offload completed (retired {len(dead)} dead)")
 
     def _fanout(self, method: str, *, skip_ranks: Optional[set] = None, **kwargs) -> list[int]:
@@ -333,6 +357,7 @@ class MultiEngineManager:
     def _retire_engines(self, ranks: list[int]) -> None:
         """Tear down dead engines and null their slots so recover() rebuilds
         them."""
+        self._inference_blocked.update(ranks)
         for rank in ranks:
             for i in range(rank, rank + self.nodes_per_engine):
                 engine = self.all_engines[i]
@@ -391,6 +416,7 @@ class MultiEngineManager:
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
+        self._inference_state = "dead"
         for rank in range(0, len(self.all_engines), self.nodes_per_engine):
             engine = self.all_engines[rank]
             if engine is not None:
