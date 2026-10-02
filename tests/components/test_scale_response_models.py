@@ -14,8 +14,13 @@ import pytest
 
 
 try:
-    from relax.components.rollout import ListScaleOutRequestsResponse, ScaleOutStatusResponse
-    from relax.distributed.ray.rollout import ScaleOutRequest, ScaleOutStatus
+    from tests.utils._dep_stubs import import_rollout_component
+
+    _rollout = import_rollout_component()
+    ScaleOutStatusResponse = _rollout.ScaleOutStatusResponse
+    ListScaleOutRequestsResponse = _rollout.ListScaleOutRequestsResponse
+    ScaleInStatusResponse = _rollout.ScaleInStatusResponse
+    from relax.distributed.ray.rollout import ScaleInRequest, ScaleInStatus, ScaleOutRequest, ScaleOutStatus
 
     HAS_DEPS = True
 except ImportError:
@@ -53,3 +58,25 @@ def test_list_response_preserves_failure_categories():
         total_count=1,
     )
     assert listed.model_dump()["requests"][0]["failure_categories"] == ["NCCL_PRECHECK_TRANSPORT_MISMATCH"]
+
+
+def test_scale_out_status_response_exposes_cleanup_required_false():
+    """Shared-autoscaler contract: a terminal rollout scale-out must state its
+    cleanliness on the wire.
+
+    The autoscaler treats a missing ``cleanup_required`` as UNKNOWN (missing
+    != clean -- the correct fail-closed read for GenRM's dirty-terminal
+    lifecycle), so an undeclared field kept every terminal rollout
+    operation pending forever.
+    """
+    req = ScaleOutRequest(request_id="r3", status=ScaleOutStatus.ACTIVE, num_replicas=1)
+    resp = ScaleOutStatusResponse(**req.to_dict())
+    # model_dump() is what FastAPI's response_model serializes onto the wire.
+    assert resp.model_dump()["cleanup_required"] is False
+
+
+def test_scale_in_status_response_exposes_cleanup_required_false():
+    """Same wire contract for terminal scale-in (COMPLETED/FAILED)."""
+    req = ScaleInRequest(request_id="r4", status=ScaleInStatus.COMPLETED)
+    resp = ScaleInStatusResponse(**req.to_dict())
+    assert resp.model_dump()["cleanup_required"] is False

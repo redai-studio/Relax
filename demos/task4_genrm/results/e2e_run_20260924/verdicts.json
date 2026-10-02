@@ -1,0 +1,31 @@
+{
+  "scale_out_active": true,
+  "scale_out_transition_chain": [
+    "CREATING",
+    "HEALTH_CHECKING",
+    "ACTIVE"
+  ],
+  "scale_out_added_exactly_one_engine": true,
+  "scale_out_initial_survived": true,
+  "elastic_engine_served_traffic": true,
+  "scale_in_completed": true,
+  "scale_in_transition_chain": [
+    "DRAINING",
+    "COMPLETED"
+  ],
+  "scale_in_removed_exactly_the_elastic_engine": true,
+  "scale_in_initial_survived": true,
+  "scoring_identical_out": true,
+  "scoring_identical_in": true,
+  "load_zero_failures": true,
+  "load_total_requests": 4163,
+  "load_requests_during_scale_out": 2434,
+  "load_requests_during_scale_in": 52,
+  "load_served_during_both_ops": true,
+  "gpu_resources_returned": true,
+  "baseline_free_gpus": 3.0,
+  "free_gpus_after_scale_in": 3.0,
+  "scores_diff_out": [],
+  "scores_diff_in": [],
+  "E2E_PASS": true
+}

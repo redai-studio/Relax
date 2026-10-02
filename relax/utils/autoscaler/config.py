@@ -82,6 +82,45 @@ class ScaleInPolicy:
 
 
 @dataclass
+class ServiceScalingPolicy:
+    """Per-service scaling thresholds; ``None`` fields inherit the rollout
+    defaults.
+
+    Used with ``AutoscalerConfig.service_policies`` so a service such as GenRM
+    can be configured with independent bounds and token-usage thresholds while
+    everything unset keeps the global (rollout) values.
+    """
+
+    min_engines: Optional[int] = None
+    max_engines: Optional[int] = None
+    scale_out_policy: Optional[ScaleOutPolicy] = None
+    scale_in_policy: Optional[ScaleInPolicy] = None
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ServiceScalingPolicy":
+        """Create ServiceScalingPolicy from dictionary."""
+        return cls(
+            min_engines=data.get("min_engines"),
+            max_engines=data.get("max_engines"),
+            scale_out_policy=(
+                ScaleOutPolicy.from_dict(data["scale_out_policy"]) if data.get("scale_out_policy") else None
+            ),
+            scale_in_policy=(
+                ScaleInPolicy.from_dict(data["scale_in_policy"]) if data.get("scale_in_policy") else None
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "min_engines": self.min_engines,
+            "max_engines": self.max_engines,
+            "scale_out_policy": self.scale_out_policy.__dict__ if self.scale_out_policy else None,
+            "scale_in_policy": self.scale_in_policy.__dict__ if self.scale_in_policy else None,
+        }
+
+
+@dataclass
 class AutoscalerConfig:
     """Complete configuration for the Autoscaler service.
 
@@ -128,6 +167,13 @@ class AutoscalerConfig:
     rollout_service_url: str = "http://localhost:8000/rollout"
     scale_out_policy: ScaleOutPolicy = field(default_factory=ScaleOutPolicy)
     scale_in_policy: ScaleInPolicy = field(default_factory=ScaleInPolicy)
+    # Per-service targets, e.g. {"rollout": "http://host:8000/rollout",
+    # "genrm": "http://host:8000/genrm"}. ``rollout`` stays backward
+    # compatible: when absent, ``rollout_service_url`` is used.
+    service_targets: Dict[str, str] = field(default_factory=dict)
+    # Per-service threshold overrides (unset fields inherit the globals above),
+    # e.g. {"genrm": {"min_engines": 1, "max_engines": 4}}.
+    service_policies: Dict[str, ServiceScalingPolicy] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -202,6 +248,61 @@ class AutoscalerConfig:
                 f"({self.scale_out_policy.token_usage_threshold}) to avoid thrashing"
             )
 
+        for service, url in self.service_targets.items():
+            if not isinstance(url, str) or not url.strip():
+                raise ValueError(f"service_targets[{service!r}] must be a non-empty URL string, got {url!r}")
+
+        for service, policy in self.service_policies.items():
+            if policy.min_engines is not None and policy.min_engines < 1:
+                raise ValueError(f"service_policies[{service!r}].min_engines must be >= 1, got {policy.min_engines}")
+            if (
+                policy.min_engines is not None
+                and policy.max_engines is not None
+                and policy.min_engines > policy.max_engines
+            ):
+                raise ValueError(
+                    f"service_policies[{service!r}]: min_engines ({policy.min_engines}) "
+                    f"must be <= max_engines ({policy.max_engines})"
+                )
+
+    def get_service_url(self, service: str = "rollout") -> str:
+        """Resolve the service URL for scaling API calls.
+
+        ``service_targets`` takes precedence; the ``rollout`` service falls
+        back to the legacy ``rollout_service_url`` field for backward
+        compatibility. Other services must be configured explicitly.
+
+        Raises:
+            KeyError: a non-rollout service without a configured target.
+        """
+        target = self.service_targets.get(service)
+        if target:
+            return target
+        if service == "rollout":
+            return self.rollout_service_url
+        raise KeyError(f"No service_target configured for service '{service}'")
+
+    def get_effective_policies(self, service: str = "rollout") -> ServiceScalingPolicy:
+        """Effective scaling thresholds for ``service``.
+
+        Unset per-service fields inherit the global (rollout) configuration, so
+        the result is always fully resolved.
+        """
+        override = self.service_policies.get(service)
+        if override is None:
+            return ServiceScalingPolicy(
+                min_engines=self.min_engines,
+                max_engines=self.max_engines,
+                scale_out_policy=self.scale_out_policy,
+                scale_in_policy=self.scale_in_policy,
+            )
+        return ServiceScalingPolicy(
+            min_engines=override.min_engines if override.min_engines is not None else self.min_engines,
+            max_engines=override.max_engines if override.max_engines is not None else self.max_engines,
+            scale_out_policy=override.scale_out_policy or self.scale_out_policy,
+            scale_in_policy=override.scale_in_policy or self.scale_in_policy,
+        )
+
     @classmethod
     def from_yaml(cls, yaml_path: str, rollout_service_url: Optional[str] = None) -> "AutoscalerConfig":
         """Load configuration from YAML file.
@@ -229,6 +330,15 @@ class AutoscalerConfig:
 
         scale_out_policy = ScaleOutPolicy.from_dict(data.get("scale_out_policy", {}))
         scale_in_policy = ScaleInPolicy.from_dict(data.get("scale_in_policy", {}))
+        service_targets = dict(data.get("service_targets", {}))
+        if rollout_service_url:
+            # Explicit override wins over both the YAML service_targets map
+            # and the legacy rollout_service_url field.
+            service_targets["rollout"] = rollout_service_url
+        service_policies = {
+            service: ServiceScalingPolicy.from_dict(policy)
+            for service, policy in dict(data.get("service_policies", {})).items()
+        }
 
         return cls(
             enabled=data.get("enabled", True),
@@ -246,6 +356,8 @@ class AutoscalerConfig:
             or data.get("rollout_service_url", "http://localhost:8000/rollout"),
             scale_out_policy=scale_out_policy,
             scale_in_policy=scale_in_policy,
+            service_targets=service_targets,
+            service_policies=service_policies,
         )
 
     @classmethod
@@ -287,6 +399,8 @@ class AutoscalerConfig:
             "min_coverage_scale_in": self.min_coverage_scale_in,
             "scale_out_request_timeout_secs": self.scale_out_request_timeout_secs,
             "rollout_service_url": self.rollout_service_url,
+            "service_targets": dict(self.service_targets),
+            "service_policies": {service: policy.to_dict() for service, policy in self.service_policies.items()},
             "scale_out_policy": {
                 "token_usage_threshold": self.scale_out_policy.token_usage_threshold,
                 "queue_depth_per_engine": self.scale_out_policy.queue_depth_per_engine,
