@@ -846,6 +846,9 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    # OPD uses the original batch masks, even when TIS replaces the policy reducer below.
+    opd_metric_reducer = sum_of_sample_mean
+
     if isinstance(batch["advantages"], list):
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
@@ -1079,6 +1082,7 @@ def policy_loss_function(
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,
         batch=batch,
+        metric_reducer=opd_metric_reducer,
         log_probs=log_probs,
         old_log_probs=old_log_probs,
         log_probs_and_entropy=log_probs_and_entropy,

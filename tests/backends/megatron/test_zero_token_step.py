@@ -364,3 +364,151 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert calls["critic_update_successful"] == [not zero_tokens]
     assert metrics == {"loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0)}
     assert grad_norm == (0.0 if zero_tokens else 1.0)
+
+
+def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> SimpleNamespace:
+    return SimpleNamespace(
+        loss_type="policy_loss",
+        advantage_estimator="grpo",
+        calculate_per_token_loss=per_token,
+        qkv_format="thd",
+        recompute_loss_function=False,
+        allgather_cp=False,
+        global_batch_size=2,
+        true_on_policy_mode=False,
+        use_rollout_logprobs=False,
+        use_opsm=False,
+        get_mismatch_metrics=False,
+        use_tis=use_tis,
+        custom_tis_function_path=None,
+        custom_pg_loss_reducer_function_path=None,
+        entropy_coef=0.0,
+        use_kl_loss=False,
+        eps_clip=0.2,
+        eps_clip_high=0.28,
+        opd_loss_coef=1.0,
+        opd_kl_type="reverse_kl",
+        opd_jsd_alpha=0.5,
+        opd_token_selection="student_sampled",
+        opd_log_prob_top_k=0,
+        opd_per_token_clip=0.5 if clip == "per_token" else None,
+        opd_is_clip=1.0 if clip == "is" else None,
+    )
+
+
+@pytest.mark.parametrize("clip", ["per_token", "is"])
+@pytest.mark.parametrize("per_token", [True, False], ids=["token-mean", "sample-mean"])
+@pytest.mark.parametrize("use_tis", [False, True], ids=["original-policy-mask", "tis-rejects-all"])
+@pytest.mark.parametrize(
+    ("response_lengths", "mask_values", "token_fraction", "sample_fraction"),
+    [
+        ([2, 4], [[1, 1], [1, 1, 1, 1]], 0.5, 0.625),
+        ([2, 4], [[1, 0], [1, 1, 0, 0]], 2 / 3, 0.75),
+        ([2, 4], [[0, 0], [0, 0, 0, 0]], 0.0, 0.0),
+        ([2, 0], [[1, 1], []], 1.0, 0.5),
+        ([0, 0], [[], []], 0.0, 0.0),
+    ],
+    ids=["valid", "partial-mask", "fully-masked", "mixed-empty", "all-empty"],
+)
+def test_opd_clip_metrics_use_valid_tokens_and_original_masks(
+    monkeypatch: pytest.MonkeyPatch,
+    clip: str,
+    per_token: bool,
+    use_tis: bool,
+    response_lengths: list[int],
+    mask_values: list[list[int]],
+    token_fraction: float,
+    sample_fraction: float,
+) -> None:
+    from relax.backends.megatron import loss as loss_module
+
+    args = _make_opd_policy_args(clip, per_token, use_tis)
+    masks = [torch.tensor(mask, dtype=torch.float32) for mask in mask_values]
+    n = sum(response_lengths)
+    log_probs = torch.full((n,), -0.5, requires_grad=True)
+    gaps = torch.tensor([2.0, 2.0, -2.0, 2.0, -2.0, -2.0][:n])
+    old_log_probs = (log_probs.detach() - gaps).split(response_lengths)
+    batch = {
+        "total_lengths": [length + 3 for length in response_lengths],
+        "response_lengths": response_lengths,
+        "unconcat_tokens": [torch.arange(length + 3) for length in response_lengths],
+        "loss_masks": masks,
+        "log_probs": old_log_probs,
+        "rollout_log_probs": old_log_probs,
+        "teacher_log_probs": old_log_probs,
+        "advantages": torch.ones(n),
+        "dynamic_cp_size": 1,
+        "dynamic_cp_rank": 0,
+    }
+    monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **_kwargs: 1)
+    monkeypatch.setattr(
+        loss_module,
+        "get_log_probs_and_entropy",
+        lambda *_args, **_kwargs: (
+            None,
+            {
+                "log_probs": list(log_probs.split(response_lengths)),
+                "entropy": list(torch.zeros_like(log_probs).split(response_lengths)),
+            },
+        ),
+    )
+    if use_tis:
+        monkeypatch.setattr(
+            loss_module,
+            "vanilla_tis_function",
+            lambda **kwargs: (kwargs["pg_loss"], [torch.zeros_like(mask) for mask in masks], {}),
+        )
+
+    loss, _, log = loss_module.loss_function(args, batch, 1, torch.zeros(1, 1, 1, requires_grad=True))
+    values = log["values"].tolist()
+    denominator = values[0] if per_token else args.global_batch_size
+    metrics = loss_module.normalize_reduced_loss_metrics(log["keys"], [denominator, *values[1:]])
+    expected = token_fraction if per_token else sample_fraction
+    assert metrics[f"opd_{clip}_clip_frac"] == pytest.approx(expected)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(log_probs.grad).all()
+    if not any(any(mask) for mask in mask_values):
+        assert all(value == 0 for value in metrics.values())
+        assert torch.count_nonzero(log_probs.grad) == 0
+
+
+@pytest.mark.parametrize("clip", ["per_token", "is"])
+@pytest.mark.parametrize("per_token", [True, False])
+def test_opd_clip_metrics_cp_rank_without_valid_tokens_contributes_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    clip: str,
+    per_token: bool,
+) -> None:
+    from relax.backends.megatron.cp_utils import get_sum_of_sample_mean
+    from relax.utils.opd import opd_utils
+
+    # Isolate diagnostics from OPD loss's existing full-response reduction.
+    monkeypatch.setattr(opd_utils, "reduce_opd_loss", lambda batch, values: values.sum() * 0)
+    args = _make_opd_policy_args(clip, per_token)
+    masks = [torch.tensor([1.0, 1.0, 1.0, 0.0])]
+    numerators = []
+    # Zigzag CP=2: rank 0 owns response token 3; rank 1 owns tokens 0, 1, 2.
+    for rank, flags in enumerate(([1.0], [1.0, 0.0, 1.0])):
+        log_probs = torch.full((len(flags),), -0.5)
+        teacher_log_probs = log_probs - torch.tensor(flags) * 2
+        reducer = get_sum_of_sample_mean(
+            [8],
+            [4],
+            masks,
+            per_token,
+            dynamic_cp_size=2,
+            dynamic_cp_rank=rank,
+        )
+        _, metrics = opd_utils.compute_policy_opd_loss(
+            args=args,
+            batch={"response_lengths": [4], "loss_masks": masks, "teacher_log_probs": [teacher_log_probs]},
+            metric_reducer=reducer,
+            log_probs=log_probs,
+            old_log_probs=teacher_log_probs,
+            log_probs_and_entropy={},
+        )
+        numerators.append(metrics[f"opd_{clip}_clip_frac"])
+    assert numerators[0] == 0
+    denominator = 3 if per_token else 1
+    assert sum(numerators) / denominator == pytest.approx(2 / 3)
