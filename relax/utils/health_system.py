@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 import ray
 
@@ -27,6 +28,7 @@ class ServiceHealthState:
     current_step: int = 0
     task_running: bool = False
     restart_count: int = 0
+    active_fault_id: Optional[str] = None
     # Set by ``report_error(fatal=True)`` for deterministic failures (e.g. SFT
     # data schema mismatches) that won't recover from a restart. The
     # HealthChecker short-circuits the retry ladder and exits the process when
@@ -59,6 +61,7 @@ class HealthStatus:
             self.state[role] = ServiceHealthState()
         self.state[role].healthy = True
         self.state[role].error = None
+        self.state[role].active_fault_id = None
         self.state[role].last_heartbeat = time.time()
 
     def mark_unhealthy(self, role: str, error: Optional[str] = None) -> None:
@@ -70,6 +73,8 @@ class HealthStatus:
         """
         if role not in self.state:
             self.state[role] = ServiceHealthState()
+        if self.state[role].active_fault_id is None:
+            self.state[role].active_fault_id = uuid4().hex
         self.state[role].healthy = False
         if error:
             self.state[role].error = error
@@ -111,10 +116,7 @@ class HealthStatus:
                 terminate the process instead of cycling through the retry
                 ladder.
         """
-        if role not in self.state:
-            self.state[role] = ServiceHealthState()
-        self.state[role].healthy = False
-        self.state[role].error = error
+        self.mark_unhealthy(role, error)
         self.state[role].task_running = False
         if fatal:
             self.state[role].fatal = True
@@ -136,6 +138,7 @@ class HealthStatus:
                 "current_step": 0,
                 "task_running": False,
                 "fatal": False,
+                "active_fault_id": None,
             }
         state = self.state[role]
         return {
@@ -145,6 +148,7 @@ class HealthStatus:
             "current_step": state.current_step,
             "task_running": state.task_running,
             "fatal": state.fatal,
+            "active_fault_id": state.active_fault_id,
         }
 
     def get_all_health(self) -> Dict[str, Dict]:
@@ -215,9 +219,9 @@ class HealthChecker:
 
     Args:
         health_status: Remote HealthStatus actor for querying health
-        on_unhealthy: Callback function(role: str) when service becomes unhealthy
+        on_unhealthy: Callback function(role, fault_id, step, reason) when service becomes unhealthy
         check_interval: Seconds between health checks (default: 1.0)
-        on_fatal: Optional callback(role: str, error_msg: str) invoked when a
+        on_fatal: Optional callback(role, error_msg, fault_id, step) invoked when a
             service reports a fatal (non-recoverable) error. After the callback
             returns, the checker calls ``os._exit(1)`` to terminate the
             process, bypassing the restart ladder.
@@ -226,9 +230,9 @@ class HealthChecker:
     def __init__(
         self,
         health_status: HealthStatus,
-        on_unhealthy: Callable[[str], None],
+        on_unhealthy: Callable[[str, str, int, str], None],
         check_interval: float = 1.0,
-        on_fatal: Optional[Callable[[str, str], None]] = None,
+        on_fatal: Optional[Callable[[str, str, str, int], None]] = None,
     ):
         self.health_status = health_status
         self.on_unhealthy = on_unhealthy
@@ -297,13 +301,24 @@ class HealthChecker:
                         )
                         if self.on_fatal is not None:
                             try:
-                                self.on_fatal(role, error_msg)
+                                self.on_fatal(
+                                    role,
+                                    error_msg,
+                                    health_info["active_fault_id"],
+                                    health_info["current_step"],
+                                )
                             except Exception as cb_exc:
                                 logger.exception(f"on_fatal callback raised, exiting anyway: {cb_exc}")
                         self._stop_event.set()
                         os._exit(1)
                     logger.warning(f"Service {role} is unhealthy: {error_msg}, triggering restart")
-                    self.on_unhealthy(role)
+                    reason = "heartbeat_timeout" if error_msg == "Heartbeat timeout" else "reported_error"
+                    self.on_unhealthy(
+                        role,
+                        health_info["active_fault_id"],
+                        health_info["current_step"],
+                        reason,
+                    )
                     # on_unhealthy may trigger _global_restart which sets
                     # _stop_event. Check immediately to avoid using stale
                     # Ray actor handles from the destroyed cluster.
@@ -315,7 +330,13 @@ class HealthChecker:
                 for role in stale:
                     logger.warning(f"Service {role} heartbeat stale (timeout), triggering restart")
                     ray.get(self.health_status.mark_unhealthy.remote(role, "Heartbeat timeout"))
-                    self.on_unhealthy(role)
+                    health_info = ray.get(self.health_status.get_service_health.remote(role))
+                    self.on_unhealthy(
+                        role,
+                        health_info["active_fault_id"],
+                        health_info["current_step"],
+                        "heartbeat_timeout",
+                    )
                     if self._stop_event.is_set():
                         logger.info("Stop event set after on_unhealthy callback (stale), exiting check loop")
                         return
@@ -357,14 +378,14 @@ class HealthManager:
 
     def start(
         self,
-        on_unhealthy: Callable[[str], None],
-        on_fatal: Optional[Callable[[str, str], None]] = None,
+        on_unhealthy: Callable[[str, str, int, str], None],
+        on_fatal: Optional[Callable[[str, str, str, int], None]] = None,
     ) -> None:
         """Start the health management system.
 
         Args:
-            on_unhealthy: Callback function(role: str) when service becomes unhealthy.
-            on_fatal: Optional callback(role, error_msg) invoked when a service
+            on_unhealthy: Callback function(role, fault_id, step, reason) when service becomes unhealthy.
+            on_fatal: Optional callback(role, error_msg, fault_id, step) invoked when a service
                 reports a fatal (non-recoverable) error, immediately before the
                 checker terminates the process.
         """
