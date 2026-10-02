@@ -186,6 +186,14 @@ def check_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]
                     raise TypeError(f"messages[{index}].content[{item_index}] must be a dict, got {type(item)}")
                 if item.get("type") == "text" and isinstance(item.get("text"), str) and not item["text"]:
                     raise ValueError(f"messages[{index}].content[{item_index}].text must not be empty")
+                if item.get("type") == "image_url":
+                    block_field = f"messages[{index}].content[{item_index}]"
+                    image = item.get("image_url")
+                    if not isinstance(image, dict):
+                        raise TypeError(f"{block_field}.image_url must be a dict, got {type(image)}")
+                    url = image.get("url")
+                    if not isinstance(url, str) or not url:
+                        raise ValueError(f"{block_field}.image_url.url must be a non-empty string")
         else:
             raise TypeError(f"messages[{index}].content must be a list, string, or None, got {type(content)}")
         if role == "system":
