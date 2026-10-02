@@ -1,0 +1,61 @@
+{
+  "system": "You are helpful.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Search for cats"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "search",
+          "input": {
+            "limit": 3,
+            "q": "cats"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": "found 3 cats"
+        },
+        {
+          "type": "text",
+          "text": "thanks"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "search",
+      "description": "Search the web",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "q"
+        ]
+      }
+    }
+  ],
+  "thinking": {
+    "type": "enabled"
+  },
+  "max_tokens": 128
+}

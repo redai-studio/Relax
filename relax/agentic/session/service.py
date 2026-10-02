@@ -568,7 +568,8 @@ def _responses_input_messages(request_input: Any, instructions: Any) -> list[dic
         if not canonical_parts:
             return ""
         if not has_image:
-            return "".join(cast(str, part["text"]) for part in canonical_parts)
+            separator = "\n\n" if role == "system" else ""
+            return separator.join(cast(str, part["text"]) for part in canonical_parts)
         return canonical_parts
 
     def reasoning_text(item: dict[str, Any]) -> str:

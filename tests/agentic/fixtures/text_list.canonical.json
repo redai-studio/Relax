@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, world!"
+    }
+  ],
+  "tools": [],
+  "chat_template_kwargs": {}
+}
