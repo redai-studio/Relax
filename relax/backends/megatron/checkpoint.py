@@ -601,9 +601,21 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
+    path = Path(path)
+    if (path / "latest_checkpointed_iteration.txt").is_file():
+        return True
+    if not re.fullmatch(r"iter_\d{7}", path.name):
+        return False
+
+    # HF exports use the same iteration names. Native format evidence takes
+    # precedence over HF config files, including for incomplete checkpoints:
+    # let the native loader report corruption instead of falling back to HF.
+    if (path / "metadata.json").is_file() or (path / ".metadata").is_file():
+        return True
+    if any(candidate.is_file() for candidate in path.glob("mp_rank_*/model_optim_rng.pt")):
+        return True
+    # Preserve the legacy route/error behavior for unknown iteration contents.
+    return not _is_hf_checkpoint(path)
 
 
 def _is_hf_checkpoint(path: str | Path) -> bool:
