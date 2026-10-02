@@ -532,6 +532,36 @@ advantage 提供。Advantage 函数使用的每项信号都应写入 export meta
 该值。Group RM 如果为每个 exported row 写入 reward，则需要 custom logger 恢复 logical Session 分组。
 Multi-context training 中，reward 用于上报 outcome，训练 credit 由 custom advantage 提供。
 
+#### 投机解码指标
+
+Agentic rollout 会导出本批次样本所覆盖的已提交生成节点及其投机解码计数。同一个共享生成节点可能出现在多条导出轨迹中，因此生成节点级指标会在一次rollout 指标批次内使用 `(session_id, generation_id)` 去重。
+
+生成节点级指标如下：
+
+| 指标 | 口径 |
+| --- | --- |
+| `spec/accept_rate` | 对同时提供 accepted 和 proposed 的唯一已提交生成节点，计算 `sum(accepted) / sum(proposed)`。 |
+| `spec/tokens_per_verify` | 对同时提供 completion 和 verify 的唯一已提交生成节点，计算 `sum(completion) / sum(verify)`。 |
+| `spec/accepted_total` | 接受率统计范围内的 accepted 总数。 |
+| `spec/proposed_total` | 接受率统计范围内的 proposed 总数。 |
+| `spec/completion_total` | 每次 verify 产出统计范围内的 completion token 总数。 |
+| `spec/verify_total` | 每次 verify 产出统计范围内的 verify 总数。 |
+| `spec/accept_count_coverage` | 同时提供 accepted 和 proposed 的唯一生成节点比例。 |
+| `spec/verify_count_coverage` | 同时提供 completion 和 verify 的唯一生成节点比例。 |
+| `spec/unique_generation_count` | 本批次覆盖的唯一已提交生成节点数。 |
+| `spec/record_occurrence_count` | 批次去重前生成记录出现的总次数。 |
+| `spec/legacy_sample_count` | 无法恢复生成身份或计数可用性的旧版样本数。 |
+| `spec/conflicting_generation_count` | 同一生成身份携带冲突记录的数量。 |
+| `spec/invalid_record_count` | 格式无效的生成记录数量。 |
+
+覆盖情况还会通过 `*_covered_count` 和 `*_uncovered_count` 报告。后端明确返回的零值表示该计数可用；缺失字段表示不可用。当汇总分母为零时，不输出相应比率，而不会伪造 `0`。当分子为零且分母大于零时，则输出有效的零比率。
+
+旧指标 `spec_accept_rate` 和 `spec_accept_length` 为兼容性指标，口径是先计算每个样本的比率，再对样本比率取算术平均。因此，它们与新的`spec/accept_rate` 和 `spec/tokens_per_verify` 不是同一统计口径。只有所有样本都具有完整计数且分母大于零时，才会输出旧指标。旧版 Agentic 序列化数据仍可读取，但由于无法恢复生成身份和字段原始可用性，不会参与生成节点级比率计算。
+
+`spec/sample/` 前缀下的指标用于携带可用性感知计数的普通非 Agentic 样本，不会与按生成节点去重的 Agentic 指标混合。
+
+这些指标只统计本次 rollout 指标批次导出样本所覆盖的已提交生成节点，不统计被丢弃分支，也不能单独用于证明投机解码获得了实际加速。
+
 ### 多 Context Dynamic Batching
 
 任何可能从一个 session 导出多个 context 的 recipe 都**必须**配置 `--agentic-custom-advantage-path`，并且
