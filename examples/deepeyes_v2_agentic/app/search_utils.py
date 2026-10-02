@@ -2,8 +2,9 @@
 
 """Search tool helpers for the DeepEyesV2 env.
 
-* :func:`search` is a placeholder web-search returning canned snippets so the
-  recipe runs end-to-end without a real backend.
+* :func:`search` dispatches to the backend selected by
+  ``DEEPEYES_V2_SEARCH_BACKEND``. The default ``mock`` backend is fully
+  offline and deterministic.
 * :func:`image_search` serves cached results keyed by ``data_idx`` from JSON
   files listed in ``DEEPEYES_V2_SEARCH_CACHE_PATHS`` (colon/comma-separated).
   Missing / unparsable caches degrade to returning ``"Error"`` so the env
@@ -15,8 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
-import time
+from urllib.parse import quote
 
 
 logger = logging.getLogger(__name__)
@@ -63,34 +63,51 @@ def _get_image_search_cache() -> dict:
     return _IMAGE_SEARCH_CACHE
 
 
-def search(query: str, size: int = 5):
-    """Web-search placeholder. Returns canned snippets in the shape::
+def _mock_search(query: str, size: int) -> dict[str, object]:
+    """Return deterministic, fully offline results for development and tests."""
+    encoded_query = quote(query, safe="")
+    data = [
+        {
+            "title": f'Mock result {index + 1} for "{query}"',
+            "link": f"https://example.com/deepeyes-v2/mock/{encoded_query}/{index + 1}",
+            "snippet": f'Offline mock search result {index + 1} for query "{query}".',
+            "date": None,
+        }
+        for index in range(size)
+    ]
+    return {"elapsed_time": 0.0, "data": data}
 
-        {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"?}, ...]}
 
-    Replace with a real backend (Serper / Google / Bing / internal) for
-    production training.
-    """
-    max_try = 3
-    result = "Error"
-    for try_idx in range(max_try):
-        try:
-            result = {"elapsed_time": 0.0, "data": []}
-            for i in range(size):
-                result["data"].append(
-                    {
-                        "snippet": f"This is a placeholder snippet for query: {query}",
-                        "title": f"Placeholder Title {i}",
-                        "link": f"http://example.com/{i}",
-                    }
-                )
-            break
-        except Exception as e:
-            logger.warning(f"[search] attempt {try_idx + 1}/{max_try} failed: {e}")
-            result = "Error"
-            if try_idx < max_try - 1:
-                time.sleep((try_idx + 1) * random.randint(1, 5))
-    return result
+def _retriever_search(_query: str, _size: int) -> str:
+    """Reserved entry point for the retriever backend."""
+    return "Error"
+
+
+def _external_search(_query: str, _size: int) -> str:
+    """Reserved entry point for the external backend."""
+    return "Error"
+
+
+_SEARCH_BACKENDS = {
+    "mock": _mock_search,
+    "retriever": _retriever_search,
+    "external": _external_search,
+}
+
+
+def search(query: str, size: int = 5) -> dict[str, object] | str:
+    """Search with the configured backend, defaulting to the offline mock."""
+    backend_name = os.environ.get("DEEPEYES_V2_SEARCH_BACKEND", "mock").strip().lower()
+    backend = _SEARCH_BACKENDS.get(backend_name)
+    if backend is None:
+        logger.warning(f"[search] unknown backend: {backend_name}")
+        return "Error"
+
+    try:
+        return backend(query, size)
+    except Exception as exc:
+        logger.warning(f"[search] backend {backend_name} failed: {exc}")
+        return "Error"
 
 
 def image_search(_query, data_idx: str | None = None):
