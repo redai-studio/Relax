@@ -987,9 +987,11 @@ class _FakeLoraRegistry:
         self.core = core
         self.bind_calls: list[str] = []
         self.releases: list[str] = []
+        self.forgotten: list[tuple[str, ...]] = []
         self.delay_s = 0.0
         self.bind_latest = _RegistryCall(self._bind)
         self.release = _RegistryCall(self._release)
+        self.forget_sessions = _RegistryCall(self._forget_sessions)
 
     async def _bind(self, session_id: str) -> Any:
         self.bind_calls.append(session_id)
@@ -1000,6 +1002,10 @@ class _FakeLoraRegistry:
     async def _release(self, session_id: str) -> Any:
         self.releases.append(session_id)
         return self.core.release(session_id)
+
+    async def _forget_sessions(self, session_ids: tuple[str, ...]) -> None:
+        self.forgotten.append(session_ids)
+        self.core.forget_sessions(session_ids)
 
 
 def _published_registry(digest: str = _DIGEST_A, epoch: str = "epoch0") -> Any:
@@ -1314,6 +1320,120 @@ async def test_finished_session_releases_its_version_ref_once() -> None:
     assert core.status().session_bindings == {}
 
 
+def _lora_cleanup_shard(registry: Any, session: _SessionRecord) -> Any:
+    shard = _binding_shard(registry)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._notify_state_change = lambda group=None: None
+    shard._session_records = {session.session_id: session}
+    session.group.sessions.append(session)
+    shard._groups = {session.group.group_id: session.group}
+    return shard
+
+
+@pytest.mark.parametrize("cleanup", ["release_group", "drop_group"])
+async def test_group_cleanup_bounds_lora_tombstones(cleanup: str) -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    for index in range(20):
+        session = _binding_session(f"session-{index}")
+        shard = _lora_cleanup_shard(registry, session)
+        await shard._ensure_session_policy_binding(session)
+        if cleanup == "release_group":
+            await shard._finish_session(session, None)
+            assert core.closed_sessions == {f"epoch0:{session.session_id}"}
+        await getattr(shard, cleanup)(session.group.group_id)
+        assert not core.closed_sessions
+        assert not core.session_bindings
+        assert not shard._session_records
+        assert not shard._groups
+    assert len(registry.forgotten) == 20
+
+
+@pytest.mark.parametrize("cleanup", ["release_group", "drop_group"])
+async def test_group_retained_for_retry_after_lora_forget_ack_loss(cleanup: str) -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    session = _binding_session()
+    shard = _lora_cleanup_shard(registry, session)
+    await shard._ensure_session_policy_binding(session)
+    if cleanup == "release_group":
+        await shard._finish_session(session, None)
+
+    async def forget_with_lost_ack(session_ids: tuple[str, ...]) -> None:
+        assert not shard._session_records
+        await registry._forget_sessions(session_ids)
+        if len(registry.forgotten) == 1:
+            raise RuntimeError("lost forget ACK")
+
+    registry.forget_sessions = _RegistryCall(forget_with_lost_ack)
+    with pytest.raises(RuntimeError, match="lost forget ACK"):
+        await getattr(shard, cleanup)(session.group.group_id)
+    assert shard._groups[session.group.group_id] is session.group
+    assert not core.closed_sessions
+    await getattr(shard, cleanup)(session.group.group_id)
+    await getattr(shard, cleanup)(session.group.group_id)
+    assert not shard._groups
+    assert registry.forgotten == [(session.session_id,), (session.session_id,)]
+
+
+async def test_group_forget_waits_for_binding_even_when_drop_waiter_is_cancelled() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    session = _binding_session()
+    shard = _lora_cleanup_shard(registry, session)
+    bind_started = asyncio.Event()
+    complete_bind = asyncio.Event()
+    release_started = asyncio.Event()
+
+    async def delayed_bind(session_id: str) -> Any:
+        bind_started.set()
+        await complete_bind.wait()
+        return await registry._bind(session_id)
+
+    registry.bind_latest = _RegistryCall(delayed_bind)
+    session.binding_task = asyncio.create_task(shard._bind_session_policy(session.session_id))
+    await bind_started.wait()
+    release_ref = shard._release_session_lora_ref
+
+    async def observed_release(record: _SessionRecord) -> None:
+        release_started.set()
+        await release_ref(record)
+
+    async def checked_forget(session_ids: tuple[str, ...]) -> None:
+        assert session.binding_task.done()
+        assert registry.releases == [session.session_id]
+        assert not shard._session_records
+        await registry._forget_sessions(session_ids)
+
+    shard._release_session_lora_ref = observed_release
+    registry.forget_sessions = _RegistryCall(checked_forget)
+    drop = asyncio.create_task(shard.drop_group(session.group.group_id))
+    await release_started.wait()
+    assert not registry.releases
+    assert not registry.forgotten
+    assert session.session_id in shard._session_records
+    drop.cancel()
+    complete_bind.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drop
+    assert not shard._groups
+    assert not core.closed_sessions
+    assert not core.session_bindings
+    assert registry.forgotten == [(session.session_id,)]
+    result = await shard.chat(
+        session_id=session.session_id,
+        messages=[],
+        tools=[],
+        chat_template_kwargs={},
+        max_completion_tokens=None,
+        stop=None,
+        seed=None,
+    )
+    assert result["error"]["code"] == "session_discarded"
+    assert registry.bind_calls == [session.session_id]
+
+
 async def test_cancelled_only_waiter_retains_binding_for_next_ir_and_close() -> None:
     core = _published_registry()
     registry = _FakeLoraRegistry(core)
@@ -1449,11 +1569,13 @@ async def test_background_cleanup_failure_is_visible_and_public_drop_can_retry()
     assert shard._groups[group.group_id] is group
     assert session.session_id in shard._session_records
     assert core.session_bindings
+    assert not registry.forgotten
     registry.release = _RegistryCall(registry._release)
     await asyncio.gather(shard.drop_group(group.group_id), shard.drop_group(group.group_id))
     assert not shard._groups
     assert not shard._session_records
     assert not core.session_bindings
+    assert not core.closed_sessions
     assert session.cleanup_error is None
     assert (await shard.health())["ok"]
     await shard.drop_group(group.group_id)

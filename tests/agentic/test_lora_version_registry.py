@@ -214,6 +214,31 @@ class TestSessionBinding:
         assert other.bind_latest("s1").version_id == 1
         assert other.release("s1") is True
 
+    def test_forget_sessions_prunes_only_requested_closed_sessions(self, registry):
+        publish(registry, DIGEST_A, version_id=1)
+        registry.bind_latest("s1")
+        registry.release("s1")
+        registry.release("s2")
+        registry.forget_sessions(["s1", "s1", "unknown"])
+        registry.forget_sessions(["s1"])
+        assert registry.closed_sessions == {"epoch0:s2"}
+        with pytest.raises(LoRAVersionError) as error:
+            registry.bind_latest("s2")
+        assert error.value.code == "SESSION_CLOSED"
+        registry.forget_sessions(["s2"])
+        assert not registry.closed_sessions
+
+    def test_forget_sessions_rejects_active_binding_without_pruning_any_tombstones(self, registry):
+        publish(registry, DIGEST_A, version_id=1)
+        registry.bind_latest("active")
+        registry.release("closed")
+        before = registry.status()
+        with pytest.raises(LoRAVersionError) as error:
+            registry.forget_sessions(["closed", "active"])
+        assert error.value.code == "SESSION_STILL_BOUND"
+        assert registry.status() == before
+        assert registry.closed_sessions == {"epoch0:closed"}
+
 
 class TestReclaim:
     def test_reclaim_waits_for_the_last_session(self, registry):

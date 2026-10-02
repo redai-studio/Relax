@@ -1865,11 +1865,18 @@ class AgenticSessionShard:
         """Release a remotely addressed group after all Session results are
         available."""
 
-        group = self._groups[group_id]
+        group = self._groups.get(group_id)
+        if group is None:
+            return
         self._raise_group_error(group)
         if not group.terminal:
             raise RuntimeGroupError(f"cannot release unfinished group: {group_id}")
-        self._groups.pop(group_id)
+        # Terminal results are published only after bind tasks settle, release
+        # is confirmed, and local Session records are removed. Keep the Group's
+        # IDs until forget is acknowledged so a failed RPC can be retried.
+        if self._lora_registry is not None:
+            await self._lora_registry.forget_sessions.remote(tuple(group.result_cells))
+        self._groups.pop(group_id, None)
         self._notify_state_change()
 
     async def drop_group(self, group_id: str) -> None:
@@ -3164,6 +3171,8 @@ class AgenticSessionShard:
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
+        if self._lora_registry is not None:
+            await self._lora_registry.forget_sessions.remote(tuple(group.result_cells))
         self._groups.pop(group_id, None)
         self._notify_state_change()
 

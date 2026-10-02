@@ -22,7 +22,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Sequence, Set
 
 
 #: Adapter-name prefix for managed versions; the epoch keeps names fresh across
@@ -151,8 +151,8 @@ class LoRAVersionRegistry:
         self.deployment_epoch = deployment_epoch or uuid.uuid4().hex[:12]
         self.versions: Dict[int, VersionEntry] = {}
         self.session_bindings: Dict[str, int] = {}
-        #: Sessions that released before they ever bound. Kept as tombstones so a late
-        #: first-bind of an already-closed Session cannot resurrect a Session ref.
+        #: Released Sessions, retained until their Shard confirms that all bind
+        #: tasks have settled and the local Session records have been removed.
         self.closed_sessions: Set[str] = set()
         self.default_version: Optional[int] = None
         self.default_revision = 0
@@ -473,6 +473,20 @@ class LoRAVersionRegistry:
         key = self._key(session_id)
         self.closed_sessions.add(key)
         return self.session_bindings.pop(key, None) is not None
+
+    def forget_sessions(self, session_ids: Sequence[str]) -> None:
+        """Remove closure fences after the owning Shard finishes cleanup.
+
+        The caller must join all binding tasks and remove the local Session
+        records first, so no late bind can arrive after these tombstones go.
+        Repeated calls are safe, including retries after a lost
+        acknowledgement.
+        """
+
+        keys = {self._key(session_id) for session_id in session_ids}
+        if keys.intersection(self.session_bindings):
+            raise LoRAVersionError("SESSION_STILL_BOUND", "cannot forget Sessions with live LoRA references")
+        self.closed_sessions.difference_update(keys)
 
     # ------------------------------------------------------------------
     # Reclaim
