@@ -153,6 +153,75 @@ class TestCheckpointModeDetection:
     """Test checkpoint save gathers the adapter and records adapter-mode
     metadata."""
 
+    @pytest.mark.parametrize("failure", [None, "seal", "local_duplicate", "remote_duplicate", "remote_export"])
+    def test_adapter_only_export_propagates_final_result(self, tmp_path, failure):
+        pytest.importorskip("megatron.training.checkpointing")
+        from relax.backends.megatron.checkpoint import export_lora_adapter
+
+        args = SimpleNamespace(
+            lora_rank=2,
+            lora_alpha=2,
+            lora_target_modules=["linear_qkv"],
+            lora_dropout=0.0,
+            lora_merge_mode=False,
+            lora_adapter_mode=True,
+        )
+        name = "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        weight = torch.ones(2, 4)
+        items = [SimpleNamespace(param_name=name, weight=weight)]
+        if failure == "local_duplicate":
+            items.append(SimpleNamespace(param_name=name, weight=weight + 1))
+        bridge = MagicMock()
+        bridge.export_adapter_weights.return_value = items
+        group = object()
+        broadcasts = []
+        descriptor = {"version_id": "A", "source_train_step": 7}
+
+        def gather_errors(output, value, *, group):
+            output[:] = [value, "rank 1: export failed" if failure == "remote_export" else None]
+
+        def gather_weights(value, *, object_gather_list, dst, group):
+            assert dst == 3  # The export group's writer need not be global rank zero.
+            object_gather_list[:] = [value, {name: weight + 1 if failure == "remote_duplicate" else weight.clone()}]
+
+        def broadcast(value, *, src, group):
+            assert src == 3
+            broadcasts.append(list(value))
+
+        def seal(path):
+            assert path == tmp_path / "adapter"
+            assert (path / "adapter_model.safetensors").is_file()
+            if failure == "seal":
+                raise OSError("SEAL_COMMIT_UNKNOWN")
+            return descriptor
+
+        with (
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_global_rank", return_value=3) as global_rank,
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather_object", side_effect=gather_errors),
+            patch("torch.distributed.gather_object", side_effect=gather_weights) as gather,
+            patch("torch.distributed.broadcast_object_list", side_effect=broadcast),
+            patch("relax.backends.megatron.checkpoint.get_gloo_group", return_value=group),
+            patch("relax.backends.megatron.checkpoint.megatron_bridge_utils.patch_megatron_model"),
+        ):
+            if failure is None:
+                assert export_lora_adapter([], tmp_path / "adapter", args, bridge, seal=seal) == descriptor
+                assert broadcasts == [[None, descriptor]]
+            else:
+                with pytest.raises(RuntimeError):
+                    export_lora_adapter([], tmp_path / "adapter", args, bridge, seal=seal)
+                if failure in ("local_duplicate", "remote_export"):
+                    gather.assert_not_called()
+                    assert broadcasts == []
+                else:
+                    assert len(broadcasts) == 1
+                    assert broadcasts[0][0] is not None
+                    assert broadcasts[0][1] is None
+            global_rank.assert_called_once_with(group, 0)
+        bridge.save_hf_pretrained.assert_not_called()
+        assert not (tmp_path / "adapter" / "lora_adapter").exists()
+
     def test_checkpoint_save_with_metadata(self):
         # checkpoint.py imports megatron.training at module load; skip when unavailable (CPU-only CI).
         pytest.importorskip("megatron.training.checkpointing")
@@ -187,6 +256,7 @@ class TestCheckpointModeDetection:
 
             with (
                 patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.get_global_rank", return_value=0),
                 patch("torch.distributed.get_world_size", return_value=1),
                 patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
                 patch("torch.distributed.gather_object", side_effect=fake_gather),
@@ -229,6 +299,7 @@ class TestCheckpointModeDetection:
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.get_global_rank", return_value=0),
             patch("torch.distributed.get_world_size", return_value=1),
             patch("torch.distributed.all_gather_object", side_effect=fake_all_gather),
             patch("torch.distributed.gather_object", side_effect=fake_gather),

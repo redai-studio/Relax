@@ -225,6 +225,7 @@ def create_test_manager(args=None, servers=None):
 
     manager = object.__new__(_OriginalRM)
     manager.args = args
+    manager._lora_profile = None
     manager.servers = servers if servers is not None else {}
     manager._scale_out_requests = {}
     manager._scale_in_requests = {}

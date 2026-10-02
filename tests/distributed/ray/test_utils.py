@@ -376,3 +376,41 @@ class TestRolloutServerProperties:
         server.recover()
 
         assert len(calls) == expected_calls
+
+
+def test_two_engine_actors_share_one_gpu_and_keep_distinct_ranks(monkeypatch):
+    from relax.distributed.ray import rollout
+
+    placements, constructors, port_calls = [], [], []
+
+    class Actor:
+        @classmethod
+        def options(cls, **kwargs):
+            placements.append(kwargs)
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):
+            constructors.append(kwargs)
+            return make_mock_engine()
+
+    def ports(**kwargs):
+        port_calls.append(kwargs)
+        return {rank: {} for rank, _ in kwargs["rollout_engines"]}, {}
+
+    monkeypatch.setattr(rollout.ray, "remote", lambda _: Actor)
+    monkeypatch.setattr(rollout, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs)
+    monkeypatch.setattr(rollout, "get_ray_accelerator_kwargs", lambda count: {"num_gpus": count})
+    monkeypatch.setattr(rollout, "_allocate_rollout_engine_addr_and_ports_normal", ports)
+    args = make_mock_args(rollout_num_gpus=1, rollout_num_gpus_per_engine=1)
+    group = make_engine_group(args=args, engines=[None, None], num_gpus_per_engine=1)
+    group.engines_per_gpu = 2
+    group.pg = (object(), [0], [3])
+    handles, _ = group.start_engines()
+    assert len(handles) == 2 and len(group.engines) == 2
+    assert [entry["rank"] for entry in constructors] == [0, 1]
+    assert [entry["base_gpu_id"] for entry in constructors] == [3, 3]
+    assert all(entry["scheduling_strategy"]["placement_group_bundle_index"] == 0 for entry in placements)
+    assert sum(entry["num_gpus"] for entry in placements) <= 1
+    assert port_calls[0]["engines_per_gpu"] == 2
+    assert make_rollout_server([group]).engine_gpu_offsets == [0, 0]

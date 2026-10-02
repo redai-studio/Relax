@@ -17,6 +17,7 @@ try/finally so the gate is always released.
 
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -63,6 +64,7 @@ def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
     shell = object.__new__(Rollout)
     # ``_logger`` is a lazy read-only property on Base; prime its backing field.
     shell._logger_instance = logging.getLogger("test.rollout")
+    shell.config = SimpleNamespace(lora_publication_config=None)
     shell.step = 0
     shell.status = "running"
     shell._weight_update_ready = asyncio.Event()
@@ -176,3 +178,30 @@ def test_end_update_weight_does_not_block_after_failed_can_do():
         assert shell.status == "running"
 
     asyncio.run(_scenario())
+
+
+def test_can_do_update_weight_publication_rejects_without_touching_handshake():
+    calls = []
+
+    def unexpected_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("publication must reject before the legacy handshake")
+
+    shell = _make_rollout(
+        can_update=True,
+        manager=_ManagerStub(
+            set_weight_updating_fn=unexpected_call,
+            health_monitoring_pause_fn=unexpected_call,
+        ),
+    )
+    shell.config.lora_publication_config = "publication.yaml"
+    shell._async_check_production_for_update_weight = unexpected_call
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(shell.can_do_update_weight_for_async())
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "MANAGED_OPERATION_FORBIDDEN"
+    assert not calls
+    assert shell.status == "running"
+    assert shell._weight_update_ready.is_set()

@@ -452,6 +452,7 @@ class EngineGroup:
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    engines_per_gpu: int = 1
 
     @property
     def nodes_per_engine(self):
@@ -493,9 +494,15 @@ class EngineGroup:
             num_available_gpus=len(reordered_gpu_ids),
             rollout_num_gpus=self.args.rollout_num_gpus,
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
+            engines_per_gpu=self.engines_per_gpu,
         )
 
-        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
+        engine_class = _resolve_rollout_engine_class(self.args)
+        RolloutRayActor = (
+            ray.remote(concurrency_groups={"artifact": 1}, max_concurrency=1)(engine_class)
+            if getattr(self.args, "_lora_publication_launch", None)
+            else ray.remote(engine_class)
+        )
 
         rollout_engines = []
         for i in range(len(self.all_engines)):
@@ -503,11 +510,11 @@ class EngineGroup:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = min(0.2, 1 / self.engines_per_gpu)
             num_cpus = num_gpus
 
             # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
+            gpu_index = self.gpu_offset + (i // self.engines_per_gpu) * num_gpu_per_engine
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -601,6 +608,7 @@ class EngineGroup:
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 rank_offset=self.rank_offset,
                 base_port=base_port,
+                engines_per_gpu=self.engines_per_gpu,
             )
 
         init_handles = [
@@ -748,7 +756,7 @@ class RolloutServer:
         offsets = []
         for g in self.engine_groups:
             for j in range(len(g.engines)):
-                offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
+                offsets.append(g.gpu_offset + (j // g.engines_per_gpu) * g.num_gpus_per_engine)
         return offsets
 
     @property
@@ -889,6 +897,30 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self._lora_profile = None
+        self._lora_manager = None
+        self._lora_cleanup_task = None
+        self._lora_health_task = None
+        if getattr(args, "lora_publication_config", None):
+            from pathlib import Path
+
+            from relax.engine.lora.publication import PublicationConfig
+            from relax.engine.lora.snapshot import fingerprint_model
+            from relax.utils.async_utils import get_async_loop
+
+            self._lora_profile = PublicationConfig.read(args.lora_publication_config)
+            self._lora_profile.validate_args(args)
+            store = Path(self._lora_profile.artifact_store).resolve()
+            store.mkdir(parents=True, exist_ok=True)
+            args._lora_publication_launch = {
+                "artifact_store": str(store),
+                "base_model_digest": fingerprint_model(args.hf_checkpoint),
+                "cohort_id": uuid.uuid4().hex,
+                "capacity": self._lora_profile.capacity,
+                "max_lifecycle_records": self._lora_profile.max_lifecycle_records,
+                "engines_per_gpu": self._lora_profile.engines_per_gpu,
+            }
+            self._lora_loop = get_async_loop()
         self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
@@ -911,7 +943,7 @@ class RolloutManager(ReloadableMixin):
                 self.args.custom_convert_samples_to_train_data_path
             )
 
-        if self.args.use_agentic_rollout:
+        if self.args.use_agentic_rollout and self._lora_profile is None:
             from relax.agentic.rollout import init_agentic_resident_pipeline
 
             init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
@@ -921,6 +953,14 @@ class RolloutManager(ReloadableMixin):
         else:
             init_http_client(args)
             self.servers = start_rollout_servers(args, pg)
+        if self._lora_profile is not None:
+            from relax.agentic.rollout import init_agentic_resident_pipeline
+
+            # Shards are already deployed by Controller. Their startup handoff
+            # receives this handle but must not call back while RM constructs.
+            self.args._lora_publication_manager = ray.get_runtime_context().current_actor
+            self._lora_loop.run(self._initialize_lora_publication())
+            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
@@ -980,8 +1020,222 @@ class RolloutManager(ReloadableMixin):
         self._eviction_monitor_stop = threading.Event()
         self._eviction_monitor_thread = None
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
-        if not self.args.debug_train_only:
+        if not self.args.debug_train_only and self._lora_profile is None:
             self._start_eviction_monitor()
+
+    async def _initialize_lora_publication(self) -> None:
+        from pathlib import Path
+
+        from relax.backends.sglang.sglang_engine import PublicationEngineClient
+        from relax.engine.lora.artifact import PROVENANCE, ModelContract, read_object
+        from relax.engine.lora.publication import AdapterVersionManager, EngineIdentity
+        from relax.engine.lora.snapshot import read_snapshot
+        from relax.utils.megatron_peft_utils import convert_megatron_to_sglang_target_modules
+
+        profile = self._lora_profile
+        handles = self.servers[profile.target_model].engines
+        if len(handles) < 2 or any(handle is None for handle in handles):
+            raise ValueError("publication requires at least two independent live engine actors")
+        capabilities = await asyncio.gather(*(handle.lora_publication_identity.remote() for handle in handles))
+        launch = self.args._lora_publication_launch
+        clients = []
+        for handle, capability in zip(handles, capabilities, strict=True):
+            if (
+                capability["cohort_id"] != launch["cohort_id"]
+                or capability["base_model_digest"] != launch["base_model_digest"]
+            ):
+                raise ValueError("native publication capability mismatch")
+            identity = EngineIdentity(capability["engine_id"], capability["engine_boot_id"], capability["endpoint"])
+            clients.append(PublicationEngineClient(handle, identity))
+        contract = ModelContract(
+            launch["base_model_digest"],
+            read_object(Path(self.args.hf_checkpoint) / "config.json"),
+            self.args.lora_rank,
+            tuple(convert_megatron_to_sglang_target_modules(self.args.lora_target_modules)),
+        )
+
+        def validate(snapshot):
+            root = Path(launch["artifact_store"]) / "versions"
+            if snapshot.path.resolve().parent != root:
+                raise ValueError("snapshot is outside the configured version store")
+            contract.validate(snapshot.path)
+            return read_object(snapshot.path / PROVENANCE)["export_step"]
+
+        self._lora_manager = AdapterVersionManager(
+            clients,
+            cohort_id=launch["cohort_id"],
+            capacity=profile.capacity,
+            base_model_digest=launch["base_model_digest"],
+            max_lifecycle_records=profile.max_lifecycle_records,
+            prepare_timeout_seconds=profile.prepare_timeout_seconds,
+            cleanup_timeout_seconds=profile.cleanup_timeout_seconds,
+            validate_snapshot=validate,
+        )
+
+        from ray import serve
+
+        from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME
+
+        entries, _ = await serve.get_app_handle(AGENTIC_CHAT_API_SERVICE_NAME).runtime_resources.remote()
+        request_capacity = len(clients) * self.args.sglang_server_concurrency
+        configured = await asyncio.gather(
+            *(
+                shard.configure_lora_publication.remote(self.args._lora_publication_manager, launch, request_capacity)
+                for _name, shard in entries
+            )
+        )
+        if not configured or any(
+            receipt["cohort_id"] != launch["cohort_id"]
+            or receipt["manager_id"] != self.args._lora_publication_manager._actor_id.hex()
+            or receipt["request_capacity"] != request_capacity
+            for receipt in configured
+        ):
+            raise RuntimeError("PUBLICATION_SHARD_CONFIGURATION_UNCONFIRMED")
+
+        async def maintain():
+            while True:
+                await asyncio.sleep(0.5)
+                await self._lora_manager.collect(report=False)
+                try:
+                    await asyncio.wait_for(self._sync_lora_permit_capacity(), 3)
+                except Exception as error:
+                    logger.warning("LoRA fleet capacity update pending: %s", error)
+
+        self._lora_process_exit_proofs: set[tuple[int, int]] = set()
+        self._lora_permit_epoch = 0
+        self._lora_permit_limiter = None
+        self._lora_clients = {client.identity.engine_id: client for client in clients}
+        self._lora_memory_sequences = dict.fromkeys(self._lora_clients, 0)
+        self._lora_cleanup_task = asyncio.create_task(maintain())
+
+        async def monitor_boots():
+            async def inspect(handle, client):
+                if self._lora_manager.suspended:
+                    return
+                try:
+                    capability = await asyncio.wait_for(handle.lora_publication_identity.remote(), 10)
+                    if capability["engine_boot_id"] != client.identity.boot_id:
+                        raise ValueError("native engine boot changed")
+                    await asyncio.wait_for(handle.health_generate.remote(timeout=5), 6)
+                    if not self._lora_manager.suspended:
+                        self._lora_manager.mark_engine_available(client.identity)
+                except Exception:
+                    if self._lora_manager.suspended:
+                        return
+                    # No replacement and no shrinking cleanup's fixed targets.
+                    self._lora_manager.mark_engine_unavailable(client.identity)
+
+            while True:
+                await asyncio.sleep(10)
+                identities = self._lora_manager.engine_identities
+                await asyncio.gather(
+                    *(
+                        inspect(client.handle, client)
+                        for key, client in tuple(self._lora_clients.items())
+                        if key in identities
+                    )
+                )
+
+        self._lora_health_task = asyncio.create_task(monitor_boots())
+        if profile.bootstrap_version_id is not None:
+            snapshot = await asyncio.to_thread(
+                read_snapshot, Path(launch["artifact_store"]) / "versions" / profile.bootstrap_version_id
+            )
+            result = await self._lora_manager.publish(snapshot, "bootstrap")
+            while self._lora_manager.status(result["operation_id"])["state"] == "PREPARING":
+                await asyncio.sleep(0.05)
+            if self._lora_manager.status(result["operation_id"])["state"] != "PUBLISHED":
+                raise RuntimeError("bootstrap adapter publication failed")
+
+    async def lora_control(self, action: str, payload: dict | None = None) -> dict:
+        """Control calls cross to one persistent loop; token traffic bypasses
+        RM."""
+        from pathlib import Path
+
+        from relax.engine.lora.publication import AdapterPublicationError
+        from relax.engine.lora.snapshot import AdapterSnapshot, read_snapshot
+
+        if self._lora_manager is None:
+            return {"error_code": "PUBLICATION_NOT_CONFIGURED", "status_code": 409}
+        payload = payload or {}
+
+        async def dispatch():
+            manager = self._lora_manager
+            try:
+                if action == "publish":
+                    version = payload["version_id"]
+                    replay = manager.publication_intent(
+                        payload["request_id"],
+                        version,
+                        payload.get("digest"),
+                        retry_of=payload.get("retry_of"),
+                        expected_default_epoch=payload.get("expected_default_epoch"),
+                    )
+                    if replay is not None:
+                        return replay
+                    # Validate the path segment before any filesystem access.
+                    AdapterSnapshot(
+                        version, "0" * 64, self.args._lora_publication_launch["base_model_digest"], Path(".")
+                    )
+                    snapshot = await asyncio.to_thread(
+                        read_snapshot,
+                        Path(self.args._lora_publication_launch["artifact_store"]) / "versions" / version,
+                    )
+                    if payload.get("digest", snapshot.digest) != snapshot.digest:
+                        raise AdapterPublicationError("VERSION_CONTENT_CONFLICT")
+                    return await manager.publish(
+                        snapshot,
+                        payload["request_id"],
+                        retry_of=payload.get("retry_of"),
+                        expected_default_epoch=payload.get("expected_default_epoch"),
+                    )
+                if action == "status":
+                    return manager.status(payload.get("operation_id"))
+                if action == "cancel":
+                    return await manager.cancel_publication(payload["operation_id"])
+                if action == "collect":
+                    return await manager.collect()
+                if action == "bind":
+                    return manager.bind_session(payload["owner_epoch"], payload["session_id"])
+                if action == "close":
+                    return await manager.close_session(payload["owner_epoch"], payload["session_id"])
+                if action == "session_status":
+                    return manager.session_status(payload["owner_epoch"], payload["session_id"])
+                raise ValueError("unknown publication action")
+            except AdapterPublicationError as error:
+                return {"error_code": error.code, "error": str(error), "status_code": error.status_code}
+            except KeyError as error:
+                return {"error_code": "NOT_FOUND_OR_MISSING_FIELD", "error": str(error), "status_code": 404}
+            except (ValueError, OSError) as error:
+                return {"error_code": "INVALID_ARTIFACT_OR_REQUEST", "error": str(error), "status_code": 400}
+
+        future = asyncio.run_coroutine_threadsafe(dispatch(), self._lora_loop.loop)
+        return await asyncio.shield(asyncio.wrap_future(future))
+
+    async def _sync_lora_permit_capacity(self) -> None:
+        epoch, count = self._lora_manager.admission_topology
+        if epoch <= self._lora_permit_epoch:
+            return
+        if self._lora_permit_limiter is None:
+            from ray import serve
+
+            from relax.agentic import AGENTIC_CHAT_API_SERVICE_NAME
+            from relax.agentic.session.service import agentic_session_shard_name
+
+            entries, _ = await serve.get_app_handle(AGENTIC_CHAT_API_SERVICE_NAME).runtime_resources.remote()
+            self._lora_permit_limiter = dict(entries)[agentic_session_shard_name(0)]
+        result = await self._lora_permit_limiter.set_sglang_request_capacity.remote(
+            self.args._lora_publication_launch["cohort_id"], epoch, count * self.args.sglang_server_concurrency
+        )
+        if result["topology_epoch"] != epoch or result["capacity"] != count * self.args.sglang_server_concurrency:
+            raise RuntimeError("PERMIT_CAPACITY_UNCONFIRMED")
+        self._lora_permit_epoch = max(self._lora_permit_epoch, epoch)
+
+    def _guard_lora_topology(self) -> None:
+        if self._lora_profile is not None:
+            raise ValueError(
+                "automatic replacement cannot adopt a managed engine without version and ownership recovery"
+            )
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
@@ -1019,6 +1273,15 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        if self._lora_profile is not None:
+
+            async def stop_publication_monitors():
+                tasks = [task for task in (self._lora_cleanup_task, self._lora_health_task) if task is not None]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            self._lora_loop.run(stop_publication_monitors())
         self._stop_eviction_monitor()
         for monitor in self._health_monitors:
             monitor.stop()
@@ -1124,6 +1387,14 @@ class RolloutManager(ReloadableMixin):
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
 
     async def generate(self, rollout_id):
+        if (
+            self._lora_profile is not None
+            and self._lora_manager.suspended
+            and not (self.args.colocate and not self.args.hybrid)
+        ):
+            # Dedicated inference GPUs may restore independently. Shared GPUs
+            # are restored only by the existing training/offload barrier.
+            await self.onload()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
@@ -1257,6 +1528,8 @@ class RolloutManager(ReloadableMixin):
     def _offload_local(self):
         """Sync body of offload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
+        if self._lora_profile is not None:
+            return self._lora_loop.run(self._change_lora_memory("suspend"))
         if self.status == "offload":
             logger.info("Rollout already offloaded; skipping")
             return
@@ -1271,6 +1544,8 @@ class RolloutManager(ReloadableMixin):
     def _onload_local(self, tags: list[str] | None = None):
         """Sync body of onload(); safe to call directly from code running
         inside this actor's process (e.g. custom_reward_post_process)."""
+        if self._lora_profile is not None:
+            return self._lora_loop.run(self._change_lora_memory("resume", tags))
         for srv in self.servers.values():
             srv.onload(tags)
         # Full onload transitions status; per-tag calls leave status for the
@@ -1278,12 +1553,90 @@ class RolloutManager(ReloadableMixin):
         if tags is None:
             self.status = "onload"
 
+    async def _change_lora_memory(self, action: str, tags: list[str] | None = None) -> None:
+        """An owned all-engine handoff; waiter cancellation is not drain."""
+        intent = (action, tuple(sorted(tags or ())))
+        task = getattr(self, "_lora_memory_task", None)
+        if task is not None and not task.done():
+            if self._lora_memory_intent != intent:
+                raise ValueError("MEMORY_OPERATION_BUSY")
+            return await asyncio.shield(task)
+        retry = task is not None and (task.cancelled() or task.exception() is not None)
+        if retry and self._lora_memory_intent != intent:
+            raise ValueError("MEMORY_STATE_UNKNOWN")
+        if not retry and action == "resume" and not self._lora_manager.suspended:
+            return  # Ordinary eval/onload calls do not fence a resident engine.
+        self._lora_manager.suspend()
+        self._lora_memory_intent = intent
+        if not retry:
+            for key in self._lora_manager.engine_identities:
+                self._lora_memory_sequences[key] += 1
+
+        async def change_owned():
+            await self._lora_manager.settle_control()
+            identities = self._lora_manager.engine_identities
+            targets = [(self._lora_clients[key].handle, identity) for key, identity in identities.items()]
+            handles = [engine for engine, _ in targets]
+            deadline = asyncio.get_running_loop().time() + self._lora_profile.cleanup_timeout_seconds
+            while True:
+                calls = [
+                    engine.release_memory_occupation.remote(
+                        memory_sequence=self._lora_memory_sequences[identity.engine_id],
+                        memory_owner=(self._lora_manager.cohort_id, identity.boot_id),
+                    )
+                    if action == "suspend"
+                    else engine.resume_memory_occupation.remote(
+                        tags=tags,
+                        memory_sequence=self._lora_memory_sequences[identity.engine_id],
+                        memory_owner=(self._lora_manager.cohort_id, identity.boot_id),
+                    )
+                    for engine, identity in targets
+                ]
+                results = await asyncio.gather(*calls, return_exceptions=True)
+                errors = [result for result in results if isinstance(result, BaseException)]
+                if not errors:
+                    break
+                if (
+                    all("MEMORY_OPERATION_BUSY" in str(error) for error in errors)
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    # An already-owned health probe or status query may be
+                    # finishing. Reuse the same sequence on every retry.
+                    await asyncio.sleep(0.05)
+                    continue
+                self.status = "memory_unknown"
+                raise RuntimeError(f"LoRA memory handoff incomplete: {errors}")
+            capabilities = await asyncio.gather(*(engine.lora_publication_identity.remote() for engine in handles))
+            identities = self._lora_manager.engine_identities
+            if {item.get("engine_id") for item in capabilities} != set(identities):
+                raise ValueError("MEMORY_TARGET_SET_MISMATCH")
+            for capability in capabilities:
+                expected = identities[capability["engine_id"]]
+                if (
+                    capability["engine_boot_id"] != expected.boot_id
+                    or capability.get("memory_sequence") != self._lora_memory_sequences[expected.engine_id]
+                    or capability.get("memory_state") not in ("RESIDENT", "SUSPENDED")
+                ):
+                    self.status = "memory_unknown"
+                    raise ValueError("MEMORY_STATE_UNCONFIRMED")
+            if all(item["memory_state"] == "RESIDENT" for item in capabilities):
+                self._lora_manager.resume()
+                self.status = "onload"
+                await self._lora_manager.collect(report=False)
+            else:
+                self.status = "offload"
+
+        self._lora_memory_task = asyncio.create_task(change_owned())
+        self._lora_memory_task.add_done_callback(lambda item: item.exception() if not item.cancelled() else None)
+        return await asyncio.shield(self._lora_memory_task)
+
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
     async def onload_kv(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
-        self.status = "onload"
+        if self._lora_profile is None:
+            self.status = "onload"
 
     def get_status(self):
         return self.status
@@ -1292,6 +1645,7 @@ class RolloutManager(ReloadableMixin):
     def recover_rollout_engines(self, model_name: str | None = None):
         """Restart any dead rollout engines and update num_new_engines for
         update_weights detection."""
+        self._guard_lora_topology()
         self.health_monitoring_pause()
         srv = self._get_server(model_name)
         if self.rollout_id == -1 or srv is None:
@@ -1547,6 +1901,8 @@ class RolloutManager(ReloadableMixin):
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
+        if self._lora_profile is not None and (engine_urls or model_name != self._lora_profile.target_model):
+            raise ValueError("publication scale-out requires owned Ray engines in the policy cohort")
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -1846,7 +2202,8 @@ class RolloutManager(ReloadableMixin):
                             failed_replica_ids.append(f"replica_{idx}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
                             try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
+                                if not self._retains_lora_pg(per_replica_pgs[idx]):
+                                    ray.util.remove_placement_group(per_replica_pgs[idx])
                             except Exception:
                                 pass
 
@@ -1894,7 +2251,8 @@ class RolloutManager(ReloadableMixin):
                             failed_replica_ids.append(f"replica_{replica_idx_for_result}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
                             try:
-                                ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
+                                if not self._retains_lora_pg(per_replica_pgs[replica_idx_for_result]):
+                                    ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
                             except Exception:
                                 pass
                             continue
@@ -2028,6 +2386,11 @@ class RolloutManager(ReloadableMixin):
                 skip_router_registration=True,  # Will be done in _finalize_engine_group_registration
             )
 
+            if self._lora_profile is not None:
+                new_group.lifecycle_status = EngineGroupLifecycle.DRAINING
+                with self._engine_lifecycle_lock:
+                    srv.engine_groups.append(new_group)
+
             # Step 3: Start engines
             init_handles, self._port_cursors = new_group.start_engines(self._port_cursors)
             if not init_handles:
@@ -2071,7 +2434,7 @@ class RolloutManager(ReloadableMixin):
         except Exception as e:
             logger.exception(f"[ScaleOut] Replica {replica_idx}: unexpected error: {e}")
             if new_group is not None:
-                if new_group in srv.engine_groups:
+                if self._lora_profile is None and new_group in srv.engine_groups:
                     srv.engine_groups.remove(new_group)
                 await self._rollback_engines(new_group)
             for actor in info_actors:
@@ -2286,6 +2649,56 @@ class RolloutManager(ReloadableMixin):
         if not healthy:
             logger.error(f"{log_prefix} {replica_str}: health check failed")
             return EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.HEALTH_CHECK_FAILED))
+
+        if self._lora_profile is not None:
+            if engine_group is None:
+                raise ValueError("managed publication requires an owned engine group")
+            request.update_status(ScaleOutStatus.WEIGHT_SYNCING)
+
+            async def join_owned():
+                from relax.backends.sglang.sglang_engine import PublicationEngineClient
+                from relax.engine.lora.publication import AdapterPublicationError, EngineIdentity
+
+                capabilities = await asyncio.gather(*(engine.lora_publication_identity.remote() for engine in engines))
+                clients = []
+                launch = self.args._lora_publication_launch
+                for engine, capability in zip(engines, capabilities, strict=True):
+                    if (
+                        capability["cohort_id"] != launch["cohort_id"]
+                        or capability["base_model_digest"] != launch["base_model_digest"]
+                        or capability.get("memory_state") != "RESIDENT"
+                    ):
+                        raise ValueError("joining engine capability mismatch")
+                    identity = EngineIdentity(
+                        capability["engine_id"], capability["engine_boot_id"], capability["endpoint"]
+                    )
+                    client = PublicationEngineClient(engine, identity)
+                    clients.append(client)
+                    self._lora_clients[identity.engine_id] = client
+                    self._lora_memory_sequences[identity.engine_id] = capability["memory_sequence"]
+                deadline = asyncio.get_running_loop().time() + remaining_timeout
+                while True:
+                    try:
+                        await self._lora_manager.join_engines(clients)
+                        break
+                    except AdapterPublicationError as error:
+                        if error.code != "MEMBERSHIP_BUSY" or asyncio.get_running_loop().time() >= deadline:
+                            raise
+                        await asyncio.sleep(0.05)
+                # Agentic requests use the manager's stable route. No mutable
+                # seed sync, DCS registration or router publication is needed.
+                with self._engine_lifecycle_lock:
+                    engine_group.num_new_engines = 0
+                    engine_group.lifecycle_status = EngineGroupLifecycle.ACTIVE
+
+            future = asyncio.run_coroutine_threadsafe(join_owned(), self._lora_loop.loop)
+            try:
+                await asyncio.shield(asyncio.wrap_future(future))
+            except Exception as error:
+                return EngineFinalizeResult(
+                    False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED, str(error))
+                )
+            return EngineFinalizeResult(True, group=engine_group)
 
         # Step 2: Sync weights from seed engine before publishing the engines
         # to DCS. A failed scale-out engine must never enter the actor's normal
@@ -3185,6 +3598,16 @@ class RolloutManager(ReloadableMixin):
         Args:
             engines_or_group: List of engines or EngineGroup
         """
+        if self._lora_profile is not None:
+            if not isinstance(engines_or_group, EngineGroup):
+                raise ValueError("managed cleanup requires its retained EngineGroup")
+            group = engines_or_group
+            srv = self.servers[self._lora_profile.target_model]
+            await self._remove_managed_engines(
+                srv, [(group, i) for i, engine in enumerate(group.engines) if engine is not None], 30
+            )
+            return
+
         if isinstance(engines_or_group, EngineGroup):
             engines = engines_or_group.all_engines
         else:
@@ -3623,6 +4046,8 @@ class RolloutManager(ReloadableMixin):
         dry_run: bool = False,
     ) -> dict:
         # Mutual exclusion: reject if any scale operation is in progress
+        if self._lora_profile is not None and model_name != self._lora_profile.target_model:
+            raise ValueError("publication scale-in targets the policy cohort")
         active = self._find_active_scale_request()
         if active is not None:
             return {
@@ -3823,7 +4248,11 @@ class RolloutManager(ReloadableMixin):
                 for group in selected_groups.values():
                     if id(group) in completed_eviction_groups:
                         group.eviction_requested = False
-                    if not group.eviction_requested and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                    if (
+                        self._lora_profile is None
+                        and not group.eviction_requested
+                        and group.lifecycle_status is EngineGroupLifecycle.DRAINING
+                    ):
                         group.lifecycle_status = EngineGroupLifecycle.ACTIVE
 
     async def _resolve_scale_in_url_candidates(self, request: ScaleInRequest, srv) -> list:
@@ -3912,6 +4341,9 @@ class RolloutManager(ReloadableMixin):
     ) -> tuple[list[str], list[str]]:
         """Remove live actors in Router -> drain -> DCS -> shutdown -> PG
         order."""
+        if self._lora_profile is not None:
+            # force and timer-based router drains cannot override Session ownership.
+            return await self._remove_managed_engines(srv, engine_infos, shutdown_timeout)
         unregistered_engine_infos, router_failed = await self._drain_engines(
             engine_infos,
             timeout=drain_timeout,
@@ -3952,6 +4384,61 @@ class RolloutManager(ReloadableMixin):
 
         self._cleanup_engine_groups(srv)
         return removed, failed
+
+    def _retains_lora_pg(self, pg) -> bool:
+        return self._lora_profile is not None and any(
+            group.pg is not None and group.pg[0] == pg for srv in self.servers.values() for group in srv.engine_groups
+        )
+
+    async def _remove_managed_engines(
+        self, srv, engine_infos: list, shutdown_timeout: float
+    ) -> tuple[list, list[str]]:
+        async def remove_owned():
+            removed, failed = [], []
+            for group, node0_idx in engine_infos:
+                label = f"group_{group.rank_offset}_engine_{node0_idx}"
+                engine = group.engines[node0_idx]
+                client = next((item for item in self._lora_clients.values() if item.handle == engine), None)
+                try:
+                    if client is not None and client.identity.engine_id in self._lora_manager.engine_identities:
+                        await self._lora_manager.remove_engines([client.identity])
+                    # A retry may find the native instances already detached,
+                    # but an earlier capacity update still unconfirmed.
+                    await asyncio.wait_for(self._sync_lora_permit_capacity(), 3)
+                    live = self._get_live_engine_actors(group, node0_idx)
+                    proof_key = (group.rank_offset, node0_idx)
+                    if proof_key not in self._lora_process_exit_proofs:
+                        results = await asyncio.gather(
+                            *(asyncio.wait_for(actor.shutdown.remote(), shutdown_timeout) for _, actor in live),
+                            return_exceptions=True,
+                        )
+                        if any(
+                            not isinstance(result, dict) or result.get("processes_exited") is not True
+                            for result in results
+                        ):
+                            raise RuntimeError("ENGINE_PROCESS_EXIT_UNKNOWN")
+                        self._lora_process_exit_proofs.add(proof_key)
+                    # Stop the now-empty Ray owner too. Historical protocol
+                    # tasks may otherwise keep its resource reservation alive.
+                    for _, actor in live:
+                        ray.kill(actor, no_restart=True)
+                    with self._engine_lifecycle_lock:
+                        for index, _ in live:
+                            group.all_engines[index] = None
+                    if client is not None:
+                        self._lora_clients.pop(client.identity.engine_id, None)
+                    self._lora_process_exit_proofs.discard(proof_key)
+                    removed.append(label)
+                except Exception as error:
+                    # Do not kill the Ray owner or release the PG without child
+                    # exit proof. DRAINING remains visible and retryable.
+                    logger.warning("Managed engine %s cleanup pending: %s", label, error)
+                    failed.append(label)
+            self._cleanup_engine_groups(srv)
+            return removed, failed
+
+        future = asyncio.run_coroutine_threadsafe(remove_owned(), self._lora_loop.loop)
+        return await asyncio.shield(asyncio.wrap_future(future))
 
     async def _drain_engines(self, engine_infos: list, timeout: float, force: bool) -> tuple[list, list[str]]:
         """Remove all engines from the router, then wait once for the drain
@@ -4404,6 +4891,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     num_gpus_per_engine=None,
     rank_offset=0,
     base_port=15000,
+    engines_per_gpu=1,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -4412,7 +4900,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
+    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine) * engines_per_gpu
     addr_and_ports: dict[int, dict] = {}
 
     # Track per-node port cursors so that different engine groups (called
@@ -4666,6 +5154,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     as the HTTP client is shared across all servers.
     """
     config = _resolve_sglang_config(args)
+    shared = getattr(args, "_lora_publication_launch", {}).get("engines_per_gpu", 1)
 
     servers: dict[str, RolloutServer] = {}
     gpu_offset = 0
@@ -4689,7 +5178,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         for group_cfg in model_cfg.engine_groups:
             gpus_per_engine = group_cfg.num_gpus_per_engine
             num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local * shared
 
             group = EngineGroup(
                 args=args,
@@ -4703,6 +5192,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
+                engines_per_gpu=shared,
             )
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)

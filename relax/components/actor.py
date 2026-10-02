@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 import ray
 import transfer_queue as tq
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from ray import serve
 
 from relax.components.base import Base
@@ -74,12 +74,34 @@ class Actor(Base):
         tq.init(self.config.tq_config)
         self.data_system_client = tq.get_client()
 
+        self._lora_profile = None
+        self._lora_exports: dict[str, dict] = {}
+        self._lora_export_pending = None
+        self._lora_base_digest = None
+        if getattr(config, "lora_publication_config", None):
+            from uuid import uuid4
+
+            from relax.engine.lora.publication import PublicationConfig
+
+            self._lora_profile = PublicationConfig.read(config.lora_publication_config)
+            self._lora_profile.validate_args(config)
+            self._lora_export_run = uuid4().hex
+
+        self.step = config.start_rollout_id or 0
+        self._lora_bootstrap_export = None
+        initial_export = None
+        if self._lora_profile is not None and self._lora_profile.bootstrap_version_id is None:
+            intent = "bootstrap-" + self._lora_export_run
+            self._accept_lora_export({"request_id": intent, "version_id": intent, "publish": True})
+            initial_export = self._prepare_lora_export(self.step)
+
         self.steps = ray.get(
             self.actor_model.async_init(
                 config,
                 role=self.role,
                 with_ref=config.kl_coef != 0 or config.use_kl_loss,
                 with_opd_teacher=self.config.opd_teacher_load,
+                **({"lora_export": initial_export} if initial_export is not None else {}),
             )
         )
 
@@ -98,6 +120,8 @@ class Actor(Base):
             )
         self.step = self.config.start_rollout_id
         self._logger.info(f"Actor initialized with starting step {self.step}")
+        if initial_export is not None:
+            self._lora_bootstrap_export = self._finish_lora_export(submit_publication=False)
 
         # Wired by controller in colocate mode. In fully_async / hybrid both
         # stay ``None`` and every barrier-guarded site short-circuits.
@@ -108,6 +132,7 @@ class Actor(Base):
         """Set the rollout manager and initialize weights."""
         self.rollout_manager = rollout_manager
         self.actor_model.set_rollout_manager(self.rollout_manager)
+        self._bootstrap_lora_publication()
 
         # Call update_weights when weight_updater exists (sync colocate or hybrid mode).
         # In pure fully_async mode weight_updater is not created and weights are synced via DCS.
@@ -118,7 +143,11 @@ class Actor(Base):
         # the first predict-step `onload_weights` to crash on a non-idempotent
         # `set.remove`. NCCL group setup is lazy — `connect_rollout_engines`
         # fires on the first real `update_weights` instead.
-        if (not self.config.fully_async or self.config.hybrid) and not is_sft_mode(self.config):
+        if (
+            not self._lora_profile
+            and (not self.config.fully_async or self.config.hybrid)
+            and not is_sft_mode(self.config)
+        ):
             self.actor_model.update_weights()
 
     def set_barriers(
@@ -233,6 +262,10 @@ class Actor(Base):
                 # increment step with lock
                 with self._lock:
                     self.step += 1
+                    if self.step >= self.config.num_rollout and self._lora_export_pending is not None:
+                        if self._lora_export_pending["state"] == "WAITING_BOUNDARY":
+                            self._lora_export_pending["state"] = "TRAINING_FINISHED"
+                            self._lora_export_pending = None
 
         except Exception as e:
             error_msg = f"Actor training failed at step {self.step}: {type(e).__name__}: {str(e)}"
@@ -307,17 +340,186 @@ class Actor(Base):
                 self.actor_model.update_weights()
             return False
 
-        # Use appropriate training method based on mode
-        if self.config.hybrid:
-            # hybrid mode: actor handles ref/actor_fwd/adv internally
-            ray.get(self.actor_model.train_hybrid(self.step))
-        elif self.config.fully_async:
-            ray.get(self.actor_model.train_fully_async(self.step))
-            # Save model checkpoint if needed
-            self._maybe_save_model()
-        else:
-            ray.get(self.actor_model.async_train(self.step))
+        # Capture the intent before dispatch. Requests arriving during this
+        # RPC remain queued for the next consistent training boundary.
+        descriptor = self._prepare_lora_export(self.step + 1)
+        options = {"lora_export": descriptor} if descriptor is not None else {}
+        try:
+            if self.config.hybrid:
+                ray.get(self.actor_model.train_hybrid(self.step, **options))
+            elif self.config.fully_async:
+                ray.get(self.actor_model.train_fully_async(self.step, **options))
+                if self._lora_profile is None:
+                    self._maybe_save_model()
+            else:
+                ray.get(self.actor_model.async_train(self.step, **options))
+        except Exception as error:
+            if descriptor is not None:
+                self._finish_lora_export(error=error)
+            raise
+        if descriptor is not None:
+            self._finish_lora_export()
         return True
+
+    def _accept_lora_export(self, payload: dict) -> dict:
+        from pathlib import Path
+
+        from relax.engine.lora.snapshot import AdapterSnapshot
+
+        if self._lora_profile is None:
+            raise HTTPException(409, "PUBLICATION_NOT_CONFIGURED")
+        request_id, version_id = payload["request_id"], payload["version_id"]
+        AdapterSnapshot(version_id, "0" * 64, "0" * 64, Path("."))
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise HTTPException(400, "INVALID_REQUEST_ID")
+        publish = payload.get("publish", False)
+        if type(publish) is not bool:
+            raise HTTPException(400, "INVALID_PUBLISH_FLAG")
+        with self._lock:
+            previous = self._lora_exports.get(request_id)
+            if previous is not None:
+                if (previous["version_id"], previous["publish"]) != (version_id, publish):
+                    raise HTTPException(409, "REQUEST_ID_CONFLICT")
+                return dict(previous)
+            if self._lora_export_pending is not None:
+                raise HTTPException(409, "EXPORT_BUSY")
+            if self.step >= self.config.num_rollout or self._stop_event.is_set():
+                raise HTTPException(409, "TRAINING_FINISHED")
+            if len(self._lora_exports) >= self._lora_profile.max_lifecycle_records:
+                raise HTTPException(507, "LIFECYCLE_CAPACITY_EXCEEDED")
+            record = {
+                "request_id": request_id,
+                "version_id": version_id,
+                "publish": publish,
+                "requested_step": self.step,
+                "exported_step": None,
+                "state": "WAITING_BOUNDARY",
+            }
+            self._lora_exports[request_id] = record
+            self._lora_export_pending = record
+            return dict(record)
+
+    @app.post("/lora/exports")
+    async def submit_lora_export(self, payload: dict) -> dict:
+        # No collective from the Serve thread: training consumes this intent.
+        return self._accept_lora_export(payload)
+
+    @app.get("/lora/exports/{request_id}")
+    async def lora_export_status(self, request_id: str) -> dict:
+        with self._lock:
+            if request_id not in self._lora_exports:
+                raise HTTPException(404, "EXPORT_NOT_FOUND")
+            return dict(self._lora_exports[request_id])
+
+    def _prepare_lora_export(self, completed_step: int) -> dict | None:
+        import tempfile
+        from pathlib import Path
+
+        from relax.engine.lora.snapshot import fingerprint_model
+
+        profile = self._lora_profile
+        if profile is None:
+            return None
+        with self._lock:
+            record = self._lora_export_pending
+            if record is None:
+                every = profile.export_every_n_steps
+                if every is None or completed_step % every:
+                    return None
+                intent = f"{self._lora_export_run}-{completed_step}"
+                self._accept_lora_export({"request_id": intent, "version_id": intent, "publish": profile.auto_publish})
+                record = self._lora_export_pending
+            if record["state"] != "WAITING_BOUNDARY":
+                raise RuntimeError("previous export has not settled")
+            record.update(state="EXPORTING", started=time.monotonic())
+        try:
+            store = Path(profile.artifact_store).resolve()
+            staging = store / ".staging"
+            staging.mkdir(parents=True, exist_ok=True)
+            output = tempfile.mkdtemp(prefix="train-export-", dir=staging)
+            record["staging_path"] = output
+            if self._lora_base_digest is None:
+                self._lora_base_digest = fingerprint_model(self.config.hf_checkpoint)
+            return dict(
+                output_dir=output,
+                version_id=record["version_id"],
+                store_dir=str(store),
+                base_model_digest=self._lora_base_digest,
+                artifact_max_bytes=profile.artifact_max_bytes,
+            )
+        except Exception as error:
+            self._finish_lora_export(error=error)
+            raise
+
+    def _publish_lora_export(self, record: dict) -> None:
+        descriptor = record["snapshot"]
+        result = ray.get(
+            self.rollout_manager.lora_control.remote(
+                "publish",
+                {
+                    "version_id": descriptor["version_id"],
+                    "digest": descriptor["digest"],
+                    "request_id": record["request_id"],
+                },
+            )
+        )
+        with self._lock:
+            record["publication"] = result
+            self._lora_exports[record["request_id"]]["publication"] = result
+
+    def _finish_lora_export(self, *, error: Exception | None = None, submit_publication: bool = True) -> dict:
+        import shutil
+
+        record = self._lora_export_pending
+        try:
+            if error is not None:
+                raise error
+            descriptor = self.actor_model.lora_export_result()
+            if descriptor["version_id"] != record["version_id"]:
+                raise ValueError("export result belongs to a different intent")
+            with self._lock:
+                record.update(state="SEALED", snapshot=descriptor, exported_step=descriptor["source_train_step"])
+            try:
+                shutil.rmtree(record["staging_path"])
+            except OSError as cleanup_error:
+                record["staging_cleanup_error"] = str(cleanup_error)
+            if record["publish"] and submit_publication:
+                self._publish_lora_export(record)
+        except Exception as export_error:
+            with self._lock:
+                if record["state"] != "SEALED":
+                    record["state"] = "EXPORT_UNKNOWN"
+                record["error"] = f"{type(export_error).__name__}: {export_error}"
+        finally:
+            with self._lock:
+                record["export_seconds"] = time.monotonic() - record.pop("started")
+                if record["state"] != "EXPORT_UNKNOWN":
+                    self._lora_export_pending = None
+        if record["state"] == "EXPORT_UNKNOWN":
+            raise RuntimeError(f"adapter export did not reach an all-rank result: {record}")
+        return dict(record)
+
+    def _bootstrap_lora_publication(self) -> None:
+        if self._lora_profile is None:
+            return
+        state = ray.get(self.rollout_manager.lora_control.remote("status"))
+        if state.get("default") is not None:
+            return
+        exported = self._lora_bootstrap_export
+        if exported is None or exported["state"] != "SEALED":
+            raise RuntimeError("initial adapter was not exported before releasing training GPUs")
+        self._publish_lora_export(exported)
+        result = exported.get("publication", {})
+        if exported["state"] != "SEALED" or "operation_id" not in result:
+            raise RuntimeError(f"initial adapter export/publication failed: {exported}")
+        deadline = time.monotonic() + self._lora_profile.prepare_timeout_seconds + 5
+        while result["state"] == "PREPARING" and time.monotonic() < deadline:
+            time.sleep(0.1)
+            result = ray.get(
+                self.rollout_manager.lora_control.remote("status", {"operation_id": result["operation_id"]})
+            )
+        if result["state"] != "PUBLISHED":
+            raise RuntimeError(f"initial adapter was not published: {result}")
 
     def _maybe_save_model(self) -> None:
         """Save model checkpoint if save interval is reached."""

@@ -635,6 +635,7 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
         slime_router_sticky=False,
     )
     adapter._session_lifecycle = lifecycle_enabled
+    adapter._publication_manager = None
     adapter.tokenizer = _FakeTokenizer()
     adapter.compiler = SimpleNamespace(processor=None)
     return adapter
@@ -695,13 +696,17 @@ async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
     assert posts == []
 
 
-async def test_terminal_session_closes_lifecycle_once() -> None:
+@pytest.mark.parametrize("publication,failures", [(False, 0), (True, 0), (True, 1)])
+async def test_terminal_session_closes_lifecycle_once(publication, failures) -> None:
     shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
     shard = object.__new__(shard_cls)
-    shard.args = SimpleNamespace(agentic_session_lifecycle=True)
+    shard.args = SimpleNamespace(
+        agentic_session_lifecycle=not publication, lora_publication_config="publication.yaml" if publication else None
+    )
     shard._generation_backend = SimpleNamespace(
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
+        close_adapter_session=AsyncMock(),
     )
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
@@ -723,10 +728,17 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
     group.sessions.append(session)
     shard._session_records = {session.session_id: session}
 
+    if failures:
+        shard._generation_backend.close_adapter_session.side_effect = [OSError("lost coordinator connection"), None]
     assert await shard_cls._finish_session(shard, session, None) is None
     assert await shard_cls._finish_session(shard, session, None) is None
-    shard._generation_backend.close_session.assert_awaited_once()
-    assert shard._lifecycle_close_count == 1
+    if publication:
+        assert shard._generation_backend.close_adapter_session.await_count == failures + 1
+        shard._generation_backend.close_adapter_session.assert_awaited_with("session-1")
+        shard._generation_backend.close_session.assert_not_awaited()
+    else:
+        shard._generation_backend.close_session.assert_awaited_once()
+    assert shard._lifecycle_close_count == int(not publication)
     assert shard._lifecycle_close_failure_count == 0
 
 

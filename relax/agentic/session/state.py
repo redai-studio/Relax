@@ -675,6 +675,7 @@ class SessionForest:
             "request_id": patch.get("request_id"),
             "request_kind": patch.get("request_kind"),
             "admission": patch.get("admission"),
+            "lora_attempts": copy.deepcopy(patch.get("lora_attempts", [])),
             "base_state_hash": patch.get("base_state_hash"),
             "abort_count": node.abort_count,
             "status": str(node.status),
@@ -742,6 +743,13 @@ class SessionForest:
         effective_prompt = _decode_tokens(tokenizer=tokenizer, token_ids=tokens[:prompt_train_token_count])
         merged_metadata = copy.deepcopy(self.static_metadata)
         _merge_export_metadata(merged_metadata, leaf.export_metadata_patch)
+        if "lora_adapter" in self.static_metadata:
+            merged_metadata["lora_attempts"] = [
+                copy.deepcopy(attempt)
+                for node in lineage
+                if node.kind == "resp"
+                for attempt in node.export_metadata_patch.get("lora_attempts", [])
+            ]
         if "start_rollout_id" not in merged_metadata:
             merged_metadata["start_rollout_id"] = first_response_node.rollout_id
         subtree_root = lineage[1] if len(lineage) > 1 else None
