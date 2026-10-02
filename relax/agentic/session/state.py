@@ -29,14 +29,9 @@ class RequestKind(str, Enum):
     PROTECTED = "protected"
 
 
-# Zero-valued SGLang accounting shape merged across interrupted IR attempts.
-# Keys are part of exported metadata and therefore must track backend schema.
-_EMPTY_SPEC_DELTA = {
-    "spec_accept_token_num": 0,
-    "spec_draft_token_num": 0,
-    "spec_verify_ct": 0,
-    "completion_token_num": 0,
-}
+# Speculative counters are sparse so an absent key remains distinguishable
+# from a counter explicitly reported as zero by the backend.
+_EMPTY_SPEC_DELTA: dict[str, int] = {}
 # Zero-valued prefix-cache accounting shape accumulated across resumptions.
 _EMPTY_PREFIX_CACHE_DELTA = {
     "cached_tokens": 0,
@@ -352,7 +347,6 @@ class MsgNode:
     backend_audio_data_delta: list[str] = field(default_factory=list)
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
-    spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -361,6 +355,13 @@ class MsgNode:
     status: str | None = None
     rollout_routed_experts: Any = None
     export_metadata_patch: dict[str, Any] = field(default_factory=dict)
+
+
+# Generation identity stays request-scoped even when semantic states share the same state_hash.
+@dataclass(frozen=True)
+class CommittedGeneration:
+    response_state_hash: str
+    spec_delta: dict[str, int]
 
 
 @dataclass(eq=False)
@@ -413,6 +414,7 @@ class SessionForest:
     root_state_hash: str | None = None
     leaf_state_hashes: set[str] = field(default_factory=set)
     nodes_by_hash: dict[str, MsgNode] = field(default_factory=dict)
+    committed_generations_by_request_id: dict[str, CommittedGeneration] = field(default_factory=dict)
 
     @classmethod
     def create_empty(
@@ -508,6 +510,18 @@ class SessionForest:
 
     def export_leaf_hashes(self) -> list[str]:
         return list(self.leaf_state_hashes)
+
+    def commit_generation(
+        self,
+        *,
+        request_id: str,
+        response_state_hash: str,
+        spec_delta: dict[str, int],
+    ) -> None:
+        self.committed_generations_by_request_id[request_id] = CommittedGeneration(
+            response_state_hash=response_state_hash,
+            spec_delta=dict(spec_delta),
+        )
 
     def subtree_root_node(self, state_hash: str | None) -> MsgNode | None:
         if state_hash is None:
@@ -624,7 +638,6 @@ class SessionForest:
         token_delta: list[int],
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
-        spec_delta: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
@@ -650,7 +663,6 @@ class SessionForest:
                 rollout_token_delta=token_delta,
                 logprob_delta=logprob_delta,
                 weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
-                spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
                 prefix_cache_delta=prefix_cache_delta
                 if prefix_cache_delta is not None
                 else dict(_EMPTY_PREFIX_CACHE_DELTA),
@@ -700,10 +712,10 @@ class SessionForest:
         rollout_log_probs: list[float] = []
         messages: list[dict[str, Any]] = []
         turns: list[dict[str, Any]] = []
+        response_state_hashes: set[str] = set()
         response_node_spans: list[list[int]] = []
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
-        spec_info = dict(_EMPTY_SPEC_DELTA)
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
@@ -720,6 +732,7 @@ class SessionForest:
             if node.kind == "resp":
                 if first_response_node is None:
                     first_response_node = node
+                response_state_hashes.add(node.state_hash)
                 turns.append(self._agentic_trace_turn_from_node(node, len(turns)))
                 response_start = len(continuation_train_tokens)
                 continuation_train_tokens.extend(node.train_token_delta)
@@ -727,7 +740,6 @@ class SessionForest:
                 loss_mask.extend([1] * len(node.train_token_delta))
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
-                spec_info = _sum_counter_dict(spec_info, node.spec_delta)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
             if idx == 0 or first_response_node is None:
@@ -750,6 +762,21 @@ class SessionForest:
             normalize_template_kwargs(subtree_root.chat_template_kwargs) if subtree_root is not None else {}
         )
         status = Sample.Status.TRUNCATED if leaf.kind == "obs" else Sample.Status(leaf.status)
+        # State membership defines export coverage; request_id keeps independent
+        # committed generations distinct when requests converge to the same state.
+        spec_info = dict(_EMPTY_SPEC_DELTA)
+        spec_generations = []
+        for request_id, generation in self.committed_generations_by_request_id.items():
+            if generation.response_state_hash not in response_state_hashes:
+                continue
+            spec_info = _sum_counter_dict(spec_info, generation.spec_delta)
+            spec_generations.append(
+                {
+                    "request_id": request_id,
+                    "resp_state_hash": generation.response_state_hash,
+                    **generation.spec_delta,
+                }
+            )
         trace = merge_agentic_trace(merged_metadata.get(TRACE_KEY), None)
         trace.update(
             {
@@ -758,6 +785,7 @@ class SessionForest:
                 "terminal_status": status.value,
                 "turn_count": len(turns),
                 "turns": turns,
+                "spec_generations": spec_generations,
             }
         )
         merged_metadata[TRACE_KEY] = trace

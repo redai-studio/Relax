@@ -1430,7 +1430,6 @@ class _SessionRecord:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     live_irs: set[InflightRequest] = field(default_factory=set)
     queued_irs: deque[InflightRequest] = field(default_factory=deque)
-    resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
     protection_pending_until_resume: bool = False
@@ -1642,11 +1641,23 @@ class AgenticSessionShard:
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
-        spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-        request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
-        request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
-        request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
-        request.pending_spec_delta["completion_token_num"] += int(meta_info.get("completion_tokens", 0) or 0)
+        spec_token_counts = get_spec_token_counts(meta_info)
+        if spec_token_counts is not None:
+            spec_accept_token_num, spec_draft_token_num = spec_token_counts
+            request.pending_spec_delta["spec_accept_token_num"] = (
+                request.pending_spec_delta.get("spec_accept_token_num", 0) + spec_accept_token_num
+            )
+            request.pending_spec_delta["spec_draft_token_num"] = (
+                request.pending_spec_delta.get("spec_draft_token_num", 0) + spec_draft_token_num
+            )
+        if "spec_verify_ct" in meta_info:
+            request.pending_spec_delta["spec_verify_ct"] = request.pending_spec_delta.get("spec_verify_ct", 0) + int(
+                meta_info.get("spec_verify_ct", 0) or 0
+            )
+        if "completion_tokens" in meta_info:
+            request.pending_spec_delta["completion_token_num"] = request.pending_spec_delta.get(
+                "completion_token_num", 0
+            ) + int(meta_info.get("completion_tokens", 0) or 0)
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
         request.pending_prefix_cache_delta["total_prompt_tokens"] += int(meta_info.get("prompt_tokens", 0) or 0)
 
@@ -1896,10 +1907,12 @@ class AgenticSessionShard:
             return False
         async with session.lock:
             forest = session.forest
-            state_hash = session.resp_state_hash_by_request_id.get(request_id)
-            if forest is None or state_hash is None:
+            if forest is None:
                 return False
-            response_node = forest.nodes_by_hash.get(state_hash)
+            generation = forest.committed_generations_by_request_id.get(request_id)
+            if generation is None:
+                return False
+            response_node = forest.nodes_by_hash.get(generation.response_state_hash)
             if response_node is None:
                 return False
             events = agentic_trace_events(response_node.export_metadata_patch)
@@ -2612,7 +2625,6 @@ class AgenticSessionShard:
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
             weight_version_delta=ir.pending_weight_version_delta,
-            spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
             generation_elapsed_s=ir.pending_generation_elapsed_s,
@@ -2620,7 +2632,11 @@ class AgenticSessionShard:
             rollout_routed_experts=ir.pending_routed_experts,
             export_metadata_patch=ir.pending_export_metadata_patch,
         )
-        session.resp_state_hash_by_request_id[ir.request_id] = response_node.state_hash
+        forest.commit_generation(
+            request_id=ir.request_id,
+            response_state_hash=response_node.state_hash,
+            spec_delta=ir.pending_spec_delta,
+        )
         prompt_tokens = int(ir.latest_backend_meta.get("prompt_tokens", 0))
         completion_tokens = len(ir.pending_token_delta)
         payload = {
@@ -2947,7 +2963,6 @@ class AgenticSessionShard:
             await asyncio.gather(process_wait, return_exceptions=True)
         async with session.lock:
             session.forest = None
-            session.resp_state_hash_by_request_id.clear()
             session.resources = None
         del self._session_records[session.session_id]
 
