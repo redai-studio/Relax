@@ -2,6 +2,7 @@
 
 """Preference-pair schema, rendering, truncation, and queue tests."""
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -257,6 +258,46 @@ def test_pack_pair_rows_and_custom_meta_are_aligned(tmp_path: Path):
     assert len(batch["pair_ids"]) == len(custom_meta) == 2
     for idx, metadata in enumerate(custom_meta):
         assert metadata["total_lengths"] == (batch["chosen_total_lengths"][idx] + batch["rejected_total_lengths"][idx])
+
+
+def test_cross_epoch_batch_preserves_repeated_pairs_and_resume_order(tmp_path: Path, monkeypatch):
+    path = tmp_path / "pairs.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "prompt_id": f"pair-{index}",
+                "prompt": [{"role": "user", "content": f"q{index}"}],
+                "chosen": {"role": "assistant", "content": f"yes{index}"},
+                "rejected": {"role": "assistant", "content": f"no{index}"},
+            }
+            for index in range(10)
+        ],
+    )
+    dataset = _dataset(path, seed=42)
+    dataset.shuffle(0)
+    dataset.get_batch(8)
+    pairs, crossed = dataset.get_batch(4)
+    assert crossed
+    assert [pair.source_idx for pair in pairs] == [2, 3, 7, 2]
+    batch, metadata = pack_preference_pairs_for_tq(pairs)
+    assert len(batch["pair_ids"]) == len(metadata) == 4
+    assert batch["pair_ids"][0] == batch["pair_ids"][3]
+    for index, pair in enumerate(pairs):
+        assert batch["chosen_tokens"][index] == pair.chosen_tokens.tolist()
+        assert batch["rejected_tokens"][index] == pair.rejected_tokens.tolist()
+
+    restored = _dataset(path, seed=42)
+    restored.shuffle(0, position=8)
+    resumed, _ = restored.get_batch(4)
+    assert [pair.source_idx for pair in resumed] == [pair.source_idx for pair in pairs]
+    assert pack_preference_pairs_for_tq(resumed) == (batch, metadata)
+
+    # Distinct source IDs hashing to the same value must still fail.
+    constant_digest = hashlib.sha256(b"collision")
+    monkeypatch.setattr(hashlib, "sha256", lambda _value: constant_digest)
+    with pytest.raises(ValueError, match="hash collision"):
+        pack_preference_pairs_for_tq(pairs)
 
 
 def test_preference_split_eval_and_resume_preserve_pair_order(tmp_path: Path):

@@ -74,8 +74,7 @@ def dpo_pair_loss(
 def build_preference_pair_indices(
     branch_pair_ids: Sequence[int], branch_is_chosen: Sequence[bool]
 ) -> tuple[list[int], list[int]]:
-    """Return chosen/rejected branch indices grouped by stable pair
-    identity."""
+    """Validate adjacent chosen/rejected pairs, preserving repeated samples."""
     if len(branch_pair_ids) != len(branch_is_chosen):
         raise ValueError(
             "preference pair identity fields must be branch aligned: "
@@ -84,28 +83,16 @@ def build_preference_pair_indices(
     if not branch_pair_ids:
         raise ValueError("DPO micro-batch must contain at least one preference pair")
 
-    pairs: dict[int, dict[bool, int]] = {}
-    order: list[int] = []
-    for index, (raw_pair_id, raw_is_chosen) in enumerate(zip(branch_pair_ids, branch_is_chosen, strict=True)):
-        pair_id = int(raw_pair_id)
-        is_chosen = bool(raw_is_chosen)
-        if pair_id not in pairs:
-            pairs[pair_id] = {}
-            order.append(pair_id)
-        if is_chosen in pairs[pair_id]:
-            branch = "chosen" if is_chosen else "rejected"
-            raise ValueError(f"preference pair {pair_id!r} contains duplicate {branch} branches")
-        pairs[pair_id][is_chosen] = index
-
-    chosen_indices: list[int] = []
-    rejected_indices: list[int] = []
-    for pair_id in order:
-        pair = pairs[pair_id]
-        if set(pair) != {False, True}:
-            raise ValueError(f"preference pair {pair_id!r} must contain exactly one chosen and one rejected branch")
-        chosen_indices.append(pair[True])
-        rejected_indices.append(pair[False])
-    return chosen_indices, rejected_indices
+    if len(branch_pair_ids) % 2:
+        raise ValueError("preference micro-batch must contain an even number of branches")
+    for index in range(0, len(branch_pair_ids), 2):
+        if not branch_is_chosen[index] or branch_is_chosen[index + 1]:
+            raise ValueError(f"preference branches at positions {index}/{index + 1} must be ordered chosen/rejected")
+        if int(branch_pair_ids[index]) != int(branch_pair_ids[index + 1]):
+            raise ValueError(
+                f"adjacent preference branches at positions {index}/{index + 1} must have the same pair ID"
+            )
+    return list(range(0, len(branch_pair_ids), 2)), list(range(1, len(branch_pair_ids), 2))
 
 
 def reward_model_pair_loss(chosen_scores: torch.Tensor, rejected_scores: torch.Tensor) -> torch.Tensor:

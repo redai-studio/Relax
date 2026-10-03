@@ -278,6 +278,34 @@ def test_resolve_dpo_reference_checkpoint_rejects_missing_indexed_shard_and_meta
         resolve_dpo_reference_checkpoint("org/model", revision, str(checkpoint))
 
 
+def test_reference_probe_selects_first_occurrence_of_repeated_pair():
+    try:
+        from relax.backends.megatron import actor as actor_module
+    except Exception as exc:
+        pytest.skip(f"Megatron actor unavailable: {exc}")
+
+    instance = object.__new__(actor_module.MegatronTrainRayActor)
+    instance._expected_dpo_reference_identity = None
+    instance._dpo_reference_identity = DPOReferenceIdentity(1, "repo", "revision", "loader", "a" * 64, None, None)
+    instance._compute_dpo_reference_probe = lambda manifest: "b" * 64
+    instance._validate_dpo_reference_probe(
+        {
+            "preference_branch_pair_ids": [7, 7, 8, 8, 7, 7],
+            "preference_is_chosen": [True, False] * 3,
+            "tokens": [[1, 2], [1, 3], [4, 5], [4, 6], [1, 2], [1, 3]],
+            "loss_masks": [[False, True]] * 6,
+            "total_lengths": [2] * 6,
+            "response_lengths": [1] * 6,
+        }
+    )
+    manifest = instance._dpo_reference_identity.probe_manifest
+    assert manifest["pair_ids"] == [7, 7]
+    assert manifest["branch_is_chosen"] == [True, False]
+    assert manifest["tokens"] == [[1, 2], [1, 3]]
+    assert len(manifest["loss_masks"]) == len(manifest["total_lengths"]) == len(manifest["response_lengths"]) == 2
+    assert instance._dpo_reference_identity.probe_sha256 == "b" * 64
+
+
 def test_resume_probe_materializes_manifest_lists_as_tensors(monkeypatch):
     try:
         from relax.backends.megatron import actor as actor_module

@@ -19,10 +19,13 @@ def _args(*, reference_free: bool = False, beta: float = 0.2) -> Namespace:
     return Namespace(dpo_reference_free=reference_free, dpo_beta=beta)
 
 
-def _run(monkeypatch, policy_values, *, order=None, reference_free=False, ref_values=None, num_samples=2):
+def _run(
+    monkeypatch, policy_values, *, order=None, reference_free=False, ref_values=None, num_samples=2, pair_ids=None
+):
     if order is None:
         order = [0, 1, 2, 3]
-    pair_ids = [10, 10, 20, 20]
+    if pair_ids is None:
+        pair_ids = [10, 10, 20, 20]
     is_chosen = [True, False, True, False]
     policy = [torch.as_tensor(policy_values[index]).reshape(1) for index in order]
     reference = None if ref_values is None else [torch.as_tensor(ref_values[index]).reshape(1) for index in order]
@@ -43,10 +46,11 @@ def _run(monkeypatch, policy_values, *, order=None, reference_free=False, ref_va
     return loss_module.dpo_loss_function(_args(reference_free=reference_free), batch, logits, lambda value: value)
 
 
-def test_production_dpo_loss_matches_independent_reference_and_gradients(monkeypatch):
+@pytest.mark.parametrize("pair_ids", [[10, 10, 20, 20], [10, 10, 10, 10]])
+def test_production_dpo_loss_matches_independent_reference_and_gradients(monkeypatch, pair_ids):
     policy = torch.tensor([-1.0, -2.0, -0.5, -0.75], requires_grad=True)
     reference = torch.tensor([-1.2, -1.7, -0.4, -0.8])
-    actual, metrics = _run(monkeypatch, list(policy.unbind()), ref_values=list(reference.unbind()))
+    actual, metrics = _run(monkeypatch, list(policy.unbind()), ref_values=list(reference.unbind()), pair_ids=pair_ids)
     expected = -F.logsigmoid(0.2 * ((policy[0::2] - policy[1::2]) - (reference[0::2] - reference[1::2]))).sum()
     torch.testing.assert_close(actual, expected)
     actual.backward()
@@ -64,11 +68,11 @@ def test_production_dpo_loss_matches_independent_reference_and_gradients(monkeyp
     }.issubset(metrics)
 
 
-def test_pair_identity_restores_reordered_micro_batch(monkeypatch):
+def test_whole_pair_reordering_preserves_loss(monkeypatch):
     policy = [-1.0, -2.0, -0.5, -0.75]
     reference = [-1.2, -1.7, -0.4, -0.8]
     baseline, baseline_metrics = _run(monkeypatch, policy, ref_values=reference)
-    reordered, reordered_metrics = _run(monkeypatch, policy, ref_values=reference, order=[3, 0, 2, 1])
+    reordered, reordered_metrics = _run(monkeypatch, policy, ref_values=reference, order=[2, 3, 0, 1])
     torch.testing.assert_close(reordered, baseline)
     for key in baseline_metrics:
         torch.testing.assert_close(reordered_metrics[key], baseline_metrics[key])
@@ -97,8 +101,10 @@ def test_reference_free_partition_and_num_samples_do_not_change_pair_sum(monkeyp
 @pytest.mark.parametrize(
     ("pair_ids", "chosen", "match"),
     [
-        ([1, 1, 2, 2], [True, True, True, False], "duplicate chosen"),
-        ([1, 2, 2, 3], [True, True, False, False], "exactly one"),
+        ([1, 1, 2, 2], [True, True, True, False], "ordered chosen/rejected"),
+        ([1, 2, 2, 1], [True, False, True, False], "same pair ID"),
+        ([1, 1], [False, True], "ordered chosen/rejected"),
+        ([1, 1, 2], [True, False, True], "even number"),
     ],
 )
 def test_production_dpo_rejects_invalid_pair_identity(monkeypatch, pair_ids, chosen, match):

@@ -89,6 +89,7 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.preference_utils import build_preference_pair_indices
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -849,14 +850,10 @@ class MegatronTrainRayActor(TrainRayActor):
             return
         if self._dpo_reference_identity is not None and self._dpo_reference_identity.probe_sha256 is not None:
             return
-        first_pair_id = int(rollout_data["preference_branch_pair_ids"][0])
-        indices = [
-            index
-            for index, pair_id in enumerate(rollout_data["preference_branch_pair_ids"])
-            if int(pair_id) == first_pair_id
-        ]
-        if len(indices) != 2:
-            raise RuntimeError(f"DPO reference probe pair {first_pair_id!r} is not atomic")
+        chosen_indices, rejected_indices = build_preference_pair_indices(
+            rollout_data["preference_branch_pair_ids"], rollout_data["preference_is_chosen"]
+        )
+        indices = [chosen_indices[0], rejected_indices[0]]
         manifest = {
             "pair_ids": [int(rollout_data["preference_branch_pair_ids"][index]) for index in indices],
             "branch_is_chosen": [bool(rollout_data["preference_is_chosen"][index]) for index in indices],

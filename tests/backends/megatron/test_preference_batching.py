@@ -61,8 +61,14 @@ def test_preference_iterator_validates_step_global_pair_denominator(monkeypatch)
         data_module._get_preference_data_iterator(args, invalid, None)
 
 
-def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch):
-    flat = expand_preference_rollout_data(_pair_rows())
+@pytest.mark.parametrize("pair_ids", [[100, 101], [100, 100]])
+@pytest.mark.parametrize("capacity", [4, 8])
+def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch, pair_ids, capacity):
+    rows = _pair_rows()
+    rows["pair_ids"] = pair_ids
+    rows["chosen_tokens"] = [[1, 2], [4, 5]]
+    rows["rejected_tokens"] = [[1, 3], [4, 6]]
+    flat = expand_preference_rollout_data(rows)
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
 
@@ -70,17 +76,21 @@ def test_dp2_pair_rows_remain_atomic_with_global_pair_denominator(monkeypatch):
         output[:] = [value, value]
 
     monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
-    args = Namespace(global_batch_size=4, max_tokens_per_gpu=4)
+    args = Namespace(global_batch_size=4, max_tokens_per_gpu=capacity)
     iterators, counts = data_module._get_preference_data_iterator(args, flat, None)
     assert flat["dynamic_global_batch_size"] == 4
-    assert counts == [2]
+    assert counts == [8 // capacity]
     seen = []
+    seen_tokens = []
     for _ in range(counts[0]):
-        batch = iterators[0].get_next(["preference_branch_pair_ids", "preference_is_chosen"])
-        assert len(set(batch["preference_branch_pair_ids"])) == 1
-        assert set(batch["preference_is_chosen"]) == {False, True}
+        batch = iterators[0].get_next(["preference_branch_pair_ids", "preference_is_chosen", "tokens"])
+        ids = batch["preference_branch_pair_ids"]
+        assert ids[::2] == ids[1::2]
+        assert batch["preference_is_chosen"] == [True, False] * (len(ids) // 2)
         seen.extend(batch["preference_branch_pair_ids"])
-    assert sorted(seen) == [100, 100, 101, 101]
+        seen_tokens.extend(batch["tokens"])
+    assert sorted(seen) == sorted(pair_ids * 2)
+    assert seen_tokens == [[1, 2], [1, 3], [4, 5], [4, 6]]
 
 
 def test_preference_iterator_rejects_unequal_dp_pair_rows_via_gloo(monkeypatch):

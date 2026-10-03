@@ -63,17 +63,19 @@ def _batch():
         "tokens": packed.unsqueeze(0),
         "unconcat_tokens": branches,
         "packed_seq_params": SimpleNamespace(cu_seqlens_q=torch.tensor([0, 3, 5, 9, 11])),
-        "preference_branch_pair_ids": [7, 8, 7, 8],
-        "preference_is_chosen": [False, True, True, False],
+        "preference_branch_pair_ids": [8, 8, 7, 7],
+        "preference_is_chosen": [True, False, True, False],
     }
 
 
-def test_reward_model_loss_uses_pair_identity_after_branch_reordering_and_preserves_gradient():
+@pytest.mark.parametrize("pair_ids", [[8, 8, 7, 7], [7, 7, 7, 7]])
+def test_reward_model_loss_preserves_adjacent_pairs_and_gradients(pair_ids):
     batch = _batch()
+    batch["preference_branch_pair_ids"] = pair_ids
     flat = torch.arange(11, dtype=torch.float32, requires_grad=True)
     loss, metrics = reward_model_loss_function(Namespace(), batch, flat.reshape(1, 11, 1), lambda value: value)
 
-    expected_margins = torch.tensor([8.0 - 2.0, 4.0 - 10.0])
+    expected_margins = torch.stack([flat[2] - flat[4], flat[8] - flat[10]])
     expected = -torch.nn.functional.logsigmoid(expected_margins)
     assert torch.allclose(loss, expected.sum())
     assert set(metrics) == {
@@ -88,11 +90,17 @@ def test_reward_model_loss_uses_pair_identity_after_branch_reordering_and_preser
     loss.backward()
     assert flat.grad is not None
     assert torch.count_nonzero(flat.grad).item() == 4
+    actual_grad = flat.grad.clone()
+    flat.grad = None
+    expected.sum().backward()
+    torch.testing.assert_close(actual_grad, flat.grad)
 
 
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
+        (lambda batch: batch.update(preference_branch_pair_ids=[7, 8, 7, 8]), "same pair ID"),
+        (lambda batch: batch.update(preference_is_chosen=[False, True, True, False]), "ordered chosen/rejected"),
         (lambda batch: batch["raw_loss_masks"][0].zero_(), "raw_loss_mask"),
         (lambda batch: batch["tokens"][0].__setitem__(2, 999), "terminal token"),
         (
