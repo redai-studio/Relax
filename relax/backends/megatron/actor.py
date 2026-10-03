@@ -1129,14 +1129,6 @@ class MegatronTrainRayActor(TrainRayActor):
         self._run_step_evaluation(rollout_id, end_update_weight=end_update_weight)
 
     def train(self, rollout_id: int) -> None:
-        if (
-            rollout_id == 0
-            and is_preference_mode(self.args)
-            and not self.args.debug_train_only
-            and should_run_sft_eval(self.args, 0)
-        ):
-            self._run_step_evaluation(0)
-
         if self.args.offload_rollout and dist.get_rank() == 0:
             pre_train_offload_handles = []
             if self.genrm_manager is not None:

@@ -2,6 +2,7 @@
 
 """Streaming chosen/rejected dataset for offline preference objectives."""
 
+import hashlib
 import threading
 from collections import Counter
 from collections.abc import Iterable
@@ -505,9 +506,9 @@ def pack_preference_pairs_for_tq(
     """Pack atomic pair rows and matching TransferQueue length metadata."""
     if not pairs:
         raise ValueError("preference pair batch must not be empty")
-    from relax.engine.sft.eval.acceptance import encoded_pair_id
-
-    encoded_pair_ids = [encoded_pair_id(pair.pair_id) for pair in pairs]
+    encoded_pair_ids = [
+        int.from_bytes(hashlib.sha256(pair.pair_id.encode()).digest()[:8], "big") >> 1 for pair in pairs
+    ]
     source_pair_ids: dict[int, str] = {}
     for pair, encoded_id in zip(pairs, encoded_pair_ids, strict=True):
         if source_pair_ids.setdefault(encoded_id, pair.pair_id) != pair.pair_id:

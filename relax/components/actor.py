@@ -15,7 +15,6 @@ from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import (
-    actor_training_input_ready,
     is_preference_mode,
     is_sft_mode,
     sft_partition_ids,
@@ -259,7 +258,9 @@ class Actor(Base):
             False if should continue waiting (caller should skip this iteration)
         """
         partition_list = run(self.data_system_client.async_get_partition_list())
-        if not actor_training_input_ready(self.config, self.step, partition_list):
+        if not partition_list or not all(
+            partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
+        ):
             time.sleep(1)
             return False
 

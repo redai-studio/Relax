@@ -8,7 +8,6 @@ here keeps the dispatchers in those files to one-line calls.
 """
 
 import math
-import re
 from argparse import Namespace
 
 import numpy as np
@@ -244,10 +243,6 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
 def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     """Return whether eval is due after ``completed_steps`` optimizer steps.
 
-    Preference objectives additionally evaluate at the true pre-training
-    baseline (0) and at the final completed step, independent of whether the
-    periodic interval happens to divide the run length.
-
     SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
     when an eval source is configured (either ``--eval-prompt-data`` or
     ``--eval-size``, mutually exclusive — see ``utils/arguments.py``).
@@ -262,24 +257,7 @@ def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None or interval <= 0:
         return False
-    if is_preference_mode(args) and completed_steps in {0, int(getattr(args, "num_rollout", 0) or 0)}:
-        return True
     return completed_steps > 0 and completed_steps % interval == 0
-
-
-def actor_training_input_ready(args: Namespace, step: int, partition_ids: list[str] | None) -> bool:
-    """Allow the backend to enter step 0 when its preference baseline is ready.
-
-    In colocate mode the Actor service normally waits for the train partition
-    before calling the backend. Preference producers intentionally publish and
-    drain the step-0 eval partition first, so that baseline partition is the
-    backend's first input and must also release the service-level wait.
-    """
-    if not partition_ids:
-        return False
-    if step == 0 and is_preference_mode(args) and should_run_sft_eval(args, completed_steps=0):
-        return any(re.fullmatch(r"sft_eval_0_n\d+_0", partition_id) for partition_id in partition_ids)
-    return all(partition_id in partition_ids for partition_id in sft_partition_ids(args, step))
 
 
 def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:

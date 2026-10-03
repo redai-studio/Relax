@@ -614,6 +614,63 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("objective", ["dpo", "reward_model"])
+@pytest.mark.parametrize(("n_pairs", "dp_size"), [(1, 1), (2, 2), (6, 2), (10, 2)])
+async def test_preference_eval_uses_actual_size_without_baseline_files(tmp_path, objective, n_pairs, dp_size):
+    from relax.components.sft import SFT
+    from relax.engine.sft.dataset.preference import ProcessedPreferencePair
+
+    pairs = [
+        ProcessedPreferencePair(
+            pair_id=f"pair-{idx}",
+            chosen_tokens=torch.tensor([idx, 100]),
+            rejected_tokens=torch.tensor([idx, 101]),
+            chosen_loss_mask=torch.tensor([1]),
+            rejected_loss_mask=torch.tensor([1]),
+            chosen_total_length=2,
+            rejected_total_length=2,
+            chosen_prompt_length=1,
+            rejected_prompt_length=1,
+            chosen_completion_length=1,
+            rejected_completion_length=1,
+            chosen_score_position=1,
+            rejected_score_position=1,
+            source_idx=idx,
+        )
+        for idx in reversed(range(n_pairs))
+    ]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type="sft",
+        sft_objective=objective,
+        eval_size=n_pairs,
+        eval_interval=1,
+        global_batch_size=4,
+        data_parallel_size=dp_size,
+        multimodal_keys=None,
+        load=str(tmp_path / "old-checkpoint"),
+        save=str(tmp_path / "new-output"),
+    )
+    sft.step = 20
+    sft.data_system_client = SimpleNamespace(async_put=AsyncMock())
+    sft._logger_instance = MagicMock()
+    sft._build_eval_batches = MagicMock(return_value=pairs)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+
+    await sft._maybe_produce_eval(completed_steps=21)
+
+    chunks = sft.data_system_client.async_put.call_args_list
+    expected_sizes = [4] * (n_pairs // 4) + ([n_pairs % 4] if n_pairs % 4 else [])
+    assert [len(call.kwargs["data"]["pair_ids"]) for call in chunks] == expected_sizes
+    assert [call.kwargs["partition_id"] for call in chunks] == [
+        f"sft_eval_21_n{len(chunks)}_p{n_pairs}_{idx}" for idx in range(len(chunks))
+    ]
+    chosen = [tokens.tolist() for call in chunks for tokens in call.kwargs["data"]["chosen_tokens"]]
+    assert chosen == [pair.chosen_tokens.tolist() for pair in pairs]
+    assert not (tmp_path / "new-output").exists()
+
+
+@pytest.mark.asyncio
 async def test_sft_loop_advances_step(monkeypatch):
     from relax.components.sft import SFT
 

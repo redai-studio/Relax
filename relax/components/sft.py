@@ -1020,25 +1020,9 @@ class SFT(Base):
                 "the Megatron consumer is waiting for an eval partition. Check invalid-multimodal and oversize "
                 "skip warnings."
             )
-        if is_preference_mode(self.config):
-            from relax.engine.sft.eval.acceptance import (
-                PREFERENCE_PROBE_PAIR_COUNT,
-                preference_eval_chunk_sizes,
-                preference_eval_local_batch_sizes,
-                record_probe_contract,
-            )
-
-            samples = sorted(samples, key=lambda pair: pair.pair_id)
-            record_probe_contract(
-                getattr(self.config, "save", None),
-                self.config.sft_objective,
-                completed_steps,
-                samples,
-            )
-
         # Causal eval pads sub-GBS pools because its legacy consumer requests a
         # fixed batch size. Preference eval uses actual partial-chunk sizes and
-        # must preserve every unique probe pair without padding.
+        # must preserve every evaluation pair without padding.
         gbs = self.config.global_batch_size
         n_original = len(samples)
         preference_mode = is_preference_mode(self.config)
@@ -1075,11 +1059,6 @@ class SFT(Base):
         assert backend_batch is not None
         row_key = "pair_ids" if is_preference_mode(self.config) else "tokens"
         n_samples = len(backend_batch[row_key])
-        if preference_mode and n_samples != PREFERENCE_PROBE_PAIR_COUNT:
-            raise RuntimeError(
-                "preference eval packing must preserve exactly "
-                f"{PREFERENCE_PROBE_PAIR_COUNT} probe pairs, got {n_samples}"
-            )
 
         # Drain all train shards before eval takes the queue capacity.
         if completed_steps > 0:
@@ -1096,6 +1075,8 @@ class SFT(Base):
         # already burned a full eval round in the wild — see the
         # `[get_data_profile] samples=0` log spam).
         if preference_mode:
+            from relax.engine.sft.eval.preference import preference_eval_chunk_sizes, preference_eval_local_batch_sizes
+
             chunk_sizes = preference_eval_chunk_sizes(n_samples, chunk_size)
             preference_eval_local_batch_sizes(
                 n_samples,
@@ -1134,7 +1115,10 @@ class SFT(Base):
             e = s + current_chunk_size
             offset = e
             chunk = {k: v[s:e] for k, v in backend_batch.items()}
-            partition_id = f"sft_eval_{completed_steps}_n{n_chunks}_{chunk_idx}"
+            prefix = f"sft_eval_{completed_steps}_n{n_chunks}"
+            if preference_mode:
+                prefix += f"_p{n_samples}"
+            partition_id = f"{prefix}_{chunk_idx}"
             await self.data_system_client.async_put(
                 data=dict_to_tensordict(chunk, batch_size=len(chunk[row_key])),
                 partition_id=partition_id,
@@ -1162,8 +1146,6 @@ class SFT(Base):
 
     async def _async_run(self) -> None:
         try:
-            if self.step == 0 and is_preference_mode(self.config):
-                await self._maybe_produce_eval(0)
             while self.step < self.config.num_rollout and not self._stop_event.is_set():
                 await self._produce_one_step()
         except Exception as exc:

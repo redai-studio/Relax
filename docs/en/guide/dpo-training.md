@@ -65,11 +65,11 @@ DPO emits the following training metrics under the `train/dpo/` namespace:
 
 For distributed parity claims, run DP=1 and DP=2 with the same image, model/data revisions, hyperparameters, and batch semantics, and retain the raw logs and reference digests.
 
-## Reward modeling and acceptance artifacts
+## Reward modeling and evaluation
 
-The companion recipe is `scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh`. It defaults to 200 optimizer steps and 32 pairs per global batch. Preference evaluation runs before the first optimizer step (step 0), periodically, and after the final completed step even when the interval does not divide the run length.
+The companion recipe is `scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh`. It defaults to 200 optimizer steps and 32 pairs per global batch. DPO and reward-model evaluation follow `--eval-interval`, just like other SFT objectives.
 
-Both DPO and reward modeling write acceptance data under `<SAVE_DIR>/<EXP_NAME>/preference_eval/`: the canonical probe contract and SHA-256, the DP/micro-batch plan and SHA-256, step-0/final per-pair JSONL, and a 10,000-replicate FP64 PCG64 paired-bootstrap summary. Final evaluation fails if probe preprocessing, pair order, or the batch plan differs from step 0. Retain this directory together with the expanded command, environment inventory, raw stdout/stderr, metrics, and curves.
+Evaluation reports loss, chosen/rejected scores, margin, accuracy, tie rate, and the actual pair count. The evaluation set is not restricted to 512 pairs, and resuming with a new `--save` directory does not require step-0 evaluation files. Partial final chunks are retained; each chunk must still be divisible by the data-parallel size. Fixed-probe comparisons and acceptance thresholds belong in the acceptance experiment, outside the training loop.
 
 Reward-model Megatron checkpoints persist `sft_objective=reward_model`, `head_type=reward_model_terminal_v1`, and `checkpoint_role=actor`. Resume rejects missing or incompatible metadata, non-exact scalar-head keys/shapes, partial optimizer/RNG restoration, and PPO critic checkpoints.
 

@@ -5,6 +5,8 @@ configured."""
 
 from argparse import Namespace
 
+import pytest
+
 from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
 
 
@@ -34,13 +36,14 @@ def test_should_run_sft_eval_at_interval_boundary():
     assert should_run_sft_eval(args, completed_steps=0) is False
 
 
-def test_preference_eval_includes_true_baseline_and_final_independent_of_interval():
+@pytest.mark.parametrize("objective", ["dpo", "reward_model", "causal_lm"])
+def test_preference_eval_follows_configured_interval(objective):
     args = _mk_actor_args()
-    args.sft_objective = "reward_model"
-    args.eval_interval = 200
-    assert should_run_sft_eval(args, completed_steps=0) is True
-    assert should_run_sft_eval(args, completed_steps=20) is True
-    assert should_run_sft_eval(args, completed_steps=1) is False
+    args.sft_objective = objective
+    args.eval_interval = 2
+    args.num_rollout = 5
+
+    assert [step for step in range(6) if should_run_sft_eval(args, step)] == [2, 4]
 
 
 def test_should_run_sft_eval_disabled_when_no_interval():

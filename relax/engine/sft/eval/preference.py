@@ -7,14 +7,24 @@ import torch
 from relax.utils.training.preference_utils import select_packed_sequence_scores
 
 
-def extract_preference_eval_pair_ids(pair_data: dict) -> list[int]:
-    """Read one ID per pair from either expanded or raw preference data."""
-    pair_ids = pair_data.get("preference_pair_ids")
-    if pair_ids is None:
-        pair_ids = pair_data.get("pair_ids")
-    if pair_ids is None:
-        raise RuntimeError("preference eval data is missing pair IDs; expected preference_pair_ids or pair_ids")
-    return [int(value) for value in pair_ids]
+def preference_eval_chunk_sizes(pair_count: int, global_batch_size: int) -> list[int]:
+    """Split every evaluation pair into capacity-bounded eval chunks."""
+    if pair_count <= 0 or global_batch_size <= 0:
+        raise ValueError("preference eval pair count and global batch size must be positive")
+    full_chunks, remainder = divmod(pair_count, global_batch_size)
+    return [global_batch_size] * full_chunks + ([remainder] if remainder else [])
+
+
+def preference_eval_local_batch_sizes(pair_count: int, global_batch_size: int, dp_size: int) -> list[int]:
+    if dp_size <= 0:
+        raise ValueError("preference eval data-parallel size must be positive")
+    chunk_sizes = preference_eval_chunk_sizes(pair_count, global_batch_size)
+    invalid = [size for size in chunk_sizes if size % dp_size != 0]
+    if invalid:
+        raise ValueError(
+            f"preference eval chunk sizes must be divisible by data-parallel size: chunks={invalid}, dp={dp_size}"
+        )
+    return [size // dp_size for size in chunk_sizes]
 
 
 def compute_reward_model_eval_step(
@@ -88,7 +98,8 @@ def finalize_pair_metrics(values: torch.Tensor, *, prefix: str) -> dict[str, flo
 
 __all__ = [
     "compute_reward_model_eval_step",
-    "extract_preference_eval_pair_ids",
     "finalize_pair_metrics",
     "pair_metric_sums",
+    "preference_eval_chunk_sizes",
+    "preference_eval_local_batch_sizes",
 ]
