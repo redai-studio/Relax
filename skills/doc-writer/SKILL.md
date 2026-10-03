@@ -11,10 +11,13 @@ description: Write and maintain bilingual (English + Chinese) documentation for
 
 Write bilingual VitePress documentation for the Relax project, ensuring both **format correctness** and **content correctness**.
 
+For articles under `docs/en/blog/` and `docs/zh/blog/`, use
+[blog-writer](../blog-writer/SKILL.md) and its publishing workflow.
+
 ## Three Inviolable Rules
 
-1. **Bilingual requirement** — EVERY documentation page MUST be created in BOTH English (`docs/guide/`) AND Chinese (`docs/zh/guide/`) simultaneously. Never create only one language version. Both versions must have identical structure and content coverage.
-2. **Format correctness** — every doc page must exist in both `docs/guide/` (English) and `docs/zh/guide/` (Chinese), be registered in `docs/.vitepress/config.mts` sidebar, and follow the established Markdown conventions.
+1. **Bilingual requirement** — EVERY documentation page MUST be created in BOTH English (`docs/en/guide/`) AND Chinese (`docs/zh/guide/`) simultaneously. Never create only one language version. Both versions must have identical structure and content coverage.
+2. **Format correctness** — every doc page must exist in both `docs/en/guide/` (English) and `docs/zh/guide/` (Chinese), be registered in `docs/.vitepress/config.mts` sidebar, and follow the established Markdown conventions.
 3. **Content correctness** — every API, class, function, config option, and CLI flag mentioned in the doc **must** be verified against the current source code. Never invent features, never describe removed/renamed APIs, never guess parameter names.
 
 ______________________________________________________________________
@@ -39,6 +42,23 @@ Ask (or infer from user request):
 - **Category**: where it belongs in the sidebar (`Getting Started`, `Core Concepts`, `Advanced`, `Development`, or `Examples`)
 - **Filename**: kebab-case, e.g., `checkpoint-engine.md`
 
+### Images
+
+Read the **Images / 图片** section in [docs/README.md](../../docs/README.md)
+before adding images. New images live in the `docs/public/images/` submodule
+from [redai-studio/relax-images](https://github.com/redai-studio/relax-images).
+Initialize it with `git submodule update --init docs/public/images`.
+Guide images use `guide/<topic-slug>/`; blog images follow the blog-writer workflow.
+Reference images as `/images/guide/<topic-slug>/<image-name>.<ext>` with meaningful
+alt text, without the deployment base or `docs/public` prefix. Reuse images across
+languages or provide translated `-en` and `-zh` versions when needed.
+
+Keep article Markdown in Relax and image changes in the image repository.
+Before preparing a publishable parent commit, ensure its pinned image commit is
+available remotely, then stage `docs/public/images` with the corresponding docs.
+Respect the user's authorization for commits and pushes; loading this skill does
+not grant additional remote-write permission. Existing assets can stay in place.
+
 ### Step 2: Verify content against source code
 
 Before writing a single line of documentation, **read the actual source code** for the feature being documented. Required steps:
@@ -58,7 +78,7 @@ Before writing a single line of documentation, **read the actual source code** f
 
 #### Step 3a: Write English doc
 
-Create `docs/guide/<filename>.md` (or `docs/examples/<filename>.md`, `docs/api/<filename>.md` depending on category).
+Create `docs/en/guide/<filename>.md` (or `docs/en/examples/<filename>.md`, `docs/en/api/<filename>.md` depending on category).
 
 Follow the doc template in `references/doc-template.md`.
 
@@ -84,7 +104,7 @@ Translation rules:
 - Section headers must be natural Chinese (e.g., "Overview" → "概述", "Quick Start" → "快速开始", "Configuration" → "配置", "Best Practices" → "最佳实践", "Troubleshooting" → "故障排除", "Next Steps" → "下一步")
 - Chinese doc must cover the exact same sections and content as the English doc — no missing sections, no extra sections
 
-**Verification**: Before proceeding to Step 4, confirm that BOTH `docs/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created.
+**Verification**: Before proceeding to Step 4, confirm that BOTH `docs/en/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created.
 
 ### Step 4: Register in VitePress config
 
@@ -92,7 +112,7 @@ Edit `docs/.vitepress/config.mts`:
 
 1. Add to the English sidebar under the correct group
 2. Add to the Chinese sidebar under the corresponding Chinese group
-3. Both entries must use correct `link` paths (`/guide/<filename>` and `/zh/guide/<filename>`)
+3. Both entries must use correct `link` paths (`/en/guide/<filename>` and `/zh/guide/<filename>`)
 
 English sidebar group mapping:
 | Category | Sidebar group text |
@@ -101,8 +121,8 @@ English sidebar group mapping:
 | Core Concepts | `Core Concepts` |
 | Advanced | `Advanced` |
 | Development | `Development` |
-| Examples | (separate `/examples/` sidebar) |
-| API | (separate `/api/` sidebar) |
+| Examples | (separate `/en/examples/` sidebar) |
+| API | (separate `/en/api/` sidebar) |
 
 Chinese sidebar group mapping:
 | Category | Sidebar group text |
@@ -118,12 +138,16 @@ Chinese sidebar group mapping:
 
 After creating both docs and updating config:
 
-1. **Verify both language versions exist** — confirm BOTH `docs/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created. If only one exists, immediately create the missing version.
+1. **Verify both language versions exist** — confirm BOTH `docs/en/guide/<filename>.md` AND `docs/zh/guide/<filename>.md` have been created. If only one exists, immediately create the missing version.
 2. **Cross-check code examples** — re-read the source files and confirm every import path, class name, and function signature in the doc matches the code.
 3. **Check bilingual parity** — confirm both docs have the same sections in the same order, with identical content coverage.
 4. **Check sidebar config** — confirm both English and Chinese entries are added to `config.mts`.
 5. **Check internal links** — any `[text](./other-doc.md)` references must point to docs that actually exist.
 6. **Check repository paths** — scan the doc for every file/directory path that references the repo (e.g., `relax/utils/health_system.py`, `scripts/models/qwen3-4B.sh`). For each path, verify the file or directory actually exists. Remove or correct any stale/wrong paths.
+7. **Build and preview** — run `npm run docs:build` from the repository root and
+   inspect `npm run docs:preview`, including images beneath the configured deployment
+   base and narrow-screen layout. Check the image submodule's status and revision;
+   the published output must not contain `images/.git` metadata.
 
 ______________________________________________________________________
 
@@ -131,7 +155,7 @@ ______________________________________________________________________
 
 When writing docs, verify each of these against the source code:
 
-- [ ] **Bilingual completeness** — BOTH English (`docs/guide/`) AND Chinese (`docs/zh/guide/`) versions exist with identical structure
+- [ ] **Bilingual completeness** — BOTH English (`docs/en/guide/`) AND Chinese (`docs/zh/guide/`) versions exist with identical structure
 - [ ] **Import paths** — `from relax.xxx import YYY` must match actual `__init__.py` exports
 - [ ] **Class names** — must match actual class definitions
 - [ ] **Function signatures** — parameter names, types, and defaults must match source
@@ -152,13 +176,20 @@ ______________________________________________________________________
 docs/
 ├── .vitepress/
 │   └── config.mts              # Sidebar & nav config (MUST update for new pages)
-├── guide/                      # English guides
-├── zh/guide/                   # Chinese guides (mirror of guide/)
-├── api/                        # English API docs
-├── zh/api/                     # Chinese API docs
-├── examples/                   # English example docs
-├── zh/examples/                # Chinese example docs
-└── index.md / zh/index.md      # Home pages
+├── en/
+│   ├── guide/                  # English guides
+│   ├── api/                    # English API docs
+│   ├── examples/               # English example docs
+│   ├── blog/                   # English blog posts (use blog-writer)
+│   └── index.md                # English home page
+├── zh/
+│   ├── guide/                  # Chinese guides
+│   ├── api/                    # Chinese API docs
+│   ├── examples/               # Chinese example docs
+│   ├── blog/                   # Chinese blog posts (use blog-writer)
+│   └── index.md                # Chinese home page
+├── public/images/              # relax-images Git submodule
+└── index.md                    # Root home page
 ```
 
 Source code locations for verification:
