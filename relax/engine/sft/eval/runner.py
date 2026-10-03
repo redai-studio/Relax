@@ -232,6 +232,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
         preference_eval_chunk_sizes,
         preference_eval_local_batch_sizes,
     )
+    from relax.utils.sft_utils import align_loss_mask_for_sft
     from relax.utils.training.preference_utils import dpo_pair_loss, reward_model_pair_loss
 
     args = actor.args
@@ -272,6 +273,12 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                 rollout_data["dynamic_global_batch_size"] = global_chunk_size
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
                 if args.sft_objective == "dpo":
+                    # Returned log-probabilities predict the next token; the
+                    # rollout masks still mark the tokens at their input positions.
+                    aligned_loss_masks = [
+                        align_loss_mask_for_sft(torch.as_tensor(mask, device=local.device))
+                        for mask in rollout_data["loss_masks"]
+                    ]
                     if args.dpo_reference_free:
                         reference_sums = None
                     else:
@@ -279,10 +286,10 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                         reference = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")[
                             "ref_log_probs"
                         ]
-                        reference_sums = _masked_sequence_sums(reference, rollout_data["loss_masks"], local.device)
+                        reference_sums = _masked_sequence_sums(reference, aligned_loss_masks, local.device)
                     actor._switch_model("actor")
                     policy = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="")["log_probs"]
-                    policy_sums = _masked_sequence_sums(policy, rollout_data["loss_masks"], local.device)
+                    policy_sums = _masked_sequence_sums(policy, aligned_loss_masks, local.device)
                     policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
                     if reference_sums is None:
                         reference_chosen = reference_rejected = None
