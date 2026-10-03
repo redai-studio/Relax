@@ -586,8 +586,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--preference-pair-id-key", type=str, default="prompt_id")
             parser.add_argument("--preference-max-length", type=int, default=1024)
             parser.add_argument("--preference-max-completion-length", type=int, default=512)
-            parser.add_argument("--preference-chat-template-sha256", type=str, default=None)
-            parser.add_argument("--preference-require-no-generation-marker", action="store_true", default=False)
             parser.add_argument("--dpo-beta", type=float, default=0.1)
             parser.add_argument("--dpo-reference-repository", type=str, default=None)
             parser.add_argument("--dpo-reference-revision", type=str, default=None)

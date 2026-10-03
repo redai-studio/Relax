@@ -2,7 +2,6 @@
 
 """Streaming chosen/rejected dataset for offline preference objectives."""
 
-import hashlib
 import threading
 from collections import Counter
 from collections.abc import Iterable
@@ -11,11 +10,7 @@ from typing import Any
 
 import torch
 
-from relax.engine.sft.dataset.chat_template import (
-    HAS_GENERATION_MARKER,
-    _resolve_sft_template_kwargs,
-    render_with_loss_mask,
-)
+from relax.engine.sft.dataset.chat_template import render_with_loss_mask
 from relax.engine.sft.dataset.sample import CanonicalMessage, CanonicalSample
 from relax.engine.sft.dataset.streaming import _build_reader
 from relax.utils.data.streaming_dataset import IndexManager, PrefetchBuffer
@@ -248,8 +243,6 @@ class PreferenceStreamingDataset:
         prefetch_chunk_size: int = 32,
         prefetch_num_workers: int = 4,
         apply_chat_template_kwargs: dict | None = None,
-        expected_chat_template_sha256: str | None = None,
-        require_no_generation_marker: bool = False,
     ) -> None:
         if max_length <= 0 or max_completion_length <= 0:
             raise ValueError("preference length limits must be positive")
@@ -266,13 +259,9 @@ class PreferenceStreamingDataset:
         self.max_completion_length = max_completion_length
         self.pair_capacity = pair_capacity or (2 * max_length)
         self.apply_chat_template_kwargs = apply_chat_template_kwargs
-        self.expected_chat_template_sha256 = expected_chat_template_sha256
-        self.require_no_generation_marker = require_no_generation_marker
         self._rejection_counts: Counter[str] = Counter()
         self._rejection_records: list[dict[str, Any]] = []
         self._rejection_lock = threading.Lock()
-        self._template_contract_validated = False
-        self._template_contract_lock = threading.Lock()
         self._validate_unique_pair_ids()
         self._first_error: BaseException | None = None
         self._error_lock = threading.Lock()
@@ -397,16 +386,17 @@ class PreferenceStreamingDataset:
         rejected_sample = CanonicalSample(
             messages=[*pair.prompt, pair.rejected], metadata=dict(pair.metadata), tools=None
         )
-        self._validate_template_contract(chosen_sample)
         chosen_tokens, chosen_mask = render_with_loss_mask(
             chosen_sample,
             tokenizer=self.tokenizer,
             apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            last_turn_only=True,
         )
         rejected_tokens, rejected_mask = render_with_loss_mask(
             rejected_sample,
             tokenizer=self.tokenizer,
             apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            last_turn_only=True,
         )
         chosen_prompt, chosen_completion = _split_branch(
             chosen_tokens, chosen_mask, pair_id=pair.pair_id, branch="chosen"
@@ -463,28 +453,6 @@ class PreferenceStreamingDataset:
         """Return row IDs and stable reason codes for evidence manifests."""
         with self._rejection_lock:
             return [dict(record) for record in self._rejection_records]
-
-    def _validate_template_contract(self, sample: CanonicalSample) -> None:
-        if self._template_contract_validated:
-            return
-        with self._template_contract_lock:
-            if self._template_contract_validated:
-                return
-            resolved = _resolve_sft_template_kwargs(
-                sample,
-                tokenizer=self.tokenizer,
-                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
-            )
-            template = resolved.template or ""
-            digest = hashlib.sha256(template.encode()).hexdigest()
-            if self.expected_chat_template_sha256 is not None and digest != self.expected_chat_template_sha256:
-                raise ValueError(
-                    "preference chat template SHA-256 mismatch: "
-                    f"expected={self.expected_chat_template_sha256}, actual={digest}"
-                )
-            if self.require_no_generation_marker and HAS_GENERATION_MARKER(template):
-                raise ValueError("preference recipe requires a chat template without {% generation %} markers")
-            self._template_contract_validated = True
 
     def _process_one_safe(self, idx: int) -> ProcessedPreferencePair | None:
         try:

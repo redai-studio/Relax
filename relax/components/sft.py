@@ -152,8 +152,6 @@ def _create_sft_train_dataset(
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
-            expected_chat_template_sha256=getattr(config, "preference_chat_template_sha256", None),
-            require_no_generation_marker=getattr(config, "preference_require_no_generation_marker", False),
         )
     dataset_cls = _load_custom_dataset_class(getattr(config, "custom_dataset_class_path", None))
     if dataset_cls is None:
@@ -772,8 +770,6 @@ class SFT(Base):
                     seed=seed,
                     prefetch_max_cached=0,
                     apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
-                    expected_chat_template_sha256=self.config.preference_chat_template_sha256,
-                    require_no_generation_marker=self.config.preference_require_no_generation_marker,
                 )
             else:
                 self._eval_dataset = SFTStreamingDataset(

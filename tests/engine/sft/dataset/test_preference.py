@@ -94,6 +94,40 @@ def test_explicit_pair_builds_identical_prompt_and_completion_only_masks(tmp_pat
     assert pair.rejected_score_position == pair.rejected_total_length - 1
 
 
+@pytest.mark.parametrize("implicit_prompt", [False, True])
+@pytest.mark.parametrize("history_turns", [1, 2])
+def test_preference_pair_masks_historical_assistant_turns(tmp_path: Path, implicit_prompt: bool, history_turns: int):
+    prompt = [
+        message
+        for _ in range(history_turns)
+        for message in (
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier answer"},
+        )
+    ]
+    prompt.append({"role": "user", "content": "question"})
+    chosen = {"role": "assistant", "content": "good"}
+    rejected = {"role": "assistant", "content": "bad"}
+    row = {"prompt_id": "history", "prompt": prompt, "chosen": chosen, "rejected": rejected}
+    if implicit_prompt:
+        row = {"prompt_id": "history", "chosen": [*prompt, chosen], "rejected": [*prompt, rejected]}
+    path = tmp_path / "history.jsonl"
+    _write_jsonl(path, [row])
+
+    pair = _dataset(path).get_processed_pair(0)
+
+    expected_prompt = _FakeTokenizer().apply_chat_template(prompt).squeeze(0)
+    for branch, expected_completion in (("chosen", [33, 31, 31, 30]), ("rejected", [38, 37, 30])):
+        tokens = getattr(pair, f"{branch}_tokens")
+        mask = getattr(pair, f"{branch}_loss_mask")
+        prompt_length = getattr(pair, f"{branch}_prompt_length")
+        assert prompt_length == expected_prompt.numel()
+        assert torch.equal(tokens[:prompt_length], expected_prompt)
+        assert tokens[prompt_length:].tolist() == expected_completion
+        assert not mask[:prompt_length].any()
+        assert mask[prompt_length:].all()
+
+
 def test_implicit_ultrafeedback_pair_extracts_strict_common_prefix(tmp_path: Path):
     path = tmp_path / "pairs.jsonl"
     _write_jsonl(
