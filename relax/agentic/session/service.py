@@ -68,7 +68,7 @@ from relax.agentic.session.state import (
     normalize_tools,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.types import get_spec_token_counts
+from relax.utils.types import accumulate_spec_counter_values, get_spec_counter_values
 
 
 # Stable actor-name prefix embedded in opaque Session route tokens. Renaming it
@@ -1638,15 +1638,17 @@ class AgenticSessionShard:
         return {key: value for key, value in sampling_params.items() if value is not None}
 
     @staticmethod
-    def _accumulate_request_meta(request, *, meta_info: dict[str, Any]) -> None:
+    def _accumulate_request_meta(request: InflightRequest, *, meta_info: dict[str, Any]) -> None:
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             request.pending_weight_version_delta.append(str(weight_version))
-        spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-        request.pending_spec_delta["spec_accept_token_num"] += spec_accept_token_num
-        request.pending_spec_delta["spec_draft_token_num"] += spec_draft_token_num
-        request.pending_spec_delta["spec_verify_ct"] += int(meta_info.get("spec_verify_ct", 0) or 0)
-        request.pending_spec_delta["completion_token_num"] += int(meta_info.get("completion_tokens", 0) or 0)
+        counters = get_spec_counter_values(meta_info)
+        request.pending_spec_counters = accumulate_spec_counter_values(request.pending_spec_counters, counters)
+        for key, value in counters.items():
+            request.pending_spec_delta[key] += value
+        request.pending_spec_counts_reported = any(
+            key != "completion_token_num" for key in request.pending_spec_counters
+        )
         request.pending_prefix_cache_delta["cached_tokens"] += int(meta_info.get("cached_tokens", 0) or 0)
         request.pending_prefix_cache_delta["total_prompt_tokens"] += int(meta_info.get("prompt_tokens", 0) or 0)
 
@@ -2604,6 +2606,11 @@ class AgenticSessionShard:
             tools=forest.subtree_tools(ir.parent_state_hash),
             parent_state_hash=ir.parent_state_hash,
         )
+        # Key this submitted generation by its own request id so the rollout metric can
+        # deduplicate a node shared by several exported samples. Only speculative
+        # decoding rollouts produce counters, and the metric consuming them is gated on
+        # the same switch, so nothing is exported otherwise.
+        spec_node_key = ir.request_id if getattr(self.args, "sglang_speculative_algorithm", None) is not None else None
         response_node = forest.append_resp(
             parent_state_hash=ir.parent_state_hash,
             rollout_id=ir.rollout_id,
@@ -2613,6 +2620,9 @@ class AgenticSessionShard:
             logprob_delta=ir.pending_logprob_delta,
             weight_version_delta=ir.pending_weight_version_delta,
             spec_delta=ir.pending_spec_delta,
+            spec_node_key=spec_node_key,
+            spec_node_counts_reported=ir.pending_spec_counts_reported,
+            spec_counters=ir.pending_spec_counters or {},
             prefix_cache_delta=ir.pending_prefix_cache_delta,
             wall_elapsed_s=time.monotonic() - ir.wall_started_at,
             generation_elapsed_s=ir.pending_generation_elapsed_s,

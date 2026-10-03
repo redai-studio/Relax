@@ -9,7 +9,7 @@ import torch
 
 from relax.algorithms.spec import get_algorithm
 from relax.utils.repetition import detect_repetition
-from relax.utils.types import Sample
+from relax.utils.types import SPEC_COUNTER_KEYS, Sample, normalize_spec_counter_values
 
 
 logger = logging.getLogger(__name__)
@@ -234,6 +234,105 @@ def compute_rollout_reward_metrics(
 
 
 compute_rollout_explicit_reward_metrics = compute_rollout_reward_metrics
+
+
+def _record_spec_node(node_counts: dict[str, dict[str, int]], node_key: str, counters: dict[str, int]) -> None:
+    """Record one submitted generation node under its own identity.
+
+    Counters belong to the submitted node, not to the sample that exports it,
+    so a node exported by several samples (``A -> B`` and ``A -> C``) is
+    recorded once instead of being added again per sample. An occurrence that
+    carries no counters never overwrites counters another occurrence reported.
+    Partial copies can supply missing fields without adding duplicate work.
+    """
+    record = node_counts.setdefault(node_key, {})
+    for key, value in normalize_spec_counter_values(counters).items():
+        record.setdefault(key, value)
+
+
+def compute_spec_decoding_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Aggregate speculative decoding counters of one rollout metric batch.
+
+    Counters are deduplicated per submitted generation node and summed before any
+    rate is derived, so a node shared by several exported samples (``A -> B`` and
+    ``A -> C`` both export ``A``) counts once, and a batch whose samples carry very
+    different counter magnitudes is weighted by counters instead of averaging ratios.
+
+    A sample without node identities -- a non-agentic rollout, or a dump written
+    before node identities were exported -- falls back to its own totals. Totals of
+    a legacy dump carry no report flag, so they count only when a draft or verify
+    counter is non-zero. ``spec_legacy_samples`` counts legacy payloads whose
+    generation identities cannot be recovered. Each ratio uses only records with
+    both of its counters available. Missing and null fields remain unknown even
+    after serialization, so they cannot become a zero numerator.
+
+    Returns an empty mapping when the batch carries no submitted generation node.
+
+    Keys (``compute_metrics_from_samples`` logs them verbatim):
+        ``spec_accept_rate``: accepted drafts over proposed drafts, summed per node.
+        ``spec_accept_length``: completion tokens over verify calls, summed over the
+        nodes with at least one verify call.
+        ``spec_nodes_total``: counted generation nodes, shared nodes counted once.
+        ``spec_nodes_missing_counts``: nodes missing at least one of the four counters.
+        ``spec_coverage``: share of counted nodes with all four counters available.
+        ``spec_accept_rate_coverage``: share with accepted and proposed available.
+        ``spec_accept_length_coverage``: share with completion and verify available.
+        ``spec_legacy_samples``: only when any sample had to fall back to its totals.
+    """
+    node_counts: dict[str, dict[str, int]] = {}
+    sample_records: list[dict[str, int]] = []
+    legacy_samples = 0
+
+    for sample in samples:
+        info = sample.spec_info
+        if info.nodes:
+            for node_key, counters in info.nodes.items():
+                _record_spec_node(node_counts, node_key, counters)
+            continue
+        # One sample owns these totals, so no cross-sample deduplication applies.
+        counters = info.counter_values()
+        if info.counts_reported is None:
+            # A legacy dump has no report flag. ``completion_token_num`` is filled for
+            # every response, so only a draft or verify counter proves a report.
+            if not (counters.get("spec_draft_token_num", 0) > 0 or counters.get("spec_verify_ct", 0) > 0):
+                counters = {}
+            legacy_samples += 1
+        sample_records.append(counters)
+
+    records = [*node_counts.values(), *sample_records]
+    if not records:
+        return {}
+
+    counters_reported = sum(all(key in counters for key in SPEC_COUNTER_KEYS) for counters in records)
+    nodes_total = len(records)
+    # Each ratio sums only the records that carry its own denominator, so completion
+    # tokens of a record without verify steps cannot inflate the accept length.
+    accepted = proposed = completion = verify = 0
+    acceptance_covered = length_covered = 0
+    for counters in records:
+        if "spec_accept_token_num" in counters and "spec_draft_token_num" in counters:
+            acceptance_covered += 1
+            accepted += counters["spec_accept_token_num"]
+            proposed += counters["spec_draft_token_num"]
+        if "completion_token_num" in counters and "spec_verify_ct" in counters:
+            length_covered += 1
+            if counters["spec_verify_ct"] > 0:
+                completion += counters["completion_token_num"]
+                verify += counters["spec_verify_ct"]
+
+    metrics: dict[str, float] = {}
+    if proposed > 0:
+        metrics["spec_accept_rate"] = accepted / proposed
+    if verify > 0:
+        metrics["spec_accept_length"] = completion / verify
+    metrics["spec_nodes_total"] = float(nodes_total)
+    metrics["spec_nodes_missing_counts"] = float(nodes_total - counters_reported)
+    metrics["spec_coverage"] = counters_reported / nodes_total
+    metrics["spec_accept_rate_coverage"] = acceptance_covered / nodes_total
+    metrics["spec_accept_length_coverage"] = length_covered / nodes_total
+    if legacy_samples:
+        metrics["spec_legacy_samples"] = float(legacy_samples)
+    return metrics
 
 
 def compression_ratio(

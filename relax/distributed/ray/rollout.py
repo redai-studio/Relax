@@ -44,6 +44,7 @@ from relax.utils.metrics.metric_utils import (
     compute_pass_rate,
     compute_rollout_reward_metrics,
     compute_rollout_step,
+    compute_spec_decoding_metrics,
     compute_statistics,
     dict_add_prefix,
     has_repetition,
@@ -4939,11 +4940,7 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
 def _compute_spec_metrics(args, all_samples: list[Sample]):
     if getattr(args, "sglang_speculative_algorithm", None) is None:
         return {}
-    num_samples = len(all_samples)
-    metrics = {}
-    metrics["spec_accept_rate"] = sum(sample.spec_info.spec_accept_rate for sample in all_samples) / num_samples
-    metrics["spec_accept_length"] = sum(sample.spec_info.spec_accept_length for sample in all_samples) / num_samples
-    return metrics
+    return compute_spec_decoding_metrics(all_samples)
 
 
 def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):
