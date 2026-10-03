@@ -25,7 +25,7 @@ python scripts/data/prepare_ultrafeedback_preferences.py \
 }
 ```
 
-chosen/rejected 必须共享完全相同的 prompt，并包含不同且非空的 assistant completion。
+chosen/rejected 必须共享完全相同的 prompt，并包含不同的 assistant completion。
 
 ## 启动标准 DPO
 

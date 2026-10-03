@@ -25,7 +25,7 @@ Each input row contains one complete preference pair:
 }
 ```
 
-Chosen and rejected branches must have an identical prompt and different, non-empty assistant completions.
+Chosen and rejected branches must have an identical prompt and different assistant completions.
 
 ## Launch standard DPO
 
