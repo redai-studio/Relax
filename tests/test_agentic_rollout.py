@@ -16,6 +16,7 @@ import pytest
 from relax.agentic.pipeline import (
     GroupExport,
     GroupInput,
+    RuntimeGroupError,
     SampleExport,
     SessionExport,
 )
@@ -43,6 +44,7 @@ from relax.agentic.session.service import (
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
 from relax.utils.types import Sample
+from tests.agentic.lora_helpers import commit_ready
 
 
 # ``relax.agentic.rollout`` only needs this logging helper at import time. Keep
@@ -703,6 +705,7 @@ async def test_terminal_session_closes_lifecycle_once() -> None:
         abort_request=AsyncMock(),
         close_session=AsyncMock(return_value=True),
     )
+    shard._lora_registry = None
     shard._lifecycle_close_count = 0
     shard._lifecycle_close_failure_count = 0
     shard._notify_state_change = lambda group=None: None
@@ -941,3 +944,708 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
         }
     ]
     assert client.releases == ["lease-1"]
+
+
+# ---------------------------------------------------------------------------
+# Immutable LoRA version binding (Task 7)
+# ---------------------------------------------------------------------------
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+class _RemoteCall:
+    """Awaitable mimicking a Ray ObjectRef: awaiting it runs the call at most
+    once."""
+
+    def __init__(self, fn, args) -> None:
+        self._fn = fn
+        self._args = args
+        self._task: Any = None
+
+    def __await__(self) -> Any:
+        if self._task is None:
+            self._task = asyncio.ensure_future(self._fn(*self._args))
+        return self._task.__await__()
+
+
+class _RegistryCall:
+    """One registry actor method, with the ``.remote()``-returns-awaitable
+    shape."""
+
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def remote(self, *args: Any) -> Any:
+        return _RemoteCall(self._fn, args)
+
+
+class _FakeLoraRegistry:
+    """Ray actor handle stand-in backed by a real (in-process) registry."""
+
+    def __init__(self, core: Any) -> None:
+        self.core = core
+        self.bind_calls: list[str] = []
+        self.releases: list[str] = []
+        self.forgotten: list[tuple[str, ...]] = []
+        self.delay_s = 0.0
+        self.bind_latest = _RegistryCall(self._bind)
+        self.release = _RegistryCall(self._release)
+        self.forget_sessions = _RegistryCall(self._forget_sessions)
+
+    async def _bind(self, session_id: str) -> Any:
+        self.bind_calls.append(session_id)
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        return self.core.bind_latest(session_id)
+
+    async def _release(self, session_id: str) -> Any:
+        self.releases.append(session_id)
+        return self.core.release(session_id)
+
+    async def _forget_sessions(self, session_ids: tuple[str, ...]) -> None:
+        self.forgotten.append(session_ids)
+        self.core.forget_sessions(session_ids)
+
+
+def _published_registry(digest: str = _DIGEST_A, epoch: str = "epoch0") -> Any:
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+
+    core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch=epoch)
+    publication = core.allocate(digest, version_id=1)
+    commit_ready(core, publication.version_id, publication.attempt_id)
+    return core
+
+
+def _binding_shard(registry: Any) -> Any:
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._lora_registry = registry
+    shard._versioned_lora = True
+    return shard
+
+
+def _binding_session(session_id: str = "session-1") -> _SessionRecord:
+    result_cell = _SessionResultCell()
+    group = ResidentGroup(
+        rollout_mode="train",
+        group_id="group-1",
+        result_cells={session_id: result_cell},
+        sessions=[],
+    )
+    return _SessionRecord(
+        group=group,
+        session_id=session_id,
+        session_sampling_params={},
+        result_cell=result_cell,
+    )
+
+
+async def test_generate_carries_the_bound_lora_path(monkeypatch: Any) -> None:
+    payloads: list[dict[str, Any]] = []
+    retry_options = []
+
+    async def fake_post(url, payload, headers=None, **kwargs):
+        retry_options.append(kwargs)
+        del url, headers
+        payloads.append(dict(payload))
+        return {
+            "output_ids": [4],
+            "meta_info": {"output_token_logprobs": [], "finish_reason": {"type": "stop"}},
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    await adapter.generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="session-1",
+        request_id="request-1:0",
+        lora_path="relax_policy_lora@epoch0-1-aaaa",
+    )
+    assert payloads[-1]["lora_path"] == "relax_policy_lora@epoch0-1-aaaa"
+
+    await adapter.generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="session-1",
+        request_id="request-2:0",
+    )
+    assert "lora_path" not in payloads[-1]
+    assert retry_options == [{"max_retries": 1, "fallback_to_local": False}, {}]
+
+
+async def test_first_bind_is_shared_and_keeps_the_version() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    bindings = await asyncio.gather(
+        shard._ensure_session_policy_binding(session),
+        shard._ensure_session_policy_binding(session),
+    )
+    assert registry.bind_calls == ["session-1"]
+    assert bindings[0].lora_name == bindings[1].lora_name
+    assert session.bound_lora_name == bindings[0].lora_name
+    assert session.bound_lora_digest == bindings[0].digest == _DIGEST_A
+    assert session.binding_task is None
+
+    # A later publication must not move an already-bound Session.
+    second = core.allocate(_DIGEST_B, version_id=2)
+    commit_ready(core, second.version_id, second.attempt_id)
+    again = await shard._ensure_session_policy_binding(session)
+    assert again.lora_name == bindings[0].lora_name
+    assert again == bindings[0] == bindings[1]
+
+
+async def test_versioned_generation_does_not_fallback_after_distributed_reply_loss(monkeypatch: Any) -> None:
+    from relax.utils import http_utils
+
+    submitted = []
+    lost_reply = RuntimeError("Ray reply lost after generation was accepted")
+
+    async def remote(url, payload, max_retries, headers=None):
+        submitted.append(dict(payload))
+        assert max_retries == 1
+        raise lost_reply
+
+    actor = SimpleNamespace(do_post=SimpleNamespace(remote=remote))
+    local_post = AsyncMock()
+    monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
+    monkeypatch.setattr(http_utils, "_post_actors", [actor])
+    monkeypatch.setattr(http_utils, "_next_actor", lambda: actor)
+    monkeypatch.setattr(http_utils, "_post", local_post)
+    monkeypatch.setattr(runtime_mod, "post", http_utils.post)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    with pytest.raises(RuntimeError) as error:
+        await adapter.generate(
+            input_ids=[1, 2, 3],
+            sampling_params={"max_new_tokens": 4},
+            session_id="session-1",
+            request_id="request-1:0",
+            lora_path="relax_policy_lora@epoch0-1-aaaa",
+        )
+    assert error.value is lost_reply
+    assert len(submitted) == 1
+    assert submitted[0]["rid"] == "request-1:0"
+    assert submitted[0]["lora_path"] == "relax_policy_lora@epoch0-1-aaaa"
+    local_post.assert_not_awaited()
+
+
+async def test_ir_abort_resume_and_later_turn_keep_version_after_publication(monkeypatch: Any) -> None:
+    from relax.agentic.session.service import GroupOwnership
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    shard.args = SimpleNamespace(
+        agentic_admission_scope="all",
+        partial_rollout=False,
+        agentic_reasoning_parser=None,
+        agentic_tool_call_parser=None,
+    )
+    shard._admission_client = None
+    shard._generation_backend = _backend_adapter(lifecycle_enabled=False)
+    shard._acquire_sglang_request_permit = AsyncMock()
+    shard._release_sglang_request_permit = AsyncMock()
+    shard._notify_state_change = lambda group=None: None
+    shard._train_generation_open = True
+    payloads = []
+
+    async def respond(url: str, payload: dict, **kwargs: Any) -> dict:
+        payloads.append(dict(payload))
+        interrupted = len(payloads) == 1
+        if interrupted:
+            shard._train_generation_open = False
+        token = ord("X") if interrupted else ord("Y")
+        return {
+            "output_ids": [token],
+            "meta_info": {
+                "output_token_logprobs": [[-0.1, token, None]],
+                "finish_reason": {"type": "abort" if interrupted else "stop"},
+            },
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", respond)
+
+    def make_session(sid: str) -> tuple[Any, Any]:
+        session = _binding_session(sid)
+        session.group.ownership = GroupOwnership.RUNTIME
+        session.forest, parent = _forest_with_initial_obs(
+            session_id=sid,
+            messages=[{"role": "user", "content": "p"}],
+            train_token_delta=[112],
+            rollout_token_delta=[112],
+        )
+        return session, parent
+
+    def dispatch(session: Any, parent: Any, request_id: str, prefix: list[int]) -> InflightRequest:
+        ir = InflightRequest(
+            request_id=request_id,
+            parent_state_hash=parent.state_hash,
+            rollout_id=0,
+            kind=RequestKind.FRESH,
+            abort_count=0,
+            waiter=asyncio.get_running_loop().create_future(),
+            wall_started_at=time.monotonic(),
+            sampling_params={"max_new_tokens": 4},
+            history_train_token_prefix=prefix,
+            history_rollout_token_prefix=prefix,
+        )
+        session.live_irs.add(ir)
+        session.queued_irs.append(ir)
+        shard._dispatch_queued_irs_locked(session)
+        return ir
+
+    old, parent = make_session("old")
+    ir = dispatch(old, parent, "first", [112])
+    await asyncio.wait_for(ir.runner_task, timeout=5)
+    assert not ir.waiter.done() and ir.abort_count == 1
+    assert ir.pending_token_delta == [88] and ir in old.queued_irs
+    name_a = old.bound_lora_name
+
+    publication_b = core.allocate(_DIGEST_B, version_id=2)
+    commit_ready(core, publication_b.version_id, publication_b.attempt_id)
+    shard._train_generation_open = True
+    shard._dispatch_queued_irs_locked(old)
+    result = await asyncio.wait_for(ir.waiter, timeout=5)
+    assert result["message"]["content"] == "XY"
+    assert payloads[1]["input_ids"] == [112, 88]
+    assert payloads[1]["rid"] == "first:1"
+    assert payloads[1]["sampling_params"]["max_new_tokens"] == 3
+
+    followup = old.forest.append_obs(
+        parent_state_hash=old.resp_state_hash_by_request_id["first"],
+        rollout_id=0,
+        abort_count=0,
+        messages_delta=check_messages([{"role": "user", "content": "next"}]),
+        train_token_delta=[113],
+        rollout_token_delta=[113],
+    )
+    later = dispatch(old, followup, "later", [112, 88, 89, 113])
+    await asyncio.wait_for(later.waiter, timeout=5)
+    new, new_parent = make_session("new")
+    fresh = dispatch(new, new_parent, "fresh", [112])
+    await asyncio.wait_for(fresh.waiter, timeout=5)
+    assert [p["lora_path"] for p in payloads] == [name_a, name_a, name_a, publication_b.lora_name]
+    assert registry.bind_calls == ["old", "new"]
+    assert core.claim_reclaimable() is None
+    await shard._release_session_lora_ref(old)
+    assert core.claim_reclaimable().lora_name == name_a
+
+
+async def test_cancelling_one_waiter_does_not_cancel_the_shared_bind() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.05
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    first = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    second = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    binding = await second
+    assert registry.bind_calls == ["session-1"]
+    assert session.bound_lora_name == binding.lora_name
+    assert session.bound_lora_digest == binding.digest == _DIGEST_A
+
+
+async def test_failed_bind_is_retried_by_the_next_turn() -> None:
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+
+    core = LoRAVersionRegistry(logical_capacity=2, deployment_epoch="epoch0")
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+
+    with pytest.raises(AgenticChatRequestError) as error:
+        await shard._ensure_session_policy_binding(session)
+    assert error.value.code == "no_published_version"
+    assert session.binding_task is None
+
+    publication = core.allocate(_DIGEST_A, version_id=1)
+    commit_ready(core, publication.version_id, publication.attempt_id)
+    binding = await shard._ensure_session_policy_binding(session)
+    assert binding.lora_name == publication.lora_name
+    assert registry.bind_calls == ["session-1", "session-1"]
+
+
+async def test_bind_completing_after_finalize_releases_the_ref() -> None:
+    from relax.agentic.session.service import SessionPhase
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.02
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    session.phase = SessionPhase.FINALIZING
+
+    with pytest.raises(AgenticChatRequestError) as error:
+        await shard._ensure_session_policy_binding(session)
+    assert error.value.code == "session_discarded"
+    assert registry.releases == ["session-1"]
+    assert session.bound_lora_name is None
+    assert core.status().session_bindings == {}
+
+
+async def test_finished_session_releases_its_version_ref_once() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+    shard = object.__new__(shard_cls)
+    shard._lora_registry = registry
+    shard._versioned_lora = True
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(
+        abort_request=AsyncMock(),
+        close_session=AsyncMock(return_value=True),
+    )
+    shard._lifecycle_close_count = 0
+    shard._lifecycle_close_failure_count = 0
+    shard._notify_state_change = lambda group=None: None
+
+    session = _binding_session()
+    session.group.sessions.append(session)
+    shard._session_records = {session.session_id: session}
+    await shard._ensure_session_policy_binding(session)
+
+    assert await shard_cls._finish_session(shard, session, None) is None
+    assert await shard_cls._finish_session(shard, session, None) is None
+    assert registry.releases == ["session-1"]
+    assert core.status().session_bindings == {}
+
+
+def _lora_cleanup_shard(registry: Any, session: _SessionRecord) -> Any:
+    shard = _binding_shard(registry)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._notify_state_change = lambda group=None: None
+    shard._session_records = {session.session_id: session}
+    session.group.sessions.append(session)
+    shard._groups = {session.group.group_id: session.group}
+    return shard
+
+
+@pytest.mark.parametrize("cleanup", ["release_group", "drop_group"])
+async def test_group_cleanup_bounds_lora_tombstones(cleanup: str) -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    for index in range(20):
+        session = _binding_session(f"session-{index}")
+        shard = _lora_cleanup_shard(registry, session)
+        await shard._ensure_session_policy_binding(session)
+        if cleanup == "release_group":
+            await shard._finish_session(session, None)
+            assert core.closed_sessions == {f"epoch0:{session.session_id}"}
+        await getattr(shard, cleanup)(session.group.group_id)
+        assert not core.closed_sessions
+        assert not core.session_bindings
+        assert not shard._session_records
+        assert not shard._groups
+    assert len(registry.forgotten) == 20
+
+
+@pytest.mark.parametrize("cleanup", ["release_group", "drop_group"])
+async def test_group_retained_for_retry_after_lora_forget_ack_loss(cleanup: str) -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    session = _binding_session()
+    shard = _lora_cleanup_shard(registry, session)
+    await shard._ensure_session_policy_binding(session)
+    if cleanup == "release_group":
+        await shard._finish_session(session, None)
+
+    async def forget_with_lost_ack(session_ids: tuple[str, ...]) -> None:
+        assert not shard._session_records
+        await registry._forget_sessions(session_ids)
+        if len(registry.forgotten) == 1:
+            raise RuntimeError("lost forget ACK")
+
+    registry.forget_sessions = _RegistryCall(forget_with_lost_ack)
+    with pytest.raises(RuntimeError, match="lost forget ACK"):
+        await getattr(shard, cleanup)(session.group.group_id)
+    assert shard._groups[session.group.group_id] is session.group
+    assert not core.closed_sessions
+    await getattr(shard, cleanup)(session.group.group_id)
+    await getattr(shard, cleanup)(session.group.group_id)
+    assert not shard._groups
+    assert registry.forgotten == [(session.session_id,), (session.session_id,)]
+
+
+async def test_group_forget_waits_for_binding_even_when_drop_waiter_is_cancelled() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    session = _binding_session()
+    shard = _lora_cleanup_shard(registry, session)
+    bind_started = asyncio.Event()
+    complete_bind = asyncio.Event()
+    release_started = asyncio.Event()
+
+    async def delayed_bind(session_id: str) -> Any:
+        bind_started.set()
+        await complete_bind.wait()
+        return await registry._bind(session_id)
+
+    registry.bind_latest = _RegistryCall(delayed_bind)
+    session.binding_task = asyncio.create_task(shard._bind_session_policy(session.session_id))
+    await bind_started.wait()
+    release_ref = shard._release_session_lora_ref
+
+    async def observed_release(record: _SessionRecord) -> None:
+        release_started.set()
+        await release_ref(record)
+
+    async def checked_forget(session_ids: tuple[str, ...]) -> None:
+        assert session.binding_task.done()
+        assert registry.releases == [session.session_id]
+        assert not shard._session_records
+        await registry._forget_sessions(session_ids)
+
+    shard._release_session_lora_ref = observed_release
+    registry.forget_sessions = _RegistryCall(checked_forget)
+    drop = asyncio.create_task(shard.drop_group(session.group.group_id))
+    await release_started.wait()
+    assert not registry.releases
+    assert not registry.forgotten
+    assert session.session_id in shard._session_records
+    drop.cancel()
+    complete_bind.set()
+    with pytest.raises(asyncio.CancelledError):
+        await drop
+    assert not shard._groups
+    assert not core.closed_sessions
+    assert not core.session_bindings
+    assert registry.forgotten == [(session.session_id,)]
+    result = await shard.chat(
+        session_id=session.session_id,
+        messages=[],
+        tools=[],
+        chat_template_kwargs={},
+        max_completion_tokens=None,
+        stop=None,
+        seed=None,
+    )
+    assert result["error"]["code"] == "session_discarded"
+    assert registry.bind_calls == [session.session_id]
+
+
+async def test_cancelled_only_waiter_retains_binding_for_next_ir_and_close() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    registry.delay_s = 0.05
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    waiter = asyncio.create_task(shard._ensure_session_policy_binding(session))
+    await asyncio.sleep(0)
+    owned_task = session.binding_task
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert session.binding_task is owned_task
+    assert owned_task is not None and not owned_task.cancelled()
+    binding = await shard._ensure_session_policy_binding(session)
+    assert registry.bind_calls == [session.session_id]
+    assert binding.lora_name == session.bound_lora_name
+    assert binding.digest == session.bound_lora_digest == _DIGEST_A
+    await shard._release_session_lora_ref(session)
+    assert core.status().session_bindings == {}
+
+
+async def test_versioned_generation_does_not_retry_lost_http_response(monkeypatch) -> None:
+    import httpx
+
+    from relax.utils.http_utils import _post
+
+    calls = []
+
+    class LostResponseClient:
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            raise httpx.ReadTimeout("backend may have accepted this request")
+
+    async def real_retry_policy(url, payload, *, fallback_to_local, **kwargs):
+        assert fallback_to_local is False
+        return await _post(LostResponseClient(), url, payload, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "post", real_retry_policy)
+    adapter = _backend_adapter(lifecycle_enabled=False)
+    with pytest.raises(httpx.ReadTimeout):
+        await adapter.generate(
+            input_ids=[1],
+            sampling_params={"max_new_tokens": 1},
+            session_id="s",
+            request_id="r",
+            lora_path="relax_policy_lora@epoch-1-digest",
+        )
+    assert len(calls) == 1
+
+
+async def test_lora_release_retries_lost_ack_without_leaking_ref() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    calls = 0
+
+    async def release(session_id: str) -> None:
+        nonlocal calls
+        calls += 1
+        core.release(session_id)
+        if calls == 1:
+            raise RuntimeError("lost release ACK")
+
+    registry.release = _RegistryCall(release)
+    await shard._release_session_lora_ref(session)
+    assert calls == 2
+    assert not core.session_bindings
+
+
+async def test_finish_retains_session_after_unconfirmed_lora_release_and_can_retry() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._notify_state_change = lambda group=None: None
+    shard._session_records = {session.session_id: session}
+    session.group.sessions.append(session)
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard._finish_session(session, None)
+    assert session.session_id in shard._session_records
+    assert core.session_bindings
+    registry.release = _RegistryCall(registry._release)
+    assert await shard._finish_session(session, None) is None
+    assert not shard._session_records
+    assert not core.session_bindings
+
+
+async def test_background_cleanup_failure_is_visible_and_public_drop_can_retry() -> None:
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    changes = []
+    shard._notify_state_change = lambda group=None: changes.append(group)
+    shard._session_records = {session.session_id: session}
+    group = session.group
+    group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    # This is the path used by the process watcher for infrastructure failures.
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard._handle_infra_failure(session, RuntimeError("agent failed"))
+    assert group.first_error() is session.cleanup_error
+    assert not group.terminal
+    assert changes[-1] is group
+    health = await shard.health()
+    assert not health["ok"]
+    assert session.session_id in health["cleanup_errors"]
+    with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+        shard._raise_group_error(group)
+
+    # Exercise the public method, including its shared drop_task, not just _finish_session.
+    with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+        await shard.drop_group(group.group_id)
+    assert shard._groups[group.group_id] is group
+    assert session.session_id in shard._session_records
+    assert core.session_bindings
+    assert not registry.forgotten
+    registry.release = _RegistryCall(registry._release)
+    await asyncio.gather(shard.drop_group(group.group_id), shard.drop_group(group.group_id))
+    assert not shard._groups
+    assert not shard._session_records
+    assert not core.session_bindings
+    assert not core.closed_sessions
+    assert session.cleanup_error is None
+    assert (await shard.health())["ok"]
+    await shard.drop_group(group.group_id)
+
+
+@pytest.mark.parametrize("barrier_already_ready", [False, True])
+async def test_cleanup_failure_reaches_runtime_waiters_via_progress(barrier_already_ready: bool) -> None:
+    import pickle
+
+    core = _published_registry()
+    registry = _FakeLoraRegistry(core)
+    shard = _binding_shard(registry)
+    session = _binding_session()
+    await shard._ensure_session_policy_binding(session)
+    shard.args = SimpleNamespace(agentic_session_lifecycle=False)
+    shard._generation_backend = SimpleNamespace(abort_request=AsyncMock())
+    shard._state_revision = 0
+    shard._state_changed = asyncio.Event()
+    group = session.group
+    group.sessions.append(session)
+    shard._groups = {group.group_id: group}
+    shard._session_records = {session.session_id: session}
+
+    async def failed_release(session_id: str) -> None:
+        raise RuntimeError("registry unavailable")
+
+    registry.release = _RegistryCall(failed_release)
+    binding = runtime_mod._SessionShardBinding(
+        actor_name="test-shard",
+        handle=SimpleNamespace(wait_for_state_change=_RegistryCall(shard.wait_for_state_change)),
+    )
+    runtime = RuntimeDomain(SimpleNamespace(), "train", [binding], 1, None)
+    loop = asyncio.get_running_loop()
+    result = runtime_mod._SessionResultRef(session.session_id, loop.create_future())
+    completed_result = runtime_mod._SessionResultRef("already-completed", loop.create_future())
+    completed_result.completion.set_result(None)
+    stream = runtime_mod.RuntimeGroupStream(
+        group.group_id, binding, loop.create_future(), (result, completed_result), protected=True
+    )
+    binding.group_streams[group.group_id] = stream
+    if barrier_already_ready:
+        stream.first_request_barrier.set_result(True)
+    observer = asyncio.create_task(runtime._watch_shard_progress(binding))
+    try:
+        with pytest.raises(RuntimeGroupError, match="release unconfirmed"):
+            await shard._handle_infra_failure(session, RuntimeError("agent failed"))
+        with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+            await asyncio.wait_for(asyncio.shield(result.completion), 1)
+        if barrier_already_ready:
+            assert stream.first_request_barrier.result() is True
+        else:
+            with pytest.raises(RuntimeGroupError, match="Session cleanup failed"):
+                await stream.first_request_barrier
+        assert completed_result.completion.result() is None
+        assert not stream.protected
+        assert result.take_task is None
+        assert not observer.done()  # A Group failure does not kill the shared Shard observer.
+
+        # Wire payload stays serializable; repeated delivery cannot overwrite terminal futures.
+        progress = pickle.loads(pickle.dumps(shard._current_progress(0)))
+        assert "release unconfirmed" in progress.groups[0].error
+        runtime._apply_shard_progress(binding, progress)
+        assert isinstance(result.completion.exception(), RuntimeGroupError)
+        assert shard._session_records[session.session_id] is session
+        assert core.session_bindings  # Reporting failure must not pretend release succeeded.
+
+        registry.release = _RegistryCall(registry._release)
+        await shard.drop_group(group.group_id)
+        assert not core.session_bindings
+        assert not shard._session_records
+    finally:
+        observer.cancel()
+        await asyncio.gather(observer, return_exceptions=True)

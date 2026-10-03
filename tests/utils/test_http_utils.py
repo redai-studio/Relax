@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from relax.utils import http_utils
 from relax.utils.http_utils import _post, router_worker_base_url, router_worker_base_urls
 
 
@@ -55,6 +57,41 @@ def test_post_retries_retryable_503_then_succeeds():
 
     assert result == {"ok": True}
     assert client.calls == 2
+
+
+@pytest.mark.parametrize("fallback_to_local", [False, True])
+def test_distributed_post_lost_reply_respects_fallback_policy(monkeypatch, fallback_to_local):
+    remote_client = _StubClient([_response(200, body={"accepted": True})])
+    local_client = _StubClient([_response(200, body={"local": True})])
+    lost_reply = RuntimeError("Ray reply lost after HTTP request completed")
+
+    async def remote(url, payload, max_retries, headers=None):
+        await _post(remote_client, url, payload, max_retries, headers=headers)
+        raise lost_reply
+
+    actor = SimpleNamespace(do_post=SimpleNamespace(remote=remote))
+    monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
+    monkeypatch.setattr(http_utils, "_post_actors", [actor])
+    monkeypatch.setattr(http_utils, "_next_actor", lambda: actor)
+    monkeypatch.setattr(http_utils, "_http_client", local_client)
+    options = {} if fallback_to_local else {"fallback_to_local": False}
+    if fallback_to_local:
+        assert asyncio.run(http_utils.post("http://test/post", {}, max_retries=1, **options)) == {"local": True}
+    else:
+        with pytest.raises(RuntimeError) as error:
+            asyncio.run(http_utils.post("http://test/post", {}, max_retries=1, **options))
+        assert error.value is lost_reply
+    assert remote_client.calls == 1
+    assert local_client.calls == int(fallback_to_local)
+
+
+def test_post_without_distributed_actor_still_sends_once_when_fallback_disabled(monkeypatch):
+    client = _StubClient([_response(200, body={"ok": True})])
+    monkeypatch.setattr(http_utils, "_distributed_post_enabled", True)
+    monkeypatch.setattr(http_utils, "_post_actors", [])
+    monkeypatch.setattr(http_utils, "_http_client", client)
+    assert asyncio.run(http_utils.post("http://test/post", {}, max_retries=1, fallback_to_local=False)) == {"ok": True}
+    assert client.calls == 1
 
 
 @pytest.mark.parametrize(

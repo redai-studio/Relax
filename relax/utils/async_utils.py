@@ -1,5 +1,12 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import asyncio
 import threading
+
+from relax.utils.logging_utils import get_logger
+
+
+logger = get_logger(__name__)
 
 
 __all__ = ["get_async_loop", "run"]
@@ -33,12 +40,13 @@ def get_async_loop():
 
 
 def shutdown_async_loop(timeout: float = 5.0):
-    """Stop the global async event loop and **block** until its thread exits.
+    """Request loop shutdown and join its thread when called externally.
 
     Must be called before ``ray.shutdown()`` during global restart.  The call
-    is blocking: it waits for the event-loop thread to fully terminate so that
-    no C++ ObjectRefStream watchers survive into ``ray.shutdown()``. The next
-    call to :func:`run` will lazily create a fresh loop.
+    waits up to ``timeout`` for the event-loop thread when called externally. A
+    call from the loop thread only requests shutdown; the loop stops after the
+    current callback returns. The next call to :func:`run` lazily creates a
+    fresh loop.
     """
     global async_loop
     if async_loop is None:
@@ -47,7 +55,11 @@ def shutdown_async_loop(timeout: float = 5.0):
     async_loop = None
     loop = inst.loop
     loop.call_soon_threadsafe(loop.stop)
-    inst._thread.join(timeout=timeout)
+    if inst._thread is threading.current_thread():
+        # A shutdown callback running on this loop cannot join its own thread.
+        logger.warning("shutdown_async_loop() called from the async loop thread; skipping join")
+    else:
+        inst._thread.join(timeout=timeout)
 
 
 def run(coro):

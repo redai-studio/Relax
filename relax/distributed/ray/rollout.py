@@ -4540,6 +4540,11 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
         router_args.log_level = "warn"
         router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
+        if getattr(args, "enable_versioned_lora_publication", False):
+            # Backend acceptance may be unknown after a timeout. Only the IR
+            # lifecycle may decide to submit another versioned generation.
+            router_args.disable_retries = True
+            router_args.retry_max_retries = 1
 
         if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
             router_args.policy = args.sglang_router_policy
