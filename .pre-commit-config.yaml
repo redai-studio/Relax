@@ -40,6 +40,15 @@ repos:
     rev: v15.0.6
     hooks:
       - id: clang-format
+        exclude_types: [javascript, json]
+  - repo: https://github.com/ShigureLab/oxfmt-pre-commit-mirror
+    rev: v0.69.0
+    hooks:
+      - id: oxfmt
+        args: ["--config", ".oxfmtrc.json", "--no-error-on-unmatched-pattern"]
+        # Let oxfmt detect supported formats while leaving YAML and TOML unchanged.
+        types_or: [text]
+        exclude_types: [yaml, toml]
   - repo: local
     hooks:
       - id: docformatter

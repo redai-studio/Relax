@@ -1,0 +1,13 @@
+name: CI commands
+description: Rerun or cancel the current PR's CI and show command help
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v8
+      env:
+        CI_COMMANDS_PATH: ${{ github.action_path }}
+      with:
+        retries: 0
+        script: |
+          const { run } = await import(`${process.env.CI_COMMANDS_PATH}/index.mjs`);
+          await run({ github, context, core });
