@@ -23,6 +23,63 @@ def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
     return 0, 0
 
 
+# Counter fields of ``Sample.SpecInfo`` and of every per-node record it exports.
+SPEC_COUNTER_KEYS = (
+    "spec_accept_token_num",
+    "spec_draft_token_num",
+    "spec_verify_ct",
+    "completion_token_num",
+)
+
+
+def spec_token_counts_reported(meta_info: dict[str, Any]) -> bool:
+    """Whether the backend reported speculative decoding counters for this
+    request.
+
+    ``get_spec_token_counts`` returns ``(0, 0)`` both for a missing report and
+    for a genuine zero, so coverage accounting needs this separate signal.
+    """
+    return any(key != "completion_token_num" for key in get_spec_counter_values(meta_info))
+
+
+def normalize_spec_counter_values(counters: dict[str, Any]) -> dict[str, int]:
+    """Keep known non-negative integer counters, including explicit zeros."""
+    normalized: dict[str, int] = {}
+    for key in SPEC_COUNTER_KEYS:
+        value = counters.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count >= 0 and (isinstance(value, str) or value == count):
+            normalized[key] = count
+    return normalized
+
+
+def get_spec_counter_values(meta_info: dict[str, Any]) -> dict[str, int]:
+    """Normalize backend aliases without replacing missing counters with
+    zero."""
+    counters = {
+        "spec_verify_ct": meta_info.get("spec_verify_ct"),
+        "completion_token_num": meta_info.get("completion_tokens"),
+    }
+    for accept_key, draft_key in _SPEC_TOKEN_COUNT_KEYS:
+        if accept_key in meta_info or draft_key in meta_info:
+            counters["spec_accept_token_num"] = meta_info.get(accept_key)
+            counters["spec_draft_token_num"] = meta_info.get(draft_key)
+            break
+    return normalize_spec_counter_values(counters)
+
+
+def accumulate_spec_counter_values(previous: dict[str, int] | None, counters: dict[str, int]) -> dict[str, int]:
+    """Sum only fields reported by every attempt of a generation request."""
+    if previous is None:
+        return dict(counters)
+    return {key: previous[key] + counters[key] for key in SPEC_COUNTER_KEYS if key in previous and key in counters}
+
+
 @dataclass
 class Sample:
     """The sample generated."""
@@ -97,6 +154,18 @@ class Sample:
         spec_draft_token_num: int = 0
         spec_verify_ct: int = 0
         completion_token_num: int = 0
+        # Counters of every submitted generation node, keyed by node identity (the
+        # agentic rollout request id). A submitted node whose backend reported no
+        # counters keeps an empty record, so coverage can tell an explicit zero apart
+        # from a missing report.
+        nodes: dict[str, dict[str, int]] = field(default_factory=dict)
+        # Whether the totals above come from a backend report. Non-agentic rollouts
+        # carry no node identity and rely on this flag instead. ``None`` marks totals
+        # deserialized from a dump written before this flag existed.
+        counts_reported: bool | None = False
+        # None supports callers that explicitly mark all integer totals as reported.
+        # Serialized records preserve the exact known fields through JSON round trips.
+        available_counters: list[str] | None = None
 
         @property
         def spec_accept_rate(self) -> float:
@@ -106,28 +175,61 @@ class Sample:
         def spec_accept_length(self) -> float:
             return self.completion_token_num / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
-        def add(self, meta_info: dict):
-            spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-            self.spec_accept_token_num += spec_accept_token_num
-            self.spec_draft_token_num += spec_draft_token_num
-            self.spec_verify_ct += meta_info.get("spec_verify_ct", 0)
-            self.completion_token_num += meta_info.get("completion_tokens", 0)
+        def counter_values(self) -> dict[str, int]:
+            """Return totals whose availability is known, without inventing
+            zeros."""
+            keys = self.available_counters
+            if keys is None:
+                keys = SPEC_COUNTER_KEYS if self.counts_reported is not False else ()
+            return normalize_spec_counter_values({key: getattr(self, key) for key in keys})
 
-        def to_dict(self):
+        def add(self, meta_info: dict[str, Any]) -> None:
+            counters = get_spec_counter_values(meta_info)
+            previous = (
+                self.counter_values()
+                if self.available_counters is not None or self.counts_reported is not False
+                else None
+            )
+            known_totals = accumulate_spec_counter_values(previous, counters)
+            for key, value in counters.items():
+                setattr(self, key, getattr(self, key) + value)
+            self.available_counters = list(known_totals)
+            self.counts_reported = any(key != "completion_token_num" for key in known_totals)
+
+        def to_dict(self) -> dict[str, Any]:
             return {
                 "spec_accept_token_num": self.spec_accept_token_num,
                 "spec_draft_token_num": self.spec_draft_token_num,
                 "spec_verify_ct": self.spec_verify_ct,
                 "completion_token_num": self.completion_token_num,
+                "nodes": {node_key: dict(record) for node_key, record in self.nodes.items()},
+                "counts_reported": self.counts_reported,
+                "available_counters": None if self.available_counters is None else list(self.available_counters),
             }
 
         @staticmethod
-        def from_dict(data: dict):
+        def from_dict(data: dict[str, Any] | None) -> "Sample.SpecInfo":
+            data = data or {}
             info = Sample.SpecInfo()
-            info.spec_accept_token_num = data.get("spec_accept_token_num", 0)
-            info.spec_draft_token_num = data.get("spec_draft_token_num", 0)
-            info.spec_verify_ct = data.get("spec_verify_ct", 0)
-            info.completion_token_num = data.get("completion_token_num", 0)
+            counters = normalize_spec_counter_values(data)
+            for key, value in counters.items():
+                setattr(info, key, value)
+            # Dumps written before node identities were exported carry neither key.
+            info.nodes = {
+                str(node_key): normalize_spec_counter_values(dict(record or {}))
+                for node_key, record in (data.get("nodes") or {}).items()
+            }
+            counts_reported = data.get("counts_reported")
+            info.counts_reported = None if counts_reported is None else bool(counts_reported)
+            available = data.get("available_counters")
+            if "available_counters" in data and available is None and info.counts_reported is False:
+                # A fresh Sample has not seen an attempt. An empty list instead
+                # means an earlier attempt made every field unavailable.
+                info.available_counters = None
+                return info
+            if available is None:
+                available = counters if info.counts_reported is not False else ()
+            info.available_counters = [key for key in SPEC_COUNTER_KEYS if key in available and key in counters]
             return info
 
     spec_info: SpecInfo = field(default_factory=SpecInfo)
@@ -172,7 +274,12 @@ class Sample:
     def from_dict(data: dict):
         data = dict(data)
         data["status"] = Sample.Status(data["status"])
-        data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
+        spec_payload = data.get("spec_info")
+        data["spec_info"] = (
+            Sample.SpecInfo()
+            if not spec_payload and data["status"] is Sample.Status.PENDING
+            else Sample.SpecInfo.from_dict(spec_payload)
+        )
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
 
         field_names = set(Sample.__dataclass_fields__.keys())

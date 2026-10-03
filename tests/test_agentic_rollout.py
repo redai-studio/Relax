@@ -18,6 +18,7 @@ from relax.agentic.pipeline import (
     GroupInput,
     SampleExport,
     SessionExport,
+    TrainingFieldArtifact,
 )
 from relax.agentic.pipeline import runtime as runtime_mod
 from relax.agentic.pipeline.prepare import PrepareDomain
@@ -42,6 +43,7 @@ from relax.agentic.session.service import (
     _SessionResultCell,
 )
 from relax.agentic.session.state import InflightRequest, RequestKind, SessionForest, check_messages
+from relax.utils.metrics.metric_utils import compute_spec_decoding_metrics
 from relax.utils.types import Sample
 
 
@@ -345,6 +347,414 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     )
     assert session_spec.sampling_params == {"temperature": 0.2}
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def _spec_counters(accept: int, propose: int, *, verify: int = 0, completion: int = 0) -> dict[str, int]:
+    return {
+        "spec_accept_token_num": accept,
+        "spec_draft_token_num": propose,
+        "spec_verify_ct": verify,
+        "completion_token_num": completion,
+    }
+
+
+def _spec_forest_with_shared_response():
+    """``A -> B`` and ``A -> C``: two exported samples sharing submitted node
+    A."""
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sess-spec",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        train_token_delta=_chars("hello"),
+        rollout_token_delta=_chars("hello"),
+        rollout_id=5,
+    )
+    shared = forest.append_resp(
+        parent_state_hash=initial_obs.state_hash,
+        rollout_id=5,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "a"}]}],
+        token_delta=_chars("a"),
+        logprob_delta=[-0.1],
+        spec_delta=_spec_counters(4, 8, verify=2, completion=6),
+        spec_node_key="req_sess-spec_0",
+    )
+    branches = []
+    for suffix, counters in (
+        ("b", _spec_counters(1, 2, verify=1, completion=2)),
+        ("c", _spec_counters(1, 1, verify=1, completion=1)),
+    ):
+        branches.append(
+            forest.append_resp(
+                parent_state_hash=shared.state_hash,
+                rollout_id=5,
+                abort_count=0,
+                messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": suffix}]}],
+                token_delta=_chars(suffix),
+                logprob_delta=[-0.2],
+                spec_delta=counters,
+                spec_node_key=f"req_sess-spec_{len(branches) + 1}",
+            )
+        )
+    return forest, shared, branches
+
+
+def test_session_forest_exports_spec_counters_per_submitted_node() -> None:
+    forest, shared, (branch_b, branch_c) = _spec_forest_with_shared_response()
+
+    sample_b = forest.build_sample(leaf_state_hash=branch_b.state_hash, tokenizer=_FakeTokenizer())
+    sample_c = forest.build_sample(leaf_state_hash=branch_c.state_hash, tokenizer=_FakeTokenizer())
+
+    assert set(sample_b.spec_info.nodes) == {"req_sess-spec_0", "req_sess-spec_1"}
+    assert set(sample_c.spec_info.nodes) == {"req_sess-spec_0", "req_sess-spec_2"}
+    assert sample_b.spec_info.nodes["req_sess-spec_0"] == sample_c.spec_info.nodes["req_sess-spec_0"]
+    assert sample_b.spec_info.spec_accept_token_num == shared.spec_delta["spec_accept_token_num"] + 1
+
+
+def test_session_forest_spec_metrics_deduplicate_shared_generation_nodes() -> None:
+    forest, _, (branch_b, branch_c) = _spec_forest_with_shared_response()
+
+    samples = [
+        forest.build_sample(leaf_state_hash=branch_b.state_hash, tokenizer=_FakeTokenizer()),
+        forest.build_sample(leaf_state_hash=branch_c.state_hash, tokenizer=_FakeTokenizer()),
+    ]
+
+    metrics = compute_spec_decoding_metrics(samples)
+
+    assert metrics["spec_nodes_total"] == 3.0
+    assert metrics["spec_accept_rate"] == pytest.approx(6 / 11)
+    assert metrics["spec_accept_length"] == pytest.approx(9 / 4)
+
+
+def test_session_forest_keeps_counters_of_content_identical_requests() -> None:
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sess-spec-identical",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        train_token_delta=_chars("hello"),
+        rollout_token_delta=_chars("hello"),
+        rollout_id=5,
+    )
+    response_kwargs = {
+        "parent_state_hash": initial_obs.state_hash,
+        "rollout_id": 5,
+        "abort_count": 0,
+        "messages_delta": [{"role": "assistant", "content": [{"type": "text", "text": "same"}]}],
+        "token_delta": _chars("same"),
+        "logprob_delta": [-0.1, -0.1, -0.1, -0.1],
+    }
+    first = forest.append_resp(
+        **response_kwargs,
+        spec_delta=_spec_counters(1, 2),
+        spec_node_key="req_sess-spec-identical_0",
+    )
+    second = forest.append_resp(
+        **response_kwargs,
+        spec_delta=_spec_counters(3, 4),
+        spec_node_key="req_sess-spec-identical_1",
+    )
+
+    # Identical content collapses onto one state hash, but both requests were submitted.
+    assert second is first
+    assert set(first.spec_node_records) == {
+        "req_sess-spec-identical_0",
+        "req_sess-spec-identical_1",
+    }
+    sample = forest.build_sample(leaf_state_hash=first.state_hash, tokenizer=_FakeTokenizer())
+    # The sample totals agree with its per-request records.
+    assert sample.spec_info.spec_accept_token_num == 4
+    assert sample.spec_info.spec_draft_token_num == 6
+    metrics = compute_spec_decoding_metrics([sample])
+    assert metrics["spec_nodes_total"] == 2.0
+    assert metrics["spec_accept_rate"] == pytest.approx(4 / 6)
+
+
+def test_session_forest_records_unreported_spec_counters_as_missing() -> None:
+    forest, initial_obs = _forest_with_initial_obs(
+        session_id="sess-spec-missing",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        train_token_delta=_chars("hello"),
+        rollout_token_delta=_chars("hello"),
+        rollout_id=5,
+    )
+    leaf = forest.append_resp(
+        parent_state_hash=initial_obs.state_hash,
+        rollout_id=5,
+        abort_count=0,
+        messages_delta=[{"role": "assistant", "content": [{"type": "text", "text": "a"}]}],
+        token_delta=_chars("a"),
+        logprob_delta=[-0.1],
+        spec_node_key="req_sess-spec-missing_0",
+        spec_node_counts_reported=False,
+    )
+
+    sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
+    metrics = compute_spec_decoding_metrics([sample])
+
+    assert sample.spec_info.nodes == {"req_sess-spec-missing_0": {}}
+    assert metrics["spec_nodes_missing_counts"] == 1.0
+    assert metrics["spec_coverage"] == 0.0
+    assert "spec_accept_rate" not in metrics
+
+
+def test_agentic_session_accumulates_spec_counters_and_report_flag() -> None:
+    async def _request_with(meta_info: dict[str, Any]) -> InflightRequest:
+        request = InflightRequest(
+            request_id="req_sess-spec_0",
+            parent_state_hash="hash",
+            rollout_id=5,
+            kind=RequestKind.FRESH,
+            abort_count=0,
+            waiter=asyncio.get_running_loop().create_future(),
+            wall_started_at=0.0,
+        )
+        AgenticSessionShard._accumulate_request_meta(request, meta_info=meta_info)
+        return request
+
+    reported = asyncio.run(_request_with({"spec_accept_token_num": 3, "spec_draft_token_num": 4}))
+    missing = asyncio.run(_request_with({"prompt_tokens": 7}))
+
+    assert reported.pending_spec_delta["spec_accept_token_num"] == 3
+    assert reported.pending_spec_delta["spec_draft_token_num"] == 4
+    assert reported.pending_spec_counts_reported is True
+    assert missing.pending_spec_delta["spec_draft_token_num"] == 0
+    assert missing.pending_spec_counts_reported is False
+
+
+class _SpecSessionHarness:
+    """Commit backend results through the real shard path of one Session."""
+
+    def __init__(self, session_id: str, *, speculative_algorithm: str | None = "EAGLE") -> None:
+        shard_cls = AgenticSessionShard.__ray_metadata__.modified_class
+        self.shard = object.__new__(shard_cls)
+        self.shard.args = SimpleNamespace(
+            sglang_speculative_algorithm=speculative_algorithm,
+            agentic_reasoning_parser=None,
+            agentic_tool_call_parser=None,
+        )
+        self.shard._generation_backend = SimpleNamespace(tokenizer=_FakeTokenizer())
+        self.forest, self.initial_obs = _forest_with_initial_obs(
+            session_id=session_id,
+            messages=[{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            train_token_delta=_chars("hello"),
+            rollout_token_delta=_chars("hello"),
+            rollout_id=5,
+        )
+        result_cell = _SessionResultCell()
+        group = ResidentGroup(
+            rollout_mode="train",
+            group_id=f"group-{session_id}",
+            result_cells={session_id: result_cell},
+            sessions=[],
+        )
+        self.session = _SessionRecord(
+            group=group,
+            session_id=session_id,
+            session_sampling_params={},
+            result_cell=result_cell,
+            forest=self.forest,
+        )
+
+    def commit(self, text: str, *meta_infos: dict[str, Any], parent_state_hash: str | None = None) -> str:
+        """Apply one backend attempt per ``meta_info``, then commit."""
+
+        async def _commit() -> str:
+            session = self.session
+            ir = InflightRequest(
+                request_id=f"req_{session.session_id}_{session.next_ir_sequence}",
+                parent_state_hash=parent_state_hash or self.initial_obs.state_hash,
+                rollout_id=5,
+                kind=RequestKind.FRESH,
+                abort_count=0,
+                waiter=asyncio.get_running_loop().create_future(),
+                wall_started_at=time.monotonic(),
+            )
+            session.next_ir_sequence += 1
+            tokens = _chars(text)
+            for attempt, meta_info in enumerate(meta_infos):
+                # An aborted attempt resumes on the same request, so only the last
+                # attempt carries the rest of the text.
+                new_tokens = tokens if attempt == len(meta_infos) - 1 else []
+                result = SimpleNamespace(
+                    new_tokens=new_tokens,
+                    new_log_probs=[-0.1] * len(new_tokens),
+                    elapsed=0.01,
+                    meta_info=meta_info,
+                )
+                self.shard._apply_generate_result(ir, result)
+            ir.pending_status = "completed"
+            self.shard._terminal_response_locked(session=session, ir=ir, finish_type="stop")
+            return session.resp_state_hash_by_request_id[ir.request_id]
+
+        return asyncio.run(_commit())
+
+    def export(self, leaf_state_hash: str) -> Sample:
+        """Export one leaf through the same payload Runtime receives."""
+        sample = self.forest.build_sample(leaf_state_hash=leaf_state_hash, tokenizer=_FakeTokenizer())
+        payload = self.shard._export_payload(name=None, sample=sample)
+        return TrainingFieldArtifact(sample_payload=payload["sample_payload"]).to_sample()
+
+
+def _spec_meta(accept: int, propose: int, *, verify: int, completion: int) -> dict[str, Any]:
+    """SGLang ``meta_info`` with the current speculative counter names."""
+    return {
+        "spec_num_correct_drafts": accept,
+        "spec_num_proposed_drafts": propose,
+        "spec_verify_ct": verify,
+        "completion_tokens": completion,
+    }
+
+
+def test_agentic_spec_metrics_flow_from_meta_info_through_export_to_batch_metrics() -> None:
+    """``A -> B`` and ``A -> C`` count A once; 1/2 and 9/10 give 10/12."""
+    harness = _SpecSessionHarness("sess-e2e")
+    node_a = harness.commit("a", _spec_meta(1, 2, verify=1, completion=2))
+    node_b = harness.commit("b", _spec_meta(9, 10, verify=2, completion=11), parent_state_hash=node_a)
+    node_c = harness.commit("c", _spec_meta(2, 4, verify=1, completion=3), parent_state_hash=node_a)
+
+    samples = [harness.export(node_b), harness.export(node_c)]
+    metrics = compute_spec_decoding_metrics(samples)
+
+    assert set(samples[0].spec_info.nodes) == {"req_sess-e2e_0", "req_sess-e2e_1"}
+    assert set(samples[1].spec_info.nodes) == {"req_sess-e2e_0", "req_sess-e2e_2"}
+    assert metrics["spec_nodes_total"] == 3.0
+    # A + B + C once each: accepted 1 + 9 + 2, proposed 2 + 10 + 4.
+    assert metrics["spec_accept_rate"] == pytest.approx(12 / 16)
+    assert metrics["spec_accept_length"] == pytest.approx(16 / 4)
+    assert metrics["spec_coverage"] == 1.0
+
+    # The two independent generations of acceptance criterion one: 1/2 and 9/10.
+    assert compute_spec_decoding_metrics([samples[0]])["spec_accept_rate"] == pytest.approx(10 / 12)
+
+
+def test_agentic_spec_metrics_keep_identical_requests_and_sessions_apart() -> None:
+    first = _SpecSessionHarness("sess-x")
+    second = _SpecSessionHarness("sess-y")
+    # Same session, same text: the two requests collapse onto one node yet both count.
+    leaf_x = first.commit("same", _spec_meta(1, 2, verify=1, completion=4))
+    assert first.commit("same", _spec_meta(3, 4, verify=1, completion=4)) == leaf_x
+    # Another session commits the same text under the same request sequence.
+    leaf_y = second.commit("same", _spec_meta(5, 6, verify=1, completion=4))
+
+    samples = [first.export(leaf_x), second.export(leaf_y)]
+    metrics = compute_spec_decoding_metrics(samples)
+
+    assert set(samples[0].spec_info.nodes) == {"req_sess-x_0", "req_sess-x_1"}
+    assert set(samples[1].spec_info.nodes) == {"req_sess-y_0"}
+    assert metrics["spec_nodes_total"] == 3.0
+    assert metrics["spec_accept_rate"] == pytest.approx(9 / 12)
+
+
+def test_agentic_spec_metrics_sum_resumed_attempts_and_report_missing_counters() -> None:
+    harness = _SpecSessionHarness("sess-resume")
+    # An aborted attempt resumes on the same request: one submitted node. The attempt
+    # without speculative counters makes those request totals unavailable.
+    resumed = harness.commit(
+        "a",
+        _spec_meta(1, 2, verify=1, completion=1),
+        {"completion_tokens": 9},
+        _spec_meta(2, 2, verify=1, completion=2),
+    )
+    # A backend reply without speculative counters stays a missing report.
+    unreported = harness.commit("b", {"completion_tokens": 1}, parent_state_hash=resumed)
+
+    sample = harness.export(unreported)
+    metrics = compute_spec_decoding_metrics([sample])
+
+    assert sample.spec_info.nodes == {
+        "req_sess-resume_0": {
+            "completion_token_num": 12,
+        },
+        "req_sess-resume_1": {"completion_token_num": 1},
+    }
+    assert "spec_accept_rate" not in metrics
+    assert "spec_accept_length" not in metrics
+    assert metrics["spec_nodes_missing_counts"] == 2.0
+    assert metrics["spec_coverage"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "meta,expected_rate,expected_length",
+    [
+        (
+            {
+                "spec_num_correct_drafts": None,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": 1,
+                "completion_tokens": 3,
+            },
+            None,
+            3.0,
+        ),
+        ({"spec_num_correct_drafts": 1, "spec_num_proposed_drafts": 2, "spec_verify_ct": 1}, 0.5, None),
+        ({"spec_verify_ct": 2, "completion_tokens": 6}, None, 3.0),
+        (
+            {
+                "spec_num_correct_drafts": 1,
+                "spec_num_proposed_drafts": 2,
+                "spec_verify_ct": "bad",
+                "completion_tokens": 3,
+            },
+            0.5,
+            None,
+        ),
+    ],
+)
+def test_agentic_spec_metrics_preserve_partial_backend_counters_through_export(
+    meta, expected_rate, expected_length
+) -> None:
+    harness = _SpecSessionHarness("sess-partial")
+    sample = harness.export(harness.commit("a", meta))
+    metrics = compute_spec_decoding_metrics([sample])
+
+    for name, expected in [("spec_accept_rate", expected_rate), ("spec_accept_length", expected_length)]:
+        if expected is None:
+            assert name not in metrics
+            assert metrics[name + "_coverage"] == 0.0
+        else:
+            assert metrics[name] == pytest.approx(expected)
+            assert metrics[name + "_coverage"] == 1.0
+    assert metrics["spec_coverage"] == 0.0
+
+
+@pytest.mark.parametrize("missing_first", [True, False])
+def test_agentic_spec_metrics_keep_resumed_request_partial_when_one_attempt_omits_a_field(missing_first) -> None:
+    harness = _SpecSessionHarness("sess-partial-resume")
+    full = _spec_meta(2, 2, verify=1, completion=2)
+    partial = _spec_meta(1, 2, verify=1, completion=1)
+    del partial["completion_tokens"]
+    attempts = [partial, full] if missing_first else [full, partial]
+    sample = harness.export(harness.commit("a", *attempts))
+    metrics = compute_spec_decoding_metrics([sample])
+
+    assert set(sample.spec_info.nodes) == {"req_sess-partial-resume_0"}
+    assert metrics["spec_accept_rate"] == pytest.approx(3 / 4)
+    assert "spec_accept_length" not in metrics
+    assert metrics["spec_coverage"] == 0.0
+    assert metrics["spec_accept_rate_coverage"] == 1.0
+    assert metrics["spec_accept_length_coverage"] == 0.0
+
+
+def test_agentic_spec_metrics_exclude_committed_siblings_outside_exported_lineage() -> None:
+    harness = _SpecSessionHarness("sess-covered")
+    shared = harness.commit("a", _spec_meta(1, 2, verify=1, completion=2))
+    exported = harness.commit("b", _spec_meta(9, 10, verify=2, completion=11), parent_state_hash=shared)
+    harness.commit("discarded", _spec_meta(100, 100, verify=1, completion=100), parent_state_hash=shared)
+    sample = harness.export(exported)
+    metrics = compute_spec_decoding_metrics([sample])
+
+    assert set(sample.spec_info.nodes) == {"req_sess-covered_0", "req_sess-covered_1"}
+    assert metrics["spec_nodes_total"] == 2.0
+    assert metrics["spec_accept_rate"] == pytest.approx(10 / 12)
+    assert metrics["spec_accept_length"] == pytest.approx(13 / 3)
+
+
+def test_agentic_spec_node_identities_are_not_exported_without_speculative_decoding() -> None:
+    harness = _SpecSessionHarness("sess-off", speculative_algorithm=None)
+    leaf = harness.commit("a", {"completion_tokens": 1})
+
+    sample = harness.export(leaf)
+
+    assert sample.spec_info.nodes == {}
+    assert sample.spec_info.counts_reported is False
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:

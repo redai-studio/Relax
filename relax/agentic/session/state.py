@@ -14,7 +14,7 @@ from typing import Any, Literal
 import torch
 
 from relax.agentic.profile import TRACE_KEY, merge_agentic_trace
-from relax.utils.types import Sample
+from relax.utils.types import SPEC_COUNTER_KEYS, Sample, normalize_spec_counter_values
 
 
 MsgKind = Literal["obs", "resp"]
@@ -353,6 +353,11 @@ class MsgNode:
     backend_video_data_delta: list[str] = field(default_factory=list)
     weight_version_delta: list[str] = field(default_factory=list)
     spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    # Counters keyed by the identity of every generation request committed to this
+    # node. Collapsing identical content onto one state hash must not drop a request,
+    # so a node can hold several records; a request whose backend reported no counters
+    # keeps an empty record so coverage can tell it apart from an explicit zero.
+    spec_node_records: dict[str, dict[str, int]] = field(default_factory=dict)
     prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -385,6 +390,8 @@ class InflightRequest:
     pending_logprob_delta: list[float] = field(default_factory=list)
     pending_weight_version_delta: list[str] = field(default_factory=list)
     pending_spec_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_SPEC_DELTA))
+    pending_spec_counts_reported: bool = False
+    pending_spec_counters: dict[str, int] | None = None
     pending_prefix_cache_delta: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_PREFIX_CACHE_DELTA))
     pending_generation_elapsed_s: float = 0.0
     pending_status: str | None = None
@@ -625,6 +632,9 @@ class SessionForest:
         logprob_delta: list[float],
         weight_version_delta: list[str] | None = None,
         spec_delta: dict[str, int] | None = None,
+        spec_node_key: str | None = None,
+        spec_node_counts_reported: bool = True,
+        spec_counters: dict[str, int] | None = None,
         prefix_cache_delta: dict[str, int] | None = None,
         wall_elapsed_s: float = 0.0,
         generation_elapsed_s: float = 0.0,
@@ -638,29 +648,42 @@ class SessionForest:
             tools=None,
             chat_template_kwargs=None,
         )
-        return self._register_node(
-            MsgNode(
-                kind="resp",
-                state_hash=state_hash,
-                parent_state_hash=parent_state_hash,
-                rollout_id=rollout_id,
-                abort_count=abort_count,
-                messages_delta=messages_delta,
-                train_token_delta=token_delta,
-                rollout_token_delta=token_delta,
-                logprob_delta=logprob_delta,
-                weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
-                spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
-                prefix_cache_delta=prefix_cache_delta
-                if prefix_cache_delta is not None
-                else dict(_EMPTY_PREFIX_CACHE_DELTA),
-                wall_elapsed_s=wall_elapsed_s,
-                generation_elapsed_s=generation_elapsed_s,
-                status=status,
-                rollout_routed_experts=rollout_routed_experts,
-                export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
-            )
+        # Keep the counters of this submitted generation keyed by its own identity, so
+        # the batch metric counts each node once even when several exported samples
+        # share it. An unreported request keeps an empty record.
+        spec_node_records: dict[str, dict[str, int]] = {}
+        if spec_node_key is not None:
+            if spec_counters is None:
+                spec_counters = (spec_delta or {}) if spec_node_counts_reported else {}
+            spec_node_records[spec_node_key] = normalize_spec_counter_values(spec_counters)
+        node = MsgNode(
+            kind="resp",
+            state_hash=state_hash,
+            parent_state_hash=parent_state_hash,
+            rollout_id=rollout_id,
+            abort_count=abort_count,
+            messages_delta=messages_delta,
+            train_token_delta=token_delta,
+            rollout_token_delta=token_delta,
+            logprob_delta=logprob_delta,
+            weight_version_delta=weight_version_delta if weight_version_delta is not None else [],
+            spec_delta=spec_delta if spec_delta is not None else dict(_EMPTY_SPEC_DELTA),
+            spec_node_records=spec_node_records,
+            prefix_cache_delta=prefix_cache_delta
+            if prefix_cache_delta is not None
+            else dict(_EMPTY_PREFIX_CACHE_DELTA),
+            wall_elapsed_s=wall_elapsed_s,
+            generation_elapsed_s=generation_elapsed_s,
+            status=status,
+            rollout_routed_experts=rollout_routed_experts,
+            export_metadata_patch=export_metadata_patch if export_metadata_patch is not None else {},
         )
+        registered = self._register_node(node)
+        if registered is not node and spec_node_records:
+            # Identical content collapses onto one state hash, but the two requests are
+            # independent submissions and both must be counted.
+            registered.spec_node_records.update(spec_node_records)
+        return registered
 
     @staticmethod
     def _agentic_trace_turn_from_node(node: MsgNode, turn_idx: int) -> dict[str, Any]:
@@ -704,6 +727,7 @@ class SessionForest:
         multimodal_train_inputs_buffer: list[dict[str, Any]] = []
         weight_versions: list[str] = []
         spec_info = dict(_EMPTY_SPEC_DELTA)
+        spec_nodes: dict[str, dict[str, int]] = {}
         prefix_cache_info = dict(_EMPTY_PREFIX_CACHE_DELTA)
         wall_elapsed_s = 0.0
         generation_elapsed_s = 0.0
@@ -728,6 +752,7 @@ class SessionForest:
                 rollout_log_probs.extend(node.logprob_delta)
                 weight_versions.extend(node.weight_version_delta)
                 spec_info = _sum_counter_dict(spec_info, node.spec_delta)
+                spec_nodes.update(node.spec_node_records)
                 prefix_cache_info = _sum_counter_dict(prefix_cache_info, node.prefix_cache_delta)
                 continue
             if idx == 0 or first_response_node is None:
@@ -789,6 +814,22 @@ class SessionForest:
             session_id=self.session_id,
             non_generation_time=wall_elapsed_s - generation_elapsed_s,
         )
-        sample.spec_info = Sample.SpecInfo.from_dict(spec_info)
+        if spec_nodes:
+            # A node shared by identical-content requests keeps only the first request in
+            # ``spec_delta``; the per-request records hold every one, so derive the totals
+            # from them to keep both views of the sample consistent.
+            spec_info = dict(_EMPTY_SPEC_DELTA)
+            for record in spec_nodes.values():
+                spec_info = _sum_counter_dict(spec_info, record)
+        if spec_nodes:
+            available = [key for key in SPEC_COUNTER_KEYS if all(key in record for record in spec_nodes.values())]
+            reported = any(any(key != "completion_token_num" for key in record) for record in spec_nodes.values())
+            sample.spec_info = Sample.SpecInfo.from_dict(
+                {**spec_info, "nodes": spec_nodes, "counts_reported": reported, "available_counters": available}
+            )
+        else:
+            # Legacy callers can still export their totals without generation identities.
+            reported = None if spec_info["spec_draft_token_num"] > 0 or spec_info["spec_verify_ct"] > 0 else False
+            sample.spec_info = Sample.SpecInfo.from_dict({**spec_info, "counts_reported": reported})
         sample.prefix_cache_info = Sample.PrefixCacheInfo.from_dict(prefix_cache_info)
         return sample
