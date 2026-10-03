@@ -15,6 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
+from relax.engine.sft.runtime import is_preference_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -25,6 +26,7 @@ from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.preference_utils import pack_preference_pair_indices
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -497,6 +499,7 @@ def get_batch(
 
     from relax.utils.sft_utils import align_loss_mask_for_sft
 
+    batch["raw_loss_masks"] = list(batch["loss_masks"])
     loss_masks: list[torch.Tensor] = []
     per_sample_loss_masks: list[torch.Tensor] = []
     full_per_sample_loss_masks: list[torch.Tensor] = []
@@ -799,6 +802,147 @@ class DataIterator:
         return self
 
 
+def expand_preference_rollout_data(rollout_data: RolloutBatch) -> RolloutBatch:
+    """Expand pair rows into adjacent chosen/rejected model sequences."""
+    if "preference_pair_costs" in rollout_data:
+        return rollout_data
+    required = (
+        "pair_ids",
+        "chosen_tokens",
+        "rejected_tokens",
+        "chosen_loss_masks",
+        "rejected_loss_masks",
+        "chosen_total_lengths",
+        "rejected_total_lengths",
+        "chosen_score_positions",
+        "rejected_score_positions",
+    )
+    missing = [key for key in required if key not in rollout_data]
+    if missing:
+        raise ValueError(f"preference rollout data is missing fields: {missing}")
+    pair_count = len(rollout_data["pair_ids"])
+    if pair_count <= 0:
+        raise ValueError("preference rollout batch must contain at least one pair")
+    for key in required:
+        if len(rollout_data[key]) != pair_count:
+            raise ValueError(
+                f"preference field {key!r} is not pair-row aligned: expected {pair_count}, got {len(rollout_data[key])}"
+            )
+
+    flat: RolloutBatch = {
+        "tokens": [],
+        "loss_masks": [],
+        "total_lengths": [],
+        "response_lengths": [],
+        "score_positions": [],
+        "preference_branch_pair_ids": [],
+        "preference_is_chosen": [],
+    }
+    pair_costs: list[int] = []
+    pair_ids: list[int] = []
+    for index in range(pair_count):
+        chosen_length = int(rollout_data["chosen_total_lengths"][index])
+        rejected_length = int(rollout_data["rejected_total_lengths"][index])
+        if chosen_length <= 0 or rejected_length <= 0:
+            raise ValueError(f"preference pair row {index} has non-positive branch length")
+        pair_id = int(rollout_data["pair_ids"][index])
+        pair_ids.append(pair_id)
+        pair_costs.append(chosen_length + rejected_length)
+        for prefix, is_chosen in (("chosen", True), ("rejected", False)):
+            tokens = rollout_data[f"{prefix}_tokens"][index]
+            loss_mask = rollout_data[f"{prefix}_loss_masks"][index]
+            total_length = int(rollout_data[f"{prefix}_total_lengths"][index])
+            score_position = int(rollout_data[f"{prefix}_score_positions"][index])
+            if len(tokens) != total_length or len(loss_mask) != total_length:
+                raise ValueError(
+                    f"preference pair row {index} {prefix} tensor length does not match declared total_length"
+                )
+            if not 0 <= score_position < total_length:
+                raise ValueError(f"preference pair row {index} {prefix} score position is out of range")
+            flat["tokens"].append(tokens)
+            flat["loss_masks"].append(loss_mask)
+            flat["total_lengths"].append(total_length)
+            flat["response_lengths"].append(total_length)
+            flat["score_positions"].append(score_position)
+            flat["preference_branch_pair_ids"].append(pair_id)
+            flat["preference_is_chosen"].append(is_chosen)
+    flat["preference_pair_costs"] = pair_costs
+    flat["preference_pair_ids"] = pair_ids
+    if "dynamic_global_batch_size" in rollout_data:
+        flat["dynamic_global_batch_size"] = rollout_data["dynamic_global_batch_size"]
+    return flat
+
+
+def _split_preference_bins_to_count(bins: list[list[int]], target_count: int) -> list[list[int]]:
+    bins = [list(group) for group in bins]
+    while len(bins) < target_count:
+        candidates = [(len(group), -index, index) for index, group in enumerate(bins) if len(group) > 1]
+        if not candidates:
+            raise RuntimeError(
+                f"cannot split {len(bins)} preference micro-batches to DP-synchronized count {target_count}"
+            )
+        _, _, index = max(candidates)
+        group = bins[index]
+        bins[index] = group[:-1]
+        bins.insert(index + 1, [group[-1]])
+    return bins
+
+
+def _get_preference_data_iterator(
+    args: Namespace,
+    rollout_data: RolloutBatch,
+    max_tokens_per_gpu: int | None,
+) -> tuple[list[DataIterator], list[int]]:
+    pair_costs = [int(cost) for cost in rollout_data["preference_pair_costs"]]
+    pair_ids = [str(pair_id) for pair_id in rollout_data["preference_pair_ids"]]
+    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+    dynamic_count = rollout_data.get("dynamic_global_batch_size")
+    if isinstance(dynamic_count, (list, tuple)):
+        normalized = {int(value) for value in dynamic_count}
+        if len(normalized) != 1:
+            raise ValueError(f"dynamic_global_batch_size values must be identical, got {dynamic_count}")
+        dynamic_count = normalized.pop()
+    expected_global_pairs = int(args.global_batch_size) if dynamic_count is None else int(dynamic_count)
+    capacity = int(max_tokens_per_gpu or args.max_tokens_per_gpu)
+    pair_bins = pack_preference_pair_indices(pair_costs, pair_ids, capacity=capacity)
+    control_values = [None] * dp_size
+    dist.all_gather_object(
+        control_values,
+        (len(pair_costs), expected_global_pairs, len(pair_bins)),
+        group=mpu.get_data_parallel_group_gloo(with_context_parallel=False),
+    )
+    local_pair_counts = {int(values[0]) for values in control_values}
+    if len(local_pair_counts) != 1:
+        raise ValueError(f"preference objectives require equal local pair rows on every DP rank: {local_pair_counts}")
+    declared_global_pairs = {int(values[1]) for values in control_values}
+    if len(declared_global_pairs) != 1:
+        raise ValueError(f"dynamic_global_batch_size must be identical on every DP rank: {declared_global_pairs}")
+    step_global_pair_count = local_pair_counts.pop() * dp_size
+    declared_global_pair_count = declared_global_pairs.pop()
+    if declared_global_pair_count != step_global_pair_count:
+        raise ValueError(
+            "dynamic_global_batch_size must equal the step-global preference pair count: "
+            f"declared={declared_global_pair_count}, actual={step_global_pair_count}, "
+            f"local={len(pair_costs)}, dp_size={dp_size}"
+        )
+    rollout_data["dynamic_global_batch_size"] = step_global_pair_count
+    rollout_data[ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY] = [step_global_pair_count]
+    pair_bins = _split_preference_bins_to_count(pair_bins, max(int(values[2]) for values in control_values))
+    if any(sum(pair_costs[index] for index in group) > capacity for group in pair_bins):
+        raise RuntimeError("preference DP bin synchronization produced an over-capacity micro-batch")
+    branch_bins = [
+        [branch for pair_index in group for branch in (2 * pair_index, 2 * pair_index + 1)] for group in pair_bins
+    ]
+    covered = [index for group in pair_bins for index in group]
+    if sorted(covered) != list(range(len(pair_costs))):
+        raise RuntimeError("preference dynamic batching lost or duplicated a pair")
+    for group in branch_bins:
+        if len(group) % 2 != 0 or any(group[index + 1] != group[index] + 1 for index in range(0, len(group), 2)):
+            raise RuntimeError("preference dynamic batching split a chosen/rejected pair")
+    iterator = DataIterator(rollout_data, micro_batch_indices=branch_bins, max_tokens_per_gpu=capacity)
+    return [iterator], [len(branch_bins)]
+
+
 def get_data_iterator(
     args: Namespace,
     model: torch.nn.Module | Sequence[torch.nn.Module],
@@ -818,6 +962,9 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    if is_preference_mode(args):
+        return _get_preference_data_iterator(args, rollout_data, max_tokens_per_gpu)
+
     dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
     dp_group = mpu.get_data_parallel_group()
     vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
@@ -1070,6 +1217,11 @@ def log_rollout_data(
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
+                "preference_pair_costs",
+                "preference_pair_ids",
+                "preference_branch_pair_ids",
+                "preference_is_chosen",
+                "score_positions",
             ]:
                 continue
             if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:

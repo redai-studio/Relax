@@ -30,6 +30,18 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     ``actor``); other algorithms ignore it and receive the base rollout fields.
     """
     if getattr(args, "loss_type", None) == "sft":
+        if getattr(args, "sft_objective", "causal_lm") in {"dpo", "reward_model"}:
+            return [
+                "pair_ids",
+                "chosen_tokens",
+                "rejected_tokens",
+                "chosen_loss_masks",
+                "rejected_loss_masks",
+                "chosen_total_lengths",
+                "rejected_total_lengths",
+                "chosen_score_positions",
+                "rejected_score_positions",
+            ]
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")

@@ -482,8 +482,9 @@ async def test_sft_remote_step_produces_eval_before_advancing_step(monkeypatch):
     sft._stop_event = MagicMock()
     sft._stop_event.is_set = MagicMock(return_value=False)
 
-    async def _maybe_produce_eval():
+    async def _maybe_produce_eval(completed_steps):
         assert sft.step == 0
+        assert completed_steps == 1
 
     sft._maybe_produce_eval = AsyncMock(side_effect=_maybe_produce_eval)
 
@@ -544,6 +545,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
+    args.eval_prompt_data = "/fake/eval.jsonl"
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -560,7 +562,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        await sft._maybe_produce_eval(completed_steps=1)
 
     fake_client.async_put.assert_not_awaited()
 
@@ -587,6 +589,8 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
         eval_interval=1,
         global_batch_size=4,
         task_type="seq_cls",
@@ -599,14 +603,71 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     sft._build_eval_batches = MagicMock(return_value=samples)
     sft._wait_for_partition_drained = AsyncMock(return_value=True)
 
-    await sft._maybe_produce_eval()
+    await sft._maybe_produce_eval(completed_steps=1)
 
     expected_chunks = (n_real + 3) // 4
     assert fake_client.async_put.await_count == expected_chunks
     weights = torch.cat([call.kwargs["data"]["sample_weights"] for call in fake_client.async_put.call_args_list])
     assert weights.tolist() == [1.0] * n_real + [0.0] * (expected_chunks * 4 - n_real)
     partition_ids = [call.kwargs["partition_id"] for call in fake_client.async_put.call_args_list]
-    assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+    assert partition_ids == [f"sft_eval_1_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("objective", ["dpo", "reward_model"])
+@pytest.mark.parametrize(("n_pairs", "dp_size"), [(1, 1), (2, 2), (6, 2), (10, 2)])
+async def test_preference_eval_uses_actual_size_without_baseline_files(tmp_path, objective, n_pairs, dp_size):
+    from relax.components.sft import SFT
+    from relax.engine.sft.dataset.preference import ProcessedPreferencePair
+
+    pairs = [
+        ProcessedPreferencePair(
+            pair_id=f"pair-{idx}",
+            chosen_tokens=torch.tensor([idx, 100]),
+            rejected_tokens=torch.tensor([idx, 101]),
+            chosen_loss_mask=torch.tensor([1]),
+            rejected_loss_mask=torch.tensor([1]),
+            chosen_total_length=2,
+            rejected_total_length=2,
+            chosen_prompt_length=1,
+            rejected_prompt_length=1,
+            chosen_completion_length=1,
+            rejected_completion_length=1,
+            chosen_score_position=1,
+            rejected_score_position=1,
+            source_idx=idx,
+        )
+        for idx in reversed(range(n_pairs))
+    ]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type="sft",
+        sft_objective=objective,
+        eval_size=n_pairs,
+        eval_interval=1,
+        global_batch_size=4,
+        data_parallel_size=dp_size,
+        multimodal_keys=None,
+        load=str(tmp_path / "old-checkpoint"),
+        save=str(tmp_path / "new-output"),
+    )
+    sft.step = 20
+    sft.data_system_client = SimpleNamespace(async_put=AsyncMock())
+    sft._logger_instance = MagicMock()
+    sft._build_eval_batches = MagicMock(return_value=pairs)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+
+    await sft._maybe_produce_eval(completed_steps=21)
+
+    chunks = sft.data_system_client.async_put.call_args_list
+    expected_sizes = [4] * (n_pairs // 4) + ([n_pairs % 4] if n_pairs % 4 else [])
+    assert [len(call.kwargs["data"]["pair_ids"]) for call in chunks] == expected_sizes
+    assert [call.kwargs["partition_id"] for call in chunks] == [
+        f"sft_eval_21_n{len(chunks)}_p{n_pairs}_{idx}" for idx in range(len(chunks))
+    ]
+    chosen = [tokens.tolist() for call in chunks for tokens in call.kwargs["data"]["chosen_tokens"]]
+    assert chosen == [pair.chosen_tokens.tolist() for pair in pairs]
+    assert not (tmp_path / "new-output").exists()
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import should_bypass_main_output_layer
+from relax.engine.sft.runtime import is_preference_mode, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.env import Envs
@@ -51,10 +51,15 @@ from relax.utils.training.ppo_utils import (
     release_critic_lm_heads,
     release_sequence_classification_lm_heads,
     validate_critic_value_head_registration,
+    validate_reward_model_head_registration,
     validate_sequence_classification_head_registration,
 )
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    REWARD_MODEL_HEAD_TYPE,
+    load_checkpoint,
+    save_checkpoint,
+)
 from .data import ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY, DataIterator, get_batch
 from .loss import loss_function
 from .model_provider import (
@@ -688,6 +693,19 @@ def force_param_sync(model_chunks: Sequence[DDP]) -> None:
         model_chunk.start_param_sync(force_sync=True)
 
 
+def _restore_micro_batch_output_order(values: list, micro_batch_indices: list[list[int]]) -> list:
+    """Restore per-sample outputs from packed micro-batch order."""
+    origin_indices = sum(micro_batch_indices, [])
+    if len(values) != len(origin_indices):
+        return values
+    if sorted(origin_indices) != list(range(len(origin_indices))):
+        raise RuntimeError("micro-batch indices must be a complete permutation of original sample indices")
+    origin_values = [None] * len(values)
+    for value, origin_index in zip(values, origin_indices, strict=False):
+        origin_values[origin_index] = value
+    return origin_values
+
+
 @torch.no_grad()
 def forward_only(
     f: Callable[..., dict[str, list[torch.Tensor]]],
@@ -758,6 +776,7 @@ def forward_only(
                 "multimodal_train_inputs",
                 "total_lengths",
                 "response_lengths",
+                "score_positions",
                 "max_seq_lens",
                 "classification_labels",
                 "sample_weights",
@@ -840,6 +859,13 @@ def forward_only(
             max_seq_lens=batch.get("max_seq_lens", None),
             padded_total_lengths=batch.get("padded_total_lengths", None),
             loss_masks=batch.get("loss_masks", None),
+            raw_loss_masks=batch.get("raw_loss_masks", None),
+            packed_tokens=batch.get("tokens", None),
+            branch_tokens=batch.get("unconcat_tokens", None),
+            cu_seqlens=(
+                batch["packed_seq_params"].cu_seqlens_q if batch.get("packed_seq_params") is not None else None
+            ),
+            score_positions=batch.get("score_positions", None),
             dynamic_cp_size=batch.get("dynamic_cp_size", None),
             dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
             classification_labels=batch.get("classification_labels", None),
@@ -920,7 +946,8 @@ def forward_only(
                 assert isinstance(value[key], list)
                 values += value[key]
 
-            if args.use_dynamic_batch_size and per_sample_output:
+            micro_batch_indices = data_iterator[0].micro_batch_indices
+            if micro_batch_indices is not None and per_sample_output:
                 # TODO: This is ugly... Find a better way to make the data have the same order.
                 # TODO: move this out of the loop.
                 iterator = data_iterator[0]
@@ -944,18 +971,7 @@ def forward_only(
                             raise RuntimeError("Dynamic forward output did not cover every local row.")
                         values = origin_values
                 else:
-                    origin_indices = sum(data_iterator[0].micro_batch_indices, [])
-                    # Per-sample callbacks (log_probs/values) emit one tensor per
-                    # sample, so values aligns with origin_indices and we can
-                    # restore the pre-balance order. Per-microbatch callbacks
-                    # (e.g. compute_sft_eval_step) emit one aggregate per
-                    # microbatch — len(values) == num_microbatches, not
-                    # num_samples — and have no per-sample order to restore.
-                    if len(values) == len(origin_indices):
-                        origin_values = [None] * len(values)
-                        for value, origin_index in zip(values, origin_indices, strict=False):
-                            origin_values[origin_index] = value
-                        values = origin_values
+                    values = _restore_micro_batch_output_order(values, micro_batch_indices)
             rollout_data[f"{store_prefix}{key}"] = values
     return rollout_data
 
@@ -1048,9 +1064,12 @@ def train_one_step(
                     "classification_labels",
                     "log_probs",
                     "ref_log_probs",
+                    "preference_branch_pair_ids",
+                    "preference_is_chosen",
                     "values",
                     "advantages",
                     "returns",
+                    "score_positions",
                     "rollout_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
@@ -1306,6 +1325,14 @@ def train_one_step(
             # Per-token and sequence-classification metrics use the all-reduced
             # effective count. RL sample-mean metrics use the step's logical GBS.
             loss_reduced[key] = value / num_samples_or_tokens
+        if "rm/_score_chosen_second_moment" in loss_reduced:
+            chosen_second = loss_reduced.pop("rm/_score_chosen_second_moment")
+            rejected_second = loss_reduced.pop("rm/_score_rejected_second_moment")
+            chosen_mean = loss_reduced["rm/score_chosen_mean"]
+            rejected_mean = loss_reduced["rm/score_rejected_mean"]
+            loss_reduced["rm/score_chosen_std"] = math.sqrt(max(chosen_second - chosen_mean**2, 0.0))
+            loss_reduced["rm/score_rejected_std"] = math.sqrt(max(rejected_second - rejected_mean**2, 0.0))
+
         capture_hooks.end_step_for()
         return loss_reduced, grad_norm
     capture_hooks.end_step_for()
@@ -1616,6 +1643,16 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
+    role = getattr(model[0], "role", "actor")
+    args.checkpoint_role = role
+    if role == "actor" and is_preference_mode(args) and args.sft_objective == "reward_model":
+        args.head_type = REWARD_MODEL_HEAD_TYPE
+    elif role == "critic":
+        args.head_type = "critic_value_terminal_v1"
+    elif getattr(args, "task_type", "causal_lm") == "seq_cls":
+        args.head_type = "sequence_classification_v1"
+    else:
+        args.head_type = "causal_lm_v1"
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
     save_checkpoint(
@@ -1933,11 +1970,14 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
     value_head_param_ids = ()
+    reward_head_param_ids = ()
     classification_head_param_ids = ()
     if role == "critic":
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
     if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
+    if role == "actor" and is_preference_mode(args) and args.sft_objective == "reward_model":
+        reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1953,6 +1993,12 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
+    elif is_preference_mode(args) and args.sft_objective == "reward_model":
+        release_critic_lm_heads(model)
+        loaded_reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
+        assert loaded_reward_head_param_ids == reward_head_param_ids, (
+            "reward-model head parameter identities changed during checkpoint loading"
+        )
     if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
         release_sequence_classification_lm_heads(model)
         loaded_classification_head_param_ids = validate_sequence_classification_head_registration(
