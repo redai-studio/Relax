@@ -1,76 +1,135 @@
 # DPO Training
 
-Relax supports Direct Preference Optimization (DPO) through the offline SFT data path. The public Task 31 recipe is [`run-qwen3-0.6B-ultrafeedback-1xgpu.sh`](../../../scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh).
+Direct Preference Optimization (DPO) trains a model to prefer one answer over another. This guide uses Qwen3-0.6B and UltraFeedback on one GPU.
 
-V1 supports synchronous text-only SFT with TP=CP=PP=1. Preference objectives require `--task-type causal_lm` and reject `--sft-async-prepack`, MTP (including MTP-only training), chunked logits, and LoRA. Regular SFT CPU dataset prefetch remains available. Global batch size and optimizer scheduler increments count preference pairs, including a smaller explicitly sized batch.
+Complete [Installation](./installation.md) first. Run the commands below from the Relax repository root.
 
-## Prepare the preference subset
+## Prepare the data
 
-Generate the deterministic UltraFeedback subset from its pinned dataset revision:
+Create the example dataset:
 
 ```bash
 python scripts/data/prepare_ultrafeedback_preferences.py \
-  --output-dir /data/task31-ultrafeedback
+  --output-dir /data/ultrafeedback
 ```
 
-The command creates train/eval JSONL and Parquet files plus `manifest.json`. For the published Task 31 subset, compare the generated manifest with the [reproducibility evidence bundle](https://github.com/user-attachments/files/31305744/task31-pr1-dpo-evidence-public-v2.tar.gz) before training. The manifest fixes the source revision, selected prompt IDs, rejection counts, and output SHA-256 values. Derived dataset files are intentionally not stored in Git.
+The script selects 4,096 training pairs and 512 evaluation pairs from a fixed UltraFeedback version. It writes JSONL and Parquet files for each split.
 
-Each input row contains one complete preference pair:
+For your own data, put one pair on each row. `chosen` is the preferred answer. `rejected` is the other answer. Use the same conversation history in both message lists. End each list with a different assistant answer. Give each row a unique `prompt_id`.
 
 ```json
 {
-  "prompt_id": "stable-id",
-  "chosen": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}],
-  "rejected": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+  "prompt_id": "capital-1",
+  "chosen": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}],
+  "rejected": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "London."}]
 }
 ```
 
-Chosen and rejected branches must have an identical prompt and different assistant completions.
+## Download the model
 
-## Launch standard DPO
-
-Download the pinned Qwen checkpoint, then set the model, data, and output locations expected by the standard entrypoint:
+The example uses a fixed model version. Download it to the directory that training will use:
 
 ```bash
 export MODEL_DIR=/models
-export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca # full 40-character commit SHA
+export MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
 export HF_CHECKPOINT="${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}"
-export PROMPT_DATA=/data/task31-ultrafeedback/ultrafeedback_train.parquet
-export SAVE_DIR=/checkpoints/task31-dpo
 
-hf download Qwen/Qwen3-0.6B --revision "${MODEL_REVISION}" --local-dir "${HF_CHECKPOINT}"
-bash scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
+hf download Qwen/Qwen3-0.6B \
+  --revision "${MODEL_REVISION}" \
+  --local-dir "${HF_CHECKPOINT}"
 ```
 
-The recipe defaults to 200 optimizer steps, 32 preference pairs per global batch, `beta=0.1`, and a 1,024-token branch limit. `GLOBAL_BATCH_SIZE`, `NUM_ROLLOUT`, `MAX_TOKENS_PER_GPU`, and `SAVE_INTERVAL` can be overridden explicitly.
+Keep the complete download directory, including `.cache/huggingface`. DPO uses its download metadata to check the reference model version.
 
-Standard DPO verifies the pinned repository revision against the local `HF_CHECKPOINT` directory, then reconstructs the frozen reference from that directory. Checkpoints include a reference-identity sidecar containing canonical parameter and fixed-probe digests. A missing or mismatched sidecar fails before the next forward pass.
+## Start DPO training
 
-The probe digest is a byte-exact SHA-256 over frozen-reference log-probabilities, so resume assumes the same GPU model, driver, image, and kernel stack as the original run. Resuming on different hardware or software fails the probe check by design — treat it as an environment mismatch, not data corruption.
+Set the data and checkpoint paths:
 
-Use `--dpo-reference-free` only when reference-free DPO is intended; do not combine it with the standard reference identity arguments.
+```bash
+export PROMPT_DATA=/data/ultrafeedback/ultrafeedback_train.parquet
+export EVAL_PROMPT_DATA=/data/ultrafeedback/ultrafeedback_eval.parquet
+export SAVE_DIR=/checkpoints/dpo
+export EXP_NAME=qwen3-0.6b-ultrafeedback-dpo-gpu1
+```
 
-## Pair-aware batching
+Run the [DPO training script](../../../scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh):
 
-One preference pair is one TransferQueue row. Its chosen and rejected branch lengths are combined into `custom_meta.total_lengths`; the pinned `SeqlenBalancedSampler` assigns complete rows and keeps equal pair counts across data-parallel ranks. Branches are expanded only after a rank receives its rows, so dynamic micro-batch reordering cannot split pair identity.
+```bash
+NUM_GPUS=1 bash scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
+```
 
-## Metrics
+The script uses a frozen copy of the downloaded model as the reference model. It saves checkpoints to `${SAVE_DIR}/${EXP_NAME}` and writes logs to `log/`.
 
-DPO emits the following training metrics under the `train/dpo/` namespace:
+Set these environment variables before you run the script to change its defaults:
 
-- `loss`, `logps_chosen`, and `logps_rejected`;
-- `ref_logps_chosen` and `ref_logps_rejected` in standard mode;
-- `reward_chosen`, `reward_rejected`, and `reward_margin`;
-- `strict_accuracy`, `tie_rate`, and `tie_aware_accuracy`.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `NUM_ROLLOUT` | `200` | Total optimizer steps, including completed steps when you resume. |
+| `GLOBAL_BATCH_SIZE` | `32` | Answer pairs per optimizer step, across all GPUs. |
+| `MAX_TOKENS_PER_GPU` | `8192` | Tokens per micro-batch, including both copies of the prompt and both answers. |
+| `LR` | `5e-7` | Learning rate. |
+| `SAVE_INTERVAL` | `50` | Steps between checkpoint saves. |
+| `EVAL_INTERVAL` | `200` | Steps between evaluations. |
 
-For distributed parity claims, run DP=1 and DP=2 with the same image, model/data revisions, hyperparameters, and batch semantics, and retain the raw logs and reference digests.
+The script sets `--dpo-beta 0.1`. It limits each prompt and answer to 1,024 tokens in total, with at most 512 tokens in the answer. It truncates longer inputs. To change these settings, edit the script.
 
-## Reward modeling and evaluation
+One pair counts as one training sample. Relax keeps its two answers together when it divides work across GPUs and micro-batches.
 
-The companion recipe is `scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh`. It defaults to 200 optimizer steps and 32 pairs per global batch. DPO and reward-model evaluation follow `--eval-interval`, just like other SFT objectives.
+## Resume DPO training
 
-Evaluation reports loss, chosen/rejected scores, margin, accuracy, tie rate, and the actual pair count. The evaluation set is not restricted to 512 pairs, and resuming with a new `--save` directory does not require step-0 evaluation files. Partial final chunks are retained; each chunk must still be divisible by the data-parallel size. Fixed-probe comparisons and acceptance thresholds belong in the acceptance experiment, outside the training loop.
+Run the same script with the same paths and training settings. It loads the checkpoint from `${SAVE_DIR}/${EXP_NAME}` and continues from the saved step. Use a different `EXP_NAME` to start a separate run.
 
-Reward-model Megatron checkpoints persist `sft_objective=reward_model`, `head_type=reward_model_terminal_v1`, and `checkpoint_role=actor`. Resume rejects missing or incompatible metadata, non-exact scalar-head keys/shapes, partial optimizer/RNG restoration, and PPO critic checkpoints.
+Keep the full checkpoint directory, including `relax_dpo_reference.json` inside each saved iteration. DPO uses this file to check that the reference model has not changed.
 
-RM uses its own scalar head while sharing the SFT training loop. Keep `--task-type causal_lm`; `seq_cls` installs a different head and cannot be combined with a preference objective. The same v1 prepack/MTP/LoRA restrictions above apply to RM.
+The current resume check also compares reference model outputs byte for byte. Use the original GPU model and software environment. An environment change can cause this check to fail even when the weights are unchanged.
+
+## Read the training metrics
+
+DPO records these metrics under `train/dpo/`:
+
+| Metrics | Meaning |
+| --- | --- |
+| `loss` | DPO training loss. |
+| `logps_chosen`, `logps_rejected` | Model log-probabilities for the two answers. |
+| `ref_logps_chosen`, `ref_logps_rejected` | Reference model log-probabilities. |
+| `reward_chosen`, `reward_rejected`, `reward_margin` | DPO rewards and their difference. |
+| `strict_accuracy`, `tie_rate`, `tie_aware_accuracy` | Preference accuracy and ties. |
+
+## Train a reward model
+
+A reward model gives each answer a scalar score. Training increases the score of the preferred answer relative to the other answer.
+
+Use the model and data paths from the steps above. Set a separate checkpoint directory and experiment name:
+
+```bash
+export SAVE_DIR=/checkpoints/reward-modeling
+export EXP_NAME=qwen3-0.6b-ultrafeedback-rm-gpu1
+
+NUM_GPUS=1 bash scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
+```
+
+The [reward model script](../../../scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh) defaults to 200 optimizer steps, 32 pairs per step, and a learning rate of `1e-5`. Set `NUM_ROLLOUT`, `GLOBAL_BATCH_SIZE`, `MAX_TOKENS_PER_GPU`, `LR`, or `EVAL_INTERVAL` before launch to change these settings. The script saves every 50 steps. To change the save interval, edit `--save-interval` in the script.
+
+To resume, run the same script with the same paths and training settings. Keep the full Megatron checkpoint from reward model training. The script restores the model, optimizer, learning rate scheduler, and random number generator state together. A PPO critic checkpoint is not compatible with this reward model.
+
+## Evaluate during training
+
+Both scripts read evaluation data from `EVAL_PROMPT_DATA`. Set `EVAL_INTERVAL` before launch to choose how often evaluation runs. For example, `EVAL_INTERVAL=50` evaluates after steps 50, 100, and so on.
+
+Metrics under `eval/dpo_*` or `eval/rm_*` include loss, chosen/rejected scores, their difference, accuracy, tie rate, and the number of pairs.
+
+Relax includes the final partial evaluation batch. With data parallelism, every batch must divide evenly across the GPUs. For example, 10 pairs with a global batch size of 8 form batches of 8 and 2 pairs; both work with DP=2.
+
+## Supported configurations
+
+- Use synchronous training with text data.
+- Set TP, CP, and PP to 1. Data parallelism is supported.
+- Keep `--task-type causal_lm` with the preference objective.
+- Use ordinary CPU data prefetch if needed. Asynchronous prepacking, MTP, chunked logits, and LoRA are not supported.
+
+For reference-free DPO, add `--dpo-reference-free` to the training command. Remove `--dpo-reference-repository` and `--dpo-reference-revision` from that command. Reference-free training does not record reference log-probabilities.
+
+## Next steps
+
+- [SFT training](./sft-training.md)
+- [Training configuration](./customize-training.md)
