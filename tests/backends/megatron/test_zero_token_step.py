@@ -296,19 +296,37 @@ def test_train_one_step_skips_optimizer_and_scheduler_on_zero_token_step(model_m
 
 
 @pytest.mark.parametrize("zero_tokens", [False, True])
-@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+@pytest.mark.parametrize(
+    ("calculate_per_token_loss", "reward_model"),
+    [(False, False), (True, False), (False, True)],
+    ids=["sample-mean", "token-mean", "reward-model-pair-mean"],
+)
 def test_train_one_step_preserves_logical_batch_and_capture(
-    model_module, monkeypatch, zero_tokens, calculate_per_token_loss
+    model_module, monkeypatch, zero_tokens, calculate_per_token_loss, reward_model
 ):
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
+    args.task_type = "causal_lm"
+    args.loss_type = "rm" if reward_model else "policy_loss"
     calls = {"optimizer": 0, "scheduler": [], "capture_begin": 0, "capture_end": 0, "critic_update_successful": []}
     token_count = 0.0 if zero_tokens else 4.0
     numerator = 0.0 if zero_tokens else 12.0
+    keys = ["loss"]
+    metric_values = [numerator]
+    if reward_model:
+        keys += [
+            "rm/score_chosen_mean",
+            "rm/score_rejected_mean",
+            "rm/_score_chosen_second_moment",
+            "rm/_score_rejected_second_moment",
+        ]
+        # RM metrics are pair sums; logical GBS=2, distinct from the token count=4.
+        pair_count = 0.0 if zero_tokens else 2.0
+        metric_values += [pair_count * value for value in (3.0, 1.5, 10.0, 2.5)]
     losses = [
         {
-            "keys": ["loss"],
-            "values": torch.tensor([token_count if calculate_per_token_loss else 0.0, numerator]),
+            "keys": keys,
+            "values": torch.tensor([token_count if calculate_per_token_loss else 0.0, *metric_values]),
             "num_tokens": torch.tensor(token_count),
         }
     ]
@@ -362,7 +380,17 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     assert calls["capture_begin"] == calls["capture_end"] == 1
     # A skipped zero-token step is not a successful update for critic movement checks.
     assert calls["critic_update_successful"] == [not zero_tokens]
-    assert metrics == {"loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0)}
+    expected_metrics = {"loss": 0.0 if zero_tokens else (3.0 if calculate_per_token_loss else 6.0)}
+    if reward_model:
+        expected_metrics.update(
+            {
+                "rm/score_chosen_mean": 0.0 if zero_tokens else 3.0,
+                "rm/score_rejected_mean": 0.0 if zero_tokens else 1.5,
+                "rm/score_chosen_std": 0.0 if zero_tokens else 1.0,
+                "rm/score_rejected_std": 0.0 if zero_tokens else 0.5,
+            }
+        )
+    assert metrics == expected_metrics
     assert grad_norm == (0.0 if zero_tokens else 1.0)
 
 

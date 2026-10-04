@@ -31,6 +31,15 @@ from relax.utils.training.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
 )
+from relax.utils.training.preference_utils import (
+    build_preference_pair_indices,
+    dpo_pair_loss,
+    dpo_rewards,
+    masked_sequence_sums,
+    preference_accuracy,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
+)
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1278,6 +1287,117 @@ def sft_loss_function(
     )
 
 
+def dpo_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute a pair-summed DPO objective using explicit pair identity."""
+    if len(batch["response_lengths"]) % 2 != 0:
+        raise ValueError("DPO micro-batch must contain an even number of chosen/rejected branches")
+    _, values = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        with_entropy=False,
+        max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
+    policy_token_log_probs = values["log_probs"]
+
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("DPO batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+
+    policy_sums = masked_sequence_sums(policy_token_log_probs, batch["loss_masks"], logits.device)
+    policy_chosen = policy_sums.index_select(0, chosen_index)
+    policy_rejected = policy_sums.index_select(0, rejected_index)
+    reference_free = bool(args.dpo_reference_free)
+    if reference_free:
+        reference_chosen = reference_rejected = None
+    else:
+        reference_values = batch.get("ref_log_probs")
+        if reference_values is None:
+            raise ValueError("standard DPO batch is missing frozen-reference log-probabilities")
+        reference_sums = masked_sequence_sums(reference_values, batch["loss_masks"], logits.device)
+        reference_chosen = reference_sums.index_select(0, chosen_index)
+        reference_rejected = reference_sums.index_select(0, rejected_index)
+    pair_losses = dpo_pair_loss(
+        policy_chosen,
+        policy_rejected,
+        reference_chosen=reference_chosen,
+        reference_rejected=reference_rejected,
+        beta=args.dpo_beta,
+        reference_free=reference_free,
+    )
+    chosen_rewards = dpo_rewards(policy_chosen, reference_chosen, beta=args.dpo_beta)
+    rejected_rewards = dpo_rewards(policy_rejected, reference_rejected, beta=args.dpo_beta)
+    # pair_losses is never empty: build_preference_pair_indices raises on an
+    # empty micro-batch, so no gradient-safety fallback is needed here.
+    loss = pair_losses.sum()
+    reward_margin = chosen_rewards - rejected_rewards
+    strict, tie, tie_aware = preference_accuracy(reward_margin)
+    metrics = {
+        "dpo/loss": pair_losses.detach().sum(),
+        "dpo/logps_chosen": policy_chosen.detach().sum(),
+        "dpo/logps_rejected": policy_rejected.detach().sum(),
+        "dpo/reward_chosen": chosen_rewards.detach().sum(),
+        "dpo/reward_rejected": rejected_rewards.detach().sum(),
+        "dpo/reward_margin": reward_margin.detach().sum(),
+        "dpo/strict_accuracy": strict.to(torch.float32).detach().sum(),
+        "dpo/tie_rate": tie.to(torch.float32).detach().sum(),
+        "dpo/tie_aware_accuracy": tie_aware.detach().sum(),
+    }
+    metrics["dpo/pair_accuracy"] = metrics["dpo/strict_accuracy"]
+    if not reference_free:
+        metrics["dpo/ref_logps_chosen"] = reference_chosen.detach().sum()
+        metrics["dpo/ref_logps_rejected"] = reference_rejected.detach().sum()
+    return loss, metrics
+
+
+def reward_model_loss_function(
+    args: Namespace,  # noqa: ARG001
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute pair-summed Bradley-Terry loss over adjacent chosen/rejected
+    branches."""
+    if len(batch["total_lengths"]) % 2 != 0:
+        raise ValueError("reward-model micro-batch must contain an even number of chosen/rejected branches")
+    scores = select_packed_sequence_scores(logits, batch["total_lengths"])
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("reward-model batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+    chosen_scores = scores.index_select(0, chosen_index)
+    rejected_scores = scores.index_select(0, rejected_index)
+    pair_losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+    margins = chosen_scores - rejected_scores
+    loss = pair_losses.sum()
+    return loss, {
+        "rm/loss": pair_losses.detach().sum(),
+        "rm/score_chosen_mean": chosen_scores.detach().sum(),
+        "rm/score_rejected_mean": rejected_scores.detach().sum(),
+        "rm/score_margin_mean": margins.detach().sum(),
+        "rm/accuracy": (margins > 0).to(torch.float32).detach().sum(),
+        "rm/_score_chosen_second_moment": chosen_scores.detach().square().sum(),
+        "rm/_score_rejected_second_moment": rejected_scores.detach().square().sum(),
+    }
+
+
 def get_sequence_classification_outputs(
     args: Namespace,
     batch: RolloutBatch,
@@ -1430,8 +1550,8 @@ def loss_function(
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
-    Selects one of "policy_loss", "value_loss", "sft", or a custom loss
-    function based on `args.loss_type`, computes the loss and metrics, then
+    Selects the loss function based on `args.loss_type`, computes the loss
+    and metrics, then
     rescales the loss by micro-batch and parallelism factors to integrate with
     Megatron's gradient accumulation.
 
@@ -1498,6 +1618,10 @@ def loss_function(
                 func = policy_loss_function
             case "value_loss":
                 func = value_loss_function
+            case "dpo":
+                func = dpo_loss_function
+            case "rm":
+                func = reward_model_loss_function
             case "sft":
                 if getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function

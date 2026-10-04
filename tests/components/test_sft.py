@@ -123,6 +123,48 @@ def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(mon
     fake_ds.get_batch_by_indices.assert_called_once_with(eval_indices)
 
 
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+@pytest.mark.parametrize("oversize_strategy", [None, "truncate_right", "custom"])
+def test_preference_datasets_receive_oversize_policy(monkeypatch, loss_type, oversize_strategy):
+    from relax.components import sft as sft_module
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
+    dataset_factory = MagicMock(return_value=fake_ds)
+    custom_fn = MagicMock()
+    load_custom_fn = MagicMock(return_value=custom_fn)
+    monkeypatch.setattr(sft_module, "PreferenceStreamingDataset", dataset_factory)
+    monkeypatch.setattr(sft_module, "load_function", load_custom_fn)
+    args = _make_args()
+    args.loss_type = loss_type
+    args.preference_chosen_key = "chosen"
+    args.preference_rejected_key = "rejected"
+    args.preference_max_length = 1024
+    args.preference_max_completion_length = 512
+    if oversize_strategy is not None:
+        args.sft_oversize_strategy = oversize_strategy
+    args.sft_oversize_custom_function_path = "test.custom"
+    args.eval_prompt_data = ["heldout", "/fake/eval.jsonl"]
+    sft = sft_module.SFT.func_or_class.__new__(sft_module.SFT.func_or_class)
+    sft.config = args
+    sft.step = 0
+    sft._dataset = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+
+    sft._init_data_pipeline()
+
+    calls = dataset_factory.call_args_list
+    assert [call.kwargs["path"] for call in calls] == [args.prompt_data, ["/fake/eval.jsonl"]]
+    for call in calls:
+        assert call.kwargs["oversize_strategy"] == (oversize_strategy or "keep")
+        assert call.kwargs["oversize_custom_fn"] is (custom_fn if oversize_strategy == "custom" else None)
+        assert call.kwargs["pair_capacity"] == args.max_tokens_per_gpu
+    if oversize_strategy == "custom":
+        load_custom_fn.assert_called_once_with("test.custom")
+    else:
+        load_custom_fn.assert_not_called()
+
+
 def test_sft_component_imports_without_ray():
     from relax.components.sft import SFT  # noqa: F401
 
@@ -482,8 +524,9 @@ async def test_sft_remote_step_produces_eval_before_advancing_step(monkeypatch):
     sft._stop_event = MagicMock()
     sft._stop_event.is_set = MagicMock(return_value=False)
 
-    async def _maybe_produce_eval():
+    async def _maybe_produce_eval(completed_steps):
         assert sft.step == 0
+        assert completed_steps == 1
 
     sft._maybe_produce_eval = AsyncMock(side_effect=_maybe_produce_eval)
 
@@ -544,6 +587,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
+    args.eval_prompt_data = "/fake/eval.jsonl"
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -560,7 +604,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        await sft._maybe_produce_eval(completed_steps=1)
 
     fake_client.async_put.assert_not_awaited()
 
@@ -587,6 +631,8 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
         eval_interval=1,
         global_batch_size=4,
         task_type="seq_cls",
@@ -599,14 +645,65 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     sft._build_eval_batches = MagicMock(return_value=samples)
     sft._wait_for_partition_drained = AsyncMock(return_value=True)
 
-    await sft._maybe_produce_eval()
+    await sft._maybe_produce_eval(completed_steps=1)
 
     expected_chunks = (n_real + 3) // 4
     assert fake_client.async_put.await_count == expected_chunks
     weights = torch.cat([call.kwargs["data"]["sample_weights"] for call in fake_client.async_put.call_args_list])
     assert weights.tolist() == [1.0] * n_real + [0.0] * (expected_chunks * 4 - n_real)
     partition_ids = [call.kwargs["partition_id"] for call in fake_client.async_put.call_args_list]
-    assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+    assert partition_ids == [f"sft_eval_1_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+@pytest.mark.parametrize(("n_pairs", "dp_size"), [(1, 1), (2, 2), (6, 2), (10, 2)])
+async def test_preference_eval_preserves_pairs_and_partial_batches(loss_type, n_pairs, dp_size):
+    from relax.components.sft import SFT
+    from relax.engine.sft.dataset.preference import ProcessedPreferencePair
+
+    pairs = [
+        ProcessedPreferencePair(
+            pair_id=idx,
+            chosen_tokens=torch.tensor([idx, 100]),
+            rejected_tokens=torch.tensor([idx, 101]),
+            chosen_loss_mask=torch.tensor([1]),
+            rejected_loss_mask=torch.tensor([1]),
+            chosen_total_length=2,
+            rejected_total_length=2,
+            chosen_prompt_length=1,
+            rejected_prompt_length=1,
+            chosen_completion_length=1,
+            rejected_completion_length=1,
+            source_idx=idx,
+        )
+        for idx in reversed(range(n_pairs))
+    ]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type=loss_type,
+        eval_size=n_pairs,
+        eval_interval=1,
+        global_batch_size=4,
+        data_parallel_size=dp_size,
+        multimodal_keys=None,
+    )
+    sft.step = 20
+    sft.data_system_client = SimpleNamespace(async_put=AsyncMock())
+    sft._logger_instance = MagicMock()
+    sft._build_eval_batches = MagicMock(return_value=pairs)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+
+    await sft._maybe_produce_eval(completed_steps=21)
+
+    chunks = sft.data_system_client.async_put.call_args_list
+    expected_sizes = [4] * (n_pairs // 4) + ([n_pairs % 4] if n_pairs % 4 else [])
+    assert [len(call.kwargs["data"]["pair_ids"]) for call in chunks] == expected_sizes
+    assert [call.kwargs["partition_id"] for call in chunks] == [
+        f"sft_eval_21_n{len(chunks)}_p{n_pairs}_{idx}" for idx in range(len(chunks))
+    ]
+    chosen = [tokens.tolist() for call in chunks for tokens in call.kwargs["data"]["chosen_tokens"]]
+    assert chosen == [pair.chosen_tokens.tolist() for pair in pairs]
 
 
 @pytest.mark.asyncio
