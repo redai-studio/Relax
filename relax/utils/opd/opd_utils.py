@@ -691,8 +691,8 @@ def add_opd_arguments(parser: Any) -> Any:
     return parser
 
 
-def validate_opd_args(args: Namespace, *, is_sft: bool, log: Any = logger) -> None:
-    if is_sft:
+def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -> None:
+    if is_offline:
         return
 
     if not getattr(args, "use_opd", False):

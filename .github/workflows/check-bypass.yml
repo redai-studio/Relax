@@ -1,0 +1,62 @@
+name: Check CI bypass
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: Workflow target from .github/ci/config.json
+        required: true
+        type: string
+    outputs:
+      can-skip:
+        description: Whether an authorized CI team member exempted this workflow
+        value: ${{ jobs.check-bypass.outputs.can-skip }}
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  check-bypass:
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    outputs:
+      can-skip: ${{ steps.check-bypass.outputs.can-skip }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: config
+        uses: actions/github-script@v8
+        env:
+          CI_TARGET: ${{ inputs.target }}
+        with:
+          script: |
+            const { default: config } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/ci/config.json`, { with: { type: 'json' } });
+            const target = config.targets[process.env.CI_TARGET];
+            if (!target?.workflow || target.job) throw new Error('Expected a workflow target.');
+            if (!config.ciTeam.length) throw new Error('Configure at least one CI team member.');
+            core.setOutput('ci-team', JSON.stringify(config.ciTeam));
+      - id: check-bypass
+        uses: ShigureLab/ci-bypass@v2
+        with:
+          github-token: ${{ github.token }}
+          non-pull-request-event-strategy: never-skipped
+          type: composite
+          composite-rule: |
+            {
+              "any": [
+                {
+                  "type": "labeled",
+                  "label": ["ci-bypass: ${{ inputs.target }}", "ci-bypass: all"],
+                  "username": ${{ steps.config.outputs.ci-team }}
+                },
+                {
+                  "type": "commented",
+                  "comment-pattern": ["^/bypass[ \\t]+(?:${{ inputs.target }}|all)(?:[ \\t\\r\\n]|$)"],
+                  "username": ${{ steps.config.outputs.ci-team }}
+                }
+              ]
+            }

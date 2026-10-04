@@ -108,7 +108,114 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-__all__ = ["save_checkpoint"]
+REWARD_MODEL_HEAD_TYPE = "reward_model_terminal_v1"
+
+__all__ = ["REWARD_MODEL_HEAD_TYPE", "load_checkpoint", "save_checkpoint"]
+
+
+def _checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path:
+    path = Path(load_path)
+    if re.fullmatch(r"iter_\d{7}", path.name):
+        return path
+    tracker = path / "latest_checkpointed_iteration.txt"
+    try:
+        metadata = tracker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if metadata == "release":
+        return path / "release"
+    try:
+        iteration = int(metadata)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if ckpt_step is not None:
+        iteration = int(ckpt_step)
+    if iteration < 0:
+        raise RuntimeError(f"Megatron checkpoint iteration must be non-negative, got {iteration}")
+    return path / f"iter_{iteration:07d}"
+
+
+def _metadata_value(metadata, name: str):
+    return metadata.get(name) if isinstance(metadata, dict) else getattr(metadata, name, None)
+
+
+def _validate_reward_model_tensor_metadata(tensor_metadata: dict, hidden_size: int) -> None:
+    head_keys = [
+        str(key)
+        for key in tensor_metadata
+        if not str(key).startswith("optimizer.") and ("output_layer." in str(key) or "reward_model_head." in str(key))
+    ]
+    weight_keys = [key for key in head_keys if key.endswith("output_layer.weight")]
+    if len(weight_keys) != 1:
+        raise RuntimeError(
+            f"RM resume requires exactly one output_layer.weight checkpoint tensor, found {weight_keys}"
+        )
+    unexpected = [key for key in head_keys if key != weight_keys[0]]
+    if unexpected:
+        raise RuntimeError(f"RM checkpoint contains unexpected scalar-head tensors: {unexpected}")
+    entry = tensor_metadata[weight_keys[0]]
+    shape = tuple(getattr(entry, "global_shape", getattr(entry, "shape", ())))
+    expected = (1, int(hidden_size))
+    if shape != expected:
+        raise RuntimeError(f"RM output_layer.weight shape mismatch: checkpoint={shape}, expected={expected}")
+
+
+def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
+    from megatron.core import dist_checkpointing
+
+    role = getattr(ddp_model[0], "role", "actor")
+    current_is_rm = role == "actor" and getattr(args, "loss_type", None) == "rm"
+    if current_is_rm and checkpoint_dir.name == "release":
+        raise RuntimeError(
+            "RM resume rejects release checkpoints because optimizer, scheduler, and RNG state are absent"
+        )
+    if not dist_checkpointing.check_is_distributed_checkpoint(str(checkpoint_dir)):
+        if current_is_rm:
+            raise RuntimeError(
+                "RM resume requires a distributed checkpoint with contract metadata; legacy Megatron "
+                "checkpoints are not supported"
+            )
+        return {}
+    common = dist_checkpointing.load_common_state_dict(checkpoint_dir)
+    saved_args = common.get("args")
+    if saved_args is None:
+        if current_is_rm:
+            raise RuntimeError(f"checkpoint {checkpoint_dir} is missing saved args metadata")
+        return common
+    saved_loss_type = _metadata_value(saved_args, "loss_type")
+    if saved_loss_type == "sft" and _metadata_value(saved_args, "sft_objective") == "reward_model":
+        saved_loss_type = "rm"
+    saved_head_type = _metadata_value(saved_args, "head_type")
+    saved_role = _metadata_value(saved_args, "checkpoint_role")
+    saved_is_rm = saved_loss_type == "rm" or saved_head_type == REWARD_MODEL_HEAD_TYPE
+
+    if current_is_rm:
+        if (saved_loss_type, saved_head_type, saved_role) != (
+            "rm",
+            REWARD_MODEL_HEAD_TYPE,
+            "actor",
+        ):
+            raise RuntimeError(
+                "RM resume requires checkpoint metadata "
+                "loss_type=rm, head_type=reward_model_terminal_v1, checkpoint_role=actor; "
+                f"got loss_type={saved_loss_type!r}, head_type={saved_head_type!r}, role={saved_role!r}"
+            )
+        incompatible_flags = [
+            name
+            for name in ("no_load_optim", "no_load_rng", "finetune", "reset_optimizer_states")
+            if bool(getattr(args, name, False))
+        ]
+        if incompatible_flags:
+            raise RuntimeError(
+                f"RM resume must restore optimizer, scheduler, and RNG state; incompatible flags: {incompatible_flags}"
+            )
+        tensor_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_dir))
+        _validate_reward_model_tensor_metadata(tensor_metadata, int(args.hidden_size))
+    elif saved_is_rm:
+        target = "PPO critic" if role == "critic" else "non-RM actor/SFT"
+        raise RuntimeError(f"{target} load rejects reward-model checkpoints")
+    return common
+
 
 _LORA_CHECKPOINT_METADATA_ATTR = "relax_lora_checkpoint_metadata"
 _LORA_CHECKPOINT_FORMAT_VERSION = 1
@@ -434,30 +541,6 @@ def _validate_lora_model_state_load(model):
             chunk.load_state_dict = original
 
 
-def _resolve_checkpoint_iteration_dir(load_path: str | Path) -> Path | None:
-    path = Path(load_path)
-    if re.fullmatch(r"iter_\d{7}", path.name):
-        return path
-    tracker = path / "latest_checkpointed_iteration.txt"
-    if not tracker.is_file():
-        return None
-    value = tracker.read_text().strip()
-    if not value.isdigit():
-        return None
-    return path / f"iter_{int(value):07d}"
-
-
-def _read_lora_checkpoint_metadata(load_path: str | Path) -> dict | None:
-    checkpoint_dir = _resolve_checkpoint_iteration_dir(load_path)
-    if checkpoint_dir is None or not checkpoint_dir.is_dir():
-        return None
-    from megatron.core import dist_checkpointing
-
-    common_state = dist_checkpointing.load_common_state_dict(str(checkpoint_dir))
-    checkpoint_args = common_state.get("args")
-    return getattr(checkpoint_args, _LORA_CHECKPOINT_METADATA_ATTR, None)
-
-
 def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> None:
     if metadata.get("format_version") != _LORA_CHECKPOINT_FORMAT_VERSION:
         raise RuntimeError(
@@ -515,9 +598,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
 
     exist = Path(load_path).exists() and _is_dir_nonempty(load_path)
 
-    if exist and _is_megatron_checkpoint(load_path):
+    if exist and is_megatron_checkpoint(load_path):
         _alias_renamed_transfer_queue_enum()
-        lora_metadata = _read_lora_checkpoint_metadata(load_path)
+        checkpoint_dir = _checkpoint_iteration_dir(load_path, getattr(args, "ckpt_step", None))
+        common = _load_checkpoint_metadata(args, ddp_model, checkpoint_dir)
+        lora_metadata = _metadata_value(common.get("args"), _LORA_CHECKPOINT_METADATA_ATTR)
         try:
             if lora_metadata is None:
                 return _load_checkpoint_megatron(
@@ -600,7 +685,7 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
     )
 
 
-def _is_megatron_checkpoint(path: str | Path) -> bool:
+def is_megatron_checkpoint(path: str | Path) -> bool:
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )

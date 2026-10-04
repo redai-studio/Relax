@@ -1,0 +1,26 @@
+name: Welcome contributors
+description: Post one expandable welcome comment using the configured bot account
+inputs:
+  bot-token:
+    description: Token belonging to the welcome bot
+    required: true
+  bot-login:
+    description: Expected GitHub login of the welcome bot
+    required: true
+  docs-url:
+    description: Published Relax documentation URL
+    default: https://redai-studio.github.io/Relax
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@v8
+      env:
+        PR_WELCOME_PATH: ${{ github.action_path }}
+        WELCOME_BOT_LOGIN: ${{ inputs.bot-login }}
+        DOCS_URL: ${{ inputs.docs-url }}
+      with:
+        github-token: ${{ inputs.bot-token }}
+        retries: 0
+        script: |
+          const { run } = await import(`${process.env.PR_WELCOME_PATH}/index.mjs`);
+          await run({ github, context, botLogin: process.env.WELCOME_BOT_LOGIN, docsUrl: process.env.DOCS_URL });

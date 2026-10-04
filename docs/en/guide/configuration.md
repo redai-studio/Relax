@@ -54,10 +54,10 @@ For common configuration usage and examples, see the [Quick Start Guide](./quick
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--hf-checkpoint` | str | None | HuggingFace model checkpoint path. Used to initialize SGLang and provide tokenizer. Need not contain latest parameters, only consistent with training model architecture |
-| `--ref-load` | str | None | Reference model checkpoint path. Used as initial checkpoint for training when `--load` is not set |
-| `--ref-ckpt-step` | int | None | Reference model checkpoint step |
-| `--load` | str | None | Actor model checkpoint load path. Specify for resuming training |
+| `--hf-checkpoint` | str | None | Hugging Face model path for tokenizer, model configuration, and SGLang initialization. DPO also uses its weights for the frozen reference when `--ref-load` is omitted. |
+| `--ref-load` | str | None | Reference model checkpoint path; also used to initialize training when `--load` is omitted. DPO accepts local Hugging Face or native Megatron checkpoints and falls back to `--hf-checkpoint` when this is omitted. |
+| `--ref-ckpt-step` | int | None | Step to load from a native Megatron reference checkpoint. Defaults to the iteration selected by its checkpoint tracker. |
+| `--load` | str | None | Actor checkpoint to initialize or resume training. For DPO, point to the saved DPO checkpoint to resume; add `--finetune` when loading a native SFT checkpoint to start a new run. |
 | `--save` | str | None | Path to save model during training |
 | `--save-interval` | int | None | Model save interval in steps |
 | `--save-hf` | str | None | Path to save HuggingFace format model for Megatron backend. Path can include `{rollout_id}` placeholder |
@@ -309,7 +309,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `custom_loss` | Loss type. `policy_loss` runs PPO/GRPO/etc. RL training; `sft` runs supervised fine-tuning (see [SFT Configuration](#sft-configuration)); `custom_loss` requires `--custom-loss-function-path`. `sft_loss` is a deprecated alias for `sft`. |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `rm`, `custom_loss` | Training loss. `policy_loss` runs PPO/GRPO/etc.; `sft` runs supervised fine-tuning; `dpo` runs preference optimization; `rm` trains a reward model; `custom_loss` requires `--custom-loss-function-path`. See [Offline Training Configuration](#offline-training-configuration) and [DPO Training](./dpo-training.md). `sft_loss` and `sft-loss` are deprecated aliases for `sft`. |
 | `--custom-loss-function-path` | str | None | - | Custom loss function path |
 | `--eps-clip` | float | 0.2 | - | PPO clipping range (lower bound) |
 | `--eps-clip-high` | float | None | - | PPO clipping upper bound. When None, equals `--eps-clip` |
@@ -396,26 +396,44 @@ PPO currently supports synchronous colocate mode and requires `critic` and `adva
 
 ---
 
-## SFT Configuration
+## Offline Training Configuration
 
-These flags only apply under `--loss-type sft`. The SFT pipeline runs an `SFTStreamingDataset` producer that pushes packed samples into the TransferQueue under partition `sft_<rollout_id>`, and an `MegatronTrainRayActor` consumer that trains, periodically evaluates (PPL), and optionally runs generative prediction.
+Ordinary SFT (`--loss-type sft`), DPO (`--loss-type dpo`), and reward modeling (`--loss-type rm`) share the offline producer/consumer pipeline. The producer reads `--prompt-data` and writes batches to TransferQueue partitions named `sft_<rollout_id>`; the Megatron actor trains from those batches. Shared queue and CPU prefetch settings retain their `--sft-*` names. Generation prediction, chunked logits, and asynchronous prepacking remain SFT-only.
 
 ### Training Control
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-size` | float | None | Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
-| `--sft-predict-interval` | int | None | Every N rollout steps run a generative predict pass over the eval set and write completions to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Setting this flag implicitly spins up the Rollout role under SFT (SGLang must be online). Controls the generative complement to the always-on PPL eval (`--eval-interval`). **Requires** `--save` (writes under `<save>/predict/`) and at least one eval source (`--eval-prompt-data` / `--eval-config` / `--eval-size`). |
+| `--eval-size` | float | None | Offline training. Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
+| `--sft-predict-interval` | int | None | Causal-LM SFT only. Every N training steps, generate answers for the eval set and write them to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Starts the Rollout role automatically. Requires `--save` and exactly one eval source: `--eval-prompt-data` or `--eval-size`. |
+| `--sft-max-in-flight-steps` | int | None | Offline TransferQueue buffer depth, including the current training step. A positive N sets `--max-staleness` to N − 1. |
+| `--sft-train-data-prefetch` | flag | False | Prefetch the next offline training step's raw TransferQueue payload on a CPU worker. Requires `--per-rank-fetch` and at least two in-flight steps. Mutually exclusive with `--sft-async-prepack`. |
+| `--sft-tq-timeout-minutes` | int | None | Timeout for the offline producer's TransferQueue waits. Defaults to `--distributed-timeout-minutes`; an explicit value must be positive. |
 
-### Streaming Dataset Prefetch
+### Preference Training
 
-The SFT producer uses its own `PrefetchBuffer` independent from the rollout data source's `--prefetch-*` knobs.
+Use `--loss-type dpo` for DPO or `--loss-type rm` to train a reward model. Keep `--task-type causal_lm`; the loss type selects the preference training path. See [DPO Training](./dpo-training.md) for data and launch examples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--sft-prefetch-buffer-size` | int | 256 | Max pre-loaded samples held by the SFT streaming dataset's PrefetchBuffer. Set to 0 to disable prefetching; the producer then falls back to an `asyncio.gather` path over the ProcessorPool for batch-level parallelism. |
-| `--sft-prefetch-chunk-size` | int | 32 | Chunk size dispatched to the SFT prefetch thread-pool per round. |
-| `--sft-prefetch-num-workers` | int | 4 | Worker threads inside the SFT PrefetchBuffer for I/O-bound media decoding (video/image). |
+| `--preference-chosen-key` | str | chosen | Dataset field containing the preferred response or conversation. |
+| `--preference-rejected-key` | str | rejected | Dataset field containing the rejected response or conversation. |
+| `--preference-max-length` | int | 1024 | Maximum prompt + completion tokens in each branch. Both branches retain the same prompt suffix. Must not exceed `--seq-length`. |
+| `--preference-max-completion-length` | int | 512 | Maximum completion tokens per branch. Keeps the first tokens of longer completions, then trims the shared prompt to fit `--preference-max-length`. Must not exceed that limit. |
+| `--dpo-beta` | float | 0.1 | DPO only. Finite, positive scale for the policy/reference log-probability margin. |
+| `--dpo-reference-free` | flag | False | DPO only. Explicitly enable reference-free logistic DPO. Missing or invalid reference configuration raises an error instead of enabling this mode. |
+
+`--global-batch-size` counts pairs. `--max-tokens-per-gpu` counts both complete branches, so it counts the shared prompt twice. After the explicit length limits above, the default `--sft-oversize-strategy keep` preserves any pair that exceeds this budget and places it alone in a micro-batch. See [Oversize Sample Handling](#oversize-sample-handling) for other strategies. Preference training does not support `--sft-predict-interval`, `--sft-chunked-logits`, or `--sft-async-prepack`.
+
+### Streaming Dataset Prefetch
+
+The offline producer uses its own `PrefetchBuffer` for SFT samples or preference pairs, independent from the rollout data source's `--prefetch-*` knobs.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--sft-prefetch-buffer-size` | int | 256 | Maximum samples or preference pairs cached by the offline dataset's PrefetchBuffer. Set to 0 to disable background prefetching. |
+| `--sft-prefetch-chunk-size` | int | 32 | Samples or preference pairs dispatched to the prefetch thread pool per round. |
+| `--sft-prefetch-num-workers` | int | 4 | Worker threads for offline dataset prefetching, including media decoding for multimodal SFT. |
 
 ### Sharded TransferQueue Producers
 
@@ -459,6 +477,10 @@ How the SFT producer handles samples whose tokenized + media-expanded length exc
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` drops the sample; `keep` returns it unchanged (may OOM downstream); `truncate_left` keeps the last `capacity` tokens; `truncate_right` keeps the first `capacity` tokens; `custom` delegates to `--sft-oversize-custom-function-path`. ⚠ Truncating multimodal samples in-place may misalign `multimodal_train_inputs` — use `custom` if you also need to trim media inputs. |
 | `--sft-oversize-custom-function-path` | str | None | - | Required when `--sft-oversize-strategy custom`. Importable path to a function with signature `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`. Returning `None` is treated as `skip`. |
 
+Preference training uses these same options after applying `--preference-max-length` and `--preference-max-completion-length`. The capacity counts both branches together: `keep` preserves the pair in its own micro-batch, while `skip` drops the whole pair.
+
+For `truncate_left`, `truncate_right`, and `custom`, Relax divides the pair budget between the two branches. Left truncation keeps a common prompt suffix; right truncation keeps the start of each branch. A custom function receives each oversized branch and its allocated capacity; returning `None` for either branch drops the whole pair. Processing raises an error if a branch has no supervised answer tokens, the two answers become identical, or their prompts differ.
+
 ::: tip Related dataset flags
 SFT also uses the general dataset flags from [Data Configuration](#data-configuration), in particular `--input-key`, `--label-key`, `--conversation-key-map` (for sharegpt-style datasets), `--multimodal-keys`, `--system-prompt`, and `--tool-key`.
 :::
@@ -469,9 +491,9 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-interval` | int | None | Evaluation interval in Rollout rounds |
+| `--eval-interval` | int | None | Evaluation interval in rollout rounds for online RL, or completed optimizer steps for offline training. |
 | `--eval-prompt-data` | str (list) | None | Evaluation datasets in format: `dataset_name /path/to/data.jsonl`. Can specify multiple pairs |
-| `--eval-config` | str | None | OmegaConf YAML/JSON evaluation config file path. When set, overrides `--eval-prompt-data` |
+| `--eval-config` | str | None | Online RL evaluation config in OmegaConf YAML/JSON format; overrides `--eval-prompt-data`. Offline training uses `--eval-prompt-data` or `--eval-size` instead. |
 | `--eval-function-path` | str | None | Evaluation generation function path. When None, uses `--rollout-function-path` |
 | `--skip-eval-before-train` | flag | False | Whether to skip evaluation before training |
 | `--eval-input-key` | str | None | Key for input field in evaluation data. When None, uses `--input-key` |
@@ -490,9 +512,11 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 
 ## Reward Configuration
 
+These flags configure reward computation for generated rollout samples. Use `--loss-type rm` to train a reward model; `--rm-type` selects the scorer used during online RL.
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--rm-type` | str | None | Built-in reward model type |
+| `--rm-type` | str | None | Built-in reward function or service type, such as rule-based `dapo` or `remote_rm` |
 | `--rm-type-fallback` | str | None | Fallback for unknown/missing reward types: `zero` scores 0.0 with a warning, a registered type name routes there. None keeps the error behavior |
 | `--rm-type-infer` | flag | False | Infer the reward type from the sample label via registered matchers when no explicit type is set; conflicts warn and the explicit type wins |
 | `--custom-rm-path` | str | None | Custom reward function path. A single-sample function receives one sample; a batched/group function receives the complete sample list and returns one result per sample. Bypasses format-aware routing |
