@@ -76,7 +76,7 @@ Before writing a single line of documentation, **read the actual source code** f
 
 Create `docs/en/guide/<filename>.md` (or `docs/en/examples/<filename>.md`, `docs/en/api/<filename>.md` depending on category).
 
-Use `references/doc-template.md` as a task-based outline, not a mandatory list of sections. Keep verification evidence separate from the page.
+Use the English and Chinese templates in `references/doc-template.md` as reusable starting points. Keep useful sections, remove unused ones, and adapt the order to the user task rather than filling every heading. Keep verification evidence separate from the page.
 
 Key rules:
 - Title is an H1 (`#`) matching the feature name
@@ -221,5 +221,5 @@ configs/                        # Runtime env config (env.yaml)
 
 ## References
 
-- `references/doc-template.md` — Flexible page planning and bilingual writing examples
+- `references/doc-template.md` — Reusable English/Chinese page templates, optional sections, and natural-writing examples
 - `references/content-verification-guide.md` — Detailed guide on verifying doc content against source code
