@@ -59,12 +59,13 @@ ______________________________________________________________________
 
 - Repeated work on a demonstrated hot path; establish its cost before introducing caching or new state
 - String building or repeated setup with material cost at the actual input size
+- Full dataset/state scans, repeated hashes, device synchronization/copies, and extra forwards: account for frequency, bytes or tokens processed, GPU/CPU placement, and the guarantee gained. A one-time identity check and the same work on every step have different costs; prefer checking at the owning boundary when it preserves the contract
 
 ### Memory
 
 - Unbounded collections growing without limit
 - Large objects held past useful lifetime
-- Loading entire large files — use streaming/iteration
+- Loading whole files when their actual size and retention cause memory pressure; compare streaming/iteration with the required access pattern
 
 ### Caching
 
@@ -88,7 +89,7 @@ if value is not None:
     process(value)
 ```
 
-- Division by zero: trace whether zero is reachable and what the operation should mean. Reject invalid external input or preserve an internal invariant failure; do not silently replace the denominator with `max(count, 1)` or an arbitrary epsilon
+- Division by zero: trace reachability and meaning. Use the contract to choose rejection, skipping, or a defined empty result; preserve an internal invariant failure when zero is invalid. Do not silently replace the denominator with `max(count, 1)` or an arbitrary epsilon
 - Empty collection access when an empty input is permitted; do not add a guard if the producer already guarantees a nonempty value
 - Off-by-one in slicing / ranges
 

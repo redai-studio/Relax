@@ -1,6 +1,26 @@
 # ML/PyTorch Checklist (Relax Project)
 
-Contents: [Tensors](#tensor-operations), [gradients](#gradient-issues), [memory](#memory-management), [distributed training](#distributed-training), [numerics](#numerical-stability), [Relax patterns](#relax-specific-patterns), [questions](#review-questions).
+Contents: [Learning semantics](#learning-semantics), [tensors](#tensor-operations), [gradients](#gradient-issues), [memory](#memory-management), [distributed training](#distributed-training), [numerics](#numerical-stability), [Relax patterns](#relax-specific-patterns), [questions](#review-questions).
+
+## Learning Semantics
+
+Trace the data contract through training and evaluation before checking tensor mechanics. Use an independent small numerical example when a coordinate or reduction is unclear; successful execution alone does not prove the estimator is correct.
+
+| Semantic boundary | What to establish |
+|-------------------|-------------------|
+| Supervision | Which turns and tokens contribute to the objective; distinguish prompt/context from supervised responses and verify the configured scope |
+| Coordinates | Whether a mask indexes input tokens or next-token targets; account for shifts, packing, padding, terminal positions, and CP offsets |
+| Counting and pairing | Whether a count denotes pairs, branches, rows, samples, or tokens; preserve complete pairs across batching and DP partitions |
+| Reduction | Sum versus mean, token versus sample weighting, global denominator, and backend gradient scaling across microbatches and DP ranks |
+| Gradient path | Which parameters should receive gradients; distinguish learned paths from frozen references and detached metrics |
+| Metrics | Definition, units, reduction, and threshold for identically named training/evaluation metrics; different definitions need explicit names or a documented reason |
+| Tail batches and sampling | Unequal final partitions, weighting, and normal repeated sampling; do not infer a uniqueness requirement from an identifier or accidentally count padding/replay as new data |
+
+### Calibration Examples
+
+- Input-position response masks cannot be applied unchanged to next-token log-probabilities. For tokens `[p, a, b]`, log-probabilities for targets `[a, b]` need the corresponding shifted mask. Use distinct token scores to expose a silent one-position error.
+- If training reports a strict positive-margin rate (`margin > 0`), evaluation's same-named metric must not silently use `margin > epsilon`. A documented tolerance metric can be valid under a distinct definition.
+- Averaging local means with unequal token counts changes global token weighting. Check the intended estimator and the backend's scaling before changing a denominator; equal-weight sample or rank means may be intentional under another contract.
 
 ## Tensor Operations
 
@@ -37,6 +57,8 @@ losses.append(loss.detach())
 ```
 
 Detached tensors still occupy memory and share storage: bound or aggregate metric retention, consume it at an explicit logging boundary, and account for later mutation. Do not add `.item()`, `.tolist()`, or tensor printing to training hot paths.
+
+Removing autograd references and reading a CPU scalar solve different problems. `.detach()` severs the gradient path without synchronizing to the CPU; scalar reads or device copies need an explicit consumption boundary and a justified frequency.
 
 - References that retain large tensors beyond their useful lifetime; lack of an explicit `del` alone is not a leak
 - Investigate actual live allocations and memory pressure before proposing cache clearing or gradient checkpointing
@@ -75,7 +97,7 @@ ______________________________________________________________________
 
 ## Numerical Stability
 
-- Establish whether zero denominators or empty masks are supported cases, invalid inputs, or broken invariants. Add a defined numerical treatment only when it preserves the algorithm; arbitrary epsilon/clamping can hide corrupt data or change the estimator
+- Establish whether zero denominators or empty masks are supported cases, invalid inputs, or broken invariants. Choose error, skip, or a defined empty value from that contract, preserving group-wide collective participation. Arbitrary epsilon/clamping can hide corrupt data or change the estimator
 - Check stability of probability/log-probability calculations and NaN/Inf propagation; prefer a mathematically equivalent stable formulation where applicable
 - Verify clipping and mixed-precision loss scaling against the configured training backend and algorithm; do not add clipping or a scaler simply because precision is reduced
 
@@ -91,7 +113,7 @@ ______________________________________________________________________
 
 ### Loss Scaling (Megatron)
 
-Loss must account for: `num_microbatches`, `global_batch_size`, `data_parallel_world_size`.
+Check how the configured backend already scales loss across microbatches, global batch size, and DP ranks. Preserve the objective's intended denominator; do not multiply by these factors mechanically or apply scaling twice.
 
 ### Context Parallelism
 

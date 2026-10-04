@@ -5,6 +5,7 @@
 - Limit removal proposals to code made obsolete by the reviewed change or needed to solve its concrete problem.
 - Use the severity definitions in `SKILL.md`; scheduling a cleanup does not make it P0/P1.
 - A disabled feature, absent direct caller, or passing test suite does not establish that a public API has no consumers. Respect repository approval requirements for deleting or renaming public APIs.
+- For removed or merged tests, identify retained coverage that detects the relevant independent failures and actually executes their production boundary. Do not preserve an intentionally removed policy solely because its old tests encode it.
 
 ______________________________________________________________________
 
