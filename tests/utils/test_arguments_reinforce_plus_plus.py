@@ -62,7 +62,7 @@ def _args(estimator: str, **overrides) -> SimpleNamespace:
 
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
 def test_valid_reinforce_plus_plus_contracts(arguments_module, estimator):
-    arguments_module._validate_reinforce_plus_plus_args(_args(estimator), is_sft=False)
+    arguments_module._validate_reinforce_plus_plus_args(_args(estimator), is_offline=False)
 
 
 @pytest.mark.parametrize(
@@ -79,7 +79,7 @@ def test_valid_reinforce_plus_plus_contracts(arguments_module, estimator):
 @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "reinforce_plus_plus_baseline"])
 def test_common_contract_rejections(arguments_module, estimator, overrides, message):
     with pytest.raises(ValueError, match=message):
-        arguments_module._validate_reinforce_plus_plus_args(_args(estimator, **overrides), is_sft=False)
+        arguments_module._validate_reinforce_plus_plus_args(_args(estimator, **overrides), is_offline=False)
 
 
 @pytest.mark.parametrize(
@@ -92,7 +92,9 @@ def test_common_contract_rejections(arguments_module, estimator, overrides, mess
 )
 def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
     with pytest.raises(ValueError, match=message):
-        arguments_module._validate_reinforce_plus_plus_args(_args("reinforce_plus_plus", **overrides), is_sft=False)
+        arguments_module._validate_reinforce_plus_plus_args(
+            _args("reinforce_plus_plus", **overrides), is_offline=False
+        )
 
 
 @pytest.mark.parametrize(
@@ -111,11 +113,11 @@ def test_reinforce_plus_plus_kl_contract(arguments_module, overrides, message):
 def test_reinforce_plus_plus_baseline_contract(arguments_module, overrides, message):
     with pytest.raises(ValueError, match=message):
         arguments_module._validate_reinforce_plus_plus_args(
-            _args("reinforce_plus_plus_baseline", **overrides), is_sft=False
+            _args("reinforce_plus_plus_baseline", **overrides), is_offline=False
         )
 
 
 def test_other_estimators_are_unchanged(arguments_module):
     arguments_module._validate_reinforce_plus_plus_args(
-        _args("grpo", normalize_advantages=False, colocate=False), is_sft=False
+        _args("grpo", normalize_advantages=False, colocate=False), is_offline=False
     )

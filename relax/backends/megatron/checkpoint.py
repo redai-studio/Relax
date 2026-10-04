@@ -442,6 +442,28 @@ def _validate_lora_model_state_load(model):
             chunk.load_state_dict = original
 
 
+def _checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path:
+    path = Path(load_path)
+    if re.fullmatch(r"iter_\d{7}", path.name):
+        return path
+    tracker = path / "latest_checkpointed_iteration.txt"
+    try:
+        metadata = tracker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if metadata == "release":
+        return path / "release"
+    try:
+        iteration = int(metadata)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if ckpt_step is not None:
+        iteration = int(ckpt_step)
+    if iteration < 0:
+        raise RuntimeError(f"Megatron checkpoint iteration must be non-negative, got {iteration}")
+    return path / f"iter_{iteration:07d}"
+
+
 def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path | None:
     """Resolve the concrete iteration directory megatron will load from.
 
@@ -535,7 +557,7 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
     """Probe only host metadata before deciding which collective loader to
     use."""
     exists = Path(load_path).exists() and _is_dir_nonempty(load_path)
-    megatron = exists and (_is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
+    megatron = exists and (is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
     iteration_dir = (
         _resolve_checkpoint_iteration_dir(load_path, ckpt_step=getattr(args, "ckpt_step", None)) if megatron else None
     )
@@ -683,7 +705,7 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
     )
 
 
-def _is_megatron_checkpoint(path: str | Path) -> bool:
+def is_megatron_checkpoint(path: str | Path) -> bool:
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )

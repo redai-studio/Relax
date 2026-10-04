@@ -9,6 +9,7 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.engine.sft.runtime import is_offline_mode
 from relax.utils.device import ray_get_device_ids
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
@@ -117,14 +118,14 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
     #   - only num_epoch   -> num_epoch * rollout_per_epoch
     #   - only num_rollout -> use as-is
-    # SFT pre-resolves both num_rollout and num_rollout_per_epoch from the SFT
+    # Offline training pre-resolves num_rollout and num_rollout_per_epoch from its
     # dataset in controller.py before any role is launched; the injected Rollout
     # has no RL global dataset, so trust those values and skip the RL-side
     # computation (which would assert on rollout_global_dataset).
-    if getattr(args, "loss_type", None) == "sft":
+    if is_offline_mode(args):
         num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
         logger.info(
-            f"RolloutManager initialized successfully (SFT mode). "
+            f"RolloutManager initialized successfully (offline mode). "
             f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
         )
     else:

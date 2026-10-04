@@ -28,9 +28,8 @@ def register_genrm(config: Namespace, algo: dict) -> list[str]:
 def register_sft_rollout(config: Namespace, algo: dict) -> list:
     """Conditionally register Rollout into the SFT algo dict.
 
-    SFT mode is identified by ``loss_type == "sft"`` throughout the codebase.
-    Do not switch this to ``advantage_estimator == "sft"``: Megatron's parser
-    does not accept ``"sft"`` as an ``--advantage-estimator`` choice.
+    Only ``loss_type == "sft"`` supports generation prediction; other offline
+    objectives reuse the producer and actor roles without a Rollout service.
 
     Rollout is only spun up when ``--sft-predict-interval`` is set — that is
     the sole consumer of generative eval under SFT today.

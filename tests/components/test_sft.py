@@ -117,6 +117,47 @@ def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(mon
     fake_ds.get_batch_by_indices.assert_called_once_with(eval_indices)
 
 
+@pytest.mark.parametrize("loss_type", ["dpo"])
+@pytest.mark.parametrize("oversize_strategy", [None, "truncate_right", "custom"])
+def test_preference_datasets_receive_oversize_policy(monkeypatch, loss_type, oversize_strategy):
+    from relax.components import sft as sft_module
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
+    dataset_factory = MagicMock(return_value=fake_ds)
+    custom_fn = MagicMock()
+    load_custom_fn = MagicMock(return_value=custom_fn)
+    monkeypatch.setattr(sft_module, "PreferenceStreamingDataset", dataset_factory)
+    monkeypatch.setattr(sft_module, "load_function", load_custom_fn)
+    args = _make_args()
+    args.loss_type = loss_type
+    args.preference_chosen_key = "chosen"
+    args.preference_rejected_key = "rejected"
+    args.preference_max_length = 1024
+    args.preference_max_completion_length = 512
+    if oversize_strategy is not None:
+        args.sft_oversize_strategy = oversize_strategy
+    args.sft_oversize_custom_function_path = "test.custom"
+    sft = sft_module.SFT.func_or_class.__new__(sft_module.SFT.func_or_class)
+    sft.config = args
+    sft.step = 0
+    sft._dataset = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+
+    sft._init_data_pipeline()
+
+    calls = dataset_factory.call_args_list
+    assert [call.kwargs["path"] for call in calls] == [args.prompt_data]
+    for call in calls:
+        assert call.kwargs["oversize_strategy"] == (oversize_strategy or "keep")
+        assert call.kwargs["oversize_custom_fn"] is (custom_fn if oversize_strategy == "custom" else None)
+        assert call.kwargs["pair_capacity"] == args.max_tokens_per_gpu
+    if oversize_strategy == "custom":
+        load_custom_fn.assert_called_once_with("test.custom")
+    else:
+        load_custom_fn.assert_not_called()
+
+
 def test_sft_component_imports_without_ray():
     from relax.components.sft import SFT  # noqa: F401
 

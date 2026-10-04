@@ -401,11 +401,11 @@ class Rollout(Base):
         await self.rollout_manager.eval.remote(rollout_id=rollout_id)
 
     async def _async_run(self) -> None:
-        from relax.engine.sft.runtime import is_sft_mode
+        from relax.engine.sft.runtime import is_offline_mode
 
-        # SFT-with-rollout: Rollout is a passive SGLang server that responds to
-        # HTTP /predict and /evaluate driven by the Actor. No RL rollout loop.
-        if is_sft_mode(self.config):
+        # Offline training has no RL rollout loop. SFT can use a passive SGLang
+        # server for HTTP /predict and /evaluate driven by the Actor.
+        if is_offline_mode(self.config):
             return
         try:
             if self.config.eval_interval is not None and self.step == 0 and not self.config.skip_eval_before_train:
