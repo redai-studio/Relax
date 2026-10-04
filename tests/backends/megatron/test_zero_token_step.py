@@ -200,59 +200,20 @@ def _make_args() -> SimpleNamespace:
     )
 
 
-def test_train_one_step_skips_optimizer_and_scheduler_on_zero_token_step(model_module, monkeypatch):
-    """A global zero-token step must not update parameters or the LR
-    scheduler."""
-    from megatron.core import mpu
-
-    calls = {"optimizer_step": 0, "scheduler_step": 0}
-
-    optimizer = SimpleNamespace(
-        step=lambda: calls.__setitem__("optimizer_step", calls["optimizer_step"] + 1) or (True, 0.0, 0),
-        zero_grad=lambda: None,
-        get_loss_scale=lambda: SimpleNamespace(item=lambda: 1.0),
-        param_groups=[],
-    )
-    scheduler = SimpleNamespace(
-        step=lambda increment=None: calls.__setitem__("scheduler_step", calls["scheduler_step"] + 1)
-    )
-    model = [SimpleNamespace(zero_grad_buffer=lambda: None)]
-
-    losses_reduced = _two_microbatch_losses(zero=True)
-
-    monkeypatch.setattr(model_module, "_is_global_zero_token_step", lambda losses: True)
-    monkeypatch.setattr(model_module, "get_args", lambda: _make_args())
-    monkeypatch.setattr(model_module, "get_forward_backward_func", lambda: lambda **_kwargs: losses_reduced)
-    monkeypatch.setattr(model_module, "maybe_verify_critic_value_head_movement", lambda *a, **k: None)
-    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda ignore_virtual=False: False)
-    monkeypatch.setattr(mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None)
-
-    loss_reduced, grad_norm = model_module.train_one_step(
-        args=_make_args(),
-        rollout_id=0,
-        step_id=3,
-        data_iterator=[[]],
-        model=model,
-        optimizer=optimizer,
-        opt_param_scheduler=scheduler,
-        num_microbatches=1,
-        step_global_batch_size=32,
-    )
-
-    assert calls["optimizer_step"] == 0
-    assert calls["scheduler_step"] == 0
-    assert grad_norm == 0.0
-    assert loss_reduced == {}
-
-
-@pytest.mark.parametrize("zero_tokens", [False, True])
 @pytest.mark.parametrize(
-    ("calculate_per_token_loss", "reward_model"),
-    [(False, False), (True, False), (False, True)],
-    ids=["sample-mean", "token-mean", "reward-model-pair-mean"],
+    ("zero_tokens", "calculate_per_token_loss", "reward_model", "is_last_stage"),
+    [
+        pytest.param(False, False, False, True, id="sample-mean"),
+        pytest.param(True, False, False, True, id="sample-mean-zero-tokens"),
+        pytest.param(False, True, False, True, id="token-mean"),
+        pytest.param(True, True, False, True, id="token-mean-zero-tokens"),
+        pytest.param(False, False, True, True, id="reward-model-pair-mean"),
+        pytest.param(True, False, True, True, id="reward-model-pair-mean-zero-tokens"),
+        pytest.param(True, False, False, False, id="non-last-stage-zero-tokens"),
+    ],
 )
 def test_train_one_step_preserves_logical_batch_and_capture(
-    model_module, monkeypatch, zero_tokens, calculate_per_token_loss, reward_model
+    model_module, monkeypatch, zero_tokens, calculate_per_token_loss, reward_model, is_last_stage
 ):
     args = _make_args()
     args.calculate_per_token_loss = calculate_per_token_loss
@@ -287,20 +248,29 @@ def test_train_one_step_preserves_logical_batch_and_capture(
     )
     scheduler = SimpleNamespace(step=lambda increment: calls["scheduler"].append(increment))
     monkeypatch.setattr(model_module, "get_args", lambda: args)
-    monkeypatch.setattr(model_module, "get_forward_backward_func", lambda: lambda **_kwargs: losses)
+    monkeypatch.setattr(
+        model_module, "get_forward_backward_func", lambda: lambda **_kwargs: losses if is_last_stage else []
+    )
     monkeypatch.setattr(
         model_module,
         "maybe_verify_critic_value_head_movement",
         lambda model, optimizer, update_successful: calls["critic_update_successful"].append(update_successful),
     )
     monkeypatch.setattr(model_module.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None)
+
+    def broadcast(tensor, src, group=None):
+        if is_last_stage:
+            pytest.fail("PP=1 must not broadcast")
+        # Supply the last pipeline stage's decision to the real skip helper.
+        tensor.fill_(int(zero_tokens))
+
     _patch_mpu(
         monkeypatch,
         model_module,
-        pp_size=1,
-        is_last_stage=True,
+        pp_size=1 if is_last_stage else 2,
+        is_last_stage=is_last_stage,
         all_reduce_impl=lambda tensor, group=None: None,
-        broadcast_impl=lambda tensor, src, group=None: pytest.fail("PP=1 must not broadcast"),
+        broadcast_impl=broadcast,
     )
     monkeypatch.setattr(
         model_module.capture_hooks,
@@ -340,7 +310,7 @@ def test_train_one_step_preserves_logical_batch_and_capture(
                 "rm/score_rejected_std": 0.0 if zero_tokens else 0.5,
             }
         )
-    assert metrics == expected_metrics
+    assert metrics == (expected_metrics if is_last_stage else {})
     assert grad_norm == (0.0 if zero_tokens else 1.0)
 
 
