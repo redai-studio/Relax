@@ -144,18 +144,14 @@ def get_responses(
             else:
                 end += total_length
                 start = end - response_length
-            if response_length == 0:
-                # ``tokens[-0:]`` is the full prompt, not an empty slice.
-                logits_chunk = logits[0:0]
-                tokens_chunk = tokens[0:0]
-            elif response_length == total_length:
+            if response_length == total_length and response_length > 0:
                 # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
                 from relax.utils.sft_utils import compute_sft_response_chunk
 
                 logits_chunk, tokens_chunk = compute_sft_response_chunk(logits, tokens, start, end)
             else:
                 logits_chunk = logits[start - 1 : end - 1]
-                tokens_chunk = tokens[-response_length:]
+                tokens_chunk = tokens[total_length - response_length : total_length]
         elif args.allgather_cp:
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
