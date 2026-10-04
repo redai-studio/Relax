@@ -64,7 +64,7 @@ $$L_{i,t} = -\operatorname{stopgrad}(A_i)\log\pi_\theta(y_{i,t}\mid x,y_{i,<t})$
 
 $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
 
-这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
+这种 global-token reduction 不会为每条 response 单独附加 $1/T_i$ 权重。loss mask 只控制 token 是否参与策略损失，不会将该样本的 reward 排除出组内 baseline 计算。RLOO 不使用 clipping，因此 `train/pg_clipfrac` 始终为 `0`。
 
 ### 约束与参数
 
