@@ -346,17 +346,19 @@ def _make_opd_policy_args(clip: str, per_token: bool, use_tis: bool = False) -> 
 
 @pytest.mark.parametrize("clip", ["per_token", "is"])
 @pytest.mark.parametrize("per_token", [True, False], ids=["token-mean", "sample-mean"])
-@pytest.mark.parametrize("use_tis", [False, True], ids=["original-policy-mask", "tis-rejects-all"])
 @pytest.mark.parametrize(
-    ("response_lengths", "mask_values", "token_fraction", "sample_fraction"),
+    ("response_lengths", "mask_values", "token_fraction", "sample_fraction", "use_tis"),
     [
-        ([2, 4], [[1, 1], [1, 1, 1, 1]], 0.5, 0.625),
-        ([2, 4], [[1, 0], [1, 1, 0, 0]], 2 / 3, 0.75),
-        ([2, 4], [[0, 0], [0, 0, 0, 0]], 0.0, 0.0),
-        ([2, 0], [[1, 1], []], 1.0, 0.5),
-        ([0, 0], [[], []], 0.0, 0.0),
+        pytest.param([2, 4], [[1, 1], [1, 1, 1, 1]], 0.5, 0.625, False, id="valid"),
+        pytest.param([2, 4], [[1, 0], [1, 1, 0, 0]], 2 / 3, 0.75, False, id="partial-mask"),
+        pytest.param([2, 4], [[0, 0], [0, 0, 0, 0]], 0.0, 0.0, False, id="fully-masked"),
+        pytest.param([2, 0], [[1, 1], []], 1.0, 0.5, False, id="mixed-empty"),
+        pytest.param([0, 0], [[], []], 0.0, 0.0, False, id="all-empty"),
+        # TIS adds distinct coverage only when the original masks contain valid tokens.
+        pytest.param([2, 4], [[1, 1], [1, 1, 1, 1]], 0.5, 0.625, True, id="tis-valid"),
+        pytest.param([2, 4], [[1, 0], [1, 1, 0, 0]], 2 / 3, 0.75, True, id="tis-partial-mask"),
+        pytest.param([2, 0], [[1, 1], []], 1.0, 0.5, True, id="tis-mixed-empty"),
     ],
-    ids=["valid", "partial-mask", "fully-masked", "mixed-empty", "all-empty"],
 )
 def test_opd_clip_metrics_use_valid_tokens_and_original_masks(
     monkeypatch: pytest.MonkeyPatch,

@@ -119,8 +119,17 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
                 torch.empty(0, dtype=torch.float64),
             ],
         ),
+        (
+            [2, 4],
+            [torch.zeros(2, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)],
+        ),
     ],
-    ids=["unequal-nonempty-responses", "unequal-with-fully-masked-response", "unequal-with-empty-response"],
+    ids=[
+        "unequal-nonempty-responses",
+        "unequal-with-fully-masked-response",
+        "unequal-with-empty-response",
+        "fully-masked-batch",
+    ],
 )
 def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkeypatch, response_lengths, masks):
     """Exercise the production reducer and returned Megatron token
@@ -175,7 +184,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
         "dynamic_cp_rank": 0,
     }
 
-    token_sum_loss, normalizer, _ = loss_module.loss_function(
+    token_sum_loss, normalizer, logging = loss_module.loss_function(
         args,
         batch,
         num_microbatches=1,
@@ -185,12 +194,21 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     flat_mask = torch.cat(masks)
     expected_token_sum = -(advantages * log_probs * flat_mask).sum()
     expected_num_tokens = flat_mask.sum()
-    expected_final_loss = expected_token_sum / expected_num_tokens
-    final_loss = token_sum_loss / normalizer
 
     assert torch.allclose(token_sum_loss, expected_token_sum)
     assert normalizer.dtype == torch.int
     assert torch.allclose(normalizer.to(expected_num_tokens.dtype), expected_num_tokens)
+
+    if expected_num_tokens == 0:
+        assert token_sum_loss.item() == 0.0
+        assert normalizer.item() == 0.0
+        assert torch.count_nonzero(logging["values"]).item() == 0
+        token_sum_loss.backward()
+        assert torch.equal(log_probs.grad, torch.zeros_like(log_probs))
+        return
+
+    expected_final_loss = expected_token_sum / expected_num_tokens
+    final_loss = token_sum_loss / normalizer
     assert torch.allclose(final_loss, expected_final_loss)
 
     first_length = response_lengths[0]
@@ -236,69 +254,6 @@ def test_get_responses_cp1_returns_matching_empty_chunks_for_empty_response():
     logits_chunk, tokens_chunk = chunks[0]
     assert logits_chunk.shape == (0, 11)
     assert tokens_chunk.shape == (0,)
-
-
-def test_all_zero_token_loss_returns_zero_normalizer_and_numerator(monkeypatch):
-    log_probs = torch.tensor([-0.2, -0.4], dtype=torch.float64, requires_grad=True)
-    mask = torch.zeros(2, dtype=torch.float64)
-    monkeypatch.setattr(
-        loss_module,
-        "get_log_probs_and_entropy",
-        lambda *_args, **_kwargs: (
-            None,
-            {"log_probs": [log_probs], "entropy": [torch.zeros_like(log_probs)]},
-        ),
-    )
-    monkeypatch.setattr(loss_module, "resolve_opd_gather_topk_token_ids", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(loss_module, "compute_policy_opd_loss", lambda **_kwargs: (None, {}))
-    args = SimpleNamespace(
-        loss_type="policy_loss",
-        advantage_estimator="rloo",
-        calculate_per_token_loss=True,
-        qkv_format="thd",
-        recompute_loss_function=False,
-        allgather_cp=False,
-        global_batch_size=1,
-        true_on_policy_mode=False,
-        use_rollout_logprobs=False,
-        use_opsm=False,
-        get_mismatch_metrics=False,
-        use_tis=False,
-        custom_pg_loss_reducer_function_path=None,
-        entropy_coef=0.0,
-        use_kl_loss=False,
-    )
-    batch = {
-        "advantages": torch.tensor([1.0, 1.0], dtype=torch.float64),
-        "log_probs": [torch.zeros_like(log_probs)],
-        "response_lengths": [2],
-        "total_lengths": [3],
-        "unconcat_tokens": [torch.arange(3)],
-        "loss_masks": [mask],
-        "dynamic_cp_size": 1,
-        "dynamic_cp_rank": 0,
-    }
-
-    token_sum_loss, normalizer, logging = loss_module.loss_function(
-        args,
-        batch,
-        num_microbatches=1,
-        logits=torch.empty(1, 1, 1, dtype=torch.float64),
-    )
-
-    assert token_sum_loss.item() == 0.0
-    assert normalizer.item() == 0.0
-    assert logging["values"][0].item() == 0.0
-    assert torch.count_nonzero(logging["values"][1:]).item() == 0
-
-
-def test_zero_token_metrics_are_reported_as_zero_without_division():
-    keys = ["loss", "pg_loss", "ppo_kl"]
-    assert loss_module.normalize_reduced_loss_metrics(keys, [0.0, 0.0, -0.0, 0.0]) == {
-        "loss": 0.0,
-        "pg_loss": 0.0,
-        "ppo_kl": 0.0,
-    }
 
 
 def test_zero_token_metrics_reject_nonzero_numerator():
