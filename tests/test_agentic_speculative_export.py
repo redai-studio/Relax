@@ -3,7 +3,10 @@
 """CPU coverage for backend metadata, committed exports and batch metrics."""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
+
+import pytest
 
 from relax.agentic.pipeline import TrainingFieldArtifact
 from relax.agentic.session.service import AgenticSessionShard
@@ -116,6 +119,80 @@ def test_untracked_content_addressed_node_does_not_become_complete_later() -> No
     _response(forest, prompt, "known", "same", SpeculativeCounts(9, 10))
     sample = forest.build_sample(leaf_state_hash=legacy.state_hash, tokenizer=_Tokenizer())
     assert sample.spec_generations is None
+
+
+def test_generation_exports_are_isolated_from_forest_and_other_samples() -> None:
+    forest, prompt = _forest()
+    node = _response(forest, prompt, "request", "reply", SpeculativeCounts(1, 2, 1, 2))
+    first = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    second = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    expected = deepcopy(second.spec_generations)
+
+    first.spec_generations[0]["counts"]["accepted"] = 999
+    first.spec_generations.clear()
+
+    assert second.spec_generations == expected
+    assert forest.committed_generations["request"].counts == SpeculativeCounts(1, 2, 1, 2)
+    fresh = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    assert fresh.spec_generations == expected
+    assert compute_speculative_metrics([second, fresh])["spec/accept_rate"] == 1 / 2
+
+
+def test_generation_serialization_and_artifacts_isolate_nested_counts() -> None:
+    forest, prompt = _forest()
+    node = _response(forest, prompt, "request", "reply", SpeculativeCounts(1, 2, 1, 2))
+    sample = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    expected = deepcopy(sample.spec_generations)
+    payload = sample.to_dict()
+    restored = type(sample).from_dict(payload)
+    artifact = TrainingFieldArtifact.from_sample(sample)
+    exported = artifact.to_sample()
+
+    payload["spec_generations"][0]["counts"]["accepted"] = 999
+    assert sample.spec_generations == expected
+    assert restored.spec_generations == expected
+
+    sample.spec_generations[0]["counts"]["proposed"] = 999
+    assert artifact.sample_payload["spec_generations"] == expected
+    exported.spec_generations[0]["counts"]["verify"] = 999
+    assert artifact.to_sample().spec_generations == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "counts"),
+    [("reply", SpeculativeCounts(9, 10, 2, 11)), ("different", SpeculativeCounts(1, 2, 1, 2))],
+    ids=["conflicting-counters", "conflicting-state"],
+)
+def test_conflicting_generation_id_preserves_committed_forest(text: str, counts: SpeculativeCounts) -> None:
+    forest, prompt = _forest()
+    node = _response(forest, prompt, "request", "reply", SpeculativeCounts(1, 2, 1, 2))
+    before = deepcopy(forest)
+
+    with pytest.raises(ValueError, match="Generation ID 'request' was committed with conflicting data"):
+        _response(forest, prompt, "request", text, counts)
+
+    assert forest == before
+    sample = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    metrics = compute_speculative_metrics([sample])
+    assert metrics["spec/unique_generation_count"] == 1
+    assert metrics["spec/accept_rate"] == 1 / 2
+
+
+def test_identical_generation_commit_does_not_duplicate_export() -> None:
+    forest, prompt = _forest()
+    counts = SpeculativeCounts(1, 2, 1, 2)
+    node = _response(forest, prompt, "request", "reply", counts)
+    before = deepcopy(forest)
+
+    repeated = _response(forest, prompt, "request", "reply", counts)
+
+    assert repeated.state_hash == node.state_hash
+    assert forest == before
+    sample = forest.build_sample(leaf_state_hash=node.state_hash, tokenizer=_Tokenizer())
+    metrics = compute_speculative_metrics([sample])
+    assert metrics["spec/record_occurrence_count"] == 1
+    assert metrics["spec/accepted_total"] == 1
+    assert metrics["spec/proposed_total"] == 2
 
 
 def test_backend_metadata_uses_normalized_counters_for_legacy_totals() -> None:
