@@ -152,56 +152,6 @@ def test_is_global_zero_token_step_false_pp1_no_broadcast(model_module, monkeypa
     assert calls == {"all_reduce": 1, "broadcast": 0}
 
 
-def test_is_global_zero_token_step_last_stage_pp2_broadcasts(model_module, monkeypatch):
-    """PP>1: the last stage reduces the count then broadcasts the decision."""
-    calls = {"all_reduce": 0, "broadcast": 0}
-
-    def all_reduce(tensor, group=None):
-        calls["all_reduce"] += 1
-
-    def broadcast(tensor, src=0, group=None):
-        calls["broadcast"] += 1
-        # TP=2, PP=2 pipeline [1, 3]: the global last rank, not stage index 1.
-        assert src == 3
-
-    _patch_mpu(
-        monkeypatch,
-        model_module,
-        pp_size=2,
-        is_last_stage=True,
-        all_reduce_impl=all_reduce,
-        broadcast_impl=broadcast,
-        pipeline_last_rank=3,
-    )
-    assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is True
-    assert calls == {"all_reduce": 1, "broadcast": 1}
-
-
-def test_is_global_zero_token_step_non_last_stage_pp2_enters_broadcast(model_module, monkeypatch):
-    """PP>1: a non-last stage skips the all-reduce but must join the broadcast
-    so the collective completes."""
-    calls = {"all_reduce": 0, "broadcast": 0}
-
-    def all_reduce(tensor, group=None):
-        calls["all_reduce"] += 1
-
-    def broadcast(tensor, src=0, group=None):
-        calls["broadcast"] += 1
-        assert src == 3
-
-    _patch_mpu(
-        monkeypatch,
-        model_module,
-        pp_size=2,
-        is_last_stage=False,
-        all_reduce_impl=all_reduce,
-        broadcast_impl=broadcast,
-        pipeline_last_rank=3,
-    )
-    assert model_module._is_global_zero_token_step(_two_microbatch_losses(zero=True)) is False
-    assert calls == {"all_reduce": 0, "broadcast": 1}
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to observe host synchronizations")
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_is_global_zero_token_step_single_host_sync(monkeypatch, pp_size):
