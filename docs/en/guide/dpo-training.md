@@ -46,6 +46,7 @@ Set the data and checkpoint paths:
 
 ```bash
 export PROMPT_DATA=/data/ultrafeedback/ultrafeedback_train.parquet
+export EVAL_PROMPT_DATA=/data/ultrafeedback/ultrafeedback_eval.parquet
 export SAVE_DIR=/checkpoints/dpo
 export EXP_NAME=qwen3-0.6b-ultrafeedback-dpo-gpu1
 ```
@@ -69,6 +70,7 @@ Set these environment variables before you run the script to change its defaults
 | `MAX_TOKENS_PER_GPU` | `8192` | Token budget per micro-batch, including both copies of the prompt and both answers. |
 | `LR` | `5e-7` | Learning rate. |
 | `SAVE_INTERVAL` | `50` | Steps between checkpoint saves. |
+| `EVAL_INTERVAL` | `200` | Steps between evaluations. |
 
 The script sets `--dpo-beta 0.1`, `--preference-max-length 1024`, and `--preference-max-completion-length 512`. These explicit length limits truncate each prompt and answer to at most 1,024 tokens in total, with at most 512 tokens in the answer. To change these settings, edit the script.
 
@@ -93,6 +95,31 @@ DPO records these metrics under `train/dpo/`:
 | `ref_logps_chosen`, `ref_logps_rejected` | Reference model log-probabilities. |
 | `reward_chosen`, `reward_rejected`, `reward_margin` | DPO rewards and their difference. |
 | `strict_accuracy`, `tie_rate`, `tie_aware_accuracy` | Preference accuracy and ties. |
+
+## Train a reward model
+
+A reward model gives each answer a scalar score. Training increases the score of the preferred answer relative to the other answer.
+
+Use the model and data paths from the steps above. Set a separate checkpoint directory and experiment name:
+
+```bash
+export SAVE_DIR=/checkpoints/reward-modeling
+export EXP_NAME=qwen3-0.6b-ultrafeedback-rm-gpu1
+
+NUM_GPUS=1 bash scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
+```
+
+The script selects reward model training with `--loss-type rm`. The [reward model script](../../../scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh) defaults to 200 optimizer steps, 32 pairs per step, and a learning rate of `1e-5`. Set `NUM_ROLLOUT`, `GLOBAL_BATCH_SIZE`, `MAX_TOKENS_PER_GPU`, `LR`, or `EVAL_INTERVAL` before launch to change these settings. The script saves every 50 steps. To change the save interval, edit `--save-interval` in the script.
+
+To resume, run the same script with the same paths and training settings. Keep the full Megatron checkpoint from reward model training. The script restores the model, optimizer, learning rate scheduler, and random number generator state together. A PPO critic checkpoint is not compatible with this reward model.
+
+## Evaluate during training
+
+Both scripts read evaluation data from `EVAL_PROMPT_DATA`. Set `EVAL_INTERVAL` before launch to choose how often evaluation runs. For example, `EVAL_INTERVAL=50` evaluates after steps 50, 100, and so on.
+
+Metrics under `eval/dpo_*` or `eval/rm_*` include loss, chosen/rejected scores, their difference, accuracy, tie rate, and the number of pairs.
+
+Relax includes the final partial evaluation batch. With data parallelism, every batch must divide evenly across the GPUs. For example, 10 pairs with a global batch size of 8 form batches of 8 and 2 pairs; both work with DP=2.
 
 ## Supported configurations
 

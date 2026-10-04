@@ -40,6 +40,7 @@ def make_args(**overrides):
     [
         ({}, True, False, False),
         ({"loss_type": "dpo"}, False, True, False),
+        ({"loss_type": "rm"}, False, True, False),
         ({"loss_type": "dpo", "max_staleness": 0}, False, False, False),
         ({"max_staleness": 0}, False, False, False),
         ({"multimodal_keys": {"image": "images"}}, False, True, True),

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Pure helpers for pair-aware DPO training."""
+"""Pure helpers shared by DPO and pairwise reward-model training."""
 
 from collections.abc import Sequence
 
@@ -122,6 +122,47 @@ def build_preference_pair_indices(
     return list(range(0, len(branch_pair_ids), 2)), list(range(1, len(branch_pair_ids), 2))
 
 
+def reward_model_pair_loss(chosen_scores: torch.Tensor, rejected_scores: torch.Tensor) -> torch.Tensor:
+    """Return unreduced Bradley-Terry loss, one value per preference pair."""
+    _validate_same_shape("reward-model scores", chosen_scores, rejected_scores)
+    margins = chosen_scores - rejected_scores
+    require_tensor_condition(
+        torch.isfinite(margins).all(),
+        "reward-model margins must contain only finite values",
+    )
+    return -F.logsigmoid(margins)
+
+
+def select_packed_sequence_scores(
+    logits: torch.Tensor,
+    total_lengths: Sequence[int],
+) -> torch.Tensor:
+    """Select each CP=1 THD branch's last-token score, excluding tail
+    padding."""
+    if logits.ndim == 3 and logits.shape[0] == 1 and logits.shape[-1] == 1:
+        flat_logits = logits[0, :, 0]
+    elif logits.ndim == 2 and logits.shape[-1] == 1:
+        flat_logits = logits[:, 0]
+    elif logits.ndim == 1:
+        flat_logits = logits
+    else:
+        raise ValueError(f"reward-model logits must have shape [1,T,1], [T,1], or [T], got {tuple(logits.shape)}")
+
+    offsets: list[int] = []
+    cursor = 0
+    for index, length in enumerate(total_lengths):
+        length = int(length)
+        if length <= 0:
+            raise ValueError(f"sequence {index} has non-positive total length {length}")
+        cursor += length
+        offsets.append(cursor - 1)
+    if cursor > flat_logits.numel():
+        raise ValueError(f"packed reward logits contain {flat_logits.numel()} tokens, expected at least {cursor}")
+    if not offsets:
+        return flat_logits.new_empty((0,))
+    return flat_logits[torch.tensor(offsets, device=flat_logits.device, dtype=torch.long)]
+
+
 def pack_preference_pair_indices(
     costs: Sequence[int],
     pair_ids: Sequence[int],
@@ -164,4 +205,6 @@ __all__ = [
     "pack_preference_pair_indices",
     "preference_accuracy",
     "require_tensor_condition",
+    "reward_model_pair_loss",
+    "select_packed_sequence_scores",
 ]

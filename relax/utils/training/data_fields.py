@@ -41,7 +41,7 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     ``consumer`` is only meaningful for PPO (``critic``, ``advantages``,
     ``actor``); other algorithms ignore it and receive the base rollout fields.
     """
-    if getattr(args, "loss_type", None) == "dpo":
+    if getattr(args, "loss_type", None) in {"dpo", "rm"}:
         return list(PREFERENCE_DATA_FIELDS)
     if getattr(args, "loss_type", None) == "sft":
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]

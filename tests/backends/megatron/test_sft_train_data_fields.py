@@ -12,7 +12,7 @@ import torch
 def _mk_actor_args(loss_type: str):
     return Namespace(
         loss_type=loss_type,
-        compute_advantages_and_returns=(loss_type not in {"sft", "dpo"}),
+        compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
         offload_train=False,
         offload_rollout=False,
@@ -44,10 +44,11 @@ def test_sft_data_fields_excludes_rl_only_keys():
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
 
 
-def test_preference_data_fields_keep_pairs_atomic():
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+def test_preference_data_fields_keep_pairs_atomic(loss_type):
     from relax.utils.training.data_fields import build_data_fields
 
-    args = _mk_actor_args(loss_type="dpo")
+    args = _mk_actor_args(loss_type=loss_type)
 
     fields = build_data_fields(args)
 
@@ -82,7 +83,9 @@ def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypat
 
     assert [tensor.tolist() for tensor in rollout_data["tokens"]] == [[1, 2, 3], [1, 4]]
     assert [tensor.tolist() for tensor in rollout_data["loss_masks"]] == [[0, 1, 1], [0, 1]]
+    assert "pair_ids" not in rollout_data
     assert rollout_data["preference_pair_ids"] == [17]
+    assert rollout_data["preference_branch_pair_ids"] == [17, 17]
     assert rollout_data["preference_pair_costs"] == [5]
 
 

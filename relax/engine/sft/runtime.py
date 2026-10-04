@@ -65,17 +65,21 @@ def is_offline_mode(args: Namespace) -> bool:
     Shared by argparse, controller wiring, components, and the Megatron
     backend.
     """
-    return getattr(args, "loss_type", None) in {"sft", "dpo"}
+    return getattr(args, "loss_type", None) in {"sft", "dpo", "rm"}
 
 
 def is_preference_mode(args: Namespace) -> bool:
-    return getattr(args, "loss_type", None) == "dpo"
+    return getattr(args, "loss_type", None) in {"dpo", "rm"}
 
 
 def validate_preference_args(args: Namespace) -> None:
     """Reject unsupported preference configurations before Serve starts."""
     if not is_preference_mode(args):
         return
+    loss_type = args.loss_type
+    if loss_type == "rm" and getattr(args, "save_hf", None) is not None:
+        raise ValueError("RM training does not support --save-hf; use native Megatron checkpoints for RM persistence")
+
     if getattr(args, "sft_async_prepack", False):
         raise ValueError("preference objectives v1 do not support --sft-async-prepack")
     if getattr(args, "task_type", "causal_lm") != "causal_lm":
@@ -126,21 +130,22 @@ def validate_preference_args(args: Namespace) -> None:
     seq_length = int(getattr(args, "seq_length", max_length) or max_length)
     if max_length > seq_length:
         raise ValueError("--preference-max-length must not exceed --seq-length")
-    if bool(getattr(args, "eval_prompt_data", None)) or getattr(args, "eval_size", None) is not None:
-        raise ValueError("DPO held-out evaluation is delivered by the follow-up reward-modeling PR")
-    beta = float(getattr(args, "dpo_beta", 0.1))
-    if not math.isfinite(beta) or beta <= 0:
-        raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
-    likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
-    if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
-        raise ValueError(
-            "preference objectives require --rollout-temperature 1.0 so sampling temperature does not scale "
-            "policy/reference likelihood logits"
-        )
-    if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
-        raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
-    if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
-        raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
+    if loss_type != "dpo" and getattr(args, "dpo_reference_free", False):
+        raise ValueError("--dpo-reference-free is valid only with --loss-type dpo")
+    if loss_type == "dpo":
+        beta = float(getattr(args, "dpo_beta", 0.1))
+        if not math.isfinite(beta) or beta <= 0:
+            raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
+        likelihood_temperature = float(getattr(args, "rollout_temperature", 1.0))
+        if not math.isfinite(likelihood_temperature) or likelihood_temperature != 1.0:
+            raise ValueError(
+                "DPO requires --rollout-temperature 1.0 so sampling temperature does not scale "
+                "policy/reference likelihood logits"
+            )
+        if not getattr(args, "dpo_reference_free", False) and getattr(args, "ref_update_interval", None) is not None:
+            raise ValueError("standard DPO requires a frozen reference and rejects --ref-update-interval")
+        if not getattr(args, "dpo_reference_free", False) and not getattr(args, "enable_weights_backuper", False):
+            raise ValueError("standard DPO requires --enable-weights-backuper for actor/ref snapshots")
 
 
 def should_skip_mtp_only_weight_management(
@@ -218,8 +223,10 @@ def sft_task_name(args: Namespace, *, component: str = "actor") -> str:
     return "train"
 
 
-def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
-    """SFT PPL eval triggers every ``--eval-interval`` steps under SFT mode
+def should_run_sft_eval(args: Namespace, completed_steps: int) -> bool:
+    """Return whether eval is due after ``completed_steps`` optimizer steps.
+
+    Offline eval triggers every ``--eval-interval`` steps
     when an eval source is configured (either ``--eval-prompt-data`` or
     ``--eval-size``, mutually exclusive — see ``utils/arguments.py``).
 
@@ -233,11 +240,11 @@ def should_run_sft_eval(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "eval_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    return completed_steps > 0 and completed_steps % interval == 0
 
 
-def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
-    """SFT periodic predict triggers every ``--sft-predict-interval`` steps.
+def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
+    """SFT periodic predict triggers after each completed interval.
 
     Argparse already validated ``--loss-type sft``, ``--save``, and the eval
     data source. Keep prediction exclusive to SFT.
@@ -247,4 +254,9 @@ def should_run_sft_predict(args: Namespace, rollout_id: int) -> bool:
     interval = getattr(args, "sft_predict_interval", None)
     if interval is None or interval <= 0:
         return False
-    return (rollout_id + 1) % interval == 0
+    return completed_steps > 0 and completed_steps % interval == 0
+
+
+def evaluation_step_for_rollout(args: Namespace, rollout_id: int) -> int:
+    """Map a zero-based training rollout to the evaluation step namespace."""
+    return rollout_id + 1 if is_offline_mode(args) else rollout_id

@@ -79,7 +79,7 @@ def _stub_loaders(monkeypatch, args):
         checkpoint, "_load_checkpoint_hf", lambda **kw: calls.append(("hf", kw["load_path"])) or (0, 0)
     )
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **kw: calls.append(("dcp",)) or (7, 0))
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda *a, **kw: None)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a, **kw: {})
     return calls
 
 
@@ -103,6 +103,18 @@ def test_checkpoint_model_only_sets_optimizer_policy(monkeypatch, tmp_path, no_l
     assert args.no_load_optim is expected
 
 
+@pytest.mark.parametrize("missing", ["iteration", "optimizer"])
+def test_reward_model_resume_rejects_incomplete_checkpoint(monkeypatch, tmp_path, missing):
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
+    args = Namespace(load=str(tmp_path), loss_type="rm", ckpt_format="torch_dist")
+    if missing == "optimizer":
+        save({"model": torch.zeros(2)}, checkpoint_id=tmp_path / "iter_0000007")
+    calls = _stub_loaders(monkeypatch, args)
+    with pytest.raises(RuntimeError, match="RM resume requires"):
+        checkpoint.load_checkpoint([Namespace(role="actor")], object(), None, {}, False)
+    assert calls == []
+
+
 def test_checkpoint_explicit_step_without_tracker_is_megatron(tmp_path):
     (tmp_path / "iter_0000009").mkdir()
     state = checkpoint._checkpoint_load_state(str(tmp_path), Namespace(ckpt_step=9), False)
@@ -119,8 +131,11 @@ def test_checkpoint_lora_metadata_uses_explicit_step(monkeypatch, tmp_path):
     marker = {"format_version": 1}
     args = Namespace(**{checkpoint._LORA_CHECKPOINT_METADATA_ATTR: marker})
     monkeypatch.setattr(dist_checkpointing, "load_common_state_dict", lambda path: seen.append(path) or {"args": args})
-    assert checkpoint._read_lora_checkpoint_metadata(tmp_path, ckpt_step=9) == marker
-    assert seen == [str(tmp_path / "iter_0000009")]
+    monkeypatch.setattr(dist_checkpointing, "check_is_distributed_checkpoint", lambda path: True)
+    directory = checkpoint._resolve_checkpoint_iteration_dir(tmp_path, ckpt_step=9)
+    common = checkpoint._load_checkpoint_metadata(args, [Namespace(role="actor")], directory)
+    assert checkpoint._metadata_value(common["args"], checkpoint._LORA_CHECKPOINT_METADATA_ATTR) == marker
+    assert seen == [tmp_path / "iter_0000009"]
 
 
 def _probe_worker(rank, rendezvous, output):
@@ -135,7 +150,7 @@ def _probe_worker(rank, rendezvous, output):
             checkpoint.get_args = lambda: Namespace(load="/shared/checkpoint")
             checkpoint._load_checkpoint_hf = lambda **kw: calls.append("hf")
             checkpoint._load_checkpoint_megatron = lambda **kw: calls.append("dcp")
-            checkpoint._read_lora_checkpoint_metadata = lambda *a, **kw: None
+            checkpoint._load_checkpoint_metadata = lambda *a, **kw: {}
 
             def probe(*args):
                 if rank == 1 and mode in ("permission", "metadata"):

@@ -231,7 +231,7 @@ def test_no_yaml_is_a_no_op(arguments_module):
     arguments_module.apply_custom_config_overrides(args)
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo"])
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
 def test_offline_runs_skip_the_algorithm_recheck(arguments_module, tmp_path, loss_type):
     """Offline training never selects an estimator, so a stale one must not
     block it."""

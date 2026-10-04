@@ -25,7 +25,7 @@ def _mk_actor_config(loss_type: str):
     )
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo"])
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
 def test_actor_helpers_emit_sft_partition_for_offline_training(loss_type):
     from relax.engine.sft.runtime import sft_partition_id, sft_task_name
 

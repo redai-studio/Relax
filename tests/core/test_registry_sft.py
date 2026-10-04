@@ -38,7 +38,7 @@ def test_algos_has_sft_entry():
     assert "actor" in registry.ALGOS["sft"]
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo"])
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
 def test_process_role_returns_sft_only_for_offline_training(loss_type):
     registry = _registry_module()
 

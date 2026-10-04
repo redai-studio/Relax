@@ -37,6 +37,8 @@ from relax.utils.training.preference_utils import (
     dpo_rewards,
     masked_sequence_sums,
     preference_accuracy,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
 )
 from relax.utils.types import RolloutBatch
 
@@ -1336,6 +1338,40 @@ def dpo_loss_function(
     return loss, metrics
 
 
+def reward_model_loss_function(
+    args: Namespace,  # noqa: ARG001
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute pair-summed Bradley-Terry loss over adjacent chosen/rejected
+    branches."""
+    if len(batch["total_lengths"]) % 2 != 0:
+        raise ValueError("reward-model micro-batch must contain an even number of chosen/rejected branches")
+    scores = select_packed_sequence_scores(logits, batch["total_lengths"])
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("reward-model batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+    chosen_scores = scores.index_select(0, chosen_index)
+    rejected_scores = scores.index_select(0, rejected_index)
+    pair_losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+    margins = chosen_scores - rejected_scores
+    loss = pair_losses.sum()
+    return loss, {
+        "rm/loss": pair_losses.detach().sum(),
+        "rm/score_chosen_mean": chosen_scores.detach().sum(),
+        "rm/score_rejected_mean": rejected_scores.detach().sum(),
+        "rm/score_margin_mean": margins.detach().sum(),
+        "rm/accuracy": (margins > 0).to(torch.float32).detach().sum(),
+        "rm/_score_chosen_second_moment": chosen_scores.detach().square().sum(),
+        "rm/_score_rejected_second_moment": rejected_scores.detach().square().sum(),
+    }
+
+
 def get_sequence_classification_outputs(
     args: Namespace,
     batch: RolloutBatch,
@@ -1557,6 +1593,8 @@ def loss_function(
                 func = value_loss_function
             case "dpo":
                 func = dpo_loss_function
+            case "rm":
+                func = reward_model_loss_function
             case "sft":
                 if getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function

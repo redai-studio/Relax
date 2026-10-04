@@ -7,7 +7,7 @@ from argparse import Namespace
 
 import pytest
 
-from relax.engine.sft.runtime import should_run_sft_eval, should_run_sft_predict
+from relax.engine.sft.runtime import evaluation_step_for_rollout, should_run_sft_eval, should_run_sft_predict
 
 
 def _mk_actor_args():
@@ -27,40 +27,90 @@ def _mk_actor_args():
     )
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo"])
-def test_should_run_sft_eval_at_interval_boundary(loss_type):
+def test_should_run_sft_eval_at_interval_boundary():
+    args = _mk_actor_args()
+    assert should_run_sft_eval(args, completed_steps=10) is True
+    assert should_run_sft_eval(args, completed_steps=20) is True
+    assert should_run_sft_eval(args, completed_steps=5) is False
+    assert should_run_sft_eval(args, completed_steps=0) is False
+
+
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_preference_eval_follows_configured_interval(loss_type):
     args = _mk_actor_args()
     args.loss_type = loss_type
-    assert should_run_sft_eval(args, rollout_id=9) is True
-    assert should_run_sft_eval(args, rollout_id=19) is True
-    assert should_run_sft_eval(args, rollout_id=4) is False
-    assert should_run_sft_eval(args, rollout_id=0) is False
+    args.eval_interval = 2
+    args.num_rollout = 5
+
+    assert [step for step in range(6) if should_run_sft_eval(args, step)] == [2, 4]
 
 
 def test_should_run_sft_eval_disabled_when_no_interval():
     args = _mk_actor_args()
     args.eval_interval = None
-    assert should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False
 
 
 def test_should_run_sft_eval_disabled_when_no_eval_source():
     args = _mk_actor_args()
     args.eval_prompt_data = None
-    assert should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False
 
 
 def test_should_run_sft_eval_disabled_for_non_sft():
     args = _mk_actor_args()
     args.loss_type = "policy_loss"
-    assert should_run_sft_eval(args, rollout_id=9) is False
+    assert should_run_sft_eval(args, completed_steps=10) is False
 
 
-@pytest.mark.parametrize("loss_type", ["sft", "dpo"])
-def test_should_run_sft_predict_only_runs_for_sft(loss_type):
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_should_run_sft_predict_uses_completed_step_boundaries(loss_type):
     args = _mk_actor_args()
     args.loss_type = loss_type
     args.sft_predict_interval = 10
 
-    assert should_run_sft_predict(args, rollout_id=0) is False
-    assert should_run_sft_predict(args, rollout_id=8) is False
-    assert should_run_sft_predict(args, rollout_id=9) is (loss_type == "sft")
+    assert should_run_sft_predict(args, completed_steps=0) is False
+    assert should_run_sft_predict(args, completed_steps=9) is False
+    assert should_run_sft_predict(args, completed_steps=10) is (loss_type == "sft")
+    assert should_run_sft_predict(args, completed_steps=19) is False
+    assert should_run_sft_predict(args, completed_steps=20) is (loss_type == "sft")
+
+
+def test_evaluation_step_mapping_is_completed_for_sft_and_zero_based_for_rl():
+    args = _mk_actor_args()
+    assert evaluation_step_for_rollout(args, rollout_id=0) == 1
+    assert evaluation_step_for_rollout(args, rollout_id=9) == 10
+
+    args.loss_type = "policy_loss"
+    assert evaluation_step_for_rollout(args, rollout_id=0) == 0
+    assert evaluation_step_for_rollout(args, rollout_id=9) == 9
+
+
+def test_sft_lookahead_uses_completed_step_eval_boundaries():
+    """Exercise the actual lookahead policy without importing the GPU actor."""
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/actor.py"
+    tree = ast.parse(source.read_text())
+    function = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_should_pause_sft_lookahead"
+    )
+    namespace = {
+        "Namespace": Namespace,
+        "evaluation_step_for_rollout": evaluation_step_for_rollout,
+        "should_run_sft_eval": should_run_sft_eval,
+        "should_run_sft_predict": should_run_sft_predict,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    for loss_type in ("sft", "dpo", "rm"):
+        args = Namespace(
+            loss_type=loss_type,
+            num_rollout=10,
+            eval_interval=2,
+            eval_size=512,
+            sft_predict_interval=None,
+            save=None,
+        )
+        assert not namespace["_should_pause_sft_lookahead"](args, 0)
+        assert namespace["_should_pause_sft_lookahead"](args, 1)

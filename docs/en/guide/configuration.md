@@ -309,7 +309,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | Parameter | Type | Default | Options | Description |
 |-----------|------|---------|---------|-------------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `custom_loss` | Training loss. `policy_loss` runs PPO/GRPO/etc.; `sft` runs supervised fine-tuning; `dpo` runs preference optimization; `custom_loss` requires `--custom-loss-function-path`. See [Offline Training Configuration](#offline-training-configuration) and [DPO Training](./dpo-training.md). `sft_loss` and `sft-loss` are deprecated aliases for `sft`. |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `rm`, `custom_loss` | Training loss. `policy_loss` runs PPO/GRPO/etc.; `sft` runs supervised fine-tuning; `dpo` runs preference optimization; `rm` trains a reward model; `custom_loss` requires `--custom-loss-function-path`. See [Offline Training Configuration](#offline-training-configuration) and [DPO Training](./dpo-training.md). `sft_loss` and `sft-loss` are deprecated aliases for `sft`. |
 | `--custom-loss-function-path` | str | None | - | Custom loss function path |
 | `--eps-clip` | float | 0.2 | - | PPO clipping range (lower bound) |
 | `--eps-clip-high` | float | None | - | PPO clipping upper bound. When None, equals `--eps-clip` |
@@ -398,13 +398,13 @@ PPO currently supports synchronous colocate mode and requires `critic` and `adva
 
 ## Offline Training Configuration
 
-Ordinary SFT (`--loss-type sft`) and DPO (`--loss-type dpo`) share the offline producer/consumer pipeline. The producer reads `--prompt-data` and writes batches to TransferQueue partitions named `sft_<rollout_id>`; the Megatron actor trains from those batches. Shared queue and CPU prefetch settings retain their `--sft-*` names. Generation prediction, chunked logits, and asynchronous prepacking remain SFT-only.
+Ordinary SFT (`--loss-type sft`), DPO (`--loss-type dpo`), and reward modeling (`--loss-type rm`) share the offline producer/consumer pipeline. The producer reads `--prompt-data` and writes batches to TransferQueue partitions named `sft_<rollout_id>`; the Megatron actor trains from those batches. Shared queue and CPU prefetch settings retain their `--sft-*` names. Generation prediction, chunked logits, and asynchronous prepacking remain SFT-only.
 
 ### Training Control
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-size` | float | None | SFT only; DPO held-out evaluation is not available in this version. Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
+| `--eval-size` | float | None | Offline training. Carve a held-out eval split from `--prompt-data` instead of supplying a separate `--eval-prompt-data`. A value <1 is treated as a fraction of the train dataset (e.g. `0.05` → 5%); a value ≥1 is treated as an absolute sample count. Rows are randomly split once using `--seed`, and the held-out rows are removed from the train pool so train and eval samples never overlap. Mutually exclusive with `--eval-prompt-data`. |
 | `--sft-predict-interval` | int | None | Causal-LM SFT only. Every N training steps, generate answers for the eval set and write them to `<save>/predict/predictions_step_<rollout_id>.jsonl`. Starts the Rollout role automatically. Requires `--save` and exactly one eval source: `--eval-prompt-data` or `--eval-size`. |
 | `--sft-max-in-flight-steps` | int | None | Offline TransferQueue buffer depth, including the current training step. A positive N sets `--max-staleness` to N − 1. |
 | `--sft-train-data-prefetch` | flag | False | Prefetch the next offline training step's raw TransferQueue payload on a CPU worker. Requires `--per-rank-fetch` and at least two in-flight steps. Mutually exclusive with `--sft-async-prepack`. |
@@ -412,7 +412,7 @@ Ordinary SFT (`--loss-type sft`) and DPO (`--loss-type dpo`) share the offline p
 
 ### Preference Training
 
-Use `--loss-type dpo` for DPO. Keep `--task-type causal_lm`; the loss type selects the preference training path. See [DPO Training](./dpo-training.md) for data and launch examples.
+Use `--loss-type dpo` for DPO or `--loss-type rm` to train a reward model. Keep `--task-type causal_lm`; the loss type selects the preference training path. See [DPO Training](./dpo-training.md) for data and launch examples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -491,7 +491,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--eval-interval` | int | None | Evaluation interval in rollout rounds for online RL, or completed optimizer steps for SFT. |
+| `--eval-interval` | int | None | Evaluation interval in rollout rounds for online RL, or completed optimizer steps for offline training. |
 | `--eval-prompt-data` | str (list) | None | Evaluation datasets in format: `dataset_name /path/to/data.jsonl`. Can specify multiple pairs |
 | `--eval-config` | str | None | Online RL evaluation config in OmegaConf YAML/JSON format; overrides `--eval-prompt-data`. Offline training uses `--eval-prompt-data` or `--eval-size` instead. |
 | `--eval-function-path` | str | None | Evaluation generation function path. When None, uses `--rollout-function-path` |
@@ -512,7 +512,7 @@ SFT also uses the general dataset flags from [Data Configuration](#data-configur
 
 ## Reward Configuration
 
-These flags configure reward computation for generated rollout samples.
+These flags configure reward computation for generated rollout samples. Use `--loss-type rm` to train a reward model; `--rm-type` selects the scorer used during online RL.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|

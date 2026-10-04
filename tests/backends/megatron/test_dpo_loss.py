@@ -8,6 +8,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from relax.engine.sft.eval.preference import finalize_pair_metrics, pair_metric_sums
+
 
 try:
     from relax.backends.megatron import loss as loss_module
@@ -116,6 +118,19 @@ def test_tie_metrics_are_epsilon_aware(monkeypatch):
     assert metrics["dpo/strict_accuracy"].item() == 0
     assert metrics["dpo/tie_rate"].item() == 2
     assert metrics["dpo/tie_aware_accuracy"].item() == 1
+
+
+def test_dpo_train_and_eval_accuracy_match_near_ties(monkeypatch):
+    policy = torch.tensor([-1.0 + 2.5e-6, -1.0, -1.0 - 2.5e-6, -1.0], dtype=torch.float64)
+    reference = torch.full_like(policy, -1.0)
+    _, train_metrics = _run(monkeypatch, list(policy.unbind()), ref_values=list(reference.unbind()))
+    rewards = 0.2 * (policy - reference)
+    eval_metrics = finalize_pair_metrics(pair_metric_sums(rewards[0::2], rewards[1::2], torch.zeros(2)), prefix="dpo")
+
+    for metric, expected in [("strict_accuracy", 0.5), ("tie_rate", 1.0), ("tie_aware_accuracy", 0.5)]:
+        assert train_metrics[f"dpo/{metric}"].item() / 2 == expected
+        assert eval_metrics[f"eval/dpo_{metric}"] == expected
+    torch.testing.assert_close(train_metrics["dpo/pair_accuracy"], train_metrics["dpo/strict_accuracy"])
 
 
 def test_reference_free_partition_and_num_samples_do_not_change_pair_sum(monkeypatch):

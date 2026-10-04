@@ -587,6 +587,7 @@ def test_loss_function_forwards_recompute_checkpoint_mode(monkeypatch, configure
         ("policy_loss", True, False),  # Not SFT
         ("value_loss", True, False),  # Not SFT
         ("dpo", True, False),
+        ("rm", True, False),
     ],
 )
 def test_should_use_sft_chunked(loss_type, chunked_flag, expected):

@@ -35,7 +35,7 @@ def test_register_sft_rollout_noop_without_flag():
     assert algo == {}
 
 
-@pytest.mark.parametrize("loss_type", ["policy_loss", "dpo"])
+@pytest.mark.parametrize("loss_type", ["policy_loss", "dpo", "rm"])
 def test_register_sft_rollout_noop_for_non_sft_algorithms(loss_type):
     """Only ordinary SFT supports the generation prediction hook."""
     from relax.core.optional_roles import register_sft_rollout

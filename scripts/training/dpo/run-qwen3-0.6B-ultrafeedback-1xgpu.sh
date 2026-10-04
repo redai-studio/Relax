@@ -14,6 +14,7 @@ source "${MODEL_CONFIG_DIR}/qwen3-0.6B.sh"
 MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_DIR}/Qwen3-0.6B-${MODEL_REVISION}}"
 PROMPT_DATA="${PROMPT_DATA:?set PROMPT_DATA to the Task 31 train JSONL or Parquet}"
+EVAL_PROMPT_DATA="${EVAL_PROMPT_DATA:?set EVAL_PROMPT_DATA to the Task 31 held-out JSONL or Parquet}"
 SAVE_DIR="${SAVE_DIR:-${SCRIPT_DIR}/../../../checkpoints/task31-dpo}"
 EXP_NAME="${EXP_NAME:-qwen3-0.6b-ultrafeedback-dpo-gpu1}"
 now=$(date "+%Y-%m-%d-%H:%M:%S")
@@ -27,6 +28,8 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --loss-type dpo \
     --dpo-beta 0.1 \
     --prompt-data "${PROMPT_DATA}" \
+    --eval-prompt-data task31 "${EVAL_PROMPT_DATA}" \
+    --eval-interval "${EVAL_INTERVAL:-200}" \
     --input-key prompt \
     --preference-max-length 1024 \
     --preference-max-completion-length 512 \

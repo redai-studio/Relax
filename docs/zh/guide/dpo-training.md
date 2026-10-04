@@ -46,6 +46,7 @@ hf download Qwen/Qwen3-0.6B \
 
 ```bash
 export PROMPT_DATA=/data/ultrafeedback/ultrafeedback_train.parquet
+export EVAL_PROMPT_DATA=/data/ultrafeedback/ultrafeedback_eval.parquet
 export SAVE_DIR=/checkpoints/dpo
 export EXP_NAME=qwen3-0.6b-ultrafeedback-dpo-gpu1
 ```
@@ -69,6 +70,7 @@ NUM_GPUS=1 bash scripts/training/dpo/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
 | `MAX_TOKENS_PER_GPU` | `8192` | 每个微批次的 token 预算，包含两份提示词及各自的回答。 |
 | `LR` | `5e-7` | 学习率。 |
 | `SAVE_INTERVAL` | `50` | 每隔多少步保存检查点。 |
+| `EVAL_INTERVAL` | `200` | 每隔多少步执行评测。 |
 
 脚本设置了 `--dpo-beta 0.1`、`--preference-max-length 1024` 和 `--preference-max-completion-length 512`。这两项显式长度限制会截断过长输入：提示词和单条回答加起来最多保留 1,024 个 token，其中回答最多保留 512 个 token。要调整这些设置，请修改训练脚本。
 
@@ -93,6 +95,31 @@ DPO 在 `train/dpo/` 下记录以下指标：
 | `ref_logps_chosen`、`ref_logps_rejected` | 参考模型对两条回答给出的对数概率。 |
 | `reward_chosen`、`reward_rejected`、`reward_margin` | DPO 奖励及两者的差值。 |
 | `strict_accuracy`、`tie_rate`、`tie_aware_accuracy` | 偏好准确率和平局比例。 |
+
+## 训练奖励模型
+
+奖励模型为每条回答输出一个分数。训练会提高更好回答相对于另一条回答的分数。
+
+沿用前面设置的模型和数据路径。为奖励模型设置单独的检查点目录和实验名称：
+
+```bash
+export SAVE_DIR=/checkpoints/reward-modeling
+export EXP_NAME=qwen3-0.6b-ultrafeedback-rm-gpu1
+
+NUM_GPUS=1 bash scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh
+```
+
+脚本通过 `--loss-type rm` 选择奖励模型训练。[奖励模型脚本](../../../scripts/training/reward_modeling/run-qwen3-0.6B-ultrafeedback-1xgpu.sh)默认训练 200 步，每步处理 32 对样本，学习率为 `1e-5`。启动前可以设置 `NUM_ROLLOUT`、`GLOBAL_BATCH_SIZE`、`MAX_TOKENS_PER_GPU`、`LR` 或 `EVAL_INTERVAL` 来调整配置。脚本每 50 步保存一次；要调整保存间隔，请修改脚本中的 `--save-interval`。
+
+恢复训练时，使用相同路径和训练配置重新运行脚本。保留奖励模型训练保存的完整 Megatron 检查点。脚本会同时恢复模型、优化器、学习率调度器和随机数生成器的状态。PPO critic 的检查点与这个奖励模型不兼容。
+
+## 在训练期间评测
+
+两个脚本都从 `EVAL_PROMPT_DATA` 读取评测数据。启动前设置 `EVAL_INTERVAL`，指定评测间隔。例如，`EVAL_INTERVAL=50` 会在完成第 50、100 步时评测，后续以此类推。
+
+`eval/dpo_*` 或 `eval/rm_*` 下的指标包括损失、两条回答的分数及差值、准确率、平局比例和样本对数。
+
+Relax 会保留最后一个不足整批的评测批次。使用数据并行时，每批样本必须能平均分给各张 GPU。例如，10 对样本按每批 8 对划分为 8 对和 2 对，两批都能用于 DP=2。
 
 ## 支持的配置
 

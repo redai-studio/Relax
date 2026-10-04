@@ -1927,11 +1927,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft", "dpo", "sft_loss", "sft-loss", "custom_loss"],
+                choices=["policy_loss", "sft", "dpo", "rm", "sft_loss", "sft-loss", "custom_loss"],
                 default="policy_loss",
                 help=(
                     "Training loss: policy_loss for RL, sft for supervised fine-tuning, dpo for preference optimization, "
-                    "or custom_loss via --custom-loss-function-path."
+                    "rm for pairwise reward modeling, or custom_loss via --custom-loss-function-path."
                 ),
             )
             parser.add_argument(

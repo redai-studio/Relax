@@ -309,7 +309,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `custom_loss` | 训练损失。`policy_loss` 用于 PPO/GRPO 等 RL 训练；`sft` 用于监督微调；`dpo` 用于偏好优化；`custom_loss` 需配 `--custom-loss-function-path`。详见 [离线训练配置](#离线训练配置)和 [DPO 训练](./dpo-training.md)。`sft_loss` 和 `sft-loss` 是 `sft` 的已弃用别名。 |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `rm`, `custom_loss` | 训练损失。`policy_loss` 用于 PPO/GRPO 等 RL 训练；`sft` 用于监督微调；`dpo` 用于偏好优化；`rm` 用于训练奖励模型；`custom_loss` 需配 `--custom-loss-function-path`。详见 [离线训练配置](#离线训练配置)和 [DPO 训练](./dpo-training.md)。`sft_loss` 和 `sft-loss` 是 `sft` 的已弃用别名。 |
 | `--custom-loss-function-path` | str | None | - | 自定义损失函数路径 |
 | `--eps-clip` | float | 0.2 | - | PPO 裁剪范围（下界） |
 | `--eps-clip-high` | float | None | - | PPO 裁剪上界。None 时等于 `--eps-clip` |
@@ -398,13 +398,13 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 
 ## 离线训练配置
 
-普通 SFT（`--loss-type sft`）和 DPO（`--loss-type dpo`）共用离线 producer/consumer 流水线。Producer 从 `--prompt-data` 读取数据，将批次写入 TransferQueue 的 `sft_<rollout_id>` 分区，再由 Megatron Actor 训练。共享的队列和 CPU 预取参数保留 `--sft-*` 名称。生成式预测、chunked logits 和异步预打包仍仅支持普通 SFT。
+普通 SFT（`--loss-type sft`）、DPO（`--loss-type dpo`）和奖励模型训练（`--loss-type rm`）共用离线 producer/consumer 流水线。Producer 从 `--prompt-data` 读取数据，将批次写入 TransferQueue 的 `sft_<rollout_id>` 分区，再由 Megatron Actor 训练。共享的队列和 CPU 预取参数保留 `--sft-*` 名称。生成式预测、chunked logits 和异步预打包仍仅支持普通 SFT。
 
 ### 训练控制
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-size` | float | None | 本版本仅支持 SFT；DPO 暂不支持留出集评估。从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
+| `--eval-size` | float | None | 用于离线训练。从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
 | `--sft-predict-interval` | int | None | 仅用于语言模型 SFT。每 N 个训练 step 在 eval 集上生成回答，写入 `<save>/predict/predictions_step_<rollout_id>.jsonl`，并自动启动 Rollout 角色。需要 `--save`，以及 `--eval-prompt-data` 或 `--eval-size` 中的一个评估数据源。 |
 | `--sft-max-in-flight-steps` | int | None | 离线训练的 TransferQueue 缓冲深度，包含当前训练 step。设为正整数 N 时，会将 `--max-staleness` 设为 N − 1。 |
 | `--sft-train-data-prefetch` | flag | False | 在 CPU 工作线程上预取离线训练下一步的原始 TransferQueue 数据。需要 `--per-rank-fetch`，且至少允许两个 in-flight step；与 `--sft-async-prepack` 互斥。 |
@@ -412,7 +412,7 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 
 ### 偏好训练
 
-使用 `--loss-type dpo` 进行 DPO 训练。保持 `--task-type causal_lm`，由损失类型选择偏好训练路径。数据格式和启动示例见 [DPO 训练](./dpo-training.md)。
+使用 `--loss-type dpo` 进行 DPO 训练，使用 `--loss-type rm` 训练奖励模型。保持 `--task-type causal_lm`，由损失类型选择偏好训练路径。数据格式和启动示例见 [DPO 训练](./dpo-training.md)。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
@@ -491,7 +491,7 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-interval` | int | None | 在线 RL 按 rollout 轮数计算评估间隔，SFT 按已完成的优化器 step 数计算。 |
+| `--eval-interval` | int | None | 在线 RL 按 rollout 轮数计算评估间隔，离线训练按已完成的优化器 step 数计算。 |
 | `--eval-prompt-data` | str (列表) | None | 评估数据集，格式：`dataset_name /path/to/data.jsonl`，可指定多对 |
 | `--eval-config` | str | None | 在线 RL 的 OmegaConf YAML/JSON 评估配置，设置时覆盖 `--eval-prompt-data`。离线训练使用 `--eval-prompt-data` 或 `--eval-size`。 |
 | `--eval-function-path` | str | None | 评估生成函数路径。None 时使用 `--rollout-function-path` |
@@ -512,7 +512,7 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 ## Reward 配置
 
-这些参数配置 rollout 生成样本之后的奖励计算。
+这些参数配置 rollout 生成样本之后的奖励计算。`--loss-type rm` 用于训练奖励模型，`--rm-type` 则选择在线 RL 使用的打分器。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|

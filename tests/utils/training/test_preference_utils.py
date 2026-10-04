@@ -14,6 +14,8 @@ from relax.utils.training.preference_utils import (
     pack_preference_pair_indices,
     preference_accuracy,
     require_tensor_condition,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
 )
 
 
@@ -119,6 +121,52 @@ def test_dpo_pair_loss_rejects_missing_reference_and_non_finite_values():
         dpo_pair_loss(finite, finite)
     with pytest.raises(ValueError, match="finite"):
         dpo_pair_loss(torch.tensor([float("nan")]), finite, reference_free=True)
+
+
+def test_reward_model_pair_loss_matches_independent_reference_and_gradient():
+    chosen = torch.tensor([1.0, -1.0, 0.0], requires_grad=True)
+    rejected = torch.tensor([0.0, 2.0, 0.0], requires_grad=True)
+
+    actual = reward_model_pair_loss(chosen, rejected)
+    expected = -F.logsigmoid(chosen - rejected)
+    assert torch.allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    actual.sum().backward()
+    actual_grad = chosen.grad.detach().clone()
+    chosen.grad = None
+    expected.sum().backward()
+    assert torch.allclose(actual_grad, chosen.grad, rtol=1e-6, atol=1e-6)
+
+
+def test_reward_model_pair_loss_rejects_non_finite_cpu_margin():
+    with pytest.raises(ValueError, match="finite"):
+        reward_model_pair_loss(torch.tensor([float("inf")]), torch.tensor([0.0]))
+
+
+@pytest.mark.parametrize("shape", [(10,), (10, 1), (1, 10, 1)])
+def test_select_packed_sequence_scores_accepts_scalar_head_shapes(shape):
+    logits = torch.arange(10, dtype=torch.float32).reshape(shape)
+
+    scores = select_packed_sequence_scores(logits, [3, 2, 4])
+
+    torch.testing.assert_close(scores, torch.tensor([2.0, 4.0, 8.0]))
+
+
+@pytest.mark.parametrize("shape", [(2, 4, 1), (4, 2)])
+def test_select_packed_sequence_scores_rejects_non_scalar_head_shapes(shape):
+    with pytest.raises(ValueError, match="logits must have shape"):
+        select_packed_sequence_scores(torch.zeros(shape), [4])
+
+
+@pytest.mark.parametrize("lengths", [[0], [-1], [3, 0]])
+def test_select_packed_sequence_scores_rejects_non_positive_lengths(lengths):
+    with pytest.raises(ValueError, match="non-positive"):
+        select_packed_sequence_scores(torch.zeros(4), lengths)
+
+
+def test_select_packed_sequence_scores_rejects_truncated_logits():
+    with pytest.raises(ValueError, match="expected at least"):
+        select_packed_sequence_scores(torch.zeros(4), [3, 2])
 
 
 def test_pair_packer_is_deterministic_complete_and_capacity_safe():
