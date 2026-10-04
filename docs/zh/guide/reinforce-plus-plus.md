@@ -116,7 +116,9 @@ Relax 默认选择 GRPO，关闭优势值归一化，两个 KL 系数均为零�
 
 ## 监控与常见问题
 
-示例将 TensorBoard event 写入 `OUTPUT_DIR/actor/tensorboard_log`，可用 `TENSORBOARD_DIR` 覆盖；提交日志保存在 `OUTPUT_DIR/logs`。评估训练效果时，结合评测奖励、`rollout/response_len/mean` 和 `rollout/truncated_ratio`，而不是只看损失。回答经常达到长度上限时，可在显存允许的情况下增大 `ROLLOUT_MAX_RESPONSE_LEN`。
+示例默认将 TensorBoard event 写入 `OUTPUT_DIR/actor/tensorboard_log`，提交日志保存在 `OUTPUT_DIR/logs`。如需更改 event 目录，在 `ray start` 前执行 `export TENSORBOARD_DIR=/path/to/tensorboard`。`ray-job.sh` 不转发该变量，因此 Ray 已启动后，只在提交终端设置它不会将覆盖值传入作业。
+
+评估训练效果时，结合评测奖励、`rollout/response_len/mean` 和 `rollout/truncated_ratio`，而不是只看损失。回答经常达到长度上限时，可在显存允许的情况下增大 `ROLLOUT_MAX_RESPONSE_LEN`。
 
 ### 奖励或优势值一直为零
 

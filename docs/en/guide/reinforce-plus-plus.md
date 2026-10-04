@@ -116,7 +116,9 @@ Relax defaults to GRPO, with advantage normalization off and both KL coefficient
 
 ## Monitoring and Common Problems
 
-TensorBoard events are written to `OUTPUT_DIR/actor/tensorboard_log`, unless overridden by `TENSORBOARD_DIR`. Submission logs are saved under `OUTPUT_DIR/logs`. Assess training with evaluation rewards, `rollout/response_len/mean`, and `rollout/truncated_ratio`, rather than loss alone. If responses often reach the length limit, increase `ROLLOUT_MAX_RESPONSE_LEN` if memory permits.
+By default, TensorBoard events use `OUTPUT_DIR/actor/tensorboard_log`, and submission logs use `OUTPUT_DIR/logs`. To change the event directory, run `export TENSORBOARD_DIR=/path/to/tensorboard` before `ray start`. The `ray-job.sh` helper does not forward this variable, so setting it only in the submission shell will not pass the override to a job on an already-running Ray runtime.
+
+Assess training with evaluation rewards, `rollout/response_len/mean`, and `rollout/truncated_ratio`, rather than loss alone. If responses often reach the length limit, increase `ROLLOUT_MAX_RESPONSE_LEN` if memory permits.
 
 ### Rewards or Advantages Stay at Zero
 
