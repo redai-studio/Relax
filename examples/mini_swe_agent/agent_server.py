@@ -510,6 +510,7 @@ def _swebench_reward(row: dict[str, Any], output: str) -> float:
         FAIL_ONLY_REPOS,
         FAIL_TO_PASS,
         KEY_INSTANCE_ID,
+        MAP_REPO_TO_EXT,
         MAP_REPO_VERSION_TO_SPECS,
         PASS_TO_PASS,
         RESET_FAILED,
@@ -520,11 +521,28 @@ def _swebench_reward(row: dict[str, Any], output: str) -> float:
     )
     from swebench.harness.grading import get_eval_tests_report, get_resolution_status
     from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
-    from swebench.harness.test_spec.test_spec import make_test_spec
+    from swebench.harness.test_spec.test_spec import TestSpec
 
     if any(code in output for code in [APPLY_PATCH_FAIL, RESET_FAILED, TESTS_ERROR, TESTS_TIMEOUT]):
         return 0.0
-    test_spec = make_test_spec(row)
+    repo, version = row["repo"], row.get("version")
+    fail_to_pass = row.get(FAIL_TO_PASS, [])
+    pass_to_pass = row.get(PASS_TO_PASS, [])
+    # Scoring existing sandbox output does not need environment or test scripts.
+    test_spec = TestSpec(
+        instance_id=row[KEY_INSTANCE_ID],
+        repo=repo,
+        version=version,
+        repo_script_list=[],
+        env_script_list=[],
+        eval_script_list=[],
+        arch="x86_64",
+        FAIL_TO_PASS=json.loads(fail_to_pass) if isinstance(fail_to_pass, str) else fail_to_pass,
+        PASS_TO_PASS=json.loads(pass_to_pass) if isinstance(pass_to_pass, str) else pass_to_pass,
+        language=MAP_REPO_TO_EXT[repo],
+        docker_specs=MAP_REPO_VERSION_TO_SPECS[repo][version].get("docker_specs", {}),
+        namespace=None,
+    )
     test_cmd = MAP_REPO_VERSION_TO_SPECS[test_spec.repo][test_spec.version]["test_cmd"]
     test_cmd = test_cmd[-1] if isinstance(test_cmd, list) else test_cmd
     eval_status_map = MAP_REPO_TO_PARSER[test_spec.repo](output.split(test_cmd)[-1], test_spec)
