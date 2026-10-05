@@ -1,29 +1,29 @@
-# K8s HPA + KEDA 弹性扩缩容集成方案
+# K8s HPA + KEDA Autoscaling Integration
 
-## 概述
+## Overview
 
-本文档描述如何将 Relax 弹性 Rollout 扩缩容与 Kubernetes HPA（通过 KEDA）结合，实现 **K8s 自动扩缩 GPU 资源 + Relax 自动注册/注销引擎** 的完整链路。
+This guide shows how to combine Relax elastic Rollout scaling with Kubernetes HPA through KEDA. Kubernetes automatically scales GPU resources, while Relax automatically registers and deregisters rollout engines.
 
-### 核心思路
+### How It Works
 
-| 层次 | 职责 | 实现方式 |
+| Layer | Responsibility | Implementation |
 |---|---|---|
-| **K8s 资源层** | 根据 SGLang 指标自动扩缩 Pod（GPU 资源） | KEDA ScaledObject + Prometheus |
-| **应用注册层** | Pod ready 后调 `scale_out`(external)，缩容前调 `scale_in` drain | Pod Lifecycle Hooks |
+| **K8s resource layer** | Scale Pods (GPU resources) based on SGLang metrics | KEDA ScaledObject + Prometheus |
+| **Engine registration layer** | Call `scale_out` in external mode after a Pod is ready, and call `scale_in` to drain traffic before scale-down | Pod Lifecycle Hooks |
 
-Relax 代码 **零修改**：所有能力（external scale_out/scale_in API、幂等性、权重同步、drain）已在 `relax/components/rollout.py` 和 `relax/distributed/ray/rollout.py` 中实现。
+**No Relax code changes are required**: the external `scale_out`/`scale_in` APIs, idempotency, weight synchronization, and draining are already implemented in `relax/components/rollout.py` and `relax/distributed/ray/rollout.py`.
 
-### 前置条件
+### Prerequisites
 
-- 训练使用 **全异步模式**（`--fully-async`）
-- Rollout 引擎使用 **SGLang** 作为推理后端
-- K8s 集群已安装 [KEDA](https://keda.sh/) 和 [Prometheus](https://prometheus.io/)
-- SGLang Pod 与 Ray 集群网络互通（NCCL 权重同步需要 GPU 直连或 RoCE/InfiniBand）
-- 启动训练时 **不要** 传 `--autoscaler-config`（禁用内置 Autoscaler，避免冲突）
+- Training uses **Fully Async mode** (`--fully-async`).
+- Rollout engines use **SGLang** as the inference backend.
+- [KEDA](https://keda.sh/) and [Prometheus](https://prometheus.io/) are installed in the K8s cluster.
+- SGLang Pods can reach the Ray cluster over the network. NCCL weight synchronization requires direct GPU connectivity or RoCE/InfiniBand.
+- Do **not** pass `--autoscaler-config` when starting training. This keeps the built-in Autoscaler disabled and avoids conflicts.
 
 ______________________________________________________________________
 
-## 架构
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -64,49 +64,49 @@ ______________________________________________________________________
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**数据流：**
+**Data flow:**
 
-1. Prometheus 抓取所有 SGLang Pod 的 `/metrics`
-2. KEDA 通过 PromQL 查询聚合指标，驱动 HPA 调整 Deployment replicas
-3. 新 Pod 启动后，`postStart` hook 等待 SGLang 就绪，调用 Relax `scale_out`(external 模式) 注册引擎
-4. 缩容时，`preStop` hook 调用 Relax `scale_in` drain 流量，等待完成后允许 Pod 终止
+1. Prometheus scrapes `/metrics` from all SGLang Pods.
+2. KEDA queries aggregated metrics with PromQL and drives HPA to adjust the Deployment replicas.
+3. After a new Pod starts, the `postStart` hook waits for SGLang to become ready, then calls Relax `scale_out` in external mode to register the engine.
+4. During scale-down, the `preStop` hook calls Relax `scale_in` to drain traffic and waits for completion before allowing the Pod to terminate.
 
 ______________________________________________________________________
 
-## 与 Relax 内置 Autoscaler 的关系
+## Relationship with the Built-in Relax Autoscaler
 
-内置 `AutoscalerService`（`relax/utils/autoscaler/`）和 K8s KEDA 方案不应同时启用。两者职责对比：
+The built-in `AutoscalerService` (`relax/utils/autoscaler/`) and the K8s KEDA setup should not be enabled at the same time. Their responsibilities are:
 
-| 职责 | 内置 Autoscaler | K8s KEDA 方案 |
+| Responsibility | Built-in Autoscaler | K8s KEDA |
 |---|---|---|
-| 指标采集 | `MetricsCollector` 轮询 `/metrics` | Prometheus 抓取 |
-| 扩缩决策 | `ScalingDecisionEngine` | KEDA ScaledObject |
-| 资源分配 | `scale_out(num_replicas=N)` ray_native 模式 | K8s Deployment replicas |
-| 引擎注册 | 内部自动完成 | Pod lifecycle hooks 调 external 模式 |
+| Metrics collection | `MetricsCollector` polls `/metrics` | Prometheus scraping |
+| Scaling decisions | `ScalingDecisionEngine` | KEDA ScaledObject |
+| Resource allocation | `scale_out(num_replicas=N)` in ray_native mode | K8s Deployment replicas |
+| Engine registration | Handled automatically | Pod lifecycle hooks call external mode |
 
-内置 Autoscaler 使用 **ray_native** 模式在 Ray 集群内创建 Actor 和 PlacementGroup；KEDA 方案使用 **external** 模式将 K8s 管理的 Pod 注册为外部引擎。
+The built-in Autoscaler uses **ray_native** mode to create Actors and PlacementGroups in the Ray cluster. The KEDA setup uses **external** mode to register K8s-managed Pods as external engines.
 
 ______________________________________________________________________
 
-## 为什么选 KEDA
+## Why KEDA
 
-| 维度 | Prometheus Adapter | KEDA |
+| Area | Prometheus Adapter | KEDA |
 |---|---|---|
-| 配置复杂度 | 需要写复杂的 relabeling 规则和 custom metrics API | 一个 ScaledObject YAML |
-| 多指标组合 | HPA 原生支持但配置繁琐 | 天然支持多 trigger（任一触发即扩容） |
-| 缩容到零 | 不支持 | 支持 |
-| 扩缩策略 | 标准 HPA behavior | 支持 HPA behavior + 高级策略 |
-| 社区成熟度 | K8s 官方附属项目 | CNCF 毕业项目，活跃维护 |
+| Setup complexity | Requires complex relabeling rules and the custom metrics API | One ScaledObject YAML |
+| Multiple metrics | Supported by HPA, but configuration is verbose | Supports multiple triggers directly; any trigger can scale up |
+| Scale to zero | Not supported | Supported |
+| Scaling policy | Standard HPA behavior | HPA behavior plus advanced policies |
+| Project maturity | Kubernetes ecosystem project | CNCF graduated project with active maintenance |
 
-KEDA 的多 trigger 默认使用 OR 逻辑（任一触发即扩容），与 Relax 内置 Autoscaler 的扩容策略一致。
+KEDA uses OR logic across multiple triggers by default, so any trigger can scale up. This matches the scale-out behavior of the built-in Relax Autoscaler.
 
 ______________________________________________________________________
 
-## K8s 资源配置
+## K8s Resource Configuration
 
 ### 1. KEDA ScaledObject
 
-根据 SGLang Prometheus 指标自动调整 Pod 数量。
+Automatically adjusts the number of Pods using SGLang Prometheus metrics.
 
 ```yaml
 apiVersion: keda.sh/v1alpha1
@@ -116,28 +116,28 @@ metadata:
   namespace: relax-training
 spec:
   scaleTargetRef:
-    name: sglang-external-engines  # 指向 SGLang Deployment
-  minReplicaCount: 2               # 最小引擎数
-  maxReplicaCount: 16              # 最大引擎数
-  cooldownPeriod: 300              # 缩容冷却期（秒）
-  pollingInterval: 30              # 评估间隔（秒）
+    name: sglang-external-engines  # Target SGLang Deployment
+  minReplicaCount: 2               # Minimum engine count
+  maxReplicaCount: 16              # Maximum engine count
+  cooldownPeriod: 300              # Scale-down cooldown in seconds
+  pollingInterval: 30              # Polling interval in seconds
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 30   # 扩容稳定窗口
+          stabilizationWindowSeconds: 30   # Scale-up stabilization window
           policies:
           - type: Pods
-            value: 4                       # 单次最多扩 4 个 Pod
+            value: 4                       # Scale up by at most 4 Pods at a time
             periodSeconds: 60
         scaleDown:
-          stabilizationWindowSeconds: 120  # 缩容稳定窗口（保守）
+          stabilizationWindowSeconds: 120  # Conservative scale-down stabilization window
           policies:
           - type: Pods
-            value: 1                       # 单次最多缩 1 个 Pod
+            value: 1                       # Scale down by at most 1 Pod at a time
             periodSeconds: 300
   triggers:
-    # 触发条件 1: KV Cache 利用率 > 85%
+    # Trigger 1: KV Cache usage > 85%
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
@@ -145,7 +145,7 @@ spec:
         threshold: "0.85"
         query: |
           avg(sglang:token_usage{job="sglang-engines"})
-    # 触发条件 2: 每引擎排队请求数 > 10
+    # Trigger 2: queued requests per engine > 10
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
@@ -157,18 +157,18 @@ spec:
           count(sglang:num_queue_reqs{job="sglang-engines"})
 ```
 
-**指标对应关系（与 Relax 内置 Autoscaler 一致）：**
+**Metric mapping (aligned with the built-in Relax Autoscaler):**
 
-| KEDA trigger | 对应 Relax 条件 | 含义 |
+| KEDA trigger | Relax condition | Meaning |
 |---|---|---|
-| `sglang_token_usage_avg > 0.85` | `token_usage_high` | KV Cache 利用率过高 |
-| `sglang_queue_per_engine > 10` | `queue_backlog` | 排队请求积压 |
+| `sglang_token_usage_avg > 0.85` | `token_usage_high` | High KV Cache usage |
+| `sglang_queue_per_engine > 10` | `queue_backlog` | Queued request backlog |
 
-可根据需要添加更多 trigger（如 `queue_time_p95 > 5s`、`ttft_p95 > 10s`）。
+Add more triggers as needed, such as `queue_time_p95 > 5s` or `ttft_p95 > 10s`.
 
-### 2. SGLang Engine Deployment（含 Lifecycle Hooks）
+### 2. SGLang Engine Deployment (with Lifecycle Hooks)
 
-通过 `postStart` 和 `preStop` hook 打通 K8s Pod 生命周期与 Relax 引擎注册/注销。
+Use `postStart` and `preStop` hooks to connect the K8s Pod lifecycle with Relax engine registration and deregistration.
 
 ```yaml
 apiVersion: apps/v1
@@ -177,7 +177,7 @@ metadata:
   name: sglang-external-engines
   namespace: relax-training
 spec:
-  replicas: 2  # 初始引擎数，由 KEDA 动态调整
+  replicas: 2  # Initial engine count, adjusted by KEDA
   selector:
     matchLabels:
       app: sglang-engine
@@ -190,7 +190,7 @@ spec:
         prometheus.io/port: "30000"
         prometheus.io/path: "/metrics"
     spec:
-      terminationGracePeriodSeconds: 180  # 必须足够长，等待 drain 完成
+      terminationGracePeriodSeconds: 180  # Must be long enough for draining to finish
 
       containers:
       - name: sglang
@@ -210,13 +210,13 @@ spec:
           httpGet:
             path: /health
             port: 30000
-          initialDelaySeconds: 60    # SGLang 模型加载较慢
+          initialDelaySeconds: 60    # SGLang model loading can be slow
           periodSeconds: 10
-          failureThreshold: 30       # 容忍 5 分钟启动
+          failureThreshold: 30       # Allow up to 5 minutes for startup
 
         resources:
           limits:
-            nvidia.com/gpu: 1        # 按 TP 并行度调整
+            nvidia.com/gpu: 1        # Adjust based on TP size
           requests:
             nvidia.com/gpu: 1
 
@@ -229,7 +229,7 @@ spec:
           value: "http://relax-rollout-service:8000/rollout"
 
         lifecycle:
-          # ========== 扩容：引擎就绪后注册到 Relax ==========
+          # ========== Scale out: register the engine after it is ready ==========
           postStart:
             exec:
               command:
@@ -240,8 +240,8 @@ spec:
                 MAX_WAIT=600
                 WAITED=0
 
-                # 等待 SGLang 引擎就绪
-                # postStart 和容器 ENTRYPOINT 并行执行，必须等 SGLang 真正 ready
+                # Wait for the SGLang engine to become ready
+                # postStart runs in parallel with the container ENTRYPOINT, so wait until SGLang is actually ready
                 while [ $WAITED -lt $MAX_WAIT ]; do
                   if curl -sf "${ENGINE_URL}/health" > /dev/null 2>&1; then
                     break
@@ -255,9 +255,9 @@ spec:
                   exit 1
                 fi
 
-                # 调用 Relax scale_out (external 模式)
-                # Relax 会执行: 健康检查 -> 权重同步 -> Router 注册
-                # scale_out 是幂等的，重复注册返回 NOOP
+                # Call Relax scale_out in external mode
+                # Relax runs: health check -> weight sync -> Router registration
+                # scale_out is idempotent; duplicate registration returns NOOP
                 echo "Registering engine ${ENGINE_URL} with Relax..."
                 RESPONSE=$(curl -sf -X POST "${RELAX_ROLLOUT_URL}/scale_out" \
                   -H "Content-Type: application/json" \
@@ -266,7 +266,7 @@ spec:
 
                 echo "Scale-out response: ${RESPONSE}"
 
-          # ========== 缩容：优雅注销引擎，等待 drain 完成 ==========
+          # ========== Scale in: gracefully deregister the engine and wait for draining ==========
           preStop:
             exec:
               command:
@@ -277,7 +277,7 @@ spec:
 
                 echo "Initiating scale-in for ${ENGINE_URL}..."
 
-                # Step 1: 调用 scale_in，指定要移除的引擎地址
+                # Step 1: Call scale_in with the engine URL to remove
                 RESPONSE=$(curl -sf -X POST "${RELAX_ROLLOUT_URL}/scale_in" \
                   -H "Content-Type: application/json" \
                   -d "{\"engine_urls\": [\"${ENGINE_URL}\"]}" \
@@ -292,9 +292,9 @@ spec:
 
                 echo "Scale-in request: ${REQ_ID}"
 
-                # Step 2: 轮询等待 drain + remove 完成
-                # Relax 会: 停止流量 -> 等待在途请求 -> 注销引擎 -> 释放资源
-                MAX_WAIT=150  # 需小于 terminationGracePeriodSeconds
+                # Step 2: Poll until draining and removal are complete
+                # Relax: stop new traffic -> wait for in-flight requests -> deregister the engine -> release resources
+                MAX_WAIT=150  # Must be less than terminationGracePeriodSeconds
                 WAITED=0
 
                 while [ $WAITED -lt $MAX_WAIT ]; do
@@ -316,7 +316,7 @@ spec:
 
 ### 3. Prometheus ServiceMonitor
 
-让 Prometheus 自动发现并抓取所有 SGLang Pod 的 `/metrics`。
+Lets Prometheus automatically discover all SGLang Pods and scrape their `/metrics` endpoints.
 
 ```yaml
 apiVersion: monitoring.coreos.com/v1
@@ -347,12 +347,12 @@ spec:
   - name: sglang
     port: 30000
     targetPort: 30000
-  clusterIP: None  # Headless Service，让 Prometheus 发现每个 Pod
+  clusterIP: None  # Headless Service so Prometheus can discover each Pod
 ```
 
-### 4. Relax Rollout Service（K8s Service）
+### 4. Relax Rollout Service (K8s Service)
 
-将 Ray 集群中的 Rollout Service 暴露为 K8s Service，供 SGLang Pod 调用。
+Expose the Rollout Service in the Ray cluster as a K8s Service so SGLang Pods can call it.
 
 ```yaml
 apiVersion: v1
@@ -362,101 +362,101 @@ metadata:
   namespace: relax-training
 spec:
   selector:
-    app: relax-ray-head   # 指向 Ray head node
+    app: relax-ray-head   # Target the Ray head node
   ports:
   - name: rollout-api
     port: 8000
-    targetPort: 8000      # Ray Serve 默认端口
+    targetPort: 8000      # Default Ray Serve port
 ```
 
 ______________________________________________________________________
 
-## 时序与生命周期
+## Lifecycle and Flow
 
-### 扩容时序
+### Scale-Out Flow
 
 ```
-K8s 创建 Pod
-  → 容器启动，SGLang 开始加载模型
-  → postStart hook 并行启动，轮询等待 /health 就绪
+K8s creates the Pod
+  → The container starts and SGLang begins loading the model
+  → The postStart hook starts in parallel and polls /health until it is ready
   → SGLang ready
-  → postStart 调用 POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
+  → postStart calls POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
+  → Relax RolloutManager runs:
       CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
-  → 引擎接入流量
+  → The engine starts receiving traffic
 ```
 
-### 缩容时序
+### Scale-In Flow
 
 ```
-K8s 发送 SIGTERM
-  → preStop hook 拦截
-  → 调用 POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
-      PENDING → DRAINING (停止新流量，等待在途请求)
-             → REMOVING (注销引擎)
+K8s sends SIGTERM
+  → The preStop hook handles the signal
+  → Call POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
+  → Relax RolloutManager runs:
+      PENDING → DRAINING (stop new traffic and wait for in-flight requests)
+             → REMOVING (deregister the engine)
              → COMPLETED
-  → preStop 轮询到 COMPLETED，退出
-  → K8s 终止 Pod
+  → preStop polls until COMPLETED, then exits
+  → K8s terminates the Pod
 ```
 
-### 关键时间参数
+### Key Timing Settings
 
-| 参数 | 推荐值 | 说明 |
+| Parameter | Recommended value | Description |
 |---|---|---|
-| `terminationGracePeriodSeconds` | 180s | 必须 > drain timeout + shutdown timeout + 轮询开销 |
-| `--scale-in-drain-timeout` (Relax) | 30s (默认) | 等待在途请求完成的超时 |
-| `--scale-in-shutdown-timeout` (Relax) | 20s (默认) | 引擎优雅关闭超时 |
-| preStop `MAX_WAIT` | 150s | 需 < `terminationGracePeriodSeconds` |
-| KEDA `cooldownPeriod` | 300s | 缩容冷却期，防止频繁扩缩 |
+| `terminationGracePeriodSeconds` | 180s | Must be greater than drain timeout + shutdown timeout + polling overhead |
+| `--scale-in-drain-timeout` (Relax) | 30s (default) | Timeout for in-flight requests to finish |
+| `--scale-in-shutdown-timeout` (Relax) | 20s (default) | Graceful engine shutdown timeout |
+| preStop `MAX_WAIT` | 150s | Must be less than `terminationGracePeriodSeconds` |
+| KEDA `cooldownPeriod` | 300s | Scale-down cooldown to avoid frequent scaling |
 
 ______________________________________________________________________
 
-## 幂等性与安全
+## Idempotency and Safety
 
-### scale_out 幂等性
+### scale_out Idempotency
 
-Relax 的 external 模式 `scale_out` 天然幂等（`relax/components/rollout.py:29`）：
+Relax's external-mode `scale_out` is idempotent by design (`relax/components/rollout.py:29`):
 
-- 已注册的 `engine_urls` 会被自动过滤，返回 `NOOP`
-- 正在处理中的 in-flight 请求中的地址也会被过滤
-- Pod 重启后 `postStart` 重新注册是安全的
+- Already registered `engine_urls` are filtered automatically, and the request returns `NOOP`.
+- Engine URLs already being handled by in-flight requests are also filtered.
+- It is safe for `postStart` to register the engine again after a Pod restart.
 
-### scale_in 安全性
+### scale_in Safety
 
-- 初始引擎（由 `--rollout-num-gpus` 启动参数定义）受保护，不会被缩容
-- 缩容前会检查权重同步状态，如果正在进行权重更新则等待完成
-- 按 LIFO（后进先出）策略优先移除最近扩容的引擎
+- Initial engines defined by `--rollout-num-gpus` are protected and cannot be scaled in.
+- Before scaling in, Relax checks the weight synchronization state and waits if a weight update is still running.
+- Relax uses LIFO (last in, first out), so the most recently added engines are removed first.
 
-### 互斥保护
+### Mutual Exclusion
 
-同一时刻只允许一个扩/缩容操作执行（HTTP 409），KEDA 的 `cooldownPeriod` 和 HPA `stabilizationWindowSeconds` 进一步防止并发冲突。
-
-______________________________________________________________________
-
-## 权重同步
-
-通过 external 模式扩容的引擎，权重同步走 **Remote Instance Sync**：从 seed engine（初始引擎）通过 NCCL Broadcast 直接传输权重到新引擎。
-
-### 网络要求
-
-- SGLang Pod 与 Ray 集群中的 seed engine 之间需要 **GPU 直连**（NCCL 通信）
-- 如果使用 RoCE/InfiniBand，需要确保 NCCL 端口开放
-- 如果跨网段，需要设置 `NCCL_SOCKET_IFNAME` 等环境变量
-
-### 跨集群场景
-
-如果 SGLang Pod 和 Ray 集群不在同一网络（跨集群联邦推理），NCCL Broadcast 无法进行：
-
-- 引擎会使用初始模型权重运行
-- 后续权重更新在 Actor 的 `update_weights_fully_async()` 完成后自动触发
-- 如果对权重一致性要求严格，参考 [弹性 Rollout 扩缩容文档](./elastic-rollout.md) 中的权重同步机制
+Only one scale-out or scale-in operation can run at a time (HTTP 409). KEDA `cooldownPeriod` and HPA `stabilizationWindowSeconds` further reduce concurrent scaling conflicts.
 
 ______________________________________________________________________
 
-## 完整部署步骤
+## Weight Synchronization
 
-### 1. 安装 KEDA
+For engines added in external mode, Relax uses **Remote Instance Sync**. Weights are sent directly from a seed engine (an initial engine) to the new engine through NCCL Broadcast.
+
+### Network Requirements
+
+- SGLang Pods need **direct GPU connectivity** to the seed engine in the Ray cluster for NCCL communication.
+- If you use RoCE/InfiniBand, make sure the required NCCL ports are open.
+- If traffic crosses network segments, configure environment variables such as `NCCL_SOCKET_IFNAME`.
+
+### Cross-Cluster Setup
+
+If the SGLang Pods and Ray cluster are not on the same network, such as in cross-cluster federated inference, NCCL Broadcast cannot be used:
+
+- The engine runs with the initial model weights.
+- Later weight updates are triggered automatically after the Actor finishes `update_weights_fully_async()`.
+- If strict weight consistency is required, see the weight synchronization section in [Elastic Rollout Scaling](./elastic-rollout.md).
+
+______________________________________________________________________
+
+## Deployment Steps
+
+### 1. Install KEDA
 
 ```bash
 helm repo add kedacore https://kedacore.github.io/charts
@@ -464,7 +464,7 @@ helm repo update
 helm install keda kedacore/keda --namespace keda --create-namespace
 ```
 
-### 2. 部署 Prometheus（如果未安装）
+### 2. Deploy Prometheus (if not already installed)
 
 ```bash
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
@@ -472,25 +472,25 @@ helm install prometheus prometheus-community/kube-prometheus-stack \
   --namespace monitoring --create-namespace
 ```
 
-### 3. 部署 SGLang Engines + KEDA
+### 3. Deploy SGLang Engines + KEDA
 
 ```bash
 kubectl create namespace relax-training
 
-# 部署 SGLang Engine Deployment（含 lifecycle hooks）
+# Deploy the SGLang Engine Deployment with lifecycle hooks
 kubectl apply -f sglang-deployment.yaml
 
-# 部署 ServiceMonitor（Prometheus 抓取）
+# Deploy the ServiceMonitor for Prometheus scraping
 kubectl apply -f sglang-servicemonitor.yaml
 
-# 部署 Relax Rollout Service（K8s Service）
+# Deploy the Relax Rollout Service as a K8s Service
 kubectl apply -f relax-rollout-service.yaml
 
-# 部署 KEDA ScaledObject
+# Deploy the KEDA ScaledObject
 kubectl apply -f sglang-scaledobject.yaml
 ```
 
-### 4. 启动 Relax 训练（不启用内置 Autoscaler）
+### 4. Start Relax Training Without the Built-in Autoscaler
 
 ```bash
 ray job submit -- python3 relax/entrypoints/train.py \
@@ -501,55 +501,55 @@ ray job submit -- python3 relax/entrypoints/train.py \
     --scale-out-partial-success-policy keep_partial \
     --scale-in-drain-timeout 60 \
     --scale-in-shutdown-timeout 30 \
-    ... # 其他训练参数（不传 --autoscaler-config）
+    ... # Other training arguments (do not pass --autoscaler-config)
 ```
 
-### 5. 验证
+### 5. Verify
 
 ```bash
-# 查看 KEDA ScaledObject 状态
+# Check KEDA ScaledObject status
 kubectl get scaledobject sglang-engine-scaler -n relax-training
 
-# 查看 HPA 状态
+# Check HPA status
 kubectl get hpa -n relax-training
 
-# 查看 SGLang Pod 状态
+# Check SGLang Pod status
 kubectl get pods -l app=sglang-engine -n relax-training
 
-# 查询 Relax 引擎状态
+# Check Relax engine status
 curl http://<rollout-host>:8000/rollout/engines
 ```
 
 ______________________________________________________________________
 
-## 监控与排障
+## Monitoring and Troubleshooting
 
-### 关键监控项
+### Key Checks
 
-| 监控项 | 查看方式 |
+| Item | How to check |
 |---|---|
-| KEDA 扩缩事件 | `kubectl describe scaledobject sglang-engine-scaler` |
-| HPA 当前指标 | `kubectl get hpa -n relax-training -o wide` |
-| Pod 扩缩历史 | `kubectl get events -n relax-training --field-selector reason=SuccessfulRescale` |
-| Relax 引擎列表 | `GET /rollout/engines` |
-| Relax scale_out 请求 | `GET /rollout/scale_out` |
-| Relax scale_in 请求 | `GET /rollout/scale_in` |
+| KEDA scaling events | `kubectl describe scaledobject sglang-engine-scaler` |
+| Current HPA metrics | `kubectl get hpa -n relax-training -o wide` |
+| Pod scaling history | `kubectl get events -n relax-training --field-selector reason=SuccessfulRescale` |
+| Relax engine list | `GET /rollout/engines` |
+| Relax scale_out requests | `GET /rollout/scale_out` |
+| Relax scale_in requests | `GET /rollout/scale_in` |
 
-### 常见问题
+### Common Issues
 
-| 问题 | 原因 | 解决方案 |
+| Issue | Cause | Solution |
 |---|---|---|
-| Pod 启动但未注册到 Relax | postStart hook 失败 | 检查 Pod events，确认 `RELAX_ROLLOUT_URL` 可达 |
-| 缩容时 Pod 被强制终止 | `terminationGracePeriodSeconds` 太短 | 增大到 180s 以上 |
-| 权重同步失败 | NCCL 网络不通 | 检查 GPU 网络互通，确认 NCCL 端口开放 |
-| KEDA 不触发扩容 | Prometheus 未抓取到指标 | 检查 ServiceMonitor 和 Prometheus targets |
-| scale_out 返回 CONFLICT | 有进行中的扩缩操作 | 等待当前操作完成，KEDA cooldownPeriod 会自动处理 |
+| Pod starts but is not registered with Relax | The postStart hook fails | Check Pod events and make sure `RELAX_ROLLOUT_URL` is reachable |
+| Pod is force-terminated during scale-down | `terminationGracePeriodSeconds` is too short | Increase it to more than 180s |
+| Weight synchronization fails | NCCL network connectivity fails | Check GPU network connectivity and make sure NCCL ports are open |
+| KEDA does not scale out | Prometheus is not scraping the metrics | Check the ServiceMonitor and Prometheus targets |
+| scale_out returns CONFLICT | Another scaling operation is in progress | Wait for the current operation to finish; KEDA cooldownPeriod will handle the delay |
 
 ______________________________________________________________________
 
-## 延伸阅读
+## Further Reading
 
-- [弹性 Rollout 扩缩容](./elastic-rollout.md) — Relax 弹性扩缩容完整文档
-- [全异步训练流水线](./fully-async-training.md) — 弹性扩缩容的基础运行模式
-- [KEDA 官方文档](https://keda.sh/docs/) — KEDA ScaledObject 配置参考
-- [Prometheus Operator](https://prometheus-operator.dev/) — ServiceMonitor 配置参考
+- [Elastic Rollout Scaling](./elastic-rollout.md) — Full documentation for Relax elastic scaling
+- [Fully Async Training Pipeline](./fully-async-training.md) — Base runtime mode for elastic scaling
+- [KEDA documentation](https://keda.sh/docs/) — ScaledObject configuration reference
+- [Prometheus Operator](https://prometheus-operator.dev/) — ServiceMonitor configuration reference
