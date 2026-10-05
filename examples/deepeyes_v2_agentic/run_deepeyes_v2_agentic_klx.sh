@@ -100,7 +100,7 @@ fi
 SEARCH_RUNTIME_HELPER="${SCRIPT_DIR}/app/search_runtime.py"
 DEEPEYES_V2_SEARCH_CONFIG_PATH=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" prepare)
 export DEEPEYES_V2_SEARCH_CONFIG_PATH
-# 保留已有 Ray runtime 配置，服务变量由统一 helper 合并。
+# Preserve existing Ray runtime config; the shared helper merges service variables.
 export DEEPEYES_V2_BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [ -z "${DEEPEYES_V2_BASE_RUNTIME_ENV_JSON}" ]; then
     DEEPEYES_V2_BASE_RUNTIME_ENV_JSON='{}'
@@ -148,7 +148,7 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
-# 核心配置提供 KLX 环境，示例配置由 JSON helper 合并。
+# Core config supplies the KLX environment; the JSON helper merges example settings.
 EXTRA_ENV_VARS_JSON=""
 source "${SCRIPT_DIR}/../../scripts/entrypoint/runtime-env-klx.sh"
 set +x

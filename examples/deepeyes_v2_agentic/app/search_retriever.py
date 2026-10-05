@@ -19,10 +19,13 @@ def _invalid_response(field: str) -> NoReturn:
 
 
 def parse_retriever_results(payload: object) -> list[SearchResult]:
-    """转换单条查询的 Search-R1 result 列表，兼容 document 包装形式.
+    """Normalize Search-R1 results for one query, including document-wrapped
+    items.
 
-    contents 首行为默认标题，其余内容为 snippet；单行内容全部作为 snippet. link 依次读取 link、url
-    或空字符串，date 缺失时使用 None；非法结构或字段类型抛出 SearchError.
+    The first contents line supplies the default title; remaining lines supply
+    snippet. Single-line contents also serve as snippet. link uses link, then
+    url, then an empty string; missing date uses None. Invalid structures or
+    field types raise SearchError.
     """
 
     if not isinstance(payload, dict):
@@ -68,9 +71,11 @@ def parse_retriever_results(payload: object) -> list[SearchResult]:
 
 
 def search_retriever(query: str, size: int, config: SearchConfig) -> SearchResponse:
-    """以 POST 提交单条 Search-R1 查询，使用 size 作为 topk 并请求分数包装.
+    """POST one Search-R1 query with size as topk and request score-wrapped
+    results.
 
-    返回统一搜索结果；配置类型、HTTP 请求或响应错误抛出 SearchError.
+    Return normalized results; invalid config types, HTTP requests, or
+    responses raise SearchError.
     """
 
     if not isinstance(config, RetrieverSearchConfig):

@@ -1,4 +1,4 @@
-# 将 endpoint 替换为实际 Search-R1 兼容服务的完整地址。
+# Set endpoint to the full URL of the Search-R1-compatible service.
 backend: retriever
 endpoint: http://retriever-host:17389/retrieve
 topk: 3

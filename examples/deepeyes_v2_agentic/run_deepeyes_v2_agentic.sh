@@ -71,7 +71,7 @@ fi
 SEARCH_RUNTIME_HELPER="${SCRIPT_DIR}/app/search_runtime.py"
 DEEPEYES_V2_SEARCH_CONFIG_PATH=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" prepare)
 export DEEPEYES_V2_SEARCH_CONFIG_PATH
-# 保留已有 Ray runtime 配置，服务变量由统一 helper 合并。
+# Preserve existing Ray runtime config; the shared helper merges service variables.
 export DEEPEYES_V2_BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
 if [ -z "${DEEPEYES_V2_BASE_RUNTIME_ENV_JSON}" ]; then
     DEEPEYES_V2_BASE_RUNTIME_ENV_JSON='{}'
@@ -119,7 +119,7 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
-# JSON 序列化负责路径、认证及其他环境变量中的特殊字符。
+# JSON serialization handles special characters in paths, credentials, and other environment variables.
 RUNTIME_ENV_JSON=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" runtime --profile standard)
 export RUNTIME_ENV_JSON
 AGENT_COMMAND=$("${DEEPEYES_V2_APP_PYTHON}" "${SEARCH_RUNTIME_HELPER}" agent-command)

@@ -100,11 +100,14 @@ def request_search(
     json_body: Mapping[str, JsonValue] | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> SearchResponse:
-    """执行 HTTP 搜索，返回统一结果及包含重试等待和客户端关闭的总耗时.
+    """Return normalized HTTP search results and elapsed time, including retry
+    delays and client cleanup.
 
-    每次调用创建并关闭客户端，HTTP 各阶段使用 timeout_s，最多请求 max_retries + 1 次.
-    408、429、500、502、503、504 及超时、指定连接、读写、协议错误触发重试. parse_results
-    转换服务响应；预期请求或结果验证错误抛出 SearchError.
+    Each call opens and closes a client with timeout_s per HTTP phase and at
+    most max_retries + 1 attempts. Status codes 408, 429, 500, 502, 503, and
+    504, timeouts, and selected connection, read, write, and protocol errors
+    trigger retries. parse_results converts the payload; expected request and
+    result validation errors raise SearchError.
     """
 
     started = time.monotonic()

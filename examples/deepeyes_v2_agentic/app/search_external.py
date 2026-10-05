@@ -53,10 +53,13 @@ def _read_path(
 
 
 def parse_external_results(payload: object, *, mapping: ResponseMapping) -> list[SearchResult]:
-    """按 mapping 的对象键路径转换外部结果，必需字段均应为字符串.
+    """Normalize external results using mapping paths; required fields must be
+    strings.
 
-    可选结果节点缺失或为 None 时生成空列表；可选摘要最终键缺失或为 None 时生成空字符串. date 未配置、键缺失或值为 None 时返回
-    None；其他路径结构及字段类型错误抛出 SearchError.
+    Missing or null optional result nodes yield an empty list. A missing or
+    null final key for an optional snippet yields an empty string.
+    Unconfigured, missing, or null dates yield None. Invalid paths or types
+    raise SearchError.
     """
 
     items = _read_path(payload, mapping.items_path, field="items", empty_paths=mapping.optional_items_paths)
@@ -100,10 +103,13 @@ def _query_params(config: ExternalSearchConfig, fields: dict[str, JsonValue]) ->
 
 
 def search_external(query: str, size: int, config: SearchConfig) -> SearchResponse:
-    """按配置构建外部搜索请求，从环境变量读取认证值并返回统一结果.
+    """Build an external request with environment credentials and return
+    normalized results.
 
-    固定字段与 query、size 一起写入 query 参数或 JSON 请求体；认证 prefix 直接拼接凭据.
-    配置类型、认证、请求或响应错误抛出 SearchError，HTTP 超时和重试由共用请求函数处理.
+    Static fields, query, and size become query parameters or a JSON body; auth
+    prefix is prepended to the credential. Invalid config types, auth,
+    requests, or responses raise SearchError. The shared HTTP helper handles
+    timeouts and retries.
     """
 
     if not isinstance(config, ExternalSearchConfig):

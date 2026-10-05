@@ -45,10 +45,12 @@ RESERVED_AUTH_NAMES = {
 
 
 def prepare_search_environment() -> dict[str, str]:
-    """解析配置文件的绝对路径，更新配置环境变量并返回需传递的搜索环境变量.
+    """Resolve the config path, update its environment variable, and return
+    search variables to forward.
 
-    默认使用示例的 mock YAML，相对路径基于当前工作目录；external 同时返回其认证变量. 文件必须已经存在，无效配置或认证信息抛出
-    SearchError.
+    Default to the example mock YAML; resolve relative paths from the current
+    working directory. Include the auth variable for external search. The file
+    must exist; invalid config or credentials raise SearchError.
     """
 
     config_path = os.environ.get(SEARCH_CONFIG_ENV, str(EXAMPLE_DIR / "search_config.mock.yaml"))
@@ -95,10 +97,13 @@ def _read_runtime_environment(name: str) -> dict[str, Any]:
 
 
 def build_runtime_environment(profile: str) -> dict[str, Any]:
-    """为 standard 或 klx 入口合并 Ray 配置、示例服务变量和搜索认证信息.
+    """Merge Ray config, example service variables, and search credentials for
+    standard or klx launchers.
 
-    RUNTIME_ENV_JSON 覆盖 DEEPEYES_V2_BASE_RUNTIME_ENV_JSON 的同名顶层字段，env_vars
-    按键合并后由示例变量覆盖. 配置路径转换为绝对路径，文件需能被 worker 访问；无效 profile 或配置抛出 SearchError.
+    RUNTIME_ENV_JSON overrides matching top-level fields in
+    DEEPEYES_V2_BASE_RUNTIME_ENV_JSON. env_vars merges by key, then example
+    variables take precedence. Config paths become absolute and must be
+    accessible to workers. Invalid profiles or config raise SearchError.
     """
 
     if profile not in {"standard", "klx"}:
@@ -122,9 +127,11 @@ def build_runtime_environment(profile: str) -> dict[str, Any]:
 
 
 def main() -> int:
-    """输出配置路径、Ray JSON 或 agent 启动命令；前两种模式验证搜索配置.
+    """Print the config path, Ray JSON, or agent command; the first two modes
+    validate search config.
 
-    成功返回 0，配置失败返回 1；命令行参数错误由 argparse 处理.
+    Return 0 on success or 1 for config errors; argparse handles command-line
+    argument errors.
     """
 
     parser = argparse.ArgumentParser(description="生成 DeepEyes-V2 示例的搜索运行环境。")
