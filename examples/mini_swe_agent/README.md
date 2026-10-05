@@ -59,7 +59,7 @@ uv pip install \
   flask \
   pyarrow \
   datasets \
-  swebench \
+  swebench==4.1.0 \
   huggingface_hub
 ```
 
