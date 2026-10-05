@@ -173,24 +173,11 @@ trust_env: false
 
 既有 `RUNTIME_ENV_JSON` 字段得到保留，环境变量按名称合并，示例生成的配置与搜索变量具有最终优先级。搜索 helper 不自动复制代理和证书变量；需要时通过 worker 环境或 `RUNTIME_ENV_JSON.env_vars` 提供。回环服务或代理地址指向 worker 自身的主机。
 
-[示例 README](./README.md) 说明模型、应用环境、sandbox 和训练准备。标准图片轨迹需要兼容的模型服务及准备好的 sandbox。合成的单次会话问题用于图片裁剪，以下离线场景直接验证搜索分支。配置传递具有示例级回归测试，目标集群还需要独立完成部署验证。
+[示例 README](./README.md) 说明模型、应用环境、sandbox 和训练准备。标准图片轨迹需要兼容的模型服务及准备好的 sandbox。合成的单次会话问题用于图片裁剪，以下 pytest agent 场景验证搜索分支。配置传递具有示例级回归测试，目标集群还需要独立完成部署验证。
 
-## 离线 smoke 与回归测试
+## 回归测试
 
-离线 smoke 使用受控模型响应与搜索 transport 执行真正的 agent 循环。导入需要示例的 Python 依赖，包括 OpenAI SDK 和 Pillow；运行无需模型或搜索服务、搜索凭据、GPU 或 sandbox 会话。错误场景提供受控的 `503` 响应，并验证 agent 在重试耗尽后继续完成回答。
-
-```bash
-mkdir -p log/search
-SEARCH_SMOKE_DIR=$(mktemp -d "$PWD/log/search/offline-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario mock --output-dir "$SEARCH_SMOKE_DIR/mock"
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario retriever-error --output-dir "$SEARCH_SMOKE_DIR/retriever-error"
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario external-error --output-dir "$SEARCH_SMOKE_DIR/external-error"
-```
-
-每次运行保存 `input.json`、`output.json`、`model_requests.json` 和 `report.json`，检查观察、后续消息、最终答案及资源清理。错误场景还会保存受控配置。smoke 脚本允许复用已有目录，因此上述命令每次使用新目录。
+[test_search_agent.py](../../tests/examples/deepeyes_v2_agentic/test_search_agent.py) 中的 agent 测试使用受控模型响应与搜索 transport 执行真正的 agent 循环，覆盖 mock 搜索成功、`retriever` 重试耗尽和 `external` 重试耗尽三个场景，检查观察、后续消息、最终答案及资源清理。错误场景提供受控的 `503` 响应，并验证 agent 在重试耗尽后继续完成回答。导入需要示例的 Python 依赖，包括 OpenAI SDK 和 Pillow；这些场景无需模型或搜索服务、搜索凭据、GPU 或 sandbox 会话。
 
 示例回归测试命令如下：
 
@@ -202,44 +189,4 @@ TMPDIR="$SEARCH_TEST_DIR" python -m pytest \
   --basetemp "$SEARCH_TEST_DIR/pytest" -o cache_dir="$SEARCH_TEST_DIR/cache"
 ```
 
-测试覆盖后端适配、配置、重试与错误、本机 HTTP 超时、agent 观察、入口传递及验证工具。运行需要绑定本机回环端口和启动子进程的权限，无需外部搜索凭据、模型服务或 GPU。这些检查验证示例行为，完整训练及模型与 sandbox 验证各有运行前提。
-
-## 真实服务验证
-
-[verify_search_live.py](./scripts/verify_search_live.py) 独立于模型和 sandbox 调用已配置的 `retriever` 或 `external` 服务。执行者需要提供至少两条不同的非空查询，并使其适合对应语料或服务；同时提供非空部署或版本说明，以及尚不存在的输出目录。版本说明的来源记录为 `operator_supplied`。
-
-已配置 Search-R1 服务的验证命令如下：
-
-```bash
-mkdir -p log/search
-SEARCH_LIVE_DIR=$(mktemp -d "$PWD/log/search/live-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
-  --config log/search-configs/retriever.yaml \
-  --service-version 'Search-R1 deployment with the configured corpus and index' \
-  --query 'capital of France' --query 'capital of Japan' \
-  --output-dir "$SEARCH_LIVE_DIR/retriever"
-```
-
-导出 `BRAVE_SEARCH_API_KEY` 后，Brave 验证命令如下：
-
-```bash
-mkdir -p log/search
-SEARCH_LIVE_DIR=$(mktemp -d "$PWD/log/search/live-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
-  --config examples/deepeyes_v2_agentic/search_config.brave.yaml \
-  --service-version 'Brave Search web API v1' \
-  --query 'Python official documentation' --query 'HTTPX official documentation' \
-  --output-dir "$SEARCH_LIVE_DIR/brave"
-```
-
-退出状态 `0` 要求每条查询结果非空、服务字段与统一结果完全对应，并通过证据文件检查。失败时返回非零状态。`query-NNN.json` 记录请求尝试、原始响应、统一结果及来源检查；`summary.json` 记录服务说明、服务地址来源、搜索选项、配置与实现 SHA-256，以及证据文件名。验证程序重新读取全部文件并核查完整内容；摘要发布或完整性检查失败时移除 `summary.json`。
-
-来源检查遵循配置中的可选字段规则，包括可选摘要对应的空字符串。合法空结果记录为 `empty_results`，因为真实服务验证要求每条查询取得至少一条结果。
-
-URL 认证信息及所选 `auth.env` 的值会自动脱敏。URL 认证包含 HTTPX 生成的完整 Basic Authorization 值、其中的 Base64 凭据及其 URL 编码形式，服务响应回传这些内容时同样进行脱敏。其他敏感 endpoint 查询参数通过可重复的 `--sensitive-query-param NAME` 声明，固定敏感 header 通过可重复的 `--sensitive-header NAME` 声明。对于 endpoint 参数 `access_token` 和固定 header `X-Internal-Key`，附加参数如下：
-
-```text
---sensitive-query-param access_token --sensitive-header X-Internal-Key
-```
-
-声明的名称必须存在于 endpoint 或配置的 `headers` 中，header 名称匹配不区分大小写。名称不存在时，在请求或创建输出目录前失败。普通值保持原内容，显式声明为敏感内容时进行脱敏。脱敏覆盖外部文字、原始响应的键和值，同时保留固定报告字段、摘要及文件引用。脱敏后的键出现名称冲突时，验证失败。
+测试覆盖后端适配、配置、重试与错误、本机 HTTP 超时、agent 观察及入口传递。运行需要绑定本机回环端口和启动子进程的权限，无需外部搜索凭据、模型服务或 GPU。这些检查验证示例行为，完整训练及模型与 sandbox 验证各有运行前提。

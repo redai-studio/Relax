@@ -115,10 +115,11 @@ produce the existing `"Error"` observation and allow the agent to continue.
 
 The [search guide](./SEARCH.md) and [中文使用说明](./SEARCH.zh-CN.md) provide an
 offline quick start, configuration examples, timeout/retry behavior, Ray and
-proxy setup, regression tests, and live-service verification commands. The
-offline search smoke uses controlled model responses and needs no running model
-service or sandbox. The standard sample above has its own model and sandbox
-requirements.
+proxy setup, and pytest regression commands. Agent regression tests use
+controlled model responses to cover mock search success and retriever/external
+retry exhaustion, including observations, follow-up messages, the final answer
+and cleanup. They need no running model service or sandbox. The standard sample
+above has its own model and sandbox requirements.
 
 ## Image-search cache (optional, only for the `search` split)
 

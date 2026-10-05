@@ -173,24 +173,11 @@ Relative configuration paths resolve against the launch directory. Ray receives 
 
 Existing `RUNTIME_ENV_JSON` fields are retained, with environment variables merged by name; generated example/search values take precedence. The search helper does not automatically copy proxy and certificate variables. When needed, provide them in worker environments or `RUNTIME_ENV_JSON.env_vars`. A loopback service/proxy address refers to the worker's own host.
 
-The [example README](./README.md) covers model, application environment, sandbox and training setup. Standard image trajectories require a compatible model endpoint and the prepared sandbox. The synthetic single-session question exercises image cropping; the offline scenarios below directly exercise search. Runtime propagation has example-level regression coverage; a target cluster needs its own deployment validation.
+The [example README](./README.md) covers model, application environment, sandbox and training setup. Standard image trajectories require a compatible model endpoint and the prepared sandbox. The synthetic single-session question exercises image cropping; the pytest agent scenarios below exercise the search branch. Runtime propagation has example-level regression coverage; a target cluster needs its own deployment validation.
 
-## Offline smoke and regression tests
+## Regression tests
 
-Offline smoke runs the actual agent loop with controlled model responses and search transport. Imports require the example's Python dependencies, including OpenAI SDK and Pillow. It needs no running model/search service, search credential, GPU or sandbox session. Error scenarios return controlled `503` responses and verify that the agent completes its answer after retry exhaustion.
-
-```bash
-mkdir -p log/search
-SEARCH_SMOKE_DIR=$(mktemp -d "$PWD/log/search/offline-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario mock --output-dir "$SEARCH_SMOKE_DIR/mock"
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario retriever-error --output-dir "$SEARCH_SMOKE_DIR/retriever-error"
-python examples/deepeyes_v2_agentic/scripts/smoke_search_offline.py \
-  --scenario external-error --output-dir "$SEARCH_SMOKE_DIR/external-error"
-```
-
-Each run writes `input.json`, `output.json`, `model_requests.json` and `report.json`, checking observations, follow-up messages, the final answer and cleanup. Error scenarios also save their controlled configuration. These commands use new directories because the smoke script permits reuse of an existing directory.
+Agent tests in [test_search_agent.py](../../tests/examples/deepeyes_v2_agentic/test_search_agent.py) run the actual agent loop with controlled model responses and search transport. They cover mock search success and retry exhaustion for both `retriever` and `external`, checking observations, follow-up messages, the final answer and resource cleanup. The error scenarios return controlled `503` responses and verify that the agent completes its answer after retry exhaustion. Imports require the example's Python dependencies, including OpenAI SDK and Pillow. These scenarios need no running model/search service, search credential, GPU or sandbox session.
 
 Run the example regression suite with:
 
@@ -202,44 +189,4 @@ TMPDIR="$SEARCH_TEST_DIR" python -m pytest \
   --basetemp "$SEARCH_TEST_DIR/pytest" -o cache_dir="$SEARCH_TEST_DIR/cache"
 ```
 
-Tests cover backend adaptation, configuration, retries and errors, local HTTP timeouts, agent observations, entry-point propagation and verification tools. They require loopback socket and subprocess permissions, with no external search credentials, model service or GPU. These checks exercise the example; full training and model/sandbox validation have separate prerequisites.
-
-## Live-service verification
-
-[verify_search_live.py](./scripts/verify_search_live.py) calls the configured `retriever` or `external` service independently of the model and sandbox. Supply at least two different nonempty queries that match the corpus or service, a nonempty deployment/version description, and an output directory that does not exist. The version description is recorded as `operator_supplied`.
-
-For the configured Search-R1 service:
-
-```bash
-mkdir -p log/search
-SEARCH_LIVE_DIR=$(mktemp -d "$PWD/log/search/live-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
-  --config log/search-configs/retriever.yaml \
-  --service-version 'Search-R1 deployment with the configured corpus and index' \
-  --query 'capital of France' --query 'capital of Japan' \
-  --output-dir "$SEARCH_LIVE_DIR/retriever"
-```
-
-For Brave, after exporting `BRAVE_SEARCH_API_KEY`:
-
-```bash
-mkdir -p log/search
-SEARCH_LIVE_DIR=$(mktemp -d "$PWD/log/search/live-XXXXXXXX")
-python examples/deepeyes_v2_agentic/scripts/verify_search_live.py \
-  --config examples/deepeyes_v2_agentic/search_config.brave.yaml \
-  --service-version 'Brave Search web API v1' \
-  --query 'Python official documentation' --query 'HTTPX official documentation' \
-  --output-dir "$SEARCH_LIVE_DIR/brave"
-```
-
-Exit status `0` requires nonempty results, exact correspondence between service fields and normalized results, and successful artifact checks for every query. Failure returns a nonzero status. `query-NNN.json` records attempts, raw responses, normalized results and source checks; `summary.json` records the service description, endpoint origin, search options, configuration/implementation SHA-256 and evidence filenames. The verifier rereads every artifact to check its complete content; summary publication or integrity failure removes `summary.json`.
-
-Source checks apply the configured optional-field rules, including empty strings for optional snippets. A valid empty search response is recorded as `empty_results` because live verification requires at least one result per query.
-
-URL authentication and the configured `auth.env` value are automatically redacted. URL authentication includes the complete HTTPX Basic Authorization value, its Base64 credentials and their URL-encoded forms when echoed in responses. Declare additional sensitive endpoint query parameters with repeated `--sensitive-query-param NAME` arguments and fixed sensitive headers with repeated `--sensitive-header NAME` arguments. For an endpoint parameter `access_token` and a fixed `X-Internal-Key` header, append:
-
-```text
---sensitive-query-param access_token --sensitive-header X-Internal-Key
-```
-
-These names must exist in the endpoint or configured `headers`; header matching is case-insensitive. Unknown names fail before requests or output-directory creation. Ordinary values remain intact unless declared sensitive. Redaction covers external text and raw-response keys/values while preserving fixed report fields, hashes and file references. A collision between redacted keys fails verification.
+Tests cover backend adaptation, configuration, retries and errors, local HTTP timeouts, agent observations and entry-point propagation. They require loopback socket and subprocess permissions, with no external search credentials, model service or GPU. These checks exercise the example; full training and model/sandbox validation have separate prerequisites.
