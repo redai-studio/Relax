@@ -18,7 +18,7 @@ from torch.nn.utils.rnn import pad_sequence
 from relax.engine.sft.runtime import is_preference_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
-from relax.utils.data.data import get_minimum_num_micro_batch_size
+from relax.utils.data.data import get_first_fit_partitions, get_minimum_num_micro_batch_size
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
@@ -207,9 +207,17 @@ def _round_up_to_microbatch_group(num_microbatches: torch.Tensor, microbatch_gro
 def _get_seqlen_partitions_with_dummy_padding(
     seqlens: list[int],
     num_partitions: int,
+    capacity: int,
 ) -> tuple[list[list[int]], set[int]]:
     real_partition_count = min(len(seqlens), num_partitions)
     partitions = get_seqlen_balanced_partitions(seqlens, real_partition_count, equal_size=False)
+    if any(sum(seqlens[index] for index in partition) > capacity for partition in partitions):
+        # KK balances load without a capacity constraint. Only split the
+        # first-fit bins when DP/VPP require more micro-batches.
+        partitions = get_first_fit_partitions(seqlens, capacity)
+        while len(partitions) < real_partition_count:
+            partition = max(partitions, key=len)
+            partitions.append([partition.pop()])
     dummy_offsets: set[int] = set()
     if real_partition_count < num_partitions:
         shortest_partition = min(partitions, key=lambda partition: sum(seqlens[index] for index in partition))
@@ -925,10 +933,9 @@ def get_data_iterator(
 
     - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
       micro-batches of `micro_batch_size`.
-    - If True, computes the number of micro-batches per local step based on
-      `max_tokens_per_gpu` (or the override passed via the parameter) and per-sample lengths, all-reduces to a DP-wide
-      maximum, optionally enforces divisibility for Virtual Pipeline Parallelism (VPP), and builds a balanced
-      index schedule to equalize token counts across micro-batches.
+    - If True, computes the micro-batch count using the token budget, aligns
+      it across DP/VPP, and balances with KK. Falls back to first-fit if KK
+      exceeds the capacity.
 
     Returns `(data_iterators, num_microbatches)` where:
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
@@ -1057,12 +1064,13 @@ def get_data_iterator(
         # calculate the number of mirobatches for each step
         samples = rollout_data["total_lengths"]
         assert len(samples) == num_local_samples
+        capacity = _max_tokens * cp_size
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
         for i in range(num_steps_per_rollout):
             start = step_offsets[i]
             end = step_offsets[i + 1]
-            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], _max_tokens * cp_size))
+            num_microbatches.append(get_minimum_num_micro_batch_size(samples[start:end], capacity))
 
         required_num_microbatches = torch.tensor(
             num_microbatches, dtype=torch.int, device=device_utils.make_current_torch_device()
@@ -1085,7 +1093,9 @@ def get_data_iterator(
             start = step_offsets[i]
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
-            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(step_samples, num_mbs)
+            partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
+                step_samples, num_mbs, capacity
+            )
             base_offset = len(micro_batch_indices)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
