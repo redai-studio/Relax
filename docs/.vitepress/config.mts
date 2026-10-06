@@ -281,7 +281,7 @@ export default defineConfig({
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
 
-{ text: 'KEDA Autoscaling', link: '/en/guide/autoscaler-k8s-keda' },
+                { text: 'KEDA Autoscaling', link: '/en/guide/autoscaler-k8s-keda' },
                 { text: 'Dynamic Context Parallelism', link: '/en/guide/dynamic-context-parallel' },
                 { text: 'Metrics Service', link: '/en/guide/metrics-service-detailed' },
                 { text: 'Notification System', link: '/en/guide/notification-system' },
@@ -408,7 +408,7 @@ export default defineConfig({
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
 
-{ text: 'KEDA 弹性扩缩容', link: '/zh/guide/autoscaler-k8s-keda' },
+                { text: 'KEDA 弹性扩缩容', link: '/zh/guide/autoscaler-k8s-keda' },
                 { text: 'Dynamic Context Parallelism', link: '/zh/guide/dynamic-context-parallel' },
                 { text: 'Metrics 服务', link: '/zh/guide/metrics-service-detailed' },
                 { text: '通知系统', link: '/zh/guide/notification-system' },
