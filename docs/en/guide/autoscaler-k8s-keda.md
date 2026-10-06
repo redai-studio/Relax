@@ -2,7 +2,7 @@
 
 ## Overview
 
-This guide shows how to combine Relax elastic Rollout scaling with Kubernetes HPA through KEDA. Kubernetes automatically scales GPU resources, while Relax automatically registers and deregisters rollout engines.
+This guide shows how to combine Relax's elastic Rollout scaling with Kubernetes HPA through KEDA. Kubernetes automatically scales GPU resources, while Relax automatically registers and deregisters rollout engines.
 
 ### How It Works
 
@@ -73,7 +73,7 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## Relationship with the Built-in Relax Autoscaler
+## Comparison with the Built-in Relax Autoscaler
 
 The built-in `AutoscalerService` (`relax/utils/autoscaler/`) and the K8s KEDA setup should not be enabled at the same time. Their responsibilities are:
 
@@ -428,9 +428,9 @@ Relax's external-mode `scale_out` is idempotent by design (`relax/components/rol
 - Before scaling in, Relax checks the weight synchronization state and waits if a weight update is still running.
 - Relax uses LIFO (last in, first out), so the most recently added engines are removed first.
 
-### Mutual Exclusion
+### Concurrency Protection
 
-Only one scale-out or scale-in operation can run at a time (HTTP 409). KEDA `cooldownPeriod` and HPA `stabilizationWindowSeconds` further reduce concurrent scaling conflicts.
+Only one scale-out or scale-in operation can run at a time (HTTP 409). HPA `stabilizationWindowSeconds` helps reduce rapid scaling changes.
 
 ______________________________________________________________________
 
@@ -524,7 +524,7 @@ ______________________________________________________________________
 
 ## Monitoring and Troubleshooting
 
-### Key Checks
+### What to Monitor
 
 | Item | How to check |
 |---|---|
@@ -543,7 +543,7 @@ ______________________________________________________________________
 | Pod is force-terminated during scale-down | `terminationGracePeriodSeconds` is too short | Increase it to more than 180s |
 | Weight synchronization fails | NCCL network connectivity fails | Check GPU network connectivity and make sure NCCL ports are open |
 | KEDA does not scale out | Prometheus is not scraping the metrics | Check the ServiceMonitor and Prometheus targets |
-| scale_out returns CONFLICT | Another scaling operation is in progress | Wait for the current operation to finish; KEDA cooldownPeriod will handle the delay |
+| scale_out returns CONFLICT | Another scaling operation is in progress | Wait for the current operation to finish before retrying. |
 
 ______________________________________________________________________
 
