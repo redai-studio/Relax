@@ -912,6 +912,8 @@ def forward_only(
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
         )
+        if getattr(args, "empty_unused_memory_level", 0) >= 1:
+            device_module.empty_cache()
 
     # Move model back to the train mode.
     for model_module in model:
