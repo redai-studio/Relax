@@ -37,6 +37,7 @@ from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
 from relax.engine.sft.runtime import should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
+from relax.utils.device import device_module
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
@@ -1248,6 +1249,9 @@ def train_one_step(
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
 
+    if getattr(args, "empty_unused_memory_level", 0) >= 1:
+        device_module.empty_cache()
+
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -1325,6 +1329,9 @@ def train_one_step(
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
+
+    if getattr(args, "empty_unused_memory_level", 0) >= 2:
+        device_module.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
