@@ -119,7 +119,7 @@ spec:
     name: sglang-external-engines  # Target SGLang Deployment
   minReplicaCount: 2               # Minimum engine count
   maxReplicaCount: 16              # Maximum engine count
-  cooldownPeriod: 300              # Scale-down cooldown in seconds
+  cooldownPeriod: 300              # Applies only when scaling to 0
   pollingInterval: 30              # Polling interval in seconds
   advanced:
     horizontalPodAutoscalerConfig:
@@ -408,7 +408,7 @@ K8s sends SIGTERM
 | `--scale-in-drain-timeout` (Relax) | 30s (default) | Timeout for in-flight requests to finish |
 | `--scale-in-shutdown-timeout` (Relax) | 30s (default) | Graceful engine shutdown timeout |
 | preStop `MAX_WAIT` | 150s | Must be less than `terminationGracePeriodSeconds` |
-| KEDA `cooldownPeriod` | 300s | Scale-down cooldown to avoid frequent scaling |
+| KEDA `cooldownPeriod` | 300s | Cooldown before scaling to 0; not used when `minReplicaCount` > 0 |
 
 ______________________________________________________________________
 
