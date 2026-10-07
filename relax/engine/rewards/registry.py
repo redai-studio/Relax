@@ -284,9 +284,7 @@ def _random_reward(response, label):
 register_reward("deepscaler", "relax.engine.rewards.deepscaler:get_deepscaler_rule_based_reward")
 register_reward("geo3k", "relax.engine.rewards.geo3k:get_geo3k_reward")
 register_reward("openr1mm", "relax.engine.rewards.openr1mm:get_openr1mm_rule_based_reward")
-register_reward(
-    "openr1mm_accuracy_format", "relax.engine.rewards.openr1mm_accuracy_format:get_openr1mm_accuracy_format_reward"
-)
+register_reward("openr1mm_accuracy_format", "relax.engine.rewards.openr1mm:get_openr1mm_accuracy_format_reward")
 register_reward(
     "multiple_choice",
     "relax.engine.rewards.multiple_choice:get_multiple_choice_reward",
