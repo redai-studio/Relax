@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
-from examples.openr1mm.prepare_eval import prepare
+from scripts.tools.process_openr1 import prepare_eval as prepare
 
 
 def test_prepare_eval_overlap_and_multimodal_reference_order(tmp_path):
@@ -66,6 +66,9 @@ def test_prepare_eval_overlap_and_multimodal_reference_order(tmp_path):
     assert "<image 2>" not in row["prompt"][0]["content"]
     assert json.loads(row["label"])["correct_index"] == 0
     assert json.loads((output / "overlap-report.json").read_text()) == report
+    config = json.loads((output / "eval.yaml").read_text())
+    assert len(config["eval"]["datasets"]) == 2
+    assert config["eval"]["datasets"][0]["path"] == str((output / "mathvista_testmini_disjoint.parquet").resolve())
 
 
 def test_download_eval_rejects_mixed_revisions(tmp_path, monkeypatch):
@@ -74,7 +77,7 @@ def test_download_eval_rejects_mixed_revisions(tmp_path, monkeypatch):
     import huggingface_hub
     import pytest
 
-    from examples.openr1mm.download_eval import download
+    from scripts.tools.process_openr1 import download_eval as download
 
     calls = []
     monkeypatch.setattr(
@@ -86,7 +89,24 @@ def test_download_eval_rejects_mixed_revisions(tmp_path, monkeypatch):
     download(tmp_path, "mv-v1", "mm-v1")
     download(tmp_path, "mv-v1", "mm-v1")
     assert len(calls) == 4
-    with pytest.raises(ValueError, match="fresh --output"):
+    with pytest.raises(ValueError, match="fresh --output-dir"):
         download(tmp_path, "mv-v2", "mm-v1")
     assert len(calls) == 4
     assert json.loads((tmp_path / "sources.json").read_text())["mathvista"]["revision"] == "mv-v1"
+
+
+def test_process_openr1_default_train_mode_is_compatible(tmp_path):
+    from scripts.tools.process_openr1 import main
+
+    source = tmp_path / "raw.parquet"
+    output = tmp_path / "train.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"problem": " Question? ", "image": {"bytes": b"original-image"}, "solution": "answer"}]
+        ),
+        source,
+    )
+    main(["--input-dir", str(source), "--output-dir", str(output)])
+    assert pq.read_table(output).to_pylist() == [
+        {"prompt": [{"role": "user", "content": "<image>Question?"}], "image": [b"original-image"], "label": "answer"}
+    ]
