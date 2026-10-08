@@ -48,9 +48,7 @@
               "type": "integer"
             }
           },
-          "required": [
-            "q"
-          ]
+          "required": ["q"]
         },
         "strict": true
       }

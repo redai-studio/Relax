@@ -47,9 +47,7 @@
               "type": "integer"
             }
           },
-          "required": [
-            "q"
-          ]
+          "required": ["q"]
         },
         "description": "Search the web"
       }
