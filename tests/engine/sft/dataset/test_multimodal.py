@@ -27,8 +27,8 @@ from relax.utils.data.processor_pool import MediaLoadError, _load_media_for_work
 @pytest.fixture(autouse=True)
 def stub_processor_pool_module(monkeypatch):
     processor_pool = ModuleType("relax.utils.data.processor_pool")
-    processor_pool.prepare_mm_inputs_for_ipc = MagicMock(side_effect=lambda mm_inputs: mm_inputs)
-    processor_pool.process_sample_in_worker = MagicMock()
+    processor_pool.MediaLoadError = MediaLoadError
+    processor_pool.process_sample_from_paths_in_worker = MagicMock()
     monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", processor_pool)
 
     import relax.utils.data as data_package
@@ -105,6 +105,17 @@ def _patch_loaders(monkeypatch, load_image):
         loader_module = ModuleType(module_name)
         setattr(loader_module, f"load_{kind}", load_image if kind == "image" else MagicMock())
         monkeypatch.setitem(sys.modules, module_name, loader_module)
+
+
+def test_worker_media_loader_loads_images_without_video_or_audio_dependencies(monkeypatch):
+    image_utils = ModuleType("relax.utils.multimodal.image_utils")
+    image_utils.load_image = MagicMock(return_value="decoded image")
+    monkeypatch.setitem(sys.modules, image_utils.__name__, image_utils)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.video_utils", None)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.audio_utils", None)
+
+    assert _load_media_for_worker({"image": ["cat.png"], "video": [], "audio": []}) == {"images": ["decoded image"]}
+    image_utils.load_image.assert_called_once_with("cat.png")
 
 
 def test_worker_media_loader_reports_position(monkeypatch):

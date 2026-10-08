@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
+
 
 @pytest.mark.parametrize(
     ("enable_mtp_training", "speculative_algorithm", "overrides", "expected"),
@@ -30,12 +32,12 @@ def test_draft_weights_cpu_backup_follows_mtp_and_speculative_config(
     assert _enable_draft_weights_cpu_backup(args, overrides) is expected
 
 
-def test_expert_sync_layout_uses_runtime_overrides(monkeypatch):
+def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, sglang_engine_module):
     from unittest.mock import Mock
 
-    from relax.backends.sglang import sglang_engine as module
     from relax.utils import misc
 
+    module = sglang_engine_module
     engine = object.__new__(module.SGLangEngine)
     engine.node_rank = 0
     engine.worker_type = "regular"
@@ -63,12 +65,10 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch):
     response.raise_for_status.assert_called_once()
 
 
-def test_expert_sync_version_commit_does_not_abort_again(monkeypatch):
+def test_expert_sync_version_commit_does_not_abort_again(monkeypatch, sglang_engine_module):
     from unittest.mock import Mock
 
-    from relax.backends.sglang.sglang_engine import SGLangEngine
-
-    engine = object.__new__(SGLangEngine)
+    engine = object.__new__(sglang_engine_module.SGLangEngine)
     request = Mock(return_value={"success": True})
     monkeypatch.setattr(engine, "_make_request", request)
     assert engine.update_weight_version("7") == {"success": True}

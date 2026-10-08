@@ -15,7 +15,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.training.global_vars import get_args
 from torch.nn.utils.rnn import pad_sequence
 
-from relax.engine.sft.runtime import is_preference_mode
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
@@ -620,8 +620,9 @@ def get_batch(
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
-            pad_between_seqs=pad != 0 if allgather_cp else None,
         )
+        # TODO: Pass pad_between_seqs to the constructor once the NPU Megatron pin supports it.
+        packed_seq_params.pad_between_seqs = pad != 0 if allgather_cp else None
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
@@ -1326,7 +1327,7 @@ def log_rollout_data(
         log_dict = {}
         metric_weights = {}
         metric_reductions = {}
-        is_sft = getattr(args, "loss_type", None) == "sft"
+        is_sft = is_sft_mode(args)
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]

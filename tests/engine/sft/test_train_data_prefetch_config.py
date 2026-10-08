@@ -39,6 +39,9 @@ def make_args(**overrides):
     "overrides,prepack,prefetch,image",
     [
         ({}, True, False, False),
+        ({"loss_type": "dpo"}, False, True, False),
+        ({"loss_type": "rm"}, False, True, False),
+        ({"loss_type": "dpo", "max_staleness": 0}, False, False, False),
         ({"max_staleness": 0}, False, False, False),
         ({"multimodal_keys": {"image": "images"}}, False, True, True),
         ({"pipeline_model_parallel_size": 2}, False, True, False),
@@ -173,7 +176,7 @@ def test_late_custom_budget_controls_automatic_pipeline(steps, expected):
     args = make_args(sft_max_in_flight_steps=None)
     namespace = dict(
         args=args,
-        is_sft=True,
+        is_offline=True,
         apply_custom_config_overrides=lambda args: setattr(args, "sft_max_in_flight_steps", steps),
     )
     exec(compile(ast.Module(body=[normalize, *calls], type_ignores=[]), str(_SOURCE), "exec"), namespace)

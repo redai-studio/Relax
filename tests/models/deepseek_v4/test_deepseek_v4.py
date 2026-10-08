@@ -216,6 +216,13 @@ def test_indexer_qat_only_affects_selected_instances(monkeypatch: pytest.MonkeyP
 
     from relax.models.deepseek_v4 import indexer
 
+    # TODO: Remove the legacy DSA namespace and CSA flag branch once CI uses the upgraded Megatron image.
+    native = not hasattr(dsa_kernels, "_ensure_dsa_namespace")
+    namespace_attr = "_DSA"
+    if native:
+        from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels as dsa_kernels
+
+        namespace_attr = "_cudnn_dsa"
     monkeypatch.setattr(indexer, "_PROCESS_MODE", None)
     monkeypatch.setattr(indexer, "activation_qdq", lambda value: value + 10)
     monkeypatch.setattr(indexer, "round_scores_", lambda scores: scores + 1)
@@ -223,7 +230,7 @@ def test_indexer_qat_only_affects_selected_instances(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(dsa_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(
         dsa_kernels,
-        "_DSA",
+        namespace_attr,
         SimpleNamespace(indexer_forward_wrapper=lambda q, k, w, **kwargs: {"scores": torch.tensor(float(q))}),
     )
 
@@ -233,8 +240,11 @@ def test_indexer_qat_only_affects_selected_instances(monkeypatch: pytest.MonkeyP
         def __init__(self) -> None:
             self.indexer = SimpleNamespace(compressor=SimpleNamespace(rotate=True))
             self.compressor = None
-            self.apply_dsa_kernel_fusion = True
-            self.config = SimpleNamespace(dsa_indexer_loss_coeff=0.0)
+            if native:
+                self.use_fused_kernels = True
+            else:
+                self.apply_dsa_kernel_fusion = True
+            self.config = SimpleNamespace(dsa_indexer_loss_coeff=0.0, dsa_kernel_backend="cudnn")
 
         def forward(self, *, nested=None, fail=False, entered=None, release=None):
             if entered is not None:
@@ -243,7 +253,7 @@ def test_indexer_qat_only_affects_selected_instances(monkeypatch: pytest.MonkeyP
             child = nested.forward() if nested is not None else None
             # Exercise the CP-style direct calls, without invoking indexer.forward.
             q = csa.rotate_activation(1)
-            scores = dsa_kernels._DSA.indexer_forward_wrapper(q, None, None)["scores"]
+            scores = getattr(dsa_kernels, namespace_attr).indexer_forward_wrapper(q, None, None)["scores"]
             if fail:
                 raise RuntimeError("forward failed")
             return q, scores.item(), child
@@ -263,7 +273,12 @@ def test_indexer_qat_only_affects_selected_instances(monkeypatch: pytest.MonkeyP
     # Unselected calls must also bypass QAT-only dtype/LSE/precision constraints.
     sentinel = object()
     assert csa.rotate_activation(sentinel) is sentinel
-    assert dsa_kernels._DSA.indexer_forward_wrapper(1, None, None, precision="fp32", return_lse=True)["scores"] == 1
+    assert (
+        getattr(dsa_kernels, namespace_attr).indexer_forward_wrapper(1, None, None, precision="fp32", return_lse=True)[
+            "scores"
+        ]
+        == 1
+    )
 
     entered, release = Event(), Event()
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -293,13 +308,18 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer as DO
 from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from megatron.core.transformer.experimental_attention_variant import csa, dsa_kernels
 from transformer_engine.pytorch.module.base import TransformerEngineBaseModule as TEBase
+score_kernels = dsa_kernels
+topk_attr, namespace_attr = '_indexer_topk_core', '_DSA'
+if not hasattr(dsa_kernels, '_ensure_dsa_namespace'):
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels as score_kernels
+    topk_attr, namespace_attr = '_indexer_topk_bshd', '_cudnn_dsa'
 prefix = 'relax.models.deepseek_v4'
 def bindings():
     methods = ('__init__', 'load_state_dict', 'step_with_ready_grads', '_copy_model_params_to_main_params')
     return tuple(getattr(DO, name) for name in methods) + (
         TEBase.get_weight_workspace, TEGroupedLinear.get_weight_workspace,
         csa.CompressedSparseAttention.forward, csa.rotate_activation,
-        dsa_kernels._indexer_topk_core, getattr(dsa_kernels, '_DSA', None))
+        getattr(score_kernels, topk_attr), getattr(score_kernels, namespace_attr))
 before = bindings()
 assert not any(name.startswith(prefix) for name in sys.modules)
 from relax.backends.megatron import model_provider

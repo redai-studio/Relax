@@ -4,17 +4,10 @@ import importlib.util
 import io
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
-from megatron.core.dist_checkpointing.mapping import (
-    LocalNonpersistentObject,
-    ShardedObject,
-    ShardedTensor,
-    ShardedTensorFactory,
-    apply_factories,
-    apply_factory_merges,
-)
 
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -24,17 +17,19 @@ export = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(export)
 
 
-def tensor(key: str, value: torch.Tensor | None = None) -> ShardedTensor:
-    return ShardedTensor.from_rank_offsets(key, torch.ones(2, 2) if value is None else value)
+def tensor(key: str, value: torch.Tensor | None = None) -> Any:
+    mapping = pytest.importorskip("megatron.core.dist_checkpointing.mapping")
+    return mapping.ShardedTensor.from_rank_offsets(key, torch.ones(2, 2) if value is None else value)
 
 
 def test_overlay_preserves_base_and_resolves_wrapped_prefix() -> None:
+    mapping = pytest.importorskip("megatron.core.dist_checkpointing.mapping")
     base = torch.full((2, 2), 17.0)
     adapter = "decoder.layers.0.linear.adapter.linear_in.weight"
     saved = "language_model." + adapter
     state = {"model": {"base": tensor("decoder.layers.0.linear.to_wrap.weight", base), "adapter": tensor(adapter)}}
     result = export.prepare_overlay(state, {saved})["model"]
-    assert isinstance(result["base"], LocalNonpersistentObject)
+    assert isinstance(result["base"], mapping.LocalNonpersistentObject)
     assert result["base"].unwrap() is base
     assert result["adapter"].key == saved
     full = export.prepare_overlay(state, {saved, "language_model.decoder.layers.0.linear.weight"})
@@ -53,19 +48,22 @@ def test_overlay_rejects_unmatched_adapter_and_unexpected_saved_weight() -> None
 
 
 def test_factory_expansion_keeps_merge_and_preserves_missing_base() -> None:
+    mapping = pytest.importorskip("megatron.core.dist_checkpointing.mapping")
     data = torch.arange(8.0).reshape(4, 2)
 
     def build(key, weight, replica, flattened):
         return {"left": tensor("decoder.left.weight", weight[:2]), "right": tensor("decoder.right.weight", weight[2:])}
 
-    factory = ShardedTensorFactory("decoder.fused.weight", data, build, lambda state: torch.cat(list(state.values())))
+    factory = mapping.ShardedTensorFactory(
+        "decoder.fused.weight", data, build, lambda state: torch.cat(list(state.values()))
+    )
     state = export.prepare_overlay({"fused": factory}, {"language_model.decoder.left.weight"})
     expanded = dict(state)
-    apply_factories(expanded)
+    mapping.apply_factories(expanded)
     assert expanded["fused"]["left"].key == "language_model.decoder.left.weight"
-    assert isinstance(expanded["fused"]["right"], LocalNonpersistentObject)
+    assert isinstance(expanded["fused"]["right"], mapping.LocalNonpersistentObject)
     loaded = {"fused": {"left": torch.full((2, 2), 99.0), "right": expanded["fused"]["right"].unwrap()}}
-    actual = apply_factory_merges(loaded, state)["fused"]
+    actual = mapping.apply_factory_merges(loaded, state)["fused"]
     torch.testing.assert_close(actual[:2], torch.full((2, 2), 99.0))
     torch.testing.assert_close(actual[2:], data[2:])
 
@@ -95,10 +93,12 @@ def test_vision_adapter_is_explicitly_rejected() -> None:
 
 
 def test_real_dcp_overlay_keeps_base_under_strict_model_load(tmp_path: Path) -> None:
+    pytest.importorskip("megatron.core.dist_checkpointing")
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
 
     owned_group = not dist.is_initialized()
     if owned_group:

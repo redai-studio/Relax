@@ -33,6 +33,7 @@ def partitioning():
     }
     _execute(_tree("relax/utils/data/seqlen_balancing.py").body, namespace)
     names = {
+        "get_first_fit_partitions",
         "get_minimum_num_micro_batch_size",
         "_get_micro_batch_token_capacity",
         "_get_first_fit_partitions",

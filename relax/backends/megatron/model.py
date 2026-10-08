@@ -35,8 +35,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import should_bypass_main_output_layer
-from relax.utils import device as device_utils
+from relax.engine.sft.runtime import is_rm_mode, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
@@ -81,7 +80,7 @@ def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None
     # router bias reduction), before forward_backward_func returns to the
     # optimizer. Make unused activation cache available at that boundary too.
     memory_before = available_memory()
-    device_utils.empty_cache()
+    device_module.empty_cache()
     logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
     finalize_model_grads(*args, **kwargs)
 
@@ -431,9 +430,9 @@ def setup_model_and_optimizer(
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
         # roles that still run forward.
-        _patch_gdn_for_dynamic_cp()
         model_config = get_model_config(model[0])
-        if getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net" and (
+        _patch_gdn_for_dynamic_cp(getattr(model_config, "linear_cp_mode", None))
+        if getattr(model_config, "experimental_attention_variant", None) in {"gated_delta_net", "gdn"} and (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         ):
@@ -521,7 +520,7 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
 
-def _patch_gdn_for_dynamic_cp() -> None:
+def _patch_gdn_for_dynamic_cp(linear_cp_mode: str | None = None) -> None:
     """Patch GDN forward for dynamic CP and Relax's all-gather mode.
 
     CP=1 and MCore-native headwise/chunkwise modes call the patched MCore
@@ -534,7 +533,8 @@ def _patch_gdn_for_dynamic_cp() -> None:
     except ImportError:
         return
 
-    if hasattr(GatedDeltaNet, "_prepare_input_for_gated_delta_rule"):
+    native_gdn = hasattr(GatedDeltaNet, "_prepare_input_for_gated_delta_rule")
+    if native_gdn and linear_cp_mode != "all_gather":
         return
 
     if getattr(GatedDeltaNet, "_dcp_patched", False):
@@ -596,6 +596,37 @@ def _patch_gdn_for_dynamic_cp() -> None:
         qkvzba = _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
         seq_len = qkvzba.shape[0]
+        if native_gdn:
+            # The packaged GDN exposes the complete convolution/QKV/gate prep.
+            # Run it on the gathered sequence with TP-local heads and no CP
+            # context; the recurrent scan is duplicated on every CP rank.
+            with torch._dynamo.config.patch(disable=True):
+                query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                    qkvzba,
+                    batch,
+                    seq_len,
+                    cp_size_headwise=1,
+                    cp_group_headwise=None,
+                    cu_seqlens_q=cu_seqlens,
+                    chunkwise_cp_context=None,
+                    packed_seq_params=packed_seq_params,
+                )
+            core_attn_out, _ = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens,
+            )
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            norm_out = norm_out.reshape(batch, seq_len, -1).transpose(0, 1).contiguous()
+            norm_out = gdn_cp_slice(norm_out, cu_seqlens_cpu, cp_size, cp_rank)
+            return self.out_proj(norm_out)
+
         qkvzba = qkvzba.transpose(0, 1)  # s b x -> b s x
 
         # Split into q/k/v, gate(z), beta, alpha using TP-local (full, no /cp) sizes.
@@ -1305,9 +1336,6 @@ def train_one_step(
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
 
-    if getattr(args, "empty_unused_memory_level", 0) >= 1:
-        device_module.empty_cache()
-
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -1330,7 +1358,7 @@ def train_one_step(
     # unused forward/backward cache before those allocations, not after an OOM.
     if getattr(args, "empty_unused_memory_level", 0) >= 1:
         memory_before = available_memory()
-        device_utils.empty_cache()
+        device_module.empty_cache()
         logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
     valid_step = True
     if _is_global_zero_token_step(losses_reduced):
@@ -1376,9 +1404,6 @@ def train_one_step(
             opt_param_scheduler.step(increment=step_global_batch_size)
         else:
             grad_norm = float("nan")
-
-    if getattr(args, "empty_unused_memory_level", 0) >= 2:
-        device_utils.empty_cache()
 
     if critic_value_head_snapshot is not None:
         from relax.backends.megatron.ci_utils import assert_critic_value_head_updated
@@ -1751,7 +1776,7 @@ def save(
     args = get_args()
     role = getattr(model[0], "role", "actor")
     args.checkpoint_role = role
-    if role == "actor" and getattr(args, "loss_type", None) == "rm":
+    if role == "actor" and is_rm_mode(args):
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
@@ -2082,7 +2107,7 @@ def initialize_model_and_optimizer(
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
     if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
-    if role == "actor" and getattr(args, "loss_type", None) == "rm":
+    if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
     iteration, _ = load_checkpoint(
@@ -2099,7 +2124,7 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
-    elif getattr(args, "loss_type", None) == "rm":
+    elif is_rm_mode(args):
         release_critic_lm_heads(model)
         loaded_reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
         assert loaded_reward_head_param_ids == reward_head_param_ids, (

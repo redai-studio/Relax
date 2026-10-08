@@ -51,6 +51,7 @@ def test_merge_selects_expert_up_projection_and_accumulates_fp32() -> None:
 
 
 def test_dense_fc1_dcp_is_canonical_not_tp_interleaved() -> None:
+    pytest.importorskip("megatron.core.transformer.mlp")
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 

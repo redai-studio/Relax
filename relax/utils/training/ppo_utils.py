@@ -13,6 +13,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from relax.algorithms import algorithm_needs_critic
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils.logging_utils import get_logger
 
 
@@ -1708,7 +1709,7 @@ def install_reward_model_head_in_provider(
 ) -> None:
     """Install the offline reward-model scalar head before DDP/optimizer
     construction."""
-    if role != "actor" or not post_process or getattr(args, "loss_type", None) != "rm":
+    if role != "actor" or not post_process or not is_rm_mode(args):
         return
 
     owner = _find_output_layer_owner(model)

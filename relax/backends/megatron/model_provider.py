@@ -322,7 +322,6 @@ def get_model_provider_func(
             # layout arguments"); drop those flags in the script when using a layout.
             "pipeline_model_parallel_layout",
             "context_parallel_size",
-            "linear_cp_mode",
             "cp_partition_mode",
             "sequence_packing_scheduler",
             "expert_model_parallel_size",

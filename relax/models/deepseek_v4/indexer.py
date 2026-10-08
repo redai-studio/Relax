@@ -152,15 +152,17 @@ def install_indexer_qat(model: Any, *, bf16_scores: bool = True) -> tuple[str, .
     for name, module in model.named_modules():
         if module.__class__.__module__ != csa.__name__ or getattr(module, "indexer", None) is None:
             continue
-        if not hasattr(module, "apply_dsa_kernel_fusion"):
+        if not hasattr(module, "apply_dsa_kernel_fusion") and not hasattr(module, "use_fused_kernels"):
             continue
         if getattr(module.config, "relax_use_indexer_replay", False):
             raise ValueError("DeepSeek-V4 MXFP4 QAT indexer simulation cannot be combined with replayed top-k")
         if bf16_scores and (
-            not module.apply_dsa_kernel_fusion or (module.config.dsa_indexer_loss_coeff or 0.0) != 0.0
+            not getattr(module, "use_fused_kernels", getattr(module, "apply_dsa_kernel_fusion", False))
+            or (module.config.dsa_indexer_loss_coeff or 0.0) != 0.0
+            or getattr(module.config, "dsa_kernel_backend", "cudnn") != "cudnn"
         ):
             raise ValueError(
-                "DeepSeek-V4 MXFP4 QAT BF16 scores currently require fused DSA and indexer auxiliary loss coefficient=0"
+                "DeepSeek-V4 MXFP4 QAT BF16 scores require fused cuDNN DSA and indexer auxiliary loss coefficient=0"
             )
         if not module.indexer.compressor.rotate or (module.compressor is not None and module.compressor.rotate):
             raise ValueError("Unexpected CSA Hadamard placement: cannot restrict QDQ to indexer Q/K")
@@ -177,10 +179,18 @@ def install_indexer_qat(model: Any, *, bf16_scores: bool = True) -> tuple[str, .
 
         rotated._relax_dsv4_fp4 = True
         csa.rotate_activation = rotated
-    dsa_kernels._ensure_dsa_namespace()
-    if bf16_scores and not isinstance(dsa_kernels._DSA, _ScoreNamespace):
-        dsa_kernels._DSA = _ScoreNamespace(dsa_kernels._DSA)
-    if not bf16_scores and isinstance(dsa_kernels._DSA, _ScoreNamespace):
+    score_kernels = dsa_kernels
+    namespace_attr = "_DSA"
+    if not hasattr(score_kernels, "_ensure_dsa_namespace"):
+        from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+        score_kernels = dsa_cudnn_kernels
+        namespace_attr = "_cudnn_dsa"
+    score_kernels._ensure_dsa_namespace()
+    namespace = getattr(score_kernels, namespace_attr)
+    if bf16_scores and not isinstance(namespace, _ScoreNamespace):
+        setattr(score_kernels, namespace_attr, _ScoreNamespace(namespace))
+    if not bf16_scores and isinstance(namespace, _ScoreNamespace):
         raise ValueError("Cannot mix different DeepSeek-V4 MXFP4 indexer score modes within one process")
     for _, module in selected:
         _install_forward_scope(type(module))

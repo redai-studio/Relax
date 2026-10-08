@@ -89,6 +89,8 @@ def _distributed_worker(rank: int, init_file: str) -> None:
 
 
 def test_two_rank_ep_quantization_matches_gather_then_quantize(tmp_path: Path) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.param_mapping")
+    pytest.importorskip("megatron.bridge.models.conversion.quantization_utils")
     torch.multiprocessing.spawn(_distributed_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True)
 
 
@@ -175,6 +177,7 @@ def test_full_shard_comparison_ignores_header_metadata_but_detects_weight_change
 
 @pytest.mark.parametrize("merge_lora", [False, True])
 def test_worker_disables_early_quantization_before_lora_merge(tmp_path: Path, monkeypatch, merge_lora: bool) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.quantization_utils")
     installed = []
     transform = SimpleNamespace(layout=object())
     monkeypatch.setattr(baseline, "_install_export_hooks", lambda *args: None)

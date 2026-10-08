@@ -9,6 +9,10 @@ import pytest
 
 @pytest.fixture
 def module():
+    pytest.importorskip("megatron.core", reason="tensor weight updates require Megatron Core", exc_type=ImportError)
+    pytest.importorskip(
+        "sglang.srt.utils", reason="tensor weight updates require SGLang serialization", exc_type=ImportError
+    )
     from relax.backends.megatron.weight_update import update_weight_from_tensor
 
     return update_weight_from_tensor

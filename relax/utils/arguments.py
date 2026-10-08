@@ -14,7 +14,7 @@ from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
 from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
-from relax.engine.sft.runtime import is_offline_mode
+from relax.engine.sft.runtime import is_dpo_mode, is_offline_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -3194,7 +3194,7 @@ def _normalize_mtp_only_training_args(args) -> None:
     if not getattr(args, "mtp_only_training", False):
         return
 
-    if getattr(args, "loss_type", None) != "sft":
+    if not is_sft_mode(args):
         raise ValueError("--mtp-only-training requires --loss-type sft.")
 
     conflicts = []
@@ -3234,7 +3234,7 @@ def _validate_cpt_args(args) -> None:
         if getattr(args, "sft_cpt_template", "raw") != "raw":
             raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
         return
-    if args.loss_type != "sft" or getattr(args, "task_type", "causal_lm") != "causal_lm":
+    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
         raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
     incompatible = {
         "--label-key": getattr(args, "label_key", None),
@@ -4036,7 +4036,7 @@ def slime_validate_args(args):
         else:
             if args.load is None:
                 args.load = args.ref_load or args.hf_checkpoint
-                if args.loss_type == "dpo":
+                if is_dpo_mode(args):
                     args.finetune = True
                     args.no_load_optim = True
                     args.no_load_rng = True
@@ -4082,7 +4082,7 @@ def slime_validate_args(args):
         assert args.save is not None, "'--save' is required when save_interval is set."
 
     if getattr(args, "sft_predict_interval", None) is not None:
-        assert args.loss_type == "sft", "--sft-predict-interval is only meaningful under --loss-type sft."
+        assert is_sft_mode(args), "--sft-predict-interval is only meaningful under --loss-type sft."
         assert args.sft_predict_interval > 0, "--sft-predict-interval must be positive."
         assert args.save is not None, "--sft-predict-interval requires --save (predictions land in <save>/predict/)."
         has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (
@@ -4282,7 +4282,7 @@ def slime_validate_args(args):
 
     task_type = getattr(args, "task_type", "causal_lm")
     if task_type == "seq_cls":
-        if args.loss_type != "sft":
+        if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
         if not args.label_key:
             raise ValueError("--task-type seq_cls requires --label-key.")

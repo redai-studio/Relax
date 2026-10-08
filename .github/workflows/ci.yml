@@ -99,7 +99,10 @@ jobs:
               f.write('    def __getattr__(self, name): return self\n')
               f.write('    def __call__(self, *a, **k): return self\n')
               f.write('_s = _Stub()\n')
-              f.write('def __getattr__(name): return _s\n')
+              f.write('def __getattr__(name):\n')
+              f.write('    if name.startswith(\"__\"):\n')
+              f.write('        raise AttributeError(name)\n')
+              f.write('    return _s\n')
           "
 
       - name: Run tests

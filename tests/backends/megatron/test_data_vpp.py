@@ -6,6 +6,8 @@ from argparse import Namespace
 import pytest
 import torch
 
+from relax.utils.data.data import get_first_fit_partitions
+
 
 def _load_data_module(monkeypatch):
     # Importing a module also assigns attributes on its parent package. Restore
@@ -17,6 +19,12 @@ def _load_data_module(monkeypatch):
         sys.modules.pop(name)
         monkeypatch.setattr(parent, leaf, None, raising=False)
 
+    metric_parent = importlib.import_module("relax.utils.training")
+    metric_name = "relax.utils.training.train_metric_utils"
+    monkeypatch.setitem(sys.modules, metric_name, sys.modules.get(metric_name))
+    sys.modules.pop(metric_name)
+    monkeypatch.setattr(metric_parent, "train_metric_utils", None, raising=False)
+
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
     mpu = types.ModuleType("megatron.core.mpu")
@@ -24,6 +32,7 @@ def _load_data_module(monkeypatch):
     training = types.ModuleType("megatron.training")
     global_vars = types.ModuleType("megatron.training.global_vars")
     tracking_utils = types.ModuleType("relax.utils.tracking_utils")
+    monkeypatch.setattr(importlib.import_module("relax.utils"), "tracking_utils", tracking_utils, raising=False)
 
     class _PackedSeqParams:
         pass
@@ -105,7 +114,7 @@ def test_seqlen_partitions_respect_capacity(
     kk_partitions = data_module.get_seqlen_balanced_partitions(seqlens, num_partitions, equal_size=False)
     assert any(sum(seqlens[index] for index in partition) > capacity for partition in kk_partitions) == expect_fallback
 
-    first_fit = data_module.get_first_fit_partitions(seqlens, capacity)
+    first_fit = get_first_fit_partitions(seqlens, capacity)
     assert len(first_fit) == first_fit_count
     assert data_module.get_minimum_num_micro_batch_size(seqlens, capacity) == first_fit_count
 

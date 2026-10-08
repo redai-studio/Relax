@@ -4,21 +4,26 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.utils.arguments import _validate_cpt_args
+from tests.utils.test_arguments_opd_teacher_colocate import arguments_module as _arguments_module_fixture
 
 
-def test_cpt_accepts_the_sft_causal_lm_backend():
-    _validate_cpt_args(SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm"))
+arguments_module = _arguments_module_fixture
 
 
-def test_default_sft_and_rl_are_unchanged():
-    _validate_cpt_args(SimpleNamespace(loss_type="sft"))
-    _validate_cpt_args(SimpleNamespace(loss_type="policy_loss"))
+def test_cpt_accepts_the_sft_causal_lm_backend(arguments_module):
+    arguments_module._validate_cpt_args(
+        SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
+    )
 
 
-def test_qwen_template_requires_cpt_mode():
+def test_default_sft_and_rl_are_unchanged(arguments_module):
+    arguments_module._validate_cpt_args(SimpleNamespace(loss_type="sft"))
+    arguments_module._validate_cpt_args(SimpleNamespace(loss_type="policy_loss"))
+
+
+def test_qwen_template_requires_cpt_mode(arguments_module):
     with pytest.raises(ValueError, match="requires --sft-training-mode cpt"):
-        _validate_cpt_args(SimpleNamespace(loss_type="sft", sft_cpt_template="qwen3_5"))
+        arguments_module._validate_cpt_args(SimpleNamespace(loss_type="sft", sft_cpt_template="qwen3_5"))
 
 
 @pytest.mark.parametrize(
@@ -41,8 +46,8 @@ def test_qwen_template_requires_cpt_mode():
         ("sft_oversize_strategy", "custom"),
     ],
 )
-def test_cpt_rejects_unsupported_options(option, value):
+def test_cpt_rejects_unsupported_options(arguments_module, option, value):
     args = SimpleNamespace(sft_training_mode="cpt", loss_type="sft", task_type="causal_lm")
     setattr(args, option, value)
     with pytest.raises(ValueError):
-        _validate_cpt_args(args)
+        arguments_module._validate_cpt_args(args)

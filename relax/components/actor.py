@@ -15,6 +15,7 @@ from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
 from relax.engine.sft.runtime import (
+    is_dpo_mode,
     is_offline_mode,
     sft_partition_ids,
     sft_task_name,
@@ -85,7 +86,7 @@ class Actor(Base):
                 with_ref=(
                     config.kl_coef != 0
                     or config.use_kl_loss
-                    or (config.loss_type == "dpo" and not config.dpo_reference_free)
+                    or (is_dpo_mode(config) and not config.dpo_reference_free)
                 ),
                 with_opd_teacher=self.config.opd_teacher_load,
             )

@@ -11,7 +11,7 @@ multi-rank scenarios.
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -538,7 +538,6 @@ def _cached_gloo_worker(rank: int, rendezvous: str) -> None:
         caches = ({}, {})
         previous = None
         actual_reduce = distributed.all_reduce
-        module = "relax.backends.megatron.weight_update.hf_weight_iterator_bridge"
         for step in range(5):
             # Only rank 3 changes schema. Both PP and EP must refresh together.
             expected = []
@@ -555,11 +554,16 @@ def _cached_gloo_worker(rank: int, rendezvous: str) -> None:
                 # A local eviction must not desynchronize the collective sequence.
                 caches[0].clear()
             with (
-                patch(f"{module}.mpu.get_pipeline_model_parallel_world_size", return_value=2),
-                patch(f"{module}.mpu.get_expert_model_parallel_world_size", return_value=2),
-                patch(f"{module}.mpu.get_pipeline_model_parallel_group", return_value=pp),
-                patch(f"{module}.mpu.get_expert_model_parallel_group", return_value=ep),
-                patch(f"{module}.dist.all_reduce", wraps=actual_reduce) as reduce,
+                patch.dict(
+                    _broadcast_converted_bucket.__globals__,
+                    mpu=SimpleNamespace(
+                        get_pipeline_model_parallel_world_size=lambda: 2,
+                        get_expert_model_parallel_world_size=lambda: 2,
+                        get_pipeline_model_parallel_group=lambda: pp,
+                        get_expert_model_parallel_group=lambda: ep,
+                    ),
+                ),
+                patch.object(distributed, "all_reduce", wraps=actual_reduce) as reduce,
             ):
                 result = _broadcast_converted_bucket(infos, local, "cpu", phase_caches=caches)
                 expected_calls = {0: 4, 1: 2, 2: 3 + (rank >= 2), 3: 2 + (rank < 2), 4: 3 + (rank >= 2)}

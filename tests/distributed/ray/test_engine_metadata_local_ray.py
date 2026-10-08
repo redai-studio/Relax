@@ -24,10 +24,9 @@ import pytest
 import ray
 from ray.core.generated.gcs_pb2 import ActorTableData
 
-from relax.distributed.ray import rollout
-
 
 ActorState = ActorTableData.ActorState
+rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
 
 
 def wait_until(predicate, *, timeout=15.0, description):

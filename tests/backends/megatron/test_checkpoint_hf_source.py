@@ -7,11 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
-pytest.importorskip("megatron.training.checkpointing", exc_type=ImportError)
-
-from relax.backends.megatron import checkpoint, compat
+from relax.backends.megatron import compat
 from relax.utils.model_source import ModelSource
+from tests.backends.megatron.test_checkpoint_preflight import _load_checkpoint_module
+
+
+checkpoint = _load_checkpoint_module()
 
 
 def test_select_hf_load_source_remaps_replaced_hf_path():
@@ -63,8 +64,10 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
     ["full", "template", "other_sharding", "partial_offload", "non_precision_aware", "non_hdo", "no_optim", "error"],
 )
 def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tmp_path, case):
-    from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    HybridDeviceOptimizer = pytest.importorskip(
+        "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+    ).HybridDeviceOptimizer
+    DistributedOptimizer = pytest.importorskip("megatron.core.optimizer.distrib_optimizer").DistributedOptimizer
 
     parameter = torch.nn.Parameter(torch.zeros(1))
     inner = torch.nn.Parameter(torch.zeros(1))
@@ -114,7 +117,7 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
     monkeypatch.setattr(DistributedOptimizer, "load_state_dict", original_load)
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda _path, ckpt_step=None: None)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *_args: {})
     monkeypatch.setattr(checkpoint, "patch_hybrid_optimizer_native_fp32_checkpoint_load", lambda: False)
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_megatron)
 
@@ -146,7 +149,7 @@ def test_hf_initialization_does_not_install_optimizer_step_fix(monkeypatch, tmp_
 
 
 def test_hdo_step_fix_nested_exceptions_restore_loader(monkeypatch):
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    DistributedOptimizer = pytest.importorskip("megatron.core.optimizer.distrib_optimizer").DistributedOptimizer
 
     optimizer = object.__new__(DistributedOptimizer)
     optimizer.optimizer = object()  # Exercise the unchanged non-HDO pass-through.
@@ -174,7 +177,7 @@ def test_hdo_step_fix_nested_exceptions_restore_loader(monkeypatch):
 
 @pytest.mark.parametrize("second_raises", [False, True])
 def test_hdo_step_fix_concurrent_contexts_restore_loader(monkeypatch, second_raises):
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    DistributedOptimizer = pytest.importorskip("megatron.core.optimizer.distrib_optimizer").DistributedOptimizer
 
     first_entered = Event()
     second_attempted = Event()

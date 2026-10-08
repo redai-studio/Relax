@@ -1,10 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-
-
-pytest.importorskip("megatron.core", exc_type=ImportError)
 
 from relax.backends.megatron import cp_utils
 from relax.utils.sft_utils import align_loss_mask_for_sft
@@ -13,8 +12,11 @@ from relax.utils.sft_utils import align_loss_mask_for_sft
 def _cp_kwargs(monkeypatch, cp_rank: int, dynamic_cp: bool) -> dict[str, int]:
     if dynamic_cp:
         return {"dynamic_cp_size": 2, "dynamic_cp_rank": cp_rank}
-    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: 2)
-    monkeypatch.setattr(cp_utils.mpu, "get_context_parallel_rank", lambda: cp_rank)
+    monkeypatch.setattr(
+        cp_utils,
+        "mpu",
+        SimpleNamespace(get_context_parallel_world_size=lambda: 2, get_context_parallel_rank=lambda: cp_rank),
+    )
     return {}
 
 

@@ -2,17 +2,76 @@
 
 """Checkpoint selection, real DCP metadata and two-rank failure agreement."""
 
+import ast
 import multiprocessing
+import os
+import re
 from argparse import Namespace
+from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint import save
 
-from relax.backends.megatron import checkpoint, checkpoint_metadata
+from relax.backends.megatron import checkpoint_metadata, compat
+from relax.engine.sft.runtime import is_rm_mode
+from relax.utils.logging_utils import get_logger
+from relax.utils.model_source import is_model_source_alias
+
+
+def _load_checkpoint_module():
+    """Load real checkpoint routing without optional backend imports.
+
+    Tests replace the heavyweight loaders at their existing call boundary.
+    Spawned Gloo workers run this loader too, without inheriting pytest mocks.
+    """
+    source = Path(__file__).resolve().parents[3] / "relax/backends/megatron/checkpoint.py"
+    names = {
+        "_resolve_checkpoint_iteration_dir",
+        "_checkpoint_load_state",
+        "load_checkpoint",
+        "is_megatron_checkpoint",
+        "_is_hf_checkpoint",
+        "_is_dir_nonempty",
+        "_metadata_value",
+        "_load_checkpoint_metadata",
+        "_validate_reward_model_tensor_metadata",
+        "_alias_renamed_transfer_queue_enum",
+        "_format_opt_param_scheduler_error",
+        "_select_hf_load_source",
+    }
+    definitions = [
+        node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    module = ModuleType("checkpoint_routing_under_test")
+    module.__dict__.update(
+        Namespace=Namespace,
+        Path=Path,
+        os=os,
+        re=re,
+        nullcontext=nullcontext,
+        logger=get_logger(__name__),
+        is_model_source_alias=is_model_source_alias,
+        is_rm_mode=is_rm_mode,
+        _collective_checkpoint_probe=checkpoint_metadata._collective_checkpoint_probe,
+        _checkpoint_has_optimizer_state=checkpoint_metadata._checkpoint_has_optimizer_state,
+        patch_hybrid_optimizer_native_fp32_checkpoint_load=compat.patch_hybrid_optimizer_native_fp32_checkpoint_load,
+        preserve_hdo_dp_reshardable_steps_on_load=compat.preserve_hdo_dp_reshardable_steps_on_load,
+        REWARD_MODEL_HEAD_TYPE="reward_model_terminal_v1",
+        _LORA_CHECKPOINT_METADATA_ATTR="relax_lora_checkpoint_metadata",
+        get_args=None,
+        _load_checkpoint_hf=None,
+        _load_checkpoint_megatron=None,
+    )
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), module.__dict__)
+    return module
+
+
+checkpoint = _load_checkpoint_module()
 
 
 @pytest.mark.parametrize(
@@ -123,7 +182,7 @@ def test_checkpoint_explicit_step_without_tracker_is_megatron(tmp_path):
 
 
 def test_checkpoint_lora_metadata_uses_explicit_step(monkeypatch, tmp_path):
-    from megatron.core import dist_checkpointing
+    dist_checkpointing = pytest.importorskip("megatron.core.dist_checkpointing")
 
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("7")
     (tmp_path / "iter_0000009").mkdir()

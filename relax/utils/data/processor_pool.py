@@ -143,15 +143,23 @@ def _load_media_for_worker(media_paths: dict[str, list[Any]]) -> dict[str, list[
     parallel — the same path-fed pipeline the rank-side rebuild already proved
     bitwise identical to the decoded-array one.
     """
-    from relax.utils.multimodal.audio_utils import load_audio
-    from relax.utils.multimodal.image_utils import load_image
-    from relax.utils.multimodal.video_utils import load_video
-
     loaded: dict[str, list[Any]] = {}
-    for kind, loader in (("image", load_image), ("video", load_video), ("audio", load_audio)):
+    for kind in ("image", "video", "audio"):
         sources = media_paths.get(kind) or []
         if not sources:
             continue
+        if kind == "image":
+            from relax.utils.multimodal.image_utils import load_image
+
+            loader = load_image
+        elif kind == "video":
+            from relax.utils.multimodal.video_utils import load_video
+
+            loader = load_video
+        else:
+            from relax.utils.multimodal.audio_utils import load_audio
+
+            loader = load_audio
         items: list[Any] = []
         for position, source in enumerate(sources):
             try:

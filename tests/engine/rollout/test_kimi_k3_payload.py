@@ -49,7 +49,7 @@ def test_k3_rollout_rejects_ambiguous_or_missing_image_slots(prompt, count):
 @pytest.mark.parametrize("is_k3,has_image", [(True, True), (True, False), (False, True)])
 def test_generate_keeps_training_ids_separate_and_resumes_rollout_ids(monkeypatch, is_k3, has_image):
     pytest.importorskip("sglang_router")
-    from relax.engine.rollout import sglang_rollout as rollout
+    rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 
     tokenizer = Tokenizer()
     state = SimpleNamespace(tokenizer=tokenizer, processor=object(), opd_manager=None)

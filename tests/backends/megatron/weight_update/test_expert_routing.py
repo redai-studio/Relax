@@ -98,7 +98,7 @@ def test_expert_routing_checks_resolved_server_overrides(override):
         validate_server_layout(config | override, 2, 2)
 
 
-def _exchange_worker(rank: int, rendezvous: str) -> None:
+def _exchange_worker(rank: int, rendezvous: str, with_bridge: bool) -> None:
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4, timeout=timedelta(seconds=60))
     try:
@@ -150,8 +150,9 @@ def _exchange_worker(rank: int, rendezvous: str) -> None:
                 pytest.raises(ValueError, match="exceeds the IPC budget"),
             ):
                 router.exchange(13, local, torch.device("cpu"), receive_budget=1)
-        _check_bridge_chunk_rounds(rank, layout, interleaved=False)
-        _check_bridge_chunk_rounds(rank, layout, interleaved=True)
+        if with_bridge:
+            _check_bridge_chunk_rounds(rank, layout, interleaved=False)
+            _check_bridge_chunk_rounds(rank, layout, interleaved=True)
     finally:
         dist.destroy_process_group()
 
@@ -227,9 +228,23 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
                 torch.testing.assert_close(actual[name], expected[name])
 
 
-def test_expert_routing_multirank_values_empty_ranks_and_cache_refresh(tmp_path):
+def _require_bridge_runtime() -> None:
+    pytest.importorskip("megatron.core", reason="Bridge iterator checks require Megatron Core", exc_type=ImportError)
+    pytest.importorskip(
+        "megatron.bridge", reason="Bridge iterator checks require Megatron Bridge", exc_type=ImportError
+    )
+
+
+@pytest.mark.parametrize("with_bridge", [False, True])
+def test_expert_routing_multirank_values_empty_ranks_and_cache_refresh(tmp_path, with_bridge):
+    if with_bridge:
+        _require_bridge_runtime()
     mp.start_processes(
-        _exchange_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=4, join=True, start_method="spawn"
+        _exchange_worker,
+        args=((tmp_path / "rendezvous").as_uri(), with_bridge),
+        nprocs=4,
+        join=True,
+        start_method="spawn",
     )
 
 
@@ -243,6 +258,7 @@ def test_expert_routing_rejects_model_expert_count_mismatch():
 
 
 def test_expert_routing_parallel_owner_buckets_respect_fanin_and_uneven_owners():
+    _require_bridge_runtime()
     from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import _bucket_experts_by_owner
     from relax.utils.types import ParamInfo
 

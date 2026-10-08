@@ -10,9 +10,11 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from relax.engine.rollout import sglang_rollout
-from relax.engine.rollout.sglang_rollout import _post_generation
 from relax.utils.types import Sample
+
+
+sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
+_post_generation = sglang_rollout._post_generation
 
 
 def _status_error(status_code: int, *, body) -> httpx.HTTPStatusError:

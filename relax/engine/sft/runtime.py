@@ -59,6 +59,21 @@ def resolve_sft_split_indices(
     return train_indices, eval_indices
 
 
+def is_sft_mode(args: Namespace) -> bool:
+    """Return whether the normalized training objective is SFT."""
+    return getattr(args, "loss_type", None) == "sft"
+
+
+def is_dpo_mode(args: Namespace) -> bool:
+    """Return whether the normalized training objective is DPO."""
+    return getattr(args, "loss_type", None) == "dpo"
+
+
+def is_rm_mode(args: Namespace) -> bool:
+    """Return whether the normalized training objective is reward modeling."""
+    return getattr(args, "loss_type", None) == "rm"
+
+
 def is_offline_mode(args: Namespace) -> bool:
     """Return whether training consumes offline datasets instead of rollouts.
 
@@ -76,8 +91,7 @@ def validate_preference_args(args: Namespace) -> None:
     """Reject unsupported preference configurations before Serve starts."""
     if not is_preference_mode(args):
         return
-    loss_type = args.loss_type
-    if loss_type == "rm" and getattr(args, "save_hf", None) is not None:
+    if is_rm_mode(args) and getattr(args, "save_hf", None) is not None:
         raise ValueError("RM training does not support --save-hf; use native Megatron checkpoints for RM persistence")
 
     if getattr(args, "sft_async_prepack", False):
@@ -130,9 +144,9 @@ def validate_preference_args(args: Namespace) -> None:
     seq_length = int(getattr(args, "seq_length", max_length) or max_length)
     if max_length > seq_length:
         raise ValueError("--preference-max-length must not exceed --seq-length")
-    if loss_type != "dpo" and getattr(args, "dpo_reference_free", False):
+    if not is_dpo_mode(args) and getattr(args, "dpo_reference_free", False):
         raise ValueError("--dpo-reference-free is valid only with --loss-type dpo")
-    if loss_type == "dpo":
+    if is_dpo_mode(args):
         beta = float(getattr(args, "dpo_beta", 0.1))
         if not math.isfinite(beta) or beta <= 0:
             raise ValueError(f"--dpo-beta must be finite and positive, got {beta}")
@@ -158,7 +172,7 @@ def should_skip_mtp_only_weight_management(
     rollout sync."""
     return bool(
         getattr(args, "mtp_only_training", False)
-        and getattr(args, "loss_type", None) == "sft"
+        and is_sft_mode(args)
         and getattr(args, "sft_predict_interval", None) is None
         and not getattr(args, "offload_train", False)
         and not with_ref
@@ -176,7 +190,7 @@ def should_bypass_main_output_layer(args: Namespace) -> bool:
 def should_use_sft_chunked(args: Namespace) -> bool:
     """Return whether regular SFT explicitly enabled chunked language-model
     logits."""
-    return getattr(args, "loss_type", None) == "sft" and getattr(args, "sft_chunked_logits", False)
+    return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
 def sft_partition_id(args: Namespace, step: int) -> str:
@@ -189,7 +203,7 @@ def sft_tq_num_shards(args: Namespace) -> int:
     Kept as an env knob while this path is experimental so launch scripts can
     do A/B tests without adding a public CLI surface.
     """
-    if getattr(args, "loss_type", None) != "sft" or not getattr(args, "sft_async_prepack", False):
+    if not is_sft_mode(args) or not getattr(args, "sft_async_prepack", False):
         return 1
     return max(1, Envs.RELAX_SFT_TQ_SHARDS)
 
@@ -249,7 +263,7 @@ def should_run_sft_predict(args: Namespace, completed_steps: int) -> bool:
     Argparse already validated ``--loss-type sft``, ``--save``, and the eval
     data source. Keep prediction exclusive to SFT.
     """
-    if getattr(args, "loss_type", None) != "sft":
+    if not is_sft_mode(args):
         return False
     interval = getattr(args, "sft_predict_interval", None)
     if interval is None or interval <= 0:

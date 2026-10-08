@@ -86,7 +86,17 @@ def test_reward_model_packing_preserves_terminal_scores_loss_and_gradients(
     padding = [] if pad_multiplier == 1 else [0] * 5
     assert batch["tokens"].tolist() == [[30, 31, 32, 33, 40, 41, 10, 11, 12, 20, 21, *padding]]
     assert batch["total_lengths"] == [4, 2, 3, 2]
-    assert batch["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 6, 9, 11, *([16] if padding else [])]
+    packed = batch["packed_seq_params"]
+    boundaries = [0, 4, 6, 9, 11]
+    if allgather_cp:
+        assert packed.cu_seqlens_q.tolist() == boundaries
+        assert packed.cu_seqlens_q_padded.tolist() == [*boundaries[:-1], 16 if padding else 11]
+        assert torch.equal(packed.cu_seqlens_q, packed.cu_seqlens_kv)
+        assert torch.equal(packed.cu_seqlens_q_padded, packed.cu_seqlens_kv_padded)
+        assert packed.pad_between_seqs is bool(padding)
+    else:
+        assert packed.cu_seqlens_q.tolist() == [*boundaries, *([16] if padding else [])]
+        assert packed.cu_seqlens_q_padded is None
 
     flat = (batch["tokens"][0].float() / 10).requires_grad_()
     logits = flat.reshape(1, -1, 1)

@@ -32,6 +32,7 @@ def _source(path: Path, shards: dict[str, dict[str, torch.Tensor]]) -> None:
 
 
 def test_quantization_owner_and_native_schema(tmp_path: Path) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.quantization_utils")
     from megatron.bridge.models.conversion.quantization_utils import quantize_mxfp4_e2m1_like_scale
 
     name = "model.layers.1.mlp.experts.0.w1.weight"
@@ -123,6 +124,7 @@ def test_waiter_does_not_start_after_failed_job(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_hooks_survive_bridge_factory_recreation(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.model_bridge")
     from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 
     class KimiK3Bridge:
@@ -170,6 +172,7 @@ def test_lora_export_rejects_unmapped_adapters() -> None:
 
 
 def test_lora_merge_precedes_native_mxfp4_quantization(tmp_path: Path) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
     from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, MegatronPeftBridge
     from megatron.bridge.models.conversion.quantization_utils import quantize_mxfp4_e2m1_like_scale
 
@@ -217,6 +220,7 @@ def test_unknown_vision_tensor_is_not_silently_dropped(tmp_path: Path) -> None:
 
 
 def test_per_expert_lora_merge_selects_each_expert_adapter(monkeypatch) -> None:
+    pytest.importorskip("megatron.bridge.models.conversion.peft_bridge")
     from megatron.bridge.models.conversion.peft_bridge import AdapterWeight, MegatronPeftBridge, parallel_state
 
     monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)

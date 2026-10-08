@@ -9,9 +9,6 @@ import pytest
 import torch
 
 
-pytest.importorskip("megatron.training.global_vars")
-
-
 class _FakeIterator:
     micro_batch_indices = [[0]]
 
@@ -33,16 +30,25 @@ class _FakeModel:
         self.training = True
 
 
-def test_forward_only_does_not_merge_dynamic_cp_aggregate_outputs(monkeypatch):
+@pytest.mark.parametrize("memory_level", [0, 1, 2])
+def test_forward_only_does_not_merge_dynamic_cp_aggregate_outputs(monkeypatch, memory_level):
     """Per-microbatch aggregates must not enter per-sample CP collectives."""
-    from relax.backends.megatron import cp_utils
-    from relax.backends.megatron import model as model_module
+    model_module = pytest.importorskip("relax.backends.megatron.model")
+    cp_utils = pytest.importorskip("relax.backends.megatron.cp_utils")
+    events = []
+    monkeypatch.setattr(
+        model_module,
+        "device_module",
+        SimpleNamespace(empty_cache=lambda: events.append("release")),
+        raising=False,
+    )
 
     args = Namespace(
         allgather_cp=False,
         custom_megatron_before_log_prob_hook_path=None,
         data_pad_size_multiplier=1,
         dynamic_context_parallel=True,
+        empty_unused_memory_level=memory_level,
         is_vl_model=False,
         micro_batch_size=1,
         qkv_format="thd",
@@ -74,6 +80,7 @@ def test_forward_only_does_not_merge_dynamic_cp_aggregate_outputs(monkeypatch):
     def fake_forward_backward_func(**kwargs):
         output, callback = kwargs["forward_step_func"](iterator, fake_model)
         _, result = callback(output)
+        events.append("forward")
         return [result]
 
     monkeypatch.setattr(model_module, "get_forward_backward_func", lambda: fake_forward_backward_func)
@@ -101,3 +108,4 @@ def test_forward_only_does_not_merge_dynamic_cp_aggregate_outputs(monkeypatch):
     assert result["sum_neg_log_prob"][0].item() == 5.0
     assert result["num_tokens"][0].item() == 2
     assert fake_model.training is True
+    assert events == ["forward"] + (["release"] if memory_level else [])
