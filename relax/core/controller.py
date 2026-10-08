@@ -1057,8 +1057,8 @@ class Controller:
             role: Service role name to restart.
         """
         logger.info(f"Restarting service '{role}'...")
-        # Must mirror register_all_serve's algo-key resolution. SFT mode is
-        # identified by ``loss_type == "sft"``, not by ``advantage_estimator``
+        # Must mirror register_all_serve's algo-key resolution. Offline mode is
+        # identified by ``loss_type``, not by ``advantage_estimator``
         # (Megatron's parser doesn't accept "sft" as an --advantage-estimator
         # choice), so looking the algo up under ``advantage_estimator`` here
         # silently misses the {sft, actor} dict, hits the cls-is-None skip

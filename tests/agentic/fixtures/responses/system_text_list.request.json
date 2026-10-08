@@ -1,0 +1,29 @@
+{
+  "input": [
+    {
+      "type": "message",
+      "role": "system",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Rule A"
+        },
+        {
+          "type": "input_text",
+          "text": "Rule B"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "hi"
+        }
+      ]
+    }
+  ],
+  "max_output_tokens": 32
+}

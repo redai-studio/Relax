@@ -87,7 +87,8 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
     assert captured["config"] is args
 
 
-def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path):
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path, loss_type):
     captured = {}
     node_id = "a" * 56
     rollout_module = ModuleType("relax.distributed.ray.rollout")
@@ -108,7 +109,7 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     )
     args = _elastic_args(
         tmp_path,
-        loss_type="sft",
+        loss_type=loss_type,
         num_rollout_per_epoch=1,
         check_weight_update_equal=False,
         offload_rollout=False,

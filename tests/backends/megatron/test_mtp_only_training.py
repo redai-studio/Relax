@@ -214,6 +214,8 @@ def test_mtp_only_trainable_validation_allows_pp_rank_without_local_mtp(monkeypa
         (False, "sft", True, True),
         (False, "sft", False, False),
         (False, "policy_loss", True, False),
+        (False, "dpo", True, False),
+        (False, "rm", True, False),
     ],
 )
 def test_mtp_only_or_chunked_sft_bypasses_main_output_layer(mtp_only, loss_type, sft_chunked, expected):

@@ -33,7 +33,9 @@ from relax.distributed.ray.train_actor import TrainRayActor
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
-    is_sft_mode,
+    evaluation_step_for_rollout,
+    is_offline_mode,
+    is_preference_mode,
     sft_partition_id,
     sft_partition_ids,
     sft_task_name,
@@ -72,6 +74,7 @@ from relax.utils.megatron_peft_utils import (
 )
 from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
+from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
     append_managed_opd_teacher_offload_handle,
     append_managed_opd_teacher_onload_handle,
@@ -99,7 +102,7 @@ from relax.utils.utils import (
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.training.tensor_backper import TensorBackuper
-from .checkpoint import load_checkpoint
+from .checkpoint import _checkpoint_iteration_dir, is_megatron_checkpoint, load_checkpoint
 from .collective_utils import _agree_drained
 from .cp_utils import all_gather_with_cp, maybe_padded_total_lengths, slice_with_cp
 from .data import (
@@ -109,6 +112,7 @@ from .data import (
     PrepackedBatch,
     build_rollout_minibatch_plan,
     concat_rollout_batches,
+    expand_preference_rollout_data,
     get_data_iterator,
     log_perf_data,
     log_perf_data_fwd,
@@ -120,6 +124,13 @@ from .data import (
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .reference_integrity import (
+    DPOReferenceIdentity,
+    canonical_tensor_sha256,
+    read_reference_identity,
+    reference_identity_path,
+    write_reference_identity,
+)
 from .weight_update.common import named_params_and_buffers
 from .weight_update.train_offload import MegatronTrainStateOffloader
 from .weight_update.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -239,7 +250,12 @@ def _should_pause_sft_lookahead(args: Namespace, rollout_id: int) -> bool:
         args.rotate_ckpt
         or (args.save_interval is not None and (next_rollout_id % args.save_interval == 0 or is_train_done))
     )
-    return should_run_sft_eval(args, rollout_id) or should_run_sft_predict(args, rollout_id) or should_save_after_step
+    completed_steps = evaluation_step_for_rollout(args, rollout_id)
+    return (
+        should_run_sft_eval(args, completed_steps)
+        or should_run_sft_predict(args, completed_steps)
+        or should_save_after_step
+    )
 
 
 def _agree_sft_train_prefetch_result(
@@ -330,9 +346,12 @@ class _SFTPrepackedDeviceIterator:
 class MegatronTrainRayActor(TrainRayActor):
     @property
     def _per_step_rollout(self) -> bool:
-        """RL: rollout consumes weights every train step. SFT: only on
-        periodic predict steps; Megatron stays awake between."""
-        return not is_sft_mode(self.args)
+        """RL consumes weights every train step.
+
+        Offline training keeps Megatron awake; SFT may sync weights for
+        periodic prediction.
+        """
+        return not is_offline_mode(self.args)
 
     def init(
         self,
@@ -375,7 +394,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._sft_train_prefetch_executor: ThreadPoolExecutor | None = None
         self._sft_train_prefetch: Future[tuple[list, float]] | None = None
         self._sft_train_prefetch_rollout_id: int | None = None
-        if is_sft_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
+        if is_offline_mode(self.args) and getattr(self.args, "sft_train_data_prefetch", False):
             self._sft_train_prefetch_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="sft-tq-prefetch",
@@ -417,9 +436,12 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args.lr = self.args.critic_lr
             self.args.lr_warmup_iters = self.args.critic_lr_warmup_iters
 
+        resumed_from_megatron = not args.finetune and args.load is not None and is_megatron_checkpoint(args.load)
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+        self._dpo_reference_identity: DPOReferenceIdentity | None = None
+        self._expected_dpo_reference_identity: DPOReferenceIdentity | None = None
 
         if is_lora_enabled(args) and dist.get_rank() == 0:
             self._log_lora_checkpoint_state()
@@ -479,7 +501,13 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
 
             if with_ref:
-                self.load_other_checkpoint("ref", args.ref_load)
+                if args.loss_type == "dpo":
+                    if resumed_from_megatron:
+                        identity_path = reference_identity_path(args.load, loaded_rollout_id)
+                        self._expected_dpo_reference_identity = read_reference_identity(identity_path)
+                    self._rebuild_dpo_reference(args.ref_load or args.hf_checkpoint)
+                else:
+                    self.load_other_checkpoint("ref", args.ref_load)
 
             # Load teacher model for Megatron-based on-policy distillation
             if with_opd_teacher:
@@ -727,8 +755,104 @@ class MegatronTrainRayActor(TrainRayActor):
         device_utils.maybe_backend_process_on_model_switch()
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
+        if self._active_model_tag == target_tag:
+            # Same-tag restore would be a byte-identical copy: paths that
+            # deliberately dirty the weights clear the tag first (see
+            # _rebuild_dpo_reference), so skipping avoids a redundant
+            # full-weight CPU->GPU copy per step after the ref forward.
+            return
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _is_standard_dpo(self) -> bool:
+        return self.args.loss_type == "dpo" and not self.args.dpo_reference_free
+
+    def _assert_dp_reference_digest_equal(self, digest: str) -> None:
+        digests = [None] * dist.get_world_size(group=get_gloo_group())
+        dist.all_gather_object(digests, digest, group=get_gloo_group())
+        if len(set(digests)) != 1:
+            raise RuntimeError(f"DPO frozen-reference parameter digests differ across ranks: {digests}")
+
+    def _assert_dpo_reference_identity(self, actual: DPOReferenceIdentity) -> None:
+        expected = self._expected_dpo_reference_identity
+        if expected is None:
+            return
+        if expected.parameter_sha256 != actual.parameter_sha256:
+            raise RuntimeError(
+                "DPO frozen-reference identity mismatch: "
+                f"expected parameter_sha256={expected.parameter_sha256}, actual={actual.parameter_sha256}"
+            )
+
+    def _rebuild_dpo_reference(self, path: str) -> None:
+        """Transactionally rebuild a frozen reference without touching
+        optimizer state."""
+        if self._active_model_tag != "actor" or "actor" not in self.weights_backuper.backup_tags:
+            raise RuntimeError("DPO reference rebuild requires an active actor backup")
+        if is_model_source_alias(self.args, path):
+            path = self.args.hf_checkpoint
+        if not os.path.isdir(path) or not (
+            is_megatron_checkpoint(path) or os.path.isfile(os.path.join(path, "config.json"))
+        ):
+            raise ValueError(f"DPO reference must be an existing Hugging Face or Megatron checkpoint: {path}")
+        reference_step = self.args.ref_ckpt_step
+        if is_megatron_checkpoint(path):
+            iteration_dir = _checkpoint_iteration_dir(path, reference_step)
+            if not iteration_dir.is_dir() or not any(iteration_dir.iterdir()):
+                raise ValueError(f"DPO reference checkpoint iteration is missing or empty: {iteration_dir}")
+            # Megatron loads from the root plus a step, including when the user
+            # supplied an iteration directory directly.
+            path = str(iteration_dir.parent)
+            reference_step = int(iteration_dir.name[5:]) if iteration_dir.name.startswith("iter_") else None
+            tracker = iteration_dir.parent / "latest_checkpointed_iteration.txt"
+            if not tracker.is_file():
+                raise ValueError(f"DPO reference checkpoint root is missing its tracker: {tracker}")
+            latest = tracker.read_text().strip()
+            if (reference_step == 0 and latest != "0") or (
+                latest == "release" and self.args.ref_ckpt_step is not None
+            ):
+                raise ValueError(
+                    "Megatron cannot select this reference step from the current tracker; "
+                    "use a checkpoint root whose tracker points to the requested reference step"
+                )
+        old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
+        old_ckpt_step = self.args.ckpt_step
+        old_non_persistent_ckpt_type = self.args.non_persistent_ckpt_type
+        try:
+            self.args.load = path
+            self.args.ckpt_step = reference_step
+            self.args.non_persistent_ckpt_type = None
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
+            self._active_model_tag = None
+            load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+            candidate_sha256 = canonical_tensor_sha256(
+                named_params_and_buffers(
+                    self.args,
+                    self.model,
+                    convert_to_global_name=self.args.megatron_to_hf_mode == "raw",
+                    translate_gpu_to_cpu=True,
+                )
+            )
+            self._assert_dp_reference_digest_equal(candidate_sha256)
+            candidate = DPOReferenceIdentity(
+                schema_version=2,
+                parameter_sha256=candidate_sha256,
+            )
+            self._assert_dpo_reference_identity(candidate)
+            self.weights_backuper.backup("ref")
+            self._dpo_reference_identity = candidate
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            self.args.ckpt_step = old_ckpt_step
+            self.args.non_persistent_ckpt_type = old_non_persistent_ckpt_type
+            self._switch_model("actor")
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -860,19 +984,19 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def _run_step_evaluation(self, rollout_id: int, *, end_update_weight: bool = False) -> None:
-        is_sft = is_sft_mode(self.args)
+        is_offline = is_offline_mode(self.args)
         has_rollout = getattr(self, "rollout_manager", None) is not None
 
-        if not is_sft and dist.get_rank() != 0:
+        if not is_offline and dist.get_rank() != 0:
             return
 
-        if is_sft:
+        if is_offline:
             should_run_eval = should_run_sft_eval(self.args, rollout_id)
             should_run_predict = has_rollout and should_run_sft_predict(self.args, rollout_id)
             try:
                 if should_run_eval:
-                    if dist.get_rank() == 0:
-                        for partition_id in sft_partition_ids(self.args, rollout_id):
+                    if rollout_id > 0 and dist.get_rank() == 0:
+                        for partition_id in sft_partition_ids(self.args, rollout_id - 1):
                             run(
                                 self.data_system_client.async_clear_partition(
                                     partition_id=partition_id,
@@ -884,7 +1008,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 if should_run_predict:
                     run_sft_predict(self, rollout_id)
             except Exception as e:
-                logger.warning(f"SFT eval/predict at rollout_id {rollout_id} failed: {e}")
+                logger.warning(f"Offline eval/predict at rollout_id {rollout_id} failed: {e}")
                 raise
             return
 
@@ -944,7 +1068,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for debug with mcore.")
             dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-            if is_sft_mode(self.args):
+            if is_offline_mode(self.args):
                 batch_size = self.args.global_batch_size // dp_size
                 rollout_mini_local_sample_counts = None
             else:
@@ -953,7 +1077,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_mini_local_sample_counts = None
             rollout_data = get_debug_data(self.args, rollout_id, batch_size, dp_rank=mpu.get_data_parallel_rank())
             post_process_rollout_data(self.args, rollout_data)
-            if not is_sft_mode(self.args):
+            if not is_offline_mode(self.args):
                 rollout_mini_local_sample_counts = _rollout_mini_row_counts(
                     rollout_data["sample_indices"],
                     plan.mini_local_sample_request,
@@ -967,7 +1091,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 return self.train_actor(rollout_id, rollout_data)
         else:
             logger.info(f"start to get rollout_id: {rollout_id} data from transfer queue for train with mcore.")
-            if is_sft_mode(self.args):
+            if is_offline_mode(self.args):
                 batch_size = self.args.global_batch_size // mpu.get_data_parallel_world_size(
                     with_context_parallel=False
                 )
@@ -989,11 +1113,11 @@ class MegatronTrainRayActor(TrainRayActor):
             # zero mini batches. Use a role-specific task_name so consumption is
             # tracked independently per consumer.
             base_task_name = sft_task_name(self.args, component="backend")
-            if not is_sft_mode(self.args) and self.role == "critic":
+            if not is_offline_mode(self.args) and self.role == "critic":
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
-            if is_sft_mode(self.args) and self._sft_window_prefetcher is not None:
+            if self.args.loss_type == "sft" and self._sft_window_prefetcher is not None:
                 data_fields = build_data_fields(self.args, consumer="actor")
                 rollout_data, prepared_iterator, num_microbatches = self._get_prefetched_sft_window(
                     task_name,
@@ -1018,7 +1142,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 # alive for that exact prefetched rollout; all other paths
                 # retain the normal consumed-partition exit condition.
                 has_prefetched_sft_batch = (
-                    is_sft_mode(self.args)
+                    is_offline_mode(self.args)
                     and self._sft_train_prefetch is not None
                     and self._sft_train_prefetch_rollout_id == rollout_id
                 )
@@ -1048,7 +1172,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         time.sleep(empty_poll_sleep_s)
                     continue
                 batch_index += 1
-                if is_sft_mode(self.args):
+                if is_offline_mode(self.args):
                     # Start N+1 only after every rank has finalized N. A raw
                     # prefetch can return empty on a subset of ranks while the
                     # producer is publishing the partition; scheduling N+1
@@ -1065,7 +1189,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_mini_batch_metas.append(batch_meta)
                 rollout_mini_local_sample_counts.append(len(rollout_data["total_lengths"]))
 
-            if not is_sft_mode(self.args):
+            if not is_offline_mode(self.args):
                 if len(rollout_mini_batches) != num_rollout_minis:
                     raise RuntimeError(
                         f"Expected {num_rollout_minis} rollout mini batches for rollout_id={rollout_id}, "
@@ -1559,6 +1683,9 @@ class MegatronTrainRayActor(TrainRayActor):
         prepared_data_iterator: list[_SFTPrepackedDeviceIterator] | None = None,
         prepared_num_microbatches: list[int] | None = None,
     ) -> None:
+        if is_preference_mode(self.args):
+            rollout_data = expand_preference_rollout_data(rollout_data)
+
         # PPO colocate: ``values`` and ``loss_masks`` reach us via TransferQueue
         # and land on CPU (critic ``.cpu()`` s ``values`` before PUT). Inline
         # GAE + normalize_advantages need GPU tensors — dispatch here so the
@@ -1581,7 +1708,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
         if (
-            not is_sft_mode(self.args)
+            not is_offline_mode(self.args)
             and self.args.use_dynamic_batch_size
             and self.args.log_probs_max_tokens_per_gpu != self.args.max_tokens_per_gpu
         ):
@@ -1599,7 +1726,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with inverse_timer("train_wait"), timer("train"):
             # All RL algorithms need ref/teacher/actor inline forwards to produce old_log_probs.
-            should_compute_old_log_probs = self.args.compute_advantages_and_returns
+            standard_dpo = self._is_standard_dpo()
+            should_compute_old_log_probs = self.args.compute_advantages_and_returns or standard_dpo
             # PPO fully_async has a standalone Advantages service that produces
             # advantages/returns via TransferQueue; every other path (including
             # PPO colocate) computes GAE inline from critic's ``values``.
@@ -1611,14 +1739,17 @@ class MegatronTrainRayActor(TrainRayActor):
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
-                    self._switch_model("ref")
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator_logprobs,
-                            num_microbatches_logprobs,
-                            store_prefix="ref_",
+                    try:
+                        self._switch_model("ref")
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator_logprobs,
+                                num_microbatches_logprobs,
+                                store_prefix="ref_",
+                            )
                         )
-                    )
+                    finally:
+                        self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
 
                 # Forward teacher model to get teacher_log_probs for Megatron-based OPD
                 if "teacher" in self.weights_backuper.backup_tags:
@@ -1635,7 +1766,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if not standard_dpo and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -1771,7 +1902,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL-only generative eval (uses SGLang via rollout_manager.eval). SFT
         # uses local eval/predict runner below.
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id)
+        self._run_step_evaluation(evaluation_step_for_rollout(self.args, rollout_id))
 
         # On the final training step the rollout component has already exited
         # its main loop, so nothing else awaits the eval handler. Block here
@@ -2242,7 +2373,10 @@ class MegatronTrainRayActor(TrainRayActor):
         self.update_weights()
         tracking_utils.flush_metrics(self.args, compute_rollout_step(self.args, rollout_id))
         dist.barrier(group=get_gloo_group())
-        self._run_step_evaluation(rollout_id, end_update_weight=True)
+        self._run_step_evaluation(
+            evaluation_step_for_rollout(self.args, rollout_id),
+            end_update_weight=True,
+        )
 
         # On the final training step the rollout component has already exited
         # its main loop, so the eval just triggered above will not be awaited
@@ -2328,7 +2462,10 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_only, actor_fwd_only = self._check_services_health()
             self.update_weights_fully_async(rollout_id, rollout_only=rollout_only, actor_fwd_only=actor_fwd_only)
             dist.barrier(group=get_gloo_group())
-            self._run_step_evaluation(rollout_id, end_update_weight=True)
+            self._run_step_evaluation(
+                evaluation_step_for_rollout(self.args, rollout_id),
+                end_update_weight=True,
+            )
             # On the final training step the rollout component has already
             # exited its main loop, so the eval just triggered above will not
             # be awaited anywhere. Block until it finishes; otherwise the
@@ -2404,8 +2541,19 @@ class MegatronTrainRayActor(TrainRayActor):
             lora_only=self.role == "actor" and getattr(self.args, "save_lora_only", False),
         )
 
-        if force_sync and self.args.async_save:
+        if (force_sync or self._is_standard_dpo()) and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
+
+        if self._is_standard_dpo():
+            identity = self._dpo_reference_identity
+            if identity is None:
+                raise RuntimeError("cannot save standard DPO without a validated reference identity")
+            if dist.get_rank(group=get_gloo_group()) == 0:
+                write_reference_identity(reference_identity_path(self.args.save, rollout_id), identity)
+            # Functional barrier (not debugging): peers must not proceed past
+            # the checkpoint before rank 0's identity sidecar is durable,
+            # otherwise a concurrent resume could miss the file.
+            dist.barrier(group=get_gloo_group())
 
         if self.args.save_hf is not None and self.role == "actor":
             from relax.backends.megatron.model import save_hf_model
@@ -2678,30 +2826,31 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
-        self.args.load = path
-        self.args.no_load_optim = True
-        self.args.no_load_rng = True
-        self.args.finetune = True
-
         old_ckpt_step = None
-        if model_tag == "ref" and self.args.ref_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.ref_ckpt_step
-        elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
-            old_ckpt_step = self.args.ckpt_step
-            self.args.ckpt_step = self.args.opd_teacher_ckpt_step
+        try:
+            self.args.load = path
+            self.args.no_load_optim = True
+            self.args.no_load_rng = True
+            self.args.finetune = True
 
-        _, _ = load_checkpoint(
-            self.model,
-            None,
-            None,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
-        )
-        self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if model_tag == "ref" and self.args.ref_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.ref_ckpt_step
+            elif model_tag == "teacher" and self.args.opd_teacher_ckpt_step is not None:
+                old_ckpt_step = self.args.ckpt_step
+                self.args.ckpt_step = self.args.opd_teacher_ckpt_step
 
-        if old_ckpt_step is not None:
-            self.args.ckpt_step = old_ckpt_step
+            _, _ = load_checkpoint(
+                self.model,
+                None,
+                None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old_args
+            if old_ckpt_step is not None:
+                self.args.ckpt_step = old_ckpt_step
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag

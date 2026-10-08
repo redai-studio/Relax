@@ -1,6 +1,6 @@
 # 快速上手
 
-本指南提供三个端到端的训练示例，分别覆盖**纯文本**、**视觉-语言**和**全模态**训练任务。每个示例包含数据准备、模型下载和训练启动命令。
+本指南提供四个端到端的训练示例，覆盖**纯文本**、**视觉-语言**、**全模态**和**视频**训练任务。每个示例包含数据准备、模型下载和训练启动命令。
 
 开始之前，请确保您已完成[安装](./installation.md)步骤。
 
@@ -117,20 +117,20 @@ bash -x scripts/entrypoint/spmd-multinode.sh scripts/training/multimodal/run-qwe
 ```bash
 # 下载数据集
 hf download --repo-type dataset harryhsing/AVQA-R1-6K \
-  --local-dir /root/AVQA-R1-6K
+  --local-dir /root/AVQA
 
 # 转换为 Relax 格式
 # --md-dir 指向 image 和 audio 文件目录所在路径，
 # 用于将相对路径拼接为绝对路径（可选，默认用相对路径）。
 python scripts/tools/process_avqa.py \
-  --input-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train.json \
-  --output-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
-  --md-dir /root/AVQA-R1-6K/AVQA_R1/train
+  --input-dir /root/AVQA/AVQA_R1/train/omni_rl_format_train.json \
+  --output-dir /root/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
+  --md-dir /root/AVQA/AVQA_R1/train
 
 python scripts/tools/process_avqa.py \
-  --input-dir /root/AVQA-R1-6K/AVQA_R1/valid/omni_rl_format_valid.json \
-  --output-dir /root/AVQA-R1-6K/AVQA_R1/valid/small_valid.jsonl \
-  --md-dir /root/AVQA-R1-6K/AVQA_R1/valid
+  --input-dir /root/AVQA/AVQA_R1/valid/omni_rl_format_valid.json \
+  --output-dir /root/AVQA/AVQA_R1/valid/small_valid.jsonl \
+  --md-dir /root/AVQA/AVQA_R1/valid
 ```
 
 转换脚本读取原始 JSON 文件，提取问题、选项、图片和音频字段，生成包含 `prompt`、`image`、`audio` 和 `label` 列的 `.jsonl` 文件。

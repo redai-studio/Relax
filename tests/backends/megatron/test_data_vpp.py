@@ -47,6 +47,43 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     assert rounded.tolist() == [4, 4, 4, 8]
 
 
+@pytest.mark.parametrize(
+    "seqlens, capacity, num_partitions, first_fit_count, expect_fallback",
+    [
+        pytest.param([2, 2, 3, 3, 5, 2], 6, 3, 3, True, id="kk-over-capacity"),
+        pytest.param([6, 6, 10, 10, 7, 1] * 4, 20, 9, 8, True, id="split-fallback-to-target"),
+        pytest.param([2, 2, 3, 3, 5, 2], 6, 4, 3, False, id="keep-valid-kk"),
+    ],
+)
+def test_seqlen_partitions_respect_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    seqlens: list[int],
+    capacity: int,
+    num_partitions: int,
+    first_fit_count: int,
+    expect_fallback: bool,
+) -> None:
+    data_module = _load_data_module(monkeypatch)
+    kk_partitions = data_module.get_seqlen_balanced_partitions(seqlens, num_partitions, equal_size=False)
+    assert any(sum(seqlens[index] for index in partition) > capacity for partition in kk_partitions) == expect_fallback
+
+    first_fit = data_module.get_first_fit_partitions(seqlens, capacity)
+    assert len(first_fit) == first_fit_count
+    assert data_module.get_minimum_num_micro_batch_size(seqlens, capacity) == first_fit_count
+
+    partitions, dummy_offsets = data_module._get_seqlen_partitions_with_dummy_padding(
+        seqlens, num_partitions, capacity
+    )
+
+    assert len(partitions) == num_partitions
+    assert all(partitions)
+    assert all(sum(seqlens[index] for index in partition) <= capacity for partition in partitions)
+    assert sorted(index for partition in partitions for index in partition) == list(range(len(seqlens)))
+    assert not dummy_offsets
+    if not expect_fallback:
+        assert partitions == kk_partitions
+
+
 def test_rollout_minibatch_plan_derives_from_global_batch(monkeypatch):
     data_module = _load_data_module(monkeypatch)
     args = Namespace(

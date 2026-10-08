@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide provides three end-to-end examples covering **text**, **vision-language**, and **omni-modal** training tasks. Each example includes data preparation, model download, and training launch commands.
+This guide provides four end-to-end examples covering **text**, **vision-language**, **omni-modal**, and **video** training tasks. Each example includes data preparation, model download, and training launch commands.
 
 Make sure you have completed the [Installation](./installation.md) steps before proceeding.
 
@@ -74,7 +74,7 @@ hf download --repo-type dataset lmms-lab/multimodal-open-r1-8k-verified \
 # Convert to Relax format
 python scripts/tools/process_openr1.py \
   --input-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
-  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001-converted.parquet
+  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 ```
 
 The conversion script reads the raw parquet, extracts `problem`, `image`, and `solution` fields, and produces a new parquet with `prompt`, `image`, and `label` columns in the format expected by Relax.
@@ -117,20 +117,20 @@ Download the dataset and convert it to the Relax format:
 ```bash
 # Download dataset
 hf download --repo-type dataset harryhsing/AVQA-R1-6K \
-  --local-dir /root/AVQA-R1-6K
+  --local-dir /root/AVQA
 
 # Convert to Relax format
 # --md-dir points to the directory containing image and audio files,
 # used to join relative paths into absolute paths (Optional, default to use relative paths).
 python scripts/tools/process_avqa.py \
-  --input-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train.json \
-  --output-dir /root/AVQA-R1-6K/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
-  --md-dir /root/AVQA-R1-6K/AVQA_R1/train
+  --input-dir /root/AVQA/AVQA_R1/train/omni_rl_format_train.json \
+  --output-dir /root/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
+  --md-dir /root/AVQA/AVQA_R1/train
 
 python scripts/tools/process_avqa.py \
-  --input-dir /root/AVQA-R1-6K/AVQA_R1/valid/omni_rl_format_valid.json \
-  --output-dir /root/AVQA-R1-6K/AVQA_R1/valid/small_valid.jsonl \
-  --md-dir /root/AVQA-R1-6K/AVQA_R1/valid
+  --input-dir /root/AVQA/AVQA_R1/valid/omni_rl_format_valid.json \
+  --output-dir /root/AVQA/AVQA_R1/valid/small_valid.jsonl \
+  --md-dir /root/AVQA/AVQA_R1/valid
 ```
 
 The conversion script reads the raw JSON, extracts problem, options, image, and audio fields, and produces a `.jsonl` file with `prompt`, `image`, `audio`, and `label` columns.

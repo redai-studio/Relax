@@ -1,0 +1,22 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Rule A"
+        },
+        {
+          "type": "text",
+          "text": "Rule B"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "hi"
+    }
+  ],
+  "max_tokens": 32
+}
