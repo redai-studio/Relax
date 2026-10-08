@@ -620,3 +620,27 @@ def test_placement_planner_deferred_teacher_may_use_the_bundles_of_an_inline_gen
 
     assert (plan.claim("genrm").start, plan.claim("teacher").start) == (4, 4)
     assert plan.claim("genrm").phases.isdisjoint(plan.claim("teacher").phases)
+
+
+# ----------------------------------------------------------------------
+# Engine sizes.
+# ----------------------------------------------------------------------
+
+
+def test_placement_planner_claims_carry_gpus_per_engine():
+    """The physical check needs to know where one engine ends and the next
+    begins; rollout's engine groups are not the plan's to lay out."""
+    genrm = plan_placement(
+        _colocate_args(
+            resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]},
+            _genrm_instances_resolved={"quality": _genrm_spec(2, 2), "safety": _genrm_spec(2, 1)},
+        )
+    )
+    assert genrm.claim("genrm", "quality").gpus_per_engine == 2
+    assert genrm.claim("genrm", "safety").gpus_per_engine == 1
+    assert genrm.claim("rollout").gpus_per_engine is None
+    assert "engines=1x2GPU" in genrm.describe() and "engines=2x1GPU" in genrm.describe()
+
+    # A teacher without --teacher-num-gpus-per-engine is one replica on its whole share.
+    assert plan_placement(_teacher_args()).claim("teacher").gpus_per_engine == 4
+    assert plan_placement(_teacher_args(teacher_num_gpus_per_engine=2)).claim("teacher").gpus_per_engine == 2

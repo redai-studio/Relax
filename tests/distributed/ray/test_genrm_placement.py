@@ -76,6 +76,31 @@ def test_genrm_manager_starts_the_shared_engine_with_genrm_profile(monkeypatch):
     assert manager._build_engine_ctor_kwargs(0) == {"profile": "genrm"}
 
 
+def test_genrm_manager_checks_its_engines_in_the_pool_they_are_planned_in(monkeypatch):
+    genrm = _import_genrm(monkeypatch)
+    instances = {"__default__": {"num_gpus": 4, "num_gpus_per_engine": 1}}
+
+    colocated = SimpleNamespace(
+        colocate=True,
+        hybrid=False,
+        rollout_num_gpus=4,
+        resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]},
+        _genrm_instances_resolved=instances,
+    )
+    manager = _bare_manager(genrm, bundle_offset=4, num_gpu_per_engine=1, args=colocated)
+    assert manager._physical_placement() == ("actor", "pg")
+
+    own_pool = SimpleNamespace(
+        colocate=False,
+        hybrid=False,
+        rollout_num_gpus=4,
+        resource={"rollout": [1, 4], "genrm": [1, 4]},
+        _genrm_instances_resolved=instances,
+    )
+    manager = _bare_manager(genrm, bundle_offset=0, num_gpu_per_engine=1, args=own_pool)
+    assert manager._physical_placement() == ("genrm", "pg")
+
+
 def _install_fake_genrm_manager(monkeypatch):
     ctor_kwargs = []
     genrm_module = ModuleType("relax.distributed.ray.genrm")

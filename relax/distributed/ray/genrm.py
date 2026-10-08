@@ -19,6 +19,7 @@ from relax.distributed.ray.multi_engine_manager import (  # noqa: F401
     MultiEngineManager,
     _is_engine_dead,
 )
+from relax.distributed.ray.placement_planner import GENRM_ROLE, plan_placement
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
@@ -111,6 +112,11 @@ class GenRMManager(MultiEngineManager):
 
     def _resolve_placement(self, rank):
         return self.pg, False, self.bundle_offset + rank * self.num_gpu_per_engine
+
+    def _physical_placement(self):
+        # Every GenRM instance lives in one pool: the actor's, or GenRM's own.
+        pools = {claim.pool for claim in plan_placement(self.args, validate=False).claims if claim.role == GENRM_ROLE}
+        return (pools.pop(), self.pg) if len(pools) == 1 else None
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with

@@ -80,6 +80,10 @@ class PlacementClaim:
     start: int
     size: int
     phases: frozenset[Phase]
+    # GPUs of one engine of this model, for the roles whose engines the plan
+    # lays out (GenRM, teacher). ``None`` for rollout, whose engine groups come
+    # from --sglang-config.
+    gpus_per_engine: int | None = None
 
     @property
     def stop(self) -> int:
@@ -106,7 +110,10 @@ class PlacementPlan:
 
     def describe(self) -> str:
         """One line per claim, for logging."""
-        return "\n".join(f"  {_describe(claim)} phases={_phase_names(claim.phases)}" for claim in self.claims)
+        return "\n".join(
+            f"  {_describe(claim)}{_describe_engines(claim)} phases={_phase_names(claim.phases)}"
+            for claim in self.claims
+        )
 
 
 # ----------------------------------------------------------------------
@@ -135,6 +142,12 @@ def _phase_names(phases: frozenset[Phase]) -> list[str]:
 
 def _describe(claim: PlacementClaim) -> str:
     return f"{claim.role}/{claim.model} pool={claim.pool} [{claim.start}, {claim.stop})"
+
+
+def _describe_engines(claim: PlacementClaim) -> str:
+    if not claim.gpus_per_engine:
+        return ""
+    return f" engines={claim.size // claim.gpus_per_engine}x{claim.gpus_per_engine}GPU"
 
 
 def claims_overlap(a: PlacementClaim, b: PlacementClaim) -> bool:
@@ -219,7 +232,8 @@ def _genrm_claims(
     claims = []
     for key, spec in instances.items():
         num_gpus = int(spec["num_gpus"])
-        claims.append(PlacementClaim(GENRM_ROLE, key, pool, start, num_gpus, phases))
+        gpus_per_engine = int(spec.get("num_gpus_per_engine") or 0) or None
+        claims.append(PlacementClaim(GENRM_ROLE, key, pool, start, num_gpus, phases, gpus_per_engine))
         # Prefix sum: instances may have unequal GPU budgets.
         start += num_gpus
     return claims
@@ -248,6 +262,8 @@ def _teacher_claims(
     # --opd-teacher-defer it sleeps through generation and only scores.
     deferred = bool(getattr(args, "opd_teacher_defer", False))
     phases = frozenset({Phase.SCORE}) if deferred else frozenset({Phase.GENERATE, Phase.SCORE})
+    # TP size of one teacher replica; a single replica takes the teacher's whole share.
+    gpus_per_replica = int(getattr(args, "teacher_num_gpus_per_engine", None) or gpus_per_teacher)
 
     claims = []
     if is_managed_opd_teacher_colocate(args):
@@ -257,18 +273,21 @@ def _teacher_claims(
         shares_rollout_bundles = deferred and rollout_stop == teacher_total == _resource_gpus(resource, "actor")
         start = 0 if shares_rollout_bundles else rollout_stop
         for key in keys:
-            claims.append(PlacementClaim(TEACHER_ROLE, key, ACTOR_POOL, start, gpus_per_teacher, phases))
+            claims.append(
+                PlacementClaim(
+                    TEACHER_ROLE, key, ACTOR_POOL, start, gpus_per_teacher, phases, gpus_per_replica or None
+                )
+            )
             start += gpus_per_teacher
         return claims
 
     # Dedicated: every replica creates and owns a placement group of its own.
-    gpus_per_replica = getattr(args, "teacher_num_gpus_per_engine", None) or gpus_per_teacher
-    num_replicas = gpus_per_teacher // gpus_per_replica if gpus_per_replica > 0 else 0
+    num_replicas = gpus_per_teacher // gpus_per_replica if gpus_per_replica else 0
     for key in keys:
         for replica in range(num_replicas):
             pool = f"{TEACHER_ROLE}/{key}/{replica}"
             pools[pool] = PlacementPool(pool, gpus_per_replica, PoolOwner.MANAGER)
-            claims.append(PlacementClaim(TEACHER_ROLE, key, pool, 0, gpus_per_replica, phases))
+            claims.append(PlacementClaim(TEACHER_ROLE, key, pool, 0, gpus_per_replica, phases, gpus_per_replica))
     return claims
 
 

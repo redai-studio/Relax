@@ -215,6 +215,41 @@ def test_lifecycle_enter_generate_in_one_step_wakes_rollout_only():
     assert (rollout.active, genrm.active) == (True, False)
 
 
+def test_lifecycle_inline_genrm_yields_to_a_deferred_teacher_on_the_same_bundles():
+    """An inline GenRM and a deferred teacher both sit right after rollout.
+
+    They never hold those bundles together: GenRM yields while the teacher
+    scores, and rollout, on other bundles, is left alone.
+    """
+    cluster = _Cluster()
+    args = _colocate_args(
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/teacher",
+        opd_teacher_defer=True,
+        resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4], "teacher": [1, 4]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(4)},
+    )
+    rollout, genrm = _Manager(cluster, "rollout"), _Manager(cluster, "genrm")
+    teacher = _Manager(cluster, "teacher", active=False)
+    coordinator = LifecycleCoordinator(
+        plan_placement(args),
+        [
+            local_rollout_participant(rollout),
+            manager_participant("genrm", "__default__", genrm),
+            manager_participant("teacher", "__default__", teacher),
+        ],
+        wait=cluster.wait,
+    )
+
+    coordinator.enter_score()
+    assert cluster.timeline == ["genrm.offload", "confirmed", "teacher.onload", "confirmed"]
+    assert (rollout.active, genrm.active, teacher.active) == (True, False, True)
+
+    coordinator.leave_score()
+    assert (genrm.active, teacher.active) == (False, False)
+
+
 # ----------------------------------------------------------------------
 # Failure and retry.
 # ----------------------------------------------------------------------

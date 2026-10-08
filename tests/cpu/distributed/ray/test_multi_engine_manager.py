@@ -567,3 +567,53 @@ def test_multi_engine_manager_snapshot_marks_offloaded_engines_not_eligible(_pat
 
     manager.onload()
     assert all(engine.direct_eligible for engine in _named(manager).engines)
+
+
+class _PlannedManager(_FakeManager):
+    """A manager whose two 2-GPU engines are planned in the actor pool."""
+
+    def __init__(self, gpu_ids):
+        self._pg_tuple = ("shared-pg", list(range(8)), gpu_ids)
+        self._made = []
+        self._instance_owns_pg = False
+        MultiEngineManager.__init__(
+            self,
+            SimpleNamespace(
+                colocate=True,
+                hybrid=False,
+                rollout_num_gpus=4,
+                num_gpus_per_node=8,
+                resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]},
+                _genrm_instances_resolved={"judge": {"num_gpus": 4, "num_gpus_per_engine": 2}},
+            ),
+            num_slots=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[planned]",
+        )
+
+    def _physical_placement(self):
+        return "actor", self._pg_tuple
+
+
+def test_multi_engine_manager_validates_physical_layout_before_start(_patch_ray, monkeypatch):
+    from relax.distributed.ray import placement_physical
+    from relax.distributed.ray.placement_planner import PlacementError
+
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: dict.fromkeys(range(8), "node-a"))
+
+    # Bundles 6 and 7 of the judge's second engine got GPU 6 and GPU 9.
+    with pytest.raises(PlacementError, match="genrm/judge engine 1.*not contiguous"):
+        _PlannedManager(gpu_ids=[0, 1, 2, 3, 4, 5, 6, 9])
+    # Refused before anything was started: not even the engine with a valid layout exists.
+    assert _patch_ray.created == []
+
+    manager = _PlannedManager(gpu_ids=list(range(8)))
+    assert len(_patch_ray.created) == 2 and all(engine is not None for engine in manager.all_engines)
+
+
+def test_multi_engine_manager_without_a_planned_pool_skips_the_physical_check(_patch_ray, monkeypatch):
+    from relax.distributed.ray import placement_physical
+
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: pytest.fail("nothing to check"))
+
+    assert len(_FakeManager(num_slots=2).all_engines) == 2

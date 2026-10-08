@@ -26,6 +26,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from relax.distributed.ray.engine_pool import ENGINE_DEAD_EXCEPTIONS as _ENGINE_DEAD_EXCEPTIONS  # noqa: F401
 from relax.distributed.ray.engine_pool import EnginePool, EnginePoolSpec
 from relax.distributed.ray.engine_pool import is_engine_dead as _is_engine_dead  # noqa: F401
+from relax.distributed.ray.placement_physical import validate_physical_placement
+from relax.distributed.ray.placement_planner import plan_placement
 from relax.engine.inference.discovery import TopologyRevision, build_model_snapshot, format_base_url
 from relax.utils.logging_utils import get_logger
 
@@ -109,6 +111,8 @@ class MultiEngineManager:
         self._topology_revision = TopologyRevision()
 
         if not skip_init:
+            # Before any engine exists: an engine on the wrong GPUs must not start.
+            self._validate_physical_placement()
             self._init_engines(list(range(num_slots)))
 
     @property
@@ -154,6 +158,16 @@ class MultiEngineManager:
     # Hooks -- subclasses may override; sane defaults provided.
     # ------------------------------------------------------------------
 
+    def _physical_placement(self) -> Optional[tuple[str, tuple]]:
+        """Return ``(pool name, pg_tuple)`` of the placement group this
+        manager's engines are planned on, so the plan can be checked against
+        where the bundles really are before any engine starts.
+
+        ``None`` (the default) skips the check, e.g. for a manager whose
+        placement groups do not exist yet.
+        """
+        return None
+
     def _engine_ctor_args(self, rank: int) -> Any:
         """First positional argument passed to the engine actor constructor."""
         return self.args
@@ -170,6 +184,19 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
     # Engine bring-up.
     # ------------------------------------------------------------------
+
+    def _validate_physical_placement(self) -> None:
+        scope = self._physical_placement()
+        if scope is None:
+            return
+        pool, pg_tuple = scope
+        validate_physical_placement(
+            # The logical layout was validated when the run started.
+            plan_placement(self.args, validate=False),
+            pool,
+            pg_tuple,
+            num_gpus_per_node=getattr(self.args, "num_gpus_per_node", None),
+        )
 
     def _engine_actor_options(self, rank: int, pg: Any, bundle_index: int) -> dict:
         return {

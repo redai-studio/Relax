@@ -27,7 +27,7 @@ Relax 中 GenRM 有两种顶层部署模式：
 | :--------------------------- | :------------------ | :-------------------------------- | :------------ | :---------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
 | **Split**                    | 不相交 bundle       | 并行（各自独占分片）              | ✅ per sample | 自动 —— `rollout_num_gpus + genrm_num_gpus == actor_total`                                                        | 小 GenRM；长尾明显（agentic、response 长度方差大）                                    |
 | **Shared / Co-resident**     | 同一批 bundle       | 并行（按 mem_fraction 切分显存）  | ✅ per sample | 自动 —— `rollout_num_gpus == genrm_num_gpus == actor_total`                                                       | 中等大小 GenRM，需要全集群 TP，但显存还能塞下 rollout                                 |
-| **Shared / Defer-swap**      | 同一批 bundle       | 串行（sleep-wake 编排）           | ❌ 延迟到批后 | 显式开启 —— Shared bundles + `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` | GenRM 显著大于 policy；短 response RLVR / math（rollout 无长尾可藏 GenRM 延迟）        |
+| **Shared / Defer-swap**      | 同一批 bundle       | 串行（sleep-wake 编排）           | ❌ 延迟到批后 | 显式开启 —— Shared bundles + `--defer-reward-to-post-process`（见[延迟打分](#延迟打分)）                                  | GenRM 显著大于 policy；短 response RLVR / math（rollout 无长尾可藏 GenRM 延迟）        |
 
 ```
                  8-GPU Colocate (Split)
@@ -98,7 +98,7 @@ Relax 中 GenRM 有两种顶层部署模式：
  └─────────────────────────────────────────────────┘
 ```
 
-三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 则在每轮 rollout 结束、Rollout 让出 GPU 之后对整批样本统一打分，两种做法见[延迟打分](#延迟打分)；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 
 ## 脚本
 
@@ -267,14 +267,14 @@ python3 relax/entrypoints/train.py \
 | `rollout_num_gpus == genrm_num_gpus == actor_total`   | **Shared**（同一批 bundle）             |
 | 其他                                                  | 启动时报错拒绝                          |
 
-Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--defer-reward-to-post-process` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存（见[延迟打分](#延迟打分)）。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 :::
 
 ::: warning Shared / Co-resident 必须设置 `mem_fraction_static`
 Shared / Co-resident 模式下两个 SGLang 引擎同时驻留在同一组 GPU，必须设置各自的 `mem_fraction_static`，使**单卡之和 < 1.0**（建议 ≤ 0.9，剩余给 cuda graph + activations）。Rollout 通过 `--sglang-mem-fraction-static`（或 `--sglang-config` YAML overrides）配置；GenRM 通过 `--genrm-engine-config` 中的 `mem_fraction_static` 配置。Shared / Defer-swap 无需切分——两者永不共存，各自可取 ≈ 0.85。
 :::
 
-GenRM 不能与 Relax 托管的 OPD Teacher（`--teacher-hf-checkpoint` 或 `--opd-teacher-routes`）同时使用 `--colocate`。两者都会被安排在 Rollout 之后的同一段 bundle 上，因此训练在创建 placement group 之前就会报 placement 冲突并退出。通过 `--opd-teacher-url` 接入的外部 Teacher 不受此限制。
+`--colocate` 下，GenRM 与 Relax 托管的 OPD Teacher（`--teacher-hf-checkpoint` 或 `--opd-teacher-routes`）都会被安排在 Rollout 之后的同一段 bundle 上。只要两者在同一阶段都占用显存，训练就会在创建 placement group 之前报 placement 冲突并退出。唯一可以同时使用的组合是 GenRM 内联打分、Teacher 通过 `--opd-teacher-defer` 延迟打分（见[在线策略蒸馏](./on-policy-distillation.md#sglang-teacher-的部署)），这时两者在不同时间使用这段 bundle。通过 `--opd-teacher-url` 接入的外部 Teacher 不受此限制。
 
 **Fully-Async 模式**：
 
@@ -288,6 +288,30 @@ python3 relax/entrypoints/train.py \
     --fully-async \
     --rm-type dapo-genrm
 ```
+
+### 延迟打分
+
+加上 `--defer-reward-to-post-process` 后，GenRM 在 Rollout 生成期间保持卸载，等一批样本生成完再统一打分。Shared / Defer-swap 正是靠这一点成立：Rollout 和 GenRM 轮流使用同一批 GPU，各自都能用到接近全部的显存。有两种做法。
+
+**交给 Relax 执行。** 传入 `--defer-reward-to-post-process` 和真正要用的奖励函数，不要传 `--custom-reward-post-process-path`：
+
+```bash
+python3 relax/entrypoints/train.py \
+    --colocate \
+    --resource '{"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]}' \
+    --rollout-num-gpus 8 \
+    --genrm-model-path /path/to/genrm/model \
+    --genrm-num-gpus-per-engine 8 \
+    --rm-type dapo-genrm \
+    --defer-reward-to-post-process \
+    ...
+```
+
+这样 Rollout 在生成过程中不会调用奖励函数。一批样本生成完成后，Relax 先卸载 Rollout、加载 GenRM，对其中还没有奖励的样本调用配置的奖励函数，再卸载 GenRM。这之后这批样本才会发布给训练；打分失败时整批都不发布。评测也按同样的方式打分：等所有评测数据集都生成完再统一进行，结束后重新加载 Rollout。
+
+这种做法要求 GenRM 与 Rollout 在同一个 placement group 里，也就是 `--colocate` 下的 Split 或 Shared 布局。`--fully-async` 模式下 GenRM 有自己的 GPU，没有可以交换的对象，启动时会被拒绝；与 `--use-agentic-rollout` 同时使用也会被拒绝。
+
+**由自己的钩子函数执行。** 再加上 `--custom-reward-post-process-path`，Relax 就把切换完全交给这个函数：不会为了打分去卸载 Rollout 或加载 GenRM，生成过程中的奖励调用也保持原有配置（示例里是 `--rm-type dummy`）。[`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) 就是这样一个钩子函数。当奖励函数接口表达不了你的打分逻辑时用这种做法，例如自定义的批量 prompt 或归一化方式。
 
 ## 多实例 GenRM（一个服务托管多个评判模型）
 
@@ -533,6 +557,19 @@ curl -X POST http://localhost:8000/genrm/generate \
 }
 ```
 
+### 推理接口
+
+除了带 `messages` 的 `/genrm/generate`，GenRM 服务还提供 Relax 每个推理角色都有的一组接口：
+
+| 接口                                                          | 用途                                                                   |
+| :------------------------------------------------------------ | :--------------------------------------------------------------------- |
+| `GET /genrm/engines`                                          | 拓扑：每个实例、它的引擎、各引擎的地址与状态                           |
+| `GET /genrm/v1/models`                                        | 已配置的实例，OpenAI 模型列表格式                                      |
+| `POST /genrm/v1/chat/completions`、`/genrm/chat/completions`  | OpenAI 风格的聊天请求，转发给 `model` 或 `route_key` 指定实例的一个引擎 |
+| 不带 `messages` 的 `POST /genrm/generate`                     | SGLang 原生的 `/generate` 请求体，按同样的方式转发                     |
+
+请求的实例处于卸载状态时返回 `503` 并带 `Retry-After` 响应头，不会因此被唤醒。`model` 或 `route_key` 对不上任何实例时返回 `400`，并列出可用的实例。
+
 ### 在 Python 中使用 GenRMClient
 
 ```python
@@ -581,6 +618,10 @@ print(response)  # "1" 或 "0"
 ### Shared 模式 OOM 或引擎初始化失败
 
 如果 shared 模式启动时 OOM 或 cuda graph capture 失败，降低一个或两个引擎的 `mem_fraction_static`，让单卡之和 ≤ 0.9。对大 MoE GenRM，可能还需要禁用 cuda graph 或减小 `max_context_len`。
+
+### 报错 "Physical placement mismatch"
+
+GenRM 引擎启动之前，Relax 会检查每个引擎的 GPU 是否位于同一个节点、GPU id 是否连续，因为引擎从它的第一张 GPU 启动，并使用紧随其后的几张。报错信息会指出是哪个引擎，以及它的 bundle 实际落在哪里。常见原因是单节点 GPU 数不是 `--genrm-num-gpus-per-engine` 的整数倍，或者节点上有一部分 GPU 被其他任务占用；调整布局或腾出 GPU 即可。
 
 ### 引擎初始化超时
 

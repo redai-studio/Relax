@@ -162,3 +162,21 @@ def test_engine_pool_retires_and_rebuilds_a_killed_engine_on_real_ray(manager):
     assert [engine["state"] for engine in after["engines"]] == ["ready", "ready"]
     assert after["topology_revision"] > before["topology_revision"]
     assert ray.get(manager.health_check.remote(), timeout=30) is True
+
+
+def test_placement_physical_reads_bundle_nodes_from_real_ray(ray_cluster):
+    from relax.distributed.ray.placement_physical import bundle_nodes_of, validate_engine_bundles
+    from relax.distributed.ray.placement_planner import PlacementError
+
+    pg = placement_group([{"CPU": 0.1}] * 2, strategy="PACK")
+    ray.get(pg.ready(), timeout=60)
+    try:
+        nodes = bundle_nodes_of(pg)
+        assert sorted(nodes) == [0, 1] and all(isinstance(node, str) and node for node in nodes.values())
+
+        # Same node on a local cluster; whether the engine fits is then down to the GPU ids.
+        validate_engine_bundles((pg, [0, 1], [0, 1]), 0, 2, label="engine")
+        with pytest.raises(PlacementError, match="not contiguous"):
+            validate_engine_bundles((pg, [0, 1], [0, 2]), 0, 2, label="engine")
+    finally:
+        remove_placement_group(pg)
