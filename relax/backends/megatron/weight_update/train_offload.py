@@ -75,6 +75,11 @@ _MOE_DISPATCHER_CACHE_ATTRS = (
     "reversed_global_input_permutation_mapping",
     "global_input_tokens_local_experts_indices",
     "local_input_tokens_global_experts_indices",
+    "reversed_mapping_for_combine",
+    "pad_offsets",
+    "num_global_tokens_per_local_expert",
+    "local_map",
+    "local_probs",
 )
 
 # A MoE layer may keep several dispatcher handles: the active one, plus a saved

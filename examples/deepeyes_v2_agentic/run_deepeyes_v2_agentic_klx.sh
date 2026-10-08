@@ -236,7 +236,7 @@ OPTIMIZER_ARGS=(
 ###############################################################################
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 2
+    --rollout-num-gpus-per-engine 4
     --sglang-mem-fraction-static 0.7
     --sglang-disable-custom-all-reduce
     --sglang-page-size 64
