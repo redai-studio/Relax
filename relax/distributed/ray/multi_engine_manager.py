@@ -22,6 +22,7 @@ import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.engine.inference.discovery import EngineState, TopologyRevision, build_model_snapshot, format_base_url
 from relax.utils.logging_utils import get_logger
 
 
@@ -96,6 +97,10 @@ class MultiEngineManager:
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
         self._engine_addr_and_ports: dict[int, dict] = {}
+        # How many times each slot has been built; a rebuild advances the
+        # topology revision even when the endpoint is preserved.
+        self._engine_incarnations: dict[int, int] = {}
+        self._topology_revision = TopologyRevision()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
@@ -203,6 +208,7 @@ class MultiEngineManager:
                 )
                 new_engines.append((rank, engine))
                 self.all_engines[rank] = engine
+                self._engine_incarnations[rank] = self._engine_incarnations.get(rank, 0) + 1
 
             addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
             for rank, _ in new_engines:
@@ -380,6 +386,36 @@ class MultiEngineManager:
 
     def is_onloaded(self) -> bool:
         return self._onloaded
+
+    def get_inference_snapshot(self) -> dict:
+        """Describe this manager's logical replicas for discovery.
+
+        Only head slots are listed: followers of a multi-node engine serve no
+        HTTP. Replicas are reported by index; the owner that knows which model
+        this manager serves names them (``model_snapshot_from_payload``).
+        """
+        rows = []
+        incarnations = {}
+        for index, rank in enumerate(range(0, len(self.all_engines), self.nodes_per_engine)):
+            address = self._engine_addr_and_ports.get(rank) or {}
+            if self.all_engines[rank] is None:
+                state, base_url = EngineState.DEAD, None
+            else:
+                state = EngineState.READY if self._onloaded else EngineState.SLEEPING
+                base_url = format_base_url(address["host"], address["port"]) if "host" in address else None
+            rows.append((index, base_url, state))
+            incarnations[f"_/{index}"] = self._engine_incarnations.get(rank, 0)
+
+        model = build_model_snapshot("_", rows)
+        revision = self._topology_revision.observe([model], incarnations)
+        return {
+            "topology_revision": revision,
+            "state": model.state.value,
+            "router_url": None,
+            "engines": [
+                {"index": index, "base_url": base_url, "state": state.value} for index, base_url, state in rows
+            ],
+        }
 
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager

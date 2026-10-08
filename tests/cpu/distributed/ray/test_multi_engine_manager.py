@@ -472,3 +472,73 @@ def test_multi_engine_manager_init_passes_hook_values_to_ray(_patch_ray, monkeyp
     }
     assert manager.all_engines == [first["engine"], second["engine"]]
     assert manager._engine_addr_and_ports[1]["port"] == 9001
+
+
+class _TwoNodeEngineManager(_FakeManager):
+    """Two slots (nodes) per logical engine, each slot on its own host."""
+
+    def __init__(self, num_slots: int):
+        MultiEngineManager.__init__(
+            self,
+            SimpleNamespace(),
+            num_slots=num_slots,
+            nodes_per_engine=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[two-node]",
+        )
+
+    _instance_owns_pg = False
+
+    def _allocate_engine_addr_and_ports(self, *, new_engines):
+        return {rank: {"host": f"node-{rank}", "port": 9000 + rank} for rank, _ in new_engines}
+
+
+def _named(manager):
+    from relax.engine.inference.discovery import model_snapshot_from_payload
+
+    return model_snapshot_from_payload("judge", manager.get_inference_snapshot())
+
+
+def test_multi_engine_manager_snapshot_lists_only_head_engines(_patch_ray):
+    manager = _TwoNodeEngineManager(num_slots=4)
+
+    model = _named(manager)
+
+    assert [engine.engine_id for engine in model.engines] == ["judge/0", "judge/1"]
+    assert [engine.base_url for engine in model.engines] == ["http://node-0:9000", "http://node-2:9002"]
+    assert all(engine.direct_eligible for engine in model.engines)
+    assert model.state.value == "ready" and model.router_url is None
+
+
+def test_multi_engine_manager_snapshot_revision_bumps_after_rebuild(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    initial = manager.get_inference_snapshot()["topology_revision"]
+    assert manager.get_inference_snapshot()["topology_revision"] == initial
+
+    manager._retire_engines([0])
+    dead = manager.get_inference_snapshot()
+    assert dead["engines"][0] == {"index": 0, "base_url": None, "state": "dead"}
+    assert dead["topology_revision"] > initial
+
+    manager.recover()
+    rebuilt = manager.get_inference_snapshot()
+    # Rebuilt on the same host/port, yet the revision still advances.
+    assert rebuilt["engines"][0] == {"index": 0, "base_url": "http://h:1", "state": "ready"}
+    assert rebuilt["topology_revision"] > dead["topology_revision"]
+
+
+def test_multi_engine_manager_snapshot_marks_offloaded_engines_not_eligible(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    before = manager.get_inference_snapshot()["topology_revision"]
+
+    manager.offload()
+    model = _named(manager)
+
+    assert [engine.state.value for engine in model.engines] == ["sleeping", "sleeping"]
+    assert not any(engine.direct_eligible for engine in model.engines)
+    assert model.state.value == "sleeping"
+    # Sleeping changes whether a replica can serve, not where it is.
+    assert manager.get_inference_snapshot()["topology_revision"] == before
+
+    manager.onload()
+    assert all(engine.direct_eligible for engine in _named(manager).engines)

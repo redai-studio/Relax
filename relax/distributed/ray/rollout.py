@@ -31,6 +31,13 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
+from relax.engine.inference.discovery import (
+    EngineState,
+    RoleSnapshot,
+    TopologyRevision,
+    build_model_snapshot,
+    format_base_url,
+)
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
@@ -3439,6 +3446,55 @@ class RolloutManager(ReloadableMixin):
 
         result["observation"]["complete"] = not issues
         return result
+
+    @ray.method(concurrency_group="scale_out")
+    def get_inference_snapshot(self) -> dict:
+        """Topology of every rollout model in the unified discovery schema.
+
+        Read-only companion of ``get_engines_info``, whose legacy shape is left
+        untouched. Lists logical replicas only -- the head node of each engine
+        -- and reports PD prefill/decode workers as diagnostics, since requests
+        reach them through the router.
+        """
+        resident_state = EngineState.SLEEPING if self.status == "offload" else EngineState.READY
+        models = []
+        for name, srv in self.servers.items():
+            router_url = format_base_url(srv.router_ip, srv.router_port) if srv.router_ip and srv.router_port else None
+            replicas, workers = [], []
+            for group in srv.engine_groups:
+                if group.lifecycle_status in (EngineGroupLifecycle.REMOVING, EngineGroupLifecycle.REMOVED):
+                    continue
+                heads = group.engines
+                live = [(i, engine) for i, engine in enumerate(heads) if engine is not None]
+                urls: dict[int, str] = {}
+                if live:
+                    try:
+                        fetched = ray.get([engine.get_url.remote() for _, engine in live], timeout=10)
+                        urls = {i: url for (i, _), url in zip(live, fetched, strict=True)}
+                    except Exception:
+                        logger.debug("Failed to fetch engine URLs for the inference snapshot")
+                group_state = (
+                    EngineState.DRAINING if group.lifecycle_status is EngineGroupLifecycle.DRAINING else resident_state
+                )
+                for i, engine in enumerate(heads):
+                    # The head slot's global rank is stable across scale-in of other groups.
+                    rank = group.rank_offset + i * group.nodes_per_engine
+                    state = EngineState.DEAD if engine is None else group_state
+                    if group.worker_type in ("prefill", "decode"):
+                        workers.append((f"{group.worker_type}-{rank}", urls.get(i), state))
+                    else:
+                        replicas.append((rank, urls.get(i), state))
+            models.append(build_model_snapshot(name, replicas, router_url=router_url, diagnostic_workers=workers))
+
+        revision = getattr(self, "_topology_revision", None)
+        if revision is None:
+            revision = self._topology_revision = TopologyRevision()
+        return RoleSnapshot(
+            role="rollout",
+            topology_revision=revision.observe(models),
+            models=tuple(models),
+            default_model="default" if "default" in self.servers else None,
+        ).to_dict()
 
     @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(
