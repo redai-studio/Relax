@@ -62,6 +62,15 @@ _SGLANG_PASSTHROUGH_SKIP_ARGS = (
 )
 
 
+# Ray actor name of the managed teacher's manager: this exact name for a single
+# teacher, suffixed with "_{data_source}" per teacher under --opd-teacher-routes.
+TEACHER_MANAGER_ACTOR_NAME = "relax_teacher_manager"
+# Serve application and route prefix of the teacher's inference gateway.
+TEACHER_GATEWAY_NAME = "teacher"
+# Model name a single managed teacher is published under.
+_DEFAULT_TEACHER_MODEL = "__default__"
+
+
 def is_managed_opd_teacher_enabled(args: Any) -> bool:
     return (
         getattr(args, "use_opd", False)
@@ -171,7 +180,7 @@ def create_managed_opd_teacher_manager(
     teacher_manager = TeacherManager.options(
         **with_control_plane_affinity(
             args,
-            {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+            {"name": TEACHER_MANAGER_ACTOR_NAME, "num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
         )
     ).remote(
         args,
@@ -353,7 +362,12 @@ def _start_managed_multi_teacher(
         return TeacherManager.options(
             **with_control_plane_affinity(
                 per_instance_args,
-                {"num_cpus": 1, "num_gpus": 0, "runtime_env": runtime_env},
+                {
+                    "name": f"{TEACHER_MANAGER_ACTOR_NAME}_{key}",
+                    "num_cpus": 1,
+                    "num_gpus": 0,
+                    "runtime_env": runtime_env,
+                },
             )
         ).remote(
             per_instance_args,
@@ -412,6 +426,50 @@ def set_managed_opd_teacher_on_train_group(train_group: Any, teacher_manager: An
     import ray
 
     ray.get([actor.set_teacher_manager.remote(teacher_manager) for actor in train_group._actor_handlers])
+
+
+def deploy_managed_opd_teacher_gateway(args: Any, teacher_manager: Any, *, runtime_env: dict | None = None) -> None:
+    """Expose the managed teacher(s) at ``/teacher`` and record where their
+    topology can be discovered.
+
+    Nothing is deployed without a managed teacher.
+    """
+    if teacher_manager is None:
+        return
+
+    from ray import serve
+
+    from relax.components.inference_gateway import InferenceGatewayService
+    from relax.utils.utils import get_serve_url
+
+    if isinstance(teacher_manager, list):
+        # MOPD: managers come back in --opd-teacher-routes order, one per data source.
+        managers = dict(zip(json.loads(args.opd_teacher_routes), teacher_manager, strict=True))
+        default_model = None
+    else:
+        managers = {_DEFAULT_TEACHER_MODEL: teacher_manager}
+        default_model = _DEFAULT_TEACHER_MODEL
+
+    gateway_service: Any = InferenceGatewayService
+    deployment = gateway_service.options(
+        ray_actor_options=with_control_plane_affinity(args, {"num_gpus": 0, "runtime_env": runtime_env})
+    ).bind(TEACHER_GATEWAY_NAME, managers, default_model)
+    serve.run(deployment, name=TEACHER_GATEWAY_NAME, route_prefix=f"/{TEACHER_GATEWAY_NAME}")
+    args.opd_teacher_discovery_url = f"{get_serve_url(f'/{TEACHER_GATEWAY_NAME}')}/engines?schema_version=2"
+    logger.info(f"[OPD teacher] gateway deployed, discovery at {args.opd_teacher_discovery_url}")
+
+
+def shutdown_managed_opd_teacher_gateway(teacher_manager: Any) -> None:
+    if teacher_manager is None:
+        return
+
+    from ray import serve
+
+    try:
+        serve.delete(TEACHER_GATEWAY_NAME)
+        logger.info("OPD teacher gateway removed.")
+    except Exception as e:
+        logger.warning(f"Failed to remove OPD teacher gateway: {e}")
 
 
 def shutdown_managed_opd_teacher(teacher_manager: Any) -> None:

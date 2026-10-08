@@ -70,6 +70,7 @@ def test_create_managed_opd_teacher_manager_offloads_shared_pg_teacher(monkeypat
     assert urls == ["http://teacher/generate"]
     assert captured["calls"] == ["get_urls", "offload"]
     assert captured["options"] == {
+        "name": "relax_teacher_manager",
         "num_cpus": 1,
         "num_gpus": 0,
         "runtime_env": {"env_vars": {"A": "B"}},

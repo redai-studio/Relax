@@ -41,9 +41,11 @@ from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
+    deploy_managed_opd_teacher_gateway,
     maybe_start_managed_opd_teacher,
     set_managed_opd_teacher_on_actor_service,
     shutdown_managed_opd_teacher,
+    shutdown_managed_opd_teacher_gateway,
 )
 from relax.utils.s3_model_loader import (
     cleanup_s3_model_weights_from_shm,
@@ -1166,6 +1168,7 @@ class Controller:
             self.config,
             runtime_env=self.runtime_env,
         )
+        deploy_managed_opd_teacher_gateway(self.config, self._teacher_manager, runtime_env=self.runtime_env)
 
         algo_key = resolve_sft_algo_key(self.config)
         if algo_key not in ALGOS:
@@ -1468,6 +1471,9 @@ class Controller:
 
         self._dispose_rollout_manager()
 
+        # The gateway only fronts the teacher's engines; take it down first so
+        # it never routes to engines that are being shut down.
+        shutdown_managed_opd_teacher_gateway(self._teacher_manager)
         shutdown_managed_opd_teacher(self._teacher_manager)
 
         self._shutdown_agentic_rollout_services()

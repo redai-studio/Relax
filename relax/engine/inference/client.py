@@ -10,6 +10,7 @@ no transport of its own.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable, Hashable, Mapping
 
@@ -40,7 +41,8 @@ class InferenceClient:
                 after ``report_failure``.
             refresh_cooldown_s: Minimum spacing between re-fetches triggered by
                 ``report_failure``, so a burst of failing requests against one
-                dead replica costs a single fetch.
+                dead replica costs a single fetch. Also spaces out retries
+                while no snapshot could be fetched at all.
         """
         self._fetch_snapshot = fetch_snapshot
         self._max_age_s = max_age_s
@@ -49,13 +51,24 @@ class InferenceClient:
         self._state = RoutingState()
         self._snapshot: RoleSnapshot | None = None
         self._fetched_at = 0.0
+        self._attempted = False
         self._stale = True
+        # Concurrent callers that find the snapshot stale share one fetch.
+        self._refresh_lock = threading.Lock()
 
     def snapshot(self) -> RoleSnapshot:
-        if self._needs_refresh():
-            self._refresh()
+        if self.needs_refresh():
+            with self._refresh_lock:
+                if self.needs_refresh():
+                    self._refresh()
         if self._snapshot is None:
             raise RuntimeError("No inference topology snapshot is available.")
+        return self._snapshot
+
+    @property
+    def last_snapshot(self) -> RoleSnapshot | None:
+        """The snapshot last fetched, without fetching; ``None`` before the
+        first successful fetch."""
         return self._snapshot
 
     def resolve(
@@ -73,8 +86,11 @@ class InferenceClient:
             return
         self._stale = True
 
-    def _needs_refresh(self) -> bool:
-        if self._snapshot is None or self._stale:
+    def needs_refresh(self) -> bool:
+        """Whether the next ``snapshot`` call would fetch."""
+        if self._snapshot is None:
+            return not self._attempted or self._clock() - self._fetched_at >= self._refresh_cooldown_s
+        if self._stale:
             return True
         return self._max_age_s > 0 and self._clock() - self._fetched_at >= self._max_age_s
 
@@ -83,6 +99,8 @@ class InferenceClient:
             fetched = self._fetch_snapshot()
         except Exception as exc:
             if self._snapshot is None:
+                self._attempted = True
+                self._fetched_at = self._clock()
                 raise
             # Keep routing on the last known topology rather than failing every
             # request while discovery is briefly unreachable.

@@ -160,15 +160,58 @@ def test_teacher_recovery_reuses_original_endpoints(monkeypatch, gpus_per_replic
     teacher_manager_module._allocate_rollout_engine_addr_and_ports_normal.assert_not_called()
 
 
-def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
+def _patch_engine_actors(monkeypatch):
+    """Let the manager "create" engines without a cluster: every engine actor
+    is a recording stand-in and ``ray.get`` resolves its calls immediately."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    class _Engine:
+        def __getattr__(self, method):
+            return SimpleNamespace(remote=lambda **kwargs: None)
+
+    class _EngineActor:
+        @staticmethod
+        def options(**options):
+            return SimpleNamespace(remote=lambda *args, **kwargs: _Engine())
+
+    monkeypatch.setattr(mem.ray, "remote", lambda cls: _EngineActor)
+    monkeypatch.setattr(mem.ray, "get", lambda refs, timeout=None: refs)
+    monkeypatch.setattr(mem.ray, "kill", lambda engine: None)
+
+
+def test_dedicated_teacher_recovery_rebuilds_and_bumps_revision(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
+    _patch_engine_actors(monkeypatch)
+    # Every dedicated replica gets its own placement group, and the rebuilt one
+    # lands on another host.
+    placement_groups = iter([("pg-first", [0, 1], [0, 1]), ("pg-rebuilt", [0, 1], [0, 1])])
+    hosts = iter(["192.0.2.1", "192.0.2.2"])
+    monkeypatch.setattr(teacher_manager, "create_placement_group", lambda **kwargs: next(placement_groups))
+    monkeypatch.setattr(
+        teacher_manager,
+        "_allocate_rollout_engine_addr_and_ports_normal",
+        lambda **kwargs: ({0: {"host": next(hosts), "port": kwargs["base_port"]}}, None),
+    )
+    removed = []
+    # ``ray.util.placement_group`` as an attribute is the function of that name; go by module.
+    monkeypatch.setattr(importlib.import_module("ray.util.placement_group"), "remove_placement_group", removed.append)
+
     manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
     manager = object.__new__(manager_cls)
-    manager._shared_pg = False
-    manager.all_engines = [None]
+    manager_cls.__init__(manager, SimpleNamespace(teacher_hf_checkpoint="/teacher", num_gpus_per_node=8), 1, 2)
+    before = manager.get_inference_snapshot()
 
-    with pytest.raises(RuntimeError, match="global restart"):
-        manager.recover()
+    manager._retire_engines([0])  # the engine died
+    rebuilt = manager.recover()
+    after = manager.get_inference_snapshot()
+
+    # Rebuilt in place of a global restart, and the move is visible to discovery.
+    assert rebuilt == {0}
+    assert before["engines"] == [{"index": 0, "base_url": "http://192.0.2.1:15000", "state": "ready"}]
+    assert after["engines"] == [{"index": 0, "base_url": "http://192.0.2.2:15000", "state": "ready"}]
+    assert after["topology_revision"] > before["topology_revision"]
+    # The dead engine's placement group went back to the cluster.
+    assert removed == ["pg-first"]
 
 
 @pytest.mark.parametrize("shared", [False, True])

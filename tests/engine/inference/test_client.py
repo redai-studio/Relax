@@ -2,6 +2,8 @@
 
 """``InferenceClient``: snapshot caching, refresh triggers, shared routing."""
 
+import threading
+
 import pytest
 
 from relax.engine.inference.client import InferenceClient
@@ -121,6 +123,60 @@ def test_client_raises_when_no_snapshot_was_ever_fetched():
 
     with pytest.raises(ConnectionError):
         client.resolve()
+
+
+def test_client_spaces_out_retries_while_no_snapshot_is_available():
+    clock = _Clock()
+    source = _Source(ConnectionError("discovery down"), _snapshot(1, ["http://a:1"]))
+    client = InferenceClient(source, refresh_cooldown_s=5.0, clock=clock)
+
+    with pytest.raises(ConnectionError):
+        client.snapshot()
+    # Within the cooldown the source is left alone; there is still no snapshot.
+    assert not client.needs_refresh()
+    with pytest.raises(RuntimeError, match="No inference topology snapshot"):
+        client.snapshot()
+    assert source.fetches == 1
+
+    clock.now += 5.0
+    assert client.snapshot().topology_revision == 1
+
+
+def test_client_last_snapshot_never_fetches():
+    source = _Source(_snapshot(1, ["http://a:1"]))
+    client = InferenceClient(source)
+
+    assert client.last_snapshot is None
+    assert client.needs_refresh()
+    assert source.fetches == 0
+
+    client.snapshot()
+    assert client.last_snapshot.topology_revision == 1
+    assert not client.needs_refresh()
+
+
+def test_client_concurrent_callers_share_one_fetch():
+    entered, release = threading.Event(), threading.Event()
+    fetches = []
+
+    def slow_source():
+        fetches.append(1)
+        entered.set()
+        assert release.wait(timeout=5)
+        return _snapshot(1, ["http://a:1"])
+
+    client = InferenceClient(slow_source)
+    results: list[int] = []
+    callers = [threading.Thread(target=lambda: results.append(client.snapshot().topology_revision)) for _ in range(4)]
+    for caller in callers:
+        caller.start()
+    assert entered.wait(timeout=5)
+    release.set()
+    for caller in callers:
+        caller.join(timeout=5)
+
+    assert results == [1, 1, 1, 1]
+    assert len(fetches) == 1
 
 
 def test_client_and_gateway_select_same_candidates():

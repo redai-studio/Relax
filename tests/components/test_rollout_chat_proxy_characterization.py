@@ -17,6 +17,7 @@ import pytest
 from fastapi import HTTPException
 
 from relax.components.rollout import Rollout as RolloutDeployment
+from relax.engine.inference.gateway import InferenceGateway
 
 
 Rollout = RolloutDeployment.func_or_class
@@ -68,7 +69,7 @@ def _make_rollout(monkeypatch, handler, *, router=("10.0.0.1", 3000)):
 
     rollout = object.__new__(Rollout)
     rollout._logger_instance = None
-    rollout._proxy_client = None
+    rollout._gateway = InferenceGateway("rollout", lambda: None, upstream_name="SGLang router")
     rollout._sglang_base_url = None
     address = {"router_ip": router[0], "router_port": router[1]}
     rollout.rollout_manager = type("_Manager", (), {})()
@@ -174,20 +175,6 @@ async def test_rollout_chat_proxy_streams_upstream_lines(monkeypatch):
     assert await _collect(response) == ['data: {"id": "1"}\n\n', 'data: {"id": "2"}\n\n', "data: [DONE]\n\n"]
 
 
-# On current main the two streaming error paths below raise NameError instead of
-# emitting an error chunk: ``_make_error_chunk`` is defined after the ``Rollout``
-# class, and ``@serve.ingress`` rebuilds the class against a copy of the module
-# globals taken before that definition exists. The tests state the intended
-# behavior; strict xfail makes them fail loudly once the bug is gone, so the
-# marker has to be removed by the change that fixes it.
-_STREAM_ERROR_CHUNK_BUG = pytest.mark.xfail(
-    strict=True,
-    raises=NameError,
-    reason="_make_error_chunk is not visible to the ingress-rewritten Rollout class",
-)
-
-
-@_STREAM_ERROR_CHUNK_BUG
 async def test_rollout_chat_proxy_stream_turns_upstream_error_into_error_chunk(monkeypatch):
     rollout, _client_kwargs = _make_rollout(monkeypatch, lambda request: httpx.Response(500, text="boom"))
 
@@ -198,7 +185,6 @@ async def test_rollout_chat_proxy_stream_turns_upstream_error_into_error_chunk(m
     assert error == {"code": 500, "message": "boom"}
 
 
-@_STREAM_ERROR_CHUNK_BUG
 async def test_rollout_chat_proxy_stream_turns_connection_failure_into_502_chunk(monkeypatch):
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)

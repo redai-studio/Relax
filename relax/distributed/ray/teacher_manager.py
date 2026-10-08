@@ -112,20 +112,6 @@ class TeacherManager(MultiEngineManager):
             urls.append(f"{base_url}/generate")
         return urls
 
-    def recover(self) -> set:
-        """Recover in place only when the teacher's endpoint can stay
-        stable."""
-        dead = [rank for rank, engine in enumerate(self.all_engines) if engine is None]
-        if dead and not self._shared_pg:
-            # A dedicated replacement PG may land on another node. OPD callers
-            # hold URLs captured at startup, so rebuilding here could advertise
-            # success while every caller keeps targeting the old host. Escalate
-            # to Controller restart, which rebuilds and re-injects the routes.
-            raise RuntimeError(
-                f"Dedicated OPD teacher engines died at ranks={dead}; global restart is required to refresh URLs."
-            )
-        return super().recover()
-
     # ------------------------------------------------------------------
     # MultiEngineManager hooks.
     # ------------------------------------------------------------------
@@ -191,9 +177,11 @@ class TeacherManager(MultiEngineManager):
         addr_and_ports: dict[int, dict] = {}
         unallocated_replicas: dict[int, list[tuple]] = {}
         for rank, engine in new_engines:
-            # OPD consumers receive teacher URLs once during startup. Preserve
-            # the original endpoint across recovery instead of silently moving
-            # a rebuilt engine to a port those consumers never learn about.
+            # A shared-PG engine is rebuilt on the bundles it had, so keep its
+            # endpoint: callers that only hold the URLs captured at startup
+            # keep working. A dedicated engine gets a fresh placement group that
+            # may land on another node; its new endpoint is published through
+            # the topology snapshot, which OPD follows via the teacher gateway.
             if self._shared_pg and rank in self._engine_addr_and_ports:
                 addr_and_ports[rank] = dict(self._engine_addr_and_ports[rank])
                 continue
