@@ -32,6 +32,7 @@ from relax.core.service import Service, create_placement_group
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
 from relax.distributed.ray.placement_planner import plan_placement
+from relax.engine.inference.deferred import validate_deferred_scoring_args
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -1161,6 +1162,7 @@ class Controller:
         # Reject conflicting inference layouts before any placement group or
         # engine exists; the managed OPD teacher right below is the first to start.
         placement_plan = plan_placement(self.config)
+        validate_deferred_scoring_args(self.config)
         if placement_plan.claims:
             logger.info(f"Inference placement plan:\n{placement_plan.describe()}")
 

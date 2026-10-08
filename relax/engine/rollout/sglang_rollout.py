@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
+from relax.engine.inference.deferred import is_framework_deferred_reward, run_deferred_scoring
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -717,10 +718,14 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
+    # With framework-deferred scoring the reward function is not called while
+    # rollout generates; the batch is scored as a whole before it is published.
+    deferred_reward = is_framework_deferred_reward(args)
+
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
-        if not args.group_rm:
+        if not args.group_rm and not deferred_reward:
             assert sample.reward is not None
         return sample
 
@@ -740,11 +745,12 @@ async def generate_and_rm(
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        if not deferred_reward:
+            # for multi agent system, the reward of some sample is calculated during generation.
+            samples_need_reward = [sample for sample in samples if sample.reward is None]
+            rewards = await batched_async_rm(args, samples_need_reward)
+            for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                sample.reward = reward
 
         if state.opd_manager and not evaluation:
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
@@ -754,7 +760,7 @@ async def generate_and_rm(
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
+        if sample.reward is None and not deferred_reward:
             sample.reward = await async_rm(args, sample)
 
         if state.opd_manager and not evaluation:
@@ -838,9 +844,10 @@ async def generate_and_rm_group(
     group_has_training_abort = not evaluation and any(sample.status == Sample.Status.ABORTED for sample in group)
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm and not group_has_training_abort:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+        if not is_framework_deferred_reward(args):
+            rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
 
         if state.opd_manager and not evaluation:
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
@@ -1358,9 +1365,36 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
         results = {}
         for r in results_list:
             results.update(r)
+        if is_framework_deferred_reward(args):
+            await _score_deferred_eval_results(args, results)
         return RolloutFnEvalOutput(data=results), []
     finally:
         state.evaluating -= 1
+
+
+async def _score_deferred_eval_results(args: Namespace, results: dict[str, dict[str, list[Any]]]) -> None:
+    """Score every dataset's samples in one score phase and fill in the rewards
+    the per-dataset results left open.
+
+    The datasets generate concurrently, so this has to wait for all of them:
+    scoring one would take the GPUs from the others. Evaluation may be followed
+    by generation right away, so rollout is brought back afterwards.
+    """
+    eval_datasets = {cfg.name: cfg for cfg in getattr(args, "eval_datasets", []) or []}
+    groups = []
+    for name, result in results.items():
+        samples = result["samples"]
+        # Samples are indexed prompt by prompt, so consecutive chunks are the prompt groups.
+        group_size = max(1, eval_datasets[name].n_samples_per_eval_prompt)
+        groups.extend(samples[i : i + group_size] for i in range(0, len(samples), group_size))
+    await run_deferred_scoring(args, groups, restore_rollout=True)
+    for result in results.values():
+        result["rewards"] = _eval_rewards(args, result["samples"])
+
+
+def _eval_rewards(args: Namespace, samples: list[Sample]) -> list[Any]:
+    reward_key = args.eval_reward_key or args.reward_key
+    return [sample.reward if not reward_key else sample.reward[reward_key] for sample in samples]
 
 
 async def eval_rollout_single_dataset(
@@ -1491,10 +1525,11 @@ async def eval_rollout_single_dataset(
 
     data.sort(key=lambda sample: sample.index)
 
-    reward_key = args.eval_reward_key or args.reward_key
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            # With framework-deferred scoring there are no rewards yet;
+            # eval_rollout fills them in once every dataset has generated.
+            "rewards": [] if is_framework_deferred_reward(args) else _eval_rewards(args, data),
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }

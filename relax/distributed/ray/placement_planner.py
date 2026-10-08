@@ -137,6 +137,11 @@ def _describe(claim: PlacementClaim) -> str:
     return f"{claim.role}/{claim.model} pool={claim.pool} [{claim.start}, {claim.stop})"
 
 
+def claims_overlap(a: PlacementClaim, b: PlacementClaim) -> bool:
+    """Whether two claims cover at least one common bundle of the same pool."""
+    return a.pool == b.pool and a.start < b.stop and b.start < a.stop
+
+
 def validate_placement(plan: PlacementPlan) -> None:
     """Raise ``PlacementError`` if a claim does not fit its pool, or two claims
     hold GPU memory on the same bundles in the same phase."""
@@ -151,7 +156,7 @@ def validate_placement(plan: PlacementPlan) -> None:
             )
 
     for a, b in itertools.combinations(plan.claims, 2):
-        if a.pool != b.pool or a.start >= b.stop or b.start >= a.stop:
+        if not claims_overlap(a, b):
             continue
         shared_phases = a.phases & b.phases
         if not shared_phases or _may_co_reside(a, b):
@@ -261,13 +266,34 @@ def _teacher_claims(
     return claims
 
 
-def plan_placement(args: Any) -> PlacementPlan:
+def _check_deferred_scoring_layout(args: Any, claims: list[PlacementClaim]) -> None:
+    """Scoring deferred to the score phase swaps GPU memory with rollout, which
+    only means something for models that live in the pool rollout lives in."""
+    # Deferred: the module imports this one back.
+    from relax.engine.inference.deferred import is_framework_deferred_reward
+
+    if not is_framework_deferred_reward(args):
+        return
+    for claim in claims:
+        if claim.role == GENRM_ROLE and claim.pool != ACTOR_POOL:
+            raise PlacementError(
+                f"--defer-reward-to-post-process needs GenRM to share the actor placement group with rollout, "
+                f"but {_describe(claim)} has its own. With GPUs of its own GenRM has nothing to swap with: drop "
+                f"the flag, or run colocate with 'actor' and 'rollout' in --resource."
+            )
+
+
+def plan_placement(args: Any, *, validate: bool = True) -> PlacementPlan:
     """Plan where every inference model of this run is placed, and validate it.
 
     A pure function of the run configuration: it needs no Ray connection and
     never writes to ``args``, so the controller preflight and the managers that
     consume the plan can each call it and get the same answer. Missing
     attributes fall back to "feature off".
+
+    Args:
+        validate: Pass ``False`` to only read a layout that was already
+            validated when the run started.
 
     Raises:
         PlacementError: the layout does not fit or two models conflict. Not
@@ -297,6 +323,7 @@ def plan_placement(args: Any) -> PlacementPlan:
     claims.extend(_teacher_claims(args, resource, pools, rollout_stop))
 
     plan = PlacementPlan(pools=tuple(pools.values()), claims=tuple(claims))
-    if not getattr(args, "debug_train_only", False):
+    if validate and not getattr(args, "debug_train_only", False):
         validate_placement(plan)
+        _check_deferred_scoring_layout(args, claims)
     return plan

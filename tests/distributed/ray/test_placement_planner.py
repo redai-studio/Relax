@@ -21,6 +21,7 @@ from relax.distributed.ray.placement_planner import (
     PlacementPlan,
     PlacementPool,
     PoolOwner,
+    claims_overlap,
     plan_placement,
     validate_placement,
 )
@@ -472,3 +473,60 @@ def test_placement_planner_genrm_without_shared_pool_starts_at_zero():
     genrm = plan_placement(args).claim("genrm")
 
     assert (genrm.pool, genrm.start, genrm.stop) == ("genrm", 0, 2)
+
+
+# ----------------------------------------------------------------------
+# Deferred scoring.
+# ----------------------------------------------------------------------
+
+
+def _own_pool_genrm_args(**overrides):
+    values = dict(
+        colocate=False,
+        hybrid=False,
+        fully_async=True,
+        rollout_num_gpus=4,
+        resource={"actor": [1, 4], "rollout": [1, 4], "genrm": [1, 4]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(4)},
+    )
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_placement_planner_framework_defer_requires_shared_pool():
+    """Deferring means swapping GPU memory with rollout; a GenRM with GPUs of
+    its own has nothing to swap."""
+    with pytest.raises(PlacementError, match="needs GenRM to share the actor placement group"):
+        plan_placement(_own_pool_genrm_args(defer_reward_to_post_process=True))
+
+    # Inside the actor pool it is accepted, whether the bundles are split or shared.
+    instances = {"__default__": _genrm_spec(4)}
+    plan_placement(_colocate_args(_genrm_instances_resolved=instances, defer_reward_to_post_process=True))
+    plan_placement(_shared_bundle_args(16, defer_reward_to_post_process=True))
+
+
+def test_placement_planner_custom_post_process_defer_is_not_checked():
+    """A userland post-process hook owns the swap; the framework neither runs
+    nor second-guesses it."""
+    args = _own_pool_genrm_args(
+        defer_reward_to_post_process=True, custom_reward_post_process_path="my_module.post_process"
+    )
+
+    assert plan_placement(args).claim("genrm").phases == SCORE
+
+
+def test_placement_planner_can_be_read_without_validating():
+    """Consumers of an already validated layout only read it."""
+    conflicting = _genrm_with_colocate_teacher_args()
+    with pytest.raises(PlacementError):
+        plan_placement(conflicting)
+
+    plan = plan_placement(conflicting, validate=False)
+
+    assert plan.claim("genrm").start == plan.claim("teacher").start == 4
+
+
+def test_placement_planner_claims_overlap_needs_a_common_bundle_of_one_pool():
+    assert claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", start=3, size=4))
+    assert not claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", start=4, size=4))
+    assert not claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", pool="genrm", start=0, size=4))

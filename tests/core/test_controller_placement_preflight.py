@@ -88,3 +88,23 @@ def test_controller_runs_preflight_before_teacher_start(monkeypatch):
         controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
 
     assert teacher_starts == [config]
+
+
+def test_controller_rejects_unsupported_deferred_scoring_before_teacher_start(monkeypatch):
+    teacher_starts = _stub_startup(monkeypatch)
+    config = Namespace(
+        colocate=True,
+        hybrid=False,
+        rollout_num_gpus=8,
+        resource={"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(8)},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+        custom_reward_post_process_path=None,
+        use_agentic_rollout=True,
+    )
+
+    with pytest.raises(ValueError, match="not supported with --use-agentic-rollout"):
+        controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
+
+    assert teacher_starts == []

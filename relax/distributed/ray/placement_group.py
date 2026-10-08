@@ -236,6 +236,22 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     return rollout_manager, num_rollout_per_epoch
 
 
+# Ray actor name of the GenRM manager. Userland code inside other actors of the
+# same job looks it up with ray.get_actor (see custom_reward_post_process_path).
+GENRM_MANAGER_ACTOR_NAME = "relax_genrm_manager"
+
+
+def genrm_manager_actor_name(instance_keys, key) -> str:
+    """Actor name of one GenRM instance's manager.
+
+    The sole instance of a legacy single-model config keeps the well-known
+    name; with several instances each is suffixed with its route key.
+    """
+    if list(instance_keys) == ["__default__"]:
+        return GENRM_MANAGER_ACTOR_NAME
+    return f"{GENRM_MANAGER_ACTOR_NAME}_{key}"
+
+
 def create_genrm_manager(args, pg, runtime_env=None, bundle_offset=0):
     """Create and initialize a single GenRM manager (legacy single-instance
     path).
@@ -260,7 +276,7 @@ def create_genrm_manager(args, pg, runtime_env=None, bundle_offset=0):
         **with_control_plane_affinity(
             args,
             {
-                "name": "relax_genrm_manager",
+                "name": GENRM_MANAGER_ACTOR_NAME,
                 "num_cpus": 1,
                 "num_gpus": 0,
                 "runtime_env": runtime_env,
@@ -320,7 +336,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
             **with_control_plane_affinity(
                 instance_args,
                 {
-                    "name": f"relax_genrm_manager_{key}",
+                    "name": genrm_manager_actor_name(instance_specs, key),
                     "num_cpus": 1,
                     "num_gpus": 0,
                     "runtime_env": runtime_env,
