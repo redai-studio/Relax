@@ -46,9 +46,11 @@ from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
+    install_reward_model_head_in_provider,
     install_sequence_classification_head_in_provider,
 )
 
+from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
 
 
@@ -279,9 +281,14 @@ def get_model_provider_func(
                 vp_stage=vp_stage,
                 **kwargs,
             )
+            for module in model.modules():
+                if getattr(module, "config", None) is not None:
+                    _validate_linear_cp_mode(args, module.config)
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_reward_model_head_in_provider(model, args, role, post_process)
+
             install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
@@ -511,6 +518,7 @@ def get_model_provider_func(
                 )
                 provider.apply_dsa_kernel_fusion = want_fusion
 
+        _validate_linear_cp_mode(args, provider)
         provider.finalize()
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
@@ -532,6 +540,8 @@ def get_model_provider_func(
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+
             install_sequence_classification_head_in_provider(
                 model,
                 args,
@@ -573,6 +583,7 @@ def get_model_provider_func(
         # Experimental loading arguments from yaml
         if config is None:
             config = core_transformer_config_from_args(args)
+        _validate_linear_cp_mode(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -662,6 +673,8 @@ def get_model_provider_func(
 
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_reward_model_head_in_provider(model, args, role, post_process)
+
         install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)

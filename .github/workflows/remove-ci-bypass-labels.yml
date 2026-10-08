@@ -1,0 +1,45 @@
+name: Remove CI Bypass Labels
+
+on:
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  remove-ci-bypass-labels:
+    name: Remove CI bypass labels on new commits
+    if: github.repository_owner == 'redai-studio'
+    runs-on: ubuntu-slim
+    timeout-minutes: 3
+    steps:
+      - name: Get PR labels
+        id: get-labels
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const bypassLabels = labels
+              .filter(label => label.name.startsWith('ci-bypass:'))
+              .map(label => label.name);
+            core.setOutput('labels', JSON.stringify(bypassLabels));
+            core.setOutput('has-labels', bypassLabels.length > 0);
+      - name: Remove CI bypass labels
+        if: steps.get-labels.outputs.has-labels == 'true'
+        uses: actions/github-script@v8
+        env:
+          CI_BYPASS_LABELS: ${{ steps.get-labels.outputs.labels }}
+        with:
+          script: |
+            for (const name of JSON.parse(process.env.CI_BYPASS_LABELS)) {
+              await github.rest.issues.removeLabel({
+                ...context.repo,
+                issue_number: context.issue.number,
+                name,
+              });
+            }

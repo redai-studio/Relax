@@ -17,6 +17,12 @@ def _load_data_module(monkeypatch):
         sys.modules.pop(name)
         monkeypatch.setattr(parent, leaf, None, raising=False)
 
+    metric_parent = importlib.import_module("relax.utils.training")
+    metric_name = "relax.utils.training.train_metric_utils"
+    monkeypatch.setitem(sys.modules, metric_name, sys.modules.get(metric_name))
+    sys.modules.pop(metric_name)
+    monkeypatch.setattr(metric_parent, "train_metric_utils", None, raising=False)
+
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
     mpu = types.ModuleType("megatron.core.mpu")
@@ -24,6 +30,7 @@ def _load_data_module(monkeypatch):
     training = types.ModuleType("megatron.training")
     global_vars = types.ModuleType("megatron.training.global_vars")
     tracking_utils = types.ModuleType("relax.utils.tracking_utils")
+    monkeypatch.setattr(importlib.import_module("relax.utils"), "tracking_utils", tracking_utils, raising=False)
 
     class _PackedSeqParams:
         pass

@@ -43,7 +43,7 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
 
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda *a, **kw: None)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *a, **kw: {})
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", lambda **_kwargs: expected)
 
     def fail_hf_load(**_kwargs):
@@ -51,7 +51,8 @@ def test_load_checkpoint_preserves_valid_megatron_resume(monkeypatch, tmp_path):
 
     monkeypatch.setattr(checkpoint, "_load_checkpoint_hf", fail_hf_load)
 
-    assert checkpoint.load_checkpoint(None, None, None, {}, False) == expected
+    model = [SimpleNamespace(role="actor")]
+    assert checkpoint.load_checkpoint(model, None, None, {}, False) == expected
 
 
 @pytest.mark.parametrize(
@@ -110,7 +111,7 @@ def test_full_checkpoint_preserves_hdo_step_only_when_applicable(monkeypatch, tm
     monkeypatch.setattr(DistributedOptimizer, "load_state_dict", original_load)
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda _path, ckpt_step=None: None)
+    monkeypatch.setattr(checkpoint, "_load_checkpoint_metadata", lambda *_args: {})
     monkeypatch.setattr(checkpoint, "patch_hybrid_optimizer_native_fp32_checkpoint_load", lambda: False)
     monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_megatron)
 

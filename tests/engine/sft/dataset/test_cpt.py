@@ -320,3 +320,29 @@ def test_qwen_cpt_truncation_preserves_native_placeholders(tmp_path, strategy, e
     sample = ds.get_batch_in_order(0, 1)[0]
     assert sample.tokens.tolist() == expected
     assert sample.loss_mask.tolist() == [0, 1, 1]
+
+
+@pytest.mark.parametrize("strategy", ["truncate_left", "truncate_right"])
+@pytest.mark.parametrize("placeholder_count", [2, 3, 4])
+def test_qwen_cpt_truncation_enforces_capacity_with_placeholders(tmp_path, strategy, placeholder_count):
+    class PlaceholderTokenizer(QwenTextTokenizer):
+        def convert_tokens_to_ids(self, name):
+            return 65 if name == "<|image_pad|>" else 66
+
+    ds = make_dataset(
+        tmp_path,
+        [{"text": "ABAB"[:placeholder_count] + "cdef"}],
+        tokenizer=PlaceholderTokenizer(),
+        cpt_template="qwen3_5",
+        capacity=3,
+        oversize_strategy=strategy,
+    )
+    if placeholder_count > 3:
+        with pytest.raises(ValueError, match="protected placeholder count 4 exceeds token capacity 3"):
+            ds.get_batch_in_order(0, 1)
+        return
+
+    sample = ds.get_batch_in_order(0, 1)[0]
+    assert sample.total_length == 3
+    assert sum(token in (65, 66) for token in sample.tokens.tolist()) == placeholder_count
+    assert sample.loss_mask.tolist() == [0, 1, 1]

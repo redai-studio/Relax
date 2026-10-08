@@ -972,7 +972,73 @@ diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gat
 index b3b829b..8e21e01 100644
 --- a/megatron/core/ssm/gated_delta_net/common.py
 +++ b/megatron/core/ssm/gated_delta_net/common.py
-@@ -706,7 +706,7 @@ def get_parameter_local_cp(
+@@ -485,6 +485,65 @@
+         """
+         raise NotImplementedError
+
++    def _resolve_thd_cu_seqlens(self, packed_seq_params, seq_len_global, cp_size):
++        """Resolve and validate this micro-batch's global THD boundaries, once.
++
++        Every GDN layer is handed the same ``PackedSeqParams``, so the checks below --
++        each of which reads a device tensor from Python and therefore stalls on the
++        GPU -- only need to run for the first layer that asks. The result is cached on
++        the ``PackedSeqParams`` instance and reused while it still describes the very
++        same boundary tensors, mirroring how the CP layout routes are cached.
++
++        A cached result is reused only when all four source tensors are still the same
++        objects *and* none of them has been written in place. Identity alone would not
++        notice a caller refilling a preallocated boundary buffer, so autograd's version
++        counter -- which every in-place op bumps, and which costs a plain Python
++        attribute read -- is checked as well. Comparing values instead would reintroduce
++        the device-host sync this cache exists to remove.
++        """
++        sources = (
++            packed_seq_params.cu_seqlens_q_padded,
++            packed_seq_params.cu_seqlens_q,
++            packed_seq_params.cu_seqlens_kv_padded,
++            packed_seq_params.cu_seqlens_kv,
++        )
++        cacheable = all(t is None or not t.is_inference() for t in sources)
++        versions = tuple(None if t is None or t.is_inference() else t._version for t in sources)
++        cached = getattr(packed_seq_params, "_gdn_resolved_cu_seqlens", None)
++        if cacheable and cached is not None:
++            cached_meta, cached_sources, cached_versions, cached_value = cached
++            if (
++                cached_meta == (seq_len_global, cp_size)
++                and all(a is b for a, b in zip(cached_sources, sources))
++                and cached_versions == versions
++            ):
++                return cached_value
++
++        cu_seqlens_q = self._resolve_cu_seqlens(
++            sources[0], sources[1], seq_len_global, "cu_seqlens_q", cp_size=cp_size
++        )
++        cu_seqlens_kv = self._resolve_cu_seqlens(
++            sources[2], sources[3], seq_len_global, "cu_seqlens_kv", cp_size=cp_size
++        )
++        assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
++            "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++        num_packed_seqs = cu_seqlens_q.shape[0] - 1
++        assert num_packed_seqs > 0, (
++            "Number of packed sequences must be greater than 0, "
++            f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
++        )
++
++        resolved = (cu_seqlens_q, cu_seqlens_kv)
++        packed_seq_params._gdn_resolved_cu_seqlens = (
++            (seq_len_global, cp_size),
++            sources,
++            versions,
++            resolved,
++        )
++        return resolved
++
+     def _resolve_cu_seqlens(
+         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+     ) -> torch.Tensor:
+@@ -706,7 +765,7 @@ def get_parameter_local_cp(
      slices = [slice(None)] * param.dim()
      dim_size = param.size(dim=dim)
      slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
@@ -1293,6 +1359,25 @@ index 35a6d87..d24c299 100644
      test_mode: bool = False
      """Whether to run real-time tests."""
  
+@@ -1851,11 +1858,13 @@
+                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                 f"linear_num_key_heads ({self.linear_num_key_heads})."
+             )
+-            if (
+-                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+-            ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
+-                raise ValueError(
+-                    f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
++            linear_cp_modes = ("headwise", "chunkwise")
++            if self.experimental_attention_variant == "gdn":
++                # Relax's all-gather fallback also keeps all TP-local heads.
++                linear_cp_modes += ("all_gather",)
++            if self.linear_cp_mode not in linear_cp_modes:
++                raise ValueError(
++                    f"linear_cp_mode must be one of {linear_cp_modes!r}, "
+                     f"got {self.linear_cp_mode!r}."
+                 )
+             if self.gdn_conv_pad_alignment is not None:
 diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
 index 100ed76..aa0088e 100644
 --- a/megatron/core/transformer/transformer_layer.py

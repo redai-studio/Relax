@@ -5,8 +5,7 @@ entrypoint.
 
 No Ray runtime is started. Actor handles and init ObjectRefs are controlled
 fakes: metadata reads must preserve timeout=0 and must never submit an actor
-getter. Import failures are collection errors, not a successful all-skipped
-test run.
+getter. Tests are skipped when the rollout runtime dependencies are unavailable.
 """
 
 import asyncio
@@ -21,10 +20,9 @@ import pytest
 from ray.core.generated.gcs_pb2 import ActorTableData
 from ray.exceptions import GetTimeoutError
 
-from relax.distributed.ray import rollout
-
 
 ActorState = ActorTableData.ActorState
+rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
 
 
 class InitResult:

@@ -72,81 +72,24 @@ def gdn_types(monkeypatch):
     )
     namespace = _load_functions(
         _MODEL_SOURCE,
-        {"_relax_gdn_cp_config_assert", "_patch_gdn_for_dynamic_cp", "_resolve_gdn_cp"},
+        {"_patch_gdn_for_dynamic_cp", "_resolve_gdn_cp"},
         {"__package__": "_relax_upgrade_test"},
     )
     return GatedDeltaNet, TransformerConfig, calls, namespace
 
 
-def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types):
+@pytest.mark.parametrize("mode", ["headwise", "chunkwise"])
+def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types, mode):
     gdn, config, _, namespace = gdn_types
     gdn._prepare_input_for_gated_delta_rule = lambda self: None
     original_forward, original_post_init = gdn.forward, config.__post_init__
 
-    namespace["_relax_gdn_cp_config_assert"]()
-    namespace["_patch_gdn_for_dynamic_cp"]()
+    namespace["_patch_gdn_for_dynamic_cp"](mode)
 
     assert gdn.forward is original_forward
     assert config.__post_init__ is original_post_init
     assert not getattr(gdn, "_dcp_patched", False)
     assert not getattr(config, "_gdn_cp_relaxed", False)
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_megatron_upgrade_legacy_gdn_config_restores_head_counts(gdn_types, fail):
-    _, config, calls, namespace = gdn_types
-    namespace["_relax_gdn_cp_config_assert"]()
-    patched = config.__post_init__
-    namespace["_relax_gdn_cp_config_assert"]()
-    assert config.__post_init__ is patched
-    instance = config()
-    instance.__dict__.update(
-        experimental_attention_variant="gated_delta_net",
-        tensor_model_parallel_size=2,
-        context_parallel_size=16,
-        linear_num_key_heads=16,
-        linear_num_value_heads=32,
-        fail=fail,
-    )
-    if fail:
-        with pytest.raises(RuntimeError, match="validation failure"):
-            instance.__post_init__()
-    else:
-        instance.__post_init__()
-    assert calls == [(256, 512)]
-    assert instance.linear_num_key_heads == 16
-    assert instance.linear_num_value_heads == 32
-
-
-@pytest.mark.parametrize("fail", [False, True])
-def test_megatron_upgrade_legacy_gdn_restores_dynamic_cp_group(monkeypatch, gdn_types, fail):
-    gdn, _, calls, namespace = gdn_types
-    # The legacy native-forward branch imports these modules but performs no tensor work.
-    dynamo = _install_module(monkeypatch, "torch._dynamo")
-    _install_module(monkeypatch, "torch", _dynamo=dynamo)
-    _install_module(monkeypatch, "_relax_upgrade_test.cp_utils", gdn_cp_slice=None)
-    original_forward = gdn.forward
-    namespace["_patch_gdn_for_dynamic_cp"]()
-    patched = gdn.forward
-    assert patched is not original_forward
-    namespace["_patch_gdn_for_dynamic_cp"]()
-    assert gdn.forward is patched
-    static_group, dynamic_group = object(), object()
-    instance = gdn()
-    instance.cp_size = 8
-    instance.pg_collection = types.SimpleNamespace(cp=static_group)
-    instance.num_key_heads = 16
-    instance.tp_size = 2
-    packed = types.SimpleNamespace(local_cp_size=1, cp_group=dynamic_group, qkv_format="thd")
-    hidden = object()
-    if fail:
-        with pytest.raises(RuntimeError, match="forward failure"):
-            instance.forward(hidden, None, packed_seq_params=packed, fail=True)
-    else:
-        assert instance.forward(hidden, None, packed_seq_params=packed) is hidden
-    assert calls == [(1, dynamic_group)]
-    assert instance.cp_size == 8
-    assert instance.pg_collection.cp is static_group
 
 
 @pytest.fixture

@@ -17,6 +17,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
@@ -111,7 +112,114 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-__all__ = ["save_checkpoint"]
+REWARD_MODEL_HEAD_TYPE = "reward_model_terminal_v1"
+
+__all__ = ["REWARD_MODEL_HEAD_TYPE", "load_checkpoint", "save_checkpoint"]
+
+
+def _checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | None = None) -> Path:
+    path = Path(load_path)
+    if re.fullmatch(r"iter_\d{7}", path.name):
+        return path
+    tracker = path / "latest_checkpointed_iteration.txt"
+    try:
+        metadata = tracker.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if metadata == "release":
+        return path / "release"
+    try:
+        iteration = int(metadata)
+    except ValueError as exc:
+        raise RuntimeError(f"cannot resolve Megatron checkpoint iteration from {tracker}") from exc
+    if ckpt_step is not None:
+        iteration = int(ckpt_step)
+    if iteration < 0:
+        raise RuntimeError(f"Megatron checkpoint iteration must be non-negative, got {iteration}")
+    return path / f"iter_{iteration:07d}"
+
+
+def _metadata_value(metadata, name: str):
+    return metadata.get(name) if isinstance(metadata, dict) else getattr(metadata, name, None)
+
+
+def _validate_reward_model_tensor_metadata(tensor_metadata: dict, hidden_size: int) -> None:
+    head_keys = [
+        str(key)
+        for key in tensor_metadata
+        if not str(key).startswith("optimizer.") and ("output_layer." in str(key) or "reward_model_head." in str(key))
+    ]
+    weight_keys = [key for key in head_keys if key.endswith("output_layer.weight")]
+    if len(weight_keys) != 1:
+        raise RuntimeError(
+            f"RM resume requires exactly one output_layer.weight checkpoint tensor, found {weight_keys}"
+        )
+    unexpected = [key for key in head_keys if key != weight_keys[0]]
+    if unexpected:
+        raise RuntimeError(f"RM checkpoint contains unexpected scalar-head tensors: {unexpected}")
+    entry = tensor_metadata[weight_keys[0]]
+    shape = tuple(getattr(entry, "global_shape", getattr(entry, "shape", ())))
+    expected = (1, int(hidden_size))
+    if shape != expected:
+        raise RuntimeError(f"RM output_layer.weight shape mismatch: checkpoint={shape}, expected={expected}")
+
+
+def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
+    from megatron.core import dist_checkpointing
+
+    role = getattr(ddp_model[0], "role", "actor")
+    current_is_rm = role == "actor" and is_rm_mode(args)
+    if current_is_rm and checkpoint_dir.name == "release":
+        raise RuntimeError(
+            "RM resume rejects release checkpoints because optimizer, scheduler, and RNG state are absent"
+        )
+    if not dist_checkpointing.check_is_distributed_checkpoint(str(checkpoint_dir)):
+        if current_is_rm:
+            raise RuntimeError(
+                "RM resume requires a distributed checkpoint with contract metadata; legacy Megatron "
+                "checkpoints are not supported"
+            )
+        return {}
+    common = dist_checkpointing.load_common_state_dict(checkpoint_dir)
+    saved_args = common.get("args")
+    if saved_args is None:
+        if current_is_rm:
+            raise RuntimeError(f"checkpoint {checkpoint_dir} is missing saved args metadata")
+        return common
+    saved_loss_type = _metadata_value(saved_args, "loss_type")
+    if saved_loss_type == "sft" and _metadata_value(saved_args, "sft_objective") == "reward_model":
+        saved_loss_type = "rm"
+    saved_head_type = _metadata_value(saved_args, "head_type")
+    saved_role = _metadata_value(saved_args, "checkpoint_role")
+    saved_is_rm = saved_loss_type == "rm" or saved_head_type == REWARD_MODEL_HEAD_TYPE
+
+    if current_is_rm:
+        if (saved_loss_type, saved_head_type, saved_role) != (
+            "rm",
+            REWARD_MODEL_HEAD_TYPE,
+            "actor",
+        ):
+            raise RuntimeError(
+                "RM resume requires checkpoint metadata "
+                "loss_type=rm, head_type=reward_model_terminal_v1, checkpoint_role=actor; "
+                f"got loss_type={saved_loss_type!r}, head_type={saved_head_type!r}, role={saved_role!r}"
+            )
+        incompatible_flags = [
+            name
+            for name in ("no_load_optim", "no_load_rng", "finetune", "reset_optimizer_states")
+            if bool(getattr(args, name, False))
+        ]
+        if incompatible_flags:
+            raise RuntimeError(
+                f"RM resume must restore optimizer, scheduler, and RNG state; incompatible flags: {incompatible_flags}"
+            )
+        tensor_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_dir))
+        _validate_reward_model_tensor_metadata(tensor_metadata, int(args.hidden_size))
+    elif saved_is_rm:
+        target = "PPO critic" if role == "critic" else "non-RM actor/SFT"
+        raise RuntimeError(f"{target} load rejects reward-model checkpoints")
+    return common
+
 
 _LORA_CHECKPOINT_METADATA_ATTR = "relax_lora_checkpoint_metadata"
 _LORA_CHECKPOINT_FORMAT_VERSION = 1
@@ -470,17 +578,6 @@ def _resolve_checkpoint_iteration_dir(load_path: str | Path, ckpt_step: int | No
     return path / f"iter_{iteration:07d}"
 
 
-def _read_lora_checkpoint_metadata(load_path: str | Path, ckpt_step: int | None = None) -> dict | None:
-    checkpoint_dir = _resolve_checkpoint_iteration_dir(load_path, ckpt_step=ckpt_step)
-    if checkpoint_dir is None or not checkpoint_dir.is_dir():
-        return None
-    from megatron.core import dist_checkpointing
-
-    common_state = dist_checkpointing.load_common_state_dict(str(checkpoint_dir))
-    checkpoint_args = common_state.get("args")
-    return getattr(checkpoint_args, _LORA_CHECKPOINT_METADATA_ATTR, None)
-
-
 def _validate_lora_checkpoint_metadata(args, model, metadata: dict) -> None:
     if metadata.get("format_version") != _LORA_CHECKPOINT_FORMAT_VERSION:
         raise RuntimeError(
@@ -535,7 +632,7 @@ def _checkpoint_load_state(load_path: str, args: Namespace, load_optimizer: bool
     """Probe only host metadata before deciding which collective loader to
     use."""
     exists = Path(load_path).exists() and _is_dir_nonempty(load_path)
-    megatron = exists and (_is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
+    megatron = exists and (is_megatron_checkpoint(load_path) or bool(getattr(args, "ckpt_step", None)))
     iteration_dir = (
         _resolve_checkpoint_iteration_dir(load_path, ckpt_step=getattr(args, "ckpt_step", None)) if megatron else None
     )
@@ -566,8 +663,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = state["exists"]
 
     if state["megatron"]:
+        current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
         iter_dir = state["iteration_dir"]
         if not state["valid_iteration"]:
+            if current_is_rm:
+                raise RuntimeError(f"RM resume requires an existing checkpoint iteration: {iter_dir}")
             logger.warning(
                 f"Cannot resume from {load_path}: iteration directory {iter_dir} does not exist "
                 "(deleted or interrupted save). Falling back to the HF checkpoint, "
@@ -576,6 +676,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             return _load_checkpoint_hf(ddp_model=ddp_model, optimizer=optimizer, args=args, load_path=None)
 
         if load_optimizer and not state["has_optimizer"]:
+            if current_is_rm:
+                raise RuntimeError(f"RM resume requires optimizer state in checkpoint {iter_dir}")
             logger.warning(
                 f"Checkpoint {iter_dir} contains no optimizer state (saved with --no-save-optim). "
                 "Loading model weights only; the optimizer and LR scheduler start from scratch."
@@ -590,7 +692,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         ):
             logger.info("Applied compatibility fix for native-FP32 CPU-offloaded optimizer checkpoint load")
         lora_metadata = _collective_checkpoint_probe(
-            lambda: _read_lora_checkpoint_metadata(load_path, ckpt_step=getattr(args, "ckpt_step", None))
+            lambda: _metadata_value(
+                _load_checkpoint_metadata(args, ddp_model, Path(iter_dir)).get("args"),
+                _LORA_CHECKPOINT_METADATA_ATTR,
+            )
         )
         try:
             if lora_metadata is None:
@@ -683,7 +788,7 @@ def _format_opt_param_scheduler_error(args, original: AssertionError) -> str:
     )
 
 
-def _is_megatron_checkpoint(path: str | Path) -> bool:
+def is_megatron_checkpoint(path: str | Path) -> bool:
     return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
         re.fullmatch(r"iter_\d{7}", Path(path).name)
     )

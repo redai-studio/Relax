@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
@@ -1091,7 +1092,7 @@ def get_data_from_transfer_queue(
 
 def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> None:
     """Count raw SFT mask positions before moving the masks to the GPU."""
-    if getattr(args, "loss_type", None) != "sft" or "learn_lengths" in rollout_data:
+    if not is_sft_mode(args) or "learn_lengths" in rollout_data:
         return
     learn_lengths = []
     for mask in rollout_data["loss_masks"]:
@@ -1109,6 +1110,15 @@ def post_process_rollout_data(args, rollout_data):
     _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
+    if "tokens" not in rollout_data and "chosen_tokens" in rollout_data:
+        # Preference rows stay pair-atomic in TransferQueue. Expand them only
+        # after sampling, before the generic sequence post-processing below.
+        from relax.backends.megatron.data import expand_preference_rollout_data
+
+        expanded = expand_preference_rollout_data(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
+
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
     cuda_dev = device_utils.make_current_torch_device()

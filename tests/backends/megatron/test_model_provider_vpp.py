@@ -49,6 +49,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
 
     megatron = types.ModuleType("megatron")
     core = types.ModuleType("megatron.core")
+    optimizer = types.ModuleType("megatron.core.optimizer")
     mpu = types.ModuleType("megatron.core.mpu")
     tensor_parallel = types.ModuleType("megatron.core.tensor_parallel")
     models = types.ModuleType("megatron.core.models")
@@ -59,6 +60,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
     transformer_config = types.ModuleType("megatron.core.transformer.transformer_config")
     training = types.ModuleType("megatron.training")
     arguments = types.ModuleType("megatron.training.arguments")
+    tokenizer_package = types.ModuleType("megatron.training.tokenizer")
+    tokenizer = types.ModuleType("megatron.training.tokenizer.tokenizer")
     bridge = types.ModuleType("megatron.bridge")
     misc = types.ModuleType("relax.utils.misc")
 
@@ -83,6 +86,7 @@ def _install_fake_megatron(monkeypatch, provider=None):
     mpu.get_tensor_model_parallel_rank = lambda: 0
     core.mpu = mpu
     core.tensor_parallel = tensor_parallel
+    optimizer.OptimizerConfig = SimpleNamespace
     gpt.GPTModel = _FakeGPTModel
     gpt_layer_specs.get_gpt_decoder_block_spec = lambda *args, **kwargs: object()
     gpt_layer_specs.get_gpt_layer_local_spec = lambda *args, **kwargs: object()
@@ -90,12 +94,16 @@ def _install_fake_megatron(monkeypatch, provider=None):
     spec_utils.import_module = lambda path: object()
     transformer_config.TransformerConfig = _FakeTransformerConfig
     arguments.core_transformer_config_from_args = lambda args: _FakeTransformerConfig()
+    arguments.parse_args = lambda *args, **kwargs: None
+    arguments.validate_args = lambda *args, **kwargs: None
+    tokenizer._vocab_size_with_padding = lambda *args, **kwargs: None
     bridge.AutoBridge = _FakeAutoBridge
     misc.load_function = lambda path: None
 
     modules = {
         "megatron": megatron,
         "megatron.core": core,
+        "megatron.core.optimizer": optimizer,
         "megatron.core.mpu": mpu,
         "megatron.core.tensor_parallel": tensor_parallel,
         "megatron.core.models": models,
@@ -106,6 +114,8 @@ def _install_fake_megatron(monkeypatch, provider=None):
         "megatron.core.transformer.transformer_config": transformer_config,
         "megatron.training": training,
         "megatron.training.arguments": arguments,
+        "megatron.training.tokenizer": tokenizer_package,
+        "megatron.training.tokenizer.tokenizer": tokenizer,
         "megatron.bridge": bridge,
         "relax.utils.misc": misc,
     }
@@ -236,6 +246,37 @@ def test_bridge_critic_provider_registers_value_head_before_ddp(monkeypatch):
     assert model.output_layer.out_features == 1
     assert ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR not in model._modules
     assert all("relax_hf_output_layer" not in name for name, _ in model.named_parameters())
+
+
+def test_bridge_reward_model_provider_registers_biasless_scalar_head_and_restores_on_error(monkeypatch):
+    class _FakeBridgeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=4, sequence_parallel=False)
+            self.output_layer = torch.nn.Linear(4, 8)
+
+    module, _ = _load_model_provider(monkeypatch, provider=_FakeProvider(_FakeBridgeModel()))
+    args = _bridge_args(loss_type="rm")
+    model = module.get_model_provider_func(args, role="actor")(post_process=True)
+    reward_head = model.output_layer
+    parameter_ids = tuple(id(parameter) for parameter in reward_head.parameters())
+
+    assert isinstance(reward_head, ppo_utils.LinearForLastLayer)
+    assert tuple(reward_head.weight.shape) == (1, 4)
+    assert reward_head.bias is None
+    assert list(model.state_dict()) == ["output_layer.weight"]
+
+    with pytest.raises(RuntimeError, match="bridge failed"):
+        with ppo_utils.use_critic_lm_head_for_hf_load([model]):
+            assert model.output_layer.out_features == 8
+            raise RuntimeError("bridge failed")
+
+    assert model.output_layer is reward_head
+    assert tuple(id(parameter) for parameter in reward_head.parameters()) == parameter_ids
+    assert not hasattr(model, ppo_utils._RELAX_HF_OUTPUT_LAYER_ATTR)
+
+    reward_head.weight.main_grad = torch.zeros_like(reward_head.weight)
+    assert ppo_utils.validate_reward_model_head_registration([model], object()) == parameter_ids
 
 
 def test_hf_load_context_restores_same_value_head(monkeypatch):

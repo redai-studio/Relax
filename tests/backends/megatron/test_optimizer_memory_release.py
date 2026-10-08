@@ -12,7 +12,7 @@ def test_gradient_finalization_releases_cache_before_collectives(monkeypatch):
 
     events = []
     model, num_tokens, pg_collection = object(), object(), object()
-    monkeypatch.setattr(module.device_utils, "empty_cache", lambda: events.append("release"))
+    monkeypatch.setattr(module.device_module, "empty_cache", lambda: events.append("release"))
     monkeypatch.setattr(module, "available_memory", lambda: {})
 
     def finalize(actual_model, actual_tokens, *, pg_collection, force_all_reduce):
@@ -49,7 +49,8 @@ def test_train_one_step_releases_cache_before_optimizer_collectives(monkeypatch,
     monkeypatch.setattr(module.capture_hooks, "end_step_for", Mock())
     monkeypatch.setattr(module, "maybe_verify_critic_value_head_movement", Mock())
     monkeypatch.setattr(module.mpu, "is_pipeline_last_stage", lambda **_: False)
-    monkeypatch.setattr(module.device_utils, "empty_cache", lambda: events.append("release"))
+    monkeypatch.setattr(module, "_is_global_zero_token_step", lambda _: False)
+    monkeypatch.setattr(module.device_module, "empty_cache", lambda: events.append("release"))
     memory_probe = Mock(return_value={"free_GB": 16})
     monkeypatch.setattr(module, "available_memory", memory_probe)
 

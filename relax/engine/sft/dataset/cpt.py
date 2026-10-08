@@ -94,6 +94,8 @@ def truncate_qwen3_5_cpt(
     # These are CPU dataset tensors, before any GPU transfer or packing.
     ids = tokens.tolist()
     protected = {index for index, token in enumerate(ids) if token in protected_ids}
+    if len(protected) > capacity:
+        raise ValueError(f"CPT protected placeholder count {len(protected)} exceeds token capacity {capacity}")
     remaining = [index for index in range(len(ids)) if index not in protected]
     budget = max(0, capacity - len(protected))
     if budget:

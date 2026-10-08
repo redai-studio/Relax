@@ -54,10 +54,10 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--hf-checkpoint` | str | None | HuggingFace 模型检查点路径。用于初始化 SGLang 和提供 tokenizer。不需要包含最新的参数，只需与训练模型架构一致 |
-| `--ref-load` | str | None | 参考模型检查点路径。当 `--load` 未设置时，会作为训练的初始检查点 |
-| `--ref-ckpt-step` | int | None | 参考模型检查点的步数 |
-| `--load` | str | None | Actor 模型检查点加载路径。断点续训时指向此路径 |
+| `--hf-checkpoint` | str | None | Hugging Face 模型路径，用于提供 tokenizer、模型配置和初始化 SGLang。DPO 未设置 `--ref-load` 时，也会从此处加载冻结参考模型的权重。 |
+| `--ref-load` | str | None | 参考模型检查点路径；未设置 `--load` 时，也用于初始化训练。DPO 支持本地 Hugging Face 或原生 Megatron 检查点；省略此参数时使用 `--hf-checkpoint`。 |
+| `--ref-ckpt-step` | int | None | 从原生 Megatron 参考检查点加载的步数。默认使用检查点记录的迭代。 |
+| `--load` | str | None | 用于初始化或恢复训练的 Actor 检查点。DPO 续训时指向已保存的 DPO 检查点；从原生 SFT 检查点开始新训练时需同时设置 `--finetune`。 |
 | `--save` | str | None | 训练中模型的保存路径 |
 | `--save-interval` | int | None | 模型保存间隔（步数） |
 | `--save-hf` | str | None | Megatron 后端时保存 HuggingFace 格式模型的路径。路径可包含 `{rollout_id}` 占位符 |
@@ -309,7 +309,7 @@ bash scripts/training/text/run-qwen3-4B-fp16-8xgpu.sh \
 
 | 参数 | 类型 | 默认值 | 可选值 | 说明 |
 |------|------|--------|--------|------|
-| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `custom_loss` | 损失类型。`policy_loss` 跑 PPO/GRPO 等 RL 训练；`sft` 跑监督微调（详见 [SFT 配置](#sft-配置)）；`custom_loss` 需配 `--custom-loss-function-path`。`sft_loss` 是 `sft` 的已弃用别名。 |
+| `--loss-type` | str | policy_loss | `policy_loss`, `sft`, `dpo`, `rm`, `custom_loss` | 训练损失。`policy_loss` 用于 PPO/GRPO 等 RL 训练；`sft` 用于监督微调；`dpo` 用于偏好优化；`rm` 用于训练奖励模型；`custom_loss` 需配 `--custom-loss-function-path`。详见 [离线训练配置](#离线训练配置)和 [DPO 训练](./dpo-training.md)。`sft_loss` 和 `sft-loss` 是 `sft` 的已弃用别名。 |
 | `--custom-loss-function-path` | str | None | - | 自定义损失函数路径 |
 | `--eps-clip` | float | 0.2 | - | PPO 裁剪范围（下界） |
 | `--eps-clip-high` | float | None | - | PPO 裁剪上界。None 时等于 `--eps-clip` |
@@ -396,26 +396,44 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 
 ---
 
-## SFT 配置
+## 离线训练配置
 
-以下参数仅在 `--loss-type sft` 下生效。SFT 流水线由 `SFTStreamingDataset` producer（把 packed 样本推入 TransferQueue 的 `sft_<rollout_id>` 分区）和 `MegatronTrainRayActor` consumer（训练、周期性 PPL eval、可选生成式 predict）组成。
+普通 SFT（`--loss-type sft`）、DPO（`--loss-type dpo`）和奖励模型训练（`--loss-type rm`）共用离线 producer/consumer 流水线。Producer 从 `--prompt-data` 读取数据，将批次写入 TransferQueue 的 `sft_<rollout_id>` 分区，再由 Megatron Actor 训练。共享的队列和 CPU 预取参数保留 `--sft-*` 名称。生成式预测、chunked logits 和异步预打包仍仅支持普通 SFT。
 
 ### 训练控制
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-size` | float | None | 从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
-| `--sft-predict-interval` | int | None | 每 N 个 rollout step 在 eval 集上跑一次生成式 predict，把生成结果写到 `<save>/predict/predictions_step_<rollout_id>.jsonl`。设置该参数后会自动拉起 Rollout 角色（SGLang 必须在线）。它是 always-on 的 PPL eval（`--eval-interval`）的生成式补充。**必需**：`--save`（写到 `<save>/predict/` 下）以及至少一个 eval 数据源（`--eval-prompt-data` / `--eval-config` / `--eval-size`）。 |
+| `--eval-size` | float | None | 用于离线训练。从 `--prompt-data` 切出一份 holdout eval 集，而不是另外指定 `--eval-prompt-data`。值 <1 视为训练集的占比（例如 `0.05` → 5%）；值 ≥1 视为绝对样本数。行 ID 会用 `--seed` 随机切分一次，被预留的行会从训练池里移除，所以训练样本和 eval 样本永不重叠。与 `--eval-prompt-data` 互斥。 |
+| `--sft-predict-interval` | int | None | 仅用于语言模型 SFT。每 N 个训练 step 在 eval 集上生成回答，写入 `<save>/predict/predictions_step_<rollout_id>.jsonl`，并自动启动 Rollout 角色。需要 `--save`，以及 `--eval-prompt-data` 或 `--eval-size` 中的一个评估数据源。 |
+| `--sft-max-in-flight-steps` | int | None | 离线训练的 TransferQueue 缓冲深度，包含当前训练 step。设为正整数 N 时，会将 `--max-staleness` 设为 N − 1。 |
+| `--sft-train-data-prefetch` | flag | False | 在 CPU 工作线程上预取离线训练下一步的原始 TransferQueue 数据。需要 `--per-rank-fetch`，且至少允许两个 in-flight step；与 `--sft-async-prepack` 互斥。 |
+| `--sft-tq-timeout-minutes` | int | None | 离线 producer 等待 TransferQueue 的超时时间。默认沿用 `--distributed-timeout-minutes`；显式设置时必须为正数。 |
 
-### 流式数据集预取
+### 偏好训练
 
-SFT producer 用自己的 `PrefetchBuffer`，跟 rollout 数据源的 `--prefetch-*` 参数互相独立。
+使用 `--loss-type dpo` 进行 DPO 训练，使用 `--loss-type rm` 训练奖励模型。保持 `--task-type causal_lm`，由损失类型选择偏好训练路径。数据格式和启动示例见 [DPO 训练](./dpo-training.md)。
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--sft-prefetch-buffer-size` | int | 256 | SFT 流式数据集 PrefetchBuffer 缓存的最大预加载样本数。设为 0 禁用预取，producer 会回退到基于 ProcessorPool 的 `asyncio.gather` 路径做 batch 级并行。 |
-| `--sft-prefetch-chunk-size` | int | 32 | 每轮派发给 SFT 预取线程池的 chunk 大小。 |
-| `--sft-prefetch-num-workers` | int | 4 | SFT PrefetchBuffer 内部用于 I/O 密集型媒体解码（视频/图像）的工作线程数。 |
+| `--preference-chosen-key` | str | chosen | 数据集中首选回答或对话的字段名。 |
+| `--preference-rejected-key` | str | rejected | 数据集中非首选回答或对话的字段名。 |
+| `--preference-max-length` | int | 1024 | 每条分支的 prompt 与 completion token 总数上限。两条分支保留相同的 prompt 后缀，且上限不能超过 `--seq-length`。 |
+| `--preference-max-completion-length` | int | 512 | 每条分支的 completion token 上限。过长回答保留开头的 token，再裁剪共享 prompt 以满足 `--preference-max-length`；此值不能超过该总长度上限。 |
+| `--dpo-beta` | float | 0.1 | 仅用于 DPO。缩放策略与参考模型的对数概率差值，必须为有限正数。 |
+| `--dpo-reference-free` | flag | False | 仅用于 DPO。显式启用 reference-free logistic DPO；参考模型配置缺失或无效时会报错，不会自动切换到此模式。 |
+
+`--global-batch-size` 按样本对计数。`--max-tokens-per-gpu` 计算两条完整分支的 token 数，因此共享 prompt 会计入两次。应用上述显式长度限制后，默认的 `--sft-oversize-strategy keep` 会保留仍超出预算的样本对，并将其单独放入一个微批次。其他策略见[超长样本处理](#超长样本处理)。偏好训练不支持 `--sft-predict-interval`、`--sft-chunked-logits` 或 `--sft-async-prepack`。
+
+### 流式数据集预取
+
+离线 producer 用自己的 `PrefetchBuffer` 预取 SFT 样本或偏好样本对，与 rollout 数据源的 `--prefetch-*` 参数互相独立。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--sft-prefetch-buffer-size` | int | 256 | 离线数据集 PrefetchBuffer 最多缓存的样本数或偏好样本对数。设为 0 可禁用后台预取。 |
+| `--sft-prefetch-chunk-size` | int | 32 | 每轮派发给预取线程池的样本数或偏好样本对数。 |
+| `--sft-prefetch-num-workers` | int | 4 | 离线数据集预取的工作线程数；多模态 SFT 中也用于媒体解码。 |
 
 ### TransferQueue 分片 Producer
 
@@ -459,6 +477,10 @@ SFT producer 如何处理 tokenize + 多模态展开后长度超过单卡容量�
 | `--sft-oversize-strategy` | str | keep | `skip`, `keep`, `truncate_left`, `truncate_right`, `custom` | `skip` 丢弃样本；`keep` 原样返回（可能下游 OOM）；`truncate_left` 保留末尾 `capacity` 个 token；`truncate_right` 保留开头 `capacity` 个 token；`custom` 委托给 `--sft-oversize-custom-function-path`。⚠ 直接截多模态样本可能导致 `multimodal_train_inputs` 错位——需要同时裁剪媒体输入时请用 `custom`。 |
 | `--sft-oversize-custom-function-path` | str | None | - | 在 `--sft-oversize-strategy custom` 时必填。指向一个 Python 可导入函数，签名为 `def truncate(tokens, loss_mask, capacity, idx) -> (tokens, loss_mask) \| None`。返回 `None` 等同于 `skip`。 |
 
+偏好训练先应用 `--preference-max-length` 和 `--preference-max-completion-length`，再使用上述选项处理超长样本对。容量按两条分支的总长度计算：`keep` 保留整对样本并单独组成一个微批次，`skip` 丢弃整对样本。
+
+使用 `truncate_left`、`truncate_right` 或 `custom` 时，Relax 会在两条分支之间分配整对样本的预算。左截断保留相同的 prompt 后缀，右截断保留每条分支的开头。自定义函数接收超出所分配容量的分支及其容量；任一分支返回 `None` 都会丢弃整对样本。处理后，若任一分支没有参与训练的回答 token、两条回答相同，或两条分支的 prompt 不同，则会报错。
+
 ::: tip 相关数据集参数
 SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--input-key`、`--label-key`、`--conversation-key-map`（sharegpt 风格数据集）、`--multimodal-keys`、`--system-prompt`、`--tool-key`。
 :::
@@ -469,9 +491,9 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--eval-interval` | int | None | 评估间隔（Rollout 轮数） |
+| `--eval-interval` | int | None | 在线 RL 按 rollout 轮数计算评估间隔，离线训练按已完成的优化器 step 数计算。 |
 | `--eval-prompt-data` | str (列表) | None | 评估数据集，格式：`dataset_name /path/to/data.jsonl`，可指定多对 |
-| `--eval-config` | str | None | OmegaConf YAML/JSON 评估配置文件路径。设置时覆盖 `--eval-prompt-data` |
+| `--eval-config` | str | None | 在线 RL 的 OmegaConf YAML/JSON 评估配置，设置时覆盖 `--eval-prompt-data`。离线训练使用 `--eval-prompt-data` 或 `--eval-size`。 |
 | `--eval-function-path` | str | None | 评估生成函数路径。None 时使用 `--rollout-function-path` |
 | `--skip-eval-before-train` | flag | False | 是否跳过训练前的评估 |
 | `--eval-input-key` | str | None | 评估数据中输入字段的 key。None 时使用 `--input-key` |
@@ -490,9 +512,11 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 ## Reward 配置
 
+这些参数配置 rollout 生成样本之后的奖励计算。`--loss-type rm` 用于训练奖励模型，`--rm-type` 则选择在线 RL 使用的打分器。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--rm-type` | str | None | 内置 Reward 模型类型 |
+| `--rm-type` | str | None | 内置奖励函数或服务类型，例如规则打分器 `dapo` 或 `remote_rm` |
 | `--rm-type-fallback` | str | None | 未知/缺失 Reward 类型的回退策略：`zero` 记 0 分并告警，注册名则路由到该 Reward；None 保持报错行为 |
 | `--rm-type-infer` | flag | False | 无显式类型时按注册的 label matcher 推断 Reward 类型；与显式类型冲突时告警并以显式类型优先 |
 | `--custom-rm-path` | str | None | 自定义 Reward 函数路径。单样本函数接收一个样本；batch/group 函数接收完整样本列表，并为每个样本返回一个结果。会绕过格式感知路由 |
