@@ -33,7 +33,7 @@ class _FakeScheduler:
 
 @pytest.mark.parametrize("num_model_chunks", [1, 2])
 def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_model_chunks):
-    from relax.backends.megatron import model as model_module
+    model_module = pytest.importorskip("relax.backends.megatron.model")
 
     args = Namespace(
         allgather_cp=False,
@@ -71,13 +71,19 @@ def test_train_one_step_counts_each_logical_microbatch_once(monkeypatch, num_mod
     monkeypatch.setattr(model_module.capture_hooks, "end_step_for", lambda: None)
     monkeypatch.setattr(model_module, "maybe_verify_critic_value_head_movement", lambda *_args: None)
     monkeypatch.setattr(model_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model_module.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(model_module.torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(model_module.mpu, "get_data_parallel_group", lambda **_kwargs: object())
     monkeypatch.setattr(model_module.mpu, "is_pipeline_last_stage", lambda **_kwargs: True)
     monkeypatch.setattr(model_module.torch.distributed, "all_reduce", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(model_module.torch.distributed, "get_world_size", lambda _group: 1)
 
     def fake_loss_function(_args, _batch, _num_microbatches, logits, **_kwargs):
-        return logits.sum() * 0, 1, {"keys": ["loss"], "values": torch.tensor([0.0, 1.0])}
+        return (
+            logits.sum() * 0,
+            1,
+            {"keys": ["loss"], "values": torch.tensor([0.0, 1.0]), "num_tokens": torch.tensor(1)},
+        )
 
     monkeypatch.setattr(model_module, "loss_function", fake_loss_function)
 

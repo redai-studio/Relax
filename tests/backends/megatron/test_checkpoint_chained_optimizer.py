@@ -162,7 +162,7 @@ def test_checkpoint_chained_optimizer_resumes_adam_and_scheduler(
 
         monkeypatch.setattr(checkpoint, "get_args", lambda: args)
         monkeypatch.setattr(checkpoint, "_load_checkpoint_megatron", load_on_cpu)
-        assert checkpoint.load_checkpoint(None, restored[0], restored[1], {}, False) == (3, 0)
+        assert checkpoint.load_checkpoint([Namespace(role="actor")], restored[0], restored[1], {}, False) == (3, 0)
         assert not args.no_load_optim
         assert restored[1].state_dict() != scheduler_before
         _assert_same(reference, restored)

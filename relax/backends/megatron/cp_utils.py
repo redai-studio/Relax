@@ -5,7 +5,14 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from megatron.core import mpu
+
+
+try:
+    from megatron.core import mpu
+except ModuleNotFoundError as exc:
+    if exc.name not in {"megatron", "megatron.core"}:
+        raise
+    mpu = None
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.reloadable_process_group import ReloadableProcessGroup

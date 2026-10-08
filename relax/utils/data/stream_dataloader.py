@@ -14,6 +14,7 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
@@ -1091,7 +1092,7 @@ def get_data_from_transfer_queue(
 
 def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> None:
     """Count raw SFT mask positions before moving the masks to the GPU."""
-    if getattr(args, "loss_type", None) != "sft" or "learn_lengths" in rollout_data:
+    if not is_sft_mode(args) or "learn_lengths" in rollout_data:
         return
     learn_lengths = []
     for mask in rollout_data["loss_masks"]:

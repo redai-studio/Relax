@@ -23,11 +23,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _check_layout_round_trip(cp_group):
-    from megatron.core.context_parallel_layout import (
-        contiguous_to_zigzag_chunks,
-        get_thd_context_parallel_rank_indices,
-        zigzag_to_contiguous_chunks,
-    )
+    from megatron.core import context_parallel_layout as cpl
 
     rank, world_size = cp_group.rank(), cp_group.size()
     device = torch.device("cuda", rank)
@@ -42,20 +38,40 @@ def _check_layout_round_trip(cp_group):
         + torch.arange(3, dtype=torch.float64, device=device).unsqueeze(0) * 1e6
     )
 
-    zig_idx = get_thd_context_parallel_rank_indices(cu, world_size, rank, "zigzag")
-    con_idx = get_thd_context_parallel_rank_indices(cu, world_size, rank, "contiguous")
+    zig_idx = torch.cat(
+        [
+            part.reshape(2 * world_size, length // (2 * world_size))[[rank, 2 * world_size - rank - 1]].flatten()
+            for part, length in zip(torch.arange(total, device=device).split(lengths), lengths)
+        ]
+    )
+    con_idx = torch.arange(rank * (total // world_size), (rank + 1) * (total // world_size), device=device)
     local_zig = full[zig_idx]
 
-    got_con = zigzag_to_contiguous_chunks(local_zig, cp_group, seq_dim=0, cu_seqlens=cu)
+    def convert(value, source, target, cu_seqlens=None):
+        # TODO: Remove the legacy layout API branch once CI uses the upgraded Megatron image.
+        if hasattr(cpl, "zigzag_to_contiguous_chunks"):
+            fn = cpl.zigzag_to_contiguous_chunks if source == "zigzag" else cpl.contiguous_to_zigzag_chunks
+            return fn(value, cp_group=cp_group, seq_dim=0, cu_seqlens=cu_seqlens)
+        from megatron.core.context_parallel_layout.conversion import convert_cp_partition_mode
+
+        return convert_cp_partition_mode(
+            value,
+            source_partition_mode=source,
+            target_partition_mode=target,
+            cp_group=cp_group,
+            cu_seqlens=cu_seqlens,
+        )
+
+    got_con = convert(local_zig, "zigzag", "contiguous", cu)
     assert torch.equal(got_con, full[con_idx]), f"rank {rank}: THD zigzag->contiguous is wrong"
-    got_zig = contiguous_to_zigzag_chunks(got_con, cp_group=cp_group, seq_dim=0, cu_seqlens=cu)
+    got_zig = convert(got_con, "contiguous", "zigzag", cu)
     assert torch.equal(got_zig, local_zig), f"rank {rank}: THD round trip is not identity"
 
     # SBHD: chunk-level swap without packed sequence metadata.
     seq_local = 2 * world_size * 4
     sbhd = torch.arange(seq_local * 2 * 3, dtype=torch.float64, device=device).reshape(seq_local, 2, 3) + rank * 1e9
-    swapped = zigzag_to_contiguous_chunks(sbhd, cp_group, seq_dim=0)
-    back = contiguous_to_zigzag_chunks(swapped, cp_group=cp_group, seq_dim=0)
+    swapped = convert(sbhd, "zigzag", "contiguous")
+    back = convert(swapped, "contiguous", "zigzag")
     assert torch.equal(back, sbhd), f"rank {rank}: SBHD round trip is not identity"
 
 
@@ -156,7 +172,7 @@ def _use_one_fla_config():
     triton.autotune = single_config
 
 
-def _worker_gdn_cp(rank, init_method):
+def _worker_gdn_cp(rank, init_method, tested_mode):
     torch.cuda.set_device(rank)
     _use_one_fla_config()  # Install before Megatron/FLA imports create kernels.
     import torch.distributed as dist
@@ -170,14 +186,16 @@ def _worker_gdn_cp(rank, init_method):
     parallel_state.initialize_model_parallel(context_parallel_size=2)
     try:
         set_args(SimpleNamespace(recompute_granularity="full"))
-        _patch_gdn_for_dynamic_cp()
+        _patch_gdn_for_dynamic_cp(tested_mode)
         cp_group = parallel_state.get_context_parallel_group()
         _check_layout_round_trip(cp_group)
         solo = [dist.new_group([r]) for r in range(2)][rank]
-        models = {mode: _build_gdn(mode) for mode in ("chunkwise", "all_gather")}
+        modes = ("chunkwise", "all_gather") if tested_mode == "all_gather" else ("chunkwise",)
+        models = {mode: _build_gdn(mode) for mode in modes}
         for param in models["chunkwise"].parameters():
             dist.broadcast(param.data, src=0)
-        models["all_gather"].load_state_dict(models["chunkwise"].state_dict())
+        if "all_gather" in models:
+            models["all_gather"].load_state_dict(models["chunkwise"].state_dict())
 
         # Unequal packed samples; the contiguous CP boundary at 512 splits the
         # first sample, exercising recurrent/convolution state across ranks.
@@ -213,8 +231,10 @@ def _worker_gdn_cp(rank, init_method):
         shard = hidden[indices]
         grad_shard = grad_out[indices]
         for mode, gdn in models.items():
+            if mode != tested_mode:
+                continue
             out, dx, grads = _forward_backward(
-                gdn, shard, packed(cp_group, 2), grad_shard, recompute=mode == "all_gather"
+                gdn, shard, packed(cp_group, 2), grad_shard, recompute=mode == "all_gather" or len(models) == 1
             )
             for name, got, expected in (("output", out, ref_out), ("input gradient", dx, ref_dx)):
                 expected = expected[indices]
@@ -238,7 +258,12 @@ def _worker_gdn_cp(rank, init_method):
         dist.destroy_process_group()
 
 
-def test_gdn_cp_layout_and_gradients(tmp_path):
+@pytest.mark.parametrize("mode", ["chunkwise", "all_gather"])
+def test_gdn_cp_layout_and_gradients(tmp_path, mode):
     """Check exact layouts and CP=2 output/input/parameter gradients against
     CP=1."""
-    mp.spawn(_worker_gdn_cp, args=(f"file://{tmp_path / 'gdn_cp_init'}",), nprocs=2, join=True)
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    if mode == "all_gather" and not hasattr(GatedDeltaNet, "_resolve_thd_cu_seqlens"):
+        pytest.skip("installed MCore lacks all_gather support; rebuild with the current Relax Megatron patch")
+    mp.spawn(_worker_gdn_cp, args=(f"file://{tmp_path / 'gdn_cp_init'}", mode), nprocs=2, join=True)

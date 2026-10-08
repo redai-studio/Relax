@@ -95,6 +95,17 @@ def _patch_loaders(monkeypatch, load_image):
         monkeypatch.setitem(sys.modules, module_name, loader_module)
 
 
+def test_worker_media_loader_loads_images_without_video_or_audio_dependencies(monkeypatch):
+    image_utils = ModuleType("relax.utils.multimodal.image_utils")
+    image_utils.load_image = MagicMock(return_value="decoded image")
+    monkeypatch.setitem(sys.modules, image_utils.__name__, image_utils)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.video_utils", None)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.audio_utils", None)
+
+    assert _load_media_for_worker({"image": ["cat.png"], "video": [], "audio": []}) == {"images": ["decoded image"]}
+    image_utils.load_image.assert_called_once_with("cat.png")
+
+
 def test_worker_media_loader_reports_position(monkeypatch):
     load_image = MagicMock(side_effect=AssertionError("missing"))
     _patch_loaders(monkeypatch, load_image)

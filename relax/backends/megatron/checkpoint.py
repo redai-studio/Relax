@@ -17,6 +17,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
+from relax.engine.sft.runtime import is_rm_mode
 from relax.utils import megatron_bridge_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.hf_page_cache import warm_hf_checkpoint_page_cache
@@ -167,7 +168,7 @@ def _load_checkpoint_metadata(args, ddp_model, checkpoint_dir: Path) -> dict:
     from megatron.core import dist_checkpointing
 
     role = getattr(ddp_model[0], "role", "actor")
-    current_is_rm = role == "actor" and getattr(args, "loss_type", None) == "rm"
+    current_is_rm = role == "actor" and is_rm_mode(args)
     if current_is_rm and checkpoint_dir.name == "release":
         raise RuntimeError(
             "RM resume rejects release checkpoints because optimizer, scheduler, and RNG state are absent"
@@ -662,7 +663,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     exist = state["exists"]
 
     if state["megatron"]:
-        current_is_rm = getattr(args, "loss_type", None) == "rm" and getattr(ddp_model[0], "role", "actor") == "actor"
+        current_is_rm = is_rm_mode(args) and getattr(ddp_model[0], "role", "actor") == "actor"
         iter_dir = state["iteration_dir"]
         if not state["valid_iteration"]:
             if current_is_rm:

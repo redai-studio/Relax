@@ -49,7 +49,11 @@ def sglang_engine_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
 
     env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace()
+    env.Envs = SimpleNamespace(
+        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
+        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
+        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
+    )
     monkeypatch.setitem(sys.modules, "relax.utils.env", env)
 
     http_utils = ModuleType("relax.utils.http_utils")
@@ -66,18 +70,14 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
-    # Force a fresh import so the module binds to the stubbed dependencies above,
-    # but restore the original module object on teardown. Leaving the key popped
-    # corrupts sys.modules for any later test that patches this module: their
-    # patch() re-imports a *new* module object distinct from the one already
-    # bound in other test files' top-level imports, so the patch silently misses.
-    original_module = sys.modules.pop("relax.backends.sglang.sglang_engine", None)
-    module = importlib.import_module("relax.backends.sglang.sglang_engine")
-    yield module
-    if original_module is not None:
-        sys.modules["relax.backends.sglang.sglang_engine"] = original_module
-    else:
-        sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    # Track both import caches before re-importing with the test dependencies.
+    # monkeypatch restores their original presence and objects at teardown.
+    module_name = "relax.backends.sglang.sglang_engine"
+    parent = importlib.import_module("relax.backends.sglang")
+    monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
+    monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+    del sys.modules[module_name]
+    yield importlib.import_module(module_name)
 
 
 class _Response:

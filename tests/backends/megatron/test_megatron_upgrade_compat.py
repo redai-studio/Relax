@@ -78,12 +78,13 @@ def gdn_types(monkeypatch):
     return GatedDeltaNet, TransformerConfig, calls, namespace
 
 
-def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types):
+@pytest.mark.parametrize("mode", ["headwise", "chunkwise"])
+def test_megatron_upgrade_native_gdn_preserves_config_and_forward(gdn_types, mode):
     gdn, config, _, namespace = gdn_types
     gdn._prepare_input_for_gated_delta_rule = lambda self: None
     original_forward, original_post_init = gdn.forward, config.__post_init__
 
-    namespace["_patch_gdn_for_dynamic_cp"]()
+    namespace["_patch_gdn_for_dynamic_cp"](mode)
 
     assert gdn.forward is original_forward
     assert config.__post_init__ is original_post_init

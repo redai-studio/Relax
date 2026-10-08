@@ -8,14 +8,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from conftest import AwaitableValue, create_test_manager, make_engine_group, make_mock_engine, make_rollout_server
+from conftest import (
+    HAS_DEPS,
+    AwaitableValue,
+    create_test_manager,
+    make_engine_group,
+    make_mock_engine,
+    make_rollout_server,
+)
 from ray.core.generated.gcs_pb2 import ActorTableData
 
-from relax.backends.megatron import actor as actor_module
-from relax.backends.sglang import sglang_engine
 from relax.distributed.checkpoint_service.client import engine as client_module
 from relax.distributed.checkpoint_service.client.engine import CheckpointEngineClient
-from relax.distributed.ray import rollout
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +32,9 @@ def single_rank_collective(monkeypatch):
 
 
 def make_recovery():
+    rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
+    if not HAS_DEPS:
+        pytest.skip("Requires rollout runtime dependencies for shared Ray test helpers")
     engine = make_mock_engine(url="http://engine-b:30000")
     engine._actor_id.hex.return_value = "actor-b"
     engine._get_local_state.return_value = ActorTableData.ALIVE
@@ -52,6 +59,8 @@ def test_recovered_engine_registers_once_after_successful_sync(patch_ray_get):
 @pytest.mark.parametrize("reason", ["not_synced", "replacement", "draining", "evicted", "no_lease", "pending"])
 def test_recovery_registration_rejects_unsafe_candidates(reason, patch_ray_get):
     manager, group, engine, record = make_recovery()
+    from relax.distributed.ray import rollout
+
     ids = ["actor-b"]
     if reason == "not_synced":
         ids = []
@@ -161,6 +170,7 @@ def test_same_endpoint_replacement_invalidates_weight_group_cache():
 
 @pytest.mark.parametrize("fail,actor_fwd_only", [(False, False), (True, False), (False, True)])
 def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail, actor_fwd_only):
+    actor_module = pytest.importorskip("relax.backends.megatron.actor", exc_type=ModuleNotFoundError)
     events = []
     actor = object.__new__(actor_module.MegatronTrainRayActor)
     actor.checkpoint_engine_client = make_client(fail=fail)
@@ -184,6 +194,7 @@ def test_actor_publishes_only_after_successful_rollout_update(monkeypatch, fail,
 
 
 def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
+    sglang_engine = pytest.importorskip("relax.backends.sglang.sglang_engine", exc_type=ModuleNotFoundError)
     engine = object.__new__(sglang_engine.SGLangEngine)
     engine.node_rank = 0
     engine.rank = 4
@@ -204,6 +215,8 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
 @pytest.mark.asyncio
 async def test_initial_scaleout_success_clears_pending_without_changing_recovery_flag():
     manager, group, engine, record = make_recovery()
+    from relax.distributed.ray import rollout
+
     group.skip_router_registration = True
     server = make_rollout_server(engine_groups=[])
     request = rollout.ScaleOutRequest(request_id="scale", status=rollout.ScaleOutStatus.CREATING)

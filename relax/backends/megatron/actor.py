@@ -35,8 +35,10 @@ from relax.engine.sft.image_prefetch import SFTImagePrefetch
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
     evaluation_step_for_rollout,
+    is_dpo_mode,
     is_offline_mode,
     is_preference_mode,
+    is_sft_mode,
     sft_partition_id,
     sft_partition_ids,
     sft_task_name,
@@ -410,7 +412,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # --sft-image-preprocess-on-rank: vision ranks rebuild pixel tensors
         # from image references inside the prefetch above. The CPU pool is
         # created lazily (it needs the built model chunks for the vision check).
-        self._sft_image_preprocess_on_rank = self.args.loss_type == "sft" and getattr(
+        self._sft_image_preprocess_on_rank = is_sft_mode(self.args) and getattr(
             self.args, "sft_image_preprocess_on_rank", False
         )
         self._sft_image_prefetch = SFTImagePrefetch(
@@ -519,7 +521,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weights_backuper.backup("actor")
 
             if with_ref:
-                if args.loss_type == "dpo":
+                if is_dpo_mode(args):
                     if resumed_from_megatron:
                         identity_path = reference_identity_path(args.load, loaded_rollout_id)
                         self._expected_dpo_reference_identity = read_reference_identity(identity_path)
@@ -804,7 +806,7 @@ class MegatronTrainRayActor(TrainRayActor):
         self._active_model_tag = target_tag
 
     def _is_standard_dpo(self) -> bool:
-        return self.args.loss_type == "dpo" and not self.args.dpo_reference_free
+        return is_dpo_mode(self.args) and not self.args.dpo_reference_free
 
     def _assert_dp_reference_digest_equal(self, digest: str) -> None:
         digests = [None] * dist.get_world_size(group=get_gloo_group())
@@ -1353,7 +1355,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 task_name = f"{base_task_name}_critic"
             else:
                 task_name = base_task_name
-            if self.args.loss_type == "sft" and self._sft_window_prefetcher is not None:
+            if is_sft_mode(self.args) and self._sft_window_prefetcher is not None:
                 data_fields = build_data_fields(self.args, consumer="actor")
                 rollout_data, prepared_iterator, num_microbatches = self._get_prefetched_sft_window(
                     task_name,

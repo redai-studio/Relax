@@ -95,7 +95,6 @@ def _encode_observation_for_generation(
     else:
         formatted_prompt = [message]
 
-    rollout_prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
     multimodal_inputs = None
     multimodal_train_inputs = None
     if processor:
@@ -105,11 +104,16 @@ def _encode_observation_for_generation(
         multimodal_inputs = process_vision_info([message], processor, use_audio_in_video=False)
         processor_output = processor(text=formatted_prompt, **multimodal_inputs)
         prompt_ids = processor_output["input_ids"][0]
+        rollout_prompt_ids = (
+            tokenizer.encode(formatted_prompt, add_special_tokens=False)
+            if isinstance(formatted_prompt, str)
+            else prompt_ids
+        )
         multimodal_train_inputs = {
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
         } or None
     else:
-        prompt_ids = rollout_prompt_ids
+        prompt_ids = rollout_prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
 
     if trim_length:
         prompt_ids = prompt_ids[trim_length:]
@@ -160,13 +164,15 @@ def _initialize_resources(args: Any, sample: Sample):
 
 
 def _prepare_initial_inputs(sample: Sample, processor, tokenizer):
-    rollout_prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
     if processor:
         processor_output = processor(text=sample.prompt, **(sample.multimodal_inputs or {}))
         prompt_ids = processor_output["input_ids"][0]
+        rollout_prompt_ids = (
+            tokenizer.encode(sample.prompt, add_special_tokens=False) if isinstance(sample.prompt, str) else prompt_ids
+        )
         init_mm_train = {k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]} or None
     else:
-        prompt_ids = rollout_prompt_ids
+        prompt_ids = rollout_prompt_ids = tokenizer.encode(sample.prompt, add_special_tokens=False)
         init_mm_train = None
 
     image_data = []

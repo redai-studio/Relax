@@ -23,6 +23,7 @@ from typing import Any
 import requests
 import torch.distributed as dist
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import tracking_utils
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -124,7 +125,7 @@ async def handle_predict(rollout, train_step: int) -> dict[str, Any]:
         # leaking KV/weights would starve the next training step's GPU
         # memory. RL: rollout manages its own offload in `_async_run`,
         # skip here.
-        if getattr(rollout.config, "loss_type", None) == "sft" and rollout.config.offload_rollout:
+        if is_sft_mode(rollout.config) and rollout.config.offload_rollout:
             try:
                 await rollout.rollout_manager.offload.remote()
             except Exception as exc:

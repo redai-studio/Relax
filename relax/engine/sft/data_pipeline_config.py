@@ -5,11 +5,11 @@
 from argparse import Namespace
 
 from relax.engine.sft.image_preprocessing_config import configure_image_preprocessing
-from relax.engine.sft.runtime import is_offline_mode
+from relax.engine.sft.runtime import is_offline_mode, is_sft_mode
 
 
 def configure_sft_data_pipeline(args: Namespace) -> None:
-    is_sft = getattr(args, "loss_type", None) in ("sft", "sft_loss", "sft-loss")
+    is_sft = is_sft_mode(args) or getattr(args, "loss_type", None) in ("sft_loss", "sft-loss")
     if is_sft or is_offline_mode(args):
         args.per_rank_fetch = args.train_backend == "megatron"
         lookahead = args.per_rank_fetch and args.max_staleness >= 1
