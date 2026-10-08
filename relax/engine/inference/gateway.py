@@ -47,6 +47,9 @@ _HOP_BY_HOP_HEADERS = frozenset({"host", "transfer-encoding", "connection", "kee
 
 # Seconds a client should wait before retrying a model that is not ready.
 DEFAULT_RETRY_AFTER_S = 5
+# Upper bound on asking a manager for its snapshot. Past it the gateway keeps
+# answering from the snapshot it has rather than hanging with the manager.
+SNAPSHOT_FETCH_TIMEOUT_S = 5.0
 
 
 def make_error_chunk(status_code: int, message: str) -> str:

@@ -28,7 +28,7 @@ from ray.serve.schema import LoggingConfig
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
 from relax.engine.inference.discovery import RoleSnapshot, role_snapshot_from_payloads
-from relax.engine.inference.gateway import InferenceGateway
+from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -220,7 +220,10 @@ class GenRM(Base):
         return None
 
     def _fetch_inference_snapshot(self) -> RoleSnapshot:
-        payloads = ray.get([manager.get_inference_snapshot.remote() for manager in self.genrm_managers.values()])
+        payloads = ray.get(
+            [manager.get_inference_snapshot.remote() for manager in self.genrm_managers.values()],
+            timeout=SNAPSHOT_FETCH_TIMEOUT_S,
+        )
         return role_snapshot_from_payloads(
             self.role,
             dict(zip(self.genrm_managers, payloads, strict=True)),

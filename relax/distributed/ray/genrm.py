@@ -13,7 +13,12 @@ import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
+from relax.distributed.ray.multi_engine_manager import (  # noqa: F401
+    SNAPSHOT_CONCURRENCY_GROUP,
+    SNAPSHOT_CONCURRENCY_GROUPS,
+    MultiEngineManager,
+    _is_engine_dead,
+)
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
@@ -29,7 +34,7 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote
+@ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
 class GenRMManager(MultiEngineManager):
     """Manager for GenRM engines.
 
@@ -65,6 +70,10 @@ class GenRMManager(MultiEngineManager):
         self.genrm_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
+
+    @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
+    def get_inference_snapshot(self) -> dict:
+        return super().get_inference_snapshot()
 
     def get_genrm_engines_and_lock(self):
         return self.engines, self.genrm_engine_lock, self.num_new_engines

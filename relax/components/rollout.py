@@ -12,7 +12,7 @@ from ray import serve
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
-from relax.engine.inference.gateway import InferenceGateway
+from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 from relax.utils.tq.lifecycle import attach_tq_client
@@ -899,7 +899,7 @@ class Rollout(Base):
     # --- OpenAI-compatible Chat Completion API (proxied to SGLang router) ---
 
     def _fetch_inference_snapshot(self) -> dict:
-        return ray.get(self.rollout_manager.get_inference_snapshot.remote())
+        return ray.get(self.rollout_manager.get_inference_snapshot.remote(), timeout=SNAPSHOT_FETCH_TIMEOUT_S)
 
     async def _ensure_sglang_base_url(self) -> str:
         if self._sglang_base_url is not None:

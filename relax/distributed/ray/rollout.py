@@ -30,6 +30,7 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutRequest,
     ScaleOutStatus,
 )
+from relax.distributed.ray.engine_pool import EnginePool, EnginePoolSpec
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.inference.discovery import (
     EngineState,
@@ -387,6 +388,130 @@ class EngineGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
+    def _engine_pool(self) -> EnginePool:
+        """The pool that runs this group's engines.
+
+        It shares ``all_engines`` by reference, so slots written here or by
+        ``RolloutManager`` are seen by both.
+        """
+        pool = self.__dict__.get("_pool")
+        if pool is None or pool.slots is not self.all_engines:
+            pool = self.__dict__["_pool"] = EnginePool(
+                EnginePoolSpec(
+                    actor_class=lambda: ray.remote(_resolve_rollout_engine_class(self.args)),
+                    resolve_placement=self._slot_placement,
+                    actor_options=self._slot_actor_options,
+                    ctor=self._slot_ctor,
+                    init_kwargs=self._slot_init_kwargs,
+                    teardown_calls=("shutdown", "unregister_dcs", "unregister_from_router"),
+                    teardown_timeout_s=10,
+                ),
+                self.all_engines,
+            )
+        pool.nodes_per_engine = self.nodes_per_engine
+        return pool
+
+    def __getstate__(self):
+        # The pool is rebuilt on demand; its spec closes over this group.
+        state = dict(self.__dict__)
+        state.pop("_pool", None)
+        return state
+
+    def _slot_placement(self, slot: int) -> tuple[tuple, bool, int]:
+        # The group never owns its placement group: RolloutManager does.
+        num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        return self.pg, False, self.gpu_offset + slot * num_gpu_per_engine
+
+    def _slot_actor_options(self, slot: int, pg: Any, bundle_index: int) -> dict:
+        num_gpus = 0.2
+        num_cpus = num_gpus
+
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=bundle_index,
+        )
+
+        env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
+            key: os.environ.get(key, default_val)
+            for key, default_val in {
+                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                # OPD per-position token_ids logprob patch: default off, enabled
+                # via env (affects the student engine too, like the teacher).
+                "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
+                # Native image OPD preserves sampled response IDs.
+                "SGLANG_MM_AVOID_RETOKENIZE": "true",
+                # The TP memory-imbalance check is overly conservative under
+                # colocate (the actor occupies GPUs at engine init and is
+                # offloaded before rollout), so disable it. Recent SGLang reads
+                # SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK (default True); the old
+                # SGL(ANG)_DISABLE_* vars are no longer honored — worse, the
+                # deprecation shim value-copies SGL_DISABLE_* into the ENABLE var,
+                # so setting them re-enables the check. Set ENABLE=false directly.
+                "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+                "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+                "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+                "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                "SLIME_ENABLE_PROFILING": "true",
+                # NOTE(sunhuo): disable custom all-reduce-v2 temporarily, as it may cause custom_all_reduce.cuh:37: CUDA error: invalid argument.
+                "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
+            }.items()
+        }
+        effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
+        effective_load_format = self.sglang_overrides.get(
+            "load_format", getattr(self.args, "sglang_load_format", "auto")
+        )
+        env_vars.update(
+            build_runai_streamer_env_for_load(
+                getattr(self.args, "model_source", None),
+                effective_model_path,
+                effective_load_format,
+            )
+        )
+        if getattr(self.args, "fp16", False):
+            env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
+
+        return {
+            "num_cpus": num_cpus,
+            "scheduling_strategy": scheduling_strategy,
+            "runtime_env": {
+                "env_vars": env_vars,
+            },
+            **get_ray_accelerator_kwargs(num_gpus),
+        }
+
+    def _slot_ctor(self, slot: int, base_gpu_id: int) -> tuple[tuple, dict]:
+        return (self.args,), {
+            "rank": self.rank_offset + slot,
+            "worker_type": self.worker_type,
+            "base_gpu_id": base_gpu_id,
+            "sglang_overrides": self.sglang_overrides,
+            "num_gpus_per_engine": self.num_gpus_per_engine,
+            "register_sigterm_handler": self.is_scaled_out,
+        }
+
+    def _slot_init_kwargs(self, slot: int, addr_and_ports: dict) -> dict:
+        return {
+            **addr_and_ports,
+            "router_ip": self.router_ip,
+            "router_port": self.router_port,
+            "skip_dcs_registration": self.skip_dcs_registration,
+            "skip_router_registration": self.skip_router_registration,
+            **({"require_router_registration": True} if self.require_router_registration else {}),
+        }
+
+    def lifecycle_states(self, resident: EngineState) -> list[EngineState]:
+        """State of each logical engine, parallel to ``engines``.
+
+        ``resident`` is what the manager's last completed memory switch left
+        the engines in. A switch issued through ``offload`` / ``onload`` that
+        the manager has not recorded as finished shows as draining / onloading.
+        """
+        pool = self._engine_pool()
+        pool.settle(resident)
+        return [pool.state(head) for head in pool.head_slots()]
+
     def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()``
         without waiting.
@@ -420,90 +545,13 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
-
-        rollout_engines = []
-        for i in range(len(self.all_engines)):
-            if self.all_engines[i] is not None:
-                continue
-
-            self.engine_init_records.pop(i, None)
-
-            global_rank = self.rank_offset + i
-            num_gpus = 0.2
-            num_cpus = num_gpus
-
-            # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
-
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
-
-            env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
-                key: os.environ.get(key, default_val)
-                for key, default_val in {
-                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                    # OPD per-position token_ids logprob patch: default off, enabled
-                    # via env (affects the student engine too, like the teacher).
-                    "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
-                    # Native image OPD preserves sampled response IDs through
-                    # SGLang's processor; returned IDs are checked per request.
-                    "SGLANG_MM_AVOID_RETOKENIZE": "true",
-                    # The TP memory-imbalance check is overly conservative under
-                    # colocate (the actor occupies GPUs at engine init and is
-                    # offloaded before rollout), so disable it. Recent SGLang reads
-                    # SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK (default True); the old
-                    # SGL(ANG)_DISABLE_* vars are no longer honored — worse, the
-                    # deprecation shim value-copies SGL_DISABLE_* into the ENABLE var,
-                    # so setting them re-enables the check. Set ENABLE=false directly.
-                    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
-                    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-                    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-                    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                    "SLIME_ENABLE_PROFILING": "true",
-                    # NOTE(sunhuo): disable custom all-reduce-v2 temporarily, as it may cause custom_all_reduce.cuh:37: CUDA error: invalid argument.
-                    "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
-                }.items()
-            }
-            effective_model_path = self.sglang_overrides.get("model_path", self.args.hf_checkpoint)
-            effective_load_format = self.sglang_overrides.get(
-                "load_format", getattr(self.args, "sglang_load_format", "auto")
-            )
-            env_vars.update(
-                build_runai_streamer_env_for_load(
-                    getattr(self.args, "model_source", None),
-                    effective_model_path,
-                    effective_load_format,
-                )
-            )
-            if getattr(self.args, "fp16", False):
-                env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
-
-            accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus)
-            rollout_engine = RolloutRayActor.options(
-                num_cpus=num_cpus,
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={
-                    "env_vars": env_vars,
-                },
-                **accelerator_kwargs,
-            ).remote(
-                self.args,
-                rank=global_rank,
-                worker_type=self.worker_type,
-                base_gpu_id=base_gpu_id,
-                sglang_overrides=self.sglang_overrides,
-                num_gpus_per_engine=self.num_gpus_per_engine,
-                register_sigterm_handler=self.is_scaled_out,
-            )
-
-            rollout_engines.append((global_rank, rollout_engine))
-            self.all_engines[i] = rollout_engine
+        for slot, engine in enumerate(self.all_engines):
+            if engine is None:
+                self.engine_init_records.pop(slot, None)
+        pool = self._engine_pool()
+        new_engines = pool.create()
+        # Outside the group an engine is known by its global rank.
+        rollout_engines = [(self.rank_offset + slot, engine) for slot, engine in new_engines]
 
         self.num_new_engines = len(rollout_engines)
 
@@ -527,6 +575,8 @@ class EngineGroup:
                 base_port=base_port,
             )
 
+        for slot, _ in new_engines:
+            pool.addresses[slot] = addr_and_ports[self.rank_offset + slot]
         init_handles = []
         for rank, engine in rollout_engines:
             # Match _compute_server_args: group overrides win over allocation.
@@ -561,14 +611,14 @@ class EngineGroup:
 
         Returns a list of Ray ObjectRefs.
         """
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        return self._engine_pool().release_handles()
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.
         """
-        return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
+        return self._engine_pool().resume_handles(tags)
 
     def healthcheck_engines(self, timeout: float = 5.0) -> set[int]:
         """Check health of engines in this group.
@@ -576,16 +626,7 @@ class EngineGroup:
         Returns:
             Set of indices of failed engines.
         """
-        failed_indices = set()
-        for i, engine in enumerate(self.all_engines):
-            if engine is None:
-                continue
-            try:
-                ray.get(engine.health_generate.remote(timeout=timeout))
-            except Exception as e:
-                logger.warning(f"Engine {i} healthcheck failed: {e}")
-                failed_indices.add(i)
-        return failed_indices
+        return self._engine_pool().failed_health_checks(range(len(self.all_engines)), timeout=timeout)
 
     def shutdown_engines(self, indices: set[int]) -> None:
         """Shutdown engines at the given indices.
@@ -593,27 +634,7 @@ class EngineGroup:
         This removes the engines from the group and unregisters them from
         router and DCS.
         """
-        for i in indices:
-            engine = self.all_engines[i]
-            if engine is not None:
-                try:
-                    ray.get(engine.shutdown.remote(), timeout=10)
-                except Exception as e:
-                    logger.warning(f"Failed to shutdown engine {i}: {e}")
-                try:
-                    ray.get(engine.unregister_dcs.remote(), timeout=10)
-                except Exception as e:
-                    logger.warning(f"Failed to unregister engine {i} from DCS: {e}")
-                try:
-                    ray.get(engine.unregister_from_router.remote(), timeout=10)
-                except Exception as e:
-                    logger.warning(f"Failed to unregister engine {i} from router: {e}")
-                try:
-                    ray.kill(engine)
-                except Exception as e:
-                    logger.warning(f"Failed to kill engine {i}: {e}")
-            self.all_engines[i] = None
-            logger.info(f"Shutdown engine at index {i}")
+        self._engine_pool().teardown(indices)
 
 
 @dataclasses.dataclass
@@ -3473,13 +3494,13 @@ class RolloutManager(ReloadableMixin):
                         urls = {i: url for (i, _), url in zip(live, fetched, strict=True)}
                     except Exception:
                         logger.debug("Failed to fetch engine URLs for the inference snapshot")
-                group_state = (
-                    EngineState.DRAINING if group.lifecycle_status is EngineGroupLifecycle.DRAINING else resident_state
-                )
+                states = group.lifecycle_states(resident_state)
                 for i, engine in enumerate(heads):
                     # The head slot's global rank is stable across scale-in of other groups.
                     rank = group.rank_offset + i * group.nodes_per_engine
-                    state = EngineState.DEAD if engine is None else group_state
+                    state = states[i]
+                    if engine is not None and group.lifecycle_status is EngineGroupLifecycle.DRAINING:
+                        state = EngineState.DRAINING
                     if group.worker_type in ("prefill", "decode"):
                         workers.append((f"{group.worker_type}-{rank}", urls.get(i), state))
                     else:

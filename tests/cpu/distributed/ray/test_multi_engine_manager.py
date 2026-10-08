@@ -527,6 +527,31 @@ def test_multi_engine_manager_snapshot_revision_bumps_after_rebuild(_patch_ray):
     assert rebuilt["topology_revision"] > dead["topology_revision"]
 
 
+def test_multi_engine_manager_snapshot_reports_draining_during_offload(_patch_ray, monkeypatch):
+    """A snapshot taken while an offload is in flight -- the manager actors
+    answer it from a separate concurrency group -- must not advertise engines
+    that are being drained."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    resolve = mem.ray.get
+    seen: list[list[str]] = []
+
+    def get_and_snapshot(handle_or_list, timeout=None):
+        if not isinstance(handle_or_list, list) and handle_or_list[1] == "release_memory_occupation":
+            model = _named(manager)
+            seen.append([engine.state.value for engine in model.engines])
+            assert not any(engine.direct_eligible for engine in model.engines)
+        return resolve(handle_or_list, timeout=timeout)
+
+    monkeypatch.setattr(mem.ray, "get", get_and_snapshot)
+
+    manager.offload()
+
+    assert seen == [["draining", "draining"], ["draining", "draining"]]
+    assert [engine.state.value for engine in _named(manager).engines] == ["sleeping", "sleeping"]
+
+
 def test_multi_engine_manager_snapshot_marks_offloaded_engines_not_eligible(_patch_ray):
     manager = _FakeManager(num_slots=2)
     before = manager.get_inference_snapshot()["topology_revision"]

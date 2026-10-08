@@ -4,8 +4,12 @@
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager
 from relax.distributed.ray.placement_group import create_placement_group
+from relax.distributed.ray.multi_engine_manager import (
+    SNAPSHOT_CONCURRENCY_GROUP,
+    SNAPSHOT_CONCURRENCY_GROUPS,
+    MultiEngineManager,
+)
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
@@ -50,7 +54,7 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
     return env_vars
 
 
-@ray.remote
+@ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
 class TeacherManager(MultiEngineManager):
     """Launch and own Relax-managed OPD teacher SGLang engine(s)."""
 
@@ -102,6 +106,10 @@ class TeacherManager(MultiEngineManager):
             engine_actor_cls=SGLangEngine,
             log_prefix="[OPD teacher]",
         )
+
+    @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
+    def get_inference_snapshot(self) -> dict:
+        return super().get_inference_snapshot()
 
     def get_urls(self) -> list[str]:
         urls = []

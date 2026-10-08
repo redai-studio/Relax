@@ -83,7 +83,9 @@ class _EngineClient:
 def _make_genrm(monkeypatch, *instances: str, state: str = "ready"):
     """A shell GenRM deployment over fake managers, without a cluster."""
     # Manager calls return their value directly, so ``ray.get`` is the identity.
-    monkeypatch.setitem(GenRM._fetch_inference_snapshot.__globals__, "ray", SimpleNamespace(get=lambda value: value))
+    monkeypatch.setitem(
+        GenRM._fetch_inference_snapshot.__globals__, "ray", SimpleNamespace(get=lambda value, timeout=None: value)
+    )
 
     genrm = object.__new__(GenRM)
     genrm._logger_instance = None
@@ -177,7 +179,7 @@ async def test_genrm_generate_without_messages_forwards_native_payload(monkeypat
 
 
 async def test_genrm_health_and_metrics_keep_their_shape(monkeypatch):
-    monkeypatch.setitem(GenRM.health.__globals__, "ray", SimpleNamespace(get=lambda value: value))
+    monkeypatch.setitem(GenRM.health.__globals__, "ray", SimpleNamespace(get=lambda value, timeout=None: value))
     single = _make_genrm(monkeypatch, "__default__")
     multi = _make_genrm(monkeypatch, "quality", "safety")
 

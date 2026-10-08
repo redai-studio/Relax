@@ -117,3 +117,23 @@ def test_rollout_snapshot_leaves_legacy_engines_info_shape(monkeypatch):
     assert set(legacy) == {"models", "total_engines"}
     assert set(legacy["models"]["default"]) == {"router_ip", "router_port", "engine_groups", "total_engines"}
     assert legacy["models"]["default"]["engine_groups"][0]["engines"][0]["url"] == "http://n0:15000"
+
+
+def test_rollout_snapshot_shows_a_memory_switch_in_flight(monkeypatch):
+    group = make_engine_group(engines=_engines("http://n0:15000"), num_gpus_per_engine=2)
+    manager = _manager(monkeypatch, [group], status="onload")
+
+    def states():
+        return [engine.state.value for engine in _snapshot(manager).model("default").engines]
+
+    # The release has been issued but the manager has not recorded it as done.
+    group.offload()
+    assert states() == ["draining"]
+    manager.status = "offload"
+    assert states() == ["sleeping"]
+
+    # A partial resume leaves the manager's status alone until the last stage.
+    group.onload(tags=["weights"])
+    assert states() == ["onloading"]
+    manager.status = "onload"
+    assert states() == ["ready"]

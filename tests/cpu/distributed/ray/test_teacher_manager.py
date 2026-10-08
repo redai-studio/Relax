@@ -138,6 +138,18 @@ def test_teacher_manager_exposes_ray_actor_api(monkeypatch):
     assert hasattr(teacher_manager.TeacherManager, "options")
 
 
+def test_teacher_manager_answers_snapshots_outside_its_default_concurrency_group(monkeypatch):
+    """Discovery must not queue behind an offload or an engine rebuild."""
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    metadata = teacher_manager.TeacherManager.__ray_metadata__
+
+    group = metadata.modified_class.get_inference_snapshot.__ray_concurrency_group__
+    assert metadata.concurrency_groups == {group: 1}
+    # Everything that changes engine state stays serialized in the default group.
+    for method in ("onload", "offload", "recover", "shutdown"):
+        assert not hasattr(getattr(metadata.modified_class, method), "__ray_concurrency_group__")
+
+
 def test_teacher_manager_starts_engines_with_teacher_profile(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
     manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class

@@ -19,7 +19,7 @@ from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.engine.inference.discovery import RoleSnapshot, role_snapshot_from_payloads
-from relax.engine.inference.gateway import InferenceGateway
+from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.env import Envs
 
 
@@ -52,7 +52,10 @@ class InferenceGatewayService:
         self._gateway = InferenceGateway(role, self._fetch_inference_snapshot, upstream_name=f"{role} engine")
 
     def _fetch_inference_snapshot(self) -> RoleSnapshot:
-        payloads = ray.get([manager.get_inference_snapshot.remote() for manager in self._managers.values()])
+        payloads = ray.get(
+            [manager.get_inference_snapshot.remote() for manager in self._managers.values()],
+            timeout=SNAPSHOT_FETCH_TIMEOUT_S,
+        )
         return role_snapshot_from_payloads(
             self.role, dict(zip(self._managers, payloads, strict=True)), default_model=self._default_model
         )

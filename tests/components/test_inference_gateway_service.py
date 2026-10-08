@@ -48,7 +48,9 @@ class _Request:
 
 def _make_service(monkeypatch, managers, default_model=None):
     # Manager calls return their value directly, so ``ray.get`` is the identity.
-    monkeypatch.setitem(Service._fetch_inference_snapshot.__globals__, "ray", SimpleNamespace(get=lambda value: value))
+    monkeypatch.setitem(
+        Service._fetch_inference_snapshot.__globals__, "ray", SimpleNamespace(get=lambda value, timeout=None: value)
+    )
     service = object.__new__(Service)
     # ``@serve.ingress`` wraps the class in one whose ``__init__`` is async and
     # also boots the ASGI app; the first base is the class as written.
