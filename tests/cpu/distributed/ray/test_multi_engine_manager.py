@@ -370,3 +370,105 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
     assert manager.all_engines == [None, None, *healthy_engines]
     assert set(manager._engine_placements) == {2, 3}
     assert all(engine not in _patch_ray.killed for engine in healthy_engines)
+
+
+class _RecordingCall(_RemoteCall):
+    def remote(self, **kwargs):
+        self._engine.remote_kwargs[self._method] = kwargs
+        return super().remote(**kwargs)
+
+
+class _RecordingEngine(_FakeEngine):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.remote_kwargs: dict[str, dict] = {}
+
+    def __getattr__(self, method: str):
+        return _RecordingCall(self, method)
+
+
+class _HookedManager(MultiEngineManager):
+    """Every hook returns a distinctive value so the test can see where it ends
+    up."""
+
+    def __init__(self):
+        self.pg_tuple = ("shared-pg", [40, 41, 42, 43], [4, 5, 6, 7])
+        super().__init__(
+            SimpleNamespace(marker="args"),
+            num_slots=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[hooked]",
+        )
+
+    def _resolve_placement(self, rank):
+        return self.pg_tuple, False, rank * 2
+
+    def _ray_resource_kwargs(self, rank):
+        return {"num_cpus": 0.3, "num_gpus": 0.1}
+
+    def _allocate_engine_addr_and_ports(self, *, new_engines):
+        return {
+            rank: {"host": "h", "port": 9000 + rank, "nccl_port": 9100 + rank, "dist_init_addr": f"h:{9200 + rank}"}
+            for rank, _ in new_engines
+        }
+
+    def _build_engine_env_vars(self):
+        return {"SOME_ENV": "1"}
+
+    def _engine_ctor_args(self, rank):
+        return ("ctor-args", rank)
+
+    def _build_engine_ctor_kwargs(self, rank):
+        return {"extra": rank}
+
+    def _build_engine_init_kwargs(self, rank, addr_and_ports):
+        return {**addr_and_ports, "skip_dcs_registration": True}
+
+
+def test_multi_engine_manager_init_passes_hook_values_to_ray(_patch_ray, monkeypatch):
+    """Characterization: where each subclass hook's value ends up when the
+    base class brings engines up."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    creations: list[dict] = []
+
+    class _CapturingActor:
+        @classmethod
+        def options(cls, **options):
+            creations.append({"options": options})
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):
+            engine = _RecordingEngine(f"engine-{kwargs['rank']}")
+            creations[-1].update(ctor_args=args, ctor_kwargs=kwargs, engine=engine)
+            return engine
+
+    monkeypatch.setattr(mem.ray, "remote", lambda cls: _CapturingActor)
+
+    manager = _HookedManager()
+
+    assert len(creations) == 2
+    first, second = creations
+    # Ray resources and env vars come straight from the hooks.
+    assert {key: first["options"][key] for key in ("num_cpus", "num_gpus")} == {"num_cpus": 0.3, "num_gpus": 0.1}
+    assert first["options"]["runtime_env"] == {"env_vars": {"SOME_ENV": "1"}}
+    # Placement: the bundle index and base GPU id are looked up at the hook's gpu_index.
+    strategies = [creation["options"]["scheduling_strategy"] for creation in creations]
+    assert [strategy.placement_group for strategy in strategies] == ["shared-pg", "shared-pg"]
+    assert [strategy.placement_group_bundle_index for strategy in strategies] == [40, 42]
+    assert all(strategy.placement_group_capture_child_tasks for strategy in strategies)
+    # Constructor: hook args first, then rank / worker_type / base_gpu_id plus hook kwargs.
+    assert first["ctor_args"] == (("ctor-args", 0),)
+    assert first["ctor_kwargs"] == {"rank": 0, "worker_type": "regular", "base_gpu_id": 4, "extra": 0}
+    assert second["ctor_kwargs"] == {"rank": 1, "worker_type": "regular", "base_gpu_id": 6, "extra": 1}
+    # init(): the allocated address merged through the init-kwargs hook.
+    assert second["engine"].remote_kwargs["init"] == {
+        "host": "h",
+        "port": 9001,
+        "nccl_port": 9101,
+        "dist_init_addr": "h:9201",
+        "skip_dcs_registration": True,
+    }
+    assert manager.all_engines == [first["engine"], second["engine"]]
+    assert manager._engine_addr_and_ports[1]["port"] == 9001
