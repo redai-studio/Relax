@@ -12,6 +12,7 @@ from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.core.optional_roles import GENRM_ROLE
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
 from relax.utils.device import ray_get_device_ids
@@ -21,6 +22,7 @@ from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .actor_group import RayTrainGroup
+from .placement_planner import plan_placement
 
 
 logger = get_logger(__name__)
@@ -234,7 +236,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     return rollout_manager, num_rollout_per_epoch
 
 
-def create_genrm_manager(args, pg, runtime_env=None):
+def create_genrm_manager(args, pg, runtime_env=None, bundle_offset=0):
     """Create and initialize a single GenRM manager (legacy single-instance
     path).
 
@@ -242,6 +244,7 @@ def create_genrm_manager(args, pg, runtime_env=None):
         args: Argument namespace containing genRM configuration
         pg: Placement group for resource allocation
         runtime_env: Optional runtime environment configuration
+        bundle_offset: Absolute index of the manager's first bundle within ``pg``
 
     Returns:
         Initialized GenRM manager
@@ -263,7 +266,7 @@ def create_genrm_manager(args, pg, runtime_env=None):
                 "runtime_env": runtime_env,
             },
         )
-    ).remote(args, pg)
+    ).remote(args, pg, bundle_offset=bundle_offset)
 
     logger.info("GenRMManager initialized successfully")
 
@@ -296,8 +299,11 @@ def create_genrm_managers(args, pg, runtime_env=None):
     from .multi_instance_orchestrator import start_multi_instance_managers
 
     instance_specs = args._genrm_instances_resolved
+    # Each instance starts where the placement plan put it within ``pg``.
+    plan = plan_placement(args)
     if list(instance_specs.keys()) == ["__default__"]:
-        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env)}
+        bundle_offset = plan.claim(GENRM_ROLE).start
+        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env, bundle_offset=bundle_offset)}
     port_window_indices = {key: index for index, key in enumerate(instance_specs)}
 
     def _build_genrm_manager_args(base_args, key, spec):
@@ -309,7 +315,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
         instance_args.genrm_sampling_config = spec["sampling_config"]
         return instance_args
 
-    def _spawn_genrm_manager(key, instance_args, bundle_offset, spec):
+    def _spawn_genrm_manager(key, instance_args, spec):
         return GenRMManager.options(
             **with_control_plane_affinity(
                 instance_args,
@@ -323,7 +329,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
         ).remote(
             instance_args,
             pg,
-            bundle_offset=bundle_offset,
+            bundle_offset=plan.claim(GENRM_ROLE, key).start,
             port_window_index=port_window_indices[key],
         )
 
@@ -332,7 +338,6 @@ def create_genrm_managers(args, pg, runtime_env=None):
         instance_specs=instance_specs,
         build_manager_args=_build_genrm_manager_args,
         spawn_manager=_spawn_genrm_manager,
-        region_offset=0,
     )
     logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
     return managers

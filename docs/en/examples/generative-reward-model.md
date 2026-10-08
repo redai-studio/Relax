@@ -275,6 +275,8 @@ Within Shared, the default is **Co-resident** (both engines held via `mem_fracti
 In Shared / Co-resident mode the two SGLang engines live on the same GPUs concurrently. You **must** size their `mem_fraction_static` so that the sum is < 1.0 (≤ 0.9 recommended; the rest covers cuda graphs and activations). Rollout reads `--sglang-mem-fraction-static` (or YAML overrides via `--sglang-config`); GenRM reads `mem_fraction_static` inside `--genrm-engine-config`. Shared / Defer-swap does not need the split — each engine can take ≈ 0.85 alone since they are never resident together.
 :::
 
+GenRM cannot be combined with a Relax-managed OPD teacher (`--teacher-hf-checkpoint` or `--opd-teacher-routes`) under `--colocate`. Both would be placed on the same bundles right after the Rollout region, so the run stops with a placement conflict error before any placement group is created. An external teacher reached through `--opd-teacher-url` is not affected.
+
 **Fully-Async mode**:
 
 ```bash

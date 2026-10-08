@@ -48,6 +48,8 @@ class GenRMManager(MultiEngineManager):
 
         self.pg = pg
         self.num_gpu_per_engine = num_gpu_per_engine
+        # Absolute index of this instance's first bundle within ``pg``, as
+        # planned by placement_planner.plan_placement.
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
 
@@ -99,12 +101,7 @@ class GenRMManager(MultiEngineManager):
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank):
-        gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        if not self.args.fully_async and not shared_with_rollout:
-            gpu_idx += self.args.rollout_num_gpus
-
-        return self.pg, False, gpu_idx
+        return self.pg, False, self.bundle_offset + rank * self.num_gpu_per_engine
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with

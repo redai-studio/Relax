@@ -274,6 +274,8 @@ Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` �
 Shared / Co-resident 模式下两个 SGLang 引擎同时驻留在同一组 GPU，必须设置各自的 `mem_fraction_static`，使**单卡之和 < 1.0**（建议 ≤ 0.9，剩余给 cuda graph + activations）。Rollout 通过 `--sglang-mem-fraction-static`（或 `--sglang-config` YAML overrides）配置；GenRM 通过 `--genrm-engine-config` 中的 `mem_fraction_static` 配置。Shared / Defer-swap 无需切分——两者永不共存，各自可取 ≈ 0.85。
 :::
 
+GenRM 不能与 Relax 托管的 OPD Teacher（`--teacher-hf-checkpoint` 或 `--opd-teacher-routes`）同时使用 `--colocate`。两者都会被安排在 Rollout 之后的同一段 bundle 上，因此训练在创建 placement group 之前就会报 placement 冲突并退出。通过 `--opd-teacher-url` 接入的外部 Teacher 不受此限制。
+
 **Fully-Async 模式**：
 
 ```bash

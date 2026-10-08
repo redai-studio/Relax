@@ -17,20 +17,18 @@ from relax.utils.opd.opd_utils import build_teacher_engine_args, build_teacher_o
 logger = get_logger(__name__)
 
 
-def _resolve_teacher_gpu_index(
-    *, args, replica: int, gpus_per_replica: int, shared_pg: bool, bundle_offset: int = 0
-) -> int:
+def _resolve_teacher_gpu_index(*, replica: int, gpus_per_replica: int, shared_pg: bool, bundle_offset: int = 0) -> int:
     if not shared_pg:
         # Dedicated (per-teacher own PG) path: each replica creates its OWN
         # placement group of size gpus_per_replica (see _resolve_placement), so the
         # index is always 0 within that per-replica PG — a replica*gpus_per_replica
         # offset would overflow it (only valid when all replicas share one big PG).
         return 0
-    # Shared (colocate) actor PG: rollout lives at the front [0, rollout_num_gpus);
-    # teachers occupy the bundles after it. ``bundle_offset`` is this teacher's
-    # slice start within the teacher region so multiple teachers (MOPD) sharing the
-    # one actor PG do not collide.
-    return int(args.rollout_num_gpus) + bundle_offset + replica * gpus_per_replica
+    # Shared (colocate) actor PG: ``bundle_offset`` is the absolute index of this
+    # teacher's first bundle, as planned by placement_planner.plan_placement --
+    # after the rollout region and after any earlier teacher (MOPD) sharing the
+    # one actor PG.
+    return bundle_offset + replica * gpus_per_replica
 
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
@@ -76,11 +74,11 @@ class TeacherManager(MultiEngineManager):
         if shared_pg:
             assert pg is not None, "shared_pg=True requires the full actor/rollout placement group."
             _pg, bundle_indices, gpu_ids = pg
-            required = int(args.rollout_num_gpus) + bundle_offset + gpus_per_replica * num_replicas
+            required = bundle_offset + gpus_per_replica * num_replicas
             assert len(bundle_indices) >= required and len(gpu_ids) >= required, (
                 f"shared teacher PG too small: bundles={len(bundle_indices)}, "
-                f"gpu_ids={len(gpu_ids)}, required={required} (rollout_num_gpus={args.rollout_num_gpus} + "
-                f"bundle_offset={bundle_offset} + gpus_per_replica={gpus_per_replica} * num_replicas={num_replicas})."
+                f"gpu_ids={len(gpu_ids)}, required={required} "
+                f"(bundle_offset={bundle_offset} + gpus_per_replica={gpus_per_replica} * num_replicas={num_replicas})."
             )
 
         self.gpus_per_replica = gpus_per_replica
@@ -139,7 +137,6 @@ class TeacherManager(MultiEngineManager):
             # Colocate: teachers share the actor placement group, which the
             # controller owns and removes → owns_pg=False.
             gpu_index = _resolve_teacher_gpu_index(
-                args=self.args,
                 replica=replica,
                 gpus_per_replica=self.gpus_per_replica,
                 shared_pg=True,
@@ -157,7 +154,6 @@ class TeacherManager(MultiEngineManager):
         else:
             pg_tuple = self._engine_placements[replica * self.nodes_per_engine][0]
         gpu_index = _resolve_teacher_gpu_index(
-            args=self.args,
             replica=replica,
             gpus_per_replica=self.gpus_per_replica,
             shared_pg=False,

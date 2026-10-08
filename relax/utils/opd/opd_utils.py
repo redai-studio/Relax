@@ -161,6 +161,7 @@ def create_managed_opd_teacher_manager(
     gpus_per_replica: int,
     pg: Any = None,
     shared_pg: bool = False,
+    bundle_offset: int = 0,
     runtime_env: dict | None = None,
 ) -> tuple[Any, list[str]]:
     import ray
@@ -178,6 +179,7 @@ def create_managed_opd_teacher_manager(
         gpus_per_replica,
         pg=pg,
         shared_pg=shared_pg,
+        bundle_offset=bundle_offset,
     )
 
     urls = ray.get(teacher_manager.get_urls.remote())
@@ -201,10 +203,14 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
 
     # ── Single-teacher path: --teacher-hf-checkpoint ───────────────────────
     shared_pg = None
+    bundle_offset = 0
     shared_pg_enabled = is_managed_opd_teacher_colocate(args)
     if shared_pg_enabled:
         from relax.core.service import create_placement_group
+        from relax.distributed.ray.placement_planner import TEACHER_ROLE, plan_placement
 
+        # Planned before the shared PG exists, so an invalid layout allocates nothing.
+        bundle_offset = plan_placement(args).claim(TEACHER_ROLE).start
         actor_gpus = args.resource["actor"][1]
         logger.info(
             f"[OPD teacher] pre-building shared PG: actor={actor_gpus}, "
@@ -237,6 +243,7 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         gpus_per_replica=gpus_per_replica,
         pg=shared_pg,
         shared_pg=shared_pg_enabled,
+        bundle_offset=bundle_offset,
         runtime_env=runtime_env,
     )
     args.opd_teacher_url = urls[0]
@@ -307,6 +314,7 @@ def _start_managed_multi_teacher(
     # check above has had a chance to short-circuit first.
     from relax.core.service import create_placement_group
     from relax.distributed.ray.multi_instance_orchestrator import start_multi_instance_managers
+    from relax.distributed.ray.placement_planner import TEACHER_ROLE, plan_placement
     from relax.distributed.ray.teacher_manager import TeacherManager
 
     actor_gpus = args.resource["actor"][1]
@@ -320,6 +328,8 @@ def _start_managed_multi_teacher(
             f"--rollout-num-gpus 8 with resource['teacher'][1]=8."
         )
 
+    # Planned before the shared PG exists, so an invalid layout allocates nothing.
+    plan = plan_placement(args)
     shared_pg = create_placement_group(
         num_gpus=actor_gpus,
         node_group_affinity=getattr(args, "enable_affinity", True),
@@ -339,7 +349,7 @@ def _start_managed_multi_teacher(
         teacher_args.teacher_hf_checkpoint = spec["checkpoint_path"]
         return teacher_args
 
-    def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:
+    def _spawn_teacher_manager(key: str, per_instance_args: Any, spec: dict) -> Any:
         return TeacherManager.options(
             **with_control_plane_affinity(
                 per_instance_args,
@@ -351,7 +361,7 @@ def _start_managed_multi_teacher(
             gpus_per_replica,
             pg=shared_pg,
             shared_pg=True,
-            bundle_offset=bundle_offset,
+            bundle_offset=plan.claim(TEACHER_ROLE, key).start,
         )
 
     instance_specs = {
@@ -363,7 +373,6 @@ def _start_managed_multi_teacher(
         instance_specs=instance_specs,
         build_manager_args=_build_teacher_manager_args,
         spawn_manager=_spawn_teacher_manager,
-        region_offset=0,
     )
 
     url_routes: dict[str, list[str]] = {}
