@@ -147,9 +147,7 @@ async def test_deferred_scoring_is_inactive_with_custom_post_process(judge, monk
 async def test_deferred_scoring_restores_rollout_after_evaluation(judge):
     args, groups = _args(), _groups(1)
 
-    await deferred.run_deferred_scoring(
-        args, groups, restore_rollout=True, coordinator=_coordinator(args, judge.events)
-    )
+    await deferred.run_deferred_scoring(args, groups, evaluation=True, coordinator=_coordinator(args, judge.events))
 
     assert judge.events == ["rollout offload", "genrm onload", "score 0", "genrm offload", "rollout onload"]
 
@@ -317,6 +315,227 @@ def test_deferred_scoring_rejects_agentic_rollout():
         _args(use_agentic_rollout=True, custom_reward_post_process_path="my_module.post_process")
     )
     deferred.validate_deferred_scoring_args(_args(use_agentic_rollout=True, defer_reward_to_post_process=False))
+
+
+# ----------------------------------------------------------------------
+# The deferred OPD teacher.
+# ----------------------------------------------------------------------
+
+
+def _teacher_args(**overrides) -> Namespace:
+    """Rollout and a deferred teacher sharing the same eight bundles."""
+    values = dict(
+        colocate=True,
+        hybrid=False,
+        rollout_num_gpus=8,
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]},
+        use_opd=True,
+        opd_type="sglang",
+        teacher_hf_checkpoint="/teacher",
+        opd_teacher_defer=True,
+        defer_reward_to_post_process=False,
+        custom_reward_post_process_path=None,
+        group_rm=False,
+    )
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def _teacher_coordinator(args: Namespace, events: list[str]) -> LifecycleCoordinator:
+    def switch(event: str):
+        def run() -> list:
+            events.append(event)
+            return []
+
+        return run
+
+    participants = [
+        LifecycleParticipant("rollout", "__default__", switch("rollout offload"), switch("rollout onload")),
+        LifecycleParticipant("teacher", "__default__", switch("teacher offload"), switch("teacher onload")),
+    ]
+    return LifecycleCoordinator(plan_placement(args), participants, wait=lambda refs: None)
+
+
+class _OpdManager:
+    """Stands in for ``OpdManager``: its stages record when they ran."""
+
+    def __init__(self, events: list[str], *, needs_student_stage: bool = False):
+        self.events = events
+        self.needs_student_stage = needs_student_stage
+        self.fail: Exception | None = None
+
+    async def teacher_stage(self, samples):
+        self.events.append(f"teacher stage {[sample.index for sample in samples]}")
+        if self.fail is not None:
+            raise self.fail
+        for sample in samples:
+            sample.teacher_log_probs = [-0.1] * 4
+
+    async def student_stage(self, samples, encode_multimodal_inputs=None):
+        self.events.append(f"student stage {[sample.index for sample in samples]}")
+
+    def assemble_stage(self, samples):
+        self.events.append("assemble")
+
+
+@pytest.fixture
+def sglang_rollout_stub(monkeypatch):
+    """The student stage looks its multimodal encoder up in the rollout module,
+    which needs sglang to import."""
+    module = ModuleType("relax.engine.rollout.sglang_rollout")
+    module._encode_multimodal_inputs = lambda inputs: None
+    monkeypatch.setitem(sys.modules, "relax.engine.rollout.sglang_rollout", module)
+
+
+async def test_deferred_teacher_runs_after_rollout_offload():
+    args, groups, events = _teacher_args(), _groups(2, 2), []
+
+    await deferred.run_deferred_scoring(
+        args, groups, coordinator=_teacher_coordinator(args, events), opd_manager=_OpdManager(events)
+    )
+
+    # The whole batch in one teacher stage, between the two switches.
+    assert events == [
+        "rollout offload",
+        "teacher onload",
+        "teacher stage [0, 1, 2, 3]",
+        "teacher offload",
+        "assemble",
+    ]
+
+
+async def test_deferred_teacher_student_stage_runs_after_rollout_reactivated(sglang_rollout_stub):
+    args, groups, events = _teacher_args(), _groups(2), []
+
+    await deferred.run_deferred_scoring(
+        args,
+        groups,
+        coordinator=_teacher_coordinator(args, events),
+        opd_manager=_OpdManager(events, needs_student_stage=True),
+    )
+
+    # The student is rollout: it can only answer once the teacher is asleep
+    # again and rollout is back.
+    assert events == [
+        "rollout offload",
+        "teacher onload",
+        "teacher stage [0, 1]",
+        "teacher offload",
+        "rollout onload",
+        "student stage [0, 1]",
+        "assemble",
+    ]
+
+
+async def test_deferred_teacher_and_genrm_share_one_score_phase(judge):
+    """A deferred GenRM on rollout's bundles and a deferred teacher on its own:
+
+    one switch into the score phase serves both.
+    """
+    args = _teacher_args(
+        rollout_num_gpus=4,
+        resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4], "teacher": [1, 4]},
+        _genrm_instances_resolved={"__default__": {"num_gpus": 4}},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+        custom_rm_path=None,
+    )
+    events, groups = judge.events, _groups(2)
+
+    def switch(event: str):
+        def run() -> list:
+            events.append(event)
+            return []
+
+        return run
+
+    participants = [
+        LifecycleParticipant(role, "__default__", switch(f"{role} offload"), switch(f"{role} onload"))
+        for role in ("rollout", "genrm", "teacher")
+    ]
+    coordinator = LifecycleCoordinator(plan_placement(args), participants, wait=lambda refs: None)
+
+    await deferred.run_deferred_scoring(args, groups, coordinator=coordinator, opd_manager=_OpdManager(events))
+
+    assert events == [
+        "rollout offload",
+        "genrm onload",
+        "teacher onload",
+        "score 0",
+        "score 1",
+        "teacher stage [0, 1]",
+        "genrm offload",
+        "teacher offload",
+        "assemble",
+    ]
+
+
+async def test_deferred_teacher_is_not_asked_for_an_evaluation():
+    args, groups, events = _teacher_args(), _groups(2), []
+
+    await deferred.run_deferred_scoring(
+        args, groups, evaluation=True, coordinator=_teacher_coordinator(args, events), opd_manager=_OpdManager(events)
+    )
+
+    # Distillation is a training signal; with nothing else deferred there is no switch at all.
+    assert events == []
+
+
+async def test_deferred_teacher_publishes_only_after_writeback(publishing, monkeypatch):
+    _unused_args, data_system = publishing
+    args, events = _teacher_args(), []
+    monkeypatch.setattr(deferred, "build_local_coordinator", lambda args: _teacher_coordinator(args, events))
+    monkeypatch.setattr("relax.engine.rollout.on_policy_distillation.OpdManager", lambda args: _OpdManager(events))
+    groups = _groups(2, 2)
+    for group in groups:
+        for sample in group:
+            sample.reward = 1.0
+
+    await relax_utils.transfer_batch_to_data_system(args, groups, 2, 0, data_system)
+
+    (published,) = data_system.published
+    assert len(published) == 4
+    # Every published sample carries what the distillation loss reads.
+    assert all(sample.teacher_log_probs == [-0.1] * 4 for sample in published)
+    assert events[-2:] == ["teacher offload", "assemble"]
+
+
+async def test_deferred_teacher_all_failed_publishes_nothing(publishing, monkeypatch):
+    _unused_args, data_system = publishing
+    args, events = _teacher_args(), []
+    manager = _OpdManager(events)
+    manager.fail = RuntimeError("All OPD teacher fetches failed for 4 non-empty samples")
+    monkeypatch.setattr(deferred, "build_local_coordinator", lambda args: _teacher_coordinator(args, events))
+    monkeypatch.setattr("relax.engine.rollout.on_policy_distillation.OpdManager", lambda args: manager)
+
+    with pytest.raises(RuntimeError, match="All OPD teacher fetches failed"):
+        await relax_utils.transfer_batch_to_data_system(args, _groups(2, 2), 2, 0, data_system)
+
+    assert data_system.published == []
+    # The teacher is put back to sleep, and rollout is not woken for a student stage.
+    assert events[-1] == "teacher offload"
+
+
+def test_deferred_scoring_rejects_a_deferred_teacher_with_agentic_rollout():
+    with pytest.raises(ValueError, match="--opd-teacher-defer is not supported with --use-agentic-rollout"):
+        deferred.validate_deferred_scoring_args(_teacher_args(use_agentic_rollout=True))
+
+    deferred.validate_deferred_scoring_args(_teacher_args(use_agentic_rollout=True, opd_teacher_defer=False))
+
+
+def test_deferred_scoring_coordinator_finds_teacher_managers_by_name(monkeypatch):
+    looked_up: list[str] = []
+    rollout_module = ModuleType("relax.distributed.ray.rollout")
+    rollout_module.get_local_rollout_manager = lambda: SimpleNamespace(status="onload")
+    monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout_module)
+    monkeypatch.setattr(ray, "get_actor", lambda name: looked_up.append(name) or SimpleNamespace())
+
+    deferred.build_local_coordinator(_teacher_args())
+    deferred.build_local_coordinator(
+        _teacher_args(teacher_hf_checkpoint=None, opd_teacher_routes='{"math": "/ckpt/math", "code": "/ckpt/code"}')
+    )
+
+    assert looked_up == ["relax_teacher_manager", "relax_teacher_manager_math", "relax_teacher_manager_code"]
 
 
 # ----------------------------------------------------------------------

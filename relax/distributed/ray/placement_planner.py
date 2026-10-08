@@ -244,12 +244,18 @@ def _teacher_claims(
     gpus_per_teacher = _resource_gpus(resource, TEACHER_ROLE) // len(keys)
 
     # A managed teacher is woken with rollout and only offloaded before
-    # training, so it is still resident while a deferred GenRM scores.
-    phases = frozenset({Phase.GENERATE, Phase.SCORE})
+    # training, so it is still resident while a deferred GenRM scores. With
+    # --opd-teacher-defer it sleeps through generation and only scores.
+    deferred = bool(getattr(args, "opd_teacher_defer", False))
+    phases = frozenset({Phase.SCORE}) if deferred else frozenset({Phase.GENERATE, Phase.SCORE})
 
     claims = []
     if is_managed_opd_teacher_colocate(args):
-        start = rollout_stop
+        # A deferred teacher as large as rollout and the actor shares rollout's
+        # bundles; every other layout puts the teachers right after rollout.
+        teacher_total = _resource_gpus(resource, TEACHER_ROLE)
+        shares_rollout_bundles = deferred and rollout_stop == teacher_total == _resource_gpus(resource, "actor")
+        start = 0 if shares_rollout_bundles else rollout_stop
         for key in keys:
             claims.append(PlacementClaim(TEACHER_ROLE, key, ACTOR_POOL, start, gpus_per_teacher, phases))
             start += gpus_per_teacher
@@ -271,6 +277,16 @@ def _check_deferred_scoring_layout(args: Any, claims: list[PlacementClaim]) -> N
     only means something for models that live in the pool rollout lives in."""
     # Deferred: the module imports this one back.
     from relax.engine.inference.deferred import is_framework_deferred_reward
+
+    if getattr(args, "opd_teacher_defer", False):
+        teachers = [claim for claim in claims if claim.role == TEACHER_ROLE]
+        if not teachers or any(claim.pool != ACTOR_POOL for claim in teachers):
+            found = ", ".join(_describe(claim) for claim in teachers) or "no Relax-managed teacher"
+            raise PlacementError(
+                f"--opd-teacher-defer needs a Relax-managed teacher that shares the actor placement group with "
+                f"rollout; found {found}. Drop the flag, or run colocate with 'actor', 'rollout' and 'teacher' "
+                f"in --resource."
+            )
 
     if not is_framework_deferred_reward(args):
         return

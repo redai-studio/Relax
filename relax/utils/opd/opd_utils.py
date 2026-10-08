@@ -328,7 +328,12 @@ def _start_managed_multi_teacher(
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
-    if rollout_gpus + total_teacher_gpus != actor_gpus:
+    # Deferred teachers may instead share rollout's bundles (all three equal);
+    # where each teacher starts comes from the placement plan below.
+    shares_rollout_bundles = (
+        getattr(args, "opd_teacher_defer", False) and rollout_gpus == total_teacher_gpus == actor_gpus
+    )
+    if rollout_gpus + total_teacher_gpus != actor_gpus and not shares_rollout_bundles:
         raise ValueError(
             f"MOPD colocate requires rollout_gpus + teacher_gpus == actor_gpus, but got "
             f"rollout={rollout_gpus} + teacher={total_teacher_gpus} != actor={actor_gpus}. "
@@ -343,9 +348,10 @@ def _start_managed_multi_teacher(
         num_gpus=actor_gpus,
         node_group_affinity=getattr(args, "enable_affinity", True),
     )
+    first_teacher_bundle = min(plan.claim(TEACHER_ROLE, key).start for key in routes_map)
     logger.info(
         f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
-        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
+        f"rollout={rollout_gpus}, teachers start at bundle {first_teacher_bundle} "
         f"({gpus_per_teacher} GPU/teacher)"
     )
     logger.info(
@@ -530,12 +536,18 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
         actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
     teacher_gpus = args.resource["teacher"][1]
-    if args.rollout_num_gpus + teacher_gpus != actor_total_gpus:
-        raise ValueError(
-            "Managed OPD teacher colocate requires split bundles where "
-            "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs. "
-            f"Got rollout={args.rollout_num_gpus}, teacher={teacher_gpus}, actor total={actor_total_gpus}."
-        )
+    if args.rollout_num_gpus + teacher_gpus == actor_total_gpus:
+        return
+    # A deferred teacher only holds GPU memory while rollout is offloaded, so
+    # the two may also use the same bundles.
+    if getattr(args, "opd_teacher_defer", False) and args.rollout_num_gpus == teacher_gpus == actor_total_gpus:
+        return
+    raise ValueError(
+        "Managed OPD teacher colocate requires split bundles where "
+        "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs "
+        "(with --opd-teacher-defer, rollout and teacher may instead each equal the actor total and share bundles). "
+        f"Got rollout={args.rollout_num_gpus}, teacher={teacher_gpus}, actor total={actor_total_gpus}."
+    )
 
 
 def add_opd_arguments(parser: Any) -> Any:
@@ -646,6 +658,18 @@ def add_opd_arguments(parser: Any) -> Any:
             'Example: \'{"openai/gsm8k":"/path/Qwen3-8B",'
             '"hiyouga/geometry3k":"/path/Qwen3-VL-8B-Instruct"}\'. '
             "Mutually exclusive with --teacher-hf-checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--opd-teacher-defer",
+        action="store_true",
+        default=False,
+        help=(
+            "Ask the Relax-managed OPD teacher for its log-probs after a batch has been generated instead of "
+            "while it is generated. The teacher then sleeps during generation and is only loaded once rollout "
+            "has released its GPUs, so in colocate mode rollout and teacher may share the same bundles "
+            "(rollout GPUs == teacher GPUs == actor GPUs) as well as use split ones. "
+            "Requires a managed teacher in colocate mode."
         ),
     )
     parser.add_argument(

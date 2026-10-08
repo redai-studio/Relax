@@ -24,6 +24,17 @@ from relax.utils.types import Sample
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing sglang dependencies")
 
 
+class _OpdManager:
+    """Stands in for the rollout's OPD manager; records inline teacher
+    requests."""
+
+    def __init__(self):
+        self.prefilled: list = []
+
+    async def prefill(self, samples, encode_multimodal_inputs=None):
+        self.prefilled.append(samples)
+
+
 def _args(*, deferred: bool, group_rm: bool = False, **overrides) -> SimpleNamespace:
     values = dict(
         defer_reward_to_post_process=deferred,
@@ -108,8 +119,8 @@ async def test_sglang_rollout_custom_post_process_keeps_inline_rewards(rollout):
 async def test_sglang_rollout_deferred_eval_scores_all_datasets_in_one_phase(monkeypatch):
     calls: list = []
 
-    async def fake_run_deferred_scoring(args, groups, *, restore_rollout=False):
-        calls.append(([[sample.index for sample in group] for group in groups], restore_rollout))
+    async def fake_run_deferred_scoring(args, groups, *, evaluation=False):
+        calls.append(([[sample.index for sample in group] for group in groups], evaluation))
         for group in groups:
             for sample in group:
                 sample.reward = {"acc": float(sample.index)}
@@ -130,7 +141,46 @@ async def test_sglang_rollout_deferred_eval_scores_all_datasets_in_one_phase(mon
 
     await sglang_rollout._score_deferred_eval_results(args, results)
 
-    # One score phase for both datasets, in prompt groups, with rollout brought back after.
+    # One score phase for both datasets, in prompt groups, flagged as an evaluation
+    # (rollout is brought back after, and no distillation is run).
     assert calls == [([[0, 1], [2, 3], [10], [11]], True)]
     assert results["math"]["rewards"] == [0.0, 1.0, 2.0, 3.0]
     assert results["code"]["rewards"] == [10.0, 11.0]
+
+
+def _opd_args(*, teacher_deferred: bool, **overrides) -> SimpleNamespace:
+    return _args(deferred=False, use_opd=True, opd_type="sglang", opd_teacher_defer=teacher_deferred, **overrides)
+
+
+@pytest.fixture
+def opd_rollout(rollout, monkeypatch):
+    manager = _OpdManager()
+    monkeypatch.setattr(
+        sglang_rollout, "GenerateState", lambda args: SimpleNamespace(opd_manager=manager, aborted=False)
+    )
+    return manager
+
+
+async def test_sglang_rollout_asks_the_teacher_inline_by_default(opd_rollout):
+    sample = await sglang_rollout.generate_and_rm(_opd_args(teacher_deferred=False), Sample(index=3), {})
+
+    assert opd_rollout.prefilled == [sample]
+
+
+async def test_deferred_teacher_no_request_during_generation(opd_rollout):
+    """A deferred teacher is asleep while rollout generates: none of the three
+    inline sites may ask it."""
+    await sglang_rollout.generate_and_rm(_opd_args(teacher_deferred=True), Sample(index=3), {})
+    await sglang_rollout.generate_and_rm_group(
+        _opd_args(teacher_deferred=True, group_rm=True), [Sample(index=4), Sample(index=5)], {}
+    )
+
+    assert opd_rollout.prefilled == []
+
+
+async def test_sglang_rollout_deferred_teacher_still_scores_rewards_inline(opd_rollout, rollout):
+    """Deferring the teacher does not defer the reward."""
+    sample = await sglang_rollout.generate_and_rm(_opd_args(teacher_deferred=True), Sample(index=3), {})
+
+    assert rollout == [3]
+    assert sample.reward == 1.0

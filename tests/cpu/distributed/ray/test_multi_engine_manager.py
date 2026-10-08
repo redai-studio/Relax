@@ -276,7 +276,7 @@ def test_shutdown_cleans_follower_slots_and_preserves_borrowed_placement_group(_
     assert all(engine.calls == ["shutdown"] for engine in engines)
     assert _patch_ray.killed == engines
     assert manager.all_engines == [None] * 4
-    assert manager._engine_placements == {}
+    assert manager._pool.placements == {}
     assert removed_pgs == []
 
 
@@ -307,7 +307,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
     manager = _FakeManager(num_slots=2, nodes_per_engine=2)
     engines = list(manager.all_engines)
     shared_pg = ("shared-pg", [0, 1], [0, 0])
-    manager._engine_placements = {0: (shared_pg, True), 1: (shared_pg, False)}
+    manager._pool.placements = {0: (shared_pg, True), 1: (shared_pg, False)}
     removed_pgs = []
 
     def remove_pg(pg):
@@ -320,7 +320,7 @@ def test_multinode_shutdown_stops_followers_before_removing_owned_group(_patch_r
 
     assert removed_pgs == ["shared-pg"]
     assert manager.all_engines == [None, None]
-    assert manager._engine_placements == {}
+    assert manager._pool.placements == {}
 
 
 @pytest.mark.parametrize("failure", ["actor_creation", "address", "init"])
@@ -368,7 +368,7 @@ def test_multinode_recovery_failure_cleans_group_and_preserves_healthy_engine(_p
 
     assert removed_pgs == ["shared-pg"]
     assert manager.all_engines == [None, None, *healthy_engines]
-    assert set(manager._engine_placements) == {2, 3}
+    assert set(manager._pool.placements) == {2, 3}
     assert all(engine not in _patch_ray.killed for engine in healthy_engines)
 
 

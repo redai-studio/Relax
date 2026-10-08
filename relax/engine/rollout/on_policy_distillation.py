@@ -403,24 +403,75 @@ class OpdManager:
         samples: Sample | Sequence[Sample],
         encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
     ) -> None:
+        """Run the three stages back to back, as generation does inline."""
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
+        async with _create_teacher_client_session(self.args) as session:
+            await self._run_teacher_stage(sample_list, session)
+            if self.needs_student_stage:
+                await self._run_student_stage(sample_list, session, encode_multimodal_inputs)
+
+        self.assemble_stage(sample_list)
+
+    # The stages are also run one at a time by deferred scoring, which has to
+    # switch GPU memory between them: the teacher stage only needs the teacher,
+    # the student stage only rollout.
+
+    @property
+    def needs_student_stage(self) -> bool:
+        """Whether the student must score the teacher's top-k tokens."""
+        return self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+
+    async def teacher_stage(self, samples: list[Sample], session: aiohttp.ClientSession | None = None) -> None:
+        """Ask the teacher for its log-probs on every sample.
+
+        Raises:
+            RuntimeError: every sample with a response failed.
+        """
+        if session is not None:
+            await self._run_teacher_stage(samples, session)
+            return
+        async with _create_teacher_client_session(self.args) as own_session:
+            await self._run_teacher_stage(samples, own_session)
+
+    async def _run_teacher_stage(self, samples: list[Sample], session: aiohttp.ClientSession) -> None:
         if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
 
         await _refresh_teacher_topology(self.args)
-        async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            if not all(fetch_results):
-                _report_teacher_failure(self.args)
-            self._raise_if_all_failed(sample_list, fetch_results)
+        fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples])
+        if not all(fetch_results):
+            _report_teacher_failure(self.args)
+        self._raise_if_all_failed(samples, fetch_results)
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
-                )
+    async def student_stage(
+        self,
+        samples: list[Sample],
+        session: aiohttp.ClientSession | None = None,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+    ) -> None:
+        """Ask the student (rollout) for its log-probs on the teacher's top-k
+        tokens; a no-op unless the token selection needs it."""
+        if not self.needs_student_stage:
+            return
+        if session is not None:
+            await self._run_student_stage(samples, session, encode_multimodal_inputs)
+            return
+        async with _create_teacher_client_session(self.args) as own_session:
+            await self._run_student_stage(samples, own_session, encode_multimodal_inputs)
 
-        self._assemble_transfer(sample_list)
+    async def _run_student_stage(
+        self,
+        samples: list[Sample],
+        session: aiohttp.ClientSession,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None,
+    ) -> None:
+        await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
+
+    def assemble_stage(self, samples: list[Sample]) -> None:
+        """Combine what the two models returned into the fields training
+        reads."""
+        self._assemble_transfer(samples)
 
     async def _post_logprob(
         self,

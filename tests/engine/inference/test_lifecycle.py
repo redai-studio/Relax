@@ -180,8 +180,11 @@ def test_lifecycle_leave_score_puts_only_score_phase_models_to_sleep():
 
 
 def test_lifecycle_enter_generate_does_not_resume_a_rollout_that_never_slept():
-    """In a split layout scoring leaves rollout up. Its onload body resumes the
-    engines unconditionally, so it must not run again."""
+    """In a split layout scoring leaves rollout up.
+
+    Its onload body resumes the engines unconditionally, so it must not run
+    again.
+    """
     cluster = _Cluster()
     args = _colocate_args(
         resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]},
@@ -390,6 +393,30 @@ def test_lifecycle_deferred_genrm_is_not_woken_for_generation(custom_post_proces
 
     assert cluster.issued() == ["rollout.onload_weights", "rollout.onload_kv"]
     assert genrm.active is False
+
+
+def test_lifecycle_deferred_teacher_stays_asleep_during_weight_sync():
+    """A deferred teacher only lives in the score phase: neither stage of
+    entering generation wakes it, whichever bundles it sits on."""
+    for rollout_gpus, teacher_gpus in ((8, 8), (4, 4)):
+        cluster = _Cluster()
+        teacher = _Manager(cluster, "teacher", active=False)
+        args = _inline_teacher_args(
+            opd_teacher_defer=True,
+            rollout_num_gpus=rollout_gpus,
+            resource={"actor": [1, 8], "rollout": [1, rollout_gpus], "teacher": [1, teacher_gpus]},
+        )
+        coordinator = _train_coordinator(cluster, args, teacher=teacher)
+
+        coordinator.enter_generate(GenerateStage.WEIGHTS)
+        coordinator.enter_generate(GenerateStage.REST)
+
+        assert cluster.issued() == ["rollout.onload_weights", "rollout.onload_kv"]
+        assert teacher.active is False
+
+        # It is still released with every other scorer before training.
+        coordinator.enter_train()
+        assert cluster.issued()[-1] == "teacher.offload"
 
 
 def test_lifecycle_nothing_to_switch_makes_no_call():

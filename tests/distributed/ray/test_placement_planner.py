@@ -530,3 +530,93 @@ def test_placement_planner_claims_overlap_needs_a_common_bundle_of_one_pool():
     assert claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", start=3, size=4))
     assert not claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", start=4, size=4))
     assert not claims_overlap(_claim("rollout", start=0, size=4), _claim("genrm", pool="genrm", start=0, size=4))
+
+
+# ----------------------------------------------------------------------
+# Deferred teacher.
+# ----------------------------------------------------------------------
+
+
+def _shared_teacher_args(**overrides):
+    """Actor, rollout and teacher all on eight GPUs."""
+    values = dict(rollout_num_gpus=8, resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]})
+    values.update(overrides)
+    return _teacher_args(**values)
+
+
+def test_placement_planner_deferred_teacher_shares_rollout_bundles():
+    plan = plan_placement(_shared_teacher_args(opd_teacher_defer=True))
+
+    rollout, teacher = plan.claim("rollout"), plan.claim("teacher")
+    assert (rollout.start, rollout.stop) == (teacher.start, teacher.stop) == (0, 8)
+    assert teacher.phases == SCORE
+
+
+def test_placement_planner_deferred_teacher_keeps_a_split_layout():
+    teacher = plan_placement(_teacher_args(opd_teacher_defer=True)).claim("teacher")
+
+    assert (teacher.start, teacher.stop) == (4, 8)
+    assert teacher.phases == SCORE
+
+
+def test_placement_planner_shared_teacher_bundles_are_rejected_without_defer():
+    with pytest.raises(PlacementError, match="teacher/__default__"):
+        plan_placement(_shared_teacher_args())
+
+
+def test_placement_planner_deferred_genrm_and_deferred_teacher_cannot_share_bundles():
+    """Both live in the score phase, so they cannot hold the same bundles."""
+    args = _shared_teacher_args(
+        opd_teacher_defer=True,
+        resource={"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8], "genrm": [1, 8]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(8)},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+    )
+
+    with pytest.raises(PlacementError, match=r"genrm/__default__.*teacher/__default__.*\['score'\]"):
+        plan_placement(args)
+
+
+def test_placement_planner_deferred_mopd_teachers_split_rollout_bundles():
+    args = _shared_teacher_args(
+        opd_teacher_defer=True,
+        teacher_hf_checkpoint=None,
+        opd_teacher_routes=json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"}),
+    )
+
+    plan = plan_placement(args)
+
+    assert (plan.claim("teacher", "math").start, plan.claim("teacher", "math").stop) == (0, 4)
+    assert (plan.claim("teacher", "code").start, plan.claim("teacher", "code").stop) == (4, 8)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # fully-async: every teacher replica has a placement group of its own.
+        dict(colocate=False, fully_async=True, resource={"actor": [1, 4], "rollout": [1, 4], "teacher": [1, 4]}),
+        # An external teacher (--opd-teacher-url) is not Relax-managed at all.
+        dict(teacher_hf_checkpoint=None, opd_teacher_url="http://teacher:1/generate"),
+        # No distillation.
+        dict(use_opd=False),
+    ],
+)
+def test_placement_planner_teacher_defer_requires_a_managed_teacher_in_the_shared_pool(overrides):
+    with pytest.raises(PlacementError, match="--opd-teacher-defer needs a Relax-managed teacher"):
+        plan_placement(_teacher_args(opd_teacher_defer=True, **overrides))
+
+
+def test_placement_planner_deferred_teacher_may_use_the_bundles_of_an_inline_genrm():
+    """Different phases on the same bundles: GenRM yields while the teacher
+    scores."""
+    args = _teacher_args(
+        opd_teacher_defer=True,
+        resource={"actor": [1, 8], "rollout": [1, 4], "teacher": [1, 4], "genrm": [1, 4]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(4)},
+    )
+
+    plan = plan_placement(args)
+
+    assert (plan.claim("genrm").start, plan.claim("teacher").start) == (4, 4)
+    assert plan.claim("genrm").phases.isdisjoint(plan.claim("teacher").phases)

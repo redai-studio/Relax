@@ -140,3 +140,35 @@ def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
 
     with pytest.raises(ValueError, match="evenly divisible"):
         opd_utils._start_managed_multi_teacher(args, routes_json)
+
+
+def test_multi_teacher_deferred_teachers_start_on_rollout_bundles(monkeypatch):
+    """With --opd-teacher-defer and rollout == teacher == actor, the teachers
+    share rollout's bundles instead of following it."""
+    import ray
+
+    from relax.utils.opd import opd_utils
+
+    captured = {"calls": [], "ctor_calls": {}}
+    _install_fake_teacher_manager(monkeypatch, captured)
+    monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: True)
+    full_pg = ("pg", list(range(8)), list(range(8)))
+    monkeypatch.setattr("relax.core.service.create_placement_group", lambda **kwargs: full_pg)
+    monkeypatch.setattr(ray, "get", lambda ref: ["http://teacher/generate"])
+
+    routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
+    resource = {"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]}
+    args = _base_args(opd_teacher_routes=routes_json, opd_teacher_defer=True, resource=resource)
+
+    opd_utils._start_managed_multi_teacher(args, routes_json)
+
+    assert captured["ctor_calls"]["/ckpt/math"]["bundle_offset"] == 0
+    assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 4
+
+    # Without the flag the same sizes are still refused.
+    import pytest
+
+    with pytest.raises(ValueError, match="rollout_gpus \\+ teacher_gpus == actor_gpus"):
+        opd_utils._start_managed_multi_teacher(
+            _base_args(opd_teacher_routes=routes_json, resource=resource), routes_json
+        )

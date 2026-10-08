@@ -146,7 +146,7 @@ class TeacherManager(MultiEngineManager):
                 node_group_affinity=getattr(self.args, "enable_affinity", True),
             )
         else:
-            pg_tuple = self._engine_placements[replica * self.nodes_per_engine][0]
+            pg_tuple = self._pool.placements[replica * self.nodes_per_engine][0]
         gpu_index = _resolve_teacher_gpu_index(
             replica=replica,
             gpus_per_replica=self.gpus_per_replica,
@@ -155,7 +155,14 @@ class TeacherManager(MultiEngineManager):
         return pg_tuple, owns_pg, gpu_index + node_gpu_offset
 
     def _ray_resource_kwargs(self, rank: int) -> dict:
-        return {"num_cpus": 0.2, "num_gpus": 0.2}
+        # A deferred teacher may sit on rollout's own bundles. Like a GenRM that
+        # shares them, it then asks Ray for a smaller slice so the bundle still
+        # fits the training actor, the rollout engine and the teacher.
+        shares_rollout_bundles = self._shared_pg and self._bundle_offset < int(
+            getattr(self.args, "rollout_num_gpus", None) or 0
+        )
+        fraction = 0.1 if shares_rollout_bundles else 0.2
+        return {"num_cpus": fraction, "num_gpus": fraction}
 
     def _build_engine_env_vars(self) -> dict[str, str]:
         return _build_teacher_engine_env(self.args)

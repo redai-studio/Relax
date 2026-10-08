@@ -165,6 +165,26 @@ def test_teacher_manager_starts_engines_with_teacher_profile(monkeypatch):
     }
 
 
+def test_teacher_engine_asks_for_a_smaller_slice_on_rollout_bundles(monkeypatch):
+    """A deferred teacher on rollout's own bundles shares each of them with the
+    training actor and a rollout engine, like a GenRM that shares them."""
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+
+    def resources(*, shared_pg, bundle_offset):
+        manager = object.__new__(manager_cls)
+        manager.args = SimpleNamespace(rollout_num_gpus=8)
+        manager._shared_pg = shared_pg
+        manager._bundle_offset = bundle_offset
+        return manager._ray_resource_kwargs(0)
+
+    assert resources(shared_pg=True, bundle_offset=0) == {"num_cpus": 0.1, "num_gpus": 0.1}
+    assert resources(shared_pg=True, bundle_offset=4) == {"num_cpus": 0.1, "num_gpus": 0.1}
+    # After rollout's region, or on a placement group of its own: unchanged.
+    assert resources(shared_pg=True, bundle_offset=8) == {"num_cpus": 0.2, "num_gpus": 0.2}
+    assert resources(shared_pg=False, bundle_offset=0) == {"num_cpus": 0.2, "num_gpus": 0.2}
+
+
 @pytest.mark.parametrize(("gpus_per_replica", "num_nodes"), [(2, 1), (16, 2)])
 def test_teacher_recovery_reuses_original_endpoints(monkeypatch, gpus_per_replica, num_nodes):
     teacher_manager_module, manager = _make_teacher_manager(monkeypatch, gpus_per_replica=gpus_per_replica)
@@ -294,7 +314,7 @@ def test_dedicated_multinode_replica_creates_one_pg_for_both_slots(monkeypatch):
     for rank in range(4):
         placement = manager._resolve_placement(rank)
         placements.append(placement)
-        manager._engine_placements[rank] = placement[:2]
+        manager._pool.placements[rank] = placement[:2]
 
     assert placements == [(pg0, True, 0), (pg0, False, 8), (pg1, True, 0), (pg1, False, 8)]
     assert teacher_manager_module.create_placement_group.call_count == 2
@@ -387,7 +407,7 @@ def test_multinode_teacher_routes_and_memory_operations_use_only_heads(monkeypat
     for rank, engine in enumerate(engines):
         engine.get_url.remote.return_value = f"http://192.0.2.{rank + 1}:15000"
         engine.health_generate.remote.return_value = True
-    manager.all_engines = engines
+    manager.all_engines[:] = engines
     monkeypatch.setattr(teacher_manager_module.ray, "get", lambda ref, timeout=None: ref)
 
     assert manager.get_urls() == ["http://192.0.2.1:15000/generate", "http://192.0.2.3:15000/generate"]

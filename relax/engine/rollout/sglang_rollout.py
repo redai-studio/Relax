@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
-from relax.engine.inference.deferred import is_framework_deferred_reward, run_deferred_scoring
+from relax.engine.inference.deferred import is_deferred_teacher, is_framework_deferred_reward, run_deferred_scoring
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -720,7 +720,9 @@ async def generate_and_rm(
 
     # With framework-deferred scoring the reward function is not called while
     # rollout generates; the batch is scored as a whole before it is published.
+    # The same goes for a deferred OPD teacher, which is asleep until then.
     deferred_reward = is_framework_deferred_reward(args)
+    deferred_teacher = is_deferred_teacher(args)
 
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
@@ -752,7 +754,7 @@ async def generate_and_rm(
             for sample, reward in zip(samples_need_reward, rewards, strict=False):
                 sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not deferred_teacher:
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
@@ -763,7 +765,7 @@ async def generate_and_rm(
         if sample.reward is None and not deferred_reward:
             sample.reward = await async_rm(args, sample)
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not deferred_teacher:
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
@@ -849,7 +851,8 @@ async def generate_and_rm_group(
             for sample, reward in zip(group, rewards, strict=False):
                 sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        # A deferred teacher is asleep now; it is asked once the batch is complete.
+        if state.opd_manager and not evaluation and not is_deferred_teacher(args):
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -1386,8 +1389,10 @@ async def _score_deferred_eval_results(args: Namespace, results: dict[str, dict[
         samples = result["samples"]
         # Samples are indexed prompt by prompt, so consecutive chunks are the prompt groups.
         group_size = max(1, eval_datasets[name].n_samples_per_eval_prompt)
-        groups.extend(samples[i : i + group_size] for i in range(0, len(samples), group_size))
-    await run_deferred_scoring(args, groups, restore_rollout=True)
+        for start in range(0, len(samples), group_size):
+            stop = start + group_size
+            groups.append(samples[start:stop])
+    await run_deferred_scoring(args, groups, evaluation=True)
     for result in results.values():
         result["rewards"] = _eval_rewards(args, result["samples"])
 
