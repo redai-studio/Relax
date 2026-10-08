@@ -26,7 +26,7 @@ def _cleanup_genrm_module():
 
 def _import_genrm(monkeypatch):
     sglang_engine = ModuleType("relax.backends.sglang.sglang_engine")
-    sglang_engine.GenRMEngine = object
+    sglang_engine.SGLangEngine = object
 
     ray_utils = ModuleType("relax.distributed.ray.utils")
     ray_utils.NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = []
@@ -67,6 +67,13 @@ def test_genrm_manager_resolve_placement_ignores_rollout_num_gpus(monkeypatch):
     manager = _bare_manager(genrm, bundle_offset=4, num_gpu_per_engine=2, args=args)
 
     assert manager._resolve_placement(0) == ("pg", False, 4)
+
+
+def test_genrm_manager_starts_the_shared_engine_with_genrm_profile(monkeypatch):
+    genrm = _import_genrm(monkeypatch)
+    manager = _bare_manager(genrm, bundle_offset=0, num_gpu_per_engine=1, args=SimpleNamespace())
+
+    assert manager._build_engine_ctor_kwargs(0) == {"profile": "genrm"}
 
 
 def _install_fake_genrm_manager(monkeypatch):

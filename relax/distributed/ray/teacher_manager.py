@@ -160,6 +160,8 @@ class TeacherManager(MultiEngineManager):
             "sglang_overrides": self._overrides,
             "num_gpus_per_engine": self.gpus_per_replica,
             "register_sigterm_handler": False,
+            # Static weights: the teacher never joins weight sync.
+            "profile": "teacher",
         }
 
     def _build_engine_init_kwargs(self, rank: int, addr_and_ports: dict) -> dict:

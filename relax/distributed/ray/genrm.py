@@ -11,7 +11,7 @@ import logging
 
 import ray
 
-from relax.backends.sglang.sglang_engine import GenRMEngine
+from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -57,7 +57,7 @@ class GenRMManager(MultiEngineManager):
             args,
             num_slots=num_slots,
             nodes_per_engine=nodes_per_engine,
-            engine_actor_cls=GenRMEngine,
+            engine_actor_cls=SGLangEngine,
             skip_init=args.debug_train_only,
             log_prefix="GenRM",
         )
@@ -111,6 +111,11 @@ class GenRMManager(MultiEngineManager):
         default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
         num_gpus = getattr(self.args, "genrm_ray_num_gpus", default_ray_num_gpus)
         return {"num_cpus": num_gpus, "num_gpus": num_gpus}
+
+    def _build_engine_ctor_kwargs(self, rank):
+        # Same engine as rollout; the profile selects GenRM's server args,
+        # static weights and pre-offload drain.
+        return {"profile": "genrm"}
 
     def _build_engine_env_vars(self):
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {

@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing sglang dependencie
 
 def _make_genrm_engine(args=None, *, rank: int = 0, base_gpu_id: int = 0):
     args = args or SimpleNamespace(rollout_external=False, fully_async=True)
-    return m.GenRMEngine(args, rank=rank, worker_type="regular", base_gpu_id=base_gpu_id)
+    return m.SGLangEngine(args, rank=rank, worker_type="regular", base_gpu_id=base_gpu_id, profile="genrm")
 
 
 def _record_init(monkeypatch, engine, *, node_rank: int = 0) -> dict:
