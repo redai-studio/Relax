@@ -313,6 +313,71 @@ def _build_reader(path: str | list[str] | tuple[str, ...]):
     return CompositeStreamingReader(paths, row_slice)
 
 
+def apply_oversize_strategy(
+    *,
+    tokens: torch.Tensor,
+    loss_mask: torch.Tensor,
+    capacity: int | None,
+    strategy: str,
+    custom_fn: Callable[..., Optional[tuple[torch.Tensor, torch.Tensor]]] | None,
+    idx: int,
+    has_multimodal: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Apply the selected oversize policy to one token sequence and its
+    mask."""
+    n = int(tokens.shape[0])
+    cap = capacity
+    if cap is None or n <= cap:
+        return tokens, loss_mask
+    if strategy == "skip":
+        logger.warning(
+            f"SFTStreamingDataset[oversize=skip]: sample idx={idx} expanded length {n} "
+            f"exceeds per-GPU capacity {cap}; skipping."
+        )
+        return None
+    if strategy == "keep":
+        logger.warning(
+            f"SFTStreamingDataset[oversize=keep]: sample idx={idx} expanded length {n} "
+            f"exceeds per-GPU capacity {cap}; keeping unchanged (may OOM or be dropped "
+            f"by the dynamic batcher downstream)."
+        )
+        return tokens, loss_mask
+    if strategy in ("truncate_left", "truncate_right"):
+        if has_multimodal:
+            logger.warning(
+                f"SFTStreamingDataset[oversize={strategy}]: sample idx={idx} expanded length {n} "
+                f"exceeds per-GPU capacity {cap} and is multimodal; truncating tokens in-place "
+                f"WILL misalign multimodal_train_inputs."
+            )
+        if strategy == "truncate_left":
+            tokens_t = tokens[-cap:].contiguous()
+            mask_t = loss_mask[-cap:].contiguous()
+        else:
+            tokens_t = tokens[:cap].contiguous()
+            mask_t = loss_mask[:cap].contiguous()
+        logger.warning(
+            f"SFTStreamingDataset[oversize={strategy}]: sample idx={idx} expanded length {n} "
+            f"exceeds per-GPU capacity {cap}; truncated to {int(tokens_t.shape[0])} tokens."
+        )
+        return tokens_t, mask_t
+    if strategy == "custom":
+        assert custom_fn is not None
+        result = custom_fn(tokens=tokens, loss_mask=loss_mask, capacity=cap, idx=idx)
+        if result is None:
+            logger.warning(
+                f"SFTStreamingDataset[oversize=custom]: sample idx={idx} expanded length {n} "
+                f"exceeds per-GPU capacity {cap}; custom function returned None; skipping."
+            )
+            return None
+        tokens_t, mask_t = result
+        logger.warning(
+            f"SFTStreamingDataset[oversize=custom]: sample idx={idx} expanded length {n} "
+            f"exceeds per-GPU capacity {cap}; custom function returned {int(tokens_t.shape[0])} tokens."
+        )
+        return tokens_t, mask_t
+    raise ValueError(f"unknown oversize strategy: {strategy!r}")
+
+
 class SFTStreamingDataset:
     """Lazy SFT dataset with epoch-aware shuffle and optional prefetch."""
 
@@ -918,58 +983,15 @@ class SFTStreamingDataset:
         has_multimodal: bool,
         capacity_override: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        n = int(tokens.shape[0])
-        cap = self.capacity if capacity_override is None else capacity_override
-        if cap is None or n <= cap:
-            return tokens, loss_mask
-        strategy = self._oversize_strategy
-        if strategy == "skip":
-            logger.warning(
-                f"SFTStreamingDataset[oversize=skip]: sample idx={idx} expanded length {n} "
-                f"exceeds per-GPU capacity {cap}; skipping."
-            )
-            return None
-        if strategy == "keep":
-            logger.warning(
-                f"SFTStreamingDataset[oversize=keep]: sample idx={idx} expanded length {n} "
-                f"exceeds per-GPU capacity {cap}; keeping unchanged (may OOM or be dropped "
-                f"by the dynamic batcher downstream)."
-            )
-            return tokens, loss_mask
-        if strategy in ("truncate_left", "truncate_right"):
-            if has_multimodal:
-                logger.warning(
-                    f"SFTStreamingDataset[oversize={strategy}]: sample idx={idx} expanded length {n} "
-                    f"exceeds per-GPU capacity {cap} and is multimodal; truncating tokens in-place "
-                    f"WILL misalign multimodal_train_inputs."
-                )
-            if strategy == "truncate_left":
-                tokens_t = tokens[-cap:].contiguous()
-                mask_t = loss_mask[-cap:].contiguous()
-            else:
-                tokens_t = tokens[:cap].contiguous()
-                mask_t = loss_mask[:cap].contiguous()
-            logger.warning(
-                f"SFTStreamingDataset[oversize={strategy}]: sample idx={idx} expanded length {n} "
-                f"exceeds per-GPU capacity {cap}; truncated to {int(tokens_t.shape[0])} tokens."
-            )
-            return tokens_t, mask_t
-        if strategy == "custom":
-            assert self._oversize_custom_fn is not None
-            result = self._oversize_custom_fn(tokens=tokens, loss_mask=loss_mask, capacity=cap, idx=idx)
-            if result is None:
-                logger.warning(
-                    f"SFTStreamingDataset[oversize=custom]: sample idx={idx} expanded length {n} "
-                    f"exceeds per-GPU capacity {cap}; custom function returned None; skipping."
-                )
-                return None
-            tokens_t, mask_t = result
-            logger.warning(
-                f"SFTStreamingDataset[oversize=custom]: sample idx={idx} expanded length {n} "
-                f"exceeds per-GPU capacity {cap}; custom function returned {int(tokens_t.shape[0])} tokens."
-            )
-            return tokens_t, mask_t
-        raise ValueError(f"unknown oversize strategy: {strategy!r}")
+        return apply_oversize_strategy(
+            tokens=tokens,
+            loss_mask=loss_mask,
+            capacity=self.capacity if capacity_override is None else capacity_override,
+            strategy=self._oversize_strategy,
+            custom_fn=self._oversize_custom_fn,
+            idx=idx,
+            has_multimodal=has_multimodal,
+        )
 
 
 @dataclass

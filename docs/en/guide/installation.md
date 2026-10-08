@@ -41,9 +41,9 @@ DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile \
   --target sglang \
   -t {your image name}:{tag} \
-  --build-arg HTTP_PROXY={代理地址（可选配置）} \
-  --build-arg HTTPS_PROXY={代理地址（可选配置）} \
-  --build-arg NO_PROXY={bypass代理地址（可选配置）} \
+  --build-arg HTTP_PROXY={proxy_address_optional} \
+  --build-arg HTTPS_PROXY={proxy_address_optional} \
+  --build-arg NO_PROXY={no_proxy_addresses_optional} \
   .
 
 # build relax runtime docker image, for training and deployment
@@ -51,9 +51,9 @@ DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile \
   --target relax \
   -t {your image name}:{tag} \
-  --build-arg HTTP_PROXY={代理地址（可选配置）} \
-  --build-arg HTTPS_PROXY={代理地址（可选配置）} \
-  --build-arg NO_PROXY={bypass代理地址（可选配置）} \
+  --build-arg HTTP_PROXY={proxy_address_optional} \
+  --build-arg HTTPS_PROXY={proxy_address_optional} \
+  --build-arg NO_PROXY={no_proxy_addresses_optional} \
   .
 ```
 

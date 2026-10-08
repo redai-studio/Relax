@@ -1,12 +1,12 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Controller-side SFT wiring helpers.
+"""Controller-side offline training wiring helpers.
 
 Extracted from ``relax/core/controller.py`` so the controller stays a thin
 orchestrator. Three responsibilities:
 
 * ``resolve_sft_num_rollout(config)`` — fill in ``config.num_rollout`` /
-  ``config.num_rollout_per_epoch`` for the SFT path before any actor is
+  ``config.num_rollout_per_epoch`` for offline training before any actor is
   launched. RL goes through ``placement_group.py`` after RolloutManager
   init, so it doesn't go through here.
 * ``resolve_sft_algo_key(config)`` — single source of truth for the
@@ -17,34 +17,31 @@ orchestrator. Three responsibilities:
 
 from argparse import Namespace
 
-from relax.engine.sft.runtime import resolve_sft_eval_split
+from relax.engine.sft.runtime import is_offline_mode, is_preference_mode, resolve_sft_eval_split
 from relax.utils.logging_utils import get_logger
 
 
 logger = get_logger(__name__)
 
 
-def _is_sft(config: Namespace) -> bool:
-    return getattr(config, "loss_type", None) == "sft"
-
-
 def resolve_sft_algo_key(config: Namespace) -> str:
-    """Pick the ``ALGOS`` lookup key. SFT > advantage_estimator (RL).
+    """Pick the shared offline ``ALGOS`` key or advantage_estimator (RL).
 
     Same priority order as ``process_role`` in ``relax.core.registry`` so the
     ROLES set and the ALGOS dict stay consistent.
     """
-    if _is_sft(config):
+    if is_offline_mode(config):
         return "sft"
     return config.advantage_estimator
 
 
 def resolve_sft_num_rollout(config: Namespace) -> None:
-    """Fill in ``config.num_rollout`` (and ``num_rollout_per_epoch``) for SFT.
+    """Fill in ``config.num_rollout`` (and ``num_rollout_per_epoch``) from
+    offline data.
 
-    Must run before any actor is launched. No-op outside SFT.
+    Must run before any actor is launched. No-op for online RL.
     """
-    if not _is_sft(config):
+    if not is_offline_mode(config):
         return
 
     custom_dataset_class_path = getattr(config, "custom_dataset_class_path", None)
@@ -59,15 +56,24 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
 
     # Lazy import: pulling streaming dataset at module load would drag heavy
     # multimodal deps into every controller import.
-    from relax.engine.sft.dataset.streaming import SFTStreamingDataset
+    if is_preference_mode(config):
+        from relax.engine.sft.dataset.preference import PreferenceStreamingDataset
+
+        sizing_dataset = PreferenceStreamingDataset(
+            path=config.prompt_data,
+            prefetch_max_cached=0,
+        )
+    else:
+        from relax.engine.sft.dataset.streaming import SFTStreamingDataset
+
+        sizing_dataset = SFTStreamingDataset(path=config.prompt_data, prefetch_max_cached=0)
 
     # Sized-only construction: no tokenizer/processor needed because we never
     # call get_batch — we just need len() to derive num_rollout.
-    sizing_dataset = SFTStreamingDataset(path=config.prompt_data, prefetch_max_cached=0)
     total_size = len(sizing_dataset)
     dataset_size, eval_size = resolve_sft_eval_split(total_size, getattr(config, "eval_size", None))
     assert dataset_size >= config.rollout_batch_size, (
-        f"SFT dataset size {dataset_size} < rollout_batch_size {config.rollout_batch_size}"
+        f"Offline dataset size {dataset_size} < rollout_batch_size {config.rollout_batch_size}"
     )
     num_per_epoch, remainder = divmod(dataset_size, config.rollout_batch_size)
     config.num_rollout_per_epoch = num_per_epoch if remainder == 0 else None
@@ -78,7 +84,7 @@ def resolve_sft_num_rollout(config: Namespace) -> None:
         )
     assert config.num_rollout is not None and config.num_rollout > 0
     logger.info(
-        f"SFT num_rollout resolved: {config.num_rollout} "
+        f"Offline num_rollout resolved: {config.num_rollout} "
         f"(num_rollout_per_epoch={config.num_rollout_per_epoch}, train_size={dataset_size}, "
         f"eval_size={eval_size}, total_size={total_size})"
     )
@@ -90,12 +96,12 @@ def validate_sft_resource(config: Namespace) -> None:
     Without this, the train workers would silently block on TransferQueue
     forever (the missing role's data never lands).
     """
-    if not _is_sft(config):
+    if not is_offline_mode(config):
         return
     resource = config.resource or {}
     if "sft" not in resource:
         raise ValueError(
-            f"--resource is missing required role 'sft' for loss_type=sft "
+            f"--resource is missing required role 'sft' for loss_type={config.loss_type} "
             f'(SFT producer is CPU-only, e.g. "sft": [1, 0]). '
             f"Got roles: {sorted(resource.keys())}"
         )

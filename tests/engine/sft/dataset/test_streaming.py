@@ -960,7 +960,6 @@ def test_streaming_dataset_missing_media_skip_refills_batch(tmp_path: Path, monk
         prefetch_num_workers=1,
         invalid_multimodal_strategy="skip",
     )
-    ds.shuffle(0)
     warning_messages: list[str] = []
     original_warning = streaming_module.logger.warning
 
@@ -971,6 +970,8 @@ def test_streaming_dataset_missing_media_skip_refills_batch(tmp_path: Path, monk
     monkeypatch.setattr(streaming_module.logger, "warning", _capture_warning)
 
     try:
+        # shuffle starts prefetch, so warning capture must be installed first.
+        ds.shuffle(0)
         if batch_mode == "async":
             samples, _ = asyncio.run(ds.get_batch_async(1))
         else:
