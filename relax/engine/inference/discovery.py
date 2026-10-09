@@ -169,13 +169,27 @@ def build_model_snapshot(
         )
         for index, base_url, state in engines
     )
+    worker_rows = tuple(diagnostic_workers)
     workers = tuple(
         EngineSnapshot(engine_id=f"{name}/{label}", base_url=base_url, state=state)
-        for label, base_url, state in diagnostic_workers
+        for label, base_url, state in worker_rows
     )
+    state = aggregate_state(replica.state for replica in replicas)
+    if any(label.startswith(("prefill-", "decode-")) for label, _, _ in worker_rows):
+        # A PD router needs both stages, even if regular replicas also exist.
+        # Within each stage a healthy spare can replace a dead worker.
+        stages = [
+            aggregate_state(state for label, _, state in worker_rows if label.startswith(f"{stage}-"))
+            for stage in ("prefill", "decode")
+        ]
+        if EngineState.DEAD in stages:
+            state = EngineState.DEAD
+        else:
+            blocked = [stage for stage in stages if stage is not EngineState.READY]
+            state = aggregate_state(blocked) if blocked else EngineState.READY
     return ModelSnapshot(
         name=name,
-        state=aggregate_state(replica.state for replica in replicas),
+        state=state,
         router_url=router_url,
         engines=replicas,
         diagnostic_workers=workers,

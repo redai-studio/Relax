@@ -936,12 +936,12 @@ class Rollout(Base):
 
     @app.post("/generate")
     async def generate(self, request: Request):
-        """Forward a native SGLang ``/generate`` payload to the router."""
+        """Forward a native SGLang payload using the shared routing rules."""
         try:
             payload = await request.json()
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
-        return await self._gateway.proxy_json(await self._get_sglang_url("/generate"), payload)
+        return await self._gateway.generate(payload)
 
     @app.get("/health")
     async def health(self) -> dict:

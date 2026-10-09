@@ -69,6 +69,31 @@ def validate_deferred_scoring_args(args: Any) -> None:
             "--dynamic-sampling-filter-path: the filter decides on a prompt group as soon as it has generated, "
             "but its rewards only exist after the batch has been scored. Drop one of the two flags."
         )
+    if (
+        is_deferred_teacher(args)
+        and getattr(args, "opd_kl_coef", 0)
+        and getattr(args, "opd_token_selection", None) in {"teacher_topk", "union"}
+    ):
+        batch_size = getattr(args, "rollout_batch_size", 0)
+        oversampling = getattr(args, "over_sampling_batch_size", None)
+        partial = getattr(args, "partial_rollout", False)
+        # The partial-rollout path masks every carried response token before
+        # its completed-sample fast path or continuation. Only new tokens then
+        # contribute to OPD, so their student scores use the current policy.
+        masks_carryover = partial and getattr(args, "mask_offpolicy_in_partial_rollout", False)
+        if (
+            partial
+            or (oversampling is not None and oversampling > batch_size)
+            or getattr(args, "dynamic_sampling_filter_path", None) is not None
+        ) and not masks_carryover:
+            raise ValueError(
+                "--opd-teacher-defer with teacher_topk/union in advantage mode requires fresh samples from one "
+                "student policy: disable --partial-rollout and --dynamic-sampling-filter-path, and set "
+                "--over-sampling-batch-size equal to --rollout-batch-size, or enable --partial-rollout with "
+                "--mask-offpolicy-in-partial-rollout. Buffered samples may cross a weight "
+                "update before deferred student prefill; their generation-time student probabilities would "
+                "then be combined with scores from a different policy."
+            )
     if not getattr(args, "use_agentic_rollout", False):
         return
     if deferred_reward:

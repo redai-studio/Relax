@@ -367,6 +367,64 @@ def _teacher_args(**overrides) -> Namespace:
     return Namespace(**values)
 
 
+@pytest.mark.parametrize("selection", ["teacher_topk", "union"])
+@pytest.mark.parametrize(
+    "carryover",
+    [
+        {"partial_rollout": True},
+        {"over_sampling_batch_size": 3},
+        {"dynamic_sampling_filter_path": "relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std"},
+    ],
+)
+def test_deferred_teacher_rejects_cross_policy_student_prefill(selection, carryover):
+    values = dict(
+        opd_token_selection=selection,
+        opd_kl_coef=1.0,
+        rollout_batch_size=2,
+        over_sampling_batch_size=2,
+        partial_rollout=False,
+    )
+    values.update(carryover)
+
+    with pytest.raises(ValueError, match="fresh samples from one student policy"):
+        deferred.validate_deferred_scoring_args(_teacher_args(**values))
+
+    # Masking is effective only inside the partial-rollout path.
+    masked = {**values, "mask_offpolicy_in_partial_rollout": True}
+    if not masked["partial_rollout"]:
+        with pytest.raises(ValueError, match="fresh samples from one student policy"):
+            deferred.validate_deferred_scoring_args(_teacher_args(**masked))
+    masked["partial_rollout"] = True
+    deferred.validate_deferred_scoring_args(_teacher_args(**masked))
+
+    # Inline scoring uses the generation policy before completed surplus is buffered.
+    deferred.validate_deferred_scoring_args(_teacher_args(**values, opd_teacher_defer=False))
+    # Loss mode recomputes student scores in training, without deferred student prefill.
+    values.update(opd_kl_coef=0.0, opd_loss_coef=1.0)
+    deferred.validate_deferred_scoring_args(_teacher_args(**values))
+
+
+@pytest.mark.parametrize("selection", ["student_sampled", "student_topk", "teacher_topk", "union"])
+def test_deferred_teacher_accepts_fresh_batches_for_all_selections(selection):
+    deferred.validate_deferred_scoring_args(
+        _teacher_args(opd_token_selection=selection, opd_kl_coef=1.0, rollout_batch_size=2, over_sampling_batch_size=2)
+    )
+
+
+@pytest.mark.parametrize("selection", ["student_sampled", "student_topk"])
+def test_deferred_teacher_retains_carryover_without_student_prefill(selection):
+    deferred.validate_deferred_scoring_args(
+        _teacher_args(
+            opd_token_selection=selection,
+            opd_kl_coef=1.0,
+            rollout_batch_size=2,
+            over_sampling_batch_size=3,
+            partial_rollout=True,
+            dynamic_sampling_filter_path="relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std",
+        )
+    )
+
+
 def _teacher_coordinator(args: Namespace, events: list[str]) -> LifecycleCoordinator:
     def switch(event: str):
         def run() -> list:

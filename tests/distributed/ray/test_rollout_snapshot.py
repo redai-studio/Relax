@@ -67,6 +67,7 @@ def test_rollout_snapshot_excludes_pd_workers_from_replicas(monkeypatch):
     model = _snapshot(_manager(monkeypatch, [prefill, decode])).model("default")
 
     assert model.engines == ()
+    assert model.state.value == "ready"
     assert [(worker.engine_id, worker.base_url) for worker in model.diagnostic_workers] == [
         ("default/prefill-0", "http://p0:15000"),
         ("default/decode-1", "http://d0:15000"),

@@ -157,6 +157,8 @@ teacher 引擎启动之前，Relax 会检查每个引擎的 GPU 是否位于同�
 
 `--opd-teacher-defer` 要求在 `--colocate` 下使用托管 teacher。使用外部 teacher、不使用 `--colocate`，或与 `--use-agentic-rollout` 同时使用时，启动时会被拒绝。
 
+advantage 模式下，延迟评分的 `teacher_topk` 和 `union` 要求样本来自当前学生策略。请关闭 `--partial-rollout` 和 `--dynamic-sampling-filter-path`，并保持 `--over-sampling-batch-size` 与 `--rollout-batch-size` 相等（默认行为）。也可以同时启用 `--partial-rollout` 和 `--mask-offpolicy-in-partial-rollout`，让跨轮携带的响应 token 不参与训练。其他组合会在启动前报错，因为跨轮缓存的样本可能在学生 prefill 之前经历权重更新，混用不同策略的概率。这个限制不适用于 loss 模式、`student_sampled` 和 `student_topk`。
+
 ### Teacher 的接口
 
 托管 teacher 可以通过 Ray Serve HTTP 端口上的 `/teacher` 路由访问，与 `/rollout`、`/genrm` 并列。没有配置托管 teacher 时不存在这个路由。

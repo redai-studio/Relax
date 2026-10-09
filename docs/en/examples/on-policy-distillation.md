@@ -157,6 +157,8 @@ The Shared layout is refused without `--opd-teacher-defer`. When the student mus
 
 `--opd-teacher-defer` needs a managed teacher under `--colocate`. It is rejected at startup with an external teacher, without `--colocate`, and with `--use-agentic-rollout`.
 
+In advantage mode, deferred `teacher_topk` and `union` require fresh samples from the current student policy. Disable `--partial-rollout` and `--dynamic-sampling-filter-path`, and keep `--over-sampling-batch-size` equal to `--rollout-batch-size` (the default). Alternatively, enable both `--partial-rollout` and `--mask-offpolicy-in-partial-rollout` so carried response tokens do not contribute to training. Other combinations are rejected at startup because buffered samples can cross a weight update before student prefill and mix scores from different policies. This restriction does not apply to loss mode, `student_sampled`, or `student_topk`.
+
 ### Teacher Endpoints
 
 A managed teacher is reachable through the `/teacher` route of the Ray Serve HTTP port, next to `/rollout` and `/genrm`. The route does not exist when no managed teacher is configured.

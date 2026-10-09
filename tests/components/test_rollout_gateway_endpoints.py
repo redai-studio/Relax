@@ -53,11 +53,11 @@ class _RemoteMethod:
         return _Awaitable(self._value)
 
 
-def _make_rollout():
+def _make_rollout(snapshot=SNAPSHOT):
     rollout = object.__new__(Rollout)
     rollout._logger_instance = None
     rollout._sglang_base_url = None
-    rollout._gateway = InferenceGateway("rollout", SNAPSHOT.to_dict, upstream_name="SGLang router")
+    rollout._gateway = InferenceGateway("rollout", snapshot.to_dict, upstream_name="SGLang router")
     rollout.rollout_manager = type("_Manager", (), {})()
     rollout.rollout_manager.get_engines_info = _RemoteMethod(LEGACY_ENGINES)
     rollout.rollout_manager.get_router_address = _RemoteMethod({"router_ip": "192.0.2.1", "router_port": 3000})
@@ -120,6 +120,62 @@ async def test_rollout_generate_forwards_native_payload_to_router(monkeypatch):
         "url": "http://192.0.2.1:3000/generate",
         "payload": {"text": "hi", "sampling_params": {"max_new_tokens": 4}},
     }
+
+
+@pytest.mark.parametrize("selection", [{"model": "code"}, {"route_key": "coding"}])
+async def test_rollout_generate_uses_shared_model_routing(monkeypatch, selection):
+    seen = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"text": "code"})
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: real_async_client(transport=httpx.MockTransport(handler))
+    )
+    snapshot = RoleSnapshot(
+        role="rollout",
+        topology_revision=1,
+        default_model="default",
+        route_keys={"coding": "code"},
+        models=(
+            *SNAPSHOT.models,
+            build_model_snapshot("code", [(0, "http://code:15000", EngineState.READY)], router_url="http://code:3000"),
+        ),
+    )
+    rollout = _make_rollout(snapshot)
+
+    class _Request:
+        async def json(self):
+            return {**selection, "input_ids": [1]}
+
+    assert await rollout.generate(_Request()) == {"text": "code"}
+    assert str(seen[0].url) == "http://code:3000/generate"
+    assert json.loads(seen[0].content) == {"input_ids": [1]}
+    assert rollout.rollout_manager.get_router_address.calls == []
+
+
+@pytest.mark.parametrize("state", [EngineState.SLEEPING, EngineState.DRAINING])
+async def test_rollout_generate_rejects_unavailable_router_model(state):
+    rollout = _make_rollout(
+        RoleSnapshot(
+            role="rollout",
+            topology_revision=1,
+            models=(build_model_snapshot("default", [(0, "http://engine:1", state)], router_url="http://router:1"),),
+        )
+    )
+
+    class _Request:
+        async def json(self):
+            return {"input_ids": [1]}
+
+    with pytest.raises(HTTPException) as excinfo:
+        await rollout.generate(_Request())
+
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.headers == {"Retry-After": "5"}
+    assert rollout.rollout_manager.get_router_address.calls == []
 
 
 def _registered_paths(app) -> set[str]:

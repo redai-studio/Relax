@@ -128,3 +128,20 @@ def test_controller_rejects_deferred_scoring_with_dynamic_filter_before_teacher_
         controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
 
     assert teacher_starts == []
+
+
+def test_controller_rejects_deferred_student_policy_carryover_before_teacher_start(monkeypatch):
+    teacher_starts = _stub_startup(monkeypatch)
+    config = _colocate_teacher_config(
+        opd_teacher_defer=True,
+        opd_token_selection="union",
+        opd_kl_coef=1.0,
+        rollout_batch_size=2,
+        over_sampling_batch_size=3,
+        partial_rollout=False,
+    )
+
+    with pytest.raises(ValueError, match="fresh samples from one student policy"):
+        controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
+
+    assert teacher_starts == []

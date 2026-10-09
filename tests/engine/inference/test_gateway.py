@@ -10,6 +10,7 @@ import json
 import httpx
 import pytest
 from fastapi import HTTPException
+from starlette.requests import ClientDisconnect
 
 from relax.engine.inference.discovery import EngineState, RoleSnapshot, build_model_snapshot
 from relax.engine.inference.gateway import InferenceGateway, build_forward_headers
@@ -119,6 +120,62 @@ async def test_gateway_generate_forwards_native_payload_to_a_replica(upstream):
     # Model selection fields are the gateway's, not the engine's.
     assert json.loads(upstream.seen[0].content) == {"input_ids": [1, 2], "sampling_params": {"temperature": 0}}
     assert json.loads(upstream.seen[1].content) == {"input_ids": [3]}
+
+
+class _NativeStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.closed = False
+        self.chunks = [b'event: token\ndata: {"text":', b' "hello"}\n\ndata: [DONE]\n\n']
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("role", ["rollout", "genrm", "teacher"])
+async def test_gateway_native_stream_preserves_sse_and_closes_upstream(upstream, role):
+    stream = _NativeStream()
+    upstream.use(lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream))
+    gateway = InferenceGateway(role, _Manager(_role(_model("math"), role=role)).fetch)
+
+    response = await gateway.generate({"model": "math", "input_ids": [1], "stream": True})
+
+    assert not stream.closed
+    assert b"".join([chunk async for chunk in response.body_iterator]) == b"".join(stream.chunks)
+    assert response.headers["content-type"] == "text/event-stream"
+    assert stream.closed
+    assert str(upstream.seen[0].url) == "http://math-0:1/generate"
+    assert json.loads(upstream.seen[0].content) == {"input_ids": [1], "stream": True}
+
+
+async def test_gateway_native_stream_closes_when_client_disconnects_before_body(upstream):
+    stream = _NativeStream()
+    upstream.use(lambda request: httpx.Response(200, stream=stream))
+    response = await _gateway(_Manager(_role(_model("math")))).generate({"input_ids": [1], "stream": True})
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        raise OSError("client disconnected")
+
+    with pytest.raises(ClientDisconnect):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+
+    assert stream.closed
+
+
+async def test_gateway_native_stream_returns_upstream_error_before_streaming(upstream):
+    upstream.use(lambda request: httpx.Response(422, text="bad sampling params"))
+    gateway = _gateway(_Manager(_role(_model("math"))))
+
+    with pytest.raises(HTTPException) as excinfo:
+        await gateway.generate({"input_ids": [1], "stream": True})
+
+    assert (excinfo.value.status_code, excinfo.value.detail) == (422, "bad sampling params")
 
 
 async def test_gateway_unknown_model_is_a_400_listing_models(upstream):

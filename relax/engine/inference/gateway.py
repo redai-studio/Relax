@@ -23,11 +23,13 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any, Callable, Mapping
 
 import httpx
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from relax.engine.inference.client import InferenceClient, SnapshotSource
 from relax.engine.inference.discovery import RoleSnapshot
@@ -67,6 +69,40 @@ def make_error_chunk(status_code: int, message: str) -> str:
 
 def build_forward_headers(original_headers: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in original_headers.items() if key.lower() not in _HOP_BY_HOP_HEADERS}
+
+
+class _NativeStreamingResponse(StreamingResponse):
+    """Preserve native SSE framing and close upstream even before iteration."""
+
+    def __init__(self, upstream: httpx.Response) -> None:
+        self._upstream = upstream
+        self._close_task: asyncio.Task[None] | None = None
+
+        async def chunks() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await self.aclose()
+
+        # HTTPX decodes content encodings while iterating bytes.
+        headers = {
+            key: value
+            for key, value in build_forward_headers(upstream.headers).items()
+            if key.lower() not in {"content-length", "content-encoding"}
+        }
+        super().__init__(chunks(), status_code=upstream.status_code, headers=headers, media_type="text/event-stream")
+
+    async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._upstream.aclose())
+        await asyncio.shield(self._close_task)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.aclose()
 
 
 class InferenceGateway:
@@ -163,9 +199,32 @@ class InferenceGateway:
         ``model`` / ``route_key`` select the model and are not part of the
         engine's payload, so they are stripped before forwarding.
         """
+        if not isinstance(payload, Mapping):
+            raise HTTPException(status_code=400, detail="Invalid request body: expected a JSON object")
         forwarded = dict(payload)
         target = await self.resolve(model=forwarded.pop("model", None), route_key=forwarded.pop("route_key", None))
+        if forwarded.get("stream"):
+            return await self._stream_generate(f"{target.base_url}/generate", forwarded)
         return await self.proxy_json(f"{target.base_url}/generate", forwarded)
+
+    async def _stream_generate(self, url: str, payload: Mapping[str, Any]) -> StreamingResponse:
+        client = self._get_proxy_client()
+        response = None
+        try:
+            response = await client.send(client.build_request("POST", url, json=dict(payload)), stream=True)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            try:
+                detail = (await exc.response.aread()).decode(errors="replace")
+                raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
+            finally:
+                await exc.response.aclose()
+        except httpx.RequestError as exc:
+            if response is not None:
+                await response.aclose()
+            self._on_upstream_unreachable(url, exc)
+            raise HTTPException(status_code=502, detail=f"Failed to connect to {self._upstream_name}: {exc}") from exc
+        return _NativeStreamingResponse(response)
 
     async def chat_completions(self, body: bytes, headers: Mapping[str, str]) -> Any:
         try:

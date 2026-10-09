@@ -2,6 +2,8 @@
 
 """Topology snapshot structure and the revision counter."""
 
+import pytest
+
 from relax.engine.inference.discovery import (
     SCHEMA_VERSION,
     EngineState,
@@ -11,6 +13,7 @@ from relax.engine.inference.discovery import (
     build_model_snapshot,
     format_base_url,
 )
+from relax.engine.inference.routing import ModelUnavailableError, RoutingState, select_target
 
 
 READY, SLEEPING, DEAD = EngineState.READY, EngineState.SLEEPING, EngineState.DEAD
@@ -70,8 +73,45 @@ def test_discovery_pd_workers_are_diagnostics_not_replicas():
     )
 
     assert model.engines == ()
+    assert model.state is READY
     assert [worker.engine_id for worker in model.diagnostic_workers] == ["policy/prefill-0", "policy/decode-0"]
     assert not any(worker.direct_eligible for worker in model.diagnostic_workers)
+
+
+@pytest.mark.parametrize(
+    "prefill,decode,expected",
+    [
+        ([READY], [READY], READY),
+        ([READY, DEAD], [DEAD, READY], READY),
+        ([READY], [], DEAD),
+        ([], [READY], DEAD),
+        ([READY], [DEAD], DEAD),
+        ([DEAD], [READY], DEAD),
+        ([READY], [SLEEPING], SLEEPING),
+        ([EngineState.DRAINING], [READY], EngineState.DRAINING),
+        ([SLEEPING], [EngineState.ONLOADING], EngineState.ONLOADING),
+        ([EngineState.STARTING], [READY], EngineState.STARTING),
+    ],
+)
+@pytest.mark.parametrize("regular", [[], [(0, "http://regular:1", READY)]])
+def test_discovery_pd_routing_requires_both_stages(prefill, decode, expected, regular):
+    workers = [
+        (f"{stage}-{index}", f"http://{stage}-{index}:1", state)
+        for stage, states in (("prefill", prefill), ("decode", decode))
+        for index, state in enumerate(states)
+    ]
+    model = build_model_snapshot("policy", regular, router_url="http://router:1", diagnostic_workers=iter(workers))
+    snapshot = RoleSnapshot(role="rollout", topology_revision=1, models=(model,))
+
+    assert model.state is expected
+    assert not any(worker.direct_eligible for worker in model.diagnostic_workers)
+    if expected is READY:
+        target = select_target(snapshot, RoutingState())
+        assert target.base_url == "http://router:1"
+        assert target.via_router
+    else:
+        with pytest.raises(ModelUnavailableError):
+            select_target(snapshot, RoutingState())
 
 
 def test_discovery_model_state_follows_its_most_available_replica():
