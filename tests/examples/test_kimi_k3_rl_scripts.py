@@ -60,8 +60,10 @@ def test_kimi_k3_rl_recipe_preserves_layout_and_worker_settings(tmp_path, monkey
             "--save-interval": "200",
             "--sglang-load-format": "dummy",
             "--sglang-moe-runner-backend": "flashinfer_mxfp4",
+            "--custom-rm-path": "examples.models.kimi-k3.rewards.openr1mm.reward_func",
         }.items():
             assert value(flag) == expected
+        assert "--rm-type" not in argv
         assert "--use-kl-loss" not in argv and "--ref-load" not in argv
         assert "--load" not in argv and "--no-save-optim" in argv
         assert worker_env["MEGATRON_SYNC_SAVE_BOUNDED_STAGING"] == "1"

@@ -54,7 +54,7 @@ ROLLOUT_ARGS=(
     --apply-chat-template
     --rollout-shuffle
     --balance-data
-    --rm-type openr1mm
+    --custom-rm-path examples.models.kimi-k3.rewards.openr1mm.reward_func
     # --dynamic-sampling-filter-path relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std
     # --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE:-128}"
     --num-rollout "${NUM_ROLLOUT:-200}"

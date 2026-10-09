@@ -119,6 +119,8 @@ bash scripts/entrypoint/ray-job.sh \
 
 全参脚本默认开启按专家路由的权重更新，设置 `COLOCATE_EXPERT_WEIGHT_ROUTING=0` 可使用广播。动态采样过滤默认关闭，可通过显式 CLI 参数开启。
 
+全参 OpenR1-MM 脚本通过 `--custom-rm-path examples.models.kimi-k3.rewards.openr1mm.reward_func` 使用 [`rewards/openr1mm.py`](./rewards/openr1mm.py) 中的 Kimi K3 专属 reward。它对完整的最终答案评分，支持 XML `<answer>...</answer>` 块和 Kimi 原生最终回答通道；未完成或含糊的最终答案计零分。复用该脚本时，使用此 custom path 配置评分。减配 DAPO math 脚本使用 `deepscaler`。
+
 两个脚本都通过 `--train-env-vars` 启用 `OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1` 和 `FLA_TILELANG=0`。Fake QAT 使用直通梯度估计：路由专家前向使用与在线 MXFP4 导出相同的量化/反量化网格，梯度回到 BF16 master。其他启动方式默认不启用此钩子。Rollout 每张图片只发送一个原始媒体 token；训练 processor 保留原始 prompt，并独立展开图像特征占位。
 
 ### 有界同步 Checkpoint 保存
