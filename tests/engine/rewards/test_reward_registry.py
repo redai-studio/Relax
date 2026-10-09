@@ -106,6 +106,15 @@ class TestRegistryRegistration:
             assert spec.mode == "sync"
         assert set(_LEGACY_SYNC_TYPES) <= set(registry.list_reward_types("sync"))
 
+    def test_openr1mm_uses_generic_handler(self) -> None:
+        route = _resolve(args_rm_type="openr1mm", fallback="zero")
+        assert route.rm_type == "openr1mm"
+        assert not route.boxed and not route.zero_reward
+        spec = registry.get_reward_spec(route.rm_type)
+        assert spec is not None and spec.mode == "sync"
+        assert spec.fn == "relax.engine.rewards.openr1mm:get_openr1mm_rule_based_reward"
+        assert registry.get_router_stats() == {}
+
     def test_guard_fixture_restores_baseline(self):
         before = set(registry.list_reward_types())
         registry.register_reward("t18_transient", lambda response, label: 0.0)

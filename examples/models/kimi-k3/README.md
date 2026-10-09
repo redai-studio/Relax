@@ -119,6 +119,8 @@ The full recipe defaults to `${MODEL_DIR}/Kimi-K3` for model weights and `${DATA
 
 The full recipe enables expert-routed weight updates by default; set `COLOCATE_EXPERT_WEIGHT_ROUTING=0` to use broadcast. Dynamic sampling filters are disabled by default; they can be enabled with explicit CLI arguments.
 
+The full OpenR1-MM recipe selects the Kimi K3 reward in [`rewards/openr1mm.py`](./rewards/openr1mm.py) through `--custom-rm-path examples.models.kimi-k3.rewards.openr1mm.reward_func`. It scores complete final answers, including XML `<answer>...</answer>` blocks and Kimi-native final channels; unfinished or ambiguous final answers receive zero reward. Use this custom path when adapting the recipe. The reduced DAPO math recipe uses `deepscaler`.
+
 Both recipes enable `OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG=1` and `FLA_TILELANG=0` through `--train-env-vars`. Fake QAT uses a straight-through estimator: routed-expert forward weights use the same quantize/dequantize grid as online MXFP4 export, while gradients reach the BF16 master. The hook is disabled by default outside these recipes. Rollout sends exactly one raw media token per image; the training processor retains the original prompt and performs its own image expansion.
 
 ### Bounded Synchronous Checkpoint Saving

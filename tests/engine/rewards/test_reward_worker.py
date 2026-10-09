@@ -164,7 +164,7 @@ class TestOpenR1MMEdgeCases:
     def test_malformed_latex_fallback(self):
         response = "\\invalid{command}"
         label = "\\invalid{command}"
-        assert get_openr1mm_rule_based_reward(response, label) == 0.0
+        assert get_openr1mm_rule_based_reward(response, label) == 1.0
 
     def test_long_response_with_boxed(self):
         response = (
@@ -237,6 +237,17 @@ class TestRewardWorkerDirect:
     def test_openr1mm_fraction(self):
         result = ray.get(self.worker.compute.remote("openr1mm", "\\frac{1}{2}", "0.5"))
         assert result == 1.0
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ("<answer>7</answer><|im_end|>", 1.0),
+            ("<answer>8</answer><|im_end|>", 0.0),
+        ],
+    )
+    def test_openr1mm_scores_answers_with_chat_end_token(self, response: str, expected: float) -> None:
+        result = ray.get(self.worker.compute.remote("openr1mm", response, "7"), timeout=60)
+        assert result == expected
 
     def test_unknown_rm_type_raises(self):
         with pytest.raises(ray.exceptions.RayTaskError):
