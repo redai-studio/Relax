@@ -108,3 +108,23 @@ def test_controller_rejects_unsupported_deferred_scoring_before_teacher_start(mo
         controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
 
     assert teacher_starts == []
+
+
+def test_controller_rejects_deferred_scoring_with_dynamic_filter_before_teacher_start(monkeypatch):
+    teacher_starts = _stub_startup(monkeypatch)
+    config = Namespace(
+        colocate=True,
+        hybrid=False,
+        rollout_num_gpus=8,
+        resource={"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]},
+        _genrm_instances_resolved={"__default__": _genrm_spec(8)},
+        _genrm_colocate_with_rollout=True,
+        defer_reward_to_post_process=True,
+        custom_reward_post_process_path=None,
+        dynamic_sampling_filter_path="relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std",
+    )
+
+    with pytest.raises(ValueError, match="not supported with --dynamic-sampling-filter-path"):
+        controller.Controller.register_all_serve(SimpleNamespace(config=config, runtime_env=None))
+
+    assert teacher_starts == []

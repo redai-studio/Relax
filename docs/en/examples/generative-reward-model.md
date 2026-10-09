@@ -310,7 +310,7 @@ python3 relax/entrypoints/train.py \
 
 Rollout then makes no reward call while it generates. When a batch is complete, Relax offloads Rollout, loads GenRM, calls the configured reward function for every sample that has no reward yet, and offloads GenRM again. The batch is published for training only after that; if scoring fails, none of it is published. Evaluation is scored the same way once all evaluation datasets have generated, and Rollout is loaded again afterwards.
 
-This needs GenRM in the same placement group as Rollout, that is `--colocate` with a Split or Shared layout. It is rejected at startup in `--fully-async` mode, where GenRM has GPUs of its own and nothing to swap, and with `--use-agentic-rollout`.
+This needs GenRM in the same placement group as Rollout, that is `--colocate` with a Split or Shared layout. It is rejected at startup in `--fully-async` mode, where GenRM has GPUs of its own and nothing to swap, and with `--use-agentic-rollout`. It is also rejected together with `--dynamic-sampling-filter-path`: the filter judges each prompt group by its rewards as soon as the group has generated, and with deferred scoring the rewards do not exist yet.
 
 **Run it from your own hook.** Add `--custom-reward-post-process-path` and Relax leaves the swap to that function: it does not offload Rollout or load GenRM for scoring, and the inline reward call stays as configured (`--rm-type dummy` in the example). [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) is such a hook. Use this when you need scoring logic that the reward function interface does not cover, such as a custom prompt batch or a custom normalization.
 

@@ -317,6 +317,32 @@ def test_deferred_scoring_rejects_agentic_rollout():
     deferred.validate_deferred_scoring_args(_args(use_agentic_rollout=True, defer_reward_to_post_process=False))
 
 
+def test_deferred_scoring_rejects_a_dynamic_sampling_filter():
+    """The filter judges a prompt group by its rewards the moment the group has
+    generated; with deferred scoring there are none yet."""
+    filter_path = "relax.engine.filters.dynamic_sampling_filters.check_reward_nonzero_std"
+
+    with pytest.raises(ValueError, match="not supported with --dynamic-sampling-filter-path"):
+        deferred.validate_deferred_scoring_args(_args(dynamic_sampling_filter_path=filter_path))
+
+    # Rewards exist while generating in each of these, so the filter works.
+    deferred.validate_deferred_scoring_args(
+        _args(dynamic_sampling_filter_path=filter_path, custom_reward_post_process_path="my_module.post_process")
+    )
+    deferred.validate_deferred_scoring_args(
+        _args(dynamic_sampling_filter_path=filter_path, defer_reward_to_post_process=False)
+    )
+    deferred.validate_deferred_scoring_args(
+        _args(
+            dynamic_sampling_filter_path=filter_path,
+            defer_reward_to_post_process=False,
+            use_opd=True,
+            opd_type="sglang",
+            opd_teacher_defer=True,
+        )
+    )
+
+
 # ----------------------------------------------------------------------
 # The deferred OPD teacher.
 # ----------------------------------------------------------------------

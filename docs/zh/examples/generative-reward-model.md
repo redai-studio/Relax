@@ -309,7 +309,7 @@ python3 relax/entrypoints/train.py \
 
 这样 Rollout 在生成过程中不会调用奖励函数。一批样本生成完成后，Relax 先卸载 Rollout、加载 GenRM，对其中还没有奖励的样本调用配置的奖励函数，再卸载 GenRM。这之后这批样本才会发布给训练；打分失败时整批都不发布。评测也按同样的方式打分：等所有评测数据集都生成完再统一进行，结束后重新加载 Rollout。
 
-这种做法要求 GenRM 与 Rollout 在同一个 placement group 里，也就是 `--colocate` 下的 Split 或 Shared 布局。`--fully-async` 模式下 GenRM 有自己的 GPU，没有可以交换的对象，启动时会被拒绝；与 `--use-agentic-rollout` 同时使用也会被拒绝。
+这种做法要求 GenRM 与 Rollout 在同一个 placement group 里，也就是 `--colocate` 下的 Split 或 Shared 布局。`--fully-async` 模式下 GenRM 有自己的 GPU，没有可以交换的对象，启动时会被拒绝；与 `--use-agentic-rollout` 同时使用也会被拒绝。与 `--dynamic-sampling-filter-path` 同时使用同样会被拒绝：过滤函数在一组样本生成完时就要根据奖励做判断，而延迟打分时奖励此刻还不存在。
 
 **由自己的钩子函数执行。** 再加上 `--custom-reward-post-process-path`，Relax 就把切换完全交给这个函数：不会为了打分去卸载 Rollout 或加载 GenRM，生成过程中的奖励调用也保持原有配置（示例里是 `--rm-type dummy`）。[`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) 就是这样一个钩子函数。当奖励函数接口表达不了你的打分逻辑时用这种做法，例如自定义的批量 prompt 或归一化方式。
 

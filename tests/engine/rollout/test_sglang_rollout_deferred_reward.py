@@ -6,6 +6,7 @@ one score phase after every dataset has generated."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -184,3 +185,141 @@ async def test_sglang_rollout_deferred_teacher_still_scores_rewards_inline(opd_r
 
     assert rollout == [3]
     assert sample.reward == 1.0
+
+
+# ----------------------------------------------------------------------
+# Publishing waits for generation to stop.
+# ----------------------------------------------------------------------
+
+
+class _GenerationState:
+    """Stands in for ``GenerateState``: every submitted group finishes at once
+    except the last of each round, which stays in flight until released -- the
+    over-sampling surplus that is still generating when the target is met."""
+
+    def __init__(self):
+        self.remaining_batch_size = 0
+        self.pendings: set = set()
+        self.protected_pendings: set = set()
+        self.prefetched_samples_ref = None
+        self.last_step_current_deficit = 0
+        self.release = asyncio.Event()
+
+    def submit_generate_tasks(self, groups):
+        for position, group in enumerate(groups):
+            in_flight = position == len(groups) - 1
+            self.pendings.add(asyncio.create_task(self._generate(group, in_flight)))
+        self.remaining_batch_size += len(groups)
+
+    async def _generate(self, group, in_flight):
+        if in_flight:
+            await self.release.wait()
+        return group
+
+    def reset(self):
+        self.pendings = set()
+
+
+@pytest.fixture
+def generation(monkeypatch):
+    """The real ``generate_rollout_async`` over a fake engine, with ``abort``
+    and the publishing exit replaced by recorders."""
+    events: list[str] = []
+    state = _GenerationState()
+    failure: dict = {}
+
+    async def fake_abort(args, rollout_id):
+        events.append("abort")
+        if "abort" in failure:
+            raise failure["abort"]
+        state.release.set()
+        while state.pendings:
+            _done, state.pendings = await asyncio.wait(state.pendings)
+        events.append("generation stopped")
+        return [], []
+
+    async def fake_transfer(args, batch, count, rollout_id, data_system_client, is_last=False):
+        events.append(f"publish {count} group(s), {len(state.pendings)} still generating")
+
+    async def no_profile(args, rollout_id):
+        return None
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "abort", fake_abort)
+    monkeypatch.setattr(sglang_rollout, "transfer_batch_to_data_system", fake_transfer)
+    monkeypatch.setattr(sglang_rollout, "start_sglang_profile", no_profile)
+    monkeypatch.setattr(sglang_rollout, "stop_sglang_profile", no_profile)
+    # The data source hands its groups back directly.
+    monkeypatch.setattr(sglang_rollout.ray, "get", lambda ref: ref)
+
+    def groups(count):
+        return [
+            [Sample(index=i, prompt="question", response="answer", label="label", status=Sample.Status.COMPLETED)]
+            for i in range(count)
+        ]
+
+    data_source = SimpleNamespace(get_samples=SimpleNamespace(remote=groups))
+
+    async def run(**flags):
+        args = _args(
+            deferred=False,
+            rollout_global_dataset=True,
+            dynamic_sampling_filter_path=None,
+            fully_async=False,
+            num_rollout=10,
+            rollout_batch_size=2,
+            # One group more than the step commits: it is still in flight when the target is met.
+            over_sampling_batch_size=3,
+            n_samples_per_prompt=1,
+            use_dynamic_global_batch_size=False,
+            debug_rollout_only=False,
+        )
+        for name, value in flags.items():
+            setattr(args, name, value)
+        return await sglang_rollout.generate_rollout_async(args, 0, data_source, None)
+
+    return SimpleNamespace(run=run, events=events, failure=failure, state=state)
+
+
+async def test_sglang_rollout_publishes_before_abort_by_default(generation):
+    """Without deferred scoring the order is what it always was: publish while
+    the surplus is still generating, abort it afterwards."""
+    await generation.run()
+
+    assert generation.events == ["publish 2 group(s), 1 still generating", "abort", "generation stopped"]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"defer_reward_to_post_process": True},
+        {"use_opd": True, "opd_type": "sglang", "opd_teacher_defer": True},
+    ],
+)
+async def test_sglang_rollout_deferred_scoring_waits_for_generation_to_stop(generation, flags):
+    """Deferred scoring runs inside the publishing exit and takes rollout's
+    GPUs: nothing may still be generating when it starts."""
+    output, _aborted = await generation.run(**flags)
+
+    assert generation.events == ["abort", "generation stopped", "publish 2 group(s), 0 still generating"]
+    assert len(output.samples) == 2
+
+
+async def test_sglang_rollout_custom_post_process_keeps_the_publishing_order(generation):
+    """A userland hook owns its swap; the framework does not reorder its
+    step."""
+    await generation.run(defer_reward_to_post_process=True, custom_reward_post_process_path="my_module.post_process")
+
+    assert generation.events[0] == "publish 2 group(s), 1 still generating"
+
+
+async def test_sglang_rollout_deferred_scoring_publishes_nothing_if_generation_cannot_be_stopped(generation):
+    generation.failure["abort"] = RuntimeError("router unreachable")
+
+    with pytest.raises(RuntimeError, match="router unreachable"):
+        await generation.run(defer_reward_to_post_process=True)
+    # Let the cancelled publishing task unwind, then free the stand-in engine.
+    await asyncio.sleep(0)
+    generation.state.release.set()
+
+    assert generation.events == ["abort"]

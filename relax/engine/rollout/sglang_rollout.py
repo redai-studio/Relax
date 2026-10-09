@@ -1031,6 +1031,19 @@ async def generate_rollout_async(
 
     loop = asyncio.get_running_loop()
 
+    # Deferred scoring runs when a batch is published and hands rollout's GPUs
+    # to the scorers. Requests may still be in flight when the target is met
+    # (over-sampling surplus, top-ups after filter drops, protected tasks), and
+    # a rollout engine cannot release memory under them. So with deferred
+    # scoring, finished batches are held back until generation has stopped.
+    hold_publishing = is_framework_deferred_reward(args) or is_deferred_teacher(args)
+    generation_stopped = asyncio.Event()
+
+    async def publish(*transfer_args: Any, **transfer_kwargs: Any) -> None:
+        if hold_publishing:
+            await generation_stopped.wait()
+        await transfer_batch_to_data_system(*transfer_args, **transfer_kwargs)
+
     def target_reached() -> bool:
         if is_final_backfill or strict_fill_current:
             return total_transfer_samples >= target_data_size
@@ -1129,7 +1142,7 @@ async def generate_rollout_async(
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
+                    publish(
                         args,
                         batch_to_transfer,
                         n,
@@ -1150,7 +1163,7 @@ async def generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer[:cutoff_batch],
                             n_prev,
@@ -1171,7 +1184,7 @@ async def generate_rollout_async(
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer,
                             n,
@@ -1192,7 +1205,7 @@ async def generate_rollout_async(
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                publish(
                     args,
                     batch_to_transfer,
                     n,
@@ -1210,7 +1223,7 @@ async def generate_rollout_async(
             if n_prev:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer[:n_prev],
                             n_prev,
@@ -1226,7 +1239,7 @@ async def generate_rollout_async(
             if n:
                 transfer_tasks.append(
                     asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer,
                             n,
@@ -1238,6 +1251,18 @@ async def generate_rollout_async(
                 )
                 committed_curr += n
             batch_to_transfer = []
+
+    # abort() returns (aborted_samples, completed_protected_samples)
+    stopped_early = None
+    if hold_publishing:
+        try:
+            stopped_early = await abort(args, rollout_id)
+        except BaseException:
+            # Nothing may be published from a step whose generation could not be stopped.
+            for transfer_task in transfer_tasks:
+                transfer_task.cancel()
+            raise
+        generation_stopped.set()
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
@@ -1260,7 +1285,9 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
-    new_aborted, completed_protected = await abort(args, rollout_id)
+    if stopped_early is None:
+        stopped_early = await abort(args, rollout_id)
+    new_aborted, completed_protected = stopped_early
     for group in new_aborted + completed_protected:
         # Groups completed during abort have not passed the main-loop filter.
         if (

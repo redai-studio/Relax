@@ -62,9 +62,16 @@ def validate_deferred_scoring_args(args: Any) -> None:
         ValueError: the rollout path scores somewhere the deferral does not
             reach.
     """
+    deferred_reward = is_framework_deferred_reward(args)
+    if deferred_reward and getattr(args, "dynamic_sampling_filter_path", None) is not None:
+        raise ValueError(
+            "--defer-reward-to-post-process without --custom-reward-post-process-path is not supported with "
+            "--dynamic-sampling-filter-path: the filter decides on a prompt group as soon as it has generated, "
+            "but its rewards only exist after the batch has been scored. Drop one of the two flags."
+        )
     if not getattr(args, "use_agentic_rollout", False):
         return
-    if is_framework_deferred_reward(args):
+    if deferred_reward:
         raise ValueError(
             "--defer-reward-to-post-process without --custom-reward-post-process-path is not supported with "
             "--use-agentic-rollout: the agentic pipeline scores inside its own stages, so the judge would be "
