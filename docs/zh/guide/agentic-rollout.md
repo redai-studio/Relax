@@ -526,6 +526,10 @@ advantage 提供。Advantage 函数使用的每项信号都应写入 export meta
 - Output metadata 的顶层 numeric field 使用 `<field>/mean|median|max|min`，不带 `rollout/` 前缀。
 - Rollout dump 保留完整 metadata。
 
+Agentic 导出还会保留每个已提交生成节点的 ID 及`accepted`/`proposed`/`verify`/`completion` 计数。一个 rollout 指标批次先按`(session_id, generation_id)` 去重，再计算`spec/accept_rate = sum(accepted) / sum(proposed)` 和`spec/tokens_per_verify = sum(completion) / sum(verify)`；每项比率只使用分子和分母均可用的生成记录。计数总量仍保留所有已知值，包括配对字段缺失的记录。对应的 `spec/*_count_coverage` 区分缺失计数与显式 0；没有完整计数对或完整计数对的分母总量为 0 时省略比率。旧的 `spec_accept_rate` 和 `spec_accept_length` 在每个样本的计数完整时继续表示样本算术平均。旧数据反序列化后仍保留计数的已知／未知状态，重复 JSON 序列化或继续生成不会把缺失字段补成已知的 0。兼容比率要求每个样本的分子已知、分母已知且大于 0，新旧样本混合的批次也遵循这一条件；不满足时省略该比率，显式零分子仍可得到真实的 0%。旧数据保持`legacy_counts` 标记，不推断其生成节点身份，也不冒充新指标的计数覆盖。指标只覆盖本次导出样本中的已提交节点，不统计被丢弃分支。未启用投机解码且没有投机专有计数时，不输出 `spec/*` 指标。
+
+例如，两次独立生成的计数为 `(accepted, proposed) = (1, 2)` 和 `(9, 10)` 时，日志中的 `spec/accepted_total`、`spec/proposed_total` 和 `spec/accept_rate` 分别为`10`、`12` 和 `0.833333...`。若导出轨迹为 `A→B`、`A→C`，其中`A=(1,2,1,2)`、`B=(9,10,2,11)`、`C=(2,4,1,3)`，则四条记录出现次数去重为三个生成节点，汇总为 `(accepted, proposed, verify, completion)=(12,16,4,16)`，所以 `spec/accept_rate=0.75`、`spec/tokens_per_verify=4`。
+
 启用 `--log-passrate` 时，multi-context Session 使用显式导出，并且只有一个代表 context 携带 reward，通常是
 `main`。选中的 primary reward value 成功时设为 `1`，其他情况设为 `0`；reward object 通过 `--reward-key` 选择该
 值。Sibling context 不设置 reward。Custom advantage 需要同一 outcome 时，其他 context 可以在 metadata 中保存
