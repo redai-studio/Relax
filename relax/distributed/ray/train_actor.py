@@ -4,6 +4,7 @@ import abc
 import os
 import random
 from datetime import timedelta
+from typing import Any
 
 import ray
 import torch
@@ -108,13 +109,14 @@ class TrainRayActor(RayActor):
     def _get_parallel_config(self):
         raise NotImplementedError
 
-    def set_rollout_manager(self, rollout_manager):
-        self.rollout_manager = rollout_manager
+    def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any):
+        self.rollout_worker = rollout_worker
+        self.inference_manager = inference_manager
         if not self.args.debug_rollout_only and self.args.rank == 0:
-            ray.get(self.rollout_manager.set_train_parallel_config.remote(self.train_parallel_config))
+            ray.get(self.rollout_worker.set_train_parallel_config.remote(self.train_parallel_config))
         # Retrieve the distributed lock that serialises DCS weight sync with
-        # P2P direct sync (_sync_weights_from_seed_engine on RolloutManager).
-        self._weight_sync_lock = ray.get(self.rollout_manager.get_weight_sync_lock.remote())
+        # P2P direct sync in the manager-owned RolloutEnginePool.
+        self._weight_sync_lock = ray.get(self.inference_manager.rollout_operation.remote("get_weight_sync_lock"))
 
     def set_genrm_manager(self, genrm_manager):
         """Set the genRM manager for coordinated offload/onload.

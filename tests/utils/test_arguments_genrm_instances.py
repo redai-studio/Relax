@@ -3,10 +3,10 @@
 """Normalization of --genrm-instances vs the legacy single-model genRM flags.
 
 ``_resolve_genrm_instances`` is the single source of truth downstream code
-(``register_genrm``, ``create_genrm_managers``, the GPU split/shared check)
-relies on to treat single- and multi-instance genRM configs uniformly. It is
-tested standalone here (not through the full ``slime_validate_args`` pipeline)
-because it has no dependency on the rest of the argument surface.
+(``register_genrm``, ``create_genrm_role``, the GPU split/shared check) relies
+on to treat single- and multi-instance genRM configs uniformly. It is tested
+standalone here (not through the full ``slime_validate_args`` pipeline) because
+it has no dependency on the rest of the argument surface.
 """
 
 import importlib
@@ -173,3 +173,23 @@ def test_genrm_resource_must_match_instance_gpu_sum(_arguments_module):
 
     with pytest.raises(ValueError, match="must equal the sum"):
         _arguments_module._validate_genrm_resource_config(args, resolved)
+
+
+@pytest.mark.parametrize("override", [None, {}])
+def test_genrm_instance_explicit_empty_config_does_not_merge_globals(_resolve_genrm_instances, override):
+    args = _args(
+        genrm_instances={
+            "judge": {"model_path": "/judge", "num_gpus": 2, "engine_config": override, "sampling_config": override}
+        },
+        genrm_engine_config={"mem_fraction_static": 0.3},
+        genrm_sampling_config={"temperature": 0.5},
+    )
+    resolved = _resolve_genrm_instances(args)["judge"]
+    assert resolved["engine_config"] == {}
+    assert resolved["sampling_config"] == {}
+
+
+def test_genrm_resource_is_required_when_enabled(_arguments_module):
+    args = _args(genrm_model_path="/judge", resource={})
+    with pytest.raises(ValueError, match="no 'genrm' entry"):
+        _arguments_module._validate_genrm_resource_config(args, _arguments_module._resolve_genrm_instances(args))

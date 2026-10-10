@@ -3,7 +3,7 @@
 """Tests for ``Rollout.can_do_update_weight_for_async`` handshake-gate safety.
 
 These exercise the real method on a shell instance (``object.__new__``) with the
-collaborators it touches (``rollout_manager`` remote calls,
+collaborators it touches (``rollout_worker`` remote calls,
 ``_async_check_production_for_update_weight``) stubbed, so we test the
 try/finally control flow in isolation -- without Ray Serve / GPUs.
 
@@ -27,7 +27,7 @@ from relax.components.rollout import Rollout as RolloutDeployment
 
 # ``Rollout`` is wrapped by ``@serve.deployment`` / ``@serve.ingress`` -- reach
 # the underlying class so we can build a plain shell instance.
-Rollout = RolloutDeployment.func_or_class
+Rollout = RolloutDeployment.func_or_class.__bases__[0]
 
 
 class _RemoteStub:
@@ -57,6 +57,10 @@ class _ManagerStub:
     def __init__(self, set_weight_updating_fn=None, health_monitoring_pause_fn=None):
         self.health_monitoring_pause = _RemoteStub(health_monitoring_pause_fn or (lambda *a, **k: _ok()))
         self.set_weight_updating = _RemoteStub(set_weight_updating_fn or (lambda *a, **k: _prepared()))
+        # ``end_update_weight`` re-observes health / Router / weight versions
+        # after releasing the lease, because the lease alone is not evidence.
+        self.refresh_inference_state = _RemoteStub(lambda *a, **k: _ok())
+        self.rollout_operation = _RemoteStub(lambda method, *a, **k: getattr(self, method).remote(*a, **k))
 
 
 def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
@@ -67,7 +71,7 @@ def _make_rollout(*, can_update: bool, manager: _ManagerStub) -> "Rollout":
     shell.status = "running"
     shell._weight_update_ready = asyncio.Event()
     shell._weight_update_ready.set()
-    shell.rollout_manager = manager
+    shell.inference_manager = manager
 
     async def _check(_step):
         return can_update
@@ -171,7 +175,7 @@ def test_end_update_weight_does_not_block_after_failed_can_do():
         # Swap in a healthy manager for the resume; the gate being set means
         # end_update_weight's ``await self._weight_update_ready.wait()`` returns
         # immediately instead of hanging forever.
-        shell.rollout_manager = _ManagerStub()
+        shell.inference_manager = _ManagerStub()
         await asyncio.wait_for(shell.end_update_weight(), timeout=1)
         assert shell.status == "running"
 

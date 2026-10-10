@@ -74,11 +74,12 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 | 组件 | 文件 | 职责 |
 |------|------|------|
 | **Actor** | [`actor.py`](../../../relax/components/actor.py) | 策略训练（Megatron 后端） |
-| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，管理 RolloutManager |
+| **Rollout** | [`rollout.py`](../../../relax/components/rollout.py) | Rollout 服务编排，创建 RolloutWorker 并提供扩缩容 API |
 | **Critic** | [`critic.py`](../../../relax/components/critic.py) | PPO value 估计与裁剪 value loss 训练 |
 | **ActorFwd** | [`actor_fwd.py`](../../../relax/components/actor_fwd.py) | 前向推理 log-prob（fully-async 模式） |
 | **Advantages** | [`advantages.py`](../../../relax/components/advantages.py) | 优势计算（PPO/GRPO/GSPO/SAPO/CISPO 等） |
 | **GenRM** | [`genrm.py`](../../../relax/components/genrm.py) | 生成式奖励模型 |
+| **InferenceGateway** | [`inference_gateway.py`](../../../relax/components/inference_gateway.py) | 各推理角色（`/rollout`、`/genrm`、`/teacher`）的 CPU 入口：v2 `GET /engines` 服务发现、请求路由与准入 |
 
 实际部署的服务图取决于算法与运行模式。Colocate 的 GRPO-like 算法使用 Actor + Rollout；同步 colocate PPO 会增加 Critic + Advantages。对于非 PPO 算法，**全异步模式**（`--fully-async`）可根据 log-probability 与 KL 配置进一步部署 ActorFwd 和 Reference 服务。暂不支持 fully-async PPO；当前支持的数据流详见 [PPO 训练](./ppo-training.md)。
 
@@ -100,7 +101,7 @@ Relax 是一个基于 Ray Serve 的大模型强化学习训练框架，支持 Me
 
 ### 6. 分布式层 (Distributed)
 
-- [**Ray Actor 组**](../../../relax/distributed/ray/)：管理 RolloutManager、GenRMManager 等 Ray Actor 组
+- [**Ray Actor**](../../../relax/distributed/ray/)：`InferenceManager`（任务级 CPU 控制面，持有 Rollout/GenRM/Teacher 引擎池、服务发现与准入）、`RolloutWorker`（承载生成与评估）以及训练用的 `RayTrainGroup`
 - [**DCS Checkpoint Service**](../../../relax/distributed/checkpoint_service/)：分布式权重同步服务，支持 NCCL/GLOO/TCP 通信后端
 
 ## 目录结构
@@ -117,6 +118,7 @@ relax/
 │   ├── critic.py            价值估计
 │   ├── advantages.py        优势计算
 │   ├── genrm.py             生成式奖励模型
+│   ├── inference_gateway.py 推理角色入口（服务发现、路由）
 │   └── rollout.py           Rollout 服务编排
 ├── engine/                  引擎层
 │   ├── rollout/             Rollout 引擎实现
@@ -156,7 +158,7 @@ relax/
 │                                                      │                │
 │                                                      ▼                │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │                  RolloutManager.generate()                       │ │
+│  │                  RolloutWorker.generate()                        │ │
 │  │  SGLang engine inference → reward computation → assemble data    │ │
 │  └───────────────────────────┬──────────────────────────────────────┘ │
 │                              │                                        │

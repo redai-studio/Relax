@@ -11,8 +11,8 @@ from relax.utils.autoscaler.metrics_collector import AggregatedMetrics
 from relax.utils.autoscaler.scaling_decision import ScalingAction, ScalingDecision
 
 
-# Underlying class behind the @serve.deployment decorator.
-_ServiceCls = getattr(AutoscalerService, "func_or_class", AutoscalerService)
+# Business class beneath Serve's ASGI wrapper; these tests do not run ASGI.
+_ServiceCls = AutoscalerService.func_or_class.__bases__[0]
 
 
 class _FakeResp:
@@ -55,7 +55,23 @@ def _service(session=None) -> "_ServiceCls":
 
 
 def _engines_payload(engines):
-    return {"models": {"default": {"engine_groups": [{"engines": engines}]}}}
+    """Build a common-schema discovery payload from ``rank/url/status``
+    rows."""
+    return {
+        "schema_version": 2,
+        "models": {
+            "default": {
+                "engines": [
+                    {
+                        "engine_id": f"default/replica-{row['rank']}",
+                        "base_url": row["url"],
+                        "state": "ready" if row["status"] == "active" else "dead",
+                    }
+                    for row in engines
+                ]
+            }
+        },
+    }
 
 
 def test_fetch_engines_filters_dead_slots():
@@ -69,8 +85,8 @@ def test_fetch_engines_filters_dead_slots():
     svc = _service(_FakeSession(get_payload=payload))
     engines = asyncio.run(svc._fetch_engines())
     ids = {e["id"] for e in engines}
-    assert ids == {"engine_0", "engine_2"}
-    assert all(e["status"] == "active" for e in engines)
+    assert ids == {"default/replica-0", "default/replica-2"}
+    assert all(e["status"] == "ready" for e in engines)
 
 
 def test_fetch_engines_all_dead_returns_empty():
@@ -95,7 +111,7 @@ def test_fetch_engines_skips_active_without_url():
     )
     svc = _service(_FakeSession(get_payload=payload))
     engines = asyncio.run(svc._fetch_engines())
-    assert [e["id"] for e in engines] == ["engine_1"]
+    assert [e["id"] for e in engines] == ["default/replica-1"]
 
 
 def test_fetch_engines_multinode_counts_logical_engines_only():
@@ -112,7 +128,7 @@ def test_fetch_engines_multinode_counts_logical_engines_only():
     )
     svc = _service(_FakeSession(get_payload=payload))
     engines = asyncio.run(svc._fetch_engines())
-    assert [e["id"] for e in engines] == ["engine_0", "engine_2"]
+    assert [e["id"] for e in engines] == ["default/replica-0", "default/replica-2"]
     assert len(engines) == 2  # logical engines, NOT 4 physical node actors
 
 

@@ -143,5 +143,5 @@ teacher 是 `max_new_tokens=0` 的纯 prefill，由此推出的链条有依赖�
 - `references/teacher-knobs.md` — R-T01..R-T10 规则目录；开头是三条自验证配方，
   然后是因果链和每条规则。新规则直接追加，无需改本文件
 - `references/balance.md` — student/teacher 产能平衡：怎么量、分卡公式与整除约束、
-  「student offload 后原地起 teacher」为什么现在做不了
+  「student offload 后原地起 teacher」（shared 布局、deferred teacher 阶段）怎么触发、代价在哪
 - `references/baselines.md` — OPD 示例脚本的配置快照 + 刷新命令 + 「明显没调过」的判断模式

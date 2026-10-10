@@ -73,14 +73,14 @@ ______________________________________________________________________
 
 Relax adopts a **six-layer service-oriented architecture** where every role is deployed as an independent [Ray Serve](https://docs.ray.io/en/latest/serve/index.html) deployment, cleanly separating orchestration, components, engines, backends, and distributed capabilities:
 
-| Layer             | Responsibility                                                                                                               |
-| :---------------- | :--------------------------------------------------------------------------------------------------------------------------- |
-| **Entrypoints**   | `train.py` — signal handling, CLI parsing, Ray cluster connection, Controller launch                                         |
-| **Orchestration** | `Controller` (training loop, global restart), `Service` (placement groups, lifecycle), `Registry` (role & algorithm mapping) |
-| **Components**    | Ray Serve deployments: **Actor**, **Rollout**, **Critic**, **ActorFwd**, **Advantages**, **GenRM**                           |
-| **Engine**        | SGLang rollout engine, pluggable reward functions, request router, data filters                                              |
-| **Backends**      | **Megatron-LM** training backend (TP/PP/CP/EP) and **SGLang** inference engine                                               |
-| **Distributed**   | Ray Actor groups (RolloutManager / GenRMManager) and **DCS** (Distributed Checkpoint Service) for NCCL/GLOO weight sync      |
+| Layer             | Responsibility                                                                                                                                               |
+| :---------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Entrypoints**   | `train.py` — signal handling, CLI parsing, Ray cluster connection, Controller launch                                                                         |
+| **Orchestration** | `Controller` (training loop, global restart), `Service` (placement groups, lifecycle), `Registry` (role & algorithm mapping)                                 |
+| **Components**    | Ray Serve deployments: **Actor**, **Rollout**, **Critic**, **ActorFwd**, **Advantages**, **GenRM**                                                           |
+| **Engine**        | SGLang rollout engine, pluggable reward functions, request router, data filters                                                                              |
+| **Backends**      | **Megatron-LM** training backend (TP/PP/CP/EP) and **SGLang** inference engine                                                                               |
+| **Distributed**   | **InferenceManager** (engine pools for Rollout / GenRM / Teacher), **RolloutWorker**, and **DCS** (Distributed Checkpoint Service) for NCCL/GLOO weight sync |
 
 **Three execution modes** are supported:
 

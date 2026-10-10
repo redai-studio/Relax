@@ -12,10 +12,52 @@ import json
 import os
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+
+def test_data_source_checkpoint_restores_buffer_and_cursor(data_source_module, tmp_path):
+    from relax.utils.types import Sample
+
+    def source():
+        instance = object.__new__(data_source_module.RolloutDataSourceWithBuffer)
+        instance.args = SimpleNamespace(
+            rollout_global_dataset=True,
+            save=str(tmp_path),
+            load=str(tmp_path),
+            rollout_shuffle=False,
+            n_samples_per_prompt=2,
+        )
+        instance.sample_offset = 4
+        instance.sample_group_index = 4
+        instance.sample_index = 8
+        instance.epoch_id = 0
+        instance.metadata = {}
+        instance._use_streaming = False
+        instance.dataset = None
+        instance.buffer = []
+        instance.buffer_filter = data_source_module.pop_first
+        return instance
+
+    original = source()
+    group = [Sample(group_index=3, index=i, response="partial", tokens=[1, 2]) for i in (6, 7)]
+    group[0].status = Sample.Status.ABORTED
+    original.add_samples([group])
+    original.save(1)
+    expected = original.get_samples(2)
+
+    restored = source()
+    restored.sample_group_index = 0
+    restored.sample_index = 0
+    restored.load(1)
+    actual = restored.get_samples(2)
+    assert [[s.index for s in group] for group in actual] == [[s.index for s in group] for group in expected]
+    assert actual[0][0].tokens == [1, 2]
+    assert actual[0][0].response == "partial"
+    assert actual[0][0].status == Sample.Status.ABORTED
+    assert restored.sample_offset == 4
 
 
 @pytest.fixture

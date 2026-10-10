@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import json
 import multiprocessing
+import os
 import random
 import socket
 from collections.abc import Iterable
@@ -149,7 +150,15 @@ def router_worker_base_urls(urls: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(router_worker_base_url(url) for url in urls))
 
 
+# The Router only talks to engines inside the cluster. Its HTTP client honors
+# these variables but not a wildcard ``NO_PROXY=*``, so an inherited proxy
+# silently fails every queued worker addition.
+_PROXY_ENV_VARS = ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
 def run_router(args):
+    for name in _PROXY_ENV_VARS:
+        os.environ.pop(name, None)
     try:
         from sglang_router.launch_router import launch_router
 

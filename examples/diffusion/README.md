@@ -11,7 +11,7 @@ Relax keeps diffusion training and rollout as separate Ray Serve components:
 
 ```text
 prompt data
-  -> RolloutManager / SGLangNativeGenerationEngine
+  -> RolloutWorker / InferenceManager / SGLangNativeGenerationEngine
   -> generated images + denoising trajectory + rollout metadata (memory)
   -> PickScore reward
   -> FlowGRPO train samples

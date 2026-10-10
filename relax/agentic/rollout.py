@@ -39,6 +39,7 @@ from relax.agentic.profile import TRACE_KEY
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.engine.rollout.deferred_opd import DeferredOpdSession, deferred_opd_active
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -69,6 +70,9 @@ class _StepContext:
     progress: Any = None
     scored: int = 0
     prepared: int = 0
+    # Deferred OPD holds every batch until the teacher has scored it at close.
+    deferred_session: Optional[DeferredOpdSession] = None
+    staged_batches: List[TransferBatch] = field(default_factory=list)
 
 
 async def _run_group(
@@ -117,6 +121,26 @@ async def _run_group(
         raise
 
 
+async def _publish_scored_batch(
+    args: Namespace,
+    batch_samples: list[list[Sample]],
+    batch_count: int,
+    rollout_id: int,
+    data_system_client: Any,
+    is_last: bool = False,
+) -> None:
+    """Publish one scored batch through the Agentic TQ boundary."""
+
+    del batch_count
+    await _transfer_batch_to_data_system(
+        args=args,
+        batch_samples=batch_samples,
+        rollout_id=rollout_id,
+        data_system_client=data_system_client,
+        is_last=is_last,
+    )
+
+
 class AgenticResidentPipeline:
     """Resident coordinator of Domains, Group tasks, and finalized Group
     refs."""
@@ -137,6 +161,9 @@ class AgenticResidentPipeline:
         self.transfer_domain = transfer_domain
         self._data_system_client = data_system_client
         self._opd_manager = opd.OpdManager(args) if opd.is_opd_enabled(args) else None
+        # A teacher sharing the rollout GPUs wakes only after generation, so
+        # Groups skip inline prefill and are scored when the step closes.
+        self._defer_opd = self._opd_manager is not None and deferred_opd_active(args)
 
         self._changed = asyncio.Event()
         self.prepare_domain.set_progress_callback(self._changed.set)
@@ -180,6 +207,17 @@ class AgenticResidentPipeline:
             # following ID to drain physical debt without opening a partition.
             final_backfill=final_backfill,
         )
+        if self._defer_opd:
+            from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
+
+            context.deferred_session = DeferredOpdSession.maybe_create(
+                self.args,
+                rollout_id,
+                self._data_system_client,
+                self._opd_manager,
+                publish=_publish_scored_batch,
+                encode_multimodal_inputs=_encode_multimodal_inputs,
+            )
         self._active_step = context
         try:
             self.prepare_domain.open_step(
@@ -366,6 +404,9 @@ class AgenticResidentPipeline:
     def _submit_tq_batch(self, context: _StepContext, batch: TransferBatch) -> None:
         """Create one TQ transfer call owned by the active step."""
 
+        if context.deferred_session is not None:
+            context.staged_batches.append(batch)
+            return
         rollout_id, groups, is_last = batch
         task = asyncio.create_task(
             _transfer_batch_to_data_system(
@@ -379,6 +420,34 @@ class AgenticResidentPipeline:
         )
         task.add_done_callback(lambda _task: self._changed.set())
         context.tq_put_tasks.append(task)
+
+    async def _flush_deferred_batches(self, context: _StepContext) -> None:
+        """Score staged batches on the shared teacher, then publish them.
+
+        Runs after generation is paused: the teacher can only take the GPUs
+        once the student has no request in flight.
+        """
+
+        session = cast(DeferredOpdSession, context.deferred_session)
+        staged, context.staged_batches = context.staged_batches, []
+        for rollout_id, groups, is_last in staged:
+            await session.transfer(
+                self.args,
+                [group.samples for group in groups],
+                len(groups),
+                rollout_id,
+                self._data_system_client,
+                is_last=is_last,
+                # Exports of one Session share its training index, so scoring
+                # correlates on the Group/Session/export position instead.
+                scoring_ids=[
+                    f"{group.group_id}/{session_position}/{export_position}"
+                    for group in groups
+                    for session_position, session in enumerate(group.sessions)
+                    for export_position, _ in enumerate(session.exports)
+                ],
+            )
+        await session.flush()
 
     async def _await_tq_puts(self, context: _StepContext) -> None:
         """Cross the TQ durability barrier for batches owned by this step."""
@@ -443,6 +512,8 @@ class AgenticResidentPipeline:
             # its remaining TQ batches. Reward-inflight Groups stay resident.
             await self._seal_dynamic_partition(context)
 
+        if context.deferred_session is not None:
+            await self._flush_deferred_batches(context)
         await self.runtime_domain.trim_memory()
         return RolloutFnTrainOutput(samples=context.output_groups, metrics={})
 
@@ -478,7 +549,12 @@ class AgenticResidentPipeline:
         for stream in self.prepare_domain.take_ready(self._runtime_group_gap(context)):
             await self.runtime_domain.lease_group(stream, context.rollout_id)
             group_task = asyncio.create_task(
-                _run_group(self.runtime_domain, self.reward_domain, stream, self._opd_manager),
+                _run_group(
+                    self.runtime_domain,
+                    self.reward_domain,
+                    stream,
+                    None if self._defer_opd else self._opd_manager,
+                ),
                 name=f"agentic-group:{stream.group_id}",
             )
             group_task.add_done_callback(lambda _task: self._changed.set())
@@ -504,6 +580,11 @@ class AgenticResidentPipeline:
         tq_put_tasks: Tuple[asyncio.Task[None], ...] = ()
         if context is not None:
             tq_put_tasks = tuple(context.tq_put_tasks)
+            if context.deferred_session is not None:
+                # Stop deferred scoring and wait for the teacher release, so no
+                # batch publishes after the Pipeline has shut down.
+                context.staged_batches.clear()
+                await finish_before_cancellation(context.deferred_session.cancel(), "agentic-deferred-opd-cancel")
         for task in tq_put_tasks:
             task.cancel()
         for outcome in await asyncio.gather(*tq_put_tasks, return_exceptions=True):
