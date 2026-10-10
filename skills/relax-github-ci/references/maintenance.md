@@ -26,16 +26,23 @@ The independent synchronize workflow removes `ci-bypass:` labels after new commi
 | `.github/actions/ci-commands/` | Comment commands using workflow `GITHUB_TOKEN` |
 | `.github/workflows/check-bypass.yml` | Reusable `ShigureLab/ci-bypass@v2` gate |
 | `.github/workflows/remove-ci-bypass-labels.yml` | Independent label cleanup on synchronize |
-| `.github/actions/pr-welcome/` | Welcome publisher and bilingual Markdown template |
-| Secret `WELCOME_BOT_TOKEN` | Credential belonging to the welcome bot, with permission to write PR comments |
+| `.github/actions/pr-welcome/` | Welcome publisher, live merge requirements and bilingual Markdown template |
+| `.github/workflows/review-signal.yml` | Unprivileged review event relay; consumers subscribe to `Review Signal` via `workflow_run` |
+| Secret `WELCOME_BOT_TOKEN` | Credential belonging to the welcome bot, with permission to write PR comments and read team membership (`read:org`, or organization Members read for a fine-grained token) |
 | Variable `WELCOME_BOT_LOGIN` | Required welcome account login; must match the token owner |
 
 Keep `ciTeam` nonempty and use exact GitHub login spelling because ci-bypass compares usernames case-sensitively. Verify workflow filenames and job names when changing targets. Only welcome publishing needs the bot secret; the action verifies its account before posting.
 
 Comment commands and welcome publishing load trusted default-branch code. Configure Nyanpasu's `/review` wake word separately. For a native GitHub stack, `pull_request.branches` matches the stack base; manually chaining PR base branches has different trigger semantics.
 
+The welcome comment refreshes on PR changes, review signal runs and configured CI workflow runs. Add new CI workflow names to `pr-welcome.yml` when extending CI. Fork runs with empty PR associations are resolved using both head repository and branch; publishing is serialized per PR. The relay does not execute PR code or pass credentials to consumers.
+
+Merge status reads active rulesets, classic branch protection, current reviews and required checks. Team candidates exclude the PR author; approvals only count when GitHub reports repository push access. Conditional team file patterns, latest-push approval, Code Quality and other conditions not exposed as individual blockers remain explicitly marked for GitHub to decide. Bypass eligibility is not inferred from a bot's limited view.
+
 ## Validation
 
 Use Node.js 24 for ESM checks and run `pre-commit run --all-files`. Validate changed workflows and render the welcome template after editing it. The oxfmt hook uses `ShigureLab/oxfmt-pre-commit-mirror`; its version and file scope are configured in `.pre-commit-config.yaml`.
+
+Run `node --test .github/actions/pr-welcome/index.test.mjs` for review transitions, required-check sources, fork resolution and comment update behavior.
 
 After deploying to the default branch, verify welcome publishing, command permissions, rerun/cancel, bypass and label cleanup on a disposable draft PR. Local checks do not establish live token permissions or GPU/NPU execution.
