@@ -1098,6 +1098,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "Only effective when --use-health-check is enabled.",
             )
             parser.add_argument(
+                "--failure-event-capacity",
+                type=int,
+                default=4096,
+                help="Maximum number of failure timeline events to retain.",
+            )
+            parser.add_argument(
                 "--rollout-health-check-interval",
                 type=float,
                 default=30.0,

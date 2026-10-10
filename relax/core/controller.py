@@ -10,6 +10,7 @@ from argparse import Namespace
 from enum import Enum, IntEnum
 from functools import partial
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import transfer_queue as tq
@@ -35,6 +36,7 @@ from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
 from relax.utils.data.identity_window_sampler import IdentityWindowSampler
 from relax.utils.env import Envs
+from relax.utils.failure_events import FailureEvent, FailureEventStore
 from relax.utils.health_system import HealthManager
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
@@ -171,6 +173,20 @@ class Controller:
         self._health_check_enabled = getattr(config, "use_health_check", False)
         self._max_global_restart = getattr(config, "max_global_restart", 3)
         require_control_plane_resource(config)
+
+        if not hasattr(config, "failure_event_store_name"):
+            config.failure_event_store_name = f"relax_failure_event_store_{uuid4().hex}"
+
+        store_actor = ray.remote(FailureEventStore)
+        self._failure_event_store = store_actor.options(
+            name=config.failure_event_store_name,
+            namespace="relax_failure_events",
+            lifetime="detached",
+            get_if_exists=True,
+            num_cpus=1,
+            num_gpus=0,
+        ).remote(getattr(config, "failure_event_capacity", 4096))
+
         self._health_manager = HealthManager(check_interval=1.0, config=config)
         if not hasattr(self, "_restarting"):
             self._restarting = False  # Flag to indicate a restart is in progress
@@ -437,23 +453,86 @@ class Controller:
         self._restart_consumed_event.set()
         return restart_mode, restart_error
 
-    def _on_service_unhealthy(self, role: str) -> None:
-        """Callback when a service becomes unhealthy. Initiates service
-        restart.
+    def _emit_failure_event(
+        self,
+        *,
+        fault_id: str,
+        role: str,
+        phase: str,
+        action: str | None = None,
+        reason: str | None = None,
+        attempt: int | None = None,
+        step: int | None = None,
+    ) -> None:
+        """Submit one failure event without waiting for the store."""
+        event = FailureEvent(
+            fault_id=fault_id,
+            role=role,
+            phase=phase,
+            occurred_at_ms=time.time_ns() // 1_000_000,
+            action=action,
+            reason=reason,
+            attempt=attempt,
+            step=step,
+        )
+        try:
+            self._failure_event_store.append.remote(event)
+        except Exception as e:
+            logger.warning(f"Failed to record failure event {event.event_id}: {e}")
 
-        Args:
-            role: Service role name that became unhealthy.
-        """
+    def _on_service_unhealthy(
+        self,
+        role: str,
+        fault_id: str,
+        step: int,
+        reason: str,
+    ) -> None:
+        """Record a detected fault and initiate service restart."""
+        self._emit_failure_event(
+            fault_id=fault_id,
+            role=role,
+            phase="detected",
+            reason=reason,
+            step=step,
+        )
+
         logger.warning(f"Service '{role}' detected as unhealthy, initiating restart...")
-        self.restart_serve(role)
+        self.restart_serve(
+            role,
+            fault_id=fault_id,
+            step=step,
+            reason=reason,
+        )
 
-    def _on_service_fatal(self, role: str, error_msg: str) -> None:
+    def _on_service_fatal(
+        self,
+        role: str,
+        error_msg: str,
+        fault_id: str,
+        step: int,
+    ) -> None:
         """Callback when a service reports a fatal (non-recoverable) error.
 
         Runs immediately before the HealthChecker calls ``os._exit(1)`` — used
         to push the error to the metrics service for Apprise so the operator
         gets a notification before the process dies.
         """
+        self._emit_failure_event(
+            fault_id=fault_id,
+            role=role,
+            phase="detected",
+            reason="fatal_error",
+            step=step,
+        )
+        self._emit_failure_event(
+            fault_id=fault_id,
+            role=role,
+            phase="handling_started",
+            action="terminate",
+            reason="fatal_error",
+            step=step,
+        )
+
         logger.error(f"Fatal error from service '{role}': {error_msg}")
         try:
             self._report_error_to_metrics_service(RuntimeError(f"{role}: {error_msg}"))
@@ -1026,6 +1105,11 @@ class Controller:
         except Exception as e:
             logger.warning(f"Failed to clean S3 model SHM cache during shutdown: {e}")
 
+        try:
+            ray.kill(self._failure_event_store)
+        except Exception as e:
+            logger.warning(f"Failed to stop failure event store: {e}")
+
         logger.info("Controller shutdown complete.")
 
     def add_serve(self, role: str) -> None:
@@ -1044,7 +1128,14 @@ class Controller:
         """
         self._health_manager.stop(timeout)
 
-    def restart_serve(self, role: str) -> None:
+    def restart_serve(
+        self,
+        role: str,
+        *,
+        fault_id: str,
+        step: int,
+        reason: str,
+    ) -> None:
         """Restart a service after it becomes unhealthy.
 
         Global restart (full Controller re-initialization from zero) is triggered when:
@@ -1055,6 +1146,9 @@ class Controller:
 
         Args:
             role: Service role name to restart.
+            fault_id: Fault lifecycle identifier.
+            step: Training step when the fault was detected.
+            reason: Fault detection reason.
         """
         logger.info(f"Restarting service '{role}'...")
         # Must mirror register_all_serve's algo-key resolution. Offline mode is
@@ -1100,17 +1194,41 @@ class Controller:
         }
         global_restart = role in full_rewire_roles or restart_count >= 3
         self._restart_mode = "global" if global_restart else "local"
+        action = "global_restart" if global_restart else "local_restart"
+
+        self._emit_failure_event(
+            fault_id=fault_id,
+            role=role,
+            phase="handling_started",
+            action=action,
+            reason=reason,
+            attempt=restart_count,
+            step=step,
+        )
+
         if global_restart:
             # Perform full Controller re-initialization from zero when:
             # 1. Actor fails (core training service, all other services depend on it)
             # 2. Any service has been restarted >= 3 times (system is unstable)
-            reason = (
+            restart_reason = (
                 f"{role} requires cross-service rewiring"
                 if role in full_rewire_roles
                 else f"restart_count({restart_count}) >= 3 for '{role}'"
             )
-            logger.warning(f"Triggering global restart due to: {reason}")
+            logger.warning(f"Triggering global restart due to: {restart_reason}")
             self._global_restart()
+
+            phase = "recovery_succeeded" if self._restart_error is None else "recovery_failed"
+            self._emit_failure_event(
+                fault_id=fault_id,
+                role=role,
+                phase=phase,
+                action=action,
+                reason=(None if self._restart_error is None else "restart_exception"),
+                attempt=restart_count,
+                step=step,
+            )
+
             # _restarting is reset by the main thread after it processes the restart_done_event
         else:
             # Delegate in-place restart to Service (reuses PG, restores step, syncs weights, re-runs task)
@@ -1119,9 +1237,26 @@ class Controller:
                 service.restart()
                 self._health_manager.mark_healthy(role)
                 logger.info(f"Service '{role}' restarted successfully")
+                self._emit_failure_event(
+                    fault_id=fault_id,
+                    role=role,
+                    phase="recovery_succeeded",
+                    action=action,
+                    attempt=restart_count,
+                    step=step,
+                )
             except BaseException as e:
                 self._restart_error = e
                 logger.exception(f"Service '{role}' restart failed: {e}")
+                self._emit_failure_event(
+                    fault_id=fault_id,
+                    role=role,
+                    phase="recovery_failed",
+                    action=action,
+                    reason="restart_exception",
+                    attempt=restart_count,
+                    step=step,
+                )
             finally:
                 self._restart_done_event.set()
 
