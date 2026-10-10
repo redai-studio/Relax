@@ -28,6 +28,8 @@ jobs:
     # A failed gate must run the tests, never grant an exemption.
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Pre-commit Checks
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
