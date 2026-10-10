@@ -9,17 +9,19 @@ through the Rollout service API.
 """
 
 import asyncio
+import copy
 import time
+import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
-from relax.utils.autoscaler.config import AutoscalerConfig
+from relax.utils.autoscaler.config import AutoscalerConfig, ServiceScalingPolicy
 from relax.utils.autoscaler.metrics_collector import MetricsCollector
 from relax.utils.autoscaler.scaling_decision import (
     ScalingAction,
@@ -41,7 +43,7 @@ app = FastAPI()
 class ScaleHistoryItem(BaseModel):
     """Single scale history record."""
 
-    request_id: str
+    request_id: Optional[str] = None
     action: str
     status: str
     triggered_at: float
@@ -81,6 +83,7 @@ class AutoscalerStatusResponse(BaseModel):
     recent_metrics: Optional[Dict[str, Any]] = None
     config: Dict[str, Any] = Field(default_factory=dict)
     total_scale_operations: int = 0
+    services: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ConditionStatusResponse(BaseModel):
@@ -141,6 +144,12 @@ class ConfigUpdateRequest(BaseModel):
         None, gt=0, description="Per-request scale-out timeout in seconds forwarded to the Rollout service"
     )
     rollout_service_url: Optional[str] = Field(None, description="Rollout service URL")
+    service_targets: Optional[Dict[str, str]] = Field(
+        None, description="Per-service target URLs, e.g. {rollout: url, genrm: url}"
+    )
+    service_policies: Optional[Dict[str, ServiceScalingPolicy]] = Field(
+        None, description="Per-service scaling policy overrides"
+    )
     scale_out_policy: Optional[ScaleOutPolicyUpdate] = Field(None, description="Scale-out policy updates")
     scale_in_policy: Optional[ScaleInPolicyUpdate] = Field(None, description="Scale-in policy updates")
 
@@ -170,6 +179,21 @@ class AutoscalerState:
     scale_history: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1000))
     total_scale_operations: int = 0
     last_error: Optional[str] = None
+
+
+@dataclass
+class ServiceRuntime:
+    """Independent mutable autoscaling state for one service target."""
+
+    name: str
+    config: AutoscalerConfig
+    metrics_collector: MetricsCollector
+    decision_engine: ScalingDecisionEngine
+    state: AutoscalerState = field(default_factory=AutoscalerState)
+    # GenRM's API is model-scoped.  First release deliberately supports one
+    # instance per service target; a mixed instance response is rejected at
+    # discovery rather than silently scaling an arbitrary "default" model.
+    model_name: Optional[str] = None
 
 
 # ===================== Autoscaler Service =====================
@@ -212,12 +236,14 @@ class AutoscalerService(Base):
         self.role = role
         self.config = autoscaler_config
 
-        # Initialize components
-        self.metrics_collector = MetricsCollector(self.config)
-        self.decision_engine = ScalingDecisionEngine(self.config)
-
-        # Runtime state
-        self._state = AutoscalerState()
+        self._services: Dict[str, ServiceRuntime] = {}
+        self._rebuild_service_runtimes()
+        # Compatibility aliases: external callers and legacy tests still see
+        # the original rollout runtime at these attributes.
+        rollout = self._services["rollout"]
+        self.metrics_collector = rollout.metrics_collector
+        self.decision_engine = rollout.decision_engine
+        self._state = rollout.state
         self._main_task: Optional[asyncio.Task] = None
         self._http_session: Optional[Any] = None  # aiohttp.ClientSession
 
@@ -226,25 +252,94 @@ class AutoscalerService(Base):
             f"max={self.config.max_engines}, enabled={self.config.enabled}"
         )
 
+    def _rebuild_service_runtimes(self) -> None:
+        """Construct independent policy/decision state for every configured
+        target."""
+        names = {"rollout", *self.config.service_targets}
+        previous = getattr(self, "_services", {})
+        runtimes: Dict[str, ServiceRuntime] = {}
+        collectors_to_start: list = []
+        collectors_to_stop: list = []
+        for name in sorted(names):
+            policy = self.config.get_effective_policies(name)
+            effective = replace(
+                self.config,
+                min_engines=policy.min_engines,
+                max_engines=policy.max_engines,
+                scale_out_policy=policy.scale_out_policy,
+                scale_in_policy=policy.scale_in_policy,
+            )
+            old = previous.get(name)
+            if old is None:
+                collector = MetricsCollector(effective)
+                # A freshly constructed collector has no HTTP session until
+                # start(); record it so the (async) config-PATCH path can
+                # start it before publishing the new runtime set (review
+                # finding: without this, a newly added service target never
+                # collects anything).
+                collectors_to_start.append(collector)
+            else:
+                collector = old.metrics_collector
+            # Keep collected history across a config PATCH, but make its
+            # subsequent polling cadence use the newly resolved service policy.
+            collector.config = effective
+            runtimes[name] = ServiceRuntime(
+                name=name,
+                config=effective,
+                metrics_collector=collector,
+                decision_engine=ScalingDecisionEngine(effective),
+                state=old.state if old else AutoscalerState(),
+            )
+        for name, old in previous.items():
+            if name not in runtimes:
+                # Service target removed by this PATCH: stop its collector so
+                # the HTTP session does not outlive the runtime.
+                collectors_to_stop.append(old.metrics_collector)
+        self._services = runtimes
+        self._collectors_to_start = collectors_to_start
+        self._collectors_to_stop = collectors_to_stop
+
+    def _runtime(self, runtime: Optional[ServiceRuntime]) -> ServiceRuntime:
+        """Return a runtime, including the lightweight legacy test shape."""
+        if runtime is not None:
+            return runtime
+        services = getattr(self, "_services", None)
+        if services is not None:
+            return services["rollout"]
+        return ServiceRuntime(
+            name="rollout",
+            config=self.config,
+            metrics_collector=getattr(self, "metrics_collector", MetricsCollector(self.config)),
+            decision_engine=getattr(self, "decision_engine", ScalingDecisionEngine(self.config)),
+            state=self._state,
+        )
+
     async def start(self) -> None:
         """Start the autoscaler service."""
         if self._main_task is not None and not self._main_task.done():
             logger.warning("Autoscaler already running")
             return
 
-        await self.metrics_collector.start()
+        for runtime in self._services.values():
+            await runtime.metrics_collector.start()
+        # start() launched every current collector, including any recorded as
+        # pending by a pre-start config PATCH; clear the pending list so a
+        # later PATCH does not double-start them.
+        self._collectors_to_start = []
         self._http_session = await self._create_http_session()
 
-        self._state.enabled = self.config.enabled
-        self._state.running = True
+        for runtime in self._services.values():
+            runtime.state.enabled = self.config.enabled
+            runtime.state.running = True
         self._main_task = asyncio.ensure_future(self._main_loop())
 
         logger.info(f"Autoscaler service started, enabled={self._state.enabled}")
 
     async def stop(self) -> None:
         """Stop the autoscaler service."""
-        self._state.running = False
-        self._state.enabled = False
+        for runtime in self._services.values():
+            runtime.state.running = False
+            runtime.state.enabled = False
 
         if self._main_task is not None and not self._main_task.done():
             self._main_task.cancel()
@@ -253,7 +348,12 @@ class AutoscalerService(Base):
             except asyncio.CancelledError:
                 pass
 
-        await self.metrics_collector.stop()
+        for runtime in self._services.values():
+            await runtime.metrics_collector.stop()
+        # Also stop collectors whose runtime was removed by a config PATCH.
+        for collector in getattr(self, "_collectors_to_stop", []):
+            await collector.stop()
+        self._collectors_to_stop = []
 
         if self._http_session is not None:
             await self._http_session.close()
@@ -274,92 +374,151 @@ class AutoscalerService(Base):
             raise
 
     async def _main_loop(self) -> None:
-        """Main autoscaler loop: collect metrics, evaluate, and scale."""
+        """Supervisor for per-service evaluation loops.
+
+        Each configured service owns an independent evaluation task with its
+        own interval timing: a slow/stalled service (e.g. a GenRM metrics
+        endpoint or pending-request wait hitting the 30 s HTTP timeout) delays
+        only its own next round, never another service's cadence (review
+        finding: the former single-cycle ``asyncio.gather`` barrier let one
+        stalled service starve every later cycle for all services). The
+        supervisor re-reconciles the worker set every ``_supervisor_poll_secs``
+        so services added or removed by a config ``PATCH`` gain or lose their
+        worker without a restart. Per service, evaluation is strictly
+        sequential (evaluate, then sleep) -- no reentrancy.
+        """
         logger.info("Autoscaler main loop started")
-
-        while self._state.running:
-            try:
-                # Only evaluate if enabled
-                if self._state.enabled:
-                    await self._evaluate_and_scale()
-
-                # Wait for next evaluation interval
-                await asyncio.sleep(self.config.evaluation_interval_secs)
-
-            except asyncio.CancelledError:
-                logger.info("Autoscaler main loop cancelled")
-                break
-            except Exception as e:
-                logger.exception(f"Error in autoscaler loop: {e}")
-                self._state.last_error = str(e)
-                await asyncio.sleep(self.config.evaluation_interval_secs)
-
+        workers: Dict[str, asyncio.Task] = {}
+        try:
+            while self._state.running:
+                services = getattr(self, "_services", None)
+                runtimes = list(services.values()) if services is not None else [self._runtime(None)]
+                names = {runtime.name for runtime in runtimes}
+                for runtime in runtimes:
+                    worker = workers.get(runtime.name)
+                    # A config PATCH rebuilds ServiceRuntime objects under the
+                    # same name. The old worker exits *by itself* once its
+                    # current evaluation -- including any in-flight scale POST
+                    # whose acceptance response has not landed -- completes
+                    # (graceful handover, see _service_loop); cancelling it
+                    # here would lose that response and strand a SUBMITTING
+                    # placeholder (re-review finding). Only dead workers are
+                    # replaced eagerly.
+                    if worker is None or worker.done():
+                        workers[runtime.name] = asyncio.ensure_future(self._service_loop(runtime))
+                for name in [n for n in workers if n not in names]:
+                    workers.pop(name).cancel()
+                await asyncio.sleep(getattr(self, "_supervisor_poll_secs", 1.0))
+        except asyncio.CancelledError:
+            logger.info("Autoscaler main loop cancelled")
+        finally:
+            for worker in workers.values():
+                worker.cancel()
+            for worker in workers.values():
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - shutdown must not abort
+                    pass
         logger.info("Autoscaler main loop exited")
 
+    async def _service_loop(self, runtime: "ServiceRuntime") -> None:
+        """Independent evaluation cadence for one service.
+
+        The global ``self._state.running``/``enabled`` flags keep their
+        service-wide meaning (``/enable`` and ``stop()`` toggle them), while
+        the interval comes from the service's effective config.
+
+        Graceful handover: a config PATCH rebuilds the runtime object under
+        the same name; this worker then finishes its CURRENT evaluation --
+        including an in-flight scale POST whose acceptance response would be
+        lost by a cancel -- and exits at the next iteration boundary. The
+        rebuilt runtime shares the same ``state`` object, so a placeholder
+        registered before the POST is updated in place even across the
+        handover (re-review finding: cancelling mid-POST stranded the
+        operation -- the server had accepted it, the autoscaler forgot it).
+        """
+        services_ref = self
+        interval = runtime.config.evaluation_interval_secs
+        while self._state.running:
+            # Re-read the mapping every iteration: a config PATCH replaces the
+            # ``_services`` dict wholesale, so a reference captured at loop
+            # entry would never observe the rebuild.
+            services_now = getattr(services_ref, "_services", None)
+            if services_now is not None and services_now.get(runtime.name) is not runtime:
+                logger.info(f"Autoscaler worker for service={runtime.name}: runtime rebuilt, handing over")
+                return
+            try:
+                if self._state.enabled:
+                    await self._evaluate_service_guarded(runtime)
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001 - keep this service alive
+                runtime.state.last_error = str(e)
+                logger.exception(f"Autoscaler loop error for service={runtime.name}: {e}")
+                await asyncio.sleep(interval)
+
+    async def _evaluate_service_guarded(self, runtime: "ServiceRuntime") -> None:
+        try:
+            await self._evaluate_service(runtime)
+        except Exception as exc:  # noqa: BLE001 - isolate per service
+            runtime.state.last_error = str(exc)
+            logger.exception(f"Autoscaler evaluation failed for service={runtime.name}: {exc}")
+
     async def _evaluate_and_scale(self) -> None:
-        """Perform one evaluation cycle: collect metrics, decide, and
-        execute."""
-        # Reconcile requests even when engine discovery fails.
-        await self._update_pending_requests()
+        """Evaluate every configured service once, concurrently.
 
-        # 1. Fetch current engine list
-        engines = await self._fetch_engines()
-        if not engines:
-            logger.warning("No engines found, skipping evaluation")
-            # An unobservable cycle breaks active debounce streaks.
-            self.decision_engine.reset_condition_trackers()
+        Compatibility entry point (direct calls and tests): within one call,
+        services are evaluated concurrently via ``asyncio.gather`` and mutable
+        decision state/history stay isolated per service. The continuously
+        running path is the per-service loops in ``_main_loop``.
+        """
+        services = getattr(self, "_services", None)
+        runtimes = list(services.values()) if services is not None else [self._runtime(None)]
+        if len(runtimes) == 1:
+            await self._evaluate_service_guarded(runtimes[0])
             return
+        await asyncio.gather(*(self._evaluate_service_guarded(runtime) for runtime in runtimes))
 
-        # 2. Collect metrics from all engines
-        metrics_snapshot = await self.metrics_collector.collect_all(engines)
-        # Bind coverage to this cycle to avoid races with status collection.
-        self.metrics_collector.add_snapshot(metrics_snapshot, num_candidates=len(engines))
-
-        # 3. Compute aggregated metrics
-        aggregated = self.metrics_collector.get_aggregated_metrics()
-
-        logger.info(
-            f"[Autoscaler] Evaluation cycle: engines={aggregated.num_engines}, "
-            f"running_reqs={aggregated.total_running_reqs}, "
-            f"queue_reqs={aggregated.total_queue_reqs}, "
-            f"token_usage={aggregated.avg_token_usage:.2%}, "
-            f"throughput={aggregated.total_throughput:.1f} tok/s"
-        )
-
-        # 5. Calculate effective engine count (active + pending scale-out)
-        pending_scale_out_count = sum(
+    async def _evaluate_service(self, runtime: ServiceRuntime) -> None:
+        if getattr(self, "_services", None) is None:
+            # Test-only legacy construction overrides these methods with their
+            # former no-argument shape.
+            await self._update_pending_requests()
+            engines = await self._fetch_engines()
+        else:
+            await self._update_pending_requests(runtime)
+            engines = await self._fetch_engines(runtime.name)
+        if runtime.name == "genrm" and engines:
+            runtime.model_name = engines[0].get("model_name")
+        if not engines:
+            logger.warning(f"No {runtime.name} engines found, skipping evaluation")
+            runtime.decision_engine.reset_condition_trackers()
+            return
+        snapshot = await runtime.metrics_collector.collect_all(engines)
+        runtime.metrics_collector.add_snapshot(snapshot, num_candidates=len(engines))
+        aggregated = runtime.metrics_collector.get_aggregated_metrics()
+        pending_out = sum(
             req.get("delta", 0)
-            for req in self._state.pending_requests
+            for req in runtime.state.pending_requests
             if req.get("action") == "scale_out" and not is_scale_request_terminal("scale_out", req.get("status"))
         )
-        effective_engines = len(engines) + pending_scale_out_count
-
-        # 6. Evaluate scaling decision
-        decision = self.decision_engine.evaluate(
+        decision = runtime.decision_engine.evaluate(
             aggregated_metrics=aggregated,
-            current_engines=effective_engines,  # Use effective count to avoid over-scaling
-            last_scale_time=self._state.last_scale_time,
-            last_scale_action=self._state.last_scale_action,
-            pending_requests=self._state.pending_requests,
+            current_engines=len(engines) + pending_out,
+            last_scale_time=runtime.state.last_scale_time,
+            last_scale_action=runtime.state.last_scale_action,
+            pending_requests=runtime.state.pending_requests,
         )
-        self._state.last_decision = decision
-
-        # 7. Execute scaling action if needed
+        runtime.state.last_decision = decision
         if decision.action == ScalingAction.SCALE_OUT:
-            logger.info(
-                f"[Autoscaler] SCALE-OUT triggered: {decision.reason}, "
-                f"delta=+{decision.delta}, triggered_conditions={decision.triggered_conditions}, "
-                f"active_engines={len(engines)}, pending_scale_out={pending_scale_out_count}"
-            )
-            await self._execute_scale_out(decision, len(engines))
+            await self._execute_scale_out(decision, len(engines), runtime)
         elif decision.action == ScalingAction.SCALE_IN:
-            logger.info(
-                f"[Autoscaler] SCALE-IN triggered: {decision.reason}, "
-                f"delta=-{decision.delta}, triggered_conditions={decision.triggered_conditions}"
-            )
-            await self._execute_scale_in(decision, len(engines))
+            await self._execute_scale_in(decision, len(engines), runtime)
 
-    async def _fetch_engines(self) -> List[Dict[str, str]]:
+    async def _fetch_engines(self, service: str = "rollout") -> List[Dict[str, str]]:
         """Fetch active engine list from Rollout service.
 
         Only engines with ``status == "active"`` and a usable URL are returned.
@@ -369,7 +528,7 @@ class AutoscalerService(Base):
         if self._http_session is None:
             return []
 
-        url = f"{self.config.rollout_service_url}/engines"
+        url = f"{self.config.get_service_url(service)}/engines"
 
         try:
             async with self._http_session.get(url) as response:
@@ -380,6 +539,30 @@ class AutoscalerService(Base):
                 data = await response.json()
                 engines = []
 
+                if service == "genrm":
+                    instances = data.get("instances") or {"default": data}
+                    active_models = [
+                        model_name for model_name, instance in instances.items() if instance.get("engines", [])
+                    ]
+                    if len(active_models) > 1:
+                        logger.error(
+                            "GenRM autoscaler target contains multiple model instances; "
+                            "configure one target per model before enabling automatic scaling"
+                        )
+                        return []
+                    for model_name, instance in instances.items():
+                        for engine in instance.get("engines", []):
+                            host, port = engine.get("host"), engine.get("port")
+                            if host and port:
+                                engines.append(
+                                    {
+                                        "id": f"{model_name}:{host}:{port}",
+                                        "url": f"http://{host}:{port}",
+                                        "model_name": model_name,
+                                        "status": "active",
+                                    }
+                                )
+                    return engines
                 for model_name, model_info in data.get("models", {}).items():
                     for engine_group in model_info.get("engine_groups", []):
                         for engine in engine_group.get("engines", []):
@@ -402,80 +585,213 @@ class AutoscalerService(Base):
             logger.warning(f"Error fetching engines: {e}")
             return []
 
-    async def _execute_scale_out(self, decision: ScalingDecision, current_engines: int) -> None:
+    async def _execute_scale_out(
+        self, decision: ScalingDecision, current_engines: int, runtime: Optional[ServiceRuntime] = None
+    ) -> None:
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         target_count = current_engines + decision.delta
-        url = f"{self.config.rollout_service_url}/scale_out"
+        service_url = self.config.get_service_url(runtime.name)
+        url = f"{service_url}/scale_out"
         payload: Dict[str, Any] = {
-            "model_name": "default",
+            "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
+            # The submission is replayable: a transport failure after server
+            # acceptance must not orphan the operation (ambiguous-outcome
+            # ownership contract below).
+            "idempotency_key": f"autoscaler:{runtime.name}:scale_out:{uuid.uuid4().hex}",
         }
-        if self.config.scale_out_request_timeout_secs is not None:
-            payload["timeout_secs"] = self.config.scale_out_request_timeout_secs
+        if runtime.config.scale_out_request_timeout_secs is not None:
+            payload["timeout_secs"] = runtime.config.scale_out_request_timeout_secs
 
         logger.info(
             f"[Autoscaler] Executing scale-out: {current_engines} -> {target_count} engines "
             f"(+{decision.delta}), reason: {decision.reason}"
         )
 
-        try:
-            async with self._http_session.post(url, json=payload) as response:
-                if response.status in (200, 201):
-                    data = await response.json()
-                    request_id = data.get("request_id")
-                    status = data.get("status", "PENDING")
+        # Register the operation BEFORE the POST leaves: between submit and
+        # response the request must already be visible to the remove-target
+        # guard -- a target deleted in that window would strand an operation
+        # the server accepted while the autoscaler forgets how to track it
+        # (re-review finding). ``SUBMITTING`` is non-terminal, so it blocks
+        # removal; NOOP/CONFLICT/explicit rejection remove it again.
+        placeholder = {
+            "request_id": None,
+            "action": "scale_out",
+            "triggered_at": time.time(),
+            "status": "SUBMITTING",
+            # The operation belongs to the service address it was submitted
+            # to: a later PATCH may repoint the target's URL while the
+            # acceptance response is still in flight, and status/reconcile
+            # queries must keep following the original service (re-review
+            # finding: queries built from the current config hit the new
+            # address and 404).
+            "service_url": service_url,
+            # Replay material for ambiguous-outcome recovery: the idempotency
+            # fingerprint (model, target, timeout) and key must reconstruct
+            # the exact submission body.
+            "idempotency_key": payload["idempotency_key"],
+            "model_name": payload["model_name"],
+            "timeout_secs": payload.get("timeout_secs"),
+            "from_engines": current_engines,
+            "to_engines": target_count,
+            "delta": decision.delta,
+            "reason": decision.reason,
+            "triggered_conditions": decision.triggered_conditions,
+            "metrics_snapshot": decision.metrics_snapshot,
+        }
+        runtime.state.pending_requests.append(placeholder)
+        await self._dispatch_scale_post(
+            runtime, "scale_out", url, payload, placeholder, decision, current_engines, target_count
+        )
 
-                    # NOOP request IDs are not persisted and must not enter pending.
-                    if status == "NOOP":
-                        logger.info(
-                            f"[Autoscaler] Scale-out NOOP (idempotent no-op), not tracking as pending: "
-                            f"request_id={request_id}"
-                        )
-                        self._record_noop("scale_out", decision, data, current_engines, target_count)
+    async def _dispatch_scale_post(
+        self,
+        runtime: "ServiceRuntime",
+        action: str,
+        url: str,
+        payload: Dict[str, Any],
+        placeholder: Dict[str, Any],
+        decision: ScalingDecision,
+        current_engines: int,
+        target_count: int,
+    ) -> None:
+        """POST a scale request with explicit ownership semantics.
+
+        Outcomes: (a) 2xx acceptance -- the placeholder adopts the server's
+        request_id; (b) definitive rejection (4xx, or 2xx NOOP/CONFLICT) --
+        the placeholder is removed, nothing was accepted; (c) ambiguous
+        (transport error without a response, or 5xx) -- the placeholder is
+        marked ``SUBMIT_UNKNOWN`` after bounded same-key retries and stays
+        non-terminal, so it keeps blocking target removal while
+        ``_update_pending_requests`` recovers ownership via idempotent
+        replay. A transport failure does NOT prove the server never accepted
+        the request (the registry may have admitted it and started the
+        lifecycle before the connection died) -- deleting the placeholder
+        there would orphan an operation the autoscaler can no longer
+        reconcile (final control-plane review finding).
+        """
+        attempts = 0
+        max_attempts = max(1, int(getattr(self, "_submit_retry_attempts", 3)))
+        backoff = float(getattr(self, "_submit_retry_backoff_secs", 0.5))
+        label = "Scale-out" if action == "scale_out" else "Scale-in"
+        while True:
+            try:
+                async with self._http_session.post(url, json=payload) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        request_id = data.get("request_id")
+                        status = data.get("status", "PENDING")
+
+                        # NOOP request IDs are not persisted and must not enter pending.
+                        if status == "NOOP":
+                            runtime.state.pending_requests.remove(placeholder)
+                            logger.info(
+                                f"[Autoscaler] {label} NOOP (idempotent no-op), not tracking as pending: "
+                                f"request_id={request_id}"
+                            )
+                            self._record_noop(action, decision, data, current_engines, target_count, runtime)
+                            return
+
+                        if status == "CONFLICT":
+                            runtime.state.pending_requests.remove(placeholder)
+                            logger.warning(
+                                f"[Autoscaler] {label} reported CONFLICT with 2xx body, not tracking as pending"
+                            )
+                            return
+
+                        logger.info(f"[Autoscaler] {label} request accepted: request_id={request_id}, status={status}")
+
+                        # Single adoption point (shared with the inline retry
+                        # and background recovery): the POST reply proves
+                        # ownership and the logical status only -- cleanup
+                        # starts UNKNOWN and only the authoritative status
+                        # endpoint may clear it.
+                        self._adopt_scale_operation(runtime, placeholder, action, request_id, status)
                         return
-
-                    if status == "CONFLICT":
-                        logger.warning(
-                            "[Autoscaler] Scale-out reported CONFLICT with 2xx body, not tracking as pending"
-                        )
-                        return
-
-                    logger.info(f"[Autoscaler] Scale-out request accepted: request_id={request_id}, status={status}")
-
-                    self._state.pending_requests.append(
-                        {
-                            "request_id": request_id,
-                            "action": "scale_out",
-                            "triggered_at": time.time(),
-                            "status": status,
-                            "from_engines": current_engines,
-                            "to_engines": target_count,
-                            "delta": decision.delta,
-                            "reason": decision.reason,
-                            "triggered_conditions": decision.triggered_conditions,
-                            "metrics_snapshot": decision.metrics_snapshot,
-                        }
-                    )
-                    self._state.last_scale_time = time.time()
-                    self._state.last_scale_action = ScalingAction.SCALE_OUT
-                else:
+                    if response.status >= 500:
+                        # Server-side error after unknown processing: the
+                        # operation may have been admitted before the failure.
+                        attempts += 1
+                        if attempts >= max_attempts:
+                            placeholder.update(status="SUBMIT_UNKNOWN")
+                            logger.error(
+                                f"[Autoscaler] {label} outcome unknown after {attempts} attempt(s) "
+                                f"(HTTP {response.status}); retaining SUBMIT_UNKNOWN for idempotent recovery"
+                            )
+                            return
+                        await asyncio.sleep(backoff * attempts)
+                        continue
                     text = await response.text()
-                    logger.warning(f"[Autoscaler] Scale-out request failed: HTTP {response.status} - {text}")
+                    runtime.state.pending_requests.remove(placeholder)
+                    logger.warning(f"[Autoscaler] {label} request failed: HTTP {response.status} - {text}")
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Transport-level failure with no response at all: classically
+                # ambiguous -- the registry may already hold the operation.
+                attempts += 1
+                if attempts >= max_attempts:
+                    placeholder.update(status="SUBMIT_UNKNOWN")
+                    logger.error(
+                        f"[Autoscaler] {label} transport failure after {attempts} attempt(s) "
+                        f"({type(e).__name__}: {e}); retaining SUBMIT_UNKNOWN for idempotent recovery"
+                    )
+                    return
+                await asyncio.sleep(backoff * attempts)
 
-        except Exception as e:
-            logger.exception(f"[Autoscaler] Error executing scale-out: {e}")
+    def _adopt_scale_operation(
+        self,
+        runtime: "ServiceRuntime",
+        req: Dict[str, Any],
+        action: str,
+        request_id: Optional[str],
+        status: str,
+    ) -> None:
+        """Adopt ownership of a scale operation the server has admitted.
 
-    async def _execute_scale_in(self, decision: ScalingDecision, current_engines: int) -> None:
+        Single bookkeeping point shared by the normal acceptance, the inline
+        same-key retry and the background ``SUBMIT_UNKNOWN`` recovery:
+        request identity, cooldown accounting and the cleanup reset. A POST
+        reply -- fresh or replayed -- proves ownership and the logical status
+        only; ``GenRMScaleResponse`` carries no ``cleanup_required``, so a
+        replayed terminal status (e.g. FAILED) must never be mistaken for a
+        completed cleanup. Cleanup therefore starts UNKNOWN (``None``) and
+        only the authoritative status endpoint may set it to ``False``
+        (re-review finding: terminal replay != physical cleanup proof).
+
+        Cooldown semantics are identical on every adoption path: the server's
+        acceptance timestamp is unknown for a background recovery, so the
+        adoption time is used instead -- deliberately conservative. The
+        cooldown may start a little late, but a recovered operation is never
+        invisible to the cooldown gate; an immediate second scale right after
+        recovery is worse than a slightly longer cooldown (re-review finding:
+        recovered operation != invisible operation).
+        """
+        req["request_id"] = request_id
+        req["status"] = status
+        req["cleanup_required"] = None
+        runtime.state.last_scale_time = time.time()
+        runtime.state.last_scale_action = ScalingAction.SCALE_OUT if action == "scale_out" else ScalingAction.SCALE_IN
+
+    async def _execute_scale_in(
+        self, decision: ScalingDecision, current_engines: int, runtime: Optional[ServiceRuntime] = None
+    ) -> None:
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         target_count = current_engines - decision.delta
-        url = f"{self.config.rollout_service_url}/scale_in"
+        service_url = self.config.get_service_url(runtime.name)
+        url = f"{service_url}/scale_in"
         payload = {
-            "model_name": "default",
+            "model_name": runtime.model_name or "default",
             "num_replicas": target_count,
+            # Replayable submission, mirroring _execute_scale_out.
+            "idempotency_key": f"autoscaler:{runtime.name}:scale_in:{uuid.uuid4().hex}",
         }
 
         logger.info(
@@ -483,52 +799,95 @@ class AutoscalerService(Base):
             f"(-{decision.delta}), reason: {decision.reason}"
         )
 
+        # Pre-POST registration, mirroring _execute_scale_out: the operation
+        # must be visible to the remove-target guard while its acceptance
+        # response is still in flight (re-review finding).
+        placeholder = {
+            "request_id": None,
+            "action": "scale_in",
+            "triggered_at": time.time(),
+            "status": "SUBMITTING",
+            # Submitted-to address and replay material, mirroring
+            # _execute_scale_out.
+            "service_url": service_url,
+            "idempotency_key": payload["idempotency_key"],
+            "model_name": payload["model_name"],
+            "timeout_secs": payload.get("timeout_secs"),
+            "from_engines": current_engines,
+            "to_engines": target_count,
+            "delta": decision.delta,
+            "reason": decision.reason,
+            "triggered_conditions": decision.triggered_conditions,
+            "metrics_snapshot": decision.metrics_snapshot,
+        }
+        runtime.state.pending_requests.append(placeholder)
+        await self._dispatch_scale_post(
+            runtime, "scale_in", url, payload, placeholder, decision, current_engines, target_count
+        )
+
+    async def _recover_ambiguous_submission(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> bool:
+        """Recover ownership of a scale POST with an unknown outcome.
+
+        Re-POSTs the exact submission body (same idempotency key, model,
+        target, timeout) to the address the operation was submitted to. A 2xx
+        replays the server's answer: acceptance adopts the request_id through
+        the same adoption helper as a normal response (cooldown + cleanup
+        UNKNOWN semantics identical), NOOP/CONFLICT remove the placeholder. A
+        4xx is a definitive rejection (nothing was accepted); a 5xx or
+        transport failure stays ambiguous and is retried on the next
+        evaluation cycle.
+
+        Returns ``True`` when ownership was adopted -- the caller must then
+        read the authoritative status in the same cycle, because the replayed
+        status (even terminal) proves nothing about cleanup. Returns ``False``
+        when the request is still unresolved or was definitively rejected.
+        """
+        if self._http_session is None:
+            return False
+        action = req.get("action", "scale_out")
+        base = req.get("service_url") or self.config.get_service_url(runtime.name)
+        url = f"{base}/{action}"
+        payload = {
+            "model_name": req.get("model_name") or runtime.model_name or "default",
+            "num_replicas": req["to_engines"],
+            "idempotency_key": req["idempotency_key"],
+        }
+        if req.get("timeout_secs") is not None:
+            payload["timeout_secs"] = req["timeout_secs"]
         try:
             async with self._http_session.post(url, json=payload) as response:
-                if response.status in (200, 201):
-                    data = await response.json()
-                    request_id = data.get("request_id")
-                    status = data.get("status", "PENDING")
-
-                    # NOOP request IDs are not persisted and must not enter pending.
-                    if status == "NOOP":
-                        logger.info(
-                            f"[Autoscaler] Scale-in NOOP (idempotent no-op), not tracking as pending: "
-                            f"request_id={request_id}"
-                        )
-                        self._record_noop("scale_in", decision, data, current_engines, target_count)
-                        return
-
-                    if status == "CONFLICT":
-                        logger.warning(
-                            "[Autoscaler] Scale-in reported CONFLICT with 2xx body, not tracking as pending"
-                        )
-                        return
-
-                    logger.info(f"[Autoscaler] Scale-in request accepted: request_id={request_id}, status={status}")
-
-                    self._state.pending_requests.append(
-                        {
-                            "request_id": request_id,
-                            "action": "scale_in",
-                            "triggered_at": time.time(),
-                            "status": status,
-                            "from_engines": current_engines,
-                            "to_engines": target_count,
-                            "delta": decision.delta,
-                            "reason": decision.reason,
-                            "triggered_conditions": decision.triggered_conditions,
-                            "metrics_snapshot": decision.metrics_snapshot,
-                        }
+                if response.status >= 500:
+                    logger.warning(
+                        f"[Autoscaler] Ambiguous scale submission recovery still uncertain "
+                        f"(HTTP {response.status}); retrying next cycle"
                     )
-                    self._state.last_scale_time = time.time()
-                    self._state.last_scale_action = ScalingAction.SCALE_IN
-                else:
+                    return False
+                if response.status not in (200, 201):
+                    runtime.state.pending_requests.remove(req)
                     text = await response.text()
-                    logger.warning(f"[Autoscaler] Scale-in request failed: HTTP {response.status} - {text}")
-
+                    logger.warning(
+                        f"[Autoscaler] Ambiguous scale submission definitively rejected: "
+                        f"HTTP {response.status} - {text}"
+                    )
+                    return False
+                data = await response.json()
+                status = data.get("status", "PENDING")
+                if status in ("NOOP", "CONFLICT"):
+                    runtime.state.pending_requests.remove(req)
+                    logger.info(f"[Autoscaler] Ambiguous scale submission resolved as {status}; nothing to track")
+                    return False
+                # Same adoption bookkeeping as a normal acceptance: the
+                # replayed status is logical state only, cleanup stays UNKNOWN
+                # until the status endpoint proves otherwise.
+                self._adopt_scale_operation(runtime, req, action, data.get("request_id"), status)
+                logger.info(f"[Autoscaler] Recovered ambiguous scale submission: request_id={data.get('request_id')}")
+                return True
         except Exception as e:
-            logger.exception(f"[Autoscaler] Error executing scale-in: {e}")
+            logger.warning(
+                f"[Autoscaler] Ambiguous scale submission recovery failed "
+                f"({type(e).__name__}: {e}); retrying next cycle"
+            )
+            return False
 
     def _record_noop(
         self,
@@ -537,6 +896,7 @@ class AutoscalerService(Base):
         data: Dict[str, Any],
         from_engines: int,
         to_engines: int,
+        runtime: Optional[ServiceRuntime] = None,
     ) -> None:
         """Record a NOOP response without changing cooldown state."""
         now = time.time()
@@ -553,52 +913,155 @@ class AutoscalerService(Base):
             "triggered_conditions": decision.triggered_conditions,
             "metrics_snapshot": decision.metrics_snapshot,
         }
-        self._state.scale_history.appendleft(record)
-        self._state.total_scale_operations += 1
+        runtime = self._runtime(runtime)
+        runtime.state.scale_history.appendleft(record)
+        runtime.state.total_scale_operations += 1
 
-    async def _update_pending_requests(self) -> None:
+    async def _update_pending_requests(self, runtime: Optional[ServiceRuntime] = None) -> None:
+        """Drive tracked scale operations toward completion.
+
+        Lifecycle: submit (elsewhere) -> adopt (ownership + cooldown +
+        cleanup UNKNOWN) -> refresh authoritative status -> maybe reconcile
+        (terminal dirty only) -> finalize (terminal AND cleanup proven False).
+        A POST reply -- fresh or replayed -- never triggers the final history
+        transition; only the status endpoint (directly or after a successful
+        reconcile) proves cleanup.
+        """
+        runtime = self._runtime(runtime)
         if self._http_session is None:
             return
 
         completed = []
 
-        for req in self._state.pending_requests:
+        # Iterate a copy: recovery may remove entries from the live list
+        # (definitive rejection / NOOP / CONFLICT).
+        for req in list(runtime.state.pending_requests):
             action = req.get("action", "scale_out")
 
             status = req.get("status")
-            if is_scale_request_terminal(action, status):
+            if status == "SUBMITTING":
+                # The acceptance response is still in flight (pre-POST
+                # registration); its owning worker fills in the request_id.
+                continue
+            if status == "SUBMIT_UNKNOWN":
+                # Bounded inline retries were exhausted without a response:
+                # recover ownership via idempotent replay (same key/body).
+                # The server either never saw the request (fresh admission)
+                # or already accepted it (replay returns the original
+                # request_id); either way exactly one operation exists.
+                if not await self._recover_ambiguous_submission(runtime, req):
+                    continue
+                # Ownership adopted: fall through so the SAME cycle reads the
+                # authoritative status -- a replayed terminal status must not
+                # skip the cleanup query (re-review finding).
+                status = req.get("status")
+            if is_scale_request_terminal(action, status) and req.get("cleanup_required") is False:
+                # Terminal AND cleanup already proven clean by an earlier
+                # authoritative status query: safe to finalize without
+                # re-querying.
                 completed.append(req)
                 continue
 
-            try:
-                endpoint = "scale_out" if action == "scale_out" else "scale_in"
-                url = f"{self.config.rollout_service_url}/{endpoint}/{req['request_id']}"
-
-                async with self._http_session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        new_status = data.get("status")
-                        req["status"] = new_status
-                        req["error_message"] = data.get("error_message")
-                        req["failure_categories"] = data.get("failure_categories") or []
-
-                        if is_scale_request_terminal(action, new_status):
-                            completed.append(req)
-                            req["completed_at"] = time.time()
-                            logger.info(
-                                f"[Autoscaler] Scale request {req['request_id']} completed: "
-                                f"status={new_status}, action={action}, "
-                                f"from={req.get('from_engines')} -> to={req.get('to_engines')}"
-                            )
-
-            except Exception as e:
-                logger.warning(f"Error checking request {req.get('request_id')}: {e}")
+            if await self._refresh_authoritative_status(runtime, req):
+                completed.append(req)
 
         for req in completed:
-            self._state.pending_requests.remove(req)
-            req["status"] = req.get("status", "UNKNOWN")
-            self._state.scale_history.appendleft(req)
-            self._state.total_scale_operations += 1
+            self._finalize_scale_request(runtime, req)
+
+    async def _refresh_authoritative_status(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> bool:
+        """Query the authoritative status endpoint for one tracked request.
+
+        This endpoint is the ONLY cleanup authority: a POST reply -- fresh or
+        replayed -- never proves physical cleanup. Returns ``True`` only when
+        the refreshed state is terminal AND the authoritative cleanup flag is
+        exactly ``False``; an unreadable response or a missing/malformed flag
+        leaves the request pending with UNKNOWN cleanup (missing != clean,
+        fail closed).
+        """
+        action = req.get("action", "scale_out")
+        request_id = req.get("request_id")
+        if request_id is None:
+            # Cannot query an unidentified request: it stays pending and keeps
+            # blocking decisions and target removal (fail closed).
+            return False
+        # Follow the address the operation was submitted to: a config
+        # PATCH may have repointed the service since (re-review finding).
+        # Entries recorded before this field exists fall back to the current
+        # config.
+        base = req.get("service_url") or self.config.get_service_url(runtime.name)
+        endpoint = "scale_out" if action == "scale_out" else "scale_in"
+        url = f"{base}/{endpoint}/{request_id}"
+        try:
+            async with self._http_session.get(url) as response:
+                if response.status != 200:
+                    # Unreadable status: no new cleanup evidence; keep whatever
+                    # was proven before (possibly nothing) and retry next
+                    # cycle.
+                    return False
+                data = await response.json()
+        except Exception as e:
+            logger.warning(f"Error checking request {request_id}: {e}")
+            return False
+        if not isinstance(data, dict):
+            return False
+
+        new_status = data.get("status")
+        req["status"] = new_status
+        req["error_message"] = data.get("error_message")
+        req["failure_categories"] = data.get("failure_categories") or []
+        req["actual_current"] = data.get("current")
+        req["actual_ready"] = data.get("ready")
+        # Authoritative cleanup proof: only an explicit boolean counts; a
+        # missing or malformed field stays UNKNOWN (unknown != clean).
+        cleanup = data.get("cleanup_required")
+        req["cleanup_required"] = cleanup if isinstance(cleanup, bool) else None
+
+        if is_scale_request_terminal(action, new_status) and req["cleanup_required"] is True:
+            # A terminal dirty operation is still a hard per-service gate.
+            await self._maybe_reconcile(req, url)
+        return is_scale_request_terminal(action, new_status) and req["cleanup_required"] is False
+
+    async def _maybe_reconcile(self, req: Dict[str, Any], url: str) -> None:
+        """Reconcile a terminal-dirty operation.
+
+        Asks the server to retry the ORIGINAL operation's unfinished resource
+        cleanup (no new request id, no victim re-selection, no re-scaling);
+        never issues a new scale request while the operation owns unresolved
+        resources. A failed or unreadable reconcile keeps the request dirty
+        (fail closed).
+        """
+        try:
+            async with self._http_session.post(f"{url}/reconcile") as reconcile_response:
+                if reconcile_response.status != 200:
+                    return
+                reconcile_data = await reconcile_response.json()
+        except Exception as e:
+            logger.warning(f"Error reconciling request {req.get('request_id')}: {e}")
+            return
+        if not isinstance(reconcile_data, dict):
+            return
+        # Fail closed: an unreadable/missing flag keeps the request dirty.
+        cleanup = reconcile_data.get("cleanup_required")
+        req["cleanup_required"] = cleanup if isinstance(cleanup, bool) else True
+
+    def _finalize_scale_request(self, runtime: "ServiceRuntime", req: Dict[str, Any]) -> None:
+        """Move a terminal, cleanup-proven request into history.
+
+        The only transition into history: terminal status AND
+        ``cleanup_required is False`` -- proven by the authoritative status
+        endpoint (directly or after a successful reconcile), never by a POST
+        reply.
+        """
+        req["completed_at"] = time.time()
+        logger.info(
+            f"[Autoscaler] Scale request {req['request_id']} completed: "
+            f"status={req.get('status')}, action={req.get('action')}, "
+            f"from={req.get('from_engines')} -> to={req.get('to_engines')}"
+        )
+        runtime.state.pending_requests.remove(req)
+        req["status"] = req.get("status", "UNKNOWN")
+        runtime.state.scale_history.appendleft(req)
+        runtime.state.total_scale_operations += 1
 
     # ===================== HTTP Endpoints =====================
 
@@ -615,6 +1078,26 @@ class AutoscalerService(Base):
 
         aggregated = self.metrics_collector.get_aggregated_metrics()
 
+        services = {}
+        for name, runtime in getattr(self, "_services", {}).items():
+            service_engines = engines if name == "rollout" else await self._fetch_engines(name)
+            service_metrics = runtime.metrics_collector.get_aggregated_metrics()
+            services[name] = {
+                "current_engines": len(service_engines),
+                "min_engines": runtime.config.min_engines,
+                "max_engines": runtime.config.max_engines,
+                # Per-service scale history: without these the monitor's
+                # service view would display the rollout runtime's last
+                # action for every service (review finding).
+                "last_scale_time": runtime.state.last_scale_time,
+                "last_scale_action": (
+                    runtime.state.last_scale_action.value if runtime.state.last_scale_action else None
+                ),
+                "last_decision": runtime.state.last_decision.to_dict() if runtime.state.last_decision else None,
+                "pending_requests": list(runtime.state.pending_requests),
+                "recent_metrics": service_metrics.to_dict(),
+                "total_scale_operations": runtime.state.total_scale_operations,
+            }
         return AutoscalerStatusResponse(
             enabled=self._state.enabled,
             running=self._state.running,
@@ -628,6 +1111,7 @@ class AutoscalerService(Base):
             recent_metrics=aggregated.to_dict(),
             config=self.config.to_dict(),
             total_scale_operations=self._state.total_scale_operations,
+            services=services,
         )
 
     @app.get("/scale_history", response_model=ScaleHistoryResponse)
@@ -635,8 +1119,12 @@ class AutoscalerService(Base):
         self,
         limit: int = 100,
         action: Optional[str] = None,
+        service: str = "rollout",
     ) -> ScaleHistoryResponse:
-        history = list(self._state.scale_history)
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        history = list(runtime.state.scale_history)
 
         if action:
             action = action.lower()
@@ -649,7 +1137,7 @@ class AutoscalerService(Base):
 
         return ScaleHistoryResponse(
             history=[ScaleHistoryItem(**h) for h in history],
-            total_count=len(self._state.scale_history),
+            total_count=len(runtime.state.scale_history),
             action_filter=action,
             limit=limit,
         )
@@ -670,10 +1158,13 @@ class AutoscalerService(Base):
         }
 
     @app.get("/conditions", response_model=ConditionStatusResponse)
-    async def get_conditions(self) -> ConditionStatusResponse:
-        aggregated = self.metrics_collector.get_aggregated_metrics()
-        conditions = self.decision_engine.get_condition_status(aggregated)
-        observations = self.decision_engine.condition_observation()
+    async def get_conditions(self, service: str = "rollout") -> ConditionStatusResponse:
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        aggregated = runtime.metrics_collector.get_aggregated_metrics()
+        conditions = runtime.decision_engine.get_condition_status(aggregated)
+        observations = runtime.decision_engine.condition_observation()
 
         return ConditionStatusResponse(
             conditions=conditions,
@@ -690,7 +1181,7 @@ class AutoscalerService(Base):
         }
 
     @app.get("/metrics_history")
-    async def get_metrics_history(self, limit: int = 10) -> Dict[str, Any]:
+    async def get_metrics_history(self, limit: int = 10, service: str = "rollout") -> Dict[str, Any]:
         """Get metrics history for debugging.
 
         Args:
@@ -699,7 +1190,10 @@ class AutoscalerService(Base):
         Returns:
             Recent metrics history.
         """
-        history = self.metrics_collector.get_history()
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        history = runtime.metrics_collector.get_history()
         return {
             "count": len(history),
             "snapshots": [
@@ -713,14 +1207,17 @@ class AutoscalerService(Base):
         }
 
     @app.post("/clear_history")
-    async def clear_history(self) -> Dict[str, Any]:
+    async def clear_history(self, service: str = "rollout") -> Dict[str, Any]:
         """Clear metrics history.
 
         Returns:
             Confirmation message.
         """
-        self.metrics_collector.clear_history()
-        return {"status": "ok", "message": "Metrics history cleared"}
+        runtime = self._services.get(service)
+        if runtime is None:
+            raise ValueError(f"Unknown autoscaler service '{service}'")
+        runtime.metrics_collector.clear_history()
+        return {"status": "ok", "message": f"Metrics history cleared for {service}"}
 
     @app.get("/config")
     async def get_config(self) -> Dict[str, Any]:
@@ -736,10 +1233,16 @@ class AutoscalerService(Base):
 
     @app.patch("/config", response_model=ConfigUpdateResponse)
     async def update_config(self, request: ConfigUpdateRequest) -> ConfigUpdateResponse:
-        """Update autoscaler configuration.
+        """Update autoscaler configuration (atomic).
 
         Allows partial updates to configuration values. Only provided fields
-        will be updated; others remain unchanged.
+        will be updated; others remain unchanged. The patch is staged on a
+        copy of the config and committed in full only after every validation
+        (cross-field consistency, service-target removal guard) passes; a
+        rejected PATCH leaves the config, service targets, runtimes,
+        collectors and workers byte-identical to before (final control-plane
+        review finding: a 409 raised after earlier field mutations had
+        already left them partially applied).
 
         Args:
             request: Configuration update request with optional fields.
@@ -749,33 +1252,34 @@ class AutoscalerService(Base):
         """
         warnings: List[str] = []
         updates_made: List[str] = []
+        candidate = copy.deepcopy(self.config)
 
         if request.min_engines is not None:
             if request.max_engines is not None and request.min_engines > request.max_engines:
                 raise ValueError(
                     f"min_engines ({request.min_engines}) cannot be greater than max_engines ({request.max_engines})"
                 )
-            if request.min_engines > self.config.max_engines:
+            if request.min_engines > candidate.max_engines:
                 raise ValueError(
-                    f"min_engines ({request.min_engines}) cannot be greater than current max_engines ({self.config.max_engines})"
+                    f"min_engines ({request.min_engines}) cannot be greater than current max_engines ({candidate.max_engines})"
                 )
-            self.config.min_engines = request.min_engines
+            candidate.min_engines = request.min_engines
             updates_made.append(f"min_engines={request.min_engines}")
 
         if request.max_engines is not None:
-            if request.max_engines < self.config.min_engines:
+            if request.max_engines < candidate.min_engines:
                 raise ValueError(
-                    f"max_engines ({request.max_engines}) cannot be less than current min_engines ({self.config.min_engines})"
+                    f"max_engines ({request.max_engines}) cannot be less than current min_engines ({candidate.min_engines})"
                 )
-            self.config.max_engines = request.max_engines
+            candidate.max_engines = request.max_engines
             updates_made.append(f"max_engines={request.max_engines}")
 
         if request.scale_out_cooldown_secs is not None:
-            self.config.scale_out_cooldown_secs = request.scale_out_cooldown_secs
+            candidate.scale_out_cooldown_secs = request.scale_out_cooldown_secs
             updates_made.append(f"scale_out_cooldown_secs={request.scale_out_cooldown_secs}")
 
         if request.scale_in_cooldown_secs is not None:
-            self.config.scale_in_cooldown_secs = request.scale_in_cooldown_secs
+            candidate.scale_in_cooldown_secs = request.scale_in_cooldown_secs
             updates_made.append(f"scale_in_cooldown_secs={request.scale_in_cooldown_secs}")
 
         if request.metrics_interval_secs is not None:
@@ -785,108 +1289,169 @@ class AutoscalerService(Base):
                         f"metrics_interval_secs ({request.metrics_interval_secs}) should be <= "
                         f"evaluation_interval_secs ({request.evaluation_interval_secs})"
                     )
-            elif request.metrics_interval_secs > self.config.evaluation_interval_secs:
+            elif request.metrics_interval_secs > candidate.evaluation_interval_secs:
                 warnings.append(
                     f"metrics_interval_secs ({request.metrics_interval_secs}) should be <= "
-                    f"evaluation_interval_secs ({self.config.evaluation_interval_secs})"
+                    f"evaluation_interval_secs ({candidate.evaluation_interval_secs})"
                 )
-            self.config.metrics_interval_secs = request.metrics_interval_secs
+            candidate.metrics_interval_secs = request.metrics_interval_secs
             updates_made.append(f"metrics_interval_secs={request.metrics_interval_secs}")
 
         if request.evaluation_interval_secs is not None:
-            self.config.evaluation_interval_secs = request.evaluation_interval_secs
+            candidate.evaluation_interval_secs = request.evaluation_interval_secs
             updates_made.append(f"evaluation_interval_secs={request.evaluation_interval_secs}")
 
         if request.condition_window_secs is not None:
-            self.config.condition_window_secs = request.condition_window_secs
+            candidate.condition_window_secs = request.condition_window_secs
             updates_made.append(f"condition_window_secs={request.condition_window_secs}")
 
         if request.min_coverage_scale_out is not None:
-            self.config.min_coverage_scale_out = request.min_coverage_scale_out
+            candidate.min_coverage_scale_out = request.min_coverage_scale_out
             updates_made.append(f"min_coverage_scale_out={request.min_coverage_scale_out}")
 
         if request.min_coverage_scale_in is not None:
-            self.config.min_coverage_scale_in = request.min_coverage_scale_in
+            candidate.min_coverage_scale_in = request.min_coverage_scale_in
             updates_made.append(f"min_coverage_scale_in={request.min_coverage_scale_in}")
 
         if request.scale_out_request_timeout_secs is not None:
-            self.config.scale_out_request_timeout_secs = request.scale_out_request_timeout_secs
+            candidate.scale_out_request_timeout_secs = request.scale_out_request_timeout_secs
             updates_made.append(f"scale_out_request_timeout_secs={request.scale_out_request_timeout_secs}")
 
         if request.rollout_service_url is not None:
-            self.config.rollout_service_url = request.rollout_service_url
+            candidate.rollout_service_url = request.rollout_service_url
+            # Keep the per-service map in sync: ``from_yaml`` seeds
+            # ``service_targets["rollout"]`` from this field, so a legacy PATCH
+            # that only updated the field left the map shadowing it with the
+            # startup value -- the new URL silently never took effect (review
+            # finding).
+            candidate.service_targets["rollout"] = request.rollout_service_url
             updates_made.append(f"rollout_service_url={request.rollout_service_url}")
+
+        if request.service_targets is not None:
+            # Fail-closed removal guard, checked before any mutation: dropping
+            # a runtime that still owns unresolved scale operations would lose
+            # the autoscaler's record of them while the target service keeps
+            # its registry mutex held -- re-adding the target later starts a
+            # blank runtime that no longer knows which request to reconcile
+            # (review finding: pending/dirty operation state was silently
+            # discarded with the runtime).
+            new_names = {"rollout", *request.service_targets}
+            for name, old in getattr(self, "_services", {}).items():
+                if name in new_names:
+                    continue
+                unresolved = [
+                    req
+                    for req in old.state.pending_requests
+                    if req.get("cleanup_required") is not False
+                    or not is_scale_request_terminal(req.get("action", "scale_out"), req.get("status"))
+                ]
+                if unresolved:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"cannot remove service target '{name}': {len(unresolved)} unresolved scale "
+                            "operation(s) (non-terminal or cleanup not yet proven clean) still reference it; "
+                            "let them finish or reconcile them first"
+                        ),
+                    )
+            candidate.service_targets = dict(request.service_targets)
+            # Mirror a rollout target back into the legacy field for the same
+            # reason: the two spellings must never disagree.
+            if request.service_targets.get("rollout"):
+                candidate.rollout_service_url = request.service_targets["rollout"]
+            updates_made.append(f"service_targets={sorted(request.service_targets)}")
+
+        if request.service_policies is not None:
+            candidate.service_policies = dict(request.service_policies)
+            updates_made.append(f"service_policies={sorted(request.service_policies)}")
 
         if request.scale_out_policy is not None:
             policy = request.scale_out_policy
             if policy.token_usage_threshold is not None:
-                if self.config.scale_in_policy.token_usage_threshold >= policy.token_usage_threshold:
+                if candidate.scale_in_policy.token_usage_threshold >= policy.token_usage_threshold:
                     warnings.append(
                         f"scale_out_policy.token_usage_threshold ({policy.token_usage_threshold}) should be > "
-                        f"scale_in_policy.token_usage_threshold ({self.config.scale_in_policy.token_usage_threshold}) "
+                        f"scale_in_policy.token_usage_threshold ({candidate.scale_in_policy.token_usage_threshold}) "
                         "to avoid thrashing"
                     )
-                self.config.scale_out_policy.token_usage_threshold = policy.token_usage_threshold
+                candidate.scale_out_policy.token_usage_threshold = policy.token_usage_threshold
                 updates_made.append(f"scale_out_policy.token_usage_threshold={policy.token_usage_threshold}")
 
             if policy.queue_depth_per_engine is not None:
-                self.config.scale_out_policy.queue_depth_per_engine = policy.queue_depth_per_engine
+                candidate.scale_out_policy.queue_depth_per_engine = policy.queue_depth_per_engine
                 updates_made.append(f"scale_out_policy.queue_depth_per_engine={policy.queue_depth_per_engine}")
 
             if policy.queue_time_p95_threshold is not None:
-                self.config.scale_out_policy.queue_time_p95_threshold = policy.queue_time_p95_threshold
+                candidate.scale_out_policy.queue_time_p95_threshold = policy.queue_time_p95_threshold
                 updates_made.append(f"scale_out_policy.queue_time_p95_threshold={policy.queue_time_p95_threshold}")
 
             if policy.ttft_p95_threshold is not None:
-                self.config.scale_out_policy.ttft_p95_threshold = policy.ttft_p95_threshold
+                candidate.scale_out_policy.ttft_p95_threshold = policy.ttft_p95_threshold
                 updates_made.append(f"scale_out_policy.ttft_p95_threshold={policy.ttft_p95_threshold}")
 
             if policy.condition_duration_secs is not None:
-                self.config.scale_out_policy.condition_duration_secs = policy.condition_duration_secs
+                candidate.scale_out_policy.condition_duration_secs = policy.condition_duration_secs
                 updates_made.append(f"scale_out_policy.condition_duration_secs={policy.condition_duration_secs}")
 
             if policy.max_delta is not None:
-                self.config.scale_out_policy.max_delta = policy.max_delta
+                candidate.scale_out_policy.max_delta = policy.max_delta
                 updates_made.append(f"scale_out_policy.max_delta={policy.max_delta}")
 
         if request.scale_in_policy is not None:
             policy = request.scale_in_policy
             if policy.token_usage_threshold is not None:
-                if policy.token_usage_threshold >= self.config.scale_out_policy.token_usage_threshold:
+                if policy.token_usage_threshold >= candidate.scale_out_policy.token_usage_threshold:
                     warnings.append(
                         f"scale_in_policy.token_usage_threshold ({policy.token_usage_threshold}) should be < "
-                        f"scale_out_policy.token_usage_threshold ({self.config.scale_out_policy.token_usage_threshold}) "
+                        f"scale_out_policy.token_usage_threshold ({candidate.scale_out_policy.token_usage_threshold}) "
                         "to avoid thrashing"
                     )
-                self.config.scale_in_policy.token_usage_threshold = policy.token_usage_threshold
+                candidate.scale_in_policy.token_usage_threshold = policy.token_usage_threshold
                 updates_made.append(f"scale_in_policy.token_usage_threshold={policy.token_usage_threshold}")
 
             if policy.queue_depth_threshold is not None:
-                self.config.scale_in_policy.queue_depth_threshold = policy.queue_depth_threshold
+                candidate.scale_in_policy.queue_depth_threshold = policy.queue_depth_threshold
                 updates_made.append(f"scale_in_policy.queue_depth_threshold={policy.queue_depth_threshold}")
 
             if policy.throughput_variance_threshold is not None:
-                self.config.scale_in_policy.throughput_variance_threshold = policy.throughput_variance_threshold
+                candidate.scale_in_policy.throughput_variance_threshold = policy.throughput_variance_threshold
                 updates_made.append(
                     f"scale_in_policy.throughput_variance_threshold={policy.throughput_variance_threshold}"
                 )
 
             if policy.condition_duration_secs is not None:
-                self.config.scale_in_policy.condition_duration_secs = policy.condition_duration_secs
+                candidate.scale_in_policy.condition_duration_secs = policy.condition_duration_secs
                 updates_made.append(f"scale_in_policy.condition_duration_secs={policy.condition_duration_secs}")
 
             if policy.max_delta is not None:
-                self.config.scale_in_policy.max_delta = policy.max_delta
+                candidate.scale_in_policy.max_delta = policy.max_delta
                 updates_made.append(f"scale_in_policy.max_delta={policy.max_delta}")
 
             if policy.projected_usage_max is not None:
-                self.config.scale_in_policy.projected_usage_max = policy.projected_usage_max
+                candidate.scale_in_policy.projected_usage_max = policy.projected_usage_max
                 updates_made.append(f"scale_in_policy.projected_usage_max={policy.projected_usage_max}")
 
-        # Validate cross-field constraints after applying the patch.
-        self.config.validate()
+        # Validate cross-field constraints on the staged candidate, then
+        # commit atomically: a failure above (ValueError / HTTPException)
+        # never reaches this point, so the live config is untouched.
+        candidate.validate()
+        self.config = candidate
 
-        self.decision_engine = ScalingDecisionEngine(self.config)
+        self._rebuild_service_runtimes()
+        # Hot start/stop for collectors added or removed by this PATCH. The
+        # rebuild itself is sync; the async start/stop happens here, before
+        # the new runtime set serves its first evaluation (review finding: a
+        # newly added target otherwise never collects metrics).
+        for collector in getattr(self, "_collectors_to_start", []):
+            await collector.start()
+        self._collectors_to_start = []
+        for collector in getattr(self, "_collectors_to_stop", []):
+            await collector.stop()
+        self._collectors_to_stop = []
+        rollout = self._services["rollout"]
+        self.metrics_collector = rollout.metrics_collector
+        self.decision_engine = rollout.decision_engine
+        self._state = rollout.state
 
         message = f"Configuration updated: {', '.join(updates_made)}" if updates_made else "No changes applied"
         logger.info(f"[Autoscaler] Config update: {message}")

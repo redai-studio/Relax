@@ -1,0 +1,38 @@
+{
+  "recipe": "scripts/training/genrm/run-qwen3-0.6B-4xgpu-genrm-smoke.sh",
+  "recipe_commits": [
+    "3704eb7",
+    "c78e613"
+  ],
+  "topology": "4x RTX 4090: actor TP1xDP2 + rollout 1 + genrm 1, fully-async",
+  "protocol": "dapo-genrm (Qwen3-0.6B both actor and judge)",
+  "run2": {
+    "ray_job": "raysubmit_2mzuf7fBGNcjwpXw (run1 log overwritten; job driver logs in /tmp/ray/session_latest)",
+    "train_step_1_completed": true,
+    "train_metrics_keys": [
+      "train/loss",
+      "train/pg_loss",
+      "train/entropy_loss",
+      "train/tis",
+      "train/grad_norm"
+    ],
+    "weight_sync": "update_weights_from_distributed 200 OK x9 (SGLangEngine)",
+    "genrm_judge_calls": 1,
+    "genrm_judge_response_landed": true,
+    "answer_missing_shortcircuits": 7,
+    "errors": 0,
+    "gpus_returned": true,
+    "checkpoint_saved": "iteration 0 and 1, torch_dist format"
+  },
+  "run1_infra_only": {
+    "note": "512-token budget truncated all responses inside <think>; format short-circuit (answer_missing) fired before any judge call. Verified infra (step/weight-sync/shutdown) but NOT the judge path; documented as driver-budget miss, fixed in c78e613 (2048 tokens, context 3072, 16 samples)."
+  },
+  "verdict": "PASS",
+  "criteria": [
+    "at least one training step advanced (step 1, full metric set, ckpt iters 0+1 saved)",
+    "GenRM judge request really happened (judge_response landed on disk, format_error empty for that sample)",
+    "weight sync without errors (9x 200 OK)",
+    "zero ERROR/Traceback in driver log; graceful shutdown; GPUs returned to 4/4 free"
+  ],
+  "judge_quality_note": "The 0.6B judge answers with a <think> preamble instead of a clean YES/NO, so parsed pred is noisy and scores stay 0. That is model capability, not a pipeline defect: the call path, prompt, ICE, parser and reward landing are all exercised and captured."
+}
