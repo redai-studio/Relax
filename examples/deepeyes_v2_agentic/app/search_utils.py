@@ -2,8 +2,7 @@
 
 """Search tool helpers for the DeepEyesV2 env.
 
-* :func:`search` is a placeholder web-search returning canned snippets so the
-  recipe runs end-to-end without a real backend.
+* :func:`search` supports offline mock, Search-R1 and external HTTP backends.
 * :func:`image_search` serves cached results keyed by ``data_idx`` from JSON
   files listed in ``DEEPEYES_V2_SEARCH_CACHE_PATHS`` (colon/comma-separated).
   Missing / unparsable caches degrade to returning ``"Error"`` so the env
@@ -13,13 +12,15 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
-import random
-import time
+from typing import Literal
+
+from relax.utils.logging_utils import get_logger
+
+from .search_backends import SearchError, run_search
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _load_image_search_cache() -> dict:
@@ -63,34 +64,15 @@ def _get_image_search_cache() -> dict:
     return _IMAGE_SEARCH_CACHE
 
 
-def search(query: str, size: int = 5):
-    """Web-search placeholder. Returns canned snippets in the shape::
-
-        {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"?}, ...]}
-
-    Replace with a real backend (Serper / Google / Bing / internal) for
-    production training.
-    """
-    max_try = 3
-    result = "Error"
-    for try_idx in range(max_try):
-        try:
-            result = {"elapsed_time": 0.0, "data": []}
-            for i in range(size):
-                result["data"].append(
-                    {
-                        "snippet": f"This is a placeholder snippet for query: {query}",
-                        "title": f"Placeholder Title {i}",
-                        "link": f"http://example.com/{i}",
-                    }
-                )
-            break
-        except Exception as e:
-            logger.warning(f"[search] attempt {try_idx + 1}/{max_try} failed: {e}")
-            result = "Error"
-            if try_idx < max_try - 1:
-                time.sleep((try_idx + 1) * random.randint(1, 5))
-    return result
+def search(query: str, size: int | None = None) -> dict | Literal["Error"]:
+    """Search with the configured backend; failures remain non-terminal."""
+    try:
+        return run_search(query, size)
+    except SearchError as exc:
+        logger.warning(f"[search] {exc}")
+    except Exception as exc:
+        logger.warning(f"[search] unexpected failure ({type(exc).__name__})")
+    return "Error"
 
 
 def image_search(_query, data_idx: str | None = None):

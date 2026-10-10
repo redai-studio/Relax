@@ -444,7 +444,7 @@ class DeepEyesV2Env:
                 }
 
         # tool_name == "search"
-        query = tool_args["query"] if isinstance(tool_args, dict) and "query" in tool_args else str(tool_args)
+        query = tool_args.get("query") if isinstance(tool_args, dict) else tool_args
         result = search(query)
         if result == "Error":
             return {"status": "error", "result": "Error", "images": []}
@@ -458,9 +458,8 @@ class DeepEyesV2Env:
                 if page.get("snippet") is not None:
                     snippet = "\n" + page["snippet"]
                 snippets.append(f"{idx + 1}. [{page['title']}]({page['link']}){date_published}{snippet}")
-            content = (
-                f"A Google search for '{query}' found {len(snippets)} results:"
-                f"\n\n## Web Results\n" + "\n\n".join(snippets)
+            content = f"A Web search for '{query}' found {len(snippets)} results:\n\n## Web Results\n" + "\n\n".join(
+                snippets
             )
         except (KeyError, TypeError) as exc:
             return {

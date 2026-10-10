@@ -13,7 +13,9 @@ TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
+set +x
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+set -x
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
@@ -108,6 +110,8 @@ NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 # agent process can find apptainer / search cache.
 # SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
 # to find the apptainer backend YAML config (image path, bind paths, etc).
+# Runtime configuration may include credentials.
+set +x
 RUNTIME_ENV_JSON=$(cat <<EOF
 {
   "env_vars": {
@@ -123,6 +127,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF
 }
 EOF
 )
+set -x
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -261,6 +266,21 @@ RAY_RESOURCE_ARGS=(
 
 mkdir -p logs
 
+# Pass search configuration to Ray workers without tracing credentials.
+set +x
+export RUNTIME_ENV_JSON
+RUNTIME_ENV_JSON=$(python3 - <<'PYTHON'
+import json
+import os
+
+payload = json.loads(os.environ["RUNTIME_ENV_JSON"])
+for name in ("DEEPEYES_V2_SEARCH_CONFIG", "DEEPEYES_V2_SEARCH_API_KEY"):
+    value = os.environ.get(name)
+    if value:
+        payload["env_vars"][name] = value
+print(json.dumps(payload))
+PYTHON
+)
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
     -- python3 relax/entrypoints/train.py \
@@ -275,3 +295,4 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MEGATRON_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     2>&1 | tee logs/${EXP_NAME}.log
+set -x
