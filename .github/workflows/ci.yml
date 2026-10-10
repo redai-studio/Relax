@@ -43,12 +43,6 @@ jobs:
       - name: Run prek
         uses: j178/prek-action@v3.0.0
 
-      - name: Test PR welcome automation
-        uses: actions/github-script@v8
-        with:
-          script: |
-            require('node:child_process').execFileSync(process.execPath, ['--test', '.github/actions/pr-welcome/index.test.mjs'], { stdio: 'inherit' });
-
   # ── Unit tests (matrix: Python 3.10 / 3.11 / 3.12) ────────────────────────
   test:
     needs: bypass

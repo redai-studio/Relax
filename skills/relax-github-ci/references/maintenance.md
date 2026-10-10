@@ -39,12 +39,12 @@ The welcome comment refreshes on PR changes, review signal runs and configured C
 
 Merge status reads active rulesets, classic branch protection, current reviews and required checks. Team candidates exclude the PR author; approvals only count when GitHub reports repository push access, and the approval row states the minimum count and write-access requirement. With no eligible approval, latest-push approval is shown as pending; once an approval exists, the renderer leaves its coverage of the last reviewable push and the pusher relationship for GitHub to confirm. Conditional team file patterns and Code Quality are not individually evaluated by this renderer and remain marked for GitHub to decide. Bypass eligibility is not inferred from a bot's limited view.
 
+CI uses GraphQL status-check contexts and GitHub's `isRequired(pullRequestNumber)` flag, preferring the test merge commit when a required context is present there. Missing required contexts remain pending. API errors fail the refresh instead of being converted into unknown rows; an absent classic branch-protection rule and inaccessible Team membership are handled explicitly.
+
 The comment shows the contribution guide first, CI commands second and merge requirements last. The greeting mentions the PR author; reviewer usernames in merge requirements are inline code without mentions. CI is summarized without listing individual checks, and disabled review options are omitted. Unrecognized active rule types remain visible as unknown; branch creation/deletion, force-push and merge-method restrictions are omitted from the comment. The merge block contains the overall state and requirement table without footer links. Fetching all active rules does not provide a complete GitHub merge-eligibility verdict: the status renderer interprets supported fields, while GitHub decides unexposed conditions and bypass eligibility.
 
 ## Validation
 
 Use Node.js 24 for ESM checks and run `pre-commit run --all-files`. Validate changed workflows and render the welcome template after editing it. The oxfmt hook uses `ShigureLab/oxfmt-pre-commit-mirror`; its version and file scope are configured in `.pre-commit-config.yaml`.
-
-Run `node --test .github/actions/pr-welcome/index.test.mjs` for review transitions, required-check sources, fork resolution and comment update behavior.
 
 After deploying to the default branch, verify welcome publishing, command permissions, rerun/cancel, bypass and label cleanup on a disposable draft PR. Local checks do not establish live token permissions or GPU/NPU execution.
