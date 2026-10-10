@@ -435,7 +435,9 @@ def setup_model_and_optimizer(
     # Optimizer
     kwargs = _build_optimizer_config_kwargs(args)
     config = OptimizerConfig(**kwargs)
-    config.timers = None
+    from relax.utils.straggler.runtime import attach_timers
+
+    attach_timers(config, args, role=role)
     _validate_vit_lr_trainable_params(args, model)
 
     optimizer = get_megatron_optimizer(
@@ -1417,7 +1419,9 @@ def train(
     # Setup some training config params.
     config = get_model_config(model[0])
     config.grad_scale_func = optimizer.scale_loss
-    config.timers = None
+    from relax.utils.straggler.runtime import attach_timers
+
+    attach_timers(config, args)
     # train() is invoked once per rollout in Relax (vs. once per run upstream),
     # so guard the sync-func setup to be idempotent — re-assigning would trip
     # Megatron's "no_sync_func must be None" assert on rollout 1+.
@@ -1659,6 +1663,10 @@ def train(
         # branch/parameter-gather order. Per-step sync above has made weights current.
         enable_forward_pre_hook(model)
         config.param_sync_func = param_sync_func
+
+    from relax.utils.straggler.runtime import on_rollout_end
+
+    on_rollout_end(args, rollout_id)
 
 
 def save(

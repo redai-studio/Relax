@@ -2386,6 +2386,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "For example, --memory-snapshot-num-steps 3 dumps after step 2 (0-indexed).",
             )
             parser.add_argument(
+                "--straggler-analysis",
+                action="store_true",
+                default=False,
+                help="Enable always-on coarse straggler timers. Off by default; Megatron timers stay unset.",
+            )
+            parser.add_argument("--straggler-interval", type=int, default=10)
+            parser.add_argument("--straggler-relative-threshold", type=float, default=0.10)
+            parser.add_argument("--straggler-absolute-ms-threshold", type=float, default=5.0)
+            parser.add_argument("--straggler-persist-windows", type=int, default=3)
+            parser.add_argument(
+                "--straggler-enable-module-stages",
+                action="store_true",
+                default=False,
+                help="Also record attention and MoE timer names when those names exist.",
+            )
+            parser.add_argument(
                 "--profile-target",
                 type=str,
                 choices=["train_overall", "train_actor", "train_log_probs"],
