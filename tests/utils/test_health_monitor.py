@@ -11,8 +11,7 @@ reached the threshold and a dead engine was never killed/rebuilt.
 Fixes under test:
 - resume() no longer clears the counter (soft failures accumulate across
   resume windows).
-- ``RayActorError`` (whole actor/node dead) bypasses the counter and kills
-  immediately.
+- Terminal ``RayActorError`` bypasses the counter and fences resource reuse.
 - only a *successful* health check resets the counter (overload mitigation).
 - ``_kill_engine`` pops the counter so a rebuilt engine reusing the slot
   starts clean.
@@ -25,7 +24,7 @@ import threading
 from unittest import mock
 
 import requests
-from ray.exceptions import RayActorError, RayTaskError
+from ray.exceptions import ActorUnavailableError, RayActorError, RayTaskError
 
 import relax.utils.health_monitor as hm
 from relax.utils.health_monitor import RolloutHealthMonitor
@@ -39,6 +38,7 @@ def _monitor(max_failures=2):
     m._consecutive_failures = {}
     m._max_consecutive_failures = max_failures
     m._check_timeout = 30
+    m._engine_group = _Group([])
     return m
 
 
@@ -171,14 +171,46 @@ def test_health_monitor_kill_engine_clears_counter(monkeypatch):
     m._engine_group = _Group([engine])
     m._consecutive_failures[0] = 5  # pretend a stale count is present
 
-    # Stub the Ray remote plumbing inside the real _kill_engine.
-    monkeypatch.setattr(hm.ray, "get", lambda *a, **k: None)
-    monkeypatch.setattr(hm.ray, "kill", lambda *a, **k: None)
+    # Confirmed cleanup is delegated to the group; the monitor only resets its counter.
+    m._engine_group.shutdown_engines = mock.Mock()
 
     m._kill_engine(rollout_engine_id=0)
 
     assert 0 not in m._consecutive_failures
-    assert m._engine_group.all_engines[0] is None
+    m._engine_group.shutdown_engines.assert_called_once_with({0})
+    assert m._engine_group.all_engines[0] is engine
+
+
+def test_health_monitor_unconfirmed_cleanup_keeps_worker_and_counter():
+    m = _monitor()
+    engine = _Engine()
+    m._engine_group = _Group([engine])
+    m._engine_group.shutdown_engines = mock.Mock(side_effect=hm.InferenceCleanupError("unconfirmed"))
+    m._consecutive_failures[0] = 2
+    m._kill_engine(0)
+    assert m._engine_group.all_engines == [engine]
+    assert m._consecutive_failures[0] == 2
+
+
+def test_health_monitor_terminal_actor_is_not_probed_again(monkeypatch):
+    m = _monitor()
+    engine = _Engine()
+    m._engine_group = _Group([engine])
+    m._engine_group.shutdown_engines = mock.Mock(side_effect=hm.InferenceRecoveryRequired("unconfirmed"))
+    get = mock.Mock(side_effect=RayActorError())
+    monkeypatch.setattr(hm.ray, "get", get)
+    m._check_engine_health(0, engine)
+    m._check_engine_health(0, engine)
+    assert get.call_count == 1
+    assert m._engine_group.all_engines == [engine]
+
+
+def test_health_monitor_temporary_actor_unavailability_does_not_trigger_cleanup(monkeypatch):
+    m = _monitor()
+    m._kill_engine = mock.Mock()
+    _install_ray_get(monkeypatch, [ActorUnavailableError("restarting", None)])
+    m._check_engine_health(0, _Engine())
+    m._kill_engine.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

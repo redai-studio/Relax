@@ -54,7 +54,8 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         captured["strategy"] = strategy
         return MagicMock(name="pg")
 
-    def _fake_ray_get(arg):
+    def _fake_ray_get(arg, timeout=None):
+        assert timeout is not None and timeout > 0
         # Second call passes a list of get_ip_and_gpu_id futures -> return one
         # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
         if isinstance(arg, list):
@@ -72,6 +73,10 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         patch("relax.core.service.ray.get", side_effect=_fake_ray_get),
         patch("relax.core.service.ray.kill", MagicMock()),
         patch("relax.core.service.ray.cluster_resources", cr_mock),
+        patch(
+            "relax.core.service.ray.nodes",
+            return_value=[{"Alive": True, "NodeID": "node-a", "NodeManagerAddress": "10.0.0.1"}],
+        ),
         patch("relax.core.service.time.sleep"),
     ):
         pg, reordered_indices, reordered_gpu_ids = create_placement_group(
@@ -193,10 +198,13 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
 
-    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {
+    expected_options = {
         "runtime_env": {"env_vars": {"A": "B"}},
         "resources": {"stable_cpu": 1},
     }
+    if has_data_source:
+        expected_options.update(num_gpus=0)
+    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == expected_options
     deployment.bind.assert_called_once()
 
 

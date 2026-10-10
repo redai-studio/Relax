@@ -175,8 +175,6 @@ class _EnvsMeta(type):
 class Envs(metaclass=_EnvsMeta):
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
-    GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
-    GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S = EnvProperty("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", float, 5.0)
 
     # ------------- Rollout -------------
     ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", int, 256)

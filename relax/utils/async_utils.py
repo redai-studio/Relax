@@ -1,6 +1,8 @@
 import asyncio
 import threading
 
+from relax.inference.client import close_loop_inference_clients
+
 
 __all__ = ["get_async_loop", "run"]
 
@@ -46,6 +48,10 @@ def shutdown_async_loop(timeout: float = 5.0):
     inst = async_loop
     async_loop = None
     loop = inst.loop
+
+    if loop.is_running() and threading.current_thread() is not inst._thread:
+        future = asyncio.run_coroutine_threadsafe(close_loop_inference_clients(), loop)
+        future.result(timeout=timeout)
     loop.call_soon_threadsafe(loop.stop)
     inst._thread.join(timeout=timeout)
 

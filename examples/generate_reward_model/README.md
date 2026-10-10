@@ -50,13 +50,13 @@ GPU 8..15 : GenRM   (397B FP8, TP=DP=EP=8)
 ### `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` — 两阶段串行
 
 ```
-Phase A (rollout):  16 GPU 全给 rollout (2× TP=8 engines), GenRM 睡眠
+Phase A (rollout):  16 GPU 全给 rollout (8× TP=2 engines), GenRM 睡眠
 Phase B (score):    16 GPU 全给 GenRM   (2× TP=8 engines), rollout 睡眠
 Phase C (train):    actor 训练 + weight update, GenRM 保持睡眠
 ```
 
-- **触发条件**: `rollout_num_gpus == genrm_num_gpus == actor_total_gpus` 命中 shared-bundles 分支 + `--defer-reward-to-post-process` + `--rm-type dummy` + `--custom-reward-post-process-path examples.generate_reward_model.post_process_genrm_swap.custom_reward_post_process`。
-- **打分方式**: inline reward 是 no-op（rm-type=dummy 返回 0），全部 rollout 完成后 `post_process_genrm_swap.py` 编排 offload rollout → onload GenRM → 批量打分 → offload GenRM 的顺序切换。
+- **触发条件**: `rollout_num_gpus == genrm_num_gpus == actor_total_gpus` 命中 shared-bundles 分支，并设置 `--inference-defer-roles genrm --rm-type dapo-genrm`。
+- **打分方式**: framework deferred scoring 收齐一个封闭 batch 后，编排 offload rollout → onload GenRM → 使用注册的 `dapo-genrm` adapter 打分 → 校验并提交 batch → offload GenRM。当前不支持 dynamic batch 或在同一训练任务中执行 model eval。
 - **优点**: rollout 和 GenRM 各自都能吃满 16 卡；相比 split 版 GenRM 吞吐 ~2×、rollout 也可能 ~1.8×（视模型/batch）。SGLang GenRM engine 一次收到全 batch 请求，prefill 能凑成大 batch，调度效率更高。
 - **缺点**: 少了 rollout ↔ GenRM 的重叠；多了两次 sleep/wake（release/resume_memory_occupation）的秒级开销。
 
@@ -159,8 +159,7 @@ examples/generate_reward_model/
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B GenRM, split-bundle (inline reward)
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh          # 35B + 397B GenRM, shared-bundle two-phase swap
 ├── run-qwen3-4B-8xgpu-dual-genrm-split.sh                 # 4B policy + two GenRM instances (--genrm-instances), split-bundle
-├── reward_dual_genrm_quality_safety.py                    # Custom reward routing to two GenRM instances via route_key
-└── post_process_genrm_swap.py                             # Custom post-process function used by the defer script
+└── reward_dual_genrm_quality_safety.py                    # Custom reward routing to two GenRM instances via route_key
 ```
 
 ## Further Reading

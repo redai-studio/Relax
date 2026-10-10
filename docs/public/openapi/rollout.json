@@ -124,6 +124,44 @@
         }
       }
     },
+    "/predict": {
+      "get": {
+        "summary": "Predict",
+        "description": "Periodic SFT predict pass — symmetric with /evaluate.\n\nBody lives in ``relax.engine.sft.predict.runner.handle_predict``;\nthis method is the thin HTTP-decoration shell.",
+        "operationId": "predict_predict_get",
+        "parameters": [
+          {
+            "name": "train_step",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Train Step"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/can_do_update_weight_for_async": {
       "get": {
         "summary": "Can Do Update Weight For Async",
@@ -425,6 +463,16 @@
               ],
               "title": "Model Name"
             }
+          },
+          {
+            "name": "schema",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 2,
+              "title": "Schema"
+            }
           }
         ],
         "responses": {
@@ -580,6 +628,92 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/generate": {
+      "post": {
+        "summary": "Inference Generate",
+        "operationId": "inference_generate_generate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Inference Health",
+        "operationId": "inference_health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Inference Health Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/chat/completions": {
+      "post": {
+        "summary": "Chat Completions Alias",
+        "operationId": "chat_completions_alias_chat_completions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "summary": "Chat Completions",
+        "operationId": "chat_completions_v1_chat_completions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "summary": "List Models",
+        "operationId": "list_models_v1_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelListResponse"
                 }
               }
             }
@@ -788,6 +922,53 @@
         "required": ["requests", "total_count"],
         "title": "ListScaleOutRequestsResponse",
         "description": "Response model for list scale-out requests endpoint."
+      },
+      "ModelListResponse": {
+        "properties": {
+          "object": {
+            "type": "string",
+            "title": "Object",
+            "default": "list"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ModelObject"
+            },
+            "type": "array",
+            "title": "Data"
+          }
+        },
+        "type": "object",
+        "required": ["data"],
+        "title": "ModelListResponse",
+        "description": "OpenAI-compatible model list response."
+      },
+      "ModelObject": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object",
+            "default": "model"
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created",
+            "default": 0
+          },
+          "owned_by": {
+            "type": "string",
+            "title": "Owned By",
+            "default": "relax"
+          }
+        },
+        "type": "object",
+        "required": ["id"],
+        "title": "ModelObject",
+        "description": "OpenAI-compatible model object."
       },
       "ScaleInAPIRequest": {
         "properties": {
@@ -1091,6 +1272,13 @@
               }
             ],
             "title": "Weight Version"
+          },
+          "failure_categories": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Failure Categories"
           }
         },
         "type": "object",

@@ -59,6 +59,7 @@ class RewardSpec:
     mode: str = "sync"
     pass_metadata: bool = False
     label_matcher: Callable[[Any], bool] | None = None
+    supports_deferred: bool = False
 
     def resolve(self) -> Callable:
         """Return the handler, importing it on first use for dotted paths."""
@@ -80,6 +81,7 @@ def register_reward(
     mode: str = "sync",
     pass_metadata: bool = False,
     label_matcher: Callable[[Any], bool] | None = None,
+    supports_deferred: bool = False,
 ) -> None:
     """Register a reward under ``name``. One call per reward; no router edit.
 
@@ -92,7 +94,14 @@ def register_reward(
         raise ValueError(f"Reward mode must be 'sync' or 'async', got {mode!r}")
     if name in _REWARDS:
         raise ValueError(f"Reward type '{name}' is already registered. Registered types: {list_reward_types()}")
-    _REWARDS[name] = RewardSpec(name=name, fn=fn, mode=mode, pass_metadata=pass_metadata, label_matcher=label_matcher)
+    _REWARDS[name] = RewardSpec(
+        name=name,
+        fn=fn,
+        mode=mode,
+        pass_metadata=pass_metadata,
+        label_matcher=label_matcher,
+        supports_deferred=supports_deferred,
+    )
 
 
 def get_reward_spec(name: str) -> RewardSpec | None:

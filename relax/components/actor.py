@@ -19,6 +19,7 @@ from relax.engine.sft.runtime import (
     sft_partition_ids,
     sft_task_name,
 )
+from relax.inference.defer import wait_inference_commit
 from relax.utils.async_utils import run
 from relax.utils.opd.opd_utils import set_managed_opd_teacher_on_train_group
 
@@ -256,12 +257,14 @@ class Actor(Base):
             True if data is ready and training can proceed,
             False if should continue waiting (caller should skip this iteration)
         """
-        partition_list = run(self.data_system_client.async_get_partition_list())
-        if not partition_list or not all(
-            partition_id in partition_list for partition_id in sft_partition_ids(self.config, self.step)
-        ):
-            time.sleep(1)
-            return False
+        partition_ids = sft_partition_ids(self.config, self.step)
+        if getattr(self.config, "inference_defer_roles", None):
+            run(wait_inference_commit(self.config, self.step))
+        else:
+            partition_list = run(self.data_system_client.async_get_partition_list())
+            if not partition_list or not all(partition_id in partition_list for partition_id in partition_ids):
+                time.sleep(1)
+                return False
 
         # Colocate: block until rollout(SGLang) has offloaded so wake_up/onload
         # of actor weights doesn't collide with SGLang's static KV pool.
@@ -294,6 +297,8 @@ class Actor(Base):
         Returns:
             True when actor training ran and this service owns partition cleanup.
         """
+
+        run(wait_inference_commit(self.config, self.step))
         # Skip training during critic-only phase.
         # But we still must trigger actor.update_weights: it is the only path
         # that calls rollout_manager.onload_weights / onload_kv on SGLang.

@@ -438,7 +438,7 @@ async def remote_rm(args, sample: Sample, max_retries: int = 10):
 
 # Async rm_types run in the event loop (not dispatched to the worker pool).
 register_reward("remote_rm", remote_rm, mode="async")
-register_reward("dapo-genrm", async_compute_score_genrm, mode="async")
+register_reward("dapo-genrm", async_compute_score_genrm, mode="async", supports_deferred=True)
 # `dummy` returns 0 without any computation. Use it when the real reward is
 # produced elsewhere (e.g., --custom-reward-post-process-path does batched
 # GenRM scoring after all rollout finishes).
@@ -451,6 +451,8 @@ async def async_rm(args, sample: Sample, **kwargs):
     Delegates to RewardExecutor which handles concurrency control and process
     isolation for CPU-bound / thread-unsafe reward functions.
     """
+    if "genrm" in (getattr(args, "inference_defer_roles", None) or []):
+        return await _dummy_reward(args)
     return await _get_reward_executor(args).execute(args, sample, **kwargs)
 
 
