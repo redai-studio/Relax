@@ -199,6 +199,34 @@ class Envs(metaclass=_EnvsMeta):
     USER = EnvProperty("USER", str, None)
     LOGNAME = EnvProperty("LOGNAME", str, None)
 
+    # ------------- Straggler profiler (Task 11) -------------
+    # Every knob defaults to off/inert; the profiler must be opt-in per run.
+    RELAX_STRAGGLER_ENABLE = EnvProperty("RELAX_STRAGGLER_ENABLE", bool, False)
+    RELAX_STRAGGLER_TIMER_LOG_LEVEL = EnvProperty("RELAX_STRAGGLER_TIMER_LOG_LEVEL", int, 2)
+    RELAX_STRAGGLER_EVENT_POOL = EnvProperty("RELAX_STRAGGLER_EVENT_POOL", int, 512)
+    RELAX_STRAGGLER_QUEUE_MAX = EnvProperty("RELAX_STRAGGLER_QUEUE_MAX", int, 4096)
+    RELAX_STRAGGLER_OUTPUT_DIR = EnvProperty("RELAX_STRAGGLER_OUTPUT_DIR", str, None)
+    RELAX_STRAGGLER_WARMUP_WINDOWS = EnvProperty("RELAX_STRAGGLER_WARMUP_WINDOWS", int, 2)
+    RELAX_STRAGGLER_WORK_TOLERANCE = EnvProperty("RELAX_STRAGGLER_WORK_TOLERANCE", float, 0.05)
+    # Below this measured stage magnitude (milliseconds) a relative deviation is
+    # dominated by host/launch jitter, so the comparison cannot tell a straggler
+    # from noise and the stage is classified ``uncertain`` instead. Measured on
+    # the DP4 SFT recipe: metadata stages run 0.06-4.0 ms while the real compute
+    # stages run ~81 ms (backward-compute) and ~134 ms (forward-compute).
+    RELAX_STRAGGLER_MIN_STAGE_MS = EnvProperty("RELAX_STRAGGLER_MIN_STAGE_MS", float, 5.0)
+    RELAX_STRAGGLER_WINDOW_S = EnvProperty("RELAX_STRAGGLER_WINDOW_S", float, 5.0)
+    RELAX_STRAGGLER_PERSIST_WINDOWS = EnvProperty("RELAX_STRAGGLER_PERSIST_WINDOWS", int, 3)
+    RELAX_STRAGGLER_MIN_COHORT = EnvProperty("RELAX_STRAGGLER_MIN_COHORT", int, 2)
+    RELAX_STRAGGLER_REPORT_INTERVAL_S = EnvProperty("RELAX_STRAGGLER_REPORT_INTERVAL_S", float, 10.0)
+    RELAX_STRAGGLER_COLLECTOR_ADDR = EnvProperty("RELAX_STRAGGLER_COLLECTOR_ADDR", str, None)
+    # Identifies one parallel layout; a re-shard invalidates every comparison.
+    RELAX_STRAGGLER_TOPOLOGY_EPOCH = EnvProperty("RELAX_STRAGGLER_TOPOLOGY_EPOCH", str, "")
+    # Test-only slow-rank injection, used to measure detector sensitivity. All
+    # three default to inert, and the delay is the only behaviour they change.
+    RELAX_STRAGGLER_DEBUG_HOST_DELAY_MS = EnvProperty("RELAX_STRAGGLER_DEBUG_HOST_DELAY_MS", float, 0.0)
+    RELAX_STRAGGLER_DEBUG_RANK = EnvProperty("RELAX_STRAGGLER_DEBUG_RANK", int, -1)
+    RELAX_STRAGGLER_DEBUG_STAGE = EnvProperty("RELAX_STRAGGLER_DEBUG_STAGE", str, "")
+
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PREEXPANDED_PATCH = EnvProperty("RELAX_OPD_PREEXPANDED_PATCH", bool, False)
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
