@@ -77,6 +77,21 @@ class TestEagerDataset:
 class TestDataSourceIntegration:
     """Integration tests for data_source.py with StreamingDataset."""
 
+    def test_resampling_clears_speculative_generation_history(self, data_source_module):
+        from relax.utils.types import Sample
+
+        source = Sample()
+        source.spec_info.add({"spec_accept_token_num": 1, "spec_draft_token_num": 2})
+        record = {"session_id": "s", "request_id": "r", **source.spec_info.observed_counts()}
+        source.spec_generations = [record]
+
+        copied = data_source_module._shallow_copy_sample(source)
+
+        assert copied.spec_generations is None
+        assert copied.spec_info == Sample.SpecInfo()
+        assert source.spec_generations == [record]
+        assert source.spec_info.spec_accept_token_num == 1
+
     @pytest.fixture
     def jsonl_file(self):
         """Create a temporary JSONL file for testing."""
