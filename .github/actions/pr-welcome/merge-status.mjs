@@ -4,7 +4,7 @@ const reviewQuery = `query($owner: String!, $repo: String!, $number: Int!, $curs
       headRefOid baseRefName mergeable mergeStateStatus
       potentialMergeCommit { oid }
       latestOpinionatedReviews(first: 100, after: $cursor) {
-        nodes { author { login } authorCanPushToRepository state }
+        nodes { author { login } authorCanPushToRepository state submittedAt commit { oid } }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -99,6 +99,35 @@ export async function loadMergeStatus({ github, repo, number }) {
   if (state.headRefOid !== pr.head.sha || state.baseRefName !== pr.base.ref)
     throw new Error('PR changed while collecting reviews.')
 
+  let lastPush
+  if (
+    reviewRules.some((rule) => rule.require_last_push_approval) &&
+    pr.head.repo &&
+    reviews.some((review) => review.state === 'APPROVED' && review.authorCanPushToRepository)
+  ) {
+    const headRepo = { owner: pr.head.repo.owner.login, repo: pr.head.repo.name }
+    const activities = await github.paginate('GET /repos/{owner}/{repo}/activity', {
+      ...headRepo,
+      ref: `refs/heads/${pr.head.ref}`,
+      per_page: 100,
+    })
+    lastPush = activities.find((activity) => activity.after === pr.head.sha)
+    if (lastPush?.actor && ['push', 'branch_creation'].includes(lastPush.activity_type)) {
+      const { data: changes } = await github.rest.repos.compareCommits({
+        ...headRepo,
+        base: lastPush.activity_type === 'branch_creation' ? pr.base.sha : lastPush.before,
+        head: lastPush.after,
+        per_page: 100,
+      })
+      // Leave pushes containing merge commits to GitHub's reviewability decision.
+      lastPush.reviewable =
+        changes.status === 'ahead' &&
+        changes.files.length > 0 &&
+        changes.commits.length === changes.total_commits &&
+        changes.commits.every((commit) => commit.parents.length === 1)
+    }
+  }
+
   const refs = [...new Set([pr.head.sha, state.potentialMergeCommit?.oid].filter(Boolean))]
   const checks = await Promise.all(
     refs.map(async (ref) => {
@@ -154,7 +183,7 @@ export async function loadMergeStatus({ github, repo, number }) {
     )
     unresolved = nodes.filter((thread) => !thread.isResolved).length
   }
-  return { pr, state, rules, reviews, checks, teams, unresolved, warnings }
+  return { pr, state, rules, reviews, checks, teams, unresolved, warnings, lastPush }
 }
 
 function ciStatus(required, checks) {
@@ -191,6 +220,7 @@ export function renderMergeStatus({
   teams,
   unresolved,
   warnings,
+  lastPush,
 }) {
   const currentReviews = reviews.filter(
     (review) =>
@@ -251,15 +281,22 @@ export function renderMergeStatus({
     if (!unconditional) parts.push(`文件条件：${names(entry.file_patterns || [])}`)
     rows.push(row(label, parts.join(' · ')))
   }
-  if (enabled('require_last_push_approval'))
-    rows.push(
-      row(
-        '最近一次推送审批',
-        approved.length
-          ? '❔ 需由推送者以外的人 Approve，GitHub 判定'
-          : '⏳ 等待推送者以外的人 Approve'
+  if (enabled('require_last_push_approval')) {
+    let status = approved.length ? '❔ GitHub 判定' : '⏳ 等待推送者以外的人 Approve'
+    if (lastPush?.reviewable) {
+      const received = currentReviews.filter(
+        (review) =>
+          review.state === 'APPROVED' &&
+          review.commit?.oid === pr.head.sha &&
+          review.submittedAt >= lastPush.timestamp &&
+          !sameUser(review.author.login, lastPush.actor.login)
       )
-    )
+      status = received.length
+        ? `✅ 已由 ${names(received.map((review) => review.author.login))} Approve`
+        : '⏳ 等待推送者以外的人 Approve'
+    }
+    rows.push(row('最近一次推送审批', status))
+  }
   if (enabled('require_code_owner_review')) rows.push(row('Code Owners', '❔ GitHub 判定'))
   if (enabled('require_extra_approval_for_unattributed_changes') && pr.user.type !== 'User')
     rows.push(row('Copilot 额外审批', '❔ 无归属的 Copilot PR 需额外审批，GitHub 判定'))
