@@ -1,9 +1,9 @@
-Thanks for contributing to Relax, @{{author}}! 感谢你为 Relax 做出贡献！
+Thanks for contributing to Relax, `{{author}}`! 感谢你为 Relax 做出贡献！
 
 {{mergeStatus}}
 
 <details>
-<summary>Contribution guide / 贡献指南</summary>
+<summary>📚 Contribution guide / 贡献指南</summary>
 
 Describe the problem, your changes, and how you validated them. Keep each PR focused and run `pre-commit run --all-files` before submitting.
 
@@ -14,7 +14,7 @@ Describe the problem, your changes, and how you validated them. Keep each PR foc
 </details>
 
 <details>
-<summary>CI commands / CI 指令</summary>
+<summary>🛠️ CI commands / CI 指令</summary>
 
 | Command / 指令       | Usage / 用途                                         |
 | -------------------- | ---------------------------------------------------- |

@@ -11,9 +11,9 @@ const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: St
   }
 }`
 
-const mentions = (users) => users.map((user) => `@${user}`).join(', ') || '—'
+const names = (users) => users.map((user) => `\`${cell(user).replaceAll('`', '\\`')}\``).join(', ')
 const cell = (value) => String(value).replaceAll('|', '\\|').replaceAll('\n', ' ')
-const row = (name, status, detail) => `| ${cell(name)} | ${cell(status)} | ${cell(detail)} |`
+const row = (name, status) => `| ${cell(name)} | ${cell(status)} |`
 
 async function optional(request, warnings, label, missingIsEmpty = false) {
   try {
@@ -246,28 +246,7 @@ export function renderMergeStatus({
   const requested = currentReviews
     .filter((review) => review.state === 'CHANGES_REQUESTED')
     .map((review) => review.author.login)
-  const rows = [
-    row(
-      'GitHub merge state / 合入状态',
-      `\`${state.mergeStateStatus}\``,
-      pr.draft
-        ? 'Mark ready for review / 先转为 Ready for review'
-        : state.mergeStateStatus === 'CLEAN'
-          ? 'GitHub reports ready / GitHub 当前报告可合入'
-          : 'See the PR merge box / 查看 PR 合入区域'
-    ),
-  ]
-  rows.push(
-    row(
-      'Conflicts / 冲突',
-      state.mergeable === 'MERGEABLE'
-        ? '✅ None / 无'
-        : state.mergeable === 'CONFLICTING'
-          ? '❌ Conflicts / 有冲突'
-          : '⏳ Computing / 计算中',
-      ''
-    )
-  )
+  const rows = []
   const reviewRules = rules
     .filter((rule) => rule.type === 'pull_request')
     .map((rule) => rule.parameters)
@@ -275,24 +254,21 @@ export function renderMergeStatus({
   if (count)
     rows.push(
       row(
-        'Approvals / 审批数',
-        `${approved.length >= count ? '✅' : '⏳'} ${approved.length}/${count}`,
-        mentions(approved)
+        '审批',
+        `${approved.length >= count ? '✅' : '⏳'} ${approved.length}/${count}${approved.length ? ` · 已审批：${names(approved)}` : ''}`
       )
     )
-  if (requested.length)
-    rows.push(
-      row(
-        'Changes requested / 要求修改',
-        '❌',
-        `Address feedback and request re-review / 处理意见后请重新审批：${mentions(requested)}`
-      )
-    )
+  if (requested.length) rows.push(row('修改意见', `❌ 处理意见后请重新审批：${names(requested)}`))
+  const requiredTeams = new Set()
   for (const rule of reviewRules) {
     for (const entry of rule.required_reviewers || []) {
+      if (!entry.minimum_approvals) continue
+      const key = JSON.stringify(entry)
+      if (requiredTeams.has(key)) continue
+      requiredTeams.add(key)
       const team = teams.get(entry.reviewer.id)
       const label = team
-        ? `@${pr.base.repo.owner.login}/${team.slug}`
+        ? `团队 ${names([team.slug])}`
         : `${entry.reviewer.type} ${entry.reviewer.id}`
       const members = team?.members?.filter(
         (login) => login.toLowerCase() !== pr.user.login.toLowerCase()
@@ -300,59 +276,42 @@ export function renderMergeStatus({
       const received = approved.filter((login) =>
         members?.some((member) => member.toLowerCase() === login.toLowerCase())
       )
-      // Only an unconditional wildcard can be evaluated without reproducing GitHub's path matcher.
+      // Conditional paths stay unknown instead of approximating GitHub's matcher.
       const unconditional =
         entry.file_patterns?.length === 1 && ['*', '**', '**/*'].includes(entry.file_patterns[0])
-      const status = !entry.minimum_approvals
-        ? 'ℹ️ Optional / 可选'
-        : !unconditional || !members
-          ? '❔ GitHub decides / GitHub 判定'
-          : `${received.length >= entry.minimum_approvals ? '✅' : '⏳'} ${received.length}/${entry.minimum_approvals}`
-      const candidates = members?.filter(
-        (login) => !received.some((user) => user.toLowerCase() === login.toLowerCase())
-      )
-      const details = []
-      if (received.length) details.push(`Approved / 已审批：${mentions(received)}`)
-      if (received.length < entry.minimum_approvals)
-        details.push(
-          candidates?.length
-            ? `Ask / 可联系：${mentions(candidates)}`
-            : members
-              ? 'No eligible candidates / 无可审批成员'
-              : 'Members unavailable / 无法读取成员'
+      const parts = [
+        !unconditional || !members
+          ? '❔ GitHub 判定'
+          : `${received.length >= entry.minimum_approvals ? '✅' : '⏳'} ${received.length}/${entry.minimum_approvals}`,
+      ]
+      if (received.length) parts.push(`已审批：${names(received)}`)
+      if (received.length < entry.minimum_approvals) {
+        const candidates = members?.filter(
+          (login) => !received.some((user) => user.toLowerCase() === login.toLowerCase())
         )
-      if (!unconditional)
-        details.push(`Paths / 文件条件：${(entry.file_patterns || []).join(', ')}`)
-      const detail = details.join('. ')
-      rows.push(row(`Team approval / 团队审批 ${label}`, status, detail))
+        parts.push(
+          candidates?.length
+            ? `可联系：${names(candidates)}`
+            : members
+              ? '无可审批成员'
+              : '无法读取成员'
+        )
+      }
+      if (!unconditional) parts.push(`文件条件：${names(entry.file_patterns || [])}`)
+      rows.push(row(label, parts.join(' · ')))
     }
   }
   if (reviewRules.some((rule) => rule.require_last_push_approval))
-    rows.push(
-      row(
-        'Latest push approval / 最近推送审批',
-        '❔ GitHub decides / GitHub 判定',
-        'Someone other than the last pusher must approve / 需由最近推送者以外的人 Approve'
-      )
-    )
-  if (reviewRules.length)
-    rows.push(
-      row(
-        'Code Owners',
-        reviewRules.some((rule) => rule.require_code_owner_review)
-          ? '❔ GitHub decides / GitHub 判定'
-          : 'ℹ️ Not required / 未要求',
-        ''
-      )
-    )
+    rows.push(row('最近一次推送审批', '❔ 需由推送者以外的人 Approve，GitHub 判定'))
+  if (reviewRules.some((rule) => rule.require_code_owner_review))
+    rows.push(row('Code Owners', '❔ GitHub 判定'))
+  if (
+    reviewRules.some((rule) => rule.require_extra_approval_for_unattributed_changes) &&
+    pr.user.type !== 'User'
+  )
+    rows.push(row('Copilot 额外审批', '❔ 无归属的 Copilot PR 需额外审批，GitHub 判定'))
   if (unresolved !== undefined)
-    rows.push(
-      row(
-        'Conversations / Review 对话',
-        unresolved ? `⏳ ${unresolved} unresolved / 未解决` : '✅ Resolved / 已解决',
-        ''
-      )
-    )
+    rows.push(row('Review 对话', unresolved ? `⏳ ${unresolved} 条未解决` : '✅ 已解决'))
   const requiredChecks = [
     ...new Map(
       rules
@@ -362,82 +321,81 @@ export function renderMergeStatus({
         .map((check) => [`${check.context}:${check.integration_id ?? 'any'}`, check])
     ).values(),
   ]
-  const results = requiredChecks.map((check) => ({ ...check, status: checkStatus(check, checks) }))
-  if (results.length) {
-    const passed = results.filter((check) => check.status.startsWith('✅')).length
-    rows.push(
-      row(
-        'Required CI / 必需检查',
-        `${passed === results.length ? '✅' : '⏳'} ${passed}/${results.length}`,
-        'Details below / 详情见下方'
-      )
-    )
+  if (requiredChecks.length) {
+    const results = requiredChecks.map((check) => checkStatus(check, checks))
+    const status = results.some((value) => value.startsWith('❌'))
+      ? '❌ 未通过'
+      : results.some((value) => value.startsWith('❔'))
+        ? '❔ 无法确认'
+        : results.every((value) => value.startsWith('✅'))
+          ? '✅ 已通过'
+          : '⏳ 等待通过'
+    rows.push(row('CI', status))
   }
   if (rules.some((rule) => rule.parameters?.strict_required_status_checks_policy))
     rows.push(
-      row(
-        'Up to date / 分支更新',
-        state.mergeStateStatus === 'BEHIND'
-          ? '⏳ Update branch / 需要更新'
-          : '❔ GitHub decides / GitHub 判定',
-        'Must be up to date with base / 需要同步目标分支'
-      )
+      row('同步目标分支', state.mergeStateStatus === 'BEHIND' ? '⏳ 需要更新' : '❔ GitHub 判定')
     )
-  const external = rules.filter(
-    (rule) =>
-      ![
-        'pull_request',
-        'required_status_checks',
-        'deletion',
-        'non_fast_forward',
-        'creation',
-        'required_linear_history',
-      ].includes(rule.type)
-  )
-  for (const rule of external)
-    rows.push(
-      row(
-        rule.type === 'code_quality' ? 'Code Quality' : rule.type,
-        '❔ GitHub decides / GitHub 判定',
-        rule.parameters?.severity || 'See repository rules / 查看仓库规则'
-      )
-    )
-  const methods = reviewRules.map((rule) => rule.allowed_merge_methods).filter(Boolean)
-  if (methods.length)
-    rows.push(
-      row(
-        'Merge method / 合入方式',
-        'ℹ️',
-        methods
-          .reduce((allowed, current) => allowed.filter((method) => current.includes(method)))
-          .join(' / ')
-      )
-    )
-  if (rules.some((rule) => rule.type === 'required_linear_history'))
-    rows.push(row('Linear history / 线性历史', 'ℹ️', 'Squash / Rebase'))
-  const lines = [
-    '### Merge readiness / 合入条件',
-    '',
-    `Base / 目标分支：\`${cell(pr.base.ref)}\` · Head：\`${pr.head.sha.slice(0, 7)}\``,
-    '',
-    '| Requirement / 条件 | Status / 状态 | Next step / 下一步 |',
-    '| --- | --- | --- |',
-    ...rows,
-    '',
-    'Rules and reviews are read live; final eligibility and bypass permissions are determined by GitHub. / 根据当前规则和审批生成，最终合入资格及绕过权限以 GitHub 为准。',
+  const handled = [
+    'pull_request',
+    'required_status_checks',
+    'deletion',
+    'non_fast_forward',
+    'creation',
+    'required_linear_history',
   ]
-  if (results.length)
+  const labels = {
+    code_quality: 'Code Quality',
+    code_scanning: 'Code scanning',
+    required_signatures: '提交签名',
+    required_deployments: '部署',
+    merge_queue: '合入队列',
+  }
+  for (const type of new Set(
+    rules.filter((rule) => !handled.includes(rule.type)).map((rule) => rule.type)
+  ))
+    rows.push(row(labels[type] || names([type]), '❔ GitHub 判定'))
+  const modes = reviewRules.map((rule) => rule.allowed_merge_methods).filter(Boolean)
+  if (rules.some((rule) => rule.type === 'required_linear_history'))
+    modes.push(['squash', 'rebase'])
+  const methods = modes.length
+    ? modes.reduce((allowed, current) => allowed.filter((method) => current.includes(method)))
+    : []
+  const states = {
+    CLEAN: '✅ 满足合入条件',
+    BLOCKED: '⏳ 合入条件未满足',
+    BEHIND: '⏳ 需要更新目标分支',
+    DIRTY: '❌ 存在冲突',
+    UNKNOWN: '⏳ 正在计算',
+    DRAFT: '📝 Draft',
+    UNSTABLE: '❔ 部分检查未通过',
+    HAS_HOOKS: '❔ 等待仓库校验',
+  }
+  const overall = pr.draft
+    ? '📝 请转为 Ready for review'
+    : state.mergeable === 'CONFLICTING'
+      ? '❌ 存在冲突'
+      : states[state.mergeStateStatus] || names([state.mergeStateStatus])
+  const lines = [
+    '<details>',
+    '<summary>🔎 Merge requirements / 合入条件</summary>',
+    '',
+    `**GitHub：${overall}**`,
+    '',
+  ]
+  if (rows.length)
+    lines.push('| Requirement / 条件 | Status / 状态 |', '| --- | --- |', ...rows, '')
+  if (modes.length)
     lines.push(
-      '',
-      '<details>',
-      '<summary>Required CI / 必需检查详情</summary>',
-      '',
-      '| Check / 检查 | Status / 状态 |',
-      '| --- | --- |',
-      ...results.map((check) => `| ${cell(check.context)} | ${cell(check.status)} |`),
-      '',
-      '</details>'
+      `允许合入方式：${methods.length ? names(methods) : '❌ 规则没有共同允许的方式'}。`,
+      ''
     )
+  const url = pr.base.repo.html_url
+  const sources = url
+    ? `[查看合入状态](${pr.html_url}#partial-pull-merging) · [规则来源](${url}/rules)`
+    : '最终以 GitHub 合入区域为准。'
+  lines.push(sources)
   if (warnings.length) lines.push('', ...warnings.map((warning) => `- ❔ ${cell(warning)}`))
+  lines.push('', '</details>')
   return lines.join('\n')
 }

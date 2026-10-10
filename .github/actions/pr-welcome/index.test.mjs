@@ -7,7 +7,7 @@ const repo = { owner: 'example', repo: 'project' }
 const pr = {
   number: 42,
   state: 'open',
-  user: { login: 'author' },
+  user: { login: 'author', type: 'User' },
   draft: false,
   head: { sha: 'a'.repeat(40), ref: 'feature', repo: { full_name: 'author/project' } },
   base: { ref: 'main', repo: { owner: { login: 'example' } } },
@@ -52,28 +52,54 @@ test('only eligible reviews count; team approval follows approve, request change
   const excluded = [review('author'), review('bot', 'APPROVED', false)]
   excluded.push({ ...review('deleted'), author: null })
   const initial = renderMergeStatus(snapshot({ reviews: excluded }))
-  assert.match(initial, /团队审批 @example\/reviewers \| ⏳ 0\/1 \| Ask \/ 可联系：@reviewer/)
-  assert.doesNotMatch(initial, /可联系：@author/)
+  assert.match(initial, /团队 `reviewers` \| ⏳ 0\/1 · 可联系：`reviewer`/)
+  assert.doesNotMatch(initial, /可联系：.*author/)
   const approved = renderMergeStatus(snapshot({ reviews: [...excluded, review('reviewer')] }))
-  assert.match(approved, /团队审批 @example\/reviewers \| ✅ 1\/1/)
-  assert.doesNotMatch(approved, /Ask \/ 可联系/)
-  assert.match(approved, /最近推送审批 \| ❔ GitHub decides/)
+  assert.match(approved, /团队 `reviewers` \| ✅ 1\/1/)
+  assert.doesNotMatch(approved, /可联系/)
+  assert.match(approved, /最近一次推送审批 \| ❔/)
   const changed = renderMergeStatus(
     snapshot({ reviews: [review('reviewer', 'CHANGES_REQUESTED')] })
   )
-  assert.match(changed, /要求修改 \| ❌/)
-  assert.match(changed, /团队审批 @example\/reviewers \| ⏳ 0\/1/)
+  assert.match(changed, /修改意见 \| ❌/)
+  assert.match(changed, /团队 `reviewers` \| ⏳ 0\/1/)
   const dismissed = renderMergeStatus(snapshot({ reviews: [review('reviewer', 'DISMISSED')] }))
-  assert.match(dismissed, /团队审批 @example\/reviewers \| ⏳ 0\/1/)
+  assert.match(dismissed, /团队 `reviewers` \| ⏳ 0\/1/)
 })
 
 test('unavailable members and conditional file patterns remain unknown', () => {
-  assert.match(renderMergeStatus(snapshot({ teams: new Map() })), /Team 1 \| ❔ GitHub decides/)
+  assert.match(renderMergeStatus(snapshot({ teams: new Map() })), /Team 1 \| ❔ GitHub 判定/)
   const conditional = structuredClone(rules)
   conditional[0].parameters.required_reviewers[0].file_patterns = ['*', '!docs/**']
   const body = renderMergeStatus(snapshot({ rules: conditional, reviews: [review('reviewer')] }))
-  assert.match(body, /团队审批 @example\/reviewers \| ❔ GitHub decides/)
-  assert.match(body, /文件条件：\*, !docs\/\*\*/)
+  assert.match(body, /团队 `reviewers` \| ❔ GitHub 判定/)
+  assert.match(body, /文件条件：`\*`, `!docs\/\*\*`/)
+})
+
+test('CI is summarized and unrecognized API rules stay visible without inventing disabled requirements', () => {
+  const configured = structuredClone(rules)
+  configured[0].parameters.require_code_owner_review = false
+  configured[0].parameters.require_extra_approval_for_unattributed_changes = true
+  configured.push(
+    {
+      type: 'required_status_checks',
+      parameters: { required_status_checks: [{ context: 'Tests' }] },
+    },
+    { type: 'future_merge_rule' }
+  )
+  const good = {
+    runs: [{ name: 'Tests', status: 'completed', conclusion: 'success', id: 1 }],
+    statuses: [],
+  }
+  const body = renderMergeStatus(snapshot({ rules: configured, checks: [good] }))
+  assert.match(body, /\| CI \| ✅ 已通过 \|/)
+  assert.match(body, /`future_merge_rule` \| ❔ GitHub 判定/)
+  assert.doesNotMatch(body, /Code Owners|Copilot|Tests/)
+  good.runs[0].conclusion = 'failure'
+  assert.match(
+    renderMergeStatus(snapshot({ rules: configured, checks: [good] })),
+    /\| CI \| ❌ 未通过 \|/
+  )
 })
 
 test('checks require the configured app and prefer test merge results', () => {
@@ -201,6 +227,7 @@ test('repeated events update the original bot comment and identical content does
   const first = client()
   await run({ ...options, github: first.github })
   assert.equal(first.writes[0].type, 'create')
+  assert.doesNotMatch(first.writes[0].body, /@[a-z\d-]+/i)
   const comment = { id: 9, user: { login: 'welcome-bot' }, body: first.writes[0].body }
   const unchanged = client({ comments: [comment] })
   await run({ ...options, github: unchanged.github })

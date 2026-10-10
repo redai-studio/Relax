@@ -39,6 +39,8 @@ The welcome comment refreshes on PR changes, review signal runs and configured C
 
 Merge status reads active rulesets, classic branch protection, current reviews and required checks. Team candidates exclude the PR author; approvals only count when GitHub reports repository push access. Conditional team file patterns, latest-push approval, Code Quality and other conditions not exposed as individual blockers remain explicitly marked for GitHub to decide. Bypass eligibility is not inferred from a bot's limited view.
 
+The comment adds one merge-requirements details block alongside the contribution guide and CI commands. Usernames are inline code without mentions, CI is summarized without listing individual checks, and disabled review options are omitted. Unrecognized active rule types remain visible as unknown; branch creation/deletion and force-push restrictions are excluded from PR merge requirements. Allowed merge methods and linear-history constraints share one line. Fetching all active rules does not provide a complete GitHub merge-eligibility verdict: the status renderer interprets supported fields and links to the repository rules, while GitHub decides unexposed conditions and bypass eligibility.
+
 ## Validation
 
 Use Node.js 24 for ESM checks and run `pre-commit run --all-files`. Validate changed workflows and render the welcome template after editing it. The oxfmt hook uses `ShigureLab/oxfmt-pre-commit-mirror`; its version and file scope are configured in `.pre-commit-config.yaml`.
