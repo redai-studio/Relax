@@ -52,6 +52,7 @@ test('only eligible reviews count; team approval follows approve, request change
   const excluded = [review('author'), review('bot', 'APPROVED', false)]
   excluded.push({ ...review('deleted'), author: null })
   const initial = renderMergeStatus(snapshot({ reviews: excluded }))
+  assert.match(initial, /审批（至少 1 位有仓库 write 或更高权限的人 Approve） \| ⏳ 0\/1/)
   assert.match(initial, /团队 `reviewers` \| ⏳ 0\/1 · 可联系：`reviewer`/)
   assert.doesNotMatch(initial, /可联系：.*author/)
   const approved = renderMergeStatus(snapshot({ reviews: [...excluded, review('reviewer')] }))
@@ -227,7 +228,7 @@ test('repeated events update the original bot comment and identical content does
   const first = client()
   await run({ ...options, github: first.github })
   assert.equal(first.writes[0].type, 'create')
-  assert.doesNotMatch(first.writes[0].body, /@[a-z\d-]+/i)
+  assert.deepEqual(first.writes[0].body.match(/@[a-z\d-]+/gi), ['@author'])
   const comment = { id: 9, user: { login: 'welcome-bot' }, body: first.writes[0].body }
   const unchanged = client({ comments: [comment] })
   await run({ ...options, github: unchanged.github })

@@ -254,7 +254,7 @@ export function renderMergeStatus({
   if (count)
     rows.push(
       row(
-        '审批',
+        `审批（至少 ${count} 位有仓库 write 或更高权限的人 Approve）`,
         `${approved.length >= count ? '✅' : '⏳'} ${approved.length}/${count}${approved.length ? ` · 已审批：${names(approved)}` : ''}`
       )
     )
@@ -355,12 +355,6 @@ export function renderMergeStatus({
     rules.filter((rule) => !handled.includes(rule.type)).map((rule) => rule.type)
   ))
     rows.push(row(labels[type] || names([type]), '❔ GitHub 判定'))
-  const modes = reviewRules.map((rule) => rule.allowed_merge_methods).filter(Boolean)
-  if (rules.some((rule) => rule.type === 'required_linear_history'))
-    modes.push(['squash', 'rebase'])
-  const methods = modes.length
-    ? modes.reduce((allowed, current) => allowed.filter((method) => current.includes(method)))
-    : []
   const states = {
     CLEAN: '✅ 满足合入条件',
     BLOCKED: '⏳ 合入条件未满足',
@@ -385,16 +379,6 @@ export function renderMergeStatus({
   ]
   if (rows.length)
     lines.push('| Requirement / 条件 | Status / 状态 |', '| --- | --- |', ...rows, '')
-  if (modes.length)
-    lines.push(
-      `允许合入方式：${methods.length ? names(methods) : '❌ 规则没有共同允许的方式'}。`,
-      ''
-    )
-  const url = pr.base.repo.html_url
-  const sources = url
-    ? `[查看合入状态](${pr.html_url}#partial-pull-merging) · [规则来源](${url}/rules)`
-    : '最终以 GitHub 合入区域为准。'
-  lines.push(sources)
   if (warnings.length) lines.push('', ...warnings.map((warning) => `- ❔ ${cell(warning)}`))
   lines.push('', '</details>')
   return lines.join('\n')

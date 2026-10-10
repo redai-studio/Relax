@@ -1,4 +1,4 @@
-Thanks for contributing to Relax, `{{author}}`! 感谢你为 Relax 做出贡献！
+Thanks for contributing to Relax, @{{author}}! 感谢你为 Relax 做出贡献！
 
 <details>
 <summary>📚 Contribution guide / 贡献指南</summary>
