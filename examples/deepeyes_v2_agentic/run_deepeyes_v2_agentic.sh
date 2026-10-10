@@ -13,7 +13,18 @@ TIMESTAMP=$(date "+%Y-%m-%d-%H:%M:%S")
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source env.sh if present (gitignored, machine-specific overrides).
 # shellcheck source=/dev/null
+_DEEPEYES_ENV_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_ENV_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 [ -f "${SCRIPT_DIR}/env.sh" ] && source "${SCRIPT_DIR}/env.sh"
+if [ "${_DEEPEYES_ENV_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_ENV_RESTORE_XTRACE
 
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     source "${SCRIPT_DIR}/../../scripts/entrypoint/local.sh"
@@ -105,15 +116,31 @@ PROMPT_SET="[$(IFS=,; echo "${TRAIN_FILES[*]}")]"
 NUM_ROLLOUT="${NUM_ROLLOUT:=2000}"
 
 # Sandbox env vars propagated into every Ray worker so the per-session
-# agent process can find apptainer / search cache.
+# agent process can find apptainer / search backends.
 # SANDBOX_CONFIG_PATH is required — the agent reads it in _build_executor
 # to find the apptainer backend YAML config (image path, bind paths, etc).
+_DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 RUNTIME_ENV_JSON=$(cat <<EOF
 {
   "env_vars": {
     "SANDBOX_BACKEND": "apptainer_jupyter",
     "SANDBOX_CONFIG_PATH": "${SCRIPT_DIR}/apptainer_env/apptainer_config.yaml",
     "DEEPEYES_V2_SEARCH_CACHE_PATHS": "${DEEPEYES_V2_SEARCH_CACHE_PATHS:-}",
+    "DEEPEYES_V2_SEARCH_BACKEND": "${DEEPEYES_V2_SEARCH_BACKEND:-}",
+    "DEEPEYES_V2_SEARCH_RETRIEVER_URL": "${DEEPEYES_V2_SEARCH_RETRIEVER_URL:-}",
+    "DEEPEYES_V2_SEARCH_TOPK": "${DEEPEYES_V2_SEARCH_TOPK:-}",
+    "DEEPEYES_V2_SEARCH_BRAVE_API_KEY": "${DEEPEYES_V2_SEARCH_BRAVE_API_KEY:-}",
+    "DEEPEYES_V2_SEARCH_BRAVE_ENDPOINT": "${DEEPEYES_V2_SEARCH_BRAVE_ENDPOINT:-}",
+    "DEEPEYES_V2_SEARCH_TRUST_ENV": "${DEEPEYES_V2_SEARCH_TRUST_ENV:-}",
+    "DEEPEYES_V2_SEARCH_TIMEOUT": "${DEEPEYES_V2_SEARCH_TIMEOUT:-}",
+    "DEEPEYES_V2_SEARCH_MAX_RETRIES": "${DEEPEYES_V2_SEARCH_MAX_RETRIES:-}",
+    "DEEPEYES_V2_SEARCH_RETRY_BUDGET": "${DEEPEYES_V2_SEARCH_RETRY_BUDGET:-}",
     "DEEPEYES_JUDGE_BASE_URL": "${DEEPEYES_JUDGE_BASE_URL:-}",
     "DEEPEYES_JUDGE_MODELS": "${DEEPEYES_JUDGE_MODELS:-}",
     "DEEPEYES_JUDGE_API_KEY": "${DEEPEYES_JUDGE_API_KEY:-}",
@@ -123,6 +150,10 @@ RUNTIME_ENV_JSON=$(cat <<EOF
 }
 EOF
 )
+if [ "${_DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_RUNTIME_ENV_RESTORE_XTRACE
 
 ROLLOUT_ARGS=(
     --prompt-data "${PROMPT_SET}"
@@ -261,6 +292,13 @@ RAY_RESOURCE_ARGS=(
 
 mkdir -p logs
 
+_DEEPEYES_SUBMIT_RESTORE_XTRACE=0
+case "$-" in
+    *x*)
+        _DEEPEYES_SUBMIT_RESTORE_XTRACE=1
+        set +x
+        ;;
+esac
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
     -- python3 relax/entrypoints/train.py \
@@ -275,3 +313,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \
     "${MEGATRON_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     2>&1 | tee logs/${EXP_NAME}.log
+if [ "${_DEEPEYES_SUBMIT_RESTORE_XTRACE}" = "1" ]; then
+    set -x
+fi
+unset _DEEPEYES_SUBMIT_RESTORE_XTRACE
