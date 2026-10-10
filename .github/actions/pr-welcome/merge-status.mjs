@@ -302,7 +302,14 @@ export function renderMergeStatus({
     }
   }
   if (reviewRules.some((rule) => rule.require_last_push_approval))
-    rows.push(row('最近一次推送审批', '❔ 需由推送者以外的人 Approve，GitHub 判定'))
+    rows.push(
+      row(
+        '最近一次推送审批',
+        approved.length
+          ? '❔ 需由推送者以外的人 Approve，GitHub 判定'
+          : '⏳ 等待推送者以外的人 Approve'
+      )
+    )
   if (reviewRules.some((rule) => rule.require_code_owner_review))
     rows.push(row('Code Owners', '❔ GitHub 判定'))
   if (

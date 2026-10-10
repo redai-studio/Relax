@@ -53,6 +53,7 @@ test('only eligible reviews count; team approval follows approve, request change
   excluded.push({ ...review('deleted'), author: null })
   const initial = renderMergeStatus(snapshot({ reviews: excluded }))
   assert.match(initial, /审批（至少 1 位有仓库 write 或更高权限的人 Approve） \| ⏳ 0\/1/)
+  assert.match(initial, /最近一次推送审批 \| ⏳ 等待推送者以外的人 Approve/)
   assert.match(initial, /团队 `reviewers` \| ⏳ 0\/1 · 可联系：`reviewer`/)
   assert.doesNotMatch(initial, /可联系：.*author/)
   const approved = renderMergeStatus(snapshot({ reviews: [...excluded, review('reviewer')] }))
