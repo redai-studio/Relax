@@ -598,7 +598,6 @@ def get_batch(
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
-            pad_between_seqs=pad != 0 if allgather_cp else None,
         )
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.

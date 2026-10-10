@@ -252,7 +252,8 @@ bash examples/osworld_agentic/run_qwen3vl_8B_osworld_outcome.sh
 | `--rollout-max-context-len`      |                      `32768` | rollout 上下文长度。                       |
 | `--rollout-max-response-len`     |                       `8192` | 单次模型回复上限。                         |
 | `--rollout-max-prompt-len`       |                      `16384` | prompt 长度上限。                          |
-| `--micro-batch-size`             |                          `1` | 训练 micro batch。                         |
+| `--micro-batch-size`             |                          `1` | 固定单样本 micro batch，控制训练显存峰值。 |
+| `--recompute-granularity`        |                       `full` | 全层重计算，降低训练激活显存。             |
 | `--sglang-mem-fraction-static`   |                        `0.7` | SGLang 静态显存比例。                      |
 | `--sglang-router-policy`         |         `consistent_hashing` | rollout 请求路由策略。                     |
 

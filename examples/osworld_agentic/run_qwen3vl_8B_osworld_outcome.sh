@@ -125,12 +125,11 @@ OPTIMIZER_ARGS=(
 MEGATRON_ARGS=(
     --tensor-model-parallel-size 4 --sequence-parallel
     --pipeline-model-parallel-size 1 --context-parallel-size 1
-    --max-tokens-per-gpu 32768
     --attention-dropout 0 --hidden-dropout 0
     --accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32
     --attention-backend flash
-    --use-dynamic-batch-size --balance-data
-    --recompute-granularity selective
+    --balance-data
+    --recompute-granularity full --recompute-method uniform --recompute-num-layers 1
 )
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 2
@@ -141,7 +140,7 @@ SGLANG_ARGS=(
 mkdir -p "${SAVE_DIR}"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}" \
     --runtime-env-json "${RUNTIME_ENV_JSON}" \
-    -- python3 relax/entrypoints/train.py \
+    -- python3 "${RELAX}/relax/entrypoints/train.py" \
     --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
     --max-staleness 0 --num-data-storage-units 1 --colocate \
     "${MODEL_ARGS[@]}" "${CKPT_ARGS[@]}" "${ROLLOUT_ARGS[@]}" \
