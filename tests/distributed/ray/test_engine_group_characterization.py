@@ -17,7 +17,9 @@ try:
 except ImportError:
     HAS_DEPS = False
 
-from conftest import make_engine_group, make_mock_args, make_mock_engine, mock_ray_get
+from conftest import make_engine_group, make_mock_args, make_mock_engine, make_rollout_server, mock_ray_get
+
+from relax.engine.inference.discovery import EngineState
 
 
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
@@ -182,6 +184,51 @@ def test_engine_group_multi_node_engine_exposes_only_head_slots(monkeypatch):
     assert group.nodes_per_engine == 2
     assert [creation["ctor_kwargs"]["base_gpu_id"] for creation in creations] == [0, 8, 16, 24]
     assert group.engines == [creations[0]["engine"], creations[2]["engine"]]
+
+
+def test_engine_group_caches_actual_head_urls_only_after_initialization(monkeypatch):
+    group = _group(pg_size=32, engines=[None] * 4, num_gpus_per_engine=16, rank_offset=4)
+    monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
+    creations, _handles, _cursors, _allocation = _start(monkeypatch, group)
+    # Effective URLs may differ from allocated addresses (overrides/custom engines).
+    creations[0]["engine"].get_url.remote.return_value.value = "http://[2001:db8::1]:18000"
+    creations[2]["engine"].get_url.remote.return_value.value = "http://custom-engine:19000"
+
+    assert group.lifecycle_states(EngineState.READY) == [EngineState.STARTING] * 2
+    assert group.lifecycle_states(EngineState.READY) == [EngineState.STARTING] * 2
+    group._cache_engine_urls()
+
+    assert group._engine_urls == {0: "http://[2001:db8::1]:18000", 2: "http://custom-engine:19000"}
+    assert group.lifecycle_states(EngineState.READY) == [EngineState.READY] * 2
+    creations[1]["engine"].get_url.remote.assert_not_called()
+    creations[3]["engine"].get_url.remote.assert_not_called()
+
+
+def test_engine_group_recovery_refreshes_only_rebuilt_engine_urls(monkeypatch):
+    group = _group(engines=[None, None])
+    monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
+    creations, _handles, _cursors, _allocation = _start(monkeypatch, group)
+    for index, creation in enumerate(creations):
+        creation["engine"].get_url.remote.return_value.value = f"http://original:{18000 + index}"
+    group._cache_engine_urls()
+    survivor = group.all_engines[1]
+    survivor.get_url.remote.reset_mock()
+    group.all_engines[0] = None
+    waiting_states = []
+
+    def wait_for_init(refs, timeout=None):
+        if refs and isinstance(refs[0], tuple) and refs[0][0] == "init-handle":
+            waiting_states.append(group.lifecycle_states(EngineState.READY))
+            assert 0 not in group._engine_urls
+        return mock_ray_get(refs, timeout=timeout)
+
+    monkeypatch.setattr(rollout.ray, "get", wait_for_init)
+    make_rollout_server(engine_groups=[group]).recover()
+
+    assert waiting_states == [[EngineState.STARTING, EngineState.READY]]
+    assert group._engine_urls == {0: "http://localhost:30000", 1: "http://original:18001"}
+    assert group.lifecycle_states(EngineState.READY) == [EngineState.READY] * 2
+    survivor.get_url.remote.assert_not_called()
 
 
 def test_engine_group_offload_and_onload_fan_out_to_head_engines():

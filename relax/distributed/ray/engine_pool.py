@@ -156,13 +156,19 @@ class EnginePool:
         For owners that switch memory through the non-blocking ``*_handles``
         calls: the pool sees a switch begin but not end. An engine still on
         its way *away* from ``resident`` is left alone -- that switch is in
-        flight.
+        flight. STARTING engines wait for an explicit ``mark_initialized``.
         """
         in_flight = EngineState.DRAINING if resident is EngineState.READY else EngineState.ONLOADING
         for head in self.head_slots():
-            if self.state(head) not in (in_flight, EngineState.DEAD):
+            if self.state(head) not in (in_flight, EngineState.STARTING, EngineState.DEAD):
                 self._move(head, resident)
         self._active = resident is EngineState.READY
+
+    def mark_initialized(self, slots: Iterable[int]) -> None:
+        """Mark head slots ready after their engines finish initialization."""
+        for slot in slots:
+            if slot % self.nodes_per_engine == 0:
+                self._move(slot, EngineState.READY)
 
     def _log(self, message: str) -> str:
         return f"{self.spec.log_prefix} {message}" if self.spec.log_prefix else message
@@ -241,9 +247,7 @@ class EnginePool:
             self.teardown(sorted(resolved))
             raise
 
-        for slot, _ in created:
-            if slot % self.nodes_per_engine == 0:
-                self._move(slot, EngineState.READY)
+        self.mark_initialized(slot for slot, _ in created)
         return [slot for slot, _ in created]
 
     def _remove_owned_pg(self, slot: int) -> None:

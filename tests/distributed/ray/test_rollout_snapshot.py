@@ -3,6 +3,10 @@
 """``RolloutManager.get_inference_snapshot``: the rollout role's topology in
 the unified discovery schema."""
 
+import asyncio
+import threading
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 
@@ -14,7 +18,14 @@ try:
 except ImportError:
     HAS_DEPS = False
 
-from conftest import create_test_manager, make_engine_group, make_mock_engine, make_rollout_server, mock_ray_get
+from conftest import (
+    AwaitableValue,
+    create_test_manager,
+    make_engine_group,
+    make_mock_engine,
+    make_rollout_server,
+    mock_ray_get,
+)
 
 from relax.engine.inference.discovery import RoleSnapshot
 
@@ -24,6 +35,12 @@ pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang depende
 
 def _manager(monkeypatch, groups, status=None):
     monkeypatch.setattr(rollout.ray, "get", mock_ray_get)
+    for group in groups:
+        group._engine_urls = {
+            slot: mock_ray_get(engine.get_url.remote.return_value)
+            for slot, engine in enumerate(group.all_engines)
+            if engine is not None
+        }
     manager = create_test_manager(servers={"default": make_rollout_server(engine_groups=groups)})
     manager.status = status
     return manager
@@ -138,3 +155,93 @@ def test_rollout_snapshot_shows_a_memory_switch_in_flight(monkeypatch):
     assert states() == ["onloading"]
     manager.status = "onload"
     assert states() == ["ready"]
+
+
+@pytest.mark.parametrize("switch", ["offload", "onload"])
+def test_rollout_snapshot_does_not_wait_for_busy_engines(monkeypatch, switch):
+    engine = make_mock_engine(url="http://[2001:db8::1]:18000")
+    group = make_engine_group(engines=[engine])
+    manager = _manager(monkeypatch, [group], status="onload" if switch == "offload" else "offload")
+    if switch == "offload":
+        group.offload()
+    else:
+        group.onload(tags=["weights"])
+
+    def unexpected_wait(*args, **kwargs):
+        pytest.fail("Discovery must not wait for a busy engine actor")
+
+    monkeypatch.setattr(rollout.ray, "get", unexpected_wait)
+    model = _snapshot(manager).model("default")
+
+    assert model.engines[0].base_url == "http://[2001:db8::1]:18000"
+    assert model.state.value == ("draining" if switch == "offload" else "onloading")
+    engine.get_url.remote.assert_not_called()
+
+
+async def test_rollout_snapshot_external_scale_out_caches_only_successful_engines(monkeypatch):
+    manager = _manager(monkeypatch, [make_engine_group()], status="onload")
+    manager.args.scale_out_partial_success_policy = "keep_successful"
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    manager._rollback_engines = AsyncMock()
+    engines = _engines("http://failed:18000", "http://second:18001", "http://third:18002")
+    engines[0].init.remote.side_effect = RuntimeError("connection failed")
+    for engine in engines[1:]:
+        engine.init.remote.return_value = AwaitableValue(None)
+    actor = MagicMock()
+    actor.options.return_value.remote.side_effect = engines
+    monkeypatch.setattr(rollout.ray, "remote", lambda cls: actor)
+    monkeypatch.setattr(rollout, "get_ray_accelerator_kwargs", lambda count: {})
+    request = rollout.ScaleOutRequest(
+        request_id="external",
+        status=rollout.ScaleOutStatus.PENDING,
+        model_name="default",
+        engine_urls=["failed:18000", "second:18001", "third:18002"],
+    )
+
+    await manager._scale_out_external(request)
+
+    assert request.status is rollout.ScaleOutStatus.ACTIVE
+    added = manager.servers["default"].engine_groups[-1]
+    assert added._engine_urls == {0: "http://second:18001", 1: "http://third:18002"}
+    model = _snapshot(manager).model("default")
+    assert [(engine.engine_id, engine.base_url) for engine in model.engines[1:]] == [
+        ("default/1", "http://second:18001"),
+        ("default/2", "http://third:18002"),
+    ]
+    engines[0].get_url.remote.assert_not_called()
+    for engine in engines[1:]:
+        engine.get_url.remote.assert_called_once_with()
+
+
+async def test_rollout_snapshot_remains_available_during_scale_out_url_capture(monkeypatch):
+    manager = _manager(monkeypatch, [make_engine_group()], status="onload")
+    manager._health_check_engines = AsyncMock(return_value=True)
+    manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
+    entered, release = threading.Event(), threading.Event()
+
+    def capture_urls(refs, timeout=None):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test URL capture was not released")
+        return mock_ray_get(refs)
+
+    monkeypatch.setattr(rollout.ray, "get", capture_urls)
+    task = asyncio.create_task(
+        manager._finalize_engine_group_registration(
+            request=rollout.ScaleOutRequest(request_id="external", status=rollout.ScaleOutStatus.CREATING),
+            srv=manager.servers["default"],
+            engines=[make_mock_engine(url="http://new:18000")],
+            rank_offset=1,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        assert not task.done()
+        # No partially registered group is visible while URL capture is pending.
+        assert len(_snapshot(manager).model("default").engines) == 1
+    finally:
+        release.set()
+        result = await task
+    assert result.success
+    assert _snapshot(manager).model("default").engines[1].base_url == "http://new:18000"
