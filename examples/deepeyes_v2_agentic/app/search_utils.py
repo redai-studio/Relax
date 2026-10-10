@@ -2,8 +2,13 @@
 
 """Search tool helpers for the DeepEyesV2 env.
 
-* :func:`search` is a placeholder web-search returning canned snippets so the
-  recipe runs end-to-end without a real backend.
+* :func:`search` dispatches to a pluggable backend (see
+  ``app.search_backends``): ``mock`` (default, deterministic and offline),
+  ``retriever`` (Search-R1 compatible HTTP service) or ``external``
+  (configurable web-search API). It returns the uniform
+  ``{"elapsed_time", "data"}`` shape on success or ``"Error"`` on any failure —
+  the env's existing convention — so backend failures surface as a clean
+  in-trajectory tool error instead of crashing the process.
 * :func:`image_search` serves cached results keyed by ``data_idx`` from JSON
   files listed in ``DEEPEYES_V2_SEARCH_CACHE_PATHS`` (colon/comma-separated).
   Missing / unparsable caches degrade to returning ``"Error"`` so the env
@@ -15,8 +20,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
-import time
+
+from app.search_backends import ERROR, SearchConfig, get_search_backend
 
 
 logger = logging.getLogger(__name__)
@@ -63,34 +68,26 @@ def _get_image_search_cache() -> dict:
     return _IMAGE_SEARCH_CACHE
 
 
-def search(query: str, size: int = 5):
-    """Web-search placeholder. Returns canned snippets in the shape::
+def search(query: str, size: int | None = None):
+    """Web search via the configured backend, returning::
 
         {"elapsed_time": float, "data": [{"title", "link", "snippet", "date"?}, ...]}
 
-    Replace with a real backend (Serper / Google / Bing / internal) for
-    production training.
+    Backends (``DEEPEYES_V2_SEARCH_BACKEND``): ``mock`` (default —
+    deterministic offline snippets), ``retriever`` (Search-R1 compatible HTTP
+    service) and ``external`` (configurable web-search API); see
+    ``app.search_backends`` for the configuration surface. Explicit ``size``
+    wins over the configured ``DEEPEYES_V2_SEARCH_TOP_K`` (default 5, matching
+    the historical signature). Any configuration or backend failure is logged
+    and mapped to ``"Error"``; callers keep running.
     """
-    max_try = 3
-    result = "Error"
-    for try_idx in range(max_try):
-        try:
-            result = {"elapsed_time": 0.0, "data": []}
-            for i in range(size):
-                result["data"].append(
-                    {
-                        "snippet": f"This is a placeholder snippet for query: {query}",
-                        "title": f"Placeholder Title {i}",
-                        "link": f"http://example.com/{i}",
-                    }
-                )
-            break
-        except Exception as e:
-            logger.warning(f"[search] attempt {try_idx + 1}/{max_try} failed: {e}")
-            result = "Error"
-            if try_idx < max_try - 1:
-                time.sleep((try_idx + 1) * random.randint(1, 5))
-    return result
+    try:
+        config = SearchConfig.from_env()
+        top_k = size if size is not None else config.top_k
+        return get_search_backend(config).search(query, top_k)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[search] query={query!r} failed: {exc}")
+        return ERROR
 
 
 def image_search(_query, data_idx: str | None = None):
