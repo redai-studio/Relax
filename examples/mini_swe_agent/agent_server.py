@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 INSTANCE_PREFIX = "mswe-"
 SETUP_AND_REWARD_TIMEOUT_SECONDS = 300
+R2E_XML_PATH = "/tmp/r2e-reward.xml"
 CHILD_KILL_WAIT_TIMEOUT_SECONDS = 5
 
 
@@ -441,22 +443,43 @@ class SessionRecord:
         self.finished_at = time.time()
 
 
-def _parse_log_pytest(log: str | None) -> dict[str, str]:
-    if log is None or "short test summary info" not in log:
+def _parse_junit_xml(report: str) -> dict[str, str]:
+    if not report:
         return {}
-    status_map: dict[str, str] = {}
-    for line in log.split("short test summary info", 1)[1].strip().splitlines():
-        if "PASSED" in line:
-            status_map[".".join(line.split("::")[1:])] = "PASSED"
-        elif "FAILED" in line:
-            status_map[".".join(line.split("::")[1:]).split(" - ")[0]] = "FAILED"
-        elif "ERROR" in line:
-            status_map[".".join(line.split("::")[1:]).split(" - ")[0]] = "ERROR"
-    return status_map
+    try:
+        root = ET.fromstring(report)
+    except ET.ParseError:
+        return {}
+    if root.tag not in ("testsuites", "testsuite"):
+        return {}
 
+    results: dict[str, str] = {}
+    for case in root.iter("testcase"):
+        if case.find("skipped") is not None:
+            continue
 
-def _decolor_dict_keys(data: dict[str, str]) -> dict[str, str]:
-    return {re.sub(r"\u001b\[\d+m", "", key): value for key, value in data.items()}
+        file = case.get("file")
+        classname = case.get("classname")
+        name = case.get("name")
+        if not file or not classname or not name:
+            return {}
+
+        module = Path(file).with_suffix("").as_posix().replace("/", ".")
+        if classname != module and not classname.startswith(module + "."):
+            return {}
+        qualifier = classname[len(module) :].lstrip(".")
+        test_id = f"{qualifier}.{name}" if qualifier else name
+        if test_id in results:
+            return {}
+
+        if case.find("error") is not None:
+            status = "ERROR"
+        elif case.find("failure") is not None:
+            status = "FAILED"
+        else:
+            status = "PASSED"
+        results[test_id] = status
+    return results
 
 
 def _trim_error_output(output: str) -> str:
@@ -493,19 +516,13 @@ def _format_command_result(label: str, result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _r2e_reward(row: dict[str, Any], output: str) -> float:
-    parsed = _decolor_dict_keys(_parse_log_pytest(output))
-    expected = _decolor_dict_keys(json.loads(row["expected_output_json"]))
-    parsed = {key.split(" - ")[0]: parsed[key] for key in sorted(parsed.keys())}
-    expected = {key.split(" - ")[0]: expected[key] for key in sorted(expected.keys())}
-    if len(parsed) != len(expected):
-        return 0.0
-    for key in parsed.keys():
-        if not key:
-            continue
-        if key not in expected or parsed[key] != expected[key]:
-            return 0.0
-    return 1.0
+def _r2e_reward(row: dict[str, Any], report: str) -> float:
+    parsed = _parse_junit_xml(report)
+    expected = json.loads(row["expected_output_json"])
+    expected = {
+        re.sub(r"\x1b\[[0-9;]*m", "", key).split(" - ", 1)[0]: value for key, value in sorted(expected.items())
+    }
+    return 1.0 if parsed and parsed == expected else 0.0
 
 
 def make_test_spec_without_deps(row: dict[str, Any]) -> "TestSpec":
@@ -761,14 +778,30 @@ class MyAgent(DefaultAgent):
             if _reward_semaphore is not None:
                 _reward_semaphore.acquire()
             try:
-                reward_result = self.env.execute(
-                    {"command": self.reward_command}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS
-                )
+                reward_command = self.reward_command
+                if self.rollout_mode == "train":
+                    reward_command = (
+                        f"rm -f {R2E_XML_PATH} && "
+                        f'PYTEST_ADDOPTS="${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}'
+                        f'--junitxml={R2E_XML_PATH} -o junit_family=xunit1" '
+                        f"{self.reward_command}"
+                    )
+                reward_result = self.env.execute({"command": reward_command}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS)
                 if reward_result.get("exception_info"):
                     raise RuntimeError(_format_command_result("reward", reward_result))
-                output = reward_result.get("output", "")
-                reward_func = _r2e_reward if self.rollout_mode == "train" else _swebench_reward
-                reward = reward_func(self.row, output)
+
+                if self.rollout_mode == "train":
+                    xml_result = self.env.execute(
+                        {"command": f"cat {R2E_XML_PATH}"}, timeout=SETUP_AND_REWARD_TIMEOUT_SECONDS
+                    )
+                    if xml_result.get("exception_info"):
+                        raise RuntimeError(_format_command_result("reward XML", xml_result))
+                    xml_output = xml_result.get("output", "")
+                    start = xml_output.find("<?xml")
+                    report = xml_output[start:] if xml_result.get("returncode") == 0 and start >= 0 else ""
+                    reward = _r2e_reward(self.row, report)
+                else:
+                    reward = _swebench_reward(self.row, reward_result.get("output", ""))
             finally:
                 if _reward_semaphore is not None:
                     _reward_semaphore.release()
