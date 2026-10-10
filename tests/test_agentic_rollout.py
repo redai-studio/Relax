@@ -324,13 +324,65 @@ def test_session_forest_build_sample_and_session_spec() -> None:
         "export_metadata_patch": {"request_id": "req-build", "base_state_hash": initial_obs.state_hash},
     }
     leaf = forest.append_resp(**response_kwargs)
-    duplicate_leaf = forest.append_resp(**response_kwargs)
+    duplicate_response_kwargs = dict(response_kwargs)
+    duplicate_response_kwargs["export_metadata_patch"] = {
+        "request_id": "req-build-duplicate",
+        "base_state_hash": initial_obs.state_hash,
+    }
+    duplicate_leaf = forest.append_resp(**duplicate_response_kwargs)
     assert duplicate_leaf.state_hash == leaf.state_hash
+
+    forest.commit_generation(
+        request_id="req-build",
+        response_state_hash=leaf.state_hash,
+        spec_delta={
+            "spec_accept_token_num": 1,
+            "spec_draft_token_num": 2,
+            "spec_verify_ct": 3,
+            "completion_token_num": 4,
+        },
+    )
+    forest.commit_generation(
+        request_id="req-build-duplicate",
+        response_state_hash=duplicate_leaf.state_hash,
+        spec_delta={
+            "spec_accept_token_num": 9,
+            "spec_draft_token_num": 10,
+            "spec_verify_ct": 5,
+            "completion_token_num": 6,
+        },
+    )
+
     assert forest.export_leaf_hashes() == [leaf.state_hash]
     sample = forest.build_sample(leaf_state_hash=leaf.state_hash, tokenizer=_FakeTokenizer())
     assert (sample.prompt, sample.response, sample.group_index, sample.index) == ("hello", "ok", 3, 7)
     assert sample.train_metadata == {"loss": "grpo"}
-    assert sample.metadata["agentic_trace"]["turn_count"] == 1
+    trace = sample.metadata["agentic_trace"]
+    assert trace["turn_count"] == 1
+    assert sample.spec_info.to_dict() == {
+        "spec_accept_token_num": 10,
+        "spec_draft_token_num": 12,
+        "spec_verify_ct": 8,
+        "completion_token_num": 10,
+    }
+    assert trace["spec_generations"] == [
+        {
+            "request_id": "req-build",
+            "resp_state_hash": leaf.state_hash,
+            "spec_accept_token_num": 1,
+            "spec_draft_token_num": 2,
+            "spec_verify_ct": 3,
+            "completion_token_num": 4,
+        },
+        {
+            "request_id": "req-build-duplicate",
+            "resp_state_hash": leaf.state_hash,
+            "spec_accept_token_num": 9,
+            "spec_draft_token_num": 10,
+            "spec_verify_ct": 5,
+            "completion_token_num": 6,
+        },
+    ]
     sample.sampling_params = {"temperature": 0.2}
     (session_spec,) = _build_session_specs(
         [sample],
@@ -345,6 +397,62 @@ def test_session_forest_build_sample_and_session_spec() -> None:
     )
     assert session_spec.sampling_params == {"temperature": 0.2}
     assert session_spec.input_payload["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_accumulate_request_meta_preserves_missing_zero_and_accumulates() -> None:
+    request = SimpleNamespace(
+        pending_weight_version_delta=[],
+        pending_spec_delta={},
+        pending_prefix_cache_delta={
+            "cached_tokens": 0,
+            "total_prompt_tokens": 0,
+        },
+    )
+
+    AgenticSessionShard._accumulate_request_meta(request, meta_info={})
+    assert request.pending_spec_delta == {}
+
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 0,
+            "spec_num_proposed_drafts": 0,
+            "spec_verify_ct": 0,
+            "completion_tokens": 0,
+        },
+    )
+    assert request.pending_spec_delta == {
+        "spec_accept_token_num": 0,
+        "spec_draft_token_num": 0,
+        "spec_verify_ct": 0,
+        "completion_token_num": 0,
+    }
+
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 3,
+            "completion_tokens": 4,
+        },
+    )
+    AgenticSessionShard._accumulate_request_meta(
+        request,
+        meta_info={
+            "spec_num_correct_drafts": 3,
+            "spec_num_proposed_drafts": 4,
+            "spec_verify_ct": 5,
+            "completion_tokens": 6,
+        },
+    )
+
+    assert request.pending_spec_delta == {
+        "spec_accept_token_num": 4,
+        "spec_draft_token_num": 6,
+        "spec_verify_ct": 8,
+        "completion_token_num": 10,
+    }
 
 
 async def test_prepare_gate_defers_unstarted_groups_and_adhoc_refills_current_gap() -> None:

@@ -15,12 +15,12 @@ _SPEC_TOKEN_COUNT_KEYS = (
 )
 
 
-def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int]:
+def get_spec_token_counts(meta_info: dict[str, Any]) -> tuple[int, int] | None:
     """Extract speculative decoding counts across SGLang metadata versions."""
     for accept_key, draft_key in _SPEC_TOKEN_COUNT_KEYS:
         if accept_key in meta_info and draft_key in meta_info:
             return int(meta_info.get(accept_key, 0) or 0), int(meta_info.get(draft_key, 0) or 0)
-    return 0, 0
+    return None
 
 
 @dataclass
@@ -107,9 +107,11 @@ class Sample:
             return self.completion_token_num / self.spec_verify_ct if self.spec_verify_ct > 0 else 0.0
 
         def add(self, meta_info: dict):
-            spec_accept_token_num, spec_draft_token_num = get_spec_token_counts(meta_info)
-            self.spec_accept_token_num += spec_accept_token_num
-            self.spec_draft_token_num += spec_draft_token_num
+            spec_token_counts = get_spec_token_counts(meta_info)
+            if spec_token_counts is not None:
+                spec_accept_token_num, spec_draft_token_num = spec_token_counts
+                self.spec_accept_token_num += spec_accept_token_num
+                self.spec_draft_token_num += spec_draft_token_num
             self.spec_verify_ct += meta_info.get("spec_verify_ct", 0)
             self.completion_token_num += meta_info.get("completion_tokens", 0)
 

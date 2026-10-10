@@ -278,6 +278,7 @@ export default defineConfig({
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
                 { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
+                { text: 'Speculative Decoding Metrics', link: '/en/guide/agentic-speculative-metrics' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
                 { text: 'Elastic Rollout Scaling', link: '/en/guide/elastic-rollout' },
 
@@ -405,6 +406,7 @@ export default defineConfig({
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
                 { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
+                { text: '投机解码指标', link: '/zh/guide/agentic-speculative-metrics' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },
                 { text: '弹性 Rollout 扩缩容', link: '/zh/guide/elastic-rollout' },
 

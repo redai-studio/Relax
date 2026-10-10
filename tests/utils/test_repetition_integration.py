@@ -186,3 +186,41 @@ def test_repetition_cli_rejects_overwriting_input(tmp_path) -> None:
         main([str(path), "--output", str(path)])
     assert exc.value.code == 2
     assert path.read_text(encoding="utf-8") == '{"response": ""}\n'
+
+
+def test_spec_metrics_reach_rollout_metrics_output(rollout_metrics_module) -> None:
+    sample = Sample(
+        index=1,
+        group_index=1,
+        response="ok",
+        response_length=1,
+        reward=0.0,
+        status=Sample.Status.COMPLETED,
+        metadata={
+            "agentic_trace": {
+                "session_id": "spec-session",
+                "spec_generations": [
+                    {
+                        "request_id": "spec-request",
+                        "resp_state_hash": "spec-state",
+                        "spec_accept_token_num": 1,
+                        "spec_draft_token_num": 2,
+                        "spec_verify_ct": 2,
+                        "completion_token_num": 3,
+                    }
+                ],
+            }
+        },
+    )
+    args = SimpleNamespace(
+        log_reward_category=None,
+        reward_key=None,
+        log_passrate=False,
+        advantage_estimator="ppo",
+        sglang_speculative_algorithm="EAGLE",
+    )
+
+    metrics = rollout_metrics_module.compute_metrics_from_samples(args, [sample])
+
+    assert metrics["spec_accept_rate"] == 0.5
+    assert metrics["spec_accept_length"] == 1.5
