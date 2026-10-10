@@ -581,6 +581,7 @@ class SGLangBackendAdapter:
         sampling_params: dict[str, Any],
         session_id: str | None,
         request_id: str,
+        lora_path: str | None = None,
         image_data: list[str] | None = None,
         audio_data: list[str] | None = None,
         video_data: list[str] | None = None,
@@ -592,6 +593,10 @@ class SGLangBackendAdapter:
             "rid": request_id,
             "return_logprob": return_logprob,
         }
+        if lora_path:
+            # The exact immutable version this Session is bound to. SGLang resolves
+            # it to its own engine-local lora_id (and thus its own KV namespace).
+            payload["lora_path"] = lora_path
         if self._args.use_rollout_routing_replay:
             payload["return_routed_experts"] = True
         if image_data:
@@ -609,7 +614,10 @@ class SGLangBackendAdapter:
             headers = {"X-SMG-Routing-Key": session_id}
         started = time.monotonic()
         try:
-            output = await post(f"{self._router_url}/generate", payload, headers=headers)
+            # A lost response does not prove the engine rejected this generation.
+            # Versioned requests may only be retried by the IR lifecycle owner.
+            request_options = {"max_retries": 1, "fallback_to_local": False} if lora_path is not None else {}
+            output = await post(f"{self._router_url}/generate", payload, headers=headers, **request_options)
         except httpx.HTTPStatusError as error:
             if _is_context_length_error(error):
                 raise BackendContextLengthExceededError(error.response.text) from error
@@ -1056,6 +1064,19 @@ class RuntimeDomain:
         for group_progress in progress.groups:
             stream = shard.group_streams.get(group_progress.group_id)
             if stream is None:
+                continue
+            if group_progress.error is not None:
+                # Cleanup ownership stays on the Shard, but consumers must stop
+                # waiting for an export that the failed Session cannot publish.
+                error = RuntimeGroupError(group_progress.error)
+                stream.interrupted = False
+                stream.protected = False
+                for local_ref in (
+                    stream.first_request_barrier,
+                    *(result.completion for result in stream.session_results),
+                ):
+                    if not local_ref.done():
+                        local_ref.set_exception(error)
                 continue
             # RuntimeDomain.prepare_group() owns the first-IR readiness waiter.
             if group_progress.ready_for_lease and not stream.first_request_barrier.done():

@@ -1720,10 +1720,13 @@ def _compute_server_args(
         # projections that SGLang groups differently from HF (GDN in_proj -> in_proj_qkvz)
         # must use the engine flavor, otherwise the module is never wrapped.
         kwargs["lora_target_modules"] = convert_megatron_to_sglang_target_modules(args.lora_target_modules)
-        # We serve exactly one policy adapter. max_loaded_loras >= max_loras_per_batch is a
-        # SGLang startup requirement; 2 leaves room for the unload->reload overlap.
-        kwargs["max_loras_per_batch"] = 1
-        kwargs["max_loaded_loras"] = 2
+        # SGLang startup requires max_loaded_loras >= max_loras_per_batch.
+        # Legacy adapter mode serves exactly one policy adapter; 2 leaves room for the
+        # unload->reload overlap. Versioned publication (Task 7) additionally keeps the retired
+        # version resident while its Sessions drain and a candidate is being published, so 3.
+        versioned_publication = getattr(args, "enable_versioned_lora_publication", False)
+        kwargs["max_loras_per_batch"] = 3 if versioned_publication else 1
+        kwargs["max_loaded_loras"] = 3 if versioned_publication else 2
         # Mandatory: base is synced once, so it must survive colocate sleep/wake. Without CPU
         # backup, release_memory_occupation drops the GPU pages and base becomes garbage after
         # the first wake (other modes re-push full base every step and never notice).

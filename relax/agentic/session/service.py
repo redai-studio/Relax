@@ -55,6 +55,12 @@ from relax.agentic.runner import (
 )
 from relax.agentic.session.admission import compute_reservation_tokens
 from relax.agentic.session.admission_coordinator import AdmissionCoordinator, RayAdmissionClient
+from relax.agentic.session.lora_version import (
+    LORA_VERSION_REGISTRY_ACTOR_NAME,
+    LoRAVersionError,
+    VersionBinding,
+    versioned_lora_publication_enabled,
+)
 from relax.agentic.session.state import (
     InflightRequest,
     MsgNode,
@@ -120,6 +126,7 @@ _TAKEN = object()
 app = FastAPI()
 logger = get_logger(__name__)
 _DEPLOYED_ADMISSION_COORDINATOR: Optional[Any] = None
+_DEPLOYED_LORA_VERSION_REGISTRY: Optional[Any] = None
 
 
 def agentic_session_shard_name(index: int) -> str:
@@ -325,6 +332,22 @@ def _session_discarded_error(session_id: str) -> AgenticChatRequestError:
         param="session_id",
         status_code=404,
         error_type="not_found_error",
+    )
+
+
+def _lora_version_error(session_id: str, error: Exception) -> AgenticChatRequestError:
+    """Surface a Registry refusal (e.g. no published version yet) to the
+    caller.
+
+    Never silently degrade to the base model: a versioned Session that cannot
+    be bound must fail the request.
+    """
+
+    return AgenticChatRequestError(
+        f"LoRA version binding failed for session {session_id!r}: {error}",
+        code=getattr(error, "code", "lora_version_error").lower(),
+        status_code=503,
+        error_type="service_unavailable_error",
     )
 
 
@@ -1406,6 +1429,9 @@ class ResidentGroup:
         return all(cell.terminal for cell in self.result_cells.values())
 
     def first_error(self) -> Optional[RuntimeGroupError]:
+        for session in self.sessions:
+            if session.cleanup_error is not None:
+                return session.cleanup_error
         for cell in self.result_cells.values():
             if isinstance(cell.payload, RuntimeGroupError):
                 return cell.payload
@@ -1434,8 +1460,16 @@ class _SessionRecord:
     resp_state_hash_by_request_id: Dict[str, str] = field(default_factory=dict)
     resources: Optional[SessionResources] = None
     finish_task: Optional["asyncio.Task[Optional[BaseException]]"] = None
+    cleanup_error: Optional[RuntimeGroupError] = None
     protection_pending_until_resume: bool = False
     protected_until_finalize: bool = False
+    #: Immutable LoRA version this Session generates with. Bound once, on the first
+    #: generation, and kept for every later tool turn / retry / resume. Lives on the
+    #: record (not on an IR) because IRs are per-generation while the record spans them.
+    bound_lora_version: Optional[int] = None
+    bound_lora_name: Optional[str] = None
+    bound_lora_digest: str = ""
+    binding_task: Optional["asyncio.Task[Any]"] = None
 
     @property
     def interrupted(self) -> bool:
@@ -1471,6 +1505,7 @@ class AgenticSessionShard:
         sglang_request_capacity: Optional[int],
         sglang_request_limiter: Optional[Any],
         admission_coordinator: Optional[Any],
+        lora_version_registry: Optional[Any] = None,
     ) -> None:
         self.args = args
         self._groups: Dict[str, ResidentGroup] = {}
@@ -1490,6 +1525,10 @@ class AgenticSessionShard:
         self._permit_cleanup_tasks: set["asyncio.Task[None]"] = set()
         self._lifecycle_close_count = 0
         self._lifecycle_close_failure_count = 0
+        # Versioned Agentic LoRA publication: every generation carries the Session's
+        # bound immutable lora_path, and the Session holds a ref until it is finished.
+        self._versioned_lora = versioned_lora_publication_enabled(args)
+        self._lora_registry = lora_version_registry if self._versioned_lora else None
         self._generation_backend = SGLangBackendAdapter(args)
         self._agent_launcher = ManagedAgentLauncher(
             load_agent_app_spec_from_args(args),
@@ -1534,6 +1573,7 @@ class AgenticSessionShard:
                     ),
                     interrupted=group.interrupted,
                     protected=group.protected,
+                    error=str(error) if (error := group.first_error()) is not None else None,
                 )
                 for group in groups
             ),
@@ -1826,11 +1866,18 @@ class AgenticSessionShard:
         """Release a remotely addressed group after all Session results are
         available."""
 
-        group = self._groups[group_id]
+        group = self._groups.get(group_id)
+        if group is None:
+            return
         self._raise_group_error(group)
         if not group.terminal:
             raise RuntimeGroupError(f"cannot release unfinished group: {group_id}")
-        self._groups.pop(group_id)
+        # Terminal results are published only after bind tasks settle, release
+        # is confirmed, and local Session records are removed. Keep the Group's
+        # IDs until forget is acknowledged so a failed RPC can be retried.
+        if self._lora_registry is not None:
+            await self._lora_registry.forget_sessions.remote(tuple(group.result_cells))
+        self._groups.pop(group_id, None)
         self._notify_state_change()
 
     async def drop_group(self, group_id: str) -> None:
@@ -1840,7 +1887,9 @@ class AgenticSessionShard:
         if group is None:
             # Driver cancellation may retry after the remote release committed.
             return
-        if group.drop_task is None:
+        if group.drop_task is None or (
+            group.drop_task.done() and (group.drop_task.cancelled() or group.drop_task.exception() is not None)
+        ):
             group.drop_task = asyncio.create_task(
                 self._drop_group(group),
                 name=f"drop-group:{group.group_id}",
@@ -1941,8 +1990,12 @@ class AgenticSessionShard:
         """Project liveness from the Shard's current Session refs."""
 
         sessions = tuple(self._session_records.values())
+        cleanup_errors = {
+            session.session_id: str(session.cleanup_error) for session in sessions if session.cleanup_error
+        }
         return {
-            "ok": True,
+            "ok": not cleanup_errors,
+            "cleanup_errors": cleanup_errors,
             "active_sessions": len(sessions),
             "active_requests": sum(len(session.live_irs) for session in sessions),
             "forest_nodes": sum(
@@ -2003,6 +2056,9 @@ class AgenticSessionShard:
             "ready_for_lease": group.ownership is GroupOwnership.PREPARE and group.first_request_barrier_crossed,
             "interrupted": group.interrupted,
             "terminal": group.terminal,
+            "cleanup_errors": {
+                session.session_id: str(session.cleanup_error) for session in sessions if session.cleanup_error
+            },
         }
 
     async def _shutdown(self) -> None:
@@ -2408,6 +2464,93 @@ class AgenticSessionShard:
         finally:
             await self._release_sglang_request_permit()
 
+    async def _bind_session_policy(self, session_id: str) -> VersionBinding:
+        """Await the Registry's atomic bind; a plain coroutine for the shared
+        task."""
+
+        return await self._lora_registry.bind_latest.remote(session_id)
+
+    async def _ensure_session_policy_binding(self, session: _SessionRecord) -> Optional[VersionBinding]:
+        """Bind this Session to a published LoRA version, exactly once.
+
+        The first generation creates a shared binding task and every waiter awaits
+        *that* task (shielded), so cancelling one IR neither cancels the binding nor
+        lets a later turn pick a different version. A failed task is cleared so the
+        Session can retry once a version is published.
+        """
+
+        registry = self._lora_registry
+        if registry is None:
+            return None
+
+        async with session.lock:
+            if session.bound_lora_name is not None:
+                return VersionBinding(session.bound_lora_version, session.bound_lora_digest, session.bound_lora_name)
+            if session.binding_task is None:
+                session.binding_task = asyncio.create_task(
+                    self._bind_session_policy(session.session_id),
+                    name=f"session-lora-bind:{session.session_id}",
+                )
+            binding_task = session.binding_task
+
+        try:
+            binding: VersionBinding = await asyncio.shield(binding_task)
+        except asyncio.CancelledError:
+            # The Session owns this task, including after an IR waiter is cancelled.
+            # Keep it available to the next waiter and terminal Session cleanup.
+            raise
+        except BaseException as error:
+            async with session.lock:
+                # Only the owner clears it: a retry of the same Session must be able
+                # to create a fresh bind attempt, and a stale task must not clear a
+                # newer one.
+                if session.binding_task is binding_task:
+                    session.binding_task = None
+            if isinstance(error, LoRAVersionError):
+                raise _lora_version_error(session.session_id, error) from error
+            raise
+
+        async with session.lock:
+            owns_task = session.binding_task is binding_task
+            if owns_task:
+                session.binding_task = None
+            if session.phase is SessionPhase.ACTIVE:
+                session.bound_lora_version = binding.version_id
+                session.bound_lora_name = binding.lora_name
+                session.bound_lora_digest = binding.digest
+                return binding
+
+        # The Session finished while the bind was in flight: hand the reference back
+        # and fail this IR instead of holding a ref for a Session that will never run.
+        await registry.release.remote(session.session_id)
+        raise _session_discarded_error(session.session_id)
+
+    async def _release_session_lora_ref(self, session: _SessionRecord) -> None:
+        """Drop the Session's Registry reference once no further turn can use
+        it."""
+
+        registry = self._lora_registry
+        if registry is None:
+            return
+        binding_task = session.binding_task
+        if binding_task is not None:
+            # Converge an in-flight first bind before releasing, so the ref cannot be
+            # recorded after the release (which would leak it forever).
+            await asyncio.gather(binding_task, return_exceptions=True)
+        # release is idempotent, including when an earlier ACK was lost. Do not
+        # retire the local record until the Registry confirms the release.
+        for attempt in range(3):
+            try:
+                await registry.release.remote(session.session_id)
+                return
+            except Exception as error:  # noqa: BLE001 - retain ownership on an unconfirmed release
+                if attempt == 2:
+                    raise RuntimeGroupError(
+                        f"LoRA reference release unconfirmed for {session.session_id}; Session retained for retry"
+                    ) from error
+                logger.warning("Retrying LoRA version ref release for %s: %s", session.session_id, error)
+                await asyncio.sleep(0.1 * (attempt + 1))
+
     async def _run_ir(
         self,
         session: _SessionRecord,
@@ -2431,6 +2574,10 @@ class AgenticSessionShard:
                 return
 
         try:
+            # Consumption barrier: the first generation binds this Session to a
+            # published version; every later turn reuses it. Everything after this
+            # point may read session.bound_lora_name.
+            await self._ensure_session_policy_binding(session)
             async with self._admission_lease(session, ir):
                 async with self._sglang_request_permit():
                     async with session.lock:
@@ -2441,8 +2588,15 @@ class AgenticSessionShard:
                             session.queued_irs.appendleft(ir)
                             self._notify_state_change(group)
                             return
+                        if self._versioned_lora and session.bound_lora_name is None:
+                            # Fail closed: sending base-model tokens for a versioned
+                            # Session would silently break on-policy consistency.
+                            raise RuntimeGroupError(
+                                f"session {session.session_id} has no bound LoRA version for this generation"
+                            )
                         backend_request_id = _backend_request_id(ir)
                         ir.backend_started = True
+                        lora_path = session.bound_lora_name
                         remaining_tokens = int(ir.sampling_params["max_new_tokens"]) - len(ir.pending_token_delta)
                         mark_agentic_event(
                             agentic_trace_events(ir.pending_export_metadata_patch),
@@ -2455,6 +2609,7 @@ class AgenticSessionShard:
                             sampling_params={**ir.sampling_params, "max_new_tokens": remaining_tokens},
                             session_id=session.session_id,
                             request_id=backend_request_id,
+                            lora_path=lora_path,
                             image_data=ir.history_backend_image_data,
                             audio_data=ir.history_backend_audio_data,
                             video_data=ir.history_backend_video_data,
@@ -2884,14 +3039,33 @@ class AgenticSessionShard:
 
         async with session.lock:
             finish_task = session.finish_task
-            if finish_task is None:
+            if finish_task is None or (
+                finish_task.done() and (finish_task.cancelled() or finish_task.exception() is not None)
+            ):
                 session.phase = SessionPhase.FINALIZING
                 finish_task = asyncio.create_task(
-                    self._finish_session_once(session, outcome),
+                    self._finish_session_with_status(session, outcome),
                     name=f"session-finish:{session.session_id}",
                 )
                 session.finish_task = finish_task
         return await asyncio.shield(finish_task)
+
+    async def _finish_session_with_status(
+        self,
+        session: _SessionRecord,
+        outcome: _SessionResultPayload,
+    ) -> Optional[BaseException]:
+        """Publish cleanup failures from the owner, even if a waiter
+        disconnects."""
+
+        try:
+            return await self._finish_session_once(session, outcome)
+        except Exception as error:
+            session.cleanup_error = RuntimeGroupError(
+                f"Session cleanup failed for {session.session_id}: {type(error).__name__}: {error}"
+            )
+            self._notify_state_change(session.group)
+            raise
 
     async def _finish_session_once(
         self,
@@ -2950,6 +3124,10 @@ class AgenticSessionShard:
             session.forest = None
             session.resp_state_hash_by_request_id.clear()
             session.resources = None
+        # No future tool turn and no live runner can use this Session's LoRA version:
+        # the Registry may now reclaim it once it is retired.
+        await self._release_session_lora_ref(session)
+        session.cleanup_error = None
         del self._session_records[session.session_id]
 
         cleanup_error = next(
@@ -2991,16 +3169,19 @@ class AgenticSessionShard:
             return_exceptions=True,
         )
         await asyncio.gather(*watcher_tasks, return_exceptions=True)
-        self._groups.pop(group_id, None)
-        self._notify_state_change()
         for outcome in cleanup_outcomes:
             if isinstance(outcome, BaseException):
                 raise outcome
+        if self._lora_registry is not None:
+            await self._lora_registry.forget_sessions.remote(tuple(group.result_cells))
+        self._groups.pop(group_id, None)
+        self._notify_state_change()
 
 
 def create_agentic_session_shards(
     config: Namespace,
     admission_coordinator: Optional[Any],
+    lora_version_registry: Optional[Any] = None,
 ) -> Tuple[Tuple[str, Any], ...]:
     """Create the named Shard fleet for one Serve deployment.
 
@@ -3027,12 +3208,57 @@ def create_agentic_session_shards(
                 sglang_request_capacity if placement == 0 else None,
                 shard_entries[0][1] if placement > 0 else None,
                 admission_coordinator,
+                lora_version_registry,
             )
             shard_entries.append((actor_name, shard))
     except BaseException:
         _shutdown_agentic_session_shards(tuple(handle for _name, handle in shard_entries))
         raise
     return tuple(shard_entries)
+
+
+def _kill_stale_lora_version_registry() -> None:
+    """Destroy a Registry left behind by an aborted previous deployment.
+
+    A named actor survives a partial control-plane restart, and its Session
+    bindings are not recoverable state: the new run must start from a fresh
+    epoch.
+    """
+
+    try:
+        stale = ray.get_actor(LORA_VERSION_REGISTRY_ACTOR_NAME)
+    except Exception:
+        return
+    try:
+        ray.kill(stale, no_restart=True)
+    except Exception as error:
+        logger.warning("Failed to kill stale LoRA version registry: %s", error)
+
+
+def _create_lora_version_registry(config: Namespace) -> Optional[Any]:
+    """Create the shared LoRA version Registry for this deployment."""
+
+    if not versioned_lora_publication_enabled(config):
+        return None
+    from relax.agentic.session.lora_version import LoRAVersionRegistry
+
+    _kill_stale_lora_version_registry()
+    registry = (
+        ray.remote(LoRAVersionRegistry)
+        .options(name=LORA_VERSION_REGISTRY_ACTOR_NAME, num_cpus=0, max_restarts=0)
+        .remote()
+    )
+    logger.info("Created LoRA version registry actor %s", LORA_VERSION_REGISTRY_ACTOR_NAME)
+    return registry
+
+
+def _shutdown_lora_version_registry(registry: Optional[Any]) -> None:
+    if registry is None:
+        return
+    try:
+        ray.kill(registry, no_restart=True)
+    except Exception as error:
+        logger.warning("Failed to kill LoRA version registry: %s", error)
 
 
 @serve.deployment
@@ -3292,17 +3518,21 @@ def deploy_agentic_chat_api_services(
     config.sglang_router_ip = router_ip
     config.sglang_router_port = router_port
 
-    global _DEPLOYED_ADMISSION_COORDINATOR
+    global _DEPLOYED_ADMISSION_COORDINATOR, _DEPLOYED_LORA_VERSION_REGISTRY
 
     shard_entries: Tuple[Tuple[str, Any], ...] = ()
     admission_coordinator = None
+    lora_version_registry = None
     try:
+        # The Registry comes up before any SessionShard so the first bind finds it.
+        lora_version_registry = _create_lora_version_registry(config)
         if config.agentic_program_admission:
             admission_coordinator = AdmissionCoordinator.options(num_cpus=0, max_restarts=0).remote(config)
             ray.get(admission_coordinator.start.remote())
         shard_entries = create_agentic_session_shards(
             config=config,
             admission_coordinator=admission_coordinator,
+            lora_version_registry=lora_version_registry,
         )
         deployment = AgenticChatAPIService.options(
             num_replicas=_DEFAULT_SESSION_SHARD_COUNT,
@@ -3315,19 +3545,23 @@ def deploy_agentic_chat_api_services(
             route_prefix=AGENTIC_CHAT_API_ROUTE_PREFIX,
         )
         _DEPLOYED_ADMISSION_COORDINATOR = admission_coordinator
+        _DEPLOYED_LORA_VERSION_REGISTRY = lora_version_registry
     except BaseException:
         _shutdown_agentic_session_shards(tuple(handle for _name, handle in shard_entries))
         _shutdown_admission_coordinator(admission_coordinator)
+        _shutdown_lora_version_registry(lora_version_registry)
         raise
 
 
 def shutdown_agentic_chat_api_services() -> None:
     """Delete Serve ingress and join Shards after Runtime borrowers stop."""
 
-    global _DEPLOYED_ADMISSION_COORDINATOR
+    global _DEPLOYED_ADMISSION_COORDINATOR, _DEPLOYED_LORA_VERSION_REGISTRY
 
     admission_coordinator = _DEPLOYED_ADMISSION_COORDINATOR
     _DEPLOYED_ADMISSION_COORDINATOR = None
+    lora_version_registry = _DEPLOYED_LORA_VERSION_REGISTRY
+    _DEPLOYED_LORA_VERSION_REGISTRY = None
     try:
         serve.delete(AGENTIC_CHAT_API_SERVICE_NAME)
     except Exception as error:
@@ -3341,6 +3575,7 @@ def shutdown_agentic_chat_api_services() -> None:
                 continue
         _shutdown_agentic_session_shards(tuple(shards))
         _shutdown_admission_coordinator(admission_coordinator)
+        _shutdown_lora_version_registry(lora_version_registry)
 
 
 def _shutdown_admission_coordinator(coordinator: Optional[Any]) -> None:
