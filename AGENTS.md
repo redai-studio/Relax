@@ -75,6 +75,10 @@ configs/env.yaml         运行时环境配置
 - 热路径禁止 GPU-CPU 同步（`.item()`、`.tolist()`、`print(tensor)`）
 - 组合优于继承，层级 ≤ 2；偏好委托
 
+## Markdown 写作格式
+
+本仓库所有 Markdown 都不要 hard wrap，不限于 `docs/`，同样适用于 README、AGENTS.md、CLAUDE.md、SKILL.md、skill 的 references/templates，以及本仓库相关的 PR 描述、评论和其他 Markdown 输出。一个自然段或同一列表项的正文写在同一源码行，依靠编辑器或阅读器的 soft wrap 展示；不要为了 80、100、119 等列宽手动折行，也不要按句子拆行。段落之间保留空行，保留代码块、表格、YAML frontmatter、嵌套列表和具有语义的显式换行。修改已有段落时合并无语义的折行，不为此批量重排无关内容。需要配置 Markdown 格式化时，使用 Prettier/Oxfmt 的 `proseWrap: "never"` 或 mdformat 的 `--wrap no`，避免格式化后再次折行。
+
 ## Naming Conventions
 
 | 类型        | 模式                    | 示例                                  |

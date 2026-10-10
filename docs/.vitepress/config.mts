@@ -1,10 +1,14 @@
 import taskLists from 'markdown-it-task-lists'
 import { fileURLToPath } from 'node:url'
-import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
+import blogDescription from './blog-excerpt'
 import sourceLinks from './plugins/source-links'
 
 // https://vitepress.dev/reference/site-config
-export default defineConfig({
+export default withMermaid({
+  mermaid: {
+    securityLevel: 'strict',
+  },
   vite: {
     build: {
       chunkSizeWarningLimit: 1500,
@@ -31,7 +35,7 @@ export default defineConfig({
    */
   async buildEnd() {
     // Use dynamic import to access Node built-ins inside the ESM config
-    const { existsSync, readdirSync, renameSync, readFileSync, writeFileSync } =
+    const { existsSync, readdirSync, renameSync, readFileSync, writeFileSync, rmSync } =
       await import('node:fs')
     const { join, dirname, basename } = await import('node:path')
     const { fileURLToPath } = await import('node:url')
@@ -39,6 +43,9 @@ export default defineConfig({
     const configDir = dirname(fileURLToPath(import.meta.url))
     const distDir = join(configDir, 'dist')
     if (!existsSync(distDir)) return
+
+    // public/ is copied verbatim; keep the image submodule's Git metadata out of the site.
+    rmSync(join(distDir, 'images', '.git'), { recursive: true, force: true })
 
     // ---------- Phase 1: Rename physical files containing ".md." ----------
     const targets: string[] = []
@@ -213,6 +220,7 @@ export default defineConfig({
   markdown: {
     math: true,
     config(md) {
+      md.use(blogDescription)
       md.use(taskLists)
       md.use(sourceLinks, {
         repo: 'https://github.com/redai-studio/Relax',
@@ -235,6 +243,7 @@ export default defineConfig({
           { text: 'Guide', link: '/en/guide/introduction' },
           { text: 'API', link: '/en/api/overview' },
           { text: 'Examples', link: '/en/examples/deepeyes' },
+          { text: 'Blog', link: '/en/blog/', activeMatch: '/en/blog/' },
           {
             text: 'Resources',
             items: [
@@ -362,6 +371,7 @@ export default defineConfig({
           { text: '指南', link: '/zh/guide/introduction' },
           { text: 'API', link: '/zh/api/overview' },
           { text: '示例', link: '/zh/examples/deepeyes' },
+          { text: '博客', link: '/zh/blog/', activeMatch: '/zh/blog/' },
           {
             text: '资源',
             items: [
@@ -497,7 +507,7 @@ export default defineConfig({
   },
 
   themeConfig: {
-    logo: '/rednote-logo.png',
+    logo: '/rai-studio-logo.png',
     socialLinks: [{ icon: 'github', link: 'https://github.com/redai-studio/Relax' }],
     search: {
       provider: 'local',
