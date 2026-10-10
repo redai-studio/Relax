@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.filters.base_types import MetricGatherer, call_dynamic_filter
+from relax.engine.inference.deferred import is_deferred_teacher, is_framework_deferred_reward, run_deferred_scoring
 from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -557,10 +558,16 @@ async def generate_and_rm(
     if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
         sample.loss_mask = [0] * sample.response_length
 
+    # With framework-deferred scoring the reward function is not called while
+    # rollout generates; the batch is scored as a whole before it is published.
+    # The same goes for a deferred OPD teacher, which is asleep until then.
+    deferred_reward = is_framework_deferred_reward(args)
+    deferred_teacher = is_deferred_teacher(args)
+
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
-        if not args.group_rm:
+        if not args.group_rm and not deferred_reward:
             assert sample.reward is not None
         return sample
 
@@ -580,13 +587,14 @@ async def generate_and_rm(
         if any(sample.status == Sample.Status.ABORTED for sample in samples):
             return samples
 
-        # for multi agent system, the reward of some sample is calculated during generation.
-        samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        if not deferred_reward:
+            # for multi agent system, the reward of some sample is calculated during generation.
+            samples_need_reward = [sample for sample in samples if sample.reward is None]
+            rewards = await batched_async_rm(args, samples_need_reward)
+            for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not deferred_teacher:
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
@@ -594,10 +602,10 @@ async def generate_and_rm(
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
+        if sample.reward is None and not deferred_reward:
             sample.reward = await async_rm(args, sample)
 
-        if state.opd_manager and not evaluation:
+        if state.opd_manager and not evaluation and not deferred_teacher:
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
@@ -673,11 +681,13 @@ async def generate_and_rm_group(
 
     # eval should still compute group reward even if abort was triggered by a concurrent rollout
     if (not state.aborted or evaluation) and args.group_rm:
-        rewards = await batched_async_rm(args, group)
-        for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+        if not is_framework_deferred_reward(args):
+            rewards = await batched_async_rm(args, group)
+            for sample, reward in zip(group, rewards, strict=False):
+                sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        # A deferred teacher is asleep now; it is asked once the batch is complete.
+        if state.opd_manager and not evaluation and not is_deferred_teacher(args):
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -854,6 +864,19 @@ async def generate_rollout_async(
 
     loop = asyncio.get_running_loop()
 
+    # Deferred scoring runs when a batch is published and hands rollout's GPUs
+    # to the scorers. Requests may still be in flight when the target is met
+    # (over-sampling surplus, top-ups after filter drops, protected tasks), and
+    # a rollout engine cannot release memory under them. So with deferred
+    # scoring, finished batches are held back until generation has stopped.
+    hold_publishing = is_framework_deferred_reward(args) or is_deferred_teacher(args)
+    generation_stopped = asyncio.Event()
+
+    async def publish(*transfer_args: Any, **transfer_kwargs: Any) -> None:
+        if hold_publishing:
+            await generation_stopped.wait()
+        await transfer_batch_to_data_system(*transfer_args, **transfer_kwargs)
+
     def target_reached() -> bool:
         if is_final_backfill:
             return total_transfer_samples >= target_data_size
@@ -939,7 +962,7 @@ async def generate_rollout_async(
                 # is_last: this backfill closes the previous partition's debt.
                 prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
                 transfer_task = asyncio.create_task(
-                    transfer_batch_to_data_system(
+                    publish(
                         args,
                         batch_to_transfer,
                         n,
@@ -960,7 +983,7 @@ async def generate_rollout_async(
                     # it always closes the debt, so it is the previous partition's last.
                     prev_is_last = args.fully_async and (committed_prev + n_prev >= prev_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer[:cutoff_batch],
                             n_prev,
@@ -981,7 +1004,7 @@ async def generate_rollout_async(
                     # target (no deficit carried) — otherwise the tail is backfilled next step.
                     curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
                     transfer_task = asyncio.create_task(
-                        transfer_batch_to_data_system(
+                        publish(
                             args,
                             batch_to_transfer,
                             n,
@@ -1002,7 +1025,7 @@ async def generate_rollout_async(
         if is_final_backfill:
             prev_is_last = args.fully_async and (committed_prev + n >= prev_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                publish(
                     args,
                     batch_to_transfer,
                     n,
@@ -1019,7 +1042,7 @@ async def generate_rollout_async(
             # Tail flush to the current partition: last only if it completes this step's target.
             curr_is_last = args.fully_async and (committed_curr + n >= curr_target)
             transfer_task = asyncio.create_task(
-                transfer_batch_to_data_system(
+                publish(
                     args,
                     batch_to_transfer,
                     n,
@@ -1034,6 +1057,18 @@ async def generate_rollout_async(
             logger.info(
                 f"Total yielded: {total_transfer_samples - num_old_samples}/{args.rollout_batch_size} for step: {rollout_id}"
             )
+
+    # abort() returns (aborted_samples, completed_protected_samples)
+    stopped_early = None
+    if hold_publishing:
+        try:
+            stopped_early = await abort(args, rollout_id)
+        except BaseException:
+            # Nothing may be published from a step whose generation could not be stopped.
+            for transfer_task in transfer_tasks:
+                transfer_task.cancel()
+            raise
+        generation_stopped.set()
 
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
@@ -1054,9 +1089,11 @@ async def generate_rollout_async(
     all_samples = [sample for group in data for sample in (group if isinstance(group, list) else [group])]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
 
-    # there are still some unfinished requests, abort them
-    # abort() returns (aborted_samples, completed_protected_samples)
-    new_aborted, completed_protected = await abort(args, rollout_id)
+    # there are still some unfinished requests, abort them (already done when
+    # publishing was held for deferred scoring)
+    if stopped_early is None:
+        stopped_early = await abort(args, rollout_id)
+    new_aborted, completed_protected = stopped_early
     aborted_samples.extend(new_aborted)
     aborted_samples.extend(completed_protected)
     if aborted_samples:
@@ -1153,9 +1190,38 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
         results = {}
         for r in results_list:
             results.update(r)
+        if is_framework_deferred_reward(args):
+            await _score_deferred_eval_results(args, results)
         return RolloutFnEvalOutput(data=results), []
     finally:
         state.evaluating -= 1
+
+
+async def _score_deferred_eval_results(args: Namespace, results: dict[str, dict[str, list[Any]]]) -> None:
+    """Score every dataset's samples in one score phase and fill in the rewards
+    the per-dataset results left open.
+
+    The datasets generate concurrently, so this has to wait for all of them:
+    scoring one would take the GPUs from the others. Evaluation may be followed
+    by generation right away, so rollout is brought back afterwards.
+    """
+    eval_datasets = {cfg.name: cfg for cfg in getattr(args, "eval_datasets", []) or []}
+    groups = []
+    for name, result in results.items():
+        samples = result["samples"]
+        # Samples are indexed prompt by prompt, so consecutive chunks are the prompt groups.
+        group_size = max(1, eval_datasets[name].n_samples_per_eval_prompt)
+        for start in range(0, len(samples), group_size):
+            stop = start + group_size
+            groups.append(samples[start:stop])
+    await run_deferred_scoring(args, groups, evaluation=True)
+    for result in results.values():
+        result["rewards"] = _eval_rewards(args, result["samples"])
+
+
+def _eval_rewards(args: Namespace, samples: list[Sample]) -> list[Any]:
+    reward_key = args.eval_reward_key or args.reward_key
+    return [sample.reward if not reward_key else sample.reward[reward_key] for sample in samples]
 
 
 async def eval_rollout_single_dataset(
@@ -1286,10 +1352,11 @@ async def eval_rollout_single_dataset(
 
     data.sort(key=lambda sample: sample.index)
 
-    reward_key = args.eval_reward_key or args.reward_key
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            # With framework-deferred scoring there are no rewards yet;
+            # eval_rollout fills them in once every dataset has generated.
+            "rewards": [] if is_framework_deferred_reward(args) else _eval_rewards(args, data),
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
         }

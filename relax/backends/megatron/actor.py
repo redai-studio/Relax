@@ -30,6 +30,7 @@ from transformers import AutoConfig, AutoTokenizer
 from relax.algorithms import algorithm_needs_critic
 from relax.distributed.checkpoint_service.client.engine import create_client
 from relax.distributed.ray.train_actor import TrainRayActor
+from relax.engine.inference.lifecycle import GenerateStage
 from relax.engine.sft.eval.runner import run_sft_eval
 from relax.engine.sft.predict.runner import run_sft_predict
 from relax.engine.sft.runtime import (
@@ -76,8 +77,6 @@ from relax.utils.memory_utils import clear_memory, print_memory
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.model_source import is_model_source_alias
 from relax.utils.opd.opd_utils import (
-    append_managed_opd_teacher_offload_handle,
-    append_managed_opd_teacher_onload_handle,
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
@@ -1047,13 +1046,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train(self, rollout_id: int) -> None:
         if self.args.offload_rollout and dist.get_rank() == 0:
-            pre_train_offload_handles = []
-            if self.genrm_manager is not None:
-                # A list of one or more GenRM manager handles (one per instance).
-                pre_train_offload_handles.extend(m.offload.remote() for m in self.genrm_manager)
-            append_managed_opd_teacher_offload_handle(pre_train_offload_handles, self)
-            if pre_train_offload_handles:
-                ray.get(pre_train_offload_handles)
+            # GenRM (one or more instances) and the managed OPD teacher release
+            # their GPU memory; returns once every release is confirmed.
+            self.lifecycle_coordinator().enter_train()
 
         # Gate all ranks behind rank-0's GenRM/OPD-teacher offload: otherwise
         # other ranks wake_up() and reclaim GPU memory while colocated GenRM or
@@ -2580,10 +2575,9 @@ class MegatronTrainRayActor(TrainRayActor):
             # Onload rollout weights. genRM (no NCCL weight sync — the reward
             # model is static) is deferred to after the weight all-gather: in
             # colocate mode its static pool would collide with the all-gather's
-            # temp buffers and OOM. See onload_kv below (post_sync_handles).
-            onload_handles = [self.rollout_manager.onload_weights.remote()]
-            append_managed_opd_teacher_onload_handle(onload_handles, self)
-            ray.get(onload_handles)
+            # temp buffers and OOM. See the REST stage below. The managed OPD
+            # teacher is woken here, together with the rollout weights.
+            self.lifecycle_coordinator().enter_generate(GenerateStage.WEIGHTS)
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
@@ -2646,19 +2640,13 @@ class MegatronTrainRayActor(TrainRayActor):
         # RL warms KV here for the next per-step generate. SFT's /predict
         # calls onload_kv itself. genRM (deferred from before the weight
         # all-gather) is onloaded here too, in parallel.
-        # When --defer-reward-to-post-process is set the userland
-        # custom_reward_post_process function owns GenRM lifecycle, so skip
-        # onloading GenRM here (it must stay offloaded for rollout to have
-        # all GPUs during generate in shared-bundles mode).
+        # When --defer-reward-to-post-process is set GenRM only lives in the
+        # score phase (run by the framework, or by a userland
+        # custom_reward_post_process function), so it is not onloaded here: it
+        # must stay offloaded for rollout to have all GPUs during generate in
+        # shared-bundles mode.
         if self.args.offload_rollout and dist.get_rank() == 0:
-            post_sync_handles = []
-            if self._per_step_rollout:
-                post_sync_handles.append(self.rollout_manager.onload_kv.remote())
-            if self.genrm_manager is not None and not getattr(self.args, "defer_reward_to_post_process", False):
-                # A list of one or more GenRM manager handles (one per instance).
-                post_sync_handles.extend(m.onload.remote() for m in self.genrm_manager)
-            if post_sync_handles:
-                ray.get(post_sync_handles)
+            self.lifecycle_coordinator(warm_rollout_kv=self._per_step_rollout).enter_generate(GenerateStage.REST)
 
     @timer("wait update_weights_fully_async")
     def _check_services_health(self) -> tuple[bool, bool]:

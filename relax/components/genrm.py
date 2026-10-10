@@ -19,13 +19,16 @@ from typing import Any, List, Optional, Union
 
 import httpx
 import ray
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ValidationError
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import create_genrm_managers
+from relax.engine.inference.discovery import RoleSnapshot, role_snapshot_from_payloads
+from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.data.processing_utils import load_tokenizer
 from relax.utils.env import Envs
 
@@ -154,6 +157,9 @@ class GenRM(Base):
         self.instance_specs = config._genrm_instances_resolved
 
         self._engine_caches: dict[str, _EngineCacheState] = {key: _EngineCacheState() for key in self.genrm_managers}
+        # Serves discovery and the unified endpoints. The messages-based
+        # /generate path below keeps its own engine picking.
+        self._gateway = InferenceGateway(role, self._fetch_inference_snapshot, upstream_name="GenRM engine")
         self._logger.info(f"GenRM service initialized successfully: instances={list(self.genrm_managers)}")
         # Shared HTTP client for engine calls (avoids per-request connection overhead).
         # Raise pool limits well above httpx's default 100 so one replica can fan out
@@ -180,7 +186,39 @@ class GenRM(Base):
         """
         return None
 
+    def _fetch_inference_snapshot(self) -> RoleSnapshot:
+        payloads = ray.get(
+            [manager.get_inference_snapshot.remote() for manager in self.genrm_managers.values()],
+            timeout=SNAPSHOT_FETCH_TIMEOUT_S,
+        )
+        return role_snapshot_from_payloads(
+            self.role,
+            dict(zip(self.genrm_managers, payloads, strict=True)),
+            default_model=_DEFAULT_INSTANCE_KEY if _DEFAULT_INSTANCE_KEY in self.genrm_managers else None,
+        )
+
     @app.post("/generate")
+    async def generate_endpoint(self, request: Request):
+        """``/generate`` entry point.
+
+        A body with ``messages`` is the long-standing GenRM contract and is
+        handled by ``generate`` unchanged. Anything else is a native engine
+        payload, forwarded to a replica chosen from the topology snapshot.
+        """
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+        if isinstance(body, dict) and "messages" in body:
+            try:
+                legacy_request = GenerateRequest.model_validate(body)
+            except ValidationError as e:
+                raise RequestValidationError(e.errors())
+            return await self.generate(legacy_request)
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body: expected a JSON object")
+        return await self._gateway.generate(body)
+
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         """Generate response for given chat messages.
 
@@ -322,6 +360,19 @@ class GenRM(Base):
                     continue
                 raise
         return resp.json()
+
+    @app.get("/engines")
+    async def get_engines(self) -> dict:
+        return await self._gateway.engines()
+
+    @app.get("/v1/models")
+    async def list_models(self) -> dict:
+        return await self._gateway.models()
+
+    @app.post("/v1/chat/completions")
+    @app.post("/chat/completions")
+    async def chat_completions(self, request: Request):
+        return await self._gateway.chat_completions(await request.body(), dict(request.headers))
 
     @app.get("/health")
     async def health(self) -> dict:

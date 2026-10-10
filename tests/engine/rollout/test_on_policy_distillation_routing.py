@@ -138,3 +138,39 @@ def test_on_policy_distillation_routing_unknown_data_source_raises():
     args = _args()
     with pytest.raises(KeyError, match="no teacher route"):
         opd._pick_teacher_url(args, _sample("not-a-source", 0))
+
+
+# Single-teacher path: no routes map, replicas come from ``opd_teacher_urls``.
+
+
+def _single_teacher_args(urls: list[str] | None) -> Namespace:
+    return Namespace(opd_teacher_url=TEXT_REPLICAS[0], opd_teacher_urls=urls)
+
+
+def test_on_policy_distillation_routing_single_teacher_uses_the_one_url():
+    for urls in (None, [TEXT_REPLICAS[0]]):
+        args = _single_teacher_args(urls)
+        picks = {opd._pick_teacher_url(args, Sample(group_index=g)) for g in range(4)}
+        assert picks == {TEXT_REPLICAS[0]}
+    # A single URL never consults or advances the replica cursor.
+    assert opd._TEACHER_URL_RR == {}
+
+
+def test_on_policy_distillation_routing_single_teacher_keeps_group_on_one_replica():
+    args = _single_teacher_args(TEXT_REPLICAS)
+    per_group = [
+        {opd._pick_teacher_url(args, Sample(group_index=g)) for _ in range(N_SAMPLES_PER_PROMPT)} for g in range(4)
+    ]
+    assert all(len(urls) == 1 for urls in per_group)
+    assert [next(iter(urls)) for urls in per_group] == [
+        TEXT_REPLICAS[0],
+        TEXT_REPLICAS[1],
+        TEXT_REPLICAS[0],
+        TEXT_REPLICAS[1],
+    ]
+
+
+def test_on_policy_distillation_routing_single_teacher_round_robins_without_sample():
+    args = _single_teacher_args(TEXT_REPLICAS)
+    urls = [opd._pick_teacher_url(args) for _ in range(4)]
+    assert urls == [TEXT_REPLICAS[0], TEXT_REPLICAS[1], TEXT_REPLICAS[0], TEXT_REPLICAS[1]]

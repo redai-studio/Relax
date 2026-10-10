@@ -7,6 +7,8 @@ from collections.abc import Awaitable, Callable, Sequence
 import aiohttp
 import numpy as np
 
+from relax.engine.inference.client import InferenceClient
+from relax.engine.inference.routing import candidate_replicas, select_replica
 from relax.utils.logging_utils import get_logger
 from relax.utils.opd import opd_main_worker, opd_opsd_worker
 from relax.utils.types import Sample
@@ -59,6 +61,12 @@ def _create_teacher_client_session(args) -> aiohttp.ClientSession:
 #      group's shared prompt prefix is prefilled by one replica -- see
 #      ``_pick_replica``.
 # Single-teacher path falls back to ``args.opd_teacher_urls`` / ``opd_teacher_url``.
+#
+# Which replicas a managed teacher has is read from its gateway's discovery
+# endpoint when ``args.opd_teacher_discovery_url`` is set, so a replica rebuilt
+# at another address is picked up without a restart. The URLs captured in
+# ``args`` at startup remain the fallback, and the only source for an external
+# teacher (``--opd-teacher-url``).
 _TEACHER_URL_RR: dict[str, int] = {}
 # (teacher key, group_index) -> replica ordinal. Bounded by clearing wholesale:
 # this is a pure cache-locality heuristic, so a dropped entry only costs prefix
@@ -67,10 +75,93 @@ _TEACHER_GROUP_REPLICA: dict[tuple[str, int], int] = {}
 _MAX_TEACHER_GROUP_REPLICA = 1 << 16
 
 
-def _round_robin(urls: list[str], key: str) -> str:
-    i = _TEACHER_URL_RR.get(key, 0)
-    _TEACHER_URL_RR[key] = i + 1
-    return urls[i % len(urls)]
+# Model name the single managed teacher is published under by its gateway.
+_SINGLE_TEACHER_MODEL = "__default__"
+# How long a discovered topology is used before it is fetched again, and the
+# minimum spacing of fetches triggered by failing teacher requests.
+_TEACHER_DISCOVERY_MAX_AGE_S = 5.0
+_TEACHER_DISCOVERY_COOLDOWN_S = 1.0
+_TEACHER_DISCOVERY_TIMEOUT_S = 2.0
+# discovery URL -> client caching that teacher role's topology.
+_TEACHER_TOPOLOGY: dict[str, InferenceClient] = {}
+_TEACHER_TOPOLOGY_REFRESHING: set[str] = set()
+# Discovery URLs already reported unreachable, so the warning is not repeated per batch.
+_TEACHER_DISCOVERY_WARNED: set[str] = set()
+
+
+def _fetch_teacher_topology(discovery_url: str) -> dict:
+    import requests
+
+    response = requests.get(discovery_url, timeout=_TEACHER_DISCOVERY_TIMEOUT_S)
+    response.raise_for_status()
+    return response.json()
+
+
+def _teacher_topology(args) -> InferenceClient | None:
+    discovery_url = getattr(args, "opd_teacher_discovery_url", None)
+    if not discovery_url:
+        return None
+    client = _TEACHER_TOPOLOGY.get(discovery_url)
+    if client is None:
+        client = InferenceClient(
+            lambda: _fetch_teacher_topology(discovery_url),
+            max_age_s=_TEACHER_DISCOVERY_MAX_AGE_S,
+            refresh_cooldown_s=_TEACHER_DISCOVERY_COOLDOWN_S,
+        )
+        _TEACHER_TOPOLOGY[discovery_url] = client
+    return client
+
+
+async def _refresh_teacher_topology(args) -> None:
+    """Bring the managed teacher's topology up to date, off the event loop.
+
+    Teacher URLs are picked synchronously per sample, so the picking itself
+    only reads the cached topology; this is where it is fetched. Concurrent
+    callers share one fetch and never wait for it.
+    """
+    client = _teacher_topology(args)
+    if client is None:
+        return
+    discovery_url: str = args.opd_teacher_discovery_url
+    if discovery_url in _TEACHER_TOPOLOGY_REFRESHING or not client.needs_refresh():
+        return
+    _TEACHER_TOPOLOGY_REFRESHING.add(discovery_url)
+    try:
+        await asyncio.to_thread(client.snapshot)
+        _TEACHER_DISCOVERY_WARNED.discard(discovery_url)
+    except Exception as exc:
+        if discovery_url not in _TEACHER_DISCOVERY_WARNED:
+            _TEACHER_DISCOVERY_WARNED.add(discovery_url)
+            logger.warning(
+                "OPD teacher discovery at %s is unreachable; using the teacher URLs captured at startup: %s",
+                discovery_url,
+                f"{type(exc).__name__}: {str(exc)[:256]}",
+            )
+    finally:
+        _TEACHER_TOPOLOGY_REFRESHING.discard(discovery_url)
+
+
+def _discovered_replicas(args, model: str) -> list[str] | None:
+    """Replica URLs of one managed teacher as last discovered.
+
+    ``None`` when there is nothing to go on -- no discovery configured, no
+    topology fetched yet, or no replica reported ready -- in which case the
+    caller keeps the URLs from ``args``.
+    """
+    client = _teacher_topology(args)
+    snapshot = client.last_snapshot if client is not None else None
+    model_snapshot = snapshot.model(model) if snapshot is not None else None
+    if model_snapshot is None:
+        return None
+    return [f"{replica.base_url}/generate" for replica in candidate_replicas(model_snapshot)] or None
+
+
+def _report_teacher_failure(args) -> None:
+    """A teacher request failed: look at the topology again before the next
+    batch, in case the replica was rebuilt elsewhere."""
+    client = _teacher_topology(args)
+    if client is not None:
+        client.report_failure()
 
 
 def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
@@ -93,20 +184,17 @@ def _pick_replica(replicas: list[str], sample, rr_key: str) -> str:
     collapses onto a subset of its replicas (e.g. an alternating text/VL dataset
     gives one teacher only even indices, which all map to replica 0).
     """
-    if len(replicas) == 1:
-        return replicas[0]
     group_index = getattr(sample, "group_index", None) if sample is not None else None
-    if group_index is None:
-        return _round_robin(replicas, rr_key)
-    key = (rr_key, int(group_index))
-    idx = _TEACHER_GROUP_REPLICA.get(key)
-    if idx is None:
-        if len(_TEACHER_GROUP_REPLICA) > _MAX_TEACHER_GROUP_REPLICA:
-            _TEACHER_GROUP_REPLICA.clear()
-        idx = _TEACHER_URL_RR.get(rr_key, 0)
-        _TEACHER_URL_RR[rr_key] = idx + 1
-        _TEACHER_GROUP_REPLICA[key] = idx
-    return replicas[idx % len(replicas)]
+    # The rule itself is shared with the inference gateway; the cursor and the
+    # group memory stay here, per process.
+    return select_replica(
+        replicas,
+        cursor_key=rr_key,
+        cursors=_TEACHER_URL_RR,
+        affinity_key=int(group_index) if group_index is not None else None,
+        affinity_memory=_TEACHER_GROUP_REPLICA,
+        affinity_memory_cap=_MAX_TEACHER_GROUP_REPLICA,
+    )
 
 
 def _pick_teacher_url(args, sample=None) -> str:
@@ -128,12 +216,14 @@ def _pick_teacher_url(args, sample=None) -> str:
                 f"MOPD routing: no teacher route for '{key_field}={routing_value}'. "
                 f"Available routes: {list(routes_map.keys())}."
             )
+        replicas = _discovered_replicas(args, routing_value) or replicas
         return _pick_replica(replicas, sample, routing_value)
     # Single-teacher path: round-robin over replicas if configured.
-    urls = getattr(args, "opd_teacher_urls", None)
+    discovered = _discovered_replicas(args, _SINGLE_TEACHER_MODEL)
+    urls = discovered or getattr(args, "opd_teacher_urls", None)
     if urls and len(urls) > 1:
         return _pick_replica(urls, sample, "__single__")
-    return args.opd_teacher_url
+    return discovered[0] if discovered else args.opd_teacher_url
 
 
 class OpdManager:
@@ -238,21 +328,75 @@ class OpdManager:
         samples: Sample | Sequence[Sample],
         encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
     ) -> None:
+        """Run the three stages back to back, as generation does inline."""
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
-        if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
-
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
+            await self._run_teacher_stage(sample_list, session)
+            if self.needs_student_stage:
+                await self._run_student_stage(sample_list, session, encode_multimodal_inputs)
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
-                )
+        self.assemble_stage(sample_list)
 
-        self._assemble_transfer(sample_list)
+    # The stages are also run one at a time by deferred scoring, which has to
+    # switch GPU memory between them: the teacher stage only needs the teacher,
+    # the student stage only rollout.
+
+    @property
+    def needs_student_stage(self) -> bool:
+        """Whether the student must score the teacher's top-k tokens."""
+        return self.topk_worker is not None and self.topk_worker.spec.student_at_teacher
+
+    async def teacher_stage(self, samples: list[Sample], session: aiohttp.ClientSession | None = None) -> None:
+        """Ask the teacher for its log-probs on every sample.
+
+        Raises:
+            RuntimeError: every sample with a response failed.
+        """
+        if session is not None:
+            await self._run_teacher_stage(samples, session)
+            return
+        async with _create_teacher_client_session(self.args) as own_session:
+            await self._run_teacher_stage(samples, own_session)
+
+    async def _run_teacher_stage(self, samples: list[Sample], session: aiohttp.ClientSession) -> None:
+        if self.opsd_worker is not None:
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
+
+        await _refresh_teacher_topology(self.args)
+        fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples])
+        if not all(fetch_results):
+            _report_teacher_failure(self.args)
+        self._raise_if_all_failed(samples, fetch_results)
+
+    async def student_stage(
+        self,
+        samples: list[Sample],
+        session: aiohttp.ClientSession | None = None,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None = None,
+    ) -> None:
+        """Ask the student (rollout) for its log-probs on the teacher's top-k
+        tokens; a no-op unless the token selection needs it."""
+        if not self.needs_student_stage:
+            return
+        if session is not None:
+            await self._run_student_stage(samples, session, encode_multimodal_inputs)
+            return
+        async with _create_teacher_client_session(self.args) as own_session:
+            await self._run_student_stage(samples, own_session, encode_multimodal_inputs)
+
+    async def _run_student_stage(
+        self,
+        samples: list[Sample],
+        session: aiohttp.ClientSession,
+        encode_multimodal_inputs: EncodeMultimodalInputs | None,
+    ) -> None:
+        await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
+
+    def assemble_stage(self, samples: list[Sample]) -> None:
+        """Combine what the two models returned into the fields training
+        reads."""
+        self._assemble_transfer(samples)
 
     async def _post_logprob(
         self,

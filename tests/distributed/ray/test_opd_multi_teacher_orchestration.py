@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""``_start_managed_multi_teacher`` was rewritten to delegate the GPU-budget
-carve-up to the domain-agnostic ``start_multi_instance_managers`` helper (also
-used by GenRM's multi-instance path).
+"""``_start_managed_multi_teacher`` launches its TeacherManagers through the
+domain-agnostic ``start_multi_instance_managers`` helper (also used by GenRM's
+multi-instance path), and takes each teacher's region from the placement plan.
 
 This must not change MOPD's observable
 contract: equal-split validation, one TeacherManager per data_source at a
@@ -93,18 +93,18 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
     checkpoint_to_source = {"/ckpt/math": "math", "/ckpt/code": "code"}
     monkeypatch.setattr(ray, "get", lambda ref: [f"http://{checkpoint_to_source[ref[0]]}/generate"])
 
-    args = _base_args()
     routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
+    args = _base_args(opd_teacher_routes=routes_json)
 
     shared_pg, managers = opd_utils._start_managed_multi_teacher(args, routes_json)
 
     assert shared_pg == full_pg
     assert isinstance(managers, list) and len(managers) == 2
 
-    # TeacherManager adds rollout_num_gpus itself, so these offsets are
-    # relative to the teacher region: math at 0, code at 0+4=4.
-    assert captured["ctor_calls"]["/ckpt/math"]["bundle_offset"] == 0
-    assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 4
+    # Offsets come from the placement plan and are absolute within the shared
+    # actor PG: math right after the 8-GPU rollout region, code at 8+4=12.
+    assert captured["ctor_calls"]["/ckpt/math"]["bundle_offset"] == 8
+    assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 12
     assert captured["ctor_calls"]["/ckpt/math"]["num_replicas"] == 1
     assert captured["ctor_calls"]["/ckpt/math"]["gpus_per_replica"] == 4
     assert captured["ctor_calls"]["/ckpt/math"]["shared_pg"] is True
@@ -140,3 +140,35 @@ def test_multi_teacher_rejects_uneven_gpu_split(monkeypatch):
 
     with pytest.raises(ValueError, match="evenly divisible"):
         opd_utils._start_managed_multi_teacher(args, routes_json)
+
+
+def test_multi_teacher_deferred_teachers_start_on_rollout_bundles(monkeypatch):
+    """With --opd-teacher-defer and rollout == teacher == actor, the teachers
+    share rollout's bundles instead of following it."""
+    import ray
+
+    from relax.utils.opd import opd_utils
+
+    captured = {"calls": [], "ctor_calls": {}}
+    _install_fake_teacher_manager(monkeypatch, captured)
+    monkeypatch.setattr(opd_utils, "is_managed_opd_teacher_colocate", lambda args: True)
+    full_pg = ("pg", list(range(8)), list(range(8)))
+    monkeypatch.setattr("relax.core.service.create_placement_group", lambda **kwargs: full_pg)
+    monkeypatch.setattr(ray, "get", lambda ref: ["http://teacher/generate"])
+
+    routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})
+    resource = {"actor": [1, 8], "rollout": [1, 8], "teacher": [1, 8]}
+    args = _base_args(opd_teacher_routes=routes_json, opd_teacher_defer=True, resource=resource)
+
+    opd_utils._start_managed_multi_teacher(args, routes_json)
+
+    assert captured["ctor_calls"]["/ckpt/math"]["bundle_offset"] == 0
+    assert captured["ctor_calls"]["/ckpt/code"]["bundle_offset"] == 4
+
+    # Without the flag the same sizes are still refused.
+    import pytest
+
+    with pytest.raises(ValueError, match="rollout_gpus \\+ teacher_gpus == actor_gpus"):
+        opd_utils._start_managed_multi_teacher(
+            _base_args(opd_teacher_routes=routes_json, resource=resource), routes_json
+        )

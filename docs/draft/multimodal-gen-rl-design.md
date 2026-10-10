@@ -852,7 +852,7 @@ Reward manifest 固定 scorer revision、preprocess、component weight 和 check
 
 ### 11.3 与现有 GenRM 的关系
 
-现有 `relax/distributed/ray/genrm.py` 管理的是 SGLang 文本生成式 reward model：它通过可选 `genrm` Serve role 暴露 HTTP 生成接口。PickScore 这类 scorer 直接消费媒体文件/tensor，不需要 tokenizer、HTTP server 或 `GenRMEngine`。
+现有 `relax/distributed/ray/genrm.py` 管理的是 SGLang 文本生成式 reward model：它通过可选 `genrm` Serve role 暴露 HTTP 生成接口。PickScore 这类 scorer 直接消费媒体文件/tensor，不需要 tokenizer、HTTP server 或 SGLang 引擎。
 
 `generative_reward.py` 复用 GenRM 已验证的生命周期原则：Ray manager 持有 worker、`onload()/offload()` 幂等、health check、placement group scheduling 和 finally-offload。区别只在 worker 类型和调用面：它由 rollout 的 post-process hook 内部调用，不注册新核心 role，并直接返回有名字的 reward component。这样既复用现有能力，也不把媒体 scorer 硬塞进文本 GenRM 协议。
 

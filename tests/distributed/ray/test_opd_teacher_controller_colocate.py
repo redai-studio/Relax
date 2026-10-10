@@ -23,12 +23,14 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         gpus_per_replica,
         pg=None,
         shared_pg=False,
+        bundle_offset=0,
         runtime_env=None,
     ):
         captured["num_replicas"] = num_replicas
         captured["gpus_per_replica"] = gpus_per_replica
         captured["pg"] = pg
         captured["shared_pg"] = shared_pg
+        captured["bundle_offset"] = bundle_offset
         captured["runtime_env"] = runtime_env
         return "teacher-manager-handle", ["http://teacher/generate"]
 
@@ -56,6 +58,8 @@ def test_managed_teacher_colocate_uses_full_shared_pg(monkeypatch):
         "gpus_per_replica": 4,
         "pg": full_pg,
         "shared_pg": True,
+        # Right after the 4-GPU rollout region of the shared actor PG.
+        "bundle_offset": 4,
         "runtime_env": {"env_vars": {"A": "B"}},
     }
     assert config.opd_teacher_url == "http://teacher/generate"

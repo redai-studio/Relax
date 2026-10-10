@@ -551,6 +551,12 @@ async def transfer_batch_to_data_system(
         batch_samples = sorted(
             batch_samples, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
         )
+        # Rewards left for the score phase are filled in here, while the batch
+        # still has its prompt groups and before anything is published. If this
+        # raises, nothing of the batch reaches training.
+        from relax.engine.inference.deferred import run_deferred_scoring
+
+        await run_deferred_scoring(args, batch_samples)
         # Flatten nested groups of samples into a single list
         while isinstance(batch_samples[0], list):
             batch_samples = sum(batch_samples, [])

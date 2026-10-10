@@ -11,9 +11,15 @@ import logging
 
 import ray
 
-from relax.backends.sglang.sglang_engine import GenRMEngine
+from relax.backends.sglang.sglang_engine import SGLangEngine
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.distributed.ray.multi_engine_manager import MultiEngineManager, _is_engine_dead  # noqa: F401
+from relax.distributed.ray.multi_engine_manager import (  # noqa: F401
+    SNAPSHOT_CONCURRENCY_GROUP,
+    SNAPSHOT_CONCURRENCY_GROUPS,
+    MultiEngineManager,
+    _is_engine_dead,
+)
+from relax.distributed.ray.placement_planner import GENRM_ROLE, plan_placement
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from relax.utils.http_utils import init_http_client
 from relax.utils.logging_utils import get_logger
@@ -29,7 +35,7 @@ _GENRM_PORT_WINDOW_SIZE = 1000
 _MAX_PORT = 65535
 
 
-@ray.remote
+@ray.remote(concurrency_groups=SNAPSHOT_CONCURRENCY_GROUPS)
 class GenRMManager(MultiEngineManager):
     """Manager for GenRM engines.
 
@@ -48,6 +54,8 @@ class GenRMManager(MultiEngineManager):
 
         self.pg = pg
         self.num_gpu_per_engine = num_gpu_per_engine
+        # Absolute index of this instance's first bundle within ``pg``, as
+        # planned by placement_planner.plan_placement.
         self.bundle_offset = bundle_offset
         self.port_window_index = port_window_index
 
@@ -55,7 +63,7 @@ class GenRMManager(MultiEngineManager):
             args,
             num_slots=num_slots,
             nodes_per_engine=nodes_per_engine,
-            engine_actor_cls=GenRMEngine,
+            engine_actor_cls=SGLangEngine,
             skip_init=args.debug_train_only,
             log_prefix="GenRM",
         )
@@ -63,6 +71,10 @@ class GenRMManager(MultiEngineManager):
         self.genrm_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
+
+    @ray.method(concurrency_group=SNAPSHOT_CONCURRENCY_GROUP)
+    def get_inference_snapshot(self) -> dict:
+        return super().get_inference_snapshot()
 
     def get_genrm_engines_and_lock(self):
         return self.engines, self.genrm_engine_lock, self.num_new_engines
@@ -99,12 +111,12 @@ class GenRMManager(MultiEngineManager):
     # ------------------------------------------------------------------
 
     def _resolve_placement(self, rank):
-        gpu_idx = rank * self.num_gpu_per_engine + self.bundle_offset
-        shared_with_rollout = getattr(self.args, "_genrm_colocate_with_rollout", False)
-        if not self.args.fully_async and not shared_with_rollout:
-            gpu_idx += self.args.rollout_num_gpus
+        return self.pg, False, self.bundle_offset + rank * self.num_gpu_per_engine
 
-        return self.pg, False, gpu_idx
+    def _physical_placement(self):
+        # Every GenRM instance lives in one pool: the actor's, or GenRM's own.
+        pools = {claim.pool for claim in plan_placement(self.args, validate=False).claims if claim.role == GENRM_ROLE}
+        return (pools.pop(), self.pg) if len(pools) == 1 else None
 
     def _ray_resource_kwargs(self, rank):
         # Lower default fractional-GPU footprint when sharing bundles with
@@ -114,6 +126,11 @@ class GenRMManager(MultiEngineManager):
         default_ray_num_gpus = 0.1 if shared_with_rollout else 0.2
         num_gpus = getattr(self.args, "genrm_ray_num_gpus", default_ray_num_gpus)
         return {"num_cpus": num_gpus, "num_gpus": num_gpus}
+
+    def _build_engine_ctor_kwargs(self, rank):
+        # Same engine as rollout; the profile selects GenRM's server args,
+        # static weights and pre-offload drain.
+        return {"profile": "genrm"}
 
     def _build_engine_env_vars(self):
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {

@@ -1,23 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
-import json
-import time
-import uuid
 from argparse import Namespace
 from typing import Any, Dict, List, Optional, Union
 
-import httpx
 import ray
 import transfer_queue as tq
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from ray import serve
 
 from relax.components.base import Base
 from relax.distributed.coordination import PeerStepBarrier
 from relax.distributed.ray.placement_group import create_rollout_manager
+from relax.engine.inference.gateway import SNAPSHOT_FETCH_TIMEOUT_S, InferenceGateway
 from relax.utils.env import Envs
 from relax.utils.http_utils import _wrap_ipv6
 
@@ -353,7 +349,9 @@ class Rollout(Base):
         self.status = "running"
 
         self._sglang_base_url: Optional[str] = None
-        self._proxy_client: Optional[httpx.AsyncClient] = None
+        # The chat proxy forwards to the SGLang router with the body untouched;
+        # the gateway adds discovery and the unified endpoints on top.
+        self._gateway = InferenceGateway("rollout", self._fetch_inference_snapshot, upstream_name="SGLang router")
 
         # Wired by controller in colocate: rollout must wait for all sharing
         # peers (actor, critic, ...) to finish round N (sleep GPU) before
@@ -819,7 +817,13 @@ class Rollout(Base):
         )
 
     @app.get("/engines")
-    async def get_engines(self, model_name: Optional[str] = None):
+    async def get_engines(self, model_name: Optional[str] = None, schema_version: Optional[int] = None):
+        # The legacy per-engine-group shape stays the default; the unified
+        # topology snapshot is opt-in.
+        if schema_version == 2:
+            return await self._gateway.engines()
+        if schema_version is not None:
+            raise HTTPException(status_code=400, detail=f"Unsupported schema_version {schema_version}; use 2.")
         result = await self.rollout_manager.get_engines_info.remote(model_name)
         return result
 
@@ -892,13 +896,8 @@ class Rollout(Base):
 
     # --- OpenAI-compatible Chat Completion API (proxied to SGLang router) ---
 
-    def _get_proxy_client(self) -> httpx.AsyncClient:
-        if self._proxy_client is None:
-            self._proxy_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(None),
-                limits=httpx.Limits(max_connections=4096, max_keepalive_connections=4096, keepalive_expiry=600),
-            )
-        return self._proxy_client
+    def _fetch_inference_snapshot(self) -> dict:
+        return ray.get(self.rollout_manager.get_inference_snapshot.remote(), timeout=SNAPSHOT_FETCH_TIMEOUT_S)
 
     async def _ensure_sglang_base_url(self) -> str:
         if self._sglang_base_url is not None:
@@ -919,6 +918,7 @@ class Rollout(Base):
         return f"{base}{path}"
 
     @app.post("/v1/chat/completions")
+    @app.post("/chat/completions")
     async def chat_completions(self, request: Request):
         body = await request.body()
         try:
@@ -926,93 +926,26 @@ class Rollout(Base):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
-        sglang_url = await self._get_sglang_url("/v1/chat/completions")
-        client = self._get_proxy_client()
+        sglang_url = await self._ensure_sglang_base_url()
+        result = await self._gateway.proxy_chat_completions(
+            sglang_url, body, dict(request.headers), stream=bool(payload.stream)
+        )
+        return result if payload.stream else ChatCompletionResponse(**result)
 
-        if payload.stream:
-            return await self._stream_chat_completions(client, sglang_url, body, dict(request.headers))
-        return await self._non_stream_chat_completions(client, sglang_url, body, dict(request.headers))
-
-    async def _non_stream_chat_completions(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-        body: bytes,
-        headers: Dict[str, str],
-    ) -> ChatCompletionResponse:
-        forward_headers = self._build_forward_headers(headers)
+    @app.post("/generate")
+    async def generate(self, request: Request):
+        """Forward a native SGLang payload using the shared routing rules."""
         try:
-            response = await client.post(url, content=body, headers=forward_headers)
-            response.raise_for_status()
-            data = response.json()
-            return ChatCompletionResponse(**data)
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            self._logger.error(f"Failed to proxy chat completion to SGLang: {e}")
-            raise HTTPException(status_code=502, detail=f"Failed to connect to SGLang router: {e}")
+            payload = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+        return await self._gateway.generate(payload)
 
-    async def _stream_chat_completions(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-        body: bytes,
-        headers: Dict[str, str],
-    ) -> StreamingResponse:
-        forward_headers = self._build_forward_headers(headers)
-
-        async def _event_generator():
-            response = None
-            try:
-                req = client.build_request("POST", url, content=body, headers=forward_headers)
-                response = await client.send(req, stream=True)
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if line:
-                        yield f"{line}\n\n"
-            except httpx.HTTPStatusError as e:
-                error_body = await e.response.aread()
-                error_chunk = _make_error_chunk(e.response.status_code, error_body.decode(errors="replace"))
-                yield f"data: {error_chunk}\n\n"
-                yield "data: [DONE]\n\n"
-            except httpx.RequestError as e:
-                self._logger.error(f"Streaming connection to SGLang failed: {e}")
-                error_chunk = _make_error_chunk(502, f"Failed to connect to SGLang router: {e}")
-                yield f"data: {error_chunk}\n\n"
-                yield "data: [DONE]\n\n"
-            finally:
-                if response is not None:
-                    await response.aclose()
-
-        return StreamingResponse(_event_generator(), media_type="text/event-stream")
-
-    @staticmethod
-    def _build_forward_headers(original_headers: Dict[str, str]) -> Dict[str, str]:
-        hop_by_hop = {"host", "transfer-encoding", "connection", "keep-alive", "upgrade"}
-        return {k: v for k, v in original_headers.items() if k.lower() not in hop_by_hop}
+    @app.get("/health")
+    async def health(self) -> dict:
+        return await self._gateway.health()
 
     @app.get("/v1/models", response_model=ModelListResponse)
     async def list_models(self):
         sglang_url = await self._get_sglang_url("/v1/models")
-        client = self._get_proxy_client()
-        try:
-            response = await client.get(sglang_url)
-            response.raise_for_status()
-            return ModelListResponse(**response.json())
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-        except httpx.RequestError as e:
-            self._logger.error(f"Failed to proxy model list to SGLang: {e}")
-            raise HTTPException(status_code=502, detail=f"Failed to connect to SGLang router: {e}")
-
-
-def _make_error_chunk(status_code: int, message: str) -> str:
-    error_response = {
-        "id": f"chatcmpl-error-{uuid.uuid4().hex[:8]}",
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": "error",
-        "choices": [],
-        "error": {"code": status_code, "message": message},
-    }
-    return json.dumps(error_response)
+        return ModelListResponse(**await self._gateway.proxy_get_json(sglang_url))

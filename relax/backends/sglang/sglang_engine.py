@@ -335,7 +335,54 @@ def _wait_server_healthy(base_url, api_key, is_process_alive, timeout=None):
             time.sleep(2)
 
 
+@dataclasses.dataclass(frozen=True)
+class EngineProfile:
+    """How an engine differs by the kind of model it serves.
+
+    One engine implementation serves the policy (rollout), GenRM judges and OPD
+    teachers; the profile carries the few differences between them.
+    """
+
+    name: str
+    # Static weights are loaded once from the checkpoint. Such an engine never
+    # joins weight sync and rejects every weight update.
+    static_weights: bool = False
+    # Whether the engine may sit behind the rollout router.
+    uses_router: bool = True
+    # Build the server args from the genrm_* arguments instead of the policy's.
+    genrm_server_args: bool = False
+    apply_policy_load_plan: bool = True
+    # Stop admitting and abort in-flight requests before releasing GPU memory,
+    # and admit again after a full resume.
+    drain_before_release: bool = False
+
+
+POLICY_PROFILE = EngineProfile("policy")
+GENRM_PROFILE = EngineProfile(
+    "genrm",
+    static_weights=True,
+    uses_router=False,
+    genrm_server_args=True,
+    apply_policy_load_plan=False,
+    drain_before_release=True,
+)
+TEACHER_PROFILE = EngineProfile("teacher", static_weights=True, uses_router=False)
+ENGINE_PROFILES: dict[str, EngineProfile] = {
+    profile.name: profile for profile in (POLICY_PROFILE, GENRM_PROFILE, TEACHER_PROFILE)
+}
+
+
+def resolve_engine_profile(name: str) -> EngineProfile:
+    try:
+        return ENGINE_PROFILES[name]
+    except KeyError:
+        raise ValueError(f"Unknown engine profile {name!r}; available: {sorted(ENGINE_PROFILES)}.") from None
+
+
 class SGLangEngine(RayActor):
+    # Engines built without ``__init__`` behave as policy engines.
+    profile: EngineProfile = POLICY_PROFILE
+
     def __init__(
         self,
         args,
@@ -345,8 +392,10 @@ class SGLangEngine(RayActor):
         sglang_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
         register_sigterm_handler: bool = False,
+        profile: str = POLICY_PROFILE.name,
     ):
         self.args = args
+        self.profile = resolve_engine_profile(profile)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -397,9 +446,14 @@ class SGLangEngine(RayActor):
                 before accepting requests. The caller must call register_to_router()
                 after weight sync completes.
         """
-        self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
-        self.router_port = router_port if router_port is not None else self.args.sglang_router_port
-        self._skip_router_registration = skip_router_registration
+        if self.profile.uses_router:
+            self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
+            self.router_port = router_port if router_port is not None else self.args.sglang_router_port
+            self._skip_router_registration = skip_router_registration
+        else:
+            self.router_ip = ""
+            self.router_port = 0
+            self._skip_router_registration = True
 
         host = host or get_host_info()[1]
 
@@ -417,19 +471,32 @@ class SGLangEngine(RayActor):
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
         dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
 
-        server_args_dict, external_engine_need_check_fields = _compute_server_args(
-            self.args,
-            self.rank,
-            dist_init_addr,
-            nccl_port,
-            host,
-            port,
-            self.worker_type,
-            disaggregation_bootstrap_port,
-            base_gpu_id=self.base_gpu_id,
-            sglang_overrides=self.sglang_overrides,
-            num_gpus_per_engine=self.num_gpus_per_engine,
-        )
+        if self.profile.genrm_server_args:
+            server_args_dict, external_engine_need_check_fields = _compute_genrm_server_args(
+                self.args,
+                self.rank,
+                dist_init_addr,
+                nccl_port,
+                host,
+                port,
+                self.worker_type,
+                disaggregation_bootstrap_port,
+                base_gpu_id=self.base_gpu_id,
+            )
+        else:
+            server_args_dict, external_engine_need_check_fields = _compute_server_args(
+                self.args,
+                self.rank,
+                dist_init_addr,
+                nccl_port,
+                host,
+                port,
+                self.worker_type,
+                disaggregation_bootstrap_port,
+                base_gpu_id=self.base_gpu_id,
+                sglang_overrides=self.sglang_overrides,
+                num_gpus_per_engine=self.num_gpus_per_engine,
+            )
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
@@ -444,16 +511,27 @@ class SGLangEngine(RayActor):
             if not init_external_kwargs:
                 init_external_kwargs = {"external_engine_need_check_fields": external_engine_need_check_fields}
             self._init_external(server_args_dict, **init_external_kwargs)
-        else:
+        elif self.profile.apply_policy_load_plan:
             self._init_normal(server_args_dict)
+        else:
+            self._init_normal(server_args_dict, apply_policy_load_plan=False)
 
         # Register to DCS coordinator only if not skipped (e.g., for scaled-out engines)
         # Scaled-out engines use direct weight sync from seed engine instead of DCS.
         # Done after engine startup so the coordinator can immediately reach the server.
-        if not skip_dcs_registration:
+        # A static model takes no part in weight sync at all.
+        if not skip_dcs_registration and not self.profile.static_weights:
             self.register_dcs()
 
+    def _require_dynamic_weights(self, operation: str) -> None:
+        if self.profile.static_weights:
+            raise RuntimeError(
+                f"{operation} is not available on a {self.profile.name!r} engine: a static model is loaded once "
+                "from its checkpoint and does not accept weight updates."
+            )
+
     def register_dcs(self):
+        self._require_dynamic_weights("register_dcs")
         if self.node_rank == 0 and self.args.fully_async:
             # Resolve effective num_gpus_per_engine for this engine
             effective_num_gpus = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
@@ -609,6 +687,7 @@ class SGLangEngine(RayActor):
         Note: The model should be on GPUs rather than CPU for this functionality to work properly.
         If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
         """
+        self._require_dynamic_weights("update_weights_from_tensor")
         payload = {
             "serialized_named_tensors": serialized_named_tensors,
             "load_format": load_format,
@@ -655,6 +734,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_dynamic_weights("load_lora_adapter_from_tensors")
         return self._make_request(
             "load_lora_adapter_from_tensors",
             {
@@ -703,6 +783,7 @@ class SGLangEngine(RayActor):
         Returns:
             Response dict from the server (``{"success": bool, ...}``), or None on non-lead node.
         """
+        self._require_dynamic_weights("update_lora_from_distributed")
         return self._make_request(
             "update_lora_from_distributed",
             {
@@ -1014,20 +1095,104 @@ class SGLangEngine(RayActor):
         return response.json()["weight_version"]
 
     def release_memory_occupation(self):
+        if self.profile.drain_before_release:
+            return self._drain_and_release_memory_occupation()
         self.flush_cache()
         return self._make_request("release_memory_occupation")
 
+    def _drain_and_release_memory_occupation(self):
+        # GenRM is colocated on the training GPUs, so it must offload at the
+        # rollout->train transition. Two failure modes are defended against here:
+        #
+        # 1. Admission race. SGLang's release_memory_occupation asserts the
+        #    scheduler is idle (``_is_no_request``); a straggler agentic
+        #    /generate admitted between our flush and the release crashes the
+        #    scheduler. relax has no hard barrier guaranteeing all agentic
+        #    sessions are quiesced before offload, so /pause_generation
+        #    (mode="abort", the default) is issued first: it stops the scheduler
+        #    from admitting new requests for the whole offloaded window AND
+        #    aborts everything in flight. Admission is re-opened by
+        #    continue_generation in resume_memory_occupation, after weights + KV
+        #    cache are back. We still abort on each retry as a fallback in case
+        #    the pause did not take (best-effort). Safe because the batch's
+        #    reward/judge is already computed by offload time — no in-flight
+        #    GenRM request needs to survive.
+        #
+        # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
+        #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
+        #    scheduler blocks rank-0 in ray.get() forever and every other rank
+        #    stalls at the downstream offload barrier — a silent training hang.
+        if self.node_rank == 0:
+            deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
+            self._pause_generation_for_offload(deadline)
+            connect_errors = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timeout while draining GenRM before release.")
+                self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+                try:
+                    resp = requests.get(
+                        f"http://{self.server_host}:{self.server_port}/flush_cache",
+                        timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
+                    )
+                    if resp.status_code == 200:
+                        break
+                    connect_errors = 0
+                except requests.exceptions.ConnectionError as e:
+                    # requests wraps urllib3's NewConnectionError, so catching the
+                    # latter here would never fire and a dead engine would be
+                    # retried until the drain deadline.
+                    connect_errors += 1
+                    logger.warning(
+                        f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
+                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
+                    )
+                    if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
+                        raise ConnectionError(
+                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
+                            f"draining before release ({connect_errors} consecutive connection "
+                            f"errors) — the server process is most likely dead."
+                        ) from e
+                except Exception as e:  # noqa: BLE001
+                    connect_errors = 0
+                    logger.info(f"Error flushing GenRM cache: {e}")
+                time.sleep(1)
+        return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
+
     def resume_memory_occupation(self, tags: list[str] = None):
         """Available tags for multi-stage resume: weights, kv_cache."""
-        return self._make_request(
+        result = self._make_request(
             "resume_memory_occupation",
             {"tags": tags},
         )
+        # Re-open admission that the pre-release drain closed via
+        # /pause_generation. Only after a full resume (weights + KV cache back):
+        # GenRM always full-resumes, but the ``not tags`` guard prevents
+        # re-enabling generation before KV cache exists if a partial
+        # (weights-only) resume is ever introduced. Not swallowed — if the
+        # engine stays paused, GenRM silently stops serving, so fail loudly.
+        if self.profile.drain_before_release and self.node_rank == 0 and not tags:
+            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+        return result
+
+    def _pause_generation_for_offload(self, deadline: float) -> None:
+        """Best-effort /pause_generation (abort mode) before draining for
+        offload.
+
+        Never raises: if the pause does not take, the per-retry abort in
+        release_memory_occupation still drains the engine — the pause only
+        additionally closes the flush->release admission window.
+        """
+        try:
+            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
     def init_weights_update_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
+        self._require_dynamic_weights("init_weights_update_group")
         return self._make_request(
             "init_weights_update_group",
             {
@@ -1055,6 +1220,7 @@ class SGLangEngine(RayActor):
     def update_weights_from_distributed(
         self, names, dtypes, shapes, group_name, flush_cache=False, weight_version: str | None = None
     ):
+        self._require_dynamic_weights("update_weights_from_distributed")
         payload = {
             "names": names,
             "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
@@ -1396,141 +1562,6 @@ class SGLangEngine(RayActor):
         if self.node_rank == 0 and self.checkpoint_engine_client is not None:
             logger.info(f"Unregistering checkpoint engine client for engine {self.server_host}:{self.server_port}...")
             run(self.checkpoint_engine_client.unregister())
-
-
-class GenRMEngine(SGLangEngine):
-    """GenRM Engine for Generative Reward Model.
-
-    Inherits from SGLangEngine and overrides initialization to use genrm-
-    specific arguments (model path, GPU count, sampling parameters, etc.).
-    """
-
-    def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
-        """Initialize the genRM engine with genrm-specific arguments."""
-        self.router_ip = ""
-        self.router_port = 0
-        self._skip_router_registration = True
-
-        host = host or get_host_info()[1]
-
-        def _format_v6_uri(addr):
-            if not addr or addr.startswith("["):
-                return addr
-            try:
-                if ipaddress.ip_address(addr).version == 6:
-                    return f"[{addr}]"
-            except ValueError:
-                pass
-            return addr
-
-        host = _format_v6_uri(host)
-        ip_part, port_part = dist_init_addr.rsplit(":", 1)
-        dist_init_addr = f"{_format_v6_uri(ip_part)}:{port_part}"
-
-        server_args_dict, external_engine_need_check_fields = _compute_genrm_server_args(
-            self.args,
-            self.rank,
-            dist_init_addr,
-            nccl_port,
-            host,
-            port,
-            self.worker_type,
-            disaggregation_bootstrap_port,
-            base_gpu_id=self.base_gpu_id,
-        )
-
-        self.node_rank = server_args_dict["node_rank"]
-        self.server_host = server_args_dict["host"]  # with [] if ipv6
-        self.server_port = server_args_dict["port"]
-
-        if self.args.rollout_external:
-            self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
-        else:
-            self._init_normal(server_args_dict, apply_policy_load_plan=False)
-
-    def release_memory_occupation(self):
-        # GenRM is colocated on the training GPUs, so it must offload at the
-        # rollout->train transition. Two failure modes are defended against here:
-        #
-        # 1. Admission race. SGLang's release_memory_occupation asserts the
-        #    scheduler is idle (``_is_no_request``); a straggler agentic
-        #    /generate admitted between our flush and the release crashes the
-        #    scheduler. relax has no hard barrier guaranteeing all agentic
-        #    sessions are quiesced before offload, so /pause_generation
-        #    (mode="abort", the default) is issued first: it stops the scheduler
-        #    from admitting new requests for the whole offloaded window AND
-        #    aborts everything in flight. Admission is re-opened by
-        #    continue_generation in resume_memory_occupation, after weights + KV
-        #    cache are back. We still abort on each retry as a fallback in case
-        #    the pause did not take (best-effort). Safe because the batch's
-        #    reward/judge is already computed by offload time — no in-flight
-        #    GenRM request needs to survive.
-        #
-        # 2. Unbounded hang. Every HTTP call must have a timeout and the whole
-        #    drain must be bounded by a wall-clock deadline. Otherwise a wedged
-        #    scheduler blocks rank-0 in ray.get() forever and every other rank
-        #    stalls at the downstream offload barrier — a silent training hang.
-        if self.node_rank == 0:
-            deadline = time.monotonic() + _GENRM_OFFLOAD_DRAIN_TIMEOUT_S
-            self._pause_generation_for_offload(deadline)
-            connect_errors = 0
-            while True:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Timeout while draining GenRM before release.")
-                self.abort_requests(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
-                try:
-                    resp = requests.get(
-                        f"http://{self.server_host}:{self.server_port}/flush_cache",
-                        timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()),
-                    )
-                    if resp.status_code == 200:
-                        break
-                    connect_errors = 0
-                except requests.exceptions.ConnectionError as e:
-                    # requests wraps urllib3's NewConnectionError, so catching the
-                    # latter here would never fire and a dead engine would be
-                    # retried until the drain deadline.
-                    connect_errors += 1
-                    logger.warning(
-                        f"Cannot reach {self.server_host}:{self.server_port}/flush_cache while "
-                        f"draining GenRM ({connect_errors}/{_MAX_CONSECUTIVE_CONNECT_ERRORS}): {e}"
-                    )
-                    if connect_errors >= _MAX_CONSECUTIVE_CONNECT_ERRORS:
-                        raise ConnectionError(
-                            f"GenRM engine {self.server_host}:{self.server_port} unreachable while "
-                            f"draining before release ({connect_errors} consecutive connection "
-                            f"errors) — the server process is most likely dead."
-                        ) from e
-                except Exception as e:  # noqa: BLE001
-                    connect_errors = 0
-                    logger.info(f"Error flushing GenRM cache: {e}")
-                time.sleep(1)
-        return self._make_request("release_memory_occupation", timeout=_GENRM_OFFLOAD_RELEASE_TIMEOUT_S)
-
-    def resume_memory_occupation(self, tags: list[str] = None):
-        result = super().resume_memory_occupation(tags=tags)
-        # Re-open admission that release_memory_occupation closed via
-        # /pause_generation. Only after a full resume (weights + KV cache back):
-        # GenRM always full-resumes, but the ``not tags`` guard prevents
-        # re-enabling generation before KV cache exists if a partial
-        # (weights-only) resume is ever introduced. Not swallowed — if the
-        # engine stays paused, GenRM silently stops serving, so fail loudly.
-        if self.node_rank == 0 and not tags:
-            self.continue_generation(timeout=_SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
-        return result
-
-    def _pause_generation_for_offload(self, deadline: float) -> None:
-        """Best-effort /pause_generation (abort mode) before draining for
-        offload.
-
-        Never raises: if the pause does not take, the per-retry abort in
-        release_memory_occupation still drains the engine — the pause only
-        additionally closes the flush->release admission window.
-        """
-        try:
-            self.pause_generation(timeout=max(_MIN_HTTP_TIMEOUT_S, deadline - time.monotonic()))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"GenRM pause_generation before offload failed (continuing to drain): {e}")
 
 
 def _enable_draft_weights_cpu_backup(args, sglang_overrides: dict | None = None) -> bool:
