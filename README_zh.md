@@ -2,8 +2,6 @@
 
 ## Relax: An Asynchronous Reinforcement Learning Engine for Omni-Modal Post-Training at Scale
 
-**Towards Async, Omni-Modal RL at Scale, Just Relax.**
-
 <img src="./assets/Relax.jpg" width="800" alt="Relax">
 
 <p>
@@ -32,108 +30,23 @@
 </p>
 </div>
 
-______________________________________________________________________
+**Relax** 是小红书 AI 平台开源的强化学习后训练框架，支持使用文本、图像、视频和音频训练大模型，也支持训练使用工具、与环境交互的智能体。
 
-**Relax**（**R**einforcement **E**ngine **L**everaging **A**gentic **X**-modality）是小红书 AI 平台开源的、面向多模态大模型的高性能强化学习后训练框架。Relax 基于 Ray Serve 构建面向服务的架构，以 Megatron-LM 为训练后端、SGLang 为推理引擎，通过 [TransferQueue](https://github.com/redai-studio/TransferQueue) 数据传输系统实现训练与推理的完全解耦，支持从文本到图像、视频、音频的全模态强化学习训练。
+Relax 使用 Megatron-LM 训练模型、SGLang 生成样本，通过 Ray Serve 管理服务。[TransferQueue](https://github.com/redai-studio/TransferQueue) 在训练与推理之间传递数据，让两者可以独立运行。
 
-______________________________________________________________________
+## ✨ 核心能力
 
-## ✨ 亮点
-
-- 🌐 **全模态统一训练** — 单一框架覆盖文本、视觉、音频强化学习，业界少数能够在统一架构下完成 Omni 模型（Qwen3-Omni）后训练的系统
-- ⚙️ **面向服务的六层架构** — 所有角色均作为独立 Ray Serve 服务部署，原生支持服务级别的弹性调度与故障恢复
-- ⚡ **基于 TransferQueue 的全异步训练** — Rollout、Actor、ActorFwd、Reference、Advantages 运行在独立 GPU 集群，流式数据交换，可配置 staleness
-- 🔁 **Hybrid 混合模式** — Actor 与 Rollout 独立 Placement Group + TransferQueue 流式数据，ref / actor_fwd / advantages 在 Actor 本机进程内完成；配合 `--balance-data` 与子批 forward，避免独立 ref/actor_fwd 服务的 GPU 浪费
-- 🤖 **Agentic RL** — 多轮交互、loss masking、灵活的终止条件以及 VLM 多模态上下文累积，构建"执行 → 观察 → 决策"闭环训练
-- 🔀 **Rollout 弹性扩缩容** — 通过 HTTP REST API 在训练过程中动态增减推理引擎，支持同集群（`ray_native`）和跨集群联邦（`external`）两种模式
-- 🧠 **丰富的算法矩阵** — 开箱即用的 PPO、GRPO、M2PO、RLOO、REINFORCE++ 系列、GSPO、SAPO、CISPO 与 On-Policy Distillation，配合可插拔奖励函数和内置 **GenRM**（LLM-as-judge）模式
-- 🚀 **Megatron + SGLang 后端** — Megatron-LM（TP/PP/CP/EP）训练 MoE 和深层模型，SGLang 提供高吞吐推理，DCS 基于 NCCL 广播同步权重
-- 📦 **生产级运维** — HealthManager 自动恢复、中心化 Metrics Service（WandB / TensorBoard / ClearML）、Apprise 实时告警
-
-______________________________________________________________________
-
-## 📢 最新动态
-
-| 📣 更新                                                                                                                                                                            |
-| :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **\[08/20/2026\]** 🧠 新增 **M2PO**、**RLOO** 与两种 **REINFORCE++** 算法；提供 RLOO 与 REINFORCE++ 可运行配方，并在[算法参考](docs/zh/examples/algorithms.md)中涵盖以上四种算法。 |
-| **\[08/19/2026\]** 🤖 新增支持多上下文轨迹导出的 multi-agent 训练，并提供 [Search-R1 参考配方](examples/search_r1/)。                                                              |
-| **\[08/18/2026\]** 🪶 LoRA RL 现已支持 MoE 模型的 adapter 与 merge 两种工作流，详见 [LoRA 训练指南](docs/zh/guide/low-rank-adaptation-training.md)。                               |
-| **\[05/26/2026\]** 🔁 新增 **Hybrid** 执行模式 —— 流式数据 + 进程内 ref/actor_fwd，支持 `--balance-data`，详见 [Hybrid 训练指南](docs/zh/guide/hybrid-training.md)。               |
-| **\[05/11/2026\]** 🚀 支持 Qwen3.6 系列模型（纯文本+多模）！                                                                                                                       |
-| **\[04/15/2026\]** 🎉 Relax 正式开源！                                                                                                                                             |
-
-______________________________________________________________________
-
-## 🏗️ 系统架构
-
-<div align="center">
-  <img src="./assets/arch.png" width="80%" alt="Relax 架构图">
-</div>
-
-Relax 采用**面向服务的六层架构**，每个角色均作为独立的 [Ray Serve](https://docs.ray.io/en/latest/serve/index.html) 部署，将编排、组件、引擎、后端与分布式能力彻底解耦：
-
-| 层级                        | 职责                                                                                                           |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------- |
-| **Entrypoints（入口层）**   | `train.py` — 信号处理、CLI 解析、Ray 集群连接、Controller 启动                                                 |
-| **Orchestration（编排层）** | `Controller`（训练循环、全局重启）、`Service`（Placement Group、生命周期管理）、`Registry`（角色与算法注册）   |
-| **Components（组件层）**    | Ray Serve 部署：**Actor**、**Rollout**、**Critic**、**ActorFwd**、**Advantages**、**GenRM**                    |
-| **Engine（引擎层）**        | SGLang Rollout 引擎、可插拔奖励函数、请求路由、数据过滤                                                        |
-| **Backends（后端层）**      | **Megatron-LM** 训练后端（TP/PP/CP/EP）与 **SGLang** 推理引擎                                                  |
-| **Distributed（分布式层）** | Ray Actor Groups（RolloutManager / GenRMManager）与 **DCS**（分布式 Checkpoint 服务，支持 NCCL/GLOO 权重同步） |
-
-支持**三种执行模式**：
-
-- **Colocate（同步模式）** — Actor 与 Rollout 共享同一组 GPU，Rollout 将整批数据写入 TransferQueue 后释放 GPU 供训练使用；显存友好，严格 on-policy（`max_staleness=0`）。
-- **Fully Async（全异步模式）** — Actor、Rollout、ActorFwd、Reference、Advantages 运行在**独立 GPU 集群**上完全并行，通过 TransferQueue 交换数据，通过 DCS 异步同步权重，在可配置 staleness 下实现最大吞吐。
-- **Hybrid（混合模式）** — Actor 与 Rollout 使用**独立的 Placement Group**（与全异步一致），通过 TransferQueue 流式交换数据并支持可配置 staleness；但 ref / actor_fwd / advantages 通过 `TensorBackuper` + `_switch_model` 在 Actor 自身 GPU 上**进程内复用权重**（与 Colocate 一致）。在不为独立 ref/actor_fwd 服务付出额外 GPU 的前提下，同时获得流式数据管线与 `--balance-data` 支持。
-
-> 📖 了解更多：[架构指南](docs/zh/guide/architecture.md) · [全异步训练](docs/zh/guide/fully-async-training.md) · [Hybrid 训练](docs/zh/guide/hybrid-training.md) · [Rollout 弹性扩缩容](docs/zh/guide/elastic-rollout.md)
-
-______________________________________________________________________
-
-## 🧠 支持的算法
-
-| 算法                       | 类型         | 描述                                              |
-| :------------------------- | :----------- | :------------------------------------------------ |
-| **PPO**                    | Actor-Critic | Proximal Policy Optimization                      |
-| **GRPO**                   | 策略优化     | Group Relative Policy Optimization                |
-| **M2PO**                   | 策略优化     | Second-Moment Trust Policy Optimization           |
-| **RLOO**                   | 策略优化     | REINFORCE Leave-One-Out                           |
-| **REINFORCE++**            | 策略优化     | token KL-to-go 与全局归一化                       |
-| **REINFORCE++-baseline**   | 策略优化     | 使用组基线的 REINFORCE++ 变体                     |
-| **GSPO**                   | 策略优化     | Group-wise Sequence-level Policy Optimization     |
-| **SAPO**                   | 策略优化     | Soft Adaptive Policy Optimization                 |
-| **CISPO**                  | 策略优化     | Clipped Importance-ratio Soft Policy Optimization |
-| **On-Policy Distillation** | 知识迁移     | 基于 KL 惩罚的师生蒸馏                            |
-
-> 📖 各算法的目标函数、训练脚本与执行模式限制请参阅[算法参考](docs/zh/examples/algorithms.md)。
-
-______________________________________________________________________
-
-## 🤖 支持的模型
-
-Relax 专为**全模态强化学习训练**设计 —— 文本、视觉、音频统一框架。通过 `--multimodal-keys` 参数灵活配置多模态数据，框架内置了完整的图像、视频、音频处理管线（`relax/utils/multimodal/`），支持图像 token 数量控制、视频帧率采样、音频采样率等精细调节。
-
-| 模型系列                                                        | 规模                                       | 模态               | 典型任务                                 | 后端     |
-| :-------------------------------------------------------------- | :----------------------------------------- | :----------------- | :--------------------------------------- | :------- |
-| **Qwen3**                                                       | 4B, 30B-A3B (MoE)                          | 文本               | 数学推理、代码生成、多轮对话、工具调用   | Megatron |
-| **Qwen3-VL**                                                    | 4B, 30B-A3B                                | 视觉 + 语言        | 视觉问答、图像理解、多模态推理           | Megatron |
-| **Qwen3.5**                                                     | 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B | 文本 + 视觉        | 推理、SFT、视觉问答、多模态推理          | Megatron |
-| **Qwen3-Omni**                                                  | 30B-A3B                                    | 文本 + 视觉 + 音频 | 图文音频联合问答、全模态理解             | Megatron |
-| **Qwen3.6**                                                     | 27B, 35B-A3B                               | 文本 + 视觉        | 推理、视觉问答、多模态推理               | Megatron |
-| **Qwen3.8**                                                     | 27B                                        | 文本 + 视觉        | 推理、SFT、视觉问答、多模态推理          | Megatron |
-| **GLM5**                                                        | 744B-A40B (MoE)                            | 文本               | 数学推理、代码生成、多轮对话             | Megatron |
-| **Kimi K2.6**                                                   | ~1T-A32B (MoE)                             | 视觉 + 语言        | 视觉问答、多模态推理；支持 INT4 QAT 训练 | Megatron |
-| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                                         | 视觉 + 语言        | OCR、文档理解、多模态推理                | Megatron |
-
-> 📖 新模型架构通过 Megatron Bridge 接入；Rollout、训练与权重转换所需的适配点请参阅[外部模型接入指南](docs/zh/guide/external-model-integration.md)。
-
-______________________________________________________________________
+- **全模态训练** — 在同一框架中训练文本、视觉语言和音视频模型，支持 Qwen3-Omni 等全模态模型。
+- **异步训练** — 生成样本与模型训练并行进行，可配置数据新鲜度。根据 GPU 资源和对 on-policy 的要求选择训练模式。
+- **Agentic RL** — 支持工具调用、环境反馈、多轮交互和多智能体训练。Loss masking 只让模型输出参与训练损失，排除环境观察；多模态上下文可跨轮保留。参阅 [Agentic 指南](docs/zh/guide/agentic-rollout.md)。
+- **Dense 与 MoE 模型** — 支持张量、流水线、上下文和专家并行（TP/PP/CP/EP），也支持 Dense 与 MoE 模型的 [LoRA 训练](docs/zh/guide/low-rank-adaptation-training.md)。
+- **算法与奖励** — 支持多种 RL 算法和 On-Policy Distillation，内置数学、问答和指令遵循奖励。可以添加自定义奖励，也可以通过 [GenRM](docs/zh/examples/generative-reward-model.md) 让模型为回答打分。
+- **Rollout 弹性扩缩容** — 在训练过程中添加推理引擎，也可接入其他集群的引擎。缩容时，等待待处理请求完成后再移除新增引擎。参阅[扩缩容指南](docs/zh/guide/elastic-rollout.md)。
+- **监控与恢复** — 故障后自动重启服务，必要时重启整个训练任务。通过 TensorBoard、WandB 或 ClearML 查看指标，通过 Apprise 接收训练通知。
 
 ## 📦 安装
 
-推荐使用官方 Docker 镜像运行 Relax，镜像中已预装并版本对齐 CUDA、PyTorch、Megatron-LM、SGLang、Ray 等全部依赖。
+推荐使用官方 Docker 镜像，其中已预装 CUDA、PyTorch、Megatron-LM、SGLang 和 Ray。将 `/path/to/your/workspace` 替换为宿主机目录，用于保存代码、模型和数据。
 
 ```bash
 # 拉取官方镜像
@@ -141,59 +54,96 @@ docker pull ghcr.io/redai-studio/relaxrl:latest
 
 # 启动容器，挂载 GPU、共享内存与工作目录
 docker run -it --gpus all --ipc=host --network=host \
-  -v /path/to/your/workspace:/root \
+  -v /path/to/your/workspace:/workspace \
   ghcr.io/redai-studio/relaxrl:latest bash
 
 # 容器内克隆仓库并安装
-git clone https://github.com/redai-studio/Relax.git /root/Relax
-cd /root/Relax && pip install -e .
+git clone https://github.com/redai-studio/Relax.git /workspace/Relax
+cd /workspace/Relax && pip install -e .
 ```
 
 > 📖 关于 GPU 驱动要求、多节点部署与持久化存储挂载，请参阅 [安装指南](docs/zh/guide/installation.md)。
 
-______________________________________________________________________
-
 ## 🚀 快速开始
 
-三个端到端任务覆盖**文本**、**视觉-语言**、**全模态**训练。每个任务直接从 HuggingFace 下载数据集与模型，并通过单条脚本启动。只需将 `EXP_DIR` 指向模型与数据集所在的根目录（如 `/root`），脚本会自动定位。
+选择一个**文本**、**视觉语言**或**音视频**任务，在训练容器的 `/workspace/Relax` 目录中运行下面的命令。设置 `EXP_DIR=/workspace` 后，脚本即可找到下载的模型与数据。本例将 ClearML 设为离线模式。
 
 ### 任务一 — DAPO Math（文本，8 卡）
 
-在 [`dapo-math-17k`](https://huggingface.co/datasets/zhuzilin/dapo-math-17k) 数学推理数据集上使用 GRPO 训练 Qwen3-4B，奖励采用规则抽取 + 符号数学校验。
+使用 GRPO 在 [`dapo-math-17k`](https://huggingface.co/datasets/zhuzilin/dapo-math-17k) 上训练 Qwen3-4B，并用 AIME 2024 评估。奖励通过规则抽取与符号数学校验判断答案是否正确。
 
 ```bash
-hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /root/dapo-math-17k
-hf download Qwen/Qwen3-4B --local-dir /root/Qwen3-4B
+hf download --repo-type dataset zhuzilin/dapo-math-17k --local-dir /workspace/dapo-math-17k
+hf download Qwen/Qwen3-4B --local-dir /workspace/Qwen3-4B
+hf download --repo-type dataset zhuzilin/aime-2024 --local-dir /workspace/aime-2024
+python scripts/tools/process_aime.py --input /workspace/aime-2024/aime-2024.jsonl
 
-cd /root/Relax && export EXP_DIR=/root
+cd /workspace/Relax
+export EXP_DIR=/workspace
+export CLEARML_OFFLINE_MODE=1
 bash scripts/training/text/run-qwen3-4B-8xgpu.sh
 ```
 
-### 任务二 — Open-R1（视觉-语言，8 卡）
+<details>
+<summary>Open-R1：视觉语言训练，8 卡</summary>
 
 在 [`multimodal-open-r1-8k-verified`](https://huggingface.co/datasets/lmms-lab/multimodal-open-r1-8k-verified) 上使用 GRPO 训练 Qwen3-VL-4B，奖励使用 `openr1mm`。
 
 ```bash
 hf download --repo-type dataset lmms-lab/multimodal-open-r1-8k-verified \
-  --local-dir /root/multimodal-open-r1-8k-verified
-hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /root/Qwen3-VL-4B-Instruct
+  --local-dir /workspace/multimodal-open-r1-8k-verified
+python scripts/tools/process_openr1.py \
+  --input-dir /workspace/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
+  --output-dir /workspace/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
+hf download Qwen/Qwen3-VL-4B-Instruct --local-dir /workspace/Qwen3-VL-4B-Instruct
 
-cd /root/Relax && export EXP_DIR=/root
+cd /workspace/Relax
+export EXP_DIR=/workspace
+export CLEARML_OFFLINE_MODE=1
 bash scripts/training/multimodal/run-qwen3-vl-4B-8xgpu.sh
 ```
 
-### 任务三 — AVQA（全模态：图像 + 音频，16 卡 / 2 节点）
+</details>
+
+<details>
+<summary>AVQA：图像与音频训练，16 卡 / 2 节点</summary>
 
 在 [`AVQA-R1-6K`](https://huggingface.co/datasets/harryhsing/AVQA-R1-6K) 上使用 GRPO 训练 Qwen3-Omni-30B-A3B，奖励采用多选题匹配。
 
-```bash
-hf download --repo-type dataset harryhsing/AVQA-R1-6K --local-dir /root/AVQA-R1-6K
-hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /root/Qwen3-Omni-30B-A3B-Instruct
+启动双节点训练前，按[多节点训练说明](docs/zh/guide/customize-training.md)配置 `MASTER_ADDR`、`POD_NAME`、`HOST_IP` 和 `WORLD_SIZE`。两个节点需要使用相同的模型与数据路径。下面的命令会准备数据，并加载 Qwen3-Omni 随附的 chat template。
 
-cd /root/Relax && export EXP_DIR=/root
+```bash
+hf download --repo-type dataset harryhsing/AVQA-R1-6K --local-dir /workspace/AVQA
+python scripts/tools/process_avqa.py \
+  --input-dir /workspace/AVQA/AVQA_R1/train/omni_rl_format_train.json \
+  --output-dir /workspace/AVQA/AVQA_R1/train/omni_rl_format_train_convert.jsonl \
+  --md-dir /workspace/AVQA/AVQA_R1/train
+python scripts/tools/process_avqa.py \
+  --input-dir /workspace/AVQA/AVQA_R1/valid/omni_rl_format_valid.json \
+  --output-dir /workspace/AVQA/AVQA_R1/valid/small_valid.jsonl \
+  --md-dir /workspace/AVQA/AVQA_R1/valid
+hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /workspace/Qwen3-Omni-30B-A3B-Instruct
+
+python - <<'PY'
+import json
+from pathlib import Path
+
+model = Path('/workspace/Qwen3-Omni-30B-A3B-Instruct')
+config_path = model / 'tokenizer_config.json'
+config = json.loads(config_path.read_text())
+if 'chat_template' not in config:
+    config['chat_template'] = json.loads((model / 'chat_template.json').read_text())['chat_template']
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+PY
+
+cd /workspace/Relax
+export EXP_DIR=/workspace
+export CLEARML_OFFLINE_MODE=1
 bash -x scripts/entrypoint/spmd-multinode.sh \
   scripts/training/multimodal/run-qwen3-30B-A3B-omni-16xgpu.sh
 ```
+
+</details>
 
 启动后若看到如下日志，说明训练已经正常运行：
 
@@ -202,61 +152,69 @@ Finish rollout 0/200
 training step 0/200
 ```
 
-Relax 保存的 checkpoint 为 Megatron DCP 格式，可通过 `scripts/tools/convert_torch_dist_to_hf_bridge.py` 转换为 HuggingFace 权重。
-
 > 📖 完整教程：[快速上手指南](docs/zh/guide/quick-start.md) · [自定义训练](docs/zh/guide/customize-training.md) · [配置指南](docs/zh/guide/configuration.md)
 
-______________________________________________________________________
+## 🏗️ 训练模式
 
-## ⚡ 核心特性
+根据训练与样本生成（Rollout）如何使用 GPU，选择执行模式：
 
-### 基于 TransferQueue 的全异步训练
+| 模式                      | GPU 分配                                                            | 训练方式                                                               |
+| :------------------------ | :------------------------------------------------------------------ | :--------------------------------------------------------------------- |
+| **Colocate（同步）**      | 训练与 Rollout 共享同一组 GPU。                                     | 生成一批样本后再训练，使用严格 on-policy 数据。                        |
+| **Fully Async（全异步）** | 训练与 Rollout 使用不同的 GPU，辅助服务独立运行。                   | 生成样本与训练并行进行，可配置 staleness，在数据新鲜度与吞吐之间取舍。 |
+| **Hybrid（混合）**        | 训练与 Rollout 使用不同的 GPU，参考模型推理和辅助计算复用训练 GPU。 | 保留流式训练流程与可配置 staleness，同时复用训练 GPU 完成辅助工作。    |
 
-在全异步模式下，Rollout、Actor、ActorFwd、Reference、Advantages 运行在**独立 GPU 集群**上完全并行。三大机制共同保证高吞吐：
+<div align="center">
+  <img src="./assets/arch.png" width="80%" alt="Relax 架构图">
+</div>
 
-- **StreamingDataLoader** — Actor 在 Rollout 增量写入 TransferQueue 的同时即可开始消费样本，消除阶段之间的 GPU 空闲。
-- **可配置 staleness** — `--max-staleness` 精确控制数据新鲜度，在 on-policy 准确性与训练吞吐之间灵活权衡。
-- **DCS 权重同步** — 每一步训练结束后，权重通过分布式 Checkpoint 服务（DCS）以 NCCL 广播方式从 Actor 分发至 Rollout/ActorFwd/Reference，与下一步训练计算重叠。
+> 📖 配置与取舍：[架构指南](docs/zh/guide/architecture.md) · [全异步训练](docs/zh/guide/fully-async-training.md) · [Hybrid 训练](docs/zh/guide/hybrid-training.md)
 
-### Agentic RL
+## 🧠 支持的算法
 
-Relax 为多轮闭环"执行 → 观察 → 决策"训练提供一等公民支持：
+| 算法                       | 描述                                              |
+| :------------------------- | :------------------------------------------------ |
+| **PPO**                    | Proximal Policy Optimization                      |
+| **GRPO**                   | Group Relative Policy Optimization                |
+| **M2PO**                   | Second-Moment Trust Policy Optimization           |
+| **RLOO**                   | REINFORCE Leave-One-Out                           |
+| **REINFORCE++**            | token KL-to-go 与全局归一化                       |
+| **REINFORCE++-baseline**   | 使用组基线的 REINFORCE++ 变体                     |
+| **GSPO**                   | Group-wise Sequence-level Policy Optimization     |
+| **SAPO**                   | Soft Adaptive Policy Optimization                 |
+| **CISPO**                  | Clipped Importance-ratio Soft Policy Optimization |
+| **On-Policy Distillation** | 基于 KL 惩罚的师生蒸馏                            |
 
-- **多轮采样 + loss masking** — 模型输出（mask=1）与环境观察（mask=0）清晰区分，只有模型动作参与训练。
-- **环境与 Rollout 解耦** — 标准 `BaseInteractionEnv` 接口（`reset`、`step`、`format_observation`）让环境独立于采样器演进。
-- **VLM 多模态上下文累积** — Rollout 侧的 `image_data` 与训练侧的 `multimodal_train_inputs` 每轮增量合并，确保多轮视觉观察正确拼接。
-- **灵活的终止条件** — 组合 `max_turns`、token 预算耗尽与环境 `done` 信号。DeepEyes 示例展示了 Qwen3-VL-30B-A3B 的 Agentic 多轮 GRPO 训练。
+> 📖 各算法的目标函数、训练脚本与执行模式限制请参阅[算法参考](docs/zh/examples/algorithms.md)。
 
-### Rollout 弹性扩缩容
+## 🤖 支持的模型
 
-由于 RL 训练中 60–70% 的时间花在 Rollout 阶段，Relax 通过 **HTTP REST API** 在训练过程中动态增减推理引擎，无需中断训练循环：
+下表中的模型使用 Megatron 后端。可用配置见[模型配置](scripts/models/)与[训练脚本](scripts/training/)。
 
-- **`ray_native`** 模式 — 指定目标引擎数量，Relax 自动在当前 Ray 集群内分配资源并启动新的 SGLang 引擎。
-- **`external`** 模式 — 注册部署在其他集群的 SGLang 引擎，面向跨集群联邦推理，适合抢占式或闲置资源。
+| 模型系列                                                        | 示例规模                                   | 模态               |
+| :-------------------------------------------------------------- | :----------------------------------------- | :----------------- |
+| **Qwen3**                                                       | 4B, 30B-A3B (MoE)                          | 文本               |
+| **Qwen3-VL**                                                    | 4B, 30B-A3B                                | 视觉 + 语言        |
+| **Qwen3.5**                                                     | 4B, 9B, 27B, 35B-A3B, 122B-A10B, 397B-A17B | 文本 + 视觉        |
+| **Qwen3-Omni**                                                  | 30B-A3B                                    | 文本 + 视觉 + 音频 |
+| **Qwen3.6**                                                     | 27B, 35B-A3B                               | 文本 + 视觉        |
+| **Qwen3.8**                                                     | 27B                                        | 文本 + 视觉        |
+| **GLM5**                                                        | 744B-A40B (MoE)                            | 文本               |
+| **Kimi K2.6**                                                   | ~1T-A32B (MoE)                             | 视觉 + 语言        |
+| **[dots.mocr](https://huggingface.co/rednote-hilab/dots.mocr)** | 3B                                         | 视觉 + 语言        |
 
-扩缩容操作异步、幂等、互斥，支持优雅缩容（等待在途请求完成）与取消回滚。启动参数定义的初始引擎受保护，只有动态添加的引擎可被缩容。
+Kimi K2.6 示例包含 INT4 QAT 训练。dots.mocr 示例面向 OCR 与文档理解任务。
 
-### Megatron 训练后端与 SGLang 推理
-
-训练后端采用 **Megatron-LM**，完整支持 Tensor / Pipeline / Context / Expert 并行，适配 MoE 与超深模型。推理后端采用 **SGLang** 并统一管理进程生命周期。新模型架构通过 Megatron Bridge 接入，HF ↔ Megatron 权重自动转换。
-
-### 可插拔奖励中心
-
-内置数学（DeepScaler、DAPO）、GPQA、F1、IFBench、多选题、多模态 Open-R1，以及 **GenRM**（生成式 LLM-as-judge）等奖励函数。自定义奖励只需在 `relax/engine/rewards/` 中添加一个文件。
-
-### 生产级运维
-
-- **HealthManager** — 心跳监控 + 两级自动恢复（优先就地恢复，失败后全局重启）。
-- **Metrics Service** — 集中式 Ray Serve 部署，向 TensorBoard、WandB、ClearML 分发指标。
-- **Notifications** — 通过 Apprise 发送实时训练告警（Slack、微信、邮件等）。
-
-______________________________________________________________________
+> 📖 接入其他模型架构，请参阅[外部模型接入指南](docs/zh/guide/external-model-integration.md)。
 
 ## 📚 文档
 
-完整的双语文档请访问 **[redai-studio.github.io/Relax](https://redai-studio.github.io/Relax)**。
+访问[完整文档](https://redai-studio.github.io/Relax/zh/)，或按任务查找：
 
-______________________________________________________________________
+- [自定义训练](docs/zh/guide/customize-training.md)：更换模型、数据集、奖励函数或启动配置。
+- [配置指南](docs/zh/guide/configuration.md)：查阅训练参数。
+- [监控训练](docs/zh/guide/metrics-service-detailed.md)：记录指标、查看训练进度。
+- [导出模型](docs/zh/guide/model-conversion.md)：将 checkpoint 转换为 Hugging Face 权重。
 
 ## 🧪 示例
 
@@ -269,41 +227,32 @@ ______________________________________________________________________
 | [NeMo Gym Agentic](./examples/nemo_gym_agentic/)             | Agentic 环境集成与可运行配方            |
 | [On-Policy Distillation](./examples/on_policy_distillation/) | 基于 KL 惩罚的师生知识蒸馏              |
 
-______________________________________________________________________
-
 ## 🧩 基于 Relax 构建的项目
 
-| 项目                                                     | 描述                                                                                                    |
-| :------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
-| [HyperEyes](https://github.com/DeepExperience/HyperEyes) | 一个并行多模态搜索智能体，使用 Relax 进行高效的 RL 训练，结合视觉定位与检索能力并发搜索多个实体。       |
-| [Iris](https://github.com/AllSpark-Research/Iris)        | 基于 Relax、从 Qwen3.5/3.6 后训练得到的开放权重搜索智能体系列，面向长程搜索、迭代证据收集与上下文管理。 |
-
-______________________________________________________________________
+| 项目                                                     | 描述                                                                                                |
+| :------------------------------------------------------- | :-------------------------------------------------------------------------------------------------- |
+| [HyperEyes](https://github.com/DeepExperience/HyperEyes) | 使用 Relax 训练的多模态搜索智能体，结合视觉定位与检索，并行搜索多个实体。                           |
+| [Iris](https://github.com/AllSpark-Research/Iris)        | 使用 Relax、基于 Qwen3.5/3.6 训练的开放权重搜索智能体，通过多步搜索收集证据，并为长任务管理上下文。 |
 
 ## 🤝 参与贡献
 
 欢迎各种形式的贡献！请阅读 [贡献指南](docs/zh/guide/how-to-contribute.md) 了解详情。
 
-______________________________________________________________________
+## 📢 最新动态
 
-## 🛠️ AI 编程技能（Skills）
+<details>
+<summary>展开更新记录</summary>
 
-Relax 在 `skills/` 目录下内置了一套 [Claude Code](https://claude.ai/code) 斜杠命令技能，用于加速开发和运维工作。在 Claude Code 中以 `/技能名` 方式调用。
+| 📣 更新                                                                                                                                                                            |
+| :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **\[08/20/2026\]** 🧠 新增 **M2PO**、**RLOO** 与两种 **REINFORCE++** 算法；提供 RLOO 与 REINFORCE++ 可运行配方，并在[算法参考](docs/zh/examples/algorithms.md)中涵盖以上四种算法。 |
+| **\[08/19/2026\]** 🤖 新增支持多上下文轨迹导出的 multi-agent 训练，并提供 [Search-R1 参考配方](examples/search_r1/)。                                                              |
+| **\[08/18/2026\]** 🪶 LoRA RL 现已支持 MoE 模型的 adapter 与 merge 两种工作流，详见 [LoRA 训练指南](docs/zh/guide/low-rank-adaptation-training.md)。                               |
+| **\[05/26/2026\]** 🔁 新增 **Hybrid** 模式：训练与采样并行，辅助计算复用训练 GPU。详见 [Hybrid 训练指南](docs/zh/guide/hybrid-training.md)。                                       |
+| **\[05/11/2026\]** 🚀 支持 Qwen3.6 系列模型（纯文本+多模）！                                                                                                                       |
+| **\[04/15/2026\]** 🎉 Relax 正式开源！                                                                                                                                             |
 
-| 技能                 | 描述                                                           |
-| :------------------- | :------------------------------------------------------------- |
-| `/code-review`       | 专业代码审查 —— 检测 SOLID 违规、安全风险、ML/分布式训练问题   |
-| `/debug-hang`        | 自动排查 Ray 分布式训练 hang 问题，收集调用栈与 Actor 状态     |
-| `/dev`               | 开发调试 Relax 代码；向远程 Ray 集群提交并监控训练任务         |
-| `/doc-writer`        | 编写和维护中英双语 VitePress 文档                              |
-| `/git-commit`        | 生成 Conventional Commits 格式提交，自动运行 pre-commit 钩子   |
-| `/model-integration` | 新模型架构接入训练管线的分步指南                               |
-| `/perf-doctor`       | 审查训练启动脚本中的性能与显存配置问题                         |
-| `/ssh-ray-cluster`   | SSH 连接远程 Ray 集群 Head 节点，检查状态、日志和调试任务      |
-| `/verl-to-relax`     | 将 RL 配方从 verl 迁移到 Relax（奖励函数、工具环境、启动脚本） |
-| `/creating-skills`   | 按 Anthropic 最佳实践编写新 Claude Code 技能的指南             |
-
-______________________________________________________________________
+</details>
 
 ## 📝 引用
 
@@ -318,13 +267,9 @@ ______________________________________________________________________
 }
 ```
 
-______________________________________________________________________
-
 ## 📜 许可证
 
 本项目基于 [Apache License 2.0](./LICENSE) 开源。
-
-______________________________________________________________________
 
 ## 🙏 致谢
 
