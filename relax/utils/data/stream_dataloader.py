@@ -14,7 +14,9 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
+from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
@@ -500,6 +502,34 @@ def _broadcast_routed_experts(
     return values_out.cpu(), offsets_out.cpu()
 
 
+def _replay_values_and_offsets(field_data: torch.Tensor, field_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize a jagged or equally-sized replay batch for tensor
+    broadcast."""
+    if field_data.is_nested:
+        values = field_data.values()
+        offsets = field_data.offsets()
+    elif field_data.ndim == 3:
+        batch_size, rows, width = field_data.shape
+        if rows == 0 or width == 0:
+            raise ValueError(f"{field_name} must have non-empty row and width dimensions, got {field_data.shape}")
+        values = field_data.reshape(batch_size * rows, width)
+        offsets = torch.arange(
+            0,
+            (batch_size + 1) * rows,
+            rows,
+            dtype=torch.int64,
+            device=field_data.device,
+        )
+    else:
+        raise TypeError(
+            f"{field_name} must be a jagged NestedTensor or dense [batch, rows, width] tensor, "
+            f"got type={type(field_data)}, shape={getattr(field_data, 'shape', None)}"
+        )
+    if values.ndim != 2:
+        raise ValueError(f"{field_name} values must be 2-D after packing, got {values.shape}")
+    return values.contiguous(), offsets.contiguous()
+
+
 def _bcast_known_tensor(tensor, is_src, dtype, shape, cuda_dev, broadcast_pp):
     """Broadcast a single tensor of *known* dtype/shape across CP, TP, then
     PP."""
@@ -835,6 +865,10 @@ def get_data_from_transfer_queue(
     has_routed_experts = "rollout_routed_experts" in data_fields
     routed_experts_values = None
     routed_experts_offsets = None
+    has_indexer_topk = getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in data_fields
+    indexer_topk_values = None
+    indexer_topk_offsets = None
+    indexer_topk_extract_error = None
 
     if has_routed_experts and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
         td = rollout_data[0]
@@ -846,6 +880,19 @@ def get_data_from_transfer_queue(
             # Remove from TensorDict so broadcast_object_list only pickles ~4 MB
             del td["rollout_routed_experts"]
             rollout_data[0] = td
+
+    if has_indexer_topk and not per_rank_fetch and should_fetch and rollout_data[0] is not None:
+        td = rollout_data[0]
+        if isinstance(td, TensorDict) and "rollout_indexer_topk" in td.keys():
+            nt = td["rollout_indexer_topk"]
+            try:
+                indexer_topk_values, indexer_topk_offsets = _replay_values_and_offsets(nt, "rollout_indexer_topk")
+            except (TypeError, ValueError) as exc:
+                indexer_topk_extract_error = str(exc)
+            del td["rollout_indexer_topk"]
+            rollout_data[0] = td
+        else:
+            indexer_topk_extract_error = "TransferQueue response is missing rollout_indexer_topk"
 
     # --- Extract multimodal_train_inputs BEFORE broadcast_object_list ---
     # Only on the broadcast path: in per_rank_fetch mode every rank already
@@ -879,6 +926,8 @@ def get_data_from_transfer_queue(
     # learns the dtype/shape of each tensor it is about to receive via NCCL.
     # In per_rank_fetch mode this is None (each rank reconstructs locally).
     rollout_data.append(mm_spec)
+    if has_indexer_topk:
+        rollout_data.append(indexer_topk_extract_error)
 
     if per_rank_fetch:
         # Cheap byte-only diagnostic; never pickles (that would defeat the
@@ -918,8 +967,13 @@ def get_data_from_transfer_queue(
                     group_src=0,
                 )
 
-    # Unpack the broadcasted triple.
+    # Unpack the broadcasted metadata and surface extraction failures on every
+    # rank only after the object collective has completed.
+    indexer_topk_extract_error = rollout_data[3] if has_indexer_topk else None
     rollout_data, batch_meta, mm_spec = rollout_data[0], rollout_data[1], rollout_data[2]
+
+    if indexer_topk_extract_error is not None:
+        raise RuntimeError(f"Unable to transfer rollout indexer replay: {indexer_topk_extract_error}")
 
     if rollout_data is None:
         return None, batch_meta
@@ -945,6 +999,18 @@ def get_data_from_transfer_queue(
                 keep_on_gpu=getattr(args, "optimize_routing_replay", False),
             )
 
+    if has_indexer_topk and not per_rank_fetch:
+        with timer("tgd_bcast_indexer_topk"):
+            indexer_topk_values, indexer_topk_offsets = _broadcast_routed_experts(
+                indexer_topk_values,
+                indexer_topk_offsets,
+                should_fetch,
+                cuda_dev,
+                broadcast_pp,
+                keep_on_gpu=True,
+            )
+        indexer_topk_offsets = indexer_topk_offsets.cpu()
+
     # If the received object is a Tensordict, convert it into a plain Python
     # dict so downstream code can mix tensors and Python lists freely.
     if isinstance(rollout_data, TensorDict):
@@ -954,7 +1020,7 @@ def get_data_from_transfer_queue(
             # including NestedTensor values reconstructed by TransferQueue.
             if "lengths" in k or "reward" in k or k == "sample_index_mask_sums":
                 new_rollout_data[k] = _tensor_to_python_values(v)
-            elif k == "multimodal_train_inputs":
+            elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
                 # list of tensordicts / dicts; some entries may be None for
@@ -981,6 +1047,10 @@ def get_data_from_transfer_queue(
                 from tensordict.tensorclass import NonTensorData
 
                 new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
+            elif has_indexer_topk and k == "rollout_indexer_topk":
+                from tensordict.tensorclass import NonTensorData
+
+                new_rollout_data[k] = [item.data if isinstance(item, NonTensorData) else item for item in v]
             elif isinstance(v, torch.Tensor):
                 # Expand a tensor with batch dimension into a Python list of
                 # per-sample tensors so downstream code can index them.
@@ -1001,6 +1071,12 @@ def get_data_from_transfer_queue(
             for i in range(len(routed_experts_offsets) - 1)
         ]
 
+    if has_indexer_topk and not per_rank_fetch:
+        rollout_data["rollout_indexer_topk"] = [
+            indexer_topk_values[indexer_topk_offsets[i] : indexer_topk_offsets[i + 1]]
+            for i in range(len(indexer_topk_offsets) - 1)
+        ]
+
     # Re-attach the NCCL-streamed multimodal inputs (CPU-resident; moved to GPU
     # per micro-batch by get_batch).
     if has_multimodal and mm_inputs is not None:
@@ -1008,11 +1084,30 @@ def get_data_from_transfer_queue(
 
     if post_process:
         post_process_rollout_data(args, rollout_data)
+    else:
+        _add_sft_token_lengths(args, rollout_data)
 
     return rollout_data, batch_meta
 
 
+def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> None:
+    """Count raw SFT mask positions before moving the masks to the GPU."""
+    if not is_sft_mode(args) or "learn_lengths" in rollout_data:
+        return
+    learn_lengths = []
+    for mask in rollout_data["loss_masks"]:
+        mask = torch.as_tensor(mask)
+        if mask.device.type != "cpu":
+            raise ValueError("SFT token lengths must be recorded while loss masks are on CPU")
+        learn_lengths.append(int((mask == 1).sum().item()))
+    rollout_data["learn_lengths"] = learn_lengths
+    rollout_data["non_learn_lengths"] = [
+        total - learn for total, learn in zip(rollout_data["total_lengths"], learn_lengths, strict=True)
+    ]
+
+
 def post_process_rollout_data(args, rollout_data):
+    _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
     if "tokens" not in rollout_data and "chosen_tokens" in rollout_data:
@@ -1131,6 +1226,14 @@ def post_process_rollout_data(args, rollout_data):
         rollout_data["rollout_routed_experts"] = [
             torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.long, device=cuda_dev)
             for r in rollout_data["rollout_routed_experts"]
+        ]
+
+    if getattr(args, "use_rollout_indexer_replay", False) and "rollout_indexer_topk" in rollout_data:
+        from tensordict.tensorclass import NonTensorData
+
+        rollout_data["rollout_indexer_topk"] = [
+            torch.as_tensor(r.data if isinstance(r, NonTensorData) else r, dtype=torch.int32, device=cuda_dev)
+            for r in rollout_data["rollout_indexer_topk"]
         ]
 
 

@@ -4,6 +4,18 @@ Relax 训练吞吐量最大化实践指南。本文提到的所有参数均可�
 
 ---
 
+## Kimi K3 TFLOPS 与 MFU
+
+`perf/actor_train_tflops` 估算每卡每秒的有效模型 FLOPs。`perf/mfu/actor_train` 再除以设备 BF16 dense 峰值（B300 为 2250 TFLOPS），记录的是比例，0.4 表示 40%。时间分母是 actor 训练耗时，不是包含 rollout/save 的整轮耗时；训练内部的 optimizer 和 offload 耗时会降低该指标。
+
+K3 分别计算 KDA 投影、卷积和状态递推；MLA 低秩/输出门投影及因果注意力；latent MoE 激活专家、router 和共享专家；词表输出；以及 MoonViT-V2 和 PatchMergerMLPV2。使用每条样本的实际长度和原始图片 `(T,H,W)` 网格：视觉编码器先对所有帧做注意力，再进行时间池化。沿不包含 CP 副本的 DP 组汇总样本元数据后，只除一次训练 GPU 数量。
+
+一次乘加计为两个 FLOPs。可训练文本部分使用常规的三倍前向近似；视觉编码器和 projector 根据 `--freeze-vision-model`、`--freeze-vision-projection` 及输入梯度需求分别计算反向开销。`--freeze-language-model` 下仍可向可训练的视觉输入传播梯度。Actor/reference log-prob 前向 FLOPs 单独估算，不再把含冻结模块的训练 FLOPs 简单除以三。
+
+这是主要矩阵计算的模型估算，不是实际 CUDA 指令计数。不计入 padding、重计算、通信、embedding 查表、AttnRes 归约、归一化及逐元素运算。KDA 每 token 计算三次状态 contraction（前向 FLOPs 为 6 × heads × head_dim²），不计入具体实现的 chunk/WY 开销。硬件 profiler 的统计口径与此不同。
+
+K3 使用 LoRA 或自定义 `--freeze-params-name-list` / `--only-train-params-name-list` 时，HF 配置无法独立确定 adapter 与参数的实际可训练状态，因此暂不报告 FLOPs/MFU，并打印一次说明；耗时和 token 吞吐继续保留。其他模型的估算口径不变。
+
 ## 性能分析
 
 调优前先定位瓶颈。Relax 内置三套互补的 profiling 工具，覆盖 **推理引擎**、**训练后端** 和 **GPU 内存** 三个维度。所有 trace 文件默认保存在 `traces/<tb_experiment_name>/` 目录下，按子目录区分：

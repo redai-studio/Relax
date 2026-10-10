@@ -7,15 +7,18 @@ import sys
 import time
 from argparse import Namespace
 from collections import deque
+from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from relax.agentic.pipeline import (
     GroupExport,
     GroupInput,
+    RuntimeGroupError,
     SampleExport,
     SessionExport,
 )
@@ -35,6 +38,7 @@ from relax.agentic.session.admission_coordinator import AdmissionCoordinator, _p
 from relax.agentic.session.service import (
     AgenticChatRequestError,
     AgenticSessionShard,
+    GroupOwnership,
     ResidentGroup,
     _normalized_chat_request,
     _openai_token_logprobs_payload,
@@ -429,25 +433,27 @@ def test_partial_resume_request_kind(
 
 
 @pytest.mark.parametrize(
-    ("fully_async", "final_backfill", "debt", "interrupted_count", "expected"),
+    ("fully_async", "final_backfill", "debt", "previous_debt", "interrupted_count", "expected"),
     [
-        (False, False, 0, 0, True),
-        (False, False, 2, 2, False),
-        (True, False, 2, 2, True),
-        (True, False, 3, 2, False),
-        (True, True, 2, 2, False),
+        (False, False, 0, 0, 0, True),
+        (False, False, 2, 0, 2, False),
+        (True, False, 2, 0, 2, True),
+        (True, False, 2, 1, 2, False),
+        (True, False, 3, 0, 2, False),
+        (True, True, 2, 0, 2, False),
     ],
 )
 def test_finish_eligibility_uses_physical_debt_and_interrupted_resident_groups(
     fully_async: bool,
     final_backfill: bool,
     debt: int,
+    previous_debt: int,
     interrupted_count: int,
     expected: bool,
 ) -> None:
     pipeline = object.__new__(AgenticResidentPipeline)
     pipeline.args = SimpleNamespace(fully_async=fully_async)
-    pipeline.transfer_domain = SimpleNamespace(total_debt=debt)
+    pipeline.transfer_domain = SimpleNamespace(total_debt=debt, previous_debt=previous_debt)
     pipeline.runtime_domain = SimpleNamespace(interrupted_group_ids=tuple(range(interrupted_count)))
 
     assert pipeline._step_can_close(_StepContext(rollout_id=3, final_backfill=final_backfill)) is expected
@@ -643,8 +649,8 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
 async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch) -> None:
     payloads: list[dict[str, Any]] = []
 
-    async def fake_post(url, payload, headers=None):
-        del url, headers
+    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
+        del url, headers, fail_fast_no_workers
         payloads.append(dict(payload))
         return {
             "output_ids": [4],
@@ -670,6 +676,30 @@ async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch
         request_id="request-2:0",
     )
     assert "session_id" not in payloads[-1]
+
+
+async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
+    async def fake_post(*_args, **_kwargs):
+        request = httpx.Request("POST", "http://test/generate")
+        response = httpx.Response(
+            499,
+            request=request,
+            json={"error": {"message": "Request request-1:0 was aborted"}},
+        )
+        raise httpx.HTTPStatusError("aborted", request=request, response=response)
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    result = await _backend_adapter(lifecycle_enabled=True).generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="session-9",
+        request_id="request-1:0",
+    )
+
+    assert result.finish_type == "abort"
+    assert result.new_tokens == []
+    assert result.new_log_probs == []
+    assert result.meta_info == {}
 
 
 async def test_close_session_fans_out_and_is_fail_open(monkeypatch) -> None:
@@ -941,3 +971,222 @@ async def test_admission_lease_uses_train_prefix_and_releases_after_backend_atte
         }
     ]
     assert client.releases == ["lease-1"]
+
+
+# --- SGLang abort and router recovery (agentic path) -------------------------
+
+
+def _shard_new():
+    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+    shard.args = SimpleNamespace(fully_async=True, partial_rollout=False)
+    return shard
+
+
+def _requeue_ir(abort_count: int = 0, prefix=(300,)) -> InflightRequest:
+    return InflightRequest(
+        request_id="r1",
+        parent_state_hash="hash",
+        rollout_id=0,
+        kind=RequestKind.FRESH,
+        abort_count=abort_count,
+        waiter=asyncio.get_running_loop().create_future(),
+        wall_started_at=0.0,
+        pending_token_delta=list(prefix),
+    )
+
+
+def _router_503() -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://test/generate")
+    response = httpx.Response(503, request=request, json={"error": {"code": "no_available_workers"}})
+    return httpx.HTTPStatusError("router unavailable", request=request, response=response)
+
+
+def _router_recovery_shard():
+    shard = _shard_new()
+    shard.args = SimpleNamespace(
+        fully_async=True,
+        partial_rollout=False,
+        partial_rollout_max_aborted_count=None,
+        use_slime_router=False,
+        router_cb_timeout_duration_secs=0,
+    )
+    shard._train_generation_open = True
+    shard._state_revision = 0
+    shard._state_changed = asyncio.Event()
+    group = ResidentGroup(rollout_mode="train", group_id="g1", result_cells={}, sessions=[])
+    group.ownership = GroupOwnership.RUNTIME
+    session = _SessionRecord(
+        group=group, session_id="s1", session_sampling_params={}, result_cell=_SessionResultCell()
+    )
+    session.forest = SessionForest
+    group.sessions.append(session)
+    group.result_cells[session.session_id] = session.result_cell
+    shard._groups = {group.group_id: group}
+    shard._set_runtime_timeouts_active = AsyncMock()
+    shard._dispatch_queued_irs_locked = lambda _session: None
+    shard._notify_state_change = lambda _group=None: None
+
+    @asynccontextmanager
+    async def no_lease(*_args):
+        yield
+
+    shard._admission_lease = no_lease
+    shard._sglang_request_permit = no_lease
+    ir = _requeue_ir(prefix=(300,))
+    ir.sampling_params = {"max_new_tokens": 8}
+    session.live_irs.add(ir)
+    return shard, group, session, ir
+
+
+@pytest.mark.asyncio
+async def test_agentic_run_ir_requeues_empty_delta_abort_without_clearing_prefix():
+    shard, _group, session, ir = _router_recovery_shard()
+    ir.pending_logprob_delta = [-0.5]
+    ir.pending_weight_version_delta = ["v1"]
+    ir.pending_spec_delta["completion_token_num"] = 1
+    ir.pending_prefix_cache_delta["cached_tokens"] = 2
+
+    async def generate(**_kwargs):
+        return SimpleNamespace(new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={}, elapsed=0.1)
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await task
+
+    assert list(session.queued_irs) == [ir]
+    assert ir.pending_token_delta == [300] and ir.abort_count == 1
+    assert ir.pending_logprob_delta == [-0.5]
+    assert ir.pending_weight_version_delta == ["v1"]
+    assert ir.pending_spec_delta["completion_token_num"] == 1
+    assert ir.pending_prefix_cache_delta["cached_tokens"] == 2
+
+
+@pytest.mark.asyncio
+async def test_agentic_eval_abort_fails_instead_of_requeueing():
+    shard, group, session, ir = _router_recovery_shard()
+    group.rollout_mode = "eval"
+
+    async def generate(**_kwargs):
+        return SimpleNamespace(new_tokens=[], new_log_probs=[], finish_type="abort", meta_info={}, elapsed=0.1)
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await task
+
+    assert list(session.queued_irs) == []
+    assert ir not in session.live_irs
+    with pytest.raises(RuntimeGroupError, match="evaluation request"):
+        await ir.waiter
+
+
+@pytest.mark.asyncio
+async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
+    shard, _group, session, ir = _router_recovery_shard()
+    calls, failures = [], []
+
+    async def generate(**_kwargs):
+        calls.append(None)
+        raise _router_503()
+
+    async def handle_failure(_session, error):
+        failures.append(error)
+
+    async def sleep(_seconds):
+        pass
+
+    shard._generation_backend = SimpleNamespace(generate=generate)
+    shard._handle_infra_failure = handle_failure
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await task
+
+    assert len(calls) == 2
+    assert len(failures) == 1 and isinstance(failures[0], RuntimeGroupError)
+
+
+@pytest.mark.asyncio
+async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
+    shard, _group, session, ir = _router_recovery_shard()
+    calls, sleeps = [], []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise _router_503()
+        return SimpleNamespace(new_tokens=[7], new_log_probs=[], finish_type="stop", meta_info={}, elapsed=0.0)
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    shard._generation_backend = SimpleNamespace(generate=generate, tokenizer=_FakeTokenizer())
+    shard._apply_generate_result = lambda request, result: request.pending_token_delta.extend(result.new_tokens)
+    shard._terminal_response_locked = lambda **_kwargs: {"ok": True}
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await task
+
+    assert len(calls) == 2 and calls[0]["request_id"] == calls[1]["request_id"]
+    assert calls[0]["input_ids"] == calls[1]["input_ids"] == [300]
+    assert sleeps == [2.0]
+    assert ir.pending_token_delta == [300, 7]
+    assert ir.waiter.result() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_agentic_router_wait_is_cancelled_as_pre_dispatch_by_pause(monkeypatch):
+    shard, _group, session, ir = _router_recovery_shard()
+    wait_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def generate(**_kwargs):
+        raise _router_503()
+
+    async def sleep(_seconds):
+        wait_started.set()
+        await never.wait()
+
+    abort_request = AsyncMock()
+    shard._generation_backend = SimpleNamespace(generate=generate, abort_request=abort_request)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await wait_started.wait()
+    await asyncio.wait_for(shard.pause_generation(), timeout=1)
+
+    assert task.done() and list(session.queued_irs) == [ir]
+    assert ir.pending_token_delta == [300] and ir.backend_started is False
+    abort_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agentic_503_is_pre_dispatch_before_permit_cleanup_finishes():
+    shard, _group, session, ir = _router_recovery_shard()
+    release_started = asyncio.Event()
+    never = asyncio.Event()
+
+    @asynccontextmanager
+    async def slow_release_permit():
+        try:
+            yield
+        finally:
+            release_started.set()
+            await never.wait()
+
+    async def generate(**_kwargs):
+        raise _router_503()
+
+    abort_request = AsyncMock()
+    shard._sglang_request_permit = slow_release_permit
+    shard._generation_backend = SimpleNamespace(generate=generate, abort_request=abort_request)
+    task = asyncio.create_task(shard._run_ir(session, ir))
+    ir.runner_task = task
+    await release_started.wait()
+    await asyncio.wait_for(shard.pause_generation(), timeout=1)
+
+    assert task.done() and list(session.queued_irs) == [ir]
+    assert ir.backend_started is False
+    abort_request.assert_not_awaited()

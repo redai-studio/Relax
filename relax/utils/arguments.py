@@ -13,7 +13,8 @@ from sglang_router.launch_router import RouterArgs
 from relax.algorithms import get_algorithm, list_algorithm_names
 from relax.backends.sglang.arguments import sglang_parse_args
 from relax.backends.sglang.arguments import validate_args as sglang_validate_args
-from relax.engine.sft.runtime import is_offline_mode
+from relax.engine.sft.data_pipeline_config import configure_sft_data_pipeline
+from relax.engine.sft.runtime import is_dpo_mode, is_offline_mode, is_sft_mode
 from relax.utils import device as device_utils
 from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
@@ -40,7 +41,7 @@ logger = get_logger(__name__)
 _MIN_TQ_VERSION = "0.1.10.dev0"
 _TQ_UPGRADE_CMD = (
     'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps'
+    'TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps'
 )
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
@@ -222,15 +223,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--per-rank-fetch",
                 action="store_true",
                 default=False,
-                help=(
-                    "Let every TP/PP rank pull its own copy from TransferQueue in parallel "
-                    "instead of paying one rank-0 pickle + one TP/PP broadcast. Cross-rank "
-                    "consistency relies on the TQ sampler's (partition_id, task_name, dp_rank, "
-                    "batch_index) cache, which is PP/TP-invariant. Auto-disabled when "
-                    "'rollout_routed_experts' is in data_fields (jagged NestedTensor bcast "
-                    "path is incompatible). Recommended for multi-GPU training together with "
-                    "--num-data-storage-units >= TP world size."
-                ),
+                help=argparse.SUPPRESS,
             )
             parser.add_argument(
                 "--max-staleness",
@@ -659,13 +652,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--sft-train-data-prefetch",
                 action="store_true",
-                default=False,
-                help=(
-                    "For offline training, while training step N, prefetch the next step's raw "
-                    "TransferQueue payload on a CPU worker. Requires --per-rank-fetch "
-                    "and at least two SFT partitions in flight; collective agreement and "
-                    "GPU transfer remain on the main training thread."
-                ),
+                default=None,
+                help=argparse.SUPPRESS,
             )
             parser.add_argument(
                 "--sft-prefetch-buffer-size",
@@ -693,16 +681,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--sft-async-prepack",
                 action="store_true",
                 default=False,
+                help=argparse.SUPPRESS,
+            )
+            parser.add_argument(
+                "--sft-training-mode",
+                choices=["sft", "cpt"],
+                default="sft",
                 help=(
-                    "Enable the SFT prepack pipeline: TQ fetch + seqlen-balanced "
-                    "micro-batch partitioning + THD packing + pinned-memory H2D "
-                    "are all offloaded to a background worker, keeping only "
-                    "fwd/bwd on the training thread. Data / batch / loss-scaling "
-                    "semantics match the standard SFT path exactly (same K, same "
-                    "get_seqlen_balanced_partitions, same __loss_scale__). Requires "
-                    "--per-rank-fetch and at least two in-flight steps "
-                    "(--max-staleness >= 1 or --sft-max-in-flight-steps >= 2); "
-                    "PP=1, CP=1, VPP=1 and THD qkv format only."
+                    "Use cpt for text-only continued pretraining: raw text plus tokenizer EOS, "
+                    "no chat template, and a CPT loss mask (see --sft-cpt-template). Requires --loss-type sft. "
+                    "Read text from --input-key (or text/messages when the default input key is absent)."
+                ),
+            )
+            parser.add_argument(
+                "--sft-cpt-template",
+                choices=["raw", "qwen3_5"],
+                default="raw",
+                help=(
+                    "CPT text preprocessing. raw preserves text and supervises all tokens; "
+                    "qwen3_5 matches ms-swift Qwen3.5 generation preprocessing and "
+                    "all+ignore_empty_think masks. Requires --sft-training-mode cpt."
                 ),
             )
             parser.add_argument(
@@ -1035,6 +1033,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "buffer size for update weight, in bytes. "
                     "This is used for updating weights by chunk and should be useful for MoE models."
+                ),
+            )
+            parser.add_argument(
+                "--colocate-expert-weight-routing",
+                action="store_true",
+                help=(
+                    "Experimental Kimi K3 MXFP4 expert routing for colocated Bridge weight sync. "
+                    "Requires unique expert owners (ETP=1, PP*EP=world), rollout TP=EP and static EP. "
+                    "Default: use the existing full broadcast path."
                 ),
             )
             parser.add_argument(
@@ -2110,6 +2117,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
             parser.add_argument(
+                "--use-rollout-indexer-replay",
+                action="store_true",
+                default=False,
+                help="Replay SGLang's DeepSeek-V4 C4 indexer top-k choices in Megatron training.",
+            )
+            parser.add_argument(
                 "--optimize-routing-replay",
                 action="store_true",
                 default=False,
@@ -3019,8 +3032,15 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
+    configure_sft_data_pipeline(args)
+
     if not args.debug_train_only:
         sglang_validate_args(args)
+
+    if getattr(args, "colocate_expert_weight_routing", False) and (
+        args.train_backend != "megatron" or not args.colocate or args.megatron_to_hf_mode != "bridge"
+    ):
+        raise ValueError("--colocate-expert-weight-routing requires colocated Megatron Bridge training")
 
     # Only fully-async mode relies on the newer TransferQueue streaming sampler.
     if getattr(args, "fully_async", False):
@@ -3174,7 +3194,7 @@ def _normalize_mtp_only_training_args(args) -> None:
     if not getattr(args, "mtp_only_training", False):
         return
 
-    if getattr(args, "loss_type", None) != "sft":
+    if not is_sft_mode(args):
         raise ValueError("--mtp-only-training requires --loss-type sft.")
 
     conflicts = []
@@ -3209,40 +3229,43 @@ def _normalize_mtp_only_training_args(args) -> None:
     args.only_train_params_name_list = [_MTP_ONLY_PARAM_PATTERN]
 
 
+def _validate_cpt_args(args) -> None:
+    if getattr(args, "sft_training_mode", "sft") != "cpt":
+        if getattr(args, "sft_cpt_template", "raw") != "raw":
+            raise ValueError("--sft-cpt-template requires --sft-training-mode cpt.")
+        return
+    if not is_sft_mode(args) or getattr(args, "task_type", "causal_lm") != "causal_lm":
+        raise ValueError("--sft-training-mode cpt requires --loss-type sft and --task-type causal_lm.")
+    incompatible = {
+        "--label-key": getattr(args, "label_key", None),
+        "--eval-label-key": getattr(args, "eval_label_key", None),
+        "--multimodal-keys": getattr(args, "multimodal_keys", None),
+        "--conversation-key-map": getattr(args, "conversation_key_map", None),
+        "--system-prompt": getattr(args, "system_prompt", None),
+        "--tool-key": getattr(args, "tool_key", None),
+        "--eval-tool-key": getattr(args, "eval_tool_key", None),
+        "--apply-chat-template-kwargs": getattr(args, "apply_chat_template_kwargs", None),
+        "--sft-loss-last-turn-only": getattr(args, "sft_loss_last_turn_only", False),
+        "--sft-ignore-empty-think": getattr(args, "sft_ignore_empty_think", False),
+        "--sft-predict-interval": getattr(args, "sft_predict_interval", None),
+        "--custom-dataset-class": getattr(args, "custom_dataset_class_path", None),
+        "--sft-oversize-strategy custom": getattr(args, "sft_oversize_strategy", None) == "custom",
+    }
+    enabled = [name for name, value in incompatible.items() if value]
+    if enabled:
+        raise ValueError(f"Text-only CPT does not support: {', '.join(enabled)}.")
+
+
 def _normalize_sft_max_in_flight_steps(args, is_offline: bool) -> None:
     sft_max_in_flight_steps = getattr(args, "sft_max_in_flight_steps", None)
     if sft_max_in_flight_steps is None:
-        if is_offline and getattr(args, "sft_async_prepack", False) and args.max_staleness < 1:
-            raise ValueError("--sft-async-prepack requires --max-staleness >= 1 or --sft-max-in-flight-steps >= 2.")
         return
 
     if not is_offline:
         raise ValueError("--sft-max-in-flight-steps is only meaningful for offline training.")
-    minimum_steps = 2 if getattr(args, "sft_async_prepack", False) else 1
-    if sft_max_in_flight_steps < minimum_steps:
-        if minimum_steps == 2:
-            raise ValueError("--sft-async-prepack requires --sft-max-in-flight-steps >= 2.")
+    if sft_max_in_flight_steps < 1:
         raise ValueError("--sft-max-in-flight-steps must be >= 1.")
     args.max_staleness = sft_max_in_flight_steps - 1
-
-
-def _validate_sft_train_data_prefetch(args, is_offline: bool) -> None:
-    if not getattr(args, "sft_train_data_prefetch", False):
-        return
-    if getattr(args, "sft_async_prepack", False):
-        raise ValueError(
-            "--sft-train-data-prefetch and --sft-async-prepack are mutually exclusive; "
-            "async prepack already includes raw TransferQueue lookahead."
-        )
-    if not is_offline:
-        raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
-    if not args.per_rank_fetch:
-        raise ValueError("--sft-train-data-prefetch requires --per-rank-fetch.")
-    if args.max_staleness < 1:
-        raise ValueError(
-            "--sft-train-data-prefetch requires at least two SFT partitions in flight; "
-            "set --sft-max-in-flight-steps >= 2."
-        )
 
 
 def _normalize_sft_tq_timeout(args, is_offline: bool) -> None:
@@ -3932,8 +3955,6 @@ def slime_validate_args(args):
                 f"SGLang's mamba radix-cache check and does NOT auto-enable spec_v2."
             )
 
-    _normalize_sft_max_in_flight_steps(args, is_offline)
-    _validate_sft_train_data_prefetch(args, is_offline)
     _normalize_sft_tq_timeout(args, is_offline)
     _validate_agentic_rollout_args(args)
     validate_save_hf_fp8_args(args)
@@ -3945,6 +3966,57 @@ def slime_validate_args(args):
             "'use_rollout_routing_replay' addresses mismatch problem between training and inference, "
             "whereas 'partial_rollout' introduces partial off-policy behavior. These two features are mutually exclusive."
         )
+
+    if getattr(args, "use_rollout_indexer_replay", False):
+        unsupported = []
+        if is_offline:
+            unsupported.append(f"offline training ({args.loss_type})")
+        if args.train_backend != "megatron":
+            unsupported.append(f"train_backend={args.train_backend}")
+        if getattr(args, "multimodal_keys", None) is not None:
+            unsupported.append("multimodal model")
+        if not args.colocate:
+            unsupported.append("non-colocated deployment")
+        if args.partial_rollout:
+            unsupported.append("partial rollout")
+        if args.fully_async or args.hybrid:
+            unsupported.append("fully-async/hybrid")
+        if args.use_slime_router:
+            unsupported.append("slime router")
+        if args.use_agentic_rollout:
+            unsupported.append("agentic rollout")
+        if args.rollout_function_path != "relax.engine.rollout.sglang_rollout.generate_rollout":
+            unsupported.append(f"custom rollout_function_path={args.rollout_function_path}")
+        if args.custom_generate_function_path is not None:
+            unsupported.append(f"custom generate_function_path={args.custom_generate_function_path}")
+        if args.qkv_format != "thd":
+            unsupported.append(f"qkv_format={args.qkv_format}")
+        if args.context_parallel_size <= 1:
+            unsupported.append(f"context_parallel_size={args.context_parallel_size}")
+        if not args.allgather_cp or args.cp_partition_mode != "contiguous":
+            unsupported.append("non-contiguous/non-allgather CP")
+        if args.tensor_model_parallel_size != 1 or args.sequence_parallel:
+            unsupported.append("TP>1/sequence parallel")
+        if args.dynamic_context_parallel:
+            unsupported.append("dynamic CP")
+        if args.enable_mtp_training or args.sglang_speculative_algorithm:
+            unsupported.append("MTP/speculative decoding")
+        if not args.sglang_enable_dp_attention:
+            unsupported.append("SGLang attention TP>1")
+        if getattr(args, "sglang_enable_hierarchical_cache", False):
+            unsupported.append("SGLang hierarchical cache")
+        if args.dsa_indexer_loss_coeff not in (None, 0, 0.0):
+            unsupported.append(f"dsa_indexer_loss_coeff={args.dsa_indexer_loss_coeff}")
+        if args.recompute_granularity == "full" and args.recompute_method != "uniform":
+            unsupported.append(f"full recompute_method={args.recompute_method}")
+        if getattr(args, "overlap_moe_expert_parallel_comm", False):
+            unsupported.append("combined-1f1b")
+        if unsupported:
+            raise ValueError(
+                "--use-rollout-indexer-replay currently supports only colocated Megatron DeepSeek-V4 "
+                "THD with static contiguous allgather CP, TP1, SGLang DP attention, no MTP, and zero "
+                f"indexer teacher-loss coefficient; unsupported settings: {', '.join(unsupported)}."
+            )
 
     validate_reward_side_kl(args, is_offline)
 
@@ -3964,7 +4036,7 @@ def slime_validate_args(args):
         else:
             if args.load is None:
                 args.load = args.ref_load or args.hf_checkpoint
-                if args.loss_type == "dpo":
+                if is_dpo_mode(args):
                     args.finetune = True
                     args.no_load_optim = True
                     args.no_load_rng = True
@@ -4010,7 +4082,7 @@ def slime_validate_args(args):
         assert args.save is not None, "'--save' is required when save_interval is set."
 
     if getattr(args, "sft_predict_interval", None) is not None:
-        assert args.loss_type == "sft", "--sft-predict-interval is only meaningful under --loss-type sft."
+        assert is_sft_mode(args), "--sft-predict-interval is only meaningful under --loss-type sft."
         assert args.sft_predict_interval > 0, "--sft-predict-interval must be positive."
         assert args.save is not None, "--sft-predict-interval requires --save (predictions land in <save>/predict/)."
         has_eval_source = bool(getattr(args, "eval_prompt_data", None)) or (
@@ -4112,6 +4184,19 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
+        data_pad_size_multiplier = getattr(args, "data_pad_size_multiplier", 128)
+        assert data_pad_size_multiplier > 0, "--data-pad-size-multiplier must be positive."
+        tp_size = getattr(args, "tensor_model_parallel_size", 1)
+        local_pad_size = tp_size * data_pad_size_multiplier
+        for name in ("max_tokens_per_gpu", "log_probs_max_tokens_per_gpu"):
+            token_budget = getattr(args, name)
+            assert token_budget > 0, f"--{name.replace('_', '-')} must be positive."
+            assert token_budget % local_pad_size == 0, (
+                f"--{name.replace('_', '-')} ({token_budget}) must be divisible by tensor_model_parallel_size * "
+                f"--data-pad-size-multiplier ({tp_size} * {data_pad_size_multiplier} = {local_pad_size}) so data "
+                "padding does not exceed the configured per-GPU token budget."
+            )
+
         # The token-budget sampler always emits at least one sample per micro-batch,
         # even if that single sample exceeds the budget (otherwise the stream stalls).
         # So the per-GPU token budget (max_tokens_per_gpu * context_parallel_size,
@@ -4164,19 +4249,11 @@ def slime_validate_args(args):
         )
         args.debug_train_only = True
 
+    _validate_cpt_args(args)
+
     if is_offline:
         if not args.custom_dataset_class_path and not args.prompt_data:
             raise ValueError(f"--loss-type {args.loss_type} requires --prompt-data.")
-        if getattr(args, "sft_async_prepack", False):
-            if not args.per_rank_fetch:
-                raise ValueError(
-                    "--sft-async-prepack enables background prepacking and requires --per-rank-fetch; "
-                    "background prefetch workers must not execute CP/TP/PP collectives."
-                )
-            if args.use_routing_replay or args.use_rollout_routing_replay:
-                raise ValueError(
-                    "--sft-async-prepack does not support routing replay because its iterator is single-pass."
-                )
         if args.sft_oversize_strategy == "custom" and not args.sft_oversize_custom_function_path:
             raise ValueError("--sft-oversize-strategy custom requires --sft-oversize-custom-function-path.")
         # Offline training does not compute advantages.
@@ -4205,7 +4282,7 @@ def slime_validate_args(args):
 
     task_type = getattr(args, "task_type", "causal_lm")
     if task_type == "seq_cls":
-        if args.loss_type != "sft":
+        if not is_sft_mode(args):
             raise ValueError("--task-type seq_cls requires --loss-type sft.")
         if not args.label_key:
             raise ValueError("--task-type seq_cls requires --label-key.")
@@ -4491,6 +4568,9 @@ def slime_validate_args(args):
         args.use_routing_replay = True
 
     apply_custom_config_overrides(args)
+    _normalize_sft_max_in_flight_steps(args, is_offline)
+    if not is_offline and getattr(args, "sft_train_data_prefetch", False):
+        raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
     # Custom YAML is applied late and may override any checkpoint option, so
     # validate this mutually exclusive mode only after those overrides settle.

@@ -10,7 +10,7 @@ into relax.utils.replay.stages.
 
 from __future__ import annotations
 
-from relax.utils.replay.adapters import advantage, loss, reward, sample  # noqa: F401
+from relax.utils.replay.adapters import advantage, loss, sample  # noqa: F401
 
 
 def register_all() -> None:

@@ -174,7 +174,8 @@ def test_hf_checkpoint_identity_covers_pytorch_bin(tmp_path):
     [
         ("7", None, False, "sft", "iter_0000007"),
         ("17", 42, False, "rm", "iter_0000042"),
-        ("17", 0, False, "rm", "iter_0000000"),
+        # Megatron treats ckpt_step=0 as unset; metadata must follow the same tracker.
+        ("17", 0, False, "rm", "iter_0000017"),
         ("release", None, False, "sft", "release"),
         (None, None, True, "sft", "iter_0000007"),
     ],
@@ -302,6 +303,33 @@ def test_lightweight_save_syncs_hybrid_optimizer_checkpoint_step():
 
     assert optimizer.param_groups[0]["step"] == 7
     assert optimizer.cpu_optimizers[0].param_groups[0]["step"] == 7
+
+
+def test_lightweight_save_syncs_all_hybrid_steps_in_chained_optimizer() -> None:
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    children = []
+    for step in (7, 11):
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = object.__new__(HybridDeviceOptimizer)
+        optimizer.state = {parameter: {"step": torch.tensor(float(step))}}
+        optimizer.param_groups = [{"params": [parameter], "step": 1}]
+        optimizer.cpu_optimizers = [SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])]
+        optimizer.gpu_optimizer = SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])
+        children.append(SimpleNamespace(optimizer=optimizer))
+
+    # Use MCore's real property contract: .optimizer asserts for multiple children.
+    # Bypass initialization because this only tests traversal, not GPU optimizer setup.
+    chained = object.__new__(ChainedOptimizer)
+    chained.chained_optimizers = children
+
+    checkpoint._sync_hybrid_optimizer_checkpoint_steps(SimpleNamespace(optimizer=chained))
+
+    for child, step in zip(children, (7, 11), strict=True):
+        assert child.optimizer.param_groups[0]["step"] == step
+        assert child.optimizer.cpu_optimizers[0].param_groups[0]["step"] == step
+        assert child.optimizer.gpu_optimizer.param_groups[0]["step"] == step
 
 
 def test_lightweight_resume_restores_step_after_distributed_parameter_load(monkeypatch):

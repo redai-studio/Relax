@@ -8,7 +8,7 @@
 #   - 训练侧：MoE expert 权重经 fake-quant STE 模拟 INT4 量化误差（symmetric, group_size=128）
 #     - 前向：对每个 expert weight 做 per-group symmetric INT4 fake-quant（round+clamp+dequant）
 #     - 反向：STE 直通，梯度等价于 BF16 训练，Master weight 保持 BF16 高精度更新
-#     - 由 Megatron patch 在 TEGroupedLinear._get_weight_tensors() 中注入
+#     - 由 Megatron 的 INT4 fake-QAT helper 在 TEGroupedLinear._get_weight_tensors() 中注入
 #     - 仅覆盖 MoE expert 层（TEGroupedLinear），attention/dense 层不受影响
 #   - Rollout 侧：SGLang 使用真实 INT4（compressed-tensors W4A16 asymmetric, group_size=128）推理
 #     - 每个 step 结束，BF16 训练权重经 pack_layer() 量化打包为 AWQ INT4 格式后
@@ -108,6 +108,8 @@ PERF_ARGS=(
    # INT4 fake-QAT 训练侧保持 BF16（假量化 STE 由 OPEN_TRAINING_INT4_FAKE_QAT_FLAG 控制）
    --transformer-impl transformer_engine
    --bf16
+   # INT4 fake-QAT replaces weight tensors; TE fused wgrad requires the original tensors.
+   --no-gradient-accumulation-fusion
 )
 
 GRPO_ARGS=(

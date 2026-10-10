@@ -255,7 +255,7 @@ export default defineConfig({
                 { text: 'Adding an Algorithm', link: '/en/guide/adding-an-algorithm' },
                 { text: 'SFT Training', link: '/en/guide/sft-training' },
                 { text: 'DPO Training', link: '/en/guide/dpo-training' },
-
+                { text: 'CPT Training', link: '/en/guide/cpt-training' },
                 { text: 'MTP Training', link: '/en/guide/mtp-rl-training' },
                 { text: 'PPO Training', link: '/en/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/en/guide/reinforce-plus-plus' },
@@ -291,6 +291,10 @@ export default defineConfig({
                   link: '/en/guide/low-rank-adaptation-training',
                 },
                 { text: 'Diffusion Generative RL', link: '/en/guide/diffusion-generative-rl' },
+                {
+                  text: 'Multimodal Training Optimizations',
+                  link: '/en/guide/multimodal-training',
+                },
               ],
             },
             {
@@ -382,7 +386,7 @@ export default defineConfig({
                 { text: '接入新算法', link: '/zh/guide/adding-an-algorithm' },
                 { text: 'SFT 训练', link: '/zh/guide/sft-training' },
                 { text: 'DPO 训练', link: '/zh/guide/dpo-training' },
-
+                { text: 'CPT 训练', link: '/zh/guide/cpt-training' },
                 { text: 'MTP 训练', link: '/zh/guide/mtp-rl-training' },
                 { text: 'PPO 训练', link: '/zh/guide/ppo-training' },
                 { text: 'REINFORCE++', link: '/zh/guide/reinforce-plus-plus' },
@@ -415,6 +419,7 @@ export default defineConfig({
                 { text: '权重更新流水线优化', link: '/zh/guide/update-weights-pipeline' },
                 { text: '低秩适配（LoRA）训练', link: '/zh/guide/low-rank-adaptation-training' },
                 { text: '扩散生成式 RL', link: '/zh/guide/diffusion-generative-rl' },
+                { text: '多模态训练优化', link: '/zh/guide/multimodal-training' },
               ],
             },
             {

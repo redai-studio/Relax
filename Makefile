@@ -1,7 +1,11 @@
-.PHONY: help install test lint format clean docs docs-dev docs-build docs-preview check-registry check-train-image check-ascend-qs-base-image check-qs-dockerfile docker-train docker-dev docker-ascend docker-qs-ascend
+.PHONY: help install test lint format clean docs docs-dev docs-build docs-preview check-registry check-train-image check-ascend-qs-base-image check-qs-dockerfile train docker-train docker-train-cu12 docker-train-cu13-b300 docker-train-cu13-hopper docker-train-image docker-dev docker-dev-cu12 docker-dev-cu13-b300 docker-dev-cu13-hopper docker-dev-image docker-ascend docker-qs-ascend
 
 DOCKER ?= docker
 DOCKERFILE ?= docker/Dockerfile
+CU13_DOCKERFILE ?= docker/Dockerfile.cu13
+CU13_BASE_IMAGE ?=
+CU13_BLACKWELL_TRAIN_IMAGE ?=
+CU13_HOPPER_TRAIN_IMAGE ?=
 ASCEND_DOCKERFILE ?= docker/Dockerfile.npu
 SOC_VERSION ?= ascend910_9391
 ASCEND_DOCKER_BUILDKIT ?= 1
@@ -13,8 +17,13 @@ BUILD_DATE := $(shell date +%Y%m%d)
 GIT_SHORT_HASH := $(shell git rev-parse --short=8 HEAD)
 
 IMAGE_REGISTRY := $(patsubst %/,%,$(strip $(REGISTRY)))
-DEFAULT_TRAIN_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)
-DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)
+DEFAULT_TRAIN_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu12
+DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu12
+
+# Static pattern targets supply b300/hopper through $*. Keep train inputs separate
+# because their CUDA kernels are compiled for different architectures.
+CU13_EXTERNAL_TRAIN_IMAGE = $(strip $(if $(filter b300,$*),$(CU13_BLACKWELL_TRAIN_IMAGE),$(CU13_HOPPER_TRAIN_IMAGE)))
+CU13_DEFAULT_TRAIN_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$(patsubst b300,blackwell,$*)
 
 # Ascend/NPU images share the same repository as GPU; the ascend- tag prefix keeps
 # aarch64 artifacts from ever overwriting the amd64 train-/dev- tags.
@@ -52,9 +61,19 @@ help:
 	@echo "  make docs-dev      - Start documentation dev server"
 	@echo "  make docs-build    - Build documentation"
 	@echo "  make docs-preview  - Preview built documentation"
-	@echo "  REGISTRY=... make docker-train - Build and push the Docker train stage"
-	@echo "  REGISTRY=... make docker-dev   - Build and push the Docker development image"
-	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev - Build dev from an existing train image"
+	@echo "  REGISTRY=... make train - Alias for docker-train"
+	@echo "  REGISTRY=... make docker-train - Build and push the CUDA 12, CUDA 13 Blackwell, and CUDA 13 Hopper train images"
+	@echo "  REGISTRY=... make docker-train-cu12 - Build and push only the CUDA 12 train stage"
+	@echo "  REGISTRY=... make docker-train-cu13-b300 - Build and push the CUDA 13 B300 train stage"
+	@echo "  REGISTRY=... make docker-train-cu13-hopper - Build and push the CUDA 13 Hopper train stage"
+	@echo "  CUDA 13 targets accept CU13_BASE_IMAGE=... independently of BASE_IMAGE"
+	@echo "  CUDA 13 dev targets reuse CU13_BLACKWELL_TRAIN_IMAGE=... or CU13_HOPPER_TRAIN_IMAGE=... when set"
+	@echo "  REGISTRY=... make docker-dev - Build and push the CUDA 12, CUDA 13 Blackwell, and CUDA 13 Hopper dev images"
+	@echo "  REGISTRY=... make docker-dev-cu12 - Build and push only the CUDA 12 dev image"
+	@echo "  REGISTRY=... make docker-dev-cu13-b300 - Build and push only the CUDA 13 Blackwell dev image"
+	@echo "  REGISTRY=... make docker-dev-cu13-hopper - Build and push only the CUDA 13 Hopper dev image"
+	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev-cu12 - Build cu12 dev from an existing train image"
+	@echo "  TRAIN_IMAGE and DEV_IMAGE overrides apply to the cu12 variant"
 	@echo "  REGISTRY=... make docker-ascend - Build and push the complete Ascend/NPU image"
 	@echo "  REGISTRY=... ASCEND_QS_DOCKERFILE=... make docker-qs-ascend - Wrap an Ascend dev image into a QS image (optional)"
 	@echo "  Ascend targets accept BASE_IMAGE=... and SOC_VERSION=... (default ascend910_9391)"
@@ -109,7 +128,20 @@ check-qs-dockerfile:
 	@test -n "$(strip $(ASCEND_QS_DOCKERFILE))" || { echo "ASCEND_QS_DOCKERFILE is required (path to relax-ci docker/Dockerfile.qs)" >&2; exit 2; }
 	@test -f "$(strip $(ASCEND_QS_DOCKERFILE))" || { echo "ASCEND_QS_DOCKERFILE not found: $(ASCEND_QS_DOCKERFILE)" >&2; exit 2; }
 
-docker-train: check-registry
+train: docker-train
+
+docker-train: docker-train-cu12 docker-train-cu13-b300 docker-train-cu13-hopper
+
+docker-train-cu12: docker-train-image
+
+docker-train-cu13-b300 docker-train-cu13-hopper: docker-train-cu13-%:
+	+$(MAKE) --no-print-directory docker-train-image \
+		DOCKERFILE="$(CU13_DOCKERFILE)" \
+		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
+		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
+		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"
+
+docker-train-image: check-registry
 	@echo "[docker] output train image: $(TRAIN_IMAGE)"
 	@set -e; \
 	if $(IMAGE_INSPECT) "$(TRAIN_IMAGE)" >/dev/null 2>&1; then \
@@ -124,7 +156,20 @@ docker-train: check-registry
 		if [ "$(DO_PUSH)" != "0" ]; then $(DOCKER) push "$(TRAIN_IMAGE)"; fi; \
 	fi
 
-docker-dev: check-registry check-train-image
+docker-dev: docker-dev-cu12 docker-dev-cu13-b300 docker-dev-cu13-hopper
+
+docker-dev-cu12: docker-dev-image
+
+docker-dev-cu13-b300 docker-dev-cu13-hopper: docker-dev-cu13-%:
+	+$(MAKE) --no-print-directory docker-dev-image \
+		DOCKERFILE="$(CU13_DOCKERFILE)" \
+		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
+		DEV_IMAGE="$(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$(patsubst b300,blackwell,$*)" \
+		BUILD_DEFAULT_TRAIN=$(if $(CU13_EXTERNAL_TRAIN_IMAGE),0,1) \
+		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
+		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"
+
+docker-dev-image: check-registry check-train-image
 	@echo "[docker] input train image: $(TRAIN_IMAGE)"
 	@echo "[docker] output dev image: $(DEV_IMAGE)"
 	@set -e; \
@@ -132,7 +177,7 @@ docker-dev: check-registry check-train-image
 		echo "[docker] skip existing $(IMAGE_LOCATION) dev image: $(DEV_IMAGE)"; \
 	else \
 		if [ "$(BUILD_DEFAULT_TRAIN)" = "1" ]; then \
-			$(MAKE) --no-print-directory docker-train TRAIN_IMAGE="$(TRAIN_IMAGE)"; \
+			$(MAKE) --no-print-directory docker-train-image TRAIN_IMAGE="$(TRAIN_IMAGE)"; \
 		fi; \
 		$(DOCKER) build --progress=$(DOCKER_BUILD_PROGRESS) \
 			-f $(DOCKERFILE) \

@@ -1,0 +1,265 @@
+# syntax=docker/dockerfile:1.7
+# CUDA 13 / TE 2.18 candidate. Build context: Relax repository root.
+# Full image build and B300 forward/backward validation are required before promotion.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.17-cu130@sha256:16aba8925507e631e1dc1e23d95d026533602591775f6a8db68b74ee99746155
+ARG TRAIN_IMAGE=train
+# GPU_ARCH: hopper (H20/H800, SM90) or b300 (Blackwell Ultra, SM103, AWS EFA).
+ARG GPU_ARCH=b300
+FROM ${BASE_IMAGE} as base
+
+ARG GPU_ARCH=b300
+# Share CUDA build targets across stages; Hopper also retains INT4 QAT support for SM80-SM89.
+RUN case "$GPU_ARCH" in \
+        b300)   ARCHES="10.0a 10.3a"; EXPECT_SM="103" ;; \
+        hopper) ARCHES="8.0 8.6 8.9 9.0"; EXPECT_SM="90" ;; \
+        *) echo "Unsupported GPU_ARCH='$GPU_ARCH' (expected: hopper | b300)" >&2; exit 1 ;; \
+    esac && \
+    printf 'export TORCH_CUDA_ARCH_LIST="%s"\nexport FLASHINFER_CUDA_ARCH_LIST="%s"\nexport RELAX_EXPECT_SM="%s"\n' \
+        "$ARCHES" "$ARCHES" "$EXPECT_SM" > /etc/relax_build.env && \
+    cat /etc/relax_build.env
+
+ENV TARGETARCH=amd64 \
+    PYVER=3.12 \
+    PYSFX=3 \
+    L4T=0 \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
+    TZ=Asia/Shanghai \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    OPENCV_VERSION=4.7.0 \
+    DEBIAN_FRONTEND=noninteractive
+
+ARG TE_VERSION=2.18.0
+ARG TILELANG_VERSION=0.1.11
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH} \
+    PIP_CONSTRAINT=/etc/relax-cu130-constraints.txt
+
+COPY docker/scripts/blackwell_constraints.py /tmp/blackwell_constraints.py
+RUN python /tmp/blackwell_constraints.py
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+    build-essential patchelf tmux net-tools htop nano iputils-ping \
+    autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
+    libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
+    libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y locales tzdata && \
+    locale-gen "$LANG" && update-locale LANG="$LANG" LC_ALL="$LC_ALL" && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+ARG EFA_INSTALLER_VERSION=latest
+RUN if [ "$GPU_ARCH" = "b300" ]; then \
+    cd /tmp && \
+    curl -fsSL -O https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+    tar -xf aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz && \
+    cd aws-efa-installer && \
+    ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify && \
+    cd /tmp && rm -rf aws-efa-installer*; \
+    else echo "skip EFA installer (GPU_ARCH=$GPU_ARCH)"; fi
+
+ENV PATH=/opt/amazon/efa/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/amazon/efa/lib:${LD_LIBRARY_PATH}
+
+FROM base as sglang
+
+WORKDIR /sgl-workspace/sglang
+
+RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
+
+FROM base as train
+
+RUN python -c "import torch; assert torch.backends.cudnn.version() is not None"
+
+# FA2 is retained as a comparison backend. Build against this image's Torch/CUDA ABI.
+# Hopper-only FA3 is intentionally omitted from this B300-focused CUDA 13 image.
+RUN FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 \
+    pip -v install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir && \
+    pip install --no-cache-dir flash-linear-attention==0.4.1
+
+# No cu128 nightly wheel in a cu130 build. Compile the pinned TileLang source.
+RUN MAX_JOBS=32 CMAKE_BUILD_PARALLEL_LEVEL=32 \
+    pip install --no-cache-dir --no-binary=tilelang "tilelang==${TILELANG_VERSION}"
+
+# Replace any inherited TE 12.x core before installing the CUDA 13 core and Torch extension.
+# Apex must compile for GPU_ARCH even when a different GPU is visible on the build host.
+RUN . /etc/relax_build.env && \
+    pip uninstall -y transformer-engine transformer-engine-cu12 transformer-engine-cu13 transformer-engine-torch && \
+    pip -v install --no-cache-dir --no-build-isolation \
+        "transformer_engine[core_cu13,pytorch]==${TE_VERSION}" && \
+    TMS_CUDA_MAJOR=13 pip install \
+        git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 \
+        --no-cache-dir --force-reinstall --no-deps && \
+    pip install "numpy==2.2.6" && \
+    NVCC_APPEND_FLAGS="--threads 32" \
+    pip -v install --disable-pip-version-check --no-cache-dir \
+    --no-build-isolation \
+    --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
+    git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+
+WORKDIR /root
+
+# Build the INT4 fake-quant CUDA extension required by INT4 QAT rollout weight sync.
+# Hide build-host GPUs so setup.py uses TORCH_CUDA_ARCH_LIST; verify the resulting cubin.
+COPY relax/backends/megatron/kernels/int4_qat /tmp/int4_qat
+RUN . /etc/relax_build.env && \
+    cd /tmp/int4_qat && \
+    CUDA_VISIBLE_DEVICES="" pip install . --no-build-isolation --no-cache-dir && \
+    cd / && \
+    INT4_SO="$(python -c 'import importlib.util as u; print(u.find_spec("fake_int4_quant_cuda").origin)')" && \
+    test -n "$INT4_SO" && \
+    /usr/local/cuda/bin/cuobjdump --list-elf "$INT4_SO" | grep -q "sm_${RELAX_EXPECT_SM}" && \
+    echo "int4_qat built for sm_${RELAX_EXPECT_SM}: $INT4_SO" && \
+    rm -rf /tmp/int4_qat
+
+ARG TRAIN_IMAGE=train
+FROM ${TRAIN_IMAGE} as relax_build
+
+WORKDIR /root
+
+ARG GPU_ARCH=b300
+ARG PATCH_VERSION=latest
+ARG ENABLE_SGLANG_PATCH=1
+
+ENV RELAX_GPU_ARCH=${GPU_ARCH}
+
+# CUTLASS DSL and gRPC require protobuf 6, including when reusing an older TRAIN_IMAGE.
+RUN sed -i '/^protobuf[<=>!~]/d' "$PIP_CONSTRAINT" && \
+    printf '%s\n' 'protobuf>=6.33.5,<7' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir 'protobuf>=6.33.5,<7'
+
+# Rebuild the bundled SGLang kernel only when B300 needs missing SM103 support.
+COPY docker/scripts/ensure_sgl_kernel_sm103.py /tmp/ensure_sgl_kernel_sm103.py
+RUN python /tmp/ensure_sgl_kernel_sm103.py
+
+# TE 2.18 replaces the old 2.14.1 attention selector. Do not apply the old tuple sed patch.
+RUN python -c "import importlib.metadata as m; \
+assert m.version('transformer-engine') == '2.18.0'"
+# Avoid host scalar synchronization when clearing context-parallel gradient padding.
+COPY docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch /tmp/te-cp-padding-no-host-sync.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
+    patch --batch --forward --fuzz=0 -p1 < /tmp/te-cp-padding-no-host-sync.patch
+
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
+ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
+    PYTHONPATH=/root/Megatron-LM/
+
+RUN rm -rf /root/Megatron-LM && git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git && \
+    cd /root/Megatron-Bridge/ && git checkout ${MEGATRON_BRIDGE_COMMIT} && \
+    git submodule update --init --recursive && ./scripts/switch_mcore.sh dev && \
+    mkdir /root/Megatron-LM &&\
+    cp -r /root/Megatron-Bridge/src/megatron /root/Megatron-LM/ && \
+    rsync -avP /root/Megatron-Bridge/3rdparty/Megatron-LM/megatron/ /root/Megatron-LM/megatron/ && \
+    rm -rf /root/Megatron-Bridge
+
+# MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
+# Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
+RUN sed -i '/^nvidia-resiliency-ext==/d' "$PIP_CONSTRAINT" && \
+    printf '%s\n' 'nvidia-resiliency-ext==0.6.0' 'grpcio-tools==1.81.1' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir \
+        "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
+RUN sed -i '/^flash-linear-attention==/d; /^fla-core==/d' "$PIP_CONSTRAINT" && \
+    printf '%s\n' 'fla-core==0.5.2' 'flash-linear-attention==0.5.2' >> "$PIP_CONSTRAINT" && \
+    pip install --no-cache-dir --force-reinstall --no-deps \
+        "fla-core==0.5.2" "flash-linear-attention==0.5.2" && \
+    pip install --no-cache-dir megatron-energon
+
+# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
+COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
+
+RUN curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+    -o apptainer_1.4.1_amd64.deb https://github.com/apptainer/apptainer/releases/download/v1.4.1/apptainer_1.4.1_amd64.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ./apptainer_1.4.1_amd64.deb \
+    && rm apptainer_1.4.1_amd64.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+
+# Align the older Relax pins with the CUDA 13 base: CuPy 14 needs NumPy 2,
+# which requires a compatible PyArrow; kernels also needs Hub >=1.10.
+# ClearML 2.1.4 accepts PyJWT >=2.11 alongside current MCP releases.
+RUN sed -i \
+    -e 's/^clearml==2\.1\.3$/clearml==2.1.4/' \
+    -e 's/numpy<2/numpy==2.2.6/g' \
+    -e 's/pyarrow==14\.0\.2/pyarrow==20.0.0/g' \
+    -e 's/huggingface_hub==1\.7\.2/huggingface_hub==1.10.0/g' \
+    /tmp/requirements.txt
+
+RUN pip install --ignore-installed 'PyJWT>=2.10.1,<3' && \
+    pip install -r /tmp/requirements.txt --no-cache-dir && \
+    pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
+
+# Install the R3-capable router after requirements to preserve routed_experts on /generate.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+        https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
+    python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
+
+COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
+RUN cd Megatron-LM && \
+    sha256sum megatron.patch > /etc/relax-megatron-patch.sha256 && \
+    patch --batch --forward -p1 < /root/Megatron-LM/megatron.patch && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    python -m compileall -q megatron && \
+    rm megatron.patch sync-save-bounded-staging.patch && \
+    apt-get update && apt-get install -y --no-install-recommends jq && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker/scripts/setup_memory_saver.py /tmp/setup_memory_saver.py
+RUN python /tmp/setup_memory_saver.py
+
+# Rebuild FlashInfer sampling for B300; Hopper keeps the prebuilt SM90 kernel.
+COPY docker/scripts/build_flashinfer_sampling.py /tmp/build_flashinfer_sampling.py
+RUN . /etc/relax_build.env && \
+    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:${PATH} GPU_ARCH="${GPU_ARCH}" \
+    python /tmp/build_flashinfer_sampling.py
+
+COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+    cd /sgl-workspace/sglang && git add . && \
+    sha256sum sglang.patch > /etc/relax-sglang-patch.sha256 && \
+    git update-index --refresh && \
+    git apply sglang.patch --3way && \
+    if grep -R -n '^<<<<<<< ' .; then \
+    echo "Patch failed to apply cleanly. Please resolve conflicts." && \
+    exit 1; \
+    fi && \
+    rm sglang.patch; \
+fi
+
+# Complete --no-deps installs, match Energon's fsspec, and retain audioread for multimodal imports.
+# NIXL 1.3.2 requires both backend wheels and selects CUDA at runtime.
+RUN pip install --no-cache-dir "hydra-core==1.3.2" "nixl-cu12==1.3.2" \
+        "s3fs==2025.3.0" "fsspec==2025.3.0" "boto3==1.41.5" "botocore==1.41.5" \
+        "packaging==25.0" "pillow==11.3.0" "audioread==3.1.0"
+
+# Check package versions and CPU-loadable components during docker build.
+# TE and SGLang require libcuda from the host; validate their imports at runtime.
+COPY docker/scripts/validate_blackwell.py /tmp/validate_blackwell.py
+COPY docker/scripts/check_gpu_imports.py /opt/relax/check_gpu_imports.py
+RUN python /tmp/validate_blackwell.py && \
+    python -m pip check
+
+# Enable the EFA NCCL plugin only for B300; Hopper clusters may not have EFA.
+FROM relax_build as relax_hopper
+
+FROM relax_build as relax_b300
+ENV FI_PROVIDER=efa \
+    NCCL_NET_PLUGIN=/opt/amazon/ofi-nccl/lib/libnccl-net-ofi.so \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
+FROM relax_${GPU_ARCH} as relax

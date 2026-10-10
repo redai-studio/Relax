@@ -28,6 +28,48 @@ logger = get_logger(__name__)
 EncodeMultimodalInputs = Callable[[dict], Awaitable[tuple[dict, float]]]
 
 
+def _replace_response_eos_for_teacher(
+    input_ids: Sequence[int],
+    *,
+    prompt_length: int,
+    response_length: int,
+    student_eos_token_id: int | None,
+    teacher_eos_token_id: int | None,
+) -> list[int]:
+    teacher_input_ids = list(input_ids)
+    if (
+        response_length <= 0
+        or student_eos_token_id is None
+        or teacher_eos_token_id is None
+        or student_eos_token_id == teacher_eos_token_id
+    ):
+        return teacher_input_ids
+
+    response_start = max(int(prompt_length), 0)
+    response_end = min(response_start + int(response_length), len(teacher_input_ids))
+    for token_index in range(response_start, response_end):
+        if teacher_input_ids[token_index] == student_eos_token_id:
+            teacher_input_ids[token_index] = teacher_eos_token_id
+            break
+    return teacher_input_ids
+
+
+def _insert_teacher_response_prefix(
+    input_ids: Sequence[int],
+    *,
+    prompt_length: int,
+    prefix_token_ids: Sequence[int],
+) -> tuple[list[int], int]:
+    teacher_input_ids = list(input_ids)
+    prefix_token_ids = list(prefix_token_ids)
+    if not prefix_token_ids:
+        return teacher_input_ids, int(prompt_length)
+
+    insertion_index = min(max(int(prompt_length), 0), len(teacher_input_ids))
+    teacher_input_ids[insertion_index:insertion_index] = prefix_token_ids
+    return teacher_input_ids, insertion_index + len(prefix_token_ids)
+
+
 def _aiohttp_json_post_kwargs(payload: dict) -> dict:
     """Bypass aiohttp's ``json=`` kwarg: serialize via orjson and ship as raw
     ``data=``."""
@@ -139,6 +181,11 @@ def _pick_teacher_url(args, sample=None) -> str:
 class OpdManager:
     def __init__(self, args):
         self.args = args
+        self.student_eos_token_id = getattr(args, "opd_student_eos_token_id", None)
+        self.teacher_eos_token_id = getattr(args, "opd_teacher_eos_token_id", None)
+        self.teacher_response_prefix_token_ids = tuple(
+            getattr(args, "opd_teacher_response_prefix_token_ids", None) or ()
+        )
         self.topk_worker: opd_main_worker.TopkWorker | None = None
         self.sampled_worker: opd_main_worker.SampledTokenWorker | None = None  # 仅 student_sampled
         self.opsd_worker: opd_opsd_worker.OpsdWorker | None = None
@@ -146,6 +193,10 @@ class OpdManager:
         token_selection = args.opd_token_selection
         if token_selection != "student_sampled":
             self.topk_worker = opd_main_worker.TopkWorker.from_args(args)
+            if bool(getattr(args, "opd_fkl_entropy_gate", False)):
+                # EOPD: sampled-token reverse-KL advantages ride alongside the
+                # entropy-gated top-k forward-KL loss; both workers are active.
+                self.sampled_worker = opd_main_worker.SampledTokenWorker.from_args(args)
         else:
             self.sampled_worker = opd_main_worker.SampledTokenWorker.from_args(args)
 
@@ -186,7 +237,7 @@ class OpdManager:
                 train_data[kl_field] = [
                     getattr(s, kl_field).tolist() if getattr(s, kl_field, None) is not None else [] for s in samples
                 ]
-        elif self.sampled_worker is not None:
+        if self.sampled_worker is not None:
             train_data[opd_main_worker.SampledTokenWorker.TRANSFER_TEACHER_LOG_PROBS] = [
                 s.teacher_log_probs if s.teacher_log_probs is not None else [] for s in samples
             ]
@@ -294,8 +345,19 @@ class OpdManager:
             prompt_length = self.opsd_worker.teacher_prompt_len(sample, response_length)
         else:
             image_data = None
-            teacher_input_ids = sample.rollout_tokens or sample.tokens
             prompt_length = len(sample.tokens) - response_length
+            teacher_input_ids = _replace_response_eos_for_teacher(
+                sample.rollout_tokens or sample.tokens,
+                prompt_length=prompt_length,
+                response_length=response_length,
+                student_eos_token_id=self.student_eos_token_id,
+                teacher_eos_token_id=self.teacher_eos_token_id,
+            )
+            teacher_input_ids, prompt_length = _insert_teacher_response_prefix(
+                teacher_input_ids,
+                prompt_length=prompt_length,
+                prefix_token_ids=self.teacher_response_prefix_token_ids,
+            )
         logprob_start_len = max(prompt_length - 1, 0)
 
         mm_fields = {"image_data": image_data} if image_data is not None else None

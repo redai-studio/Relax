@@ -1,16 +1,16 @@
-# Agentic training contract
+# Agentic exports and training scores
 
-Keep this reference limited to semantics introduced by Agentic export fanout.
+## Export, score, and batching
 
-## Export, credit, and batching
-
-| Contexts exported per Session | Export | Training credit | Dynamic batching |
+| Contexts exported per Session | Export | Training score | Dynamic batching |
 | --- | --- | --- | --- |
-| One, linear leaf | Implicit or explicit | Write `reward`, or configure a reward producer | Not required by context count |
-| One selected from several leaves | Explicit object or one JSONL record | Write `reward`, or configure a reward producer | Not required by context count |
-| More than one | Explicit JSONL records | Require `--agentic-custom-advantage-path`; ordinarily avoid `--custom-rm-path` | Require `--use-dynamic-batch-size` and `--max-tokens-per-gpu` |
+| One, linear leaf on the reward path | Implicit or explicit | Agent output `reward` or `--custom-rm-path` | Not required by context count |
+| One context with custom advantage | Explicit object or one JSONL record | `--agentic-custom-advantage-path` | Not required by context count |
+| One selected from several leaves | Explicit object or one JSONL record | Agent output `reward`, `--custom-rm-path`, or `--agentic-custom-advantage-path` | Not required by context count |
+| More than one | Explicit JSONL records | `--agentic-custom-advantage-path` | `--use-dynamic-batch-size` and `--max-tokens-per-gpu` |
 
 Multiple resident Sessions do not trigger the multi-context rule. One Session exporting several training contexts does.
+Custom advantage uses named explicit export records, including when one Session exports one context.
 
 ## Logical identity and physical rows
 
@@ -21,14 +21,24 @@ Per-token loss gives longer or multi-context Sessions more weight; keep this as 
 
 ## Custom advantage
 
-The hook receives original Session order, with each Session represented as `{export_name: merged_export_metadata}`. Every non-`None` result must return a numeric value for every exported name.
+`advantage_func` receives one mapping per sampled Session: `{export_name: export_metadata}`.
 
-A top-level `None` intentionally drops the whole prompt Group. No context from that Group reaches Transfer; outstanding demand remains and is replenished. It is not a missing value for one context.
+It returns `None` or a list with the same Session order and export names. In each result mapping, an export's advantage is a
+scalar shared by all assistant turns or a list containing one value per assistant turn.
 
-Ordinarily avoid `--custom-rm-path` for multi-context credit ownership. Without `--group-rm`, custom advantage makes
-the ordinary RM path skip it. With `--group-rm`, a deliberately designed Group RM may still write `sample.reward` for
-metrics, filtering, or dumps while custom advantage supplies training credit. Route advantage-estimator compatibility
-to the algorithm expert.
+| Function output | Meaning |
+| --- | --- |
+| `{name: scalar}` | Use the same score for every assistant turn |
+| `{name: list[float]}` | Use item `k` for assistant turn `k`; list length must equal `agentic_trace.turn_count` |
+| `None` | Drop and replenish the complete Group |
+
+Relax expands each list item over that turn's tokens; observation tokens keep zero. Put every input used by the function
+in export metadata and normalize it inside the function. Exported `reward` is not included in the function input. Eval
+does not call the function.
+
+Avoid `--custom-rm-path` for multi-context training. Without `--group-rm`, custom advantage skips the ordinary RM path.
+With `--group-rm`, Group RM may still write `sample.reward` for metrics, filtering, or dumps while custom advantage
+supplies the training score. Route advantage-estimator compatibility to the algorithm expert.
 
 ## Outcome metrics
 

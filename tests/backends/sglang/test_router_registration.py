@@ -3,6 +3,7 @@
 import importlib
 import logging
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -69,18 +70,14 @@ def sglang_engine_module(monkeypatch):
     megatron_peft_utils.is_lora_enabled = lambda _args: False
     monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
 
-    # Force a fresh import so the module binds to the stubbed dependencies above,
-    # but restore the original module object on teardown. Leaving the key popped
-    # corrupts sys.modules for any later test that patches this module: their
-    # patch() re-imports a *new* module object distinct from the one already
-    # bound in other test files' top-level imports, so the patch silently misses.
-    original_module = sys.modules.pop("relax.backends.sglang.sglang_engine", None)
-    module = importlib.import_module("relax.backends.sglang.sglang_engine")
-    yield module
-    if original_module is not None:
-        sys.modules["relax.backends.sglang.sglang_engine"] = original_module
-    else:
-        sys.modules.pop("relax.backends.sglang.sglang_engine", None)
+    # Track both import caches before re-importing with the test dependencies.
+    # monkeypatch restores their original presence and objects at teardown.
+    module_name = "relax.backends.sglang.sglang_engine"
+    parent = importlib.import_module("relax.backends.sglang")
+    monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
+    monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+    del sys.modules[module_name]
+    yield importlib.import_module(module_name)
 
 
 class _Response:
@@ -131,6 +128,8 @@ class _RouterRequests:
         if self.worker_lists is None:
             raise AssertionError("registration-level worker_id should avoid listing DP rank workers")
         self.gets.append(url)
+        if not url.endswith("/workers"):
+            return _Response(200, {})
         workers = self.worker_lists[0] if len(self.worker_lists) == 1 else self.worker_lists.pop(0)
         return _Response(200, {"workers": workers})
 
@@ -157,7 +156,167 @@ def _make_engine(sglang_engine_module):
     engine.server_port = 8000
     engine._router_worker_id = None
     engine._router_unregister_submitted = False
+    engine._evicted = threading.Event()
     return engine
+
+
+def test_registration_rejects_eviction_before_rpc_execution(monkeypatch, sglang_engine_module):
+    requests = _RouterRequests()
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    engine = _make_engine(sglang_engine_module)
+    engine._evicted.set()
+    assert engine.register_to_router() is False
+    assert requests.posts == []
+
+
+def test_dead_worker_cleanup_confirms_removal_and_is_idempotent(monkeypatch, sglang_engine_module):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    other = {"id": "other", "url": "http://other:8000", "is_healthy": False}
+    requests = _RouterRequests(worker_lists=[[old, other], [other]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.remove_dead_router_worker
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert cleanup("http://router:30000", old["url"], state)
+    assert cleanup("http://router:30000", old["url"], state)
+    assert state.worker_id == "old"
+    assert requests.deletes == ["http://router:30000/workers/old"]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"id": "live", "url": "http://worker:8000", "is_healthy": True}],
+        [{"id": "dp", "url": "http://worker:8000@0", "is_healthy": False}],
+        [{"id": "unknown", "url": "http://worker:8000"}],
+        [
+            {"id": "first", "url": "http://worker:8000", "is_healthy": False},
+            {"id": "second", "url": "http://worker:8000", "is_healthy": False},
+        ],
+    ],
+)
+def test_dead_worker_cleanup_refuses_ambiguous_or_live_owner(monkeypatch, sglang_engine_module, rows):
+    requests = _RouterRequests(worker_lists=[rows])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert not sglang_engine_module.remove_dead_router_worker("http://router:30000", "http://worker:8000", state)
+    assert requests.deletes == []
+
+
+def test_dead_worker_cleanup_timeout_retains_id_and_does_not_delete_replacement(monkeypatch, sglang_engine_module):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    requests = _RouterRequests(delete_status=503, worker_lists=[[old]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.remove_dead_router_worker
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert not cleanup("http://router:30000", old["url"], state)
+    assert state.worker_id == "old" and state.delete_requested
+    # The DELETE may have taken effect despite the failed response. Another
+    # owner, including an unhealthy new generation, must not be selected again.
+    replacement = {**old, "id": "new"}
+    requests.worker_lists = [[replacement]]
+    assert not cleanup("http://router:30000", old["url"], state)
+    assert requests.deletes == ["http://router:30000/workers/old"]
+
+
+def test_dead_worker_cleanup_wait_is_bounded(monkeypatch, sglang_engine_module):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    requests = _RouterRequests(worker_lists=[[old]])
+    clock = _Clock()
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    monkeypatch.setattr(sglang_engine_module, "time", clock)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert not sglang_engine_module.remove_dead_router_worker("http://router:30000", old["url"], state, timeout=1)
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("worker_id", ["old", "different"])
+def test_dead_worker_cleanup_never_selects_another_actor_generation(monkeypatch, sglang_engine_module, worker_id):
+    row = {"id": worker_id, "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "C"}}
+    requests = _RouterRequests(worker_lists=[[row]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert not sglang_engine_module.remove_dead_router_worker("http://router:30000", row["url"], state)
+    assert requests.deletes == [] and state.worker_id is None
+
+
+def test_dead_worker_cleanup_lost_delete_response_is_polled_not_reenqueued(monkeypatch, sglang_engine_module):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    requests = _RouterRequests(worker_lists=[[old]])
+    clock = _Clock()
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    monkeypatch.setattr(sglang_engine_module, "time", clock)
+
+    def lost_response(url, timeout):
+        requests.deletes.append(url)
+        raise TimeoutError("removal queued by URL; response lost")
+
+    monkeypatch.setattr(requests, "delete", lost_response)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    cleanup = sglang_engine_module.remove_dead_router_worker
+    assert not cleanup("http://router:30000", old["url"], state, timeout=1)
+    assert not cleanup("http://router:30000", old["url"], state, timeout=1)
+    assert len(requests.deletes) == 1
+    # Original asynchronous removal finally completes. No second queued
+    # removal remains that could later remove a replacement at this URL.
+    requests.worker_lists = [[]]
+    assert cleanup("http://router:30000", old["url"], state)
+    requests.worker_lists = [[{**old, "id": "new", "metadata": {"relax_actor_id": "B"}}]]
+    assert not cleanup("http://router:30000", old["url"], state)
+    assert len(requests.deletes) == 1
+
+
+@pytest.mark.parametrize("failure", ["connect_timeout", "router_rejection"])
+def test_dead_worker_cleanup_retries_only_definitely_unaccepted_delete(monkeypatch, sglang_engine_module, failure):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    requests = _RouterRequests(worker_lists=[[old]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+
+    def reject(url, timeout):
+        if failure == "connect_timeout":
+            raise sglang_engine_module.ConnectTimeout("not connected")
+        return _Response(500, {"code": "INTERNAL_SERVER_ERROR", "error": "Job queue not initialized"})
+
+    monkeypatch.setattr(requests, "delete", reject)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    cleanup = sglang_engine_module.remove_dead_router_worker
+    assert not cleanup("http://router:30000", old["url"], state)
+    assert not state.delete_requested
+    monkeypatch.setattr(requests, "delete", lambda url, timeout: _Response(202))
+    requests.worker_lists = [[old], []]
+    assert cleanup("http://router:30000", old["url"], state)
+
+
+def test_native_registration_attaches_actual_actor_identity(monkeypatch, sglang_engine_module):
+    requests = _RouterRequests()
+    payloads = []
+    monkeypatch.setattr(requests, "post", lambda url, json, timeout: payloads.append(json) or _Response(202))
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    monkeypatch.setattr(
+        sglang_engine_module.ray, "get_runtime_context", lambda: SimpleNamespace(get_actor_id=lambda: "A")
+    )
+    engine = _make_engine(sglang_engine_module)
+    engine._is_scaled_out = True
+    assert engine.register_to_router()
+    assert payloads[0]["labels"] == {"relax_actor_id": "A"}
+
+
+@pytest.mark.parametrize("status", ["pending", "processing", "failed"])
+def test_dead_worker_cleanup_does_not_duplicate_actor_shutdown(monkeypatch, sglang_engine_module, status):
+    old = {"id": "old", "url": "http://worker:8000", "is_healthy": False, "metadata": {"relax_actor_id": "A"}}
+    requests = _RouterRequests(worker_lists=[[old], []])
+    original_get = requests.get
+
+    def get(url, timeout):
+        if url.endswith("/old"):
+            return _Response(200, {"job_status": {"job_type": "RemoveWorker", "status": status}})
+        return original_get(url, timeout)
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    state = sglang_engine_module.RouterWorkerCleanup("A")
+    assert sglang_engine_module.remove_dead_router_worker("http://router:30000", old["url"], state)
+    assert state.delete_requested
+    assert requests.deletes == []
 
 
 def test_missing_load_format_choices_fails_closed(sglang_engine_module):

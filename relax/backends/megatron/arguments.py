@@ -147,7 +147,7 @@ def _validate_linear_cp_mode(args: Namespace, config: Optional[object] = None) -
 
     # Bridge determines the attention variant from the HF checkpoint. The default
     # linear_cp_mode on an ordinary-attention model does not make it a GDN model.
-    if getattr(model_config, "experimental_attention_variant", None) != "gated_delta_net":
+    if getattr(model_config, "experimental_attention_variant", None) not in {"gated_delta_net", "gdn"}:
         return
 
     cp_may_exceed_one = (

@@ -26,10 +26,10 @@ from typing import Any
 
 # Bundle format version. A reader refuses to open a bundle whose major version
 # differs. format_major is derived, never stored.
-FORMAT_VERSION = "1.0.0"
+FORMAT_VERSION = "2.0.0"
 FORMAT_MAJOR = FORMAT_VERSION.split(".", maxsplit=1)[0]
 
-# Top-level keys the V1 reader understands for each metadata file. Validation
+# Top-level keys the V2 reader understands for each metadata file. Validation
 # uses these to flag unknown fields (which would otherwise be silently dropped)
 # instead of letting a newer-but-same-major schema degrade without a warning.
 MANIFEST_KEYS = frozenset(
@@ -51,8 +51,6 @@ class StageId(str, Enum):
     """Pipeline stages along the reward -> advantage -> loss chain."""
 
     SAMPLE = "sample"
-    REWARD_RAW = "reward.raw"
-    REWARD_POST_PROCESS = "reward.post_process"
     ADVANTAGE_KL = "advantage.kl"
     ADVANTAGE_ESTIMATE = "advantage.estimate"
     LOSS_POLICY = "loss.policy"
@@ -63,8 +61,6 @@ class StageId(str, Enum):
 # produced by stages listed before it.
 STAGE_ORDER: tuple[StageId, ...] = (
     StageId.SAMPLE,
-    StageId.REWARD_RAW,
-    StageId.REWARD_POST_PROCESS,
     StageId.ADVANTAGE_KL,
     StageId.ADVANTAGE_ESTIMATE,
     StageId.LOSS_POLICY,
@@ -110,7 +106,6 @@ class Identity:
     consumer_batch_ids: list[str] = field(default_factory=list)
     micro_batch_ids: list[str] = field(default_factory=list)
     semantic_group_ids: list[str] = field(default_factory=list)
-    normalization_cohort_ids: list[str] = field(default_factory=list)
     weight_lineage: WeightLineage = field(default_factory=WeightLineage)
     # Parallel world sizes {dp, tp, pp, cp}, not the capturing process rank.
     rank: dict[str, int] = field(default_factory=dict)
@@ -129,8 +124,8 @@ class SampleRecord:
     response_length: int
     total_length: int
     loss_mask: list[int]
-    raw_reward: float
-    reward: float
+    # Post-processed scalar or per-token reward consumed by advantage estimation.
+    reward: float | list[float]
     label_hash: str | None = None
     # Physical micro-batch membership (single-batch replay selection). None when
     # the producer did not record it; batch selection then fails closed.
@@ -139,11 +134,9 @@ class SampleRecord:
 
 @dataclass
 class RecomputeConfig:
-    """Numerical configuration required to recompute the frozen V1 path."""
+    """Numerical configuration required to recompute the frozen V2 path."""
 
     advantage_estimator: str = "grpo"
-    n_samples_per_prompt: int = 1
-    grpo_std_normalization: bool = False
     kl_loss_type: str = "k1"
     kl_coef: float = 0.0
     eps_clip: float = 0.2
@@ -323,7 +316,6 @@ def _sample_record_to_dict(record: SampleRecord) -> dict[str, Any]:
         "response_length": record.response_length,
         "total_length": record.total_length,
         "loss_mask": record.loss_mask,
-        "raw_reward": record.raw_reward,
         "reward": record.reward,
         "label_hash": record.label_hash,
         "micro_batch_id": record.micro_batch_id,
@@ -337,7 +329,6 @@ def _sample_record_from_dict(data: dict[str, Any]) -> SampleRecord:
         response_length=data["response_length"],
         total_length=data["total_length"],
         loss_mask=data["loss_mask"],
-        raw_reward=data["raw_reward"],
         reward=data["reward"],
         label_hash=data.get("label_hash"),
         micro_batch_id=data.get("micro_batch_id"),
@@ -357,7 +348,6 @@ def _identity_to_dict(identity: Identity) -> dict[str, Any]:
         "consumer_batch_ids": identity.consumer_batch_ids,
         "micro_batch_ids": identity.micro_batch_ids,
         "semantic_group_ids": identity.semantic_group_ids,
-        "normalization_cohort_ids": identity.normalization_cohort_ids,
         "weight_lineage": {
             "rollout_weight": identity.weight_lineage.rollout_weight,
             "actor_weight": identity.weight_lineage.actor_weight,
@@ -380,7 +370,6 @@ def _identity_from_dict(data: dict[str, Any]) -> Identity:
         consumer_batch_ids=data.get("consumer_batch_ids", []),
         micro_batch_ids=data.get("micro_batch_ids", []),
         semantic_group_ids=data.get("semantic_group_ids", []),
-        normalization_cohort_ids=data.get("normalization_cohort_ids", []),
         weight_lineage=WeightLineage(
             rollout_weight=lineage_raw.get("rollout_weight"),
             actor_weight=lineage_raw.get("actor_weight"),
@@ -397,8 +386,6 @@ def index_to_dict(index: BundleIndex) -> dict[str, Any]:
         "samples": [_sample_record_to_dict(sample) for sample in index.samples],
         "config": {
             "advantage_estimator": index.config.advantage_estimator,
-            "n_samples_per_prompt": index.config.n_samples_per_prompt,
-            "grpo_std_normalization": index.config.grpo_std_normalization,
             "kl_loss_type": index.config.kl_loss_type,
             "kl_coef": index.config.kl_coef,
             "eps_clip": index.config.eps_clip,
@@ -417,8 +404,6 @@ def index_from_dict(data: dict[str, Any]) -> BundleIndex:
         samples=[_sample_record_from_dict(sample) for sample in data["samples"]],
         config=RecomputeConfig(
             advantage_estimator=config_raw.get("advantage_estimator", "grpo"),
-            n_samples_per_prompt=config_raw.get("n_samples_per_prompt", 1),
-            grpo_std_normalization=config_raw.get("grpo_std_normalization", False),
             kl_loss_type=config_raw.get("kl_loss_type", "k1"),
             kl_coef=config_raw.get("kl_coef", 0.0),
             eps_clip=config_raw.get("eps_clip", 0.2),

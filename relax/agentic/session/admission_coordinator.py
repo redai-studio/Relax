@@ -84,9 +84,15 @@ class AdmissionCoordinator:
     Shards."""
 
     def __init__(self, args: Any) -> None:
+        self._program_admission = bool(args.agentic_program_admission)
         self._router_ip = args.sglang_router_ip
         self._router_port = args.sglang_router_port
         self._max_wait_s = float(args.agentic_admission_max_wait_s)
+        self._request_permits = asyncio.BoundedSemaphore(
+            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        )
+        self._active_request_permits: set[str] = set()
+        self._cancelled_request_permits: dict[str, bool] = {}
         self._state = BudgetState(
             headroom=float(args.agentic_admission_headroom),
             pressure_threshold=float(args.agentic_admission_pressure_threshold),
@@ -101,8 +107,34 @@ class AdmissionCoordinator:
         self._poll_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        if not self._program_admission:
+            return
         await self._reconcile_once()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="agentic-admission-reconcile")
+
+    async def acquire_request_permit(self, permit_id: str) -> bool:
+        if self._cancelled_request_permits.pop(permit_id, False):
+            return False
+        await self._request_permits.acquire()
+        if self._cancelled_request_permits.pop(permit_id, False):
+            self._request_permits.release()
+            return False
+        self._active_request_permits.add(permit_id)
+        return True
+
+    @ray.method(max_task_retries=2)
+    async def cancel_request_permit(self, permit_id: str) -> None:
+        if permit_id in self._active_request_permits:
+            self._active_request_permits.remove(permit_id)
+            self._request_permits.release()
+        self._cancelled_request_permits[permit_id] = True
+
+    @ray.method(max_task_retries=2)
+    async def release_request_permit(self, permit_id: str) -> None:
+        if permit_id not in self._active_request_permits:
+            return
+        self._active_request_permits.remove(permit_id)
+        self._request_permits.release()
 
     async def acquire(self, request: dict[str, Any]) -> dict[str, Any]:
         ticket_id = str(request["ticket_id"])
@@ -164,6 +196,8 @@ class AdmissionCoordinator:
         self._drain_waiters()
 
     async def metrics(self, reset: bool = False) -> dict[str, float]:
+        if not self._program_admission:
+            return {}
         snapshot = self._state.snapshot(now=time.monotonic(), reset_usage_window=reset)
         counters = self._counters.copy()
         wait_granted = counters.pop("wait_granted", 0)

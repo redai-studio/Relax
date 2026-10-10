@@ -195,7 +195,13 @@ def adapt_processor_kwargs(
         adapted["medias"] = medias
     adapted["return_tensors"] = "pt"
     if extra:
-        dropped = sorted(k for k in extra if k not in adapted)
+        # These false defaults request no feature and need no translation for
+        # Kimi's image-only processor. Still warn for enabled/unknown options.
+        dropped = sorted(
+            k
+            for k, value in extra.items()
+            if k not in adapted and not (k in {"return_mm_token_type_ids", "use_audio_in_video"} and value is False)
+        )
         if dropped:
             _warn_dropped_kimi_k25_kwargs(tuple(dropped))
     return adapted
@@ -392,7 +398,6 @@ def process_vision_info(prompt, processor, use_audio_in_video, config=None):
     if hasattr(processor.image_processor, "patch_size"):
         image_patch_size = processor.image_processor.patch_size
     else:
-        logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
         image_patch_size = DEFAULT_PATCH_SIZE
     images, videos, audios = process_multimodal_info(
         prompt, image_patch_size=image_patch_size, use_audio_in_video=use_audio_in_video, config=config

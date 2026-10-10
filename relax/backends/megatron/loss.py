@@ -15,6 +15,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -115,7 +116,7 @@ def get_responses(
     # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
     # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
     # produce real fp32 logits and must stay strict.
-    if args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False):
+    if is_sft_mode(args) and getattr(args, "sft_chunked_logits", False):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -213,7 +214,7 @@ def get_responses(
         if (
             apply_temperature
             and args.rollout_temperature != 1.0
-            and not (args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False))
+            and not (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False))
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -477,8 +478,13 @@ def get_log_probs_and_entropy(
     if gather_topk_token_ids is not None:
         res["topk_log_probs"] = topk_log_probs_list
 
-    # we need to turn the all gather kv into zigzag ring attn kv
-    if args.allgather_cp:
+    # we need to turn the all gather kv into zigzag ring attn kv. Guard on
+    # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
+    # rank already holds the full sequence and get_responses returned per-sample
+    # log_probs of length response_length, so redistribution is a no-op — and
+    # its prompt_length==0 (SFT) path would otherwise mis-pad the first sample
+    # by +1 (logit_global_start=-1 at seq_start=0).
+    if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         _allgather_cp_redistribute(
             res,
             logits=logits,

@@ -532,3 +532,126 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     wrapped_provider(pre_process=True, post_process=False)
 
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("wrapper", ["freeze", "lora", "freeze_lora"])
+@pytest.mark.parametrize("signature", ["modern", "kwargs", "legacy"])
+def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrapper, signature):
+    module, _ = _load_model_provider(monkeypatch)
+    model = torch.nn.Linear(2, 2)
+    calls = []
+    config = object()
+    pg_collection = object()
+
+    def modern_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
+        calls.append((pre_process, post_process, vp_stage, config, pg_collection))
+        return model
+
+    def kwargs_provider(pre_process=True, post_process=True, **kwargs):
+        calls.append((pre_process, post_process, kwargs["vp_stage"], kwargs["config"], kwargs["pg_collection"]))
+        return model
+
+    def legacy_provider(pre_process=True, post_process=True):
+        calls.append((pre_process, post_process))
+        return model
+
+    monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    args = SimpleNamespace(only_train_params_name_list=None, freeze_params_name_list=None)
+    provider = {"modern": modern_provider, "kwargs": kwargs_provider, "legacy": legacy_provider}[signature]
+    if "lora" in wrapper:
+        provider = module.wrap_model_provider_with_lora(provider, args)
+    if "freeze" in wrapper:
+        provider = module.wrap_model_provider_with_freeze(provider, args)
+
+    assert provider(pre_process=False, vp_stage=3, config=config, pg_collection=pg_collection) is model
+    expected = (False, True) if signature == "legacy" else (False, True, 3, config, pg_collection)
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("accepts_mcore_arguments", [True, False])
+def test_custom_provider_forwards_supported_mcore_arguments(monkeypatch, accepts_mcore_arguments):
+    module, _ = _load_model_provider(monkeypatch)
+    model = torch.nn.Module()
+    calls = []
+    config = object()
+    pg_collection = object()
+
+    def modern_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
+        calls.append((pre_process, post_process, vp_stage, config, pg_collection))
+        return model
+
+    def legacy_provider(pre_process=True, post_process=True):
+        calls.append((pre_process, post_process))
+        return model
+
+    original_provider = modern_provider if accepts_mcore_arguments else legacy_provider
+    monkeypatch.setattr(module, "load_function", lambda path: original_provider)
+    provider = module.get_model_provider_func(_bridge_args(custom_model_provider_path="custom.provider"))
+
+    assert provider(post_process=False, vp_stage=3, config=config, pg_collection=pg_collection) is model
+    expected = (True, False, 3, config, pg_collection) if accepts_mcore_arguments else (True, False)
+    assert calls == [expected]
+
+
+def test_bridge_provider_receives_mcore_process_groups_through_wrappers(monkeypatch):
+    module, provider = _load_model_provider(monkeypatch)
+    monkeypatch.setattr(module, "is_lora_enabled", lambda args: True)
+    monkeypatch.setattr(module, "build_lora_peft", lambda args: lambda model, training: model)
+    args = _bridge_args(only_train_params_name_list=None, freeze_params_name_list=None)
+    wrapped = module.wrap_model_provider_with_freeze(module.get_model_provider_func(args), args)
+    config = object()
+    pg_collection = object()
+
+    wrapped(post_process=False, config=config, pg_collection=pg_collection)
+
+    assert provider._pg_collection is pg_collection
+    assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("explicit_config", [True, False])
+def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, explicit_config):
+    module, _ = _load_model_provider(monkeypatch)
+    config = object()
+    pg_collection = object()
+    constructed = []
+    config_calls = []
+
+    def make_config(args):
+        config_calls.append(args)
+        return config
+
+    def make_model(**kwargs):
+        constructed.append(kwargs)
+        return torch.nn.Module()
+
+    monkeypatch.setattr(module, "core_transformer_config_from_args", make_config)
+    monkeypatch.setattr(module, "GPTModel", make_model)
+    args = _bridge_args(
+        megatron_to_hf_mode="raw",
+        transformer_impl="transformer_engine",
+        spec=None,
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=False,
+        multi_latent_attention=False,
+        moe_use_legacy_grouped_gemm=False,
+        fp8_param_gather=False,
+        padded_vocab_size=128,
+        max_position_embeddings=256,
+        fp16_lm_cross_entropy=False,
+        untie_embeddings_and_output_weights=True,
+        position_embedding_type="rope",
+        rotary_percent=1.0,
+        rotary_base=10000,
+        use_rope_scaling=False,
+        mtp_num_layers=None,
+    )
+    provider = module.get_model_provider_func(args)
+
+    provider(vp_stage=2, config=config if explicit_config else None, pg_collection=pg_collection)
+
+    assert config_calls == ([] if explicit_config else [args])
+    assert constructed[0]["config"] is config
+    assert constructed[0]["pg_collection"] is pg_collection
+    assert constructed[0]["vp_stage"] == 2

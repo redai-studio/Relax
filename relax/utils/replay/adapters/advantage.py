@@ -50,21 +50,16 @@ def replay_advantage_kl(bundle: LoadedBundle, ctx: dict[str, Any]) -> StageResul
 
 @register_adapter(StageId.ADVANTAGE_ESTIMATE)
 def replay_advantage_estimate(bundle: LoadedBundle, ctx: dict[str, Any]) -> StageResult:
-    """GRPO-family returns/advantages from normalized rewards + KL."""
+    """GRPO-family returns/advantages from recorded rewards + KL."""
     result = StageResult(stage=StageId.ADVANTAGE_ESTIMATE.value, status=StageStatus.PASS)
 
-    normalized_rewards = ctx.get(StageId.REWARD_POST_PROCESS.value)
-    if normalized_rewards is None:
-        result.status = StageStatus.FAIL
-        result.message = "upstream reward.post_process output missing"
-        return result
     kl = ctx.get(StageId.ADVANTAGE_KL.value)
     if kl is None:
         result.status = StageStatus.FAIL
         result.message = "upstream advantage.kl output missing"
         return result
 
-    rewards = torch.tensor(normalized_rewards, dtype=torch.float32)
+    rewards = [torch.as_tensor(record.reward, dtype=torch.float32) for record in bundle.index.samples]
     advantages = torch.cat(get_grpo_returns(rewards, list(torch.split(kl, bundle.response_lengths))))
     ctx[StageId.ADVANTAGE_ESTIMATE.value] = advantages
 

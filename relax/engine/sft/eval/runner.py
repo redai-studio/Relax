@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 
+from relax.engine.sft.runtime import is_dpo_mode
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
 from relax.utils.async_utils import run
@@ -108,6 +109,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     from relax.backends.megatron.data import get_data_iterator
     from relax.backends.megatron.initialize import is_megatron_main_rank
     from relax.backends.megatron.model import forward_only
+    from relax.utils.data.image_refs import sft_multimodal_data_fields
 
     is_classification = getattr(actor.args, "task_type", "causal_lm") == "seq_cls"
     if is_classification:
@@ -126,8 +128,7 @@ def run_sft_eval(actor, rollout_id: int) -> None:
     data_fields = ["tokens", "loss_masks", "total_lengths", "response_lengths"]
     if is_classification:
         data_fields.extend(["classification_labels", "sample_weights"])
-    if args.multimodal_keys is not None:
-        data_fields.append("multimodal_train_inputs")
+    data_fields.extend(sft_multimodal_data_fields(args))
 
     n_chunks, _ = _wait_for_eval_plan(actor, rollout_id)
 
@@ -268,7 +269,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                 rollout_data = expand_preference_rollout_data(pair_rows)
                 rollout_data["dynamic_global_batch_size"] = global_chunk_size
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
-                if args.loss_type == "dpo":
+                if is_dpo_mode(args):
                     # Returned log-probabilities predict the next token; the
                     # rollout masks still mark the tokens at their input positions.
                     aligned_loss_masks = [
@@ -323,7 +324,7 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
 
     dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_pipeline_model_parallel_group())
     dist.all_reduce(local, op=dist.ReduceOp.SUM, group=mpu.get_data_parallel_group(with_context_parallel=True))
-    metrics = finalize_pair_metrics(local, prefix="dpo" if args.loss_type == "dpo" else "rm")
+    metrics = finalize_pair_metrics(local, prefix="dpo" if is_dpo_mode(args) else "rm")
     metrics["perf/preference_eval_time"] = time.monotonic() - started
     if is_megatron_main_rank():
         step = compute_rollout_step(args, rollout_id)

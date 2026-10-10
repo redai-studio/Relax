@@ -2,6 +2,9 @@
 
 from argparse import Namespace
 
+from relax.engine.sft.runtime import is_preference_mode, is_sft_mode
+from relax.utils.data.image_refs import sft_multimodal_data_fields
+
 
 PREFERENCE_DATA_FIELDS = (
     "pair_ids",
@@ -24,7 +27,6 @@ def _base_rollout_fields(args: Namespace) -> list[str]:
         "rewards",
         "sample_indices",
         "sample_index_mask_sums",
-        "raw_reward",
         "group_index",
     ]
     if getattr(args, "use_rollout_routing_replay", False):
@@ -40,14 +42,13 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
     ``consumer`` is only meaningful for PPO (``critic``, ``advantages``,
     ``actor``); other algorithms ignore it and receive the base rollout fields.
     """
-    if getattr(args, "loss_type", None) in {"dpo", "rm"}:
+    if is_preference_mode(args):
         return list(PREFERENCE_DATA_FIELDS)
-    if getattr(args, "loss_type", None) == "sft":
+    if is_sft_mode(args):
         fields = ["tokens", "total_lengths", "response_lengths", "loss_masks"]
         if getattr(args, "task_type", "causal_lm") == "seq_cls":
             fields.append("classification_labels")
-        if args.multimodal_keys is not None:
-            fields.append("multimodal_train_inputs")
+        fields.extend(sft_multimodal_data_fields(args))
         return fields
 
     from relax.algorithms import algorithm_needs_critic
@@ -73,6 +74,8 @@ def build_data_fields(args: Namespace, *, consumer: str = "actor") -> list[str]:
         return fields
 
     fields = _base_rollout_fields(args)
+    if getattr(args, "use_rollout_indexer_replay", False):
+        fields.append("rollout_indexer_topk")
     if has_critic:
         # PPO colocate: actor consumes critic's ``values`` and computes GAE
         # inline. Fully_async: standalone Advantages service produces

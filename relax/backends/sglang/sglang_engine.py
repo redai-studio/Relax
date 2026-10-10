@@ -18,6 +18,7 @@ import ray
 import requests
 import sglang_router
 from packaging.version import parse
+from requests.exceptions import ConnectTimeout
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
@@ -49,6 +50,109 @@ from relax.utils.scale_utils import PrecheckProbeCategory
 
 
 logger = get_logger(__name__)
+
+
+@dataclasses.dataclass
+class RouterWorkerCleanup:
+    actor_id: str
+    worker_id: str | None = None
+    delete_requested: bool = False
+
+
+def remove_dead_router_worker(
+    router_url: str, worker_url: str, cleanup: RouterWorkerCleanup, timeout: float = 10.0
+) -> bool:
+    """Remove one dead generation before its replacement is created.
+
+    Router 0.3+ enqueues removal by URL even for its ID endpoint. An accepted
+    or uncertain DELETE is therefore only polled, never submitted twice.
+    """
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("dead Router worker cleanup timed out")
+        return min(value, 3.0)
+
+    def workers() -> list[dict]:
+        response = requests.get(f"{router_url}/workers", timeout=remaining())
+        response.raise_for_status()
+        rows = response.json()["workers"]
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("invalid Router worker list")
+        return rows
+
+    try:
+        rows = workers()
+        matches = [row for row in rows if router_worker_base_url(row.get("url", "")) == worker_url]
+        if cleanup.worker_id is None:
+            if not matches:
+                return True
+            if len(matches) != 1 or matches[0].get("url") != worker_url:
+                return False  # DP rank URLs or ambiguous ownership.
+            candidate = matches[0]
+            if (
+                candidate.get("is_healthy") is not False
+                or not candidate.get("id")
+                or candidate.get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
+            ):
+                return False
+            cleanup.worker_id = str(candidate["id"])
+        # Never target another generation even if it now occupies the same URL.
+        owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
+        if owned:
+            if (
+                len(owned) != 1
+                or owned[0].get("url") != worker_url
+                or owned[0].get("is_healthy") is not False
+                or owned[0].get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
+            ):
+                return False
+            if not cleanup.delete_requested:
+                detail = requests.get(f"{router_url}/workers/{quote(cleanup.worker_id, safe='')}", timeout=remaining())
+                detail.raise_for_status()
+                job_status = detail.json().get("job_status") or {}
+                # A soft-failed actor may already have submitted its shutdown
+                # deletion. A failed workflow waiter need not cancel that job.
+                cleanup.delete_requested = job_status.get("job_type") == "RemoveWorker"
+            if not cleanup.delete_requested:
+                request_timeout = remaining()
+                cleanup.delete_requested = True
+                try:
+                    response = requests.delete(
+                        f"{router_url}/workers/{quote(cleanup.worker_id, safe='')}", timeout=request_timeout
+                    )
+                except ConnectTimeout:
+                    cleanup.delete_requested = False  # Connection was never established.
+                    raise
+                if response.status_code not in (202, 404):
+                    # Only a structured Router rejection proves no removal was
+                    # queued. A proxy error or lost response remains uncertain.
+                    body = response.json()
+                    if (response.status_code, body.get("code")) in (
+                        (400, "BAD_REQUEST"),
+                        (500, "INTERNAL_SERVER_ERROR"),
+                    ) and isinstance(body.get("error"), str):
+                        cleanup.delete_requested = False
+                    response.raise_for_status()
+        while True:
+            rows = workers()
+            if not any(str(row.get("id", "")) == cleanup.worker_id for row in rows):
+                # A different owner of the URL also prevents recreating here.
+                removed = not any(router_worker_base_url(row.get("url", "")) == worker_url for row in rows)
+                return removed
+            time.sleep(min(0.2, remaining()))
+    except Exception as error:
+        logger.warning(
+            "Dead Router worker cleanup deferred: url=%s actor=%s worker_id=%s delete_requested=%s error=%s",
+            worker_url,
+            cleanup.actor_id,
+            cleanup.worker_id,
+            cleanup.delete_requested,
+            type(error).__name__,
+        )
+        return False
 
 
 # GenRM colocate offload drain: bound every HTTP round-trip and the whole drain
@@ -137,6 +241,28 @@ def _apply_sglang_policy_load_plan(server_args: dict, args) -> dict:
         and not resolved.get("tokenizer_path")
     ):
         resolved["tokenizer_path"] = resolve_s3_model_metadata_to_shm(plan.source.uri, args)
+    return resolved
+
+
+def _materialize_scaled_out_s3_model(server_args: dict, args) -> dict:
+    """Materialize a policy model on a newly provisioned elastic node.
+
+    The baseline worker may rewrite ``args.hf_checkpoint`` to its node-local
+    SHM cache before a dynamic engine is created.  Scale-out preserves the
+    canonical model-path override, but a fresh elastic node has no full cache
+    yet.  Streaming is not sufficient for every model implementation (for
+    example, Qwen3.5 still performs HuggingFace path validation), so dynamic
+    engines materialize the canonical S3 source before SGLang starts.
+    """
+    model_source = getattr(args, "model_source", None)
+    model_path = server_args.get("model_path")
+    if model_source is None or model_path != model_source.uri or not is_s3_uri(model_path):
+        return server_args
+
+    resolved_path = maybe_resolve_s3_model_to_shm(model_source.uri, args)
+    resolved = dict(server_args)
+    resolved["model_path"] = resolved_path
+    logger.info(f"scaled-out S3 model materialized: {model_source.uri} -> {resolved_path}")
     return resolved
 
 
@@ -352,6 +478,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self._is_scaled_out = register_sigterm_handler
         self._evicted = threading.Event()
         self._router_worker_id: str | None = None
         self._router_unregister_submitted = False
@@ -388,7 +515,7 @@ class SGLangEngine(RayActor):
         init_external_kwargs: Optional[dict] = None,
         skip_dcs_registration: bool = False,
         skip_router_registration: bool = False,
-    ):
+    ) -> dict[str, str | int | None]:
         """Initialize the SGLang engine.
 
         Args:
@@ -452,6 +579,7 @@ class SGLangEngine(RayActor):
         # Done after engine startup so the coordinator can immediately reach the server.
         if not skip_dcs_registration:
             self.register_dcs()
+        return {"url": self.get_url(), **self.get_pid_and_node_id()}
 
     def register_dcs(self):
         if self.node_rank == 0 and self.args.fully_async:
@@ -465,7 +593,10 @@ class SGLangEngine(RayActor):
                     ip=self.server_host,
                     port=self.server_port,
                     rank=self.rank,
-                    metadata={"num_gpus_per_engine": effective_num_gpus},
+                    metadata={
+                        "num_gpus_per_engine": effective_num_gpus,
+                        "actor_id": ray.get_runtime_context().get_actor_id(),
+                    },
                 )
             )
 
@@ -499,6 +630,8 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict, *, apply_policy_load_plan: bool = True):
         if apply_policy_load_plan:
+            if self._is_scaled_out:
+                server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
@@ -620,6 +753,42 @@ class SGLangEngine(RayActor):
             "update_weights_from_tensor",
             payload,
         )
+
+    def update_weight_version(self, weight_version: str) -> dict:
+        """Publish a completed routed update while generation is still
+        paused."""
+        return self._make_request(
+            "update_weight_version", {"new_version": weight_version, "abort_all_requests": False}
+        )
+
+    def get_expert_weight_sync_layout(self) -> dict:
+        """Return resolved layout settings for opt-in colocated expert
+        routing."""
+        from relax.utils.misc import get_hf_config
+
+        if self.node_rank != 0 or self.worker_type != "regular":
+            raise ValueError("Expert routing requires a regular node-0 rollout engine")
+        response = requests.get(f"http://{self.server_host}:{self.server_port}/server_info", timeout=30)
+        response.raise_for_status()
+        info = response.json()
+        keys = (
+            "tp_size",
+            "ep_size",
+            "pp_size",
+            "moe_dp_size",
+            "enable_eplb",
+            "ep_num_redundant_experts",
+            "init_expert_location",
+            "ep_join_mode",
+            "speculative_algorithm",
+            "moe_runner_backend",
+            "json_model_override_args",
+        )
+        layout = {key: info[key] for key in keys if key in info}
+        config = get_hf_config(info["model_path"])
+        text_config = getattr(config, "text_config", None) or config
+        layout["num_experts"] = getattr(text_config, "num_experts", None)
+        return layout
 
     def load_lora_adapter_from_tensors(
         self,
@@ -838,6 +1007,8 @@ class SGLangEngine(RayActor):
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
         if self.node_rank != 0 or not self.router_ip or not self.router_port:
             return True
+        if self.is_evicted():
+            return False
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
         try:
@@ -857,6 +1028,8 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
+                if getattr(self, "_is_scaled_out", False) and parse(sglang_router.__version__) >= parse("0.3.0"):
+                    payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
                 response = requests.post(
@@ -1742,6 +1915,8 @@ def _compute_server_args(
 
     if args.use_rollout_routing_replay:
         kwargs["enable_return_routed_experts"] = True
+    if getattr(args, "use_rollout_indexer_replay", False):
+        kwargs["enable_return_indexer_topk"] = True
     if args.fp16:
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]

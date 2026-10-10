@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
 from megatron.core import mpu
@@ -34,7 +35,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.backends.megatron.checkpoint import _save_lora_to_checkpoint
-from relax.engine.sft.runtime import should_bypass_main_output_layer
+from relax.engine.sft.runtime import is_rm_mode, should_bypass_main_output_layer
 from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.device import device_module
@@ -42,10 +43,11 @@ from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.megatron_bridge_utils import patch_megatron_model
 from relax.utils.megatron_peft_utils import is_lora_enabled
-from relax.utils.memory_utils import clear_memory
+from relax.utils.memory_utils import available_memory, clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.replay import capture_hooks
 from relax.utils.timer import timer
+from relax.utils.training.packing_metrics import PackingMetrics
 from relax.utils.training.ppo_utils import (
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
@@ -71,6 +73,16 @@ from .model_provider import (
 
 
 logger = get_logger(__name__)
+
+
+def _finalize_model_grads_with_memory_release(*args: Any, **kwargs: Any) -> None:
+    # Finalization itself can lazily initialize NCCL communicators (e.g. MoE
+    # router bias reduction), before forward_backward_func returns to the
+    # optimizer. Make unused activation cache available at that boundary too.
+    memory_before = available_memory()
+    device_module.empty_cache()
+    logger.info("Gradient finalization cache release: before=%s after=%s", memory_before, available_memory())
+    finalize_model_grads(*args, **kwargs)
 
 
 def _find_lm_output_layer(model: torch.nn.Module) -> torch.nn.Module | None:
@@ -206,7 +218,7 @@ def _attach_mtp_forward_kwargs(args: Namespace, batch: dict, forward_kwargs: dic
     # tensors when the unsplit path is taken with MTP enabled; use them so
     # the rolled labels/mask line up with the MTP chunked hidden_states.
     if batch.get("unsplit_mtp_labels") is not None:
-        forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["unsplit_mtp_labels"]}
+        forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["unsplit_mtp_labels"], "labels_are_shifted": True}
         if forward_kwargs.get("loss_mask") is None:
             forward_kwargs["loss_mask"] = batch["unsplit_mtp_loss_mask"]
         return
@@ -418,9 +430,9 @@ def setup_model_and_optimizer(
         # Global, idempotent GatedDeltaNet patch — apply whenever CP is active
         # (dynamic CP, or static context_parallel_size > 1), incl. weight-only
         # roles that still run forward.
-        _patch_gdn_for_dynamic_cp()
         model_config = get_model_config(model[0])
-        if getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net" and (
+        _patch_gdn_for_dynamic_cp(getattr(model_config, "linear_cp_mode", None))
+        if getattr(model_config, "experimental_attention_variant", None) in {"gated_delta_net", "gdn"} and (
             not torch.distributed.is_initialized()
             or torch.distributed.get_rank(group=torch.distributed.group.WORLD) == 0
         ):
@@ -508,7 +520,7 @@ def _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group):
     return gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
 
-def _patch_gdn_for_dynamic_cp() -> None:
+def _patch_gdn_for_dynamic_cp(linear_cp_mode: str | None = None) -> None:
     """Patch GDN forward for dynamic CP and Relax's all-gather mode.
 
     CP=1 and MCore-native headwise/chunkwise modes call the patched MCore
@@ -519,6 +531,10 @@ def _patch_gdn_for_dynamic_cp() -> None:
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     except ImportError:
+        return
+
+    native_gdn = hasattr(GatedDeltaNet, "_prepare_input_for_gated_delta_rule")
+    if native_gdn and linear_cp_mode != "all_gather":
         return
 
     if getattr(GatedDeltaNet, "_dcp_patched", False):
@@ -580,6 +596,37 @@ def _patch_gdn_for_dynamic_cp() -> None:
         qkvzba = _gdn_cp_gather_full(qkvzba, cu_seqlens_cpu, cp_size, cp_group)
 
         seq_len = qkvzba.shape[0]
+        if native_gdn:
+            # The packaged GDN exposes the complete convolution/QKV/gate prep.
+            # Run it on the gathered sequence with TP-local heads and no CP
+            # context; the recurrent scan is duplicated on every CP rank.
+            with torch._dynamo.config.patch(disable=True):
+                query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                    qkvzba,
+                    batch,
+                    seq_len,
+                    cp_size_headwise=1,
+                    cp_group_headwise=None,
+                    cu_seqlens_q=cu_seqlens,
+                    chunkwise_cp_context=None,
+                    packed_seq_params=packed_seq_params,
+                )
+            core_attn_out, _ = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens,
+            )
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            norm_out = norm_out.reshape(batch, seq_len, -1).transpose(0, 1).contiguous()
+            norm_out = gdn_cp_slice(norm_out, cu_seqlens_cpu, cp_size, cp_rank)
+            return self.out_proj(norm_out)
+
         qkvzba = qkvzba.transpose(0, 1)  # s b x -> b s x
 
         # Split into q/k/v, gate(z), beta, alpha using TP-local (full, no /cp) sizes.
@@ -844,6 +891,8 @@ def forward_only(
             "loss_mask": forward_loss_mask,
             **mm_kwargs,
         }
+        if batch.get("padding_mask") is not None:
+            forward_kwargs["padding_mask"] = batch["padding_mask"]
         output_tensor = model(**forward_kwargs)
 
         if _orig_cp_group is not None:
@@ -1038,6 +1087,9 @@ def train_one_step(
         and gradient norm for logging.
     """
     args = get_args()
+    use_indexer_replay = getattr(args, "use_rollout_indexer_replay", False)
+    if use_indexer_replay:
+        from relax.utils.training.indexer_replay import IndexerReplay
 
     # Trajectory-replay capture: open a per-step accumulator (no-op unless
     # capture is enabled and this step is selected).
@@ -1055,6 +1107,7 @@ def train_one_step(
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     main_loss_has_tokens = False
+    packing_metrics = PackingMetrics()
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -1115,7 +1168,6 @@ def train_one_step(
         if Envs.ENABLE_ROUTING_REPLAY:
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
-
         # set in the SFT branch below; left as None for return_schedule_plan or
         # the non-SFT path so the original loss_function is used.
         lm_head_forward = None
@@ -1126,14 +1178,27 @@ def train_one_step(
             # chunked-logits incompatibility is enforced as a hard assert in
             # arguments.py.slime_validate_args, so bypass mode is guaranteed
             # False here — no runtime fallback or advisory needed.
-            output_tensor = model.build_schedule_plan(
-                input_ids=batch["tokens"],
-                position_ids=None,
-                attention_mask=None,
-                labels=None,
-                packed_seq_params=batch["packed_seq_params"],
-                loss_mask=batch["full_loss_masks"],
-            )
+            if use_indexer_replay:
+                with IndexerReplay.forward_stage():
+                    output_tensor = model.build_schedule_plan(
+                        input_ids=batch["tokens"],
+                        position_ids=None,
+                        attention_mask=None,
+                        labels=None,
+                        packed_seq_params=batch["packed_seq_params"],
+                        loss_mask=batch["full_loss_masks"],
+                        padding_mask=batch.get("padding_mask"),
+                    )
+            else:
+                output_tensor = model.build_schedule_plan(
+                    input_ids=batch["tokens"],
+                    position_ids=None,
+                    attention_mask=None,
+                    labels=None,
+                    packed_seq_params=batch["packed_seq_params"],
+                    loss_mask=batch["full_loss_masks"],
+                    padding_mask=batch.get("padding_mask"),
+                )
         else:
             has_mm_inputs = batch.get("multimodal_train_inputs", None) is not None
             needs_unsplit = is_vl_model or has_mm_inputs or getattr(args, "uses_unsplit_forward", False)
@@ -1147,6 +1212,8 @@ def train_one_step(
                 "packed_seq_params": None if use_unsplit else batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
             }
+            if batch.get("padding_mask") is not None:
+                forward_kwargs["padding_mask"] = batch["padding_mask"]
 
             # thd VL+CP: bridge needs per-sample attention_mask + matching thd
             # packed_seq_params (align_size = tp*cp*2).  loss_mask is None
@@ -1193,9 +1260,17 @@ def train_one_step(
                     mtp_output_layer_calls=mtp_output_layer_calls,
                     gather_passthrough=not mtp_only,
                 ) as lm_head_forward:
-                    output_tensor = model(**forward_kwargs)
+                    if use_indexer_replay:
+                        with IndexerReplay.forward_stage():
+                            output_tensor = model(**forward_kwargs)
+                    else:
+                        output_tensor = model(**forward_kwargs)
             else:
-                output_tensor = model(**forward_kwargs)
+                if use_indexer_replay:
+                    with IndexerReplay.forward_stage():
+                        output_tensor = model(**forward_kwargs)
+                else:
+                    output_tensor = model(**forward_kwargs)
 
         if Envs.ENABLE_ROUTING_REPLAY:
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
@@ -1203,7 +1278,17 @@ def train_one_step(
         # Always dispatch via loss_function. MTP-only consumes the bypassed
         # hidden states directly; chunked SFT uses lm_head_forward to compute
         # the regular language loss in bounded chunks.
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+        loss_callback = partial(loss_function, args, batch, num_microbatches, lm_head_forward=lm_head_forward)
+
+        def loss_callback_with_packing_metrics(
+            logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
+            # Megatron invokes the loss callback only on the final physical and
+            # virtual pipeline stage, so VPP chunks count each microbatch once.
+            packing_metrics.add(batch, mpu.get_context_parallel_world_size())
+            return loss_callback(logits)
+
+        return output_tensor, loss_callback_with_packing_metrics
 
     # Dynamic CP: forward_step overwrites pg_collection.cp per micro-batch (VL bridge);
     # save the original static CP group here and restore after forward+backward.
@@ -1251,9 +1336,6 @@ def train_one_step(
     if _dcp_orig_cp_group is not None:
         inner.pg_collection.cp = _dcp_orig_cp_group
 
-    if getattr(args, "empty_unused_memory_level", 0) >= 1:
-        device_module.empty_cache()
-
     # CI check: verify only MTP parameters have non-zero gradients when truncation happens
     # This check must happen before optimizer.step() as gradients may be modified during step
     if args.ci_test and args.enable_mtp_training:
@@ -1271,6 +1353,13 @@ def train_one_step(
     # clip, and inner step in one shot — avoids the double prepare_grads/unscale and
     # double grad_scaler.update that the previous external prepare_grads() flow caused.
     # In fp16 with dynamic loss scaling, step() returns (False, None, None) on overflow.
+    # Match Megatron's memory-level control. Reloaded NCCL groups may allocate
+    # their buffers for the first time during gradient-norm reduction; release
+    # unused forward/backward cache before those allocations, not after an OOM.
+    if getattr(args, "empty_unused_memory_level", 0) >= 1:
+        memory_before = available_memory()
+        device_module.empty_cache()
+        logger.info("Optimizer cache release: before=%s after=%s", memory_before, available_memory())
     valid_step = True
     if _is_global_zero_token_step(losses_reduced):
         # No effective loss tokens anywhere in the global batch. Gradients are
@@ -1347,6 +1436,7 @@ def train_one_step(
         assert len(keys) + 1 == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
+        loss_reduced = packing_metrics.reduce(mpu.get_data_parallel_group(with_context_parallel=True), values.device)
         values = values.tolist()
         is_sequence_classification = getattr(args, "task_type", "causal_lm") == "seq_cls"
         num_samples_or_tokens = (
@@ -1359,7 +1449,7 @@ def train_one_step(
             )
         # Per-token and sequence-classification metrics use the all-reduced
         # effective count. RL sample-mean metrics use the step's logical GBS.
-        loss_reduced = normalize_reduced_loss_metrics(keys, [num_samples_or_tokens, *values[1:]])
+        loss_reduced.update(normalize_reduced_loss_metrics(keys, [num_samples_or_tokens, *values[1:]]))
         if "rm/_score_chosen_second_moment" in loss_reduced:
             chosen_second = loss_reduced.pop("rm/_score_chosen_second_moment")
             rejected_second = loss_reduced.pop("rm/_score_rejected_second_moment")
@@ -1433,7 +1523,11 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    config.finalize_model_grads_func = (
+        _finalize_model_grads_with_memory_release
+        if getattr(args, "empty_unused_memory_level", 0) >= 1
+        else finalize_model_grads
+    )
 
     pre_hook_enabled = False
     param_sync_func = None
@@ -1610,7 +1704,9 @@ def train(
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
             log_dict["train/step"] = accumulated_step_id
-            num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
+            num_per_epoch = getattr(args, "num_rollout_per_epoch_for_metrics", None)
+            if num_per_epoch is None:
+                num_per_epoch = getattr(args, "num_rollout_per_epoch", None)
             if num_per_epoch:
                 log_dict[f"train/{role_tag}cur_epoch"] = (accumulated_step_id + 1) / (
                     num_per_epoch * num_steps_per_rollout
@@ -1680,7 +1776,7 @@ def save(
     args = get_args()
     role = getattr(model[0], "role", "actor")
     args.checkpoint_role = role
-    if role == "actor" and getattr(args, "loss_type", None) == "rm":
+    if role == "actor" and is_rm_mode(args):
         args.head_type = REWARD_MODEL_HEAD_TYPE
     elif role == "critic":
         args.head_type = "critic_value_terminal_v1"
@@ -2011,7 +2107,7 @@ def initialize_model_and_optimizer(
         value_head_param_ids = validate_critic_value_head_registration(model, optimizer)
     if role == "actor" and getattr(args, "task_type", "causal_lm") == "seq_cls":
         classification_head_param_ids = validate_sequence_classification_head_registration(model, optimizer, args)
-    if role == "actor" and getattr(args, "loss_type", None) == "rm":
+    if role == "actor" and is_rm_mode(args):
         reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
     clear_memory()
     iteration, _ = load_checkpoint(
@@ -2028,7 +2124,7 @@ def initialize_model_and_optimizer(
             "critic value head parameter identities changed during checkpoint loading"
         )
         install_critic_value_head_runtime_check(model)
-    elif getattr(args, "loss_type", None) == "rm":
+    elif is_rm_mode(args):
         release_critic_lm_heads(model)
         loaded_reward_head_param_ids = validate_reward_model_head_registration(model, optimizer)
         assert loaded_reward_head_param_ids == reward_head_param_ids, (

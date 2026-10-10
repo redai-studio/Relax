@@ -26,7 +26,9 @@ Mirrors `relax/components/advantages.py` in shape: no FastAPI ingress, plain
 """
 
 import asyncio
+import os
 import random
+import time
 from typing import Any
 
 import ray
@@ -61,6 +63,13 @@ from relax.utils.utils import dict_to_tensordict
 
 
 _PAD_TOKEN_ID_KEYS = ("image_token_id", "video_token_id", "audio_token_id")
+
+# Image preprocessing on the producer is what the training step ends up waiting
+# on: one SFT step runs the full processor over ``global_batch_size`` samples,
+# each carrying up to ~20 images, so the pool size sets the producer's cadence.
+# ``ProcessorPool``'s own default caps at 16 workers ("min(16, cpu_count)"),
+# which can leave the consumer waiting whenever the producer is the pacer.
+_PRODUCER_POOL_SIZE = min(64, os.cpu_count() or 16)
 
 
 def _load_custom_dataset_class(path: str | None) -> type | None:
@@ -134,6 +143,7 @@ def _create_sft_train_dataset(
     invalid_multimodal_strategy: str,
     task_type: str,
     classification_sentinel_token_id: int | None,
+    image_preprocess_on_rank: bool = False,
 ) -> Any:
     if is_preference_mode(config):
         return PreferenceStreamingDataset(
@@ -177,6 +187,8 @@ def _create_sft_train_dataset(
             oversize_custom_fn=oversize_custom_fn,
             invalid_multimodal_strategy=invalid_multimodal_strategy,
             apply_chat_template_kwargs=getattr(config, "apply_chat_template_kwargs", None),
+            training_mode=getattr(config, "sft_training_mode", "sft"),
+            cpt_template=getattr(config, "sft_cpt_template", "raw"),
             require_response=task_type != "seq_cls",
             task_type=task_type,
             num_labels=getattr(config, "num_labels", None),
@@ -184,6 +196,7 @@ def _create_sft_train_dataset(
             classification_sentinel_token_id=classification_sentinel_token_id,
             loss_last_turn_only=getattr(config, "sft_loss_last_turn_only", False),
             loss_ignore_empty_think=getattr(config, "sft_ignore_empty_think", False),
+            image_preprocess_on_rank=image_preprocess_on_rank,
         )
     return dataset_cls.from_args(
         config,
@@ -194,7 +207,10 @@ def _create_sft_train_dataset(
 
 
 def _prepare_sft_tq_payload(
-    samples: list[ProcessedSample] | list[ProcessedPreferencePair], *, force_multimodal_field: bool
+    samples: list[ProcessedSample] | list[ProcessedPreferencePair],
+    *,
+    force_multimodal_field: bool,
+    force_image_refs_field: bool = False,
 ) -> dict[str, Any]:
     if samples and isinstance(samples[0], ProcessedPreferencePair):
         backend_batch, custom_meta = pack_preference_pairs_for_tq(samples)
@@ -202,7 +218,11 @@ def _prepare_sft_tq_payload(
             "data": dict_to_tensordict(backend_batch, batch_size=len(samples)),
             "custom_meta": custom_meta,
         }
-    backend_batch = pack_samples_for_tq(samples, force_multimodal_field=force_multimodal_field)
+    backend_batch = pack_samples_for_tq(
+        samples,
+        force_multimodal_field=force_multimodal_field,
+        force_image_refs_field=force_image_refs_field,
+    )
     assert backend_batch is not None
     return {
         "data": dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
@@ -381,6 +401,7 @@ class _SFTBatchProducerActor:
             pad_token_ids=pad_token_ids,
             task_type=task_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
+            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
             **dataset_options,
         )
         n_avail = len(self._dataset)
@@ -468,7 +489,11 @@ class _SFTBatchProducerActor:
             except Exception as exc:
                 self._logger.warning(f"print_first_sample failed: {exc}")
 
-        payload = _prepare_sft_tq_payload(samples, force_multimodal_field=force_multimodal_field)
+        payload = _prepare_sft_tq_payload(
+            samples,
+            force_multimodal_field=force_multimodal_field,
+            force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+        )
         await self.data_system_client.async_put(
             data=payload["data"],
             partition_id=partition_id,
@@ -585,7 +610,9 @@ class SFT(Base):
         prepare_model_maybe_update_args(self.config, completeness="metadata")
         self._tokenizer = AutoTokenizer.from_pretrained(self.config.hf_checkpoint, trust_remote_code=True)
         try:
-            self._processor_pool = ProcessorPool(self.config.hf_checkpoint, pool_size=None, trust_remote_code=True)
+            self._processor_pool = ProcessorPool(
+                self.config.hf_checkpoint, pool_size=_PRODUCER_POOL_SIZE, trust_remote_code=True
+            )
         except Exception as exc:
             self._logger.warning(f"Could not init ProcessorPool ({exc}); multimodal eval samples will fail at push.")
             self._processor_pool = None
@@ -613,6 +640,7 @@ class SFT(Base):
                 pad_token_ids=pad_token_ids,
                 task_type=task_type,
                 classification_sentinel_token_id=classification_sentinel_token_id,
+                image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 **dataset_options,
             )
             n_avail = len(self._dataset)
@@ -662,11 +690,14 @@ class SFT(Base):
             oversize_custom_fn=dataset_options["oversize_custom_fn"],
             invalid_multimodal_strategy=dataset_options["invalid_multimodal_strategy"],
             apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+            training_mode=getattr(self.config, "sft_training_mode", "sft"),
+            cpt_template=getattr(self.config, "sft_cpt_template", "raw"),
             require_response=task_type != "seq_cls",
             task_type=task_type,
             num_labels=getattr(self.config, "num_labels", None),
             problem_type=getattr(self.config, "problem_type", "single_label_classification"),
             classification_sentinel_token_id=classification_sentinel_token_id,
+            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
         )
 
     def _init_data_pipeline(self) -> None:
@@ -682,7 +713,7 @@ class SFT(Base):
             try:
                 self._processor_pool = ProcessorPool(
                     self.config.hf_checkpoint,
-                    pool_size=None,
+                    pool_size=_PRODUCER_POOL_SIZE,
                     trust_remote_code=True,
                     multimodal_config=MultimodalConfig.from_args(self.config),
                 )
@@ -715,6 +746,7 @@ class SFT(Base):
             pad_token_ids=pad_token_ids,
             task_type=task_type,
             classification_sentinel_token_id=classification_sentinel_token_id,
+            image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
             **dataset_options,
         )
         n_avail = len(self._dataset)
@@ -794,6 +826,8 @@ class SFT(Base):
                     oversize_custom_fn=dataset_options["oversize_custom_fn"],
                     invalid_multimodal_strategy=dataset_options["invalid_multimodal_strategy"],
                     apply_chat_template_kwargs=getattr(self.config, "apply_chat_template_kwargs", None),
+                    training_mode=getattr(self.config, "sft_training_mode", "sft"),
+                    cpt_template=getattr(self.config, "sft_cpt_template", "raw"),
                     require_response=task_type != "seq_cls",
                     task_type=task_type,
                     num_labels=getattr(self.config, "num_labels", None),
@@ -801,6 +835,7 @@ class SFT(Base):
                     classification_sentinel_token_id=classification_sentinel_token_id,
                     loss_last_turn_only=getattr(self.config, "sft_loss_last_turn_only", False),
                     loss_ignore_empty_think=getattr(self.config, "sft_ignore_empty_think", False),
+                    image_preprocess_on_rank=getattr(self.config, "sft_image_preprocess_on_rank", False),
                 )
 
         # Resume: align IndexManager with `start_rollout_id` so a restart sees
@@ -923,7 +958,9 @@ class SFT(Base):
     async def _produce_one_step(self) -> None:
         batch_producers = getattr(self, "_batch_producers", [])
         assert batch_producers or (self._dataset is not None and self._tokenizer is not None)
+        step_started = time.monotonic()
         await self._wait_for_buffer_capacity()
+        waited_s = time.monotonic() - step_started
         if self._train_size == 0:
             raise RuntimeError("SFT train pool is empty (check --eval-size relative to dataset size).")
 
@@ -958,7 +995,9 @@ class SFT(Base):
         # When prefetch is on, get_batch_async delegates to the sync prefetch
         # path (already parallel via background threads). When prefetch is off,
         # it parallelises multimodal preprocess via asyncio.gather over the pool.
+        batch_started = time.monotonic()
         samples, crossed_epoch = await self._dataset.get_batch_async(self.config.global_batch_size)
+        batch_s = time.monotonic() - batch_started
         if len(samples) != self.config.global_batch_size:
             raise RuntimeError(
                 f"SFT step {self.step}: dataset returned {len(samples)}/{self.config.global_batch_size} samples "
@@ -966,6 +1005,7 @@ class SFT(Base):
                 "consumer requires a full global batch. Check invalid-multimodal and oversize skip warnings."
             )
         self._maybe_print_first_sample(samples)
+        put_started = time.monotonic()
         for partition_id, shard_samples in zip(
             partition_ids,
             _split_sft_samples_for_shards(samples, num_shards),
@@ -974,12 +1014,20 @@ class SFT(Base):
             payload = _prepare_sft_tq_payload(
                 shard_samples,
                 force_multimodal_field=self.config.multimodal_keys is not None,
+                force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
             )
             await self.data_system_client.async_put(
                 data=payload["data"],
                 partition_id=partition_id,
                 custom_meta=payload["custom_meta"],
             )
+        # The consumer's ``per_rank_fetch_time`` converges to this cadence once the
+        # producer is the pacer, so keep the split visible per step.
+        self._logger.info(
+            f"SFT producer step {self.step}: {len(samples)} samples — wait {waited_s:.1f}s, "
+            f"batch {batch_s:.1f}s ({batch_s / max(1, len(samples)) * 1000:.0f} ms/sample, "
+            f"pool={_PRODUCER_POOL_SIZE}), put {time.monotonic() - put_started:.1f}s"
+        )
         if crossed_epoch:
             self._logger.info(
                 f"SFT step {self.step}: epoch boundary crossed (epoch={self._dataset.index_manager.current_epoch})"
@@ -1055,7 +1103,10 @@ class SFT(Base):
             backend_batch, preference_custom_meta = pack_preference_pairs_for_tq(samples)
         else:
             backend_batch = pack_samples_for_tq(
-                samples, force_multimodal_field=self.config.multimodal_keys is not None, sample_weights=sample_weights
+                samples,
+                force_multimodal_field=self.config.multimodal_keys is not None,
+                force_image_refs_field=getattr(self.config, "sft_image_preprocess_on_rank", False),
+                sample_weights=sample_weights,
             )
             preference_custom_meta = None
         assert backend_batch is not None

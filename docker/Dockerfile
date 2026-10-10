@@ -85,7 +85,6 @@ RUN MAX_JOBS=64 \
 RUN pip -v install --no-cache-dir --no-build-isolation "transformer_engine[pytorch]==2.14.1" && \
     TMS_CUDA_MAJOR=$(python -c 'import torch; print(torch.version.cuda.split(".")[0])') pip install git+https://github.com/redai-studio/torch_memory_saver.git@afc13785c50119048e2dd8ac497cc9e29ec75bd4 --no-cache-dir --force-reinstall && \
     pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation --no-cache-dir && \
-    pip install megatron-energon fsspec==2024.3.1 --no-cache-dir&& \
     pip install "numpy<2" nvidia-cudnn-cu12==9.16.0.29 --no-cache-dir && \
     NVCC_APPEND_FLAGS="--threads 32" \
     pip -v install --disable-pip-version-check --no-cache-dir \
@@ -109,7 +108,7 @@ WORKDIR /root
 ARG PATCH_VERSION=latest
 ARG ENABLE_SGLANG_PATCH=1
 
-ARG MEGATRON_BRIDGE_COMMIT=af17edf52c514c58c79cd291b04a9b42bc5c57f3
+ARG MEGATRON_BRIDGE_COMMIT=6862ee170a2569607e8ebc5dde91f119779093ca
 ENV MEGATRON_BRIDGE_COMMIT=${MEGATRON_BRIDGE_COMMIT} \
     PYTHONPATH=/root/Megatron-LM/
 
@@ -132,7 +131,22 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --ignore-installed PyJWT && \
     pip install -r /tmp/requirements.txt --no-cache-dir && \
     pip install --no-cache-dir "compressed_tensors>=0.13.0" tensordict==0.10.0 pyvers==0.1.0 'nvidia-modelopt[hf]==0.44.0' --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
+    pip install "transferqueue @ git+https://github.com/redai-studio/TransferQueue.git@8686d4ea660426d3f0dee5b9306a6de6c14fba2f" --no-deps
+
+# MCore's pinned revision requires the NVRx 0.6 async checkpoint API.
+# Build the fixed v0.6.0 source for bases older than the wheel's glibc 2.39.
+# The final stage also covers externally supplied TRAIN_IMAGE builds.
+RUN pip install --no-cache-dir \
+    "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d"
+
+# Pin both FLA distributions in the final stage, including external TRAIN_IMAGE builds.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    "fla-core==0.5.2" "flash-linear-attention==0.5.2"
+
+# Preserve small KDA gate gradients in FP32 dot products inside the backward kernel.
+COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-precision.patch
+RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
+    patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
 
 # sgl-router: override the official wheel (pulled by requirements.txt above) with
 # slime's r3-capable fork. The official sglang-router drops the routed_experts
@@ -146,13 +160,15 @@ RUN pip install --no-cache-dir --force-reinstall --no-deps \
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
+COPY docker/patch/megatron/sync-save-bounded-staging.patch /root/Megatron-LM/
 RUN cd Megatron-LM && \
     patch -p1 < /root/Megatron-LM/megatron.patch || (cat megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py.rej && exit 1 )&& \
     if grep -R -n '^<<<<<<< ' .; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm megatron.patch && \
+    patch --batch --forward -p1 < sync-save-bounded-staging.patch && \
+    rm megatron.patch sync-save-bounded-staging.patch && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 

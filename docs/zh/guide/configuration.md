@@ -31,7 +31,7 @@
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--num-data-storage-units` | int | 1 | TransferQueue SimpleStorageUnit Actor 数量 |
-| `--per-rank-fetch` | flag | False | 让每个 TP/PP rank 都并行地各自从 TransferQueue 拉一份数据，省掉 rank-0 pickle + TP/PP broadcast。跨 rank 一致性依赖 TQ sampler 的 `(partition_id, task_name, dp_rank, batch_index)` 缓存（PP/TP 不变量）。当 `rollout_routed_experts` 出现在 `data_fields` 时自动禁用（jagged NestedTensor broadcast 路径不兼容）。多卡训练推荐配合 `--num-data-storage-units >= TP world size` 使用。在 pickle 主导 `tgd_bcast_tp_time` 时有收益。 |
+| `--per-rank-fetch`（RL 兼容选项；SFT 自动选择） | flag | RL: False / Megatron SFT: True | 让每个 TP/PP rank 都并行地各自从 TransferQueue 拉一份数据，省掉 rank-0 pickle + TP/PP broadcast。跨 rank 一致性依赖 TQ sampler 的 `(partition_id, task_name, dp_rank, batch_index)` 缓存（PP/TP 不变量）。当 `rollout_routed_experts` 出现在 `data_fields` 时自动禁用（jagged NestedTensor broadcast 路径不兼容）。多卡训练推荐配合 `--num-data-storage-units >= TP world size` 使用。在 pickle 主导 `tgd_bcast_tp_time` 时有收益。 |
 | `--max-staleness` | int | 0 | TransferQueue 数据系统的最大陈旧度（0=on-policy） |
 | `--polling-mode` | bool | True | 获取 metadata 时是否使用轮询模式 |
 | `--num-iters-per-train-update` | int | 1 | 全异步流水线中每个 global batch 的迭代次数 |
@@ -444,7 +444,7 @@ PPO 当前支持同步 colocate 模式，并要求在 `--resource` 中包含 `cr
 | `RELAX_SFT_TQ_SHARDS` | int | 1 | SFT TransferQueue shard 数。小于等于 0 的值按 1 处理。 |
 
 ::: warning 生效条件
-这个变量本身不会开启 prepack。它仅在使用 `--loss-type sft --sft-async-prepack` 时生效，否则 Relax 只使用一个分区。Async prepack 还要求开启 `--per-rank-fetch`、至少允许两个 in-flight step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP=1，并使用 THD QKV 格式。
+这个变量本身不会开启 prepack，仅在 SFT 自动选中 async prepack 时生效，否则 Relax 只使用一个分区。自动选择要求 Megatron 后端、NCCL、THD、至少两个在途 step（`--max-staleness >= 1` 或 `--sft-max-in-flight-steps >= 2`）、PP=1、CP=1、VPP 关闭，且无动态 CP、routing/indexer replay 和图片数据。per-rank fetch 自动开启，无需额外开关。
 :::
 
 当 `N > 1` 时，step `K` 使用从 `sft_K_shard_0_of_N` 到 `sft_K_shard_<N-1>_of_N` 的分区；原有的 `sft_K` 名称只会在 `N == 1` 时使用。Consumer 会等待所有 shard 分区就绪，然后从每个分区读取相同数量的样本。因此，`global_batch_size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。
