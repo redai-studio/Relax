@@ -144,11 +144,25 @@ def build_teacher_overrides(args: Any, colocate_sync: bool = False) -> dict[str,
     overrides["model_path"] = args.teacher_hf_checkpoint
     overrides.setdefault("load_format", "auto")
     overrides.setdefault("enable_memory_saver", colocate_sync)
+    overrides.setdefault("enable_weights_cpu_backup", True)
     return overrides
 
 
 def build_teacher_engine_args(args: Any, overrides: dict[str, object]) -> Any:
     teacher_args = copy.copy(args)
+    # Static teachers have their own engine config; policy-only flags must not leak.
+    for key in list(vars(teacher_args)):
+        if key.startswith("sglang_"):
+            delattr(teacher_args, key)
+    teacher_args.sglang_tp_size = 1
+    teacher_args.sglang_pp_size = 1
+    teacher_args.sglang_dp_size = 1
+    teacher_args.sglang_ep_size = 1
+    teacher_args.sglang_router_ip = None
+    teacher_args.sglang_router_port = None
+    teacher_args.use_rollout_routing_replay = False
+    teacher_args.enable_mtp_training = False
+    teacher_args.lora_adapter_mode = False
     for key, value in overrides.items():
         setattr(teacher_args, f"sglang_{key}", value)
     return teacher_args
@@ -180,6 +194,8 @@ def create_managed_opd_teacher_manager(
         shared_pg=shared_pg,
     )
 
+    if hasattr(args, "_teacher_startup_managers"):
+        args._teacher_startup_managers.append(teacher_manager)
     urls = ray.get(teacher_manager.get_urls.remote())
     logger.info(f"[OPD teacher] TeacherManager initialized successfully: urls={urls}")
 
@@ -191,6 +207,43 @@ def create_managed_opd_teacher_manager(
 
 
 def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
+    import ray
+
+    args._teacher_startup_managers = []
+    args._teacher_startup_pg = None
+    args._teacher_gateway_attempted = False
+    try:
+        return _start_managed_opd_teacher(args, runtime_env=runtime_env)
+    except BaseException:
+        for manager in args._teacher_startup_managers:
+            try:
+                ray.get(manager.shutdown.remote(), timeout=60)
+            except Exception:
+                logger.exception("Teacher startup rollback failed to shut down a manager")
+            try:
+                ray.kill(manager)
+            except Exception:
+                logger.exception("Teacher startup rollback failed to kill a manager")
+        if args._teacher_startup_pg is not None:
+            try:
+                ray.util.remove_placement_group(args._teacher_startup_pg[0])
+            except Exception:
+                logger.exception("Teacher startup rollback failed to remove its placement group")
+        if args._teacher_gateway_attempted:
+            try:
+                from ray import serve
+
+                serve.delete("teacher")
+            except Exception:
+                logger.exception("Teacher startup rollback failed to remove its gateway")
+        raise
+    finally:
+        del args._teacher_startup_managers
+        del args._teacher_startup_pg
+        del args._teacher_gateway_attempted
+
+
+def _start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = None) -> tuple[Any, Any]:
     if not is_managed_opd_teacher_enabled(args) or getattr(args, "debug_train_only", False):
         return None, None
 
@@ -214,6 +267,8 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
             num_gpus=actor_gpus,
             node_group_affinity=getattr(args, "enable_affinity", True),
         )
+
+    args._teacher_startup_pg = shared_pg
 
     # args.resource["teacher"] = [num_cpus, num_gpus]. The teacher replica layout
     # is derived from the GPU total and --teacher-num-gpus-per-engine (TP per
@@ -239,7 +294,8 @@ def maybe_start_managed_opd_teacher(args: Any, *, runtime_env: dict | None = Non
         shared_pg=shared_pg_enabled,
         runtime_env=runtime_env,
     )
-    args.opd_teacher_url = urls[0]
+    _publish_teacher_gateway(args, {"default": teacher_manager})
+    args.opd_teacher_url = urls[0] if urls else args.opd_teacher_gateway_url + "/generate"
     args.opd_teacher_urls = list(urls)
     logger.info(
         f"[OPD teacher] injected opd_teacher_url={args.opd_teacher_url} "
@@ -290,28 +346,21 @@ def _start_managed_multi_teacher(
             f"--teacher-num-gpus-per-engine ({gpus_per_replica})."
         )
 
-    if not is_managed_opd_teacher_colocate(args):
-        raise ValueError(
-            "MOPD (--opd-teacher-routes) requires colocate mode: pass --colocate and "
-            "include both 'actor' and 'rollout' in --resource. Dedicated teacher GPUs "
-            "are no longer supported."
-        )
+    shared_pg_enabled = is_managed_opd_teacher_colocate(args)
 
-    # MOPD is colocate-only: all teachers SHARE the actor/rollout placement group
-    # (same as the single-teacher colocate path). During training the actor uses
-    # all GPUs; during rollout student-rollout occupies bundles [0, rollout_gpus)
-    # and teacher_k occupies [rollout_gpus + k*gpus_per_teacher, +gpus_per_teacher).
-    # This requires rollout_gpus + total_teacher_gpus == actor_gpus. Both this
-    # placement-group import and TeacherManager's (below) pull in the full SGLang/
-    # transformers dependency chain, so they stay deferred until every ValueError
-    # check above has had a chance to short-circuit first.
+    # Shared deployments use the planner's Teacher region; decoupled managers
+    # each own their replica PGs. Keep backend imports after budget validation.
     from relax.core.service import create_placement_group
     from relax.distributed.ray.multi_instance_orchestrator import start_multi_instance_managers
     from relax.distributed.ray.teacher_manager import TeacherManager
 
     actor_gpus = args.resource["actor"][1]
     rollout_gpus = int(args.rollout_num_gpus)
-    if rollout_gpus + total_teacher_gpus != actor_gpus:
+    if (
+        shared_pg_enabled
+        and not getattr(args, "_inference_placement", None)
+        and rollout_gpus + total_teacher_gpus != actor_gpus
+    ):
         raise ValueError(
             f"MOPD colocate requires rollout_gpus + teacher_gpus == actor_gpus, but got "
             f"rollout={rollout_gpus} + teacher={total_teacher_gpus} != actor={actor_gpus}. "
@@ -320,13 +369,18 @@ def _start_managed_multi_teacher(
             f"--rollout-num-gpus 8 with resource['teacher'][1]=8."
         )
 
-    shared_pg = create_placement_group(
-        num_gpus=actor_gpus,
-        node_group_affinity=getattr(args, "enable_affinity", True),
+    shared_pg = (
+        create_placement_group(
+            num_gpus=actor_gpus,
+            node_group_affinity=getattr(args, "enable_affinity", True),
+        )
+        if shared_pg_enabled
+        else None
     )
+    args._teacher_startup_pg = shared_pg
     logger.info(
-        f"[MOPD teacher] colocate mode: shared actor PG={actor_gpus} GPU, "
-        f"rollout={rollout_gpus}, teachers start at bundle {rollout_gpus} "
+        f"[MOPD teacher] shared_pg={shared_pg_enabled}, actor={actor_gpus} GPU, "
+        f"rollout={rollout_gpus}, teacher region start={getattr(args, '_teacher_bundle_start', rollout_gpus) if shared_pg_enabled else 0} "
         f"({gpus_per_teacher} GPU/teacher)"
     )
     logger.info(
@@ -337,6 +391,7 @@ def _start_managed_multi_teacher(
     def _build_teacher_manager_args(base_args: Any, data_source: str, spec: dict) -> Any:
         teacher_args = copy.copy(base_args)
         teacher_args.teacher_hf_checkpoint = spec["checkpoint_path"]
+        teacher_args._teacher_port_window = list(routes_map).index(data_source)
         return teacher_args
 
     def _spawn_teacher_manager(_key: str, per_instance_args: Any, bundle_offset: int, spec: dict) -> Any:
@@ -350,7 +405,7 @@ def _start_managed_multi_teacher(
             spec["num_gpus"] // gpus_per_replica,
             gpus_per_replica,
             pg=shared_pg,
-            shared_pg=True,
+            shared_pg=shared_pg_enabled,
             bundle_offset=bundle_offset,
         )
 
@@ -365,6 +420,9 @@ def _start_managed_multi_teacher(
         spawn_manager=_spawn_teacher_manager,
         region_offset=0,
     )
+
+    if hasattr(args, "_teacher_startup_managers"):
+        args._teacher_startup_managers.extend(managers.values())
 
     url_routes: dict[str, list[str]] = {}
     for data_source, teacher_manager in managers.items():
@@ -387,7 +445,19 @@ def _start_managed_multi_teacher(
     # start_multi_instance_managers returns a dict, so convert back to preserve
     # this function's existing (pg, list[manager]) contract for callers that use
     # isinstance(x, list) to normalize single- vs multi-teacher shapes.
+    _publish_teacher_gateway(args, managers)
     return shared_pg, list(managers.values())
+
+
+def _publish_teacher_gateway(args: Any, managers: dict[str, Any]) -> None:
+    from relax.components.inference_gateway import deploy_teacher_gateway
+    from relax.utils.utils import get_serve_url
+
+    if hasattr(args, "_teacher_gateway_attempted"):
+        args._teacher_gateway_attempted = True
+    deploy_teacher_gateway(managers, args)
+    args.opd_teacher_gateway_url = get_serve_url("teacher")
+    args._inference_teacher_managers = managers
 
 
 async def set_managed_opd_teacher_on_actor_service(actor_service: Any, teacher_manager: Any, args: Any) -> None:
@@ -436,6 +506,8 @@ def append_managed_opd_teacher_offload_handle(handles: list[Any], owner: Any) ->
 
 
 def append_managed_opd_teacher_onload_handle(handles: list[Any], owner: Any) -> None:
+    if getattr(owner.args, "opd_teacher_defer", False):
+        return
     teacher_manager = getattr(owner, "teacher_manager", None)
     if teacher_manager is None:
         return
@@ -463,7 +535,13 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
         actor_total_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
 
     teacher_gpus = args.resource["teacher"][1]
-    if args.rollout_num_gpus + teacher_gpus != actor_total_gpus:
+    if getattr(args, "opd_teacher_defer", False):
+        from relax.inference.placement import PlacementPlanner
+
+        PlacementPlanner.apply(args)
+        return
+    genrm_gpus = sum(s["num_gpus"] for s in getattr(args, "_genrm_instances_resolved", {}).values())
+    if args.rollout_num_gpus + teacher_gpus + genrm_gpus != actor_total_gpus:
         raise ValueError(
             "Managed OPD teacher colocate requires split bundles where "
             "--rollout-num-gpus + resource['teacher'][1] equals actor total GPUs. "
@@ -472,6 +550,12 @@ def validate_managed_opd_teacher_colocate_args(args: Any) -> None:
 
 
 def add_opd_arguments(parser: Any) -> Any:
+    parser.add_argument(
+        "--opd-teacher-defer",
+        action="store_true",
+        default=False,
+        help="Score managed Teacher after rollout drains, writing probabilities before training data publication.",
+    )
     parser.add_argument(
         "--use-opd",
         action="store_true",

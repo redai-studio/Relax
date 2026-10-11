@@ -200,6 +200,10 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     Returns:
         Tuple[List[float], List[float]]
     """
+    if samples and all(hasattr(sample, "_inference_reward_result") for sample in samples):
+        cached = [sample._inference_reward_result for sample in samples]
+        return [value[0] for value in cached], [value[1] for value in cached]
+
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
         processed_rewards = custom_reward_post_process_func(args, samples)

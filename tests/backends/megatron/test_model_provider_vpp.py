@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from relax.inference.placement import PlacementPlanner
 from relax.utils.training import ppo_utils
 
 
@@ -191,6 +192,26 @@ def test_bridge_provider_receives_virtual_pipeline_size(monkeypatch):
     assert provider.virtual_pipeline_model_parallel_size == 2
     assert provider.finalized
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
+
+
+@pytest.mark.parametrize("npu_available", [False, True])
+def test_bridge_provider_excludes_inference_placement(monkeypatch, npu_available):
+    module, provider = _load_model_provider(monkeypatch)
+    monkeypatch.setattr(module, "is_npu_available", npu_available)
+    args = _bridge_args(resource={"actor": [1, 1], "rollout": [1, 1]}, use_flash_attn=True)
+    plan = PlacementPlanner.apply(args)
+
+    module.get_model_provider_func(args, role="actor")
+
+    # The plan belongs to the runtime; Bridge's config sanitizer cannot
+    # reconstruct frozen placement records with setattr during weight export.
+    assert not hasattr(provider, "_inference_placement")
+    assert args._inference_placement is plan
+    assert plan[0].role == "rollout"
+    assert provider.finalized
+    assert provider.tensor_model_parallel_size == args.tensor_model_parallel_size
+    if npu_available:
+        assert provider.use_flash_attn is True
 
 
 def test_bridge_provider_receives_vision_dp_when_cp(monkeypatch):

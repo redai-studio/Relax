@@ -54,7 +54,7 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         captured["strategy"] = strategy
         return MagicMock(name="pg")
 
-    def _fake_ray_get(arg):
+    def _fake_ray_get(arg, **kwargs):
         # Second call passes a list of get_ip_and_gpu_id futures -> return one
         # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
         if isinstance(arg, list):
@@ -78,6 +78,31 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
             num_gpus, node_group_affinity=node_group_affinity
         )
     return captured, cr_mock
+
+
+@pytest.mark.parametrize("fail_at", ["ready", "probe"])
+def test_create_pg_failure_removes_owned_pg_and_probe_actors(monkeypatch, fail_at):
+    monkeypatch.delenv("RELAX_INITIAL_NODE_GROUP", raising=False)
+    pg = MagicMock()
+    actor = MagicMock()
+
+    def get(ref, **kwargs):
+        if fail_at == "ready" or isinstance(ref, list):
+            raise TimeoutError("placement unavailable")
+
+    with (
+        patch("relax.core.service.placement_group", return_value=pg),
+        patch("relax.core.service.PlacementGroupSchedulingStrategy"),
+        patch("relax.core.service.InfoActor") as info,
+        patch("relax.core.service.ray.get", side_effect=get),
+        patch("relax.core.service.ray.kill") as kill,
+        patch("relax.core.service.ray.util.remove_placement_group") as remove,
+    ):
+        info.options.return_value.remote.return_value = actor
+        with pytest.raises(TimeoutError, match="placement unavailable"):
+            create_placement_group(1)
+        remove.assert_called_once_with(pg)
+        assert kill.call_count == (fail_at == "probe")
 
 
 def test_create_pg_stable_with_markers_adds_marker_bundles(monkeypatch):
@@ -195,6 +220,7 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
 
     assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {
         "runtime_env": {"env_vars": {"A": "B"}},
+        "num_gpus": 0,
         "resources": {"stable_cpu": 1},
     }
     deployment.bind.assert_called_once()
@@ -214,7 +240,7 @@ def test_service_deploy_is_unconstrained_without_autoscaler():
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
 
-    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {"runtime_env": None}
+    assert deployment_cls.options.call_args.kwargs["ray_actor_options"] == {"runtime_env": None, "num_gpus": 0}
 
 
 def test_service_deferred_deploy_keeps_placement_group_ownership():

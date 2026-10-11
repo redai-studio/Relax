@@ -166,8 +166,12 @@ def test_evaluate_resets_debounce_when_no_engines():
 
 
 def test_update_pending_requests_treats_partial_as_terminal():
-    svc = _service(session=_FakeSession())  # terminal-at-entry: GET is never issued
-    svc._state.pending_requests = [{"request_id": "r1", "action": "scale_out", "status": "PARTIAL", "delta": 2}]
+    # Terminal-at-entry with cleanup PROVEN clean (authoritative False): the
+    # GET is never issued and the request finalizes immediately.
+    svc = _service(session=_FakeSession())
+    svc._state.pending_requests = [
+        {"request_id": "r1", "action": "scale_out", "status": "PARTIAL", "delta": 2, "cleanup_required": False}
+    ]
     asyncio.run(svc._update_pending_requests())
     assert svc._state.pending_requests == []
     assert len(svc._state.scale_history) == 1
@@ -188,10 +192,12 @@ def test_update_pending_requests_keeps_non_terminal():
 
 
 def test_update_pending_requests_scale_in_completed_terminal():
-    """scale_in terminal state is COMPLETED (not ACTIVE) -> moved to
-    history."""
+    """scale_in terminal state is COMPLETED (not ACTIVE) -> moved to history
+    when cleanup is proven clean."""
     svc = _service(session=_FakeSession())  # terminal-at-entry: GET is never issued
-    svc._state.pending_requests = [{"request_id": "s1", "action": "scale_in", "status": "COMPLETED", "delta": 1}]
+    svc._state.pending_requests = [
+        {"request_id": "s1", "action": "scale_in", "status": "COMPLETED", "delta": 1, "cleanup_required": False}
+    ]
     asyncio.run(svc._update_pending_requests())
     assert svc._state.pending_requests == []
     assert len(svc._state.scale_history) == 1
@@ -209,6 +215,7 @@ def test_update_pending_requests_propagates_failure_categories():
             "status": "FAILED",
             "error_message": "scale-out failed: NCCL transport mismatch: wrong_type",
             "failure_categories": ["NCCL_PRECHECK_TRANSPORT_MISMATCH"],
+            "cleanup_required": False,
         },
         get_status=200,
     )

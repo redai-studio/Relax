@@ -404,6 +404,10 @@ def get_model_provider_func(
             provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
         if is_npu_available:
             for key, value in vars(args).items():
+                # Placement is runtime metadata, not model configuration. Older
+                # Bridge sanitizers cannot reconstruct its frozen records.
+                if key == "_inference_placement":
+                    continue
                 if not hasattr(provider, key):
                     setattr(provider, key, value)
 

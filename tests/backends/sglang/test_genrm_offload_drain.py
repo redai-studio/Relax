@@ -160,18 +160,18 @@ def test_release_tolerates_abort_failure(patched):
     assert fake_requests.calls.count("release_memory_occupation") == 1
 
 
-def test_release_tolerates_pause_failure_and_still_drains(patched):
-    # If pause does not take, per-retry abort still drains and release proceeds.
+def test_release_rejects_pause_failure_before_releasing_memory(patched):
+    # A failed admission fence must not allow another role to reuse these GPUs.
     import requests as _real_requests
 
     fake_requests, _ = patched(
         flush_statuses=[200],
         post_raises={"pause_generation": _real_requests.exceptions.ConnectionError("boom")},
     )
-    _make_engine().release_memory_occupation()
+    with pytest.raises(_real_requests.exceptions.ConnectionError):
+        _make_engine().release_memory_occupation()
 
-    assert "abort_request" in fake_requests.calls
-    assert fake_requests.calls.count("release_memory_occupation") == 1
+    assert "release_memory_occupation" not in fake_requests.calls
 
 
 def test_full_resume_reopens_admission(patched):

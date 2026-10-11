@@ -22,6 +22,9 @@ import ray
 import requests
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from relax.inference.manager import InferenceManager
+from relax.inference.placement import validate_pg_span
+from relax.inference.routing import engine_record
 from relax.utils.logging_utils import get_logger
 
 
@@ -60,6 +63,18 @@ def _is_engine_dead(exc: BaseException) -> bool:
     return isinstance(exc, _ENGINE_DEAD_EXCEPTIONS)
 
 
+def _is_actor_dead(exc: BaseException) -> bool:
+    """Return whether Ray has already lost the engine actor itself.
+
+    A transport timeout is ambiguous: the SGLang process may still own GPU
+    memory and must stay pending until ``shutdown`` succeeds.  RayActorError is
+    different.  It means the actor process is gone, so a cleanup attempt can
+    acknowledge that slot and let recovery rebuild it.
+    """
+
+    return isinstance(exc, ray.exceptions.RayActorError)
+
+
 class MultiEngineManager:
     """Base class for managers of a fixed-size pool of engine replicas.
 
@@ -85,6 +100,7 @@ class MultiEngineManager:
         engine_actor_cls: type,
         skip_init: bool = False,
         log_prefix: str = "",
+        role: str = "genrm",
     ) -> None:
         self.args = args
         self.engine_actor_cls = engine_actor_cls
@@ -96,9 +112,23 @@ class MultiEngineManager:
         # remove placement groups this manager itself created.
         self._engine_placements: dict[int, tuple] = {}
         self._engine_addr_and_ports: dict[int, dict] = {}
+        self._initializing_ranks: set[int] = set()
+        self._cleanup_pending: set[int] = set()
+        # Ranks whose owned placement-group removal failed and whose handle is
+        # retained for retry (Task 4: unconfirmed resource release keeps
+        # blocking new scale operations until reconcile succeeds).
+        self._pending_pg_cleanup: set[int] = set()
+        # Ranks for which remove_placement_group() was *accepted* by Ray.
+        # Distinct from _pending_pg_cleanup (which means "release not yet
+        # confirmed REMOVED"): a rank whose deletion submission itself threw
+        # must stay out of this set so the next retry resubmits the deletion
+        # instead of only polling a PG that was never deleted (review finding:
+        # first-attempt exception otherwise strands the PG in CREATED forever).
+        self._pg_remove_submitted: set[int] = set()
         # Track memory-occupation state so repeated onload/offload calls become
         # safe no-ops. Engines start onloaded; callers may immediately offload.
         self._onloaded = True
+        self.inference = InferenceManager(role, {"default": self})
 
         if not skip_init:
             self._init_engines(list(range(num_slots)))
@@ -171,86 +201,216 @@ class MultiEngineManager:
         On failure, kill any newly created engines and leave their slots None
         so the caller sees them as still-dead rather than silently healthy.
         """
+        self._require_cleanup_complete()
         EngineActor = ray.remote(self.engine_actor_cls)
         new_engines: list[tuple[int, Any]] = []
-        for rank in ranks:
-            if self.all_engines[rank] is not None:
-                continue
-
-            pg_tuple, owns_pg, gpu_index = self._resolve_placement(rank)
-            pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
-
-            engine = EngineActor.options(
-                **self._ray_resource_kwargs(rank),
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={"env_vars": self._build_engine_env_vars()},
-            ).remote(
-                self._engine_ctor_args(rank),
-                rank=rank,
-                worker_type="regular",
-                base_gpu_id=base_gpu_id,
-                **self._build_engine_ctor_kwargs(rank),
-            )
-            new_engines.append((rank, engine))
-            self.all_engines[rank] = engine
-            self._engine_placements[rank] = (pg_tuple, owns_pg)
-
-        num_new_engines = len(new_engines)
-        if num_new_engines == 0:
-            return num_new_engines
-
-        addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
-        for rank, _ in new_engines:
-            self._engine_addr_and_ports[rank] = addr_and_ports[rank]
-
-        init_handles = [
-            engine.init.remote(**self._build_engine_init_kwargs(rank, addr_and_ports[rank]))
-            for rank, engine in new_engines
-        ]
+        pending_ranks = [rank for rank in ranks if self.all_engines[rank] is None]
+        self._initializing_ranks.update(pending_ranks)
         try:
-            # Bounded: a bundle on a dead node never schedules, and an unbounded
-            # ray.get would block the training step forever.
+            resolved = {}
+            for rank in pending_ranks:
+                resolved[rank] = self._resolve_placement(rank)
+                pg_tuple, owns_pg, gpu_index = resolved[rank]
+                self._engine_placements[rank] = (pg_tuple, owns_pg)
+                if getattr(self.args, "_inference_placement", None):
+                    validate_pg_span(pg_tuple, gpu_index, self.num_gpu_per_engine)
+            for rank in pending_ranks:
+                pg_tuple, owns_pg, gpu_index = resolved[rank]
+                pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
+                self._engine_placements[rank] = (pg_tuple, owns_pg)
+                base_gpu_id = int(reordered_gpu_ids[gpu_index])
+                scheduling_strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                )
+
+                engine = EngineActor.options(
+                    **self._ray_resource_kwargs(rank),
+                    scheduling_strategy=scheduling_strategy,
+                    runtime_env={"env_vars": self._build_engine_env_vars()},
+                ).remote(
+                    self._engine_ctor_args(rank),
+                    rank=rank,
+                    worker_type="regular",
+                    base_gpu_id=base_gpu_id,
+                    **self._build_engine_ctor_kwargs(rank),
+                )
+                new_engines.append((rank, engine))
+                self.all_engines[rank] = engine
+                self._engine_placements[rank] = (pg_tuple, owns_pg)
+
+            num_new_engines = len(new_engines)
+            if num_new_engines == 0:
+                return num_new_engines
+
+            addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
+            for rank, _ in new_engines:
+                self._engine_addr_and_ports[rank] = addr_and_ports[rank]
+
+            init_handles = [
+                engine.init.remote(**self._build_engine_init_kwargs(rank, addr_and_ports[rank]))
+                for rank, engine in new_engines
+            ]
             ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
-        except Exception:
-            for rank, engine in new_engines:
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
-                self.all_engines[rank] = None
-                self._remove_owned_pg(rank)
+            return num_new_engines
+        except BaseException:
+            self._cleanup_slots(pending_ranks)
             raise
+        finally:
+            self._initializing_ranks.difference_update(pending_ranks)
 
-        return num_new_engines
+    def _remove_owned_pg(self, rank: int) -> bool:
+        """Remove the placement group this manager owns for ``rank``.
 
-    def _remove_owned_pg(self, rank: int) -> None:
-        placement = self._engine_placements.pop(rank, None)
+        Returns True when the slot had no owned PG or removal succeeded. On
+        removal failure the handle is retained (put back into
+        ``_engine_placements``) and the rank is recorded in
+        ``_pending_pg_cleanup`` for reconcile retries, so the resource stays
+        accounted-for instead of silently leaking.
+        """
+        # ``remove_placement_group`` only submits an asynchronous deletion.
+        # Keep ownership until Ray reports REMOVED; treating an accepted RPC as
+        # resource release lets a replacement actor race the old PG.
+        placement = self._engine_placements.get(rank)
         if placement is None:
-            return
+            return True
         pg_tuple, owns_pg = placement
         if not owns_pg:
-            return
+            self._engine_placements.pop(rank, None)
+            return True
+        if any(i != rank and other[0][0] == pg_tuple[0] for i, other in self._engine_placements.items()):
+            self._engine_placements.pop(rank, None)
+            return True
         try:
-            from ray.util.placement_group import remove_placement_group
+            from ray.util.placement_group import placement_group_table, remove_placement_group
 
-            remove_placement_group(pg_tuple[0])
+            if rank not in self._pg_remove_submitted:
+                remove_placement_group(pg_tuple[0])
+                # Ray accepted the (asynchronous) deletion request.
+                self._pg_remove_submitted.add(rank)
+            # Deletion submitted but not yet confirmed REMOVED: the rank is
+            # pending cleanup either way, so reconcile keeps retrying the
+            # confirmation poll.
+            self._pending_pg_cleanup.add(rank)
+            state = placement_group_table(pg_tuple[0]).get("state")
+            if state == "REMOVED":
+                self._engine_placements.pop(rank, None)
+                self._pending_pg_cleanup.discard(rank)
+                self._pg_remove_submitted.discard(rank)
+                if self.all_engines[rank] is None:
+                    self._cleanup_pending.discard(rank)
+                return True
+            return False
         except Exception as exc:
             logger.warning(f"{self._log_prefix} remove placement group for rank={rank} failed: {exc}")
+            # The deletion may never have reached Ray (the exception can fire
+            # before or during submission). Retain the handle, mark the rank
+            # for reconcile retries, and -- crucially -- leave it out of
+            # _pg_remove_submitted so the next attempt resubmits the deletion.
+            self._pending_pg_cleanup.add(rank)
+            self._pg_remove_submitted.discard(rank)
+            return False
+
+    def retry_pending_pg_cleanup(self) -> list[int]:
+        """Retry PG removal for all failed-cleanup ranks.
+
+        Returns the ranks still failing cleanup after this attempt.
+        """
+        still_failing: list[int] = []
+        for rank in sorted(self._pending_pg_cleanup):
+            if self._remove_owned_pg(rank):
+                self._pending_pg_cleanup.discard(rank)
+            else:
+                still_failing.append(rank)
+        return still_failing
+
+    def _require_cleanup_complete(self) -> None:
+        pending = self._cleanup_pending | self._pending_pg_cleanup
+        if pending:
+            raise RuntimeError(f"Inference cleanup pending for ranks={sorted(pending)}")
+
+    def _release_slot_pg(self, rank: int) -> bool:
+        return self._remove_owned_pg(rank)
+
+    def _cleanup_slots(self, ranks: list[int]) -> None:
+        ranks = sorted(set(ranks))
+        self._cleanup_pending.update(ranks)
+        failures = []
+        for rank in ranks:
+            try:
+                engine = self.all_engines[rank]
+                if engine is not None:
+                    # Killing only the Ray actor cannot confirm its SGLang
+                    # children released GPU memory. Keep the handle until
+                    # shutdown acknowledges cleanup, including on retry.
+                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
+                    ray.kill(engine)
+                    self.all_engines[rank] = None
+                if not self._release_slot_pg(rank):
+                    raise RuntimeError(f"Placement group release is unconfirmed for rank={rank}")
+                self._cleanup_pending.discard(rank)
+            except Exception as exc:
+                if engine is not None and _is_actor_dead(exc):
+                    # The Ray actor has already exited, so its SGLang child
+                    # cannot retain the GPU lease.  ``ray.kill`` is kept as a
+                    # best-effort acknowledgement because providers differ
+                    # on whether killing an already-dead actor raises.
+                    try:
+                        ray.kill(engine)
+                    except Exception as kill_exc:
+                        if not _is_actor_dead(kill_exc):
+                            failures.append(kill_exc)
+                            logger.warning(
+                                f"{self._log_prefix} actor death cleanup remains pending for rank={rank}: {kill_exc}"
+                            )
+                            continue
+                    try:
+                        if not self._release_slot_pg(rank):
+                            raise RuntimeError(f"Placement group release is unconfirmed for rank={rank}")
+                    except Exception as pg_exc:
+                        failures.append(pg_exc)
+                        logger.warning(
+                            f"{self._log_prefix} actor death PG cleanup remains pending for rank={rank}: {pg_exc}"
+                        )
+                        continue
+                    self.all_engines[rank] = None
+                    self._cleanup_pending.discard(rank)
+                    logger.warning(
+                        f"{self._log_prefix} acknowledged dead Ray actor rank={rank}; slot is eligible for recovery"
+                    )
+                    continue
+                failures.append(exc)
+                logger.warning(f"{self._log_prefix} cleanup remains pending for rank={rank}: {exc}")
+        if failures:
+            self.inference.state = "failed"
+            raise RuntimeError(
+                f"Inference cleanup unconfirmed for ranks={sorted(self._cleanup_pending)}"
+            ) from failures[0]
 
     # ------------------------------------------------------------------
     # Health / lifecycle.
     # ------------------------------------------------------------------
 
+    def _managed_ranks(self) -> list[int]:
+        """Slots participating in pool health and recovery."""
+        return list(range(len(self.all_engines)))
+
+    def _engine_state(self, rank: int) -> str:
+        group = range(rank, rank + self.nodes_per_engine)
+        if any(i in self._initializing_ranks for i in group):
+            return "starting"
+        if any(i in self._cleanup_pending or i in self._pending_pg_cleanup for i in group):
+            return "draining"
+        return "ready" if all(self.all_engines[i] is not None for i in group) else "dead"
+
     def health_check(self) -> bool:
         """Perform a health check on every engine."""
         health_results = []
-        for engine in self.engines:
+        for rank in self._managed_ranks():
+            if rank % self.nodes_per_engine:
+                continue
+            engine = self.all_engines[rank]
             if engine is not None:
                 try:
                     health_results.append(ray.get(engine.health_generate.remote(), timeout=5.0))
@@ -262,6 +422,12 @@ class MultiEngineManager:
         return all(health_results)
 
     def onload(self, tags: Optional[list[str]] = None) -> None:
+        self._require_cleanup_complete()
+        if self.inference.state != "dead" and any(self.all_engines[i] is None for i in self._managed_ranks()):
+            self.inference.state = "failed"
+        self.inference.transition("activate", lambda: self._onload_engines(tags), tags)
+
+    def _onload_engines(self, tags: Optional[list[str]] = None) -> None:
         """Load engine weights to GPU.
 
         Also the recovery point for engines that died since the last step: a
@@ -269,9 +435,6 @@ class MultiEngineManager:
         phase wants.
         """
         rebuilt = self.recover()
-        if self._onloaded and tags is None:
-            logger.info(f"{self._log_prefix} engines already onloaded; skipping")
-            return
         logger.info(f"{self._log_prefix} engines onload started with tags={tags}")
         # Engines rebuilt just above are already onloaded -- resuming them
         # again would be a double-resume, so only touch the ones that survived.
@@ -287,16 +450,19 @@ class MultiEngineManager:
         logger.info(f"{self._log_prefix} engines onload completed")
 
     def offload(self) -> None:
+        self.inference.transition("deactivate", self._offload_engines)
+
+    def _offload_engines(self) -> None:
         """Offload engine weights from GPU to free memory.
 
         Dead engines are retired here but NOT rebuilt: this typically runs
         while other ranks wait on a barrier, so keep it short and leave the
         rebuild to the next onload().
         """
-        if not self._onloaded:
-            logger.info(f"{self._log_prefix} engines already offloaded; skipping")
-            return
         logger.info(f"{self._log_prefix} engines offload started")
+        # A previous attempt may have removed the head but retained a follower.
+        # Retrying only the head RPCs would incorrectly publish SLEEPING.
+        self._cleanup_slots(list(self._cleanup_pending))
         dead = self._fanout("release_memory_occupation")
         self._retire_engines(dead)
         # Unconditional: the surviving engines did release, so the manager
@@ -320,38 +486,25 @@ class MultiEngineManager:
             handles[rank] = getattr(engine, method).remote(**kwargs)
 
         dead = []
+        failures = []
         for rank, handle in handles.items():
             try:
-                ray.get(handle)
+                ray.get(handle, timeout=_ENGINE_REBUILD_TIMEOUT_S)
             except Exception as exc:
                 if not _is_engine_dead(exc):
-                    raise
+                    failures.append(exc)
+                    continue
                 logger.warning(f"{self._log_prefix} engine rank={rank} died during {method}: {exc}")
                 dead.append(rank)
+        if failures:
+            self._retire_engines(dead)
+            raise failures[0]
         return dead
 
     def _retire_engines(self, ranks: list[int]) -> None:
         """Tear down dead engines and null their slots so recover() rebuilds
         them."""
-        for rank in ranks:
-            for i in range(rank, rank + self.nodes_per_engine):
-                engine = self.all_engines[i]
-                if engine is None:
-                    continue
-                try:
-                    # shutdown() kill_process_tree's the SGLang server. Must run
-                    # before ray.kill or the scheduler subprocesses are orphaned
-                    # and keep holding GPU memory, so the rebuild can't fit.
-                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} shutdown failed (killing anyway): {exc}")
-                try:
-                    ray.kill(engine)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={i} ray.kill failed: {exc}")
-                self.all_engines[i] = None
-                self._remove_owned_pg(i)
-                logger.info(f"{self._log_prefix} engine rank={i} retired")
+        self._cleanup_slots([i for rank in ranks for i in range(rank, rank + self.nodes_per_engine)])
 
     def recover(self) -> set:
         """Rebuild engines whose slot is None. Returns the ranks rebuilt.
@@ -361,7 +514,8 @@ class MultiEngineManager:
         dedicated ones) and probing fresh ports (surviving engines' ports are
         bound, so they're skipped).
         """
-        dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
+        self._require_cleanup_complete()
+        dead = [i for i in self._managed_ranks() if self.all_engines[i] is None]
         if not dead:
             return set()
 
@@ -370,17 +524,18 @@ class MultiEngineManager:
             self._init_engines(dead)
         except Exception as exc:
             logger.exception(f"{self._log_prefix} engine rebuild failed for ranks={dead}: {exc}")
+            self._require_cleanup_complete()
+            # A partial pool must never be published as READY. The caller can
+            # retry recovery after the placement or node failure is resolved,
+            # but routing and training must observe the failed state first.
+            self.inference.state = "failed"
+            raise
 
         rebuilt = {i for i in dead if self.all_engines[i] is not None}
         still_dead = [i for i in dead if i not in rebuilt]
         if still_dead:
-            # Degrade rather than escalate: running on N-1 engines beats a
-            # global restart. Only a total wipeout is unrecoverable here.
-            if all(engine is None for engine in self.all_engines):
-                raise RuntimeError(f"All engines are dead and could not be rebuilt (ranks={still_dead})")
-            logger.error(
-                f"{self._log_prefix} engines still dead after recovery, continuing degraded: ranks={still_dead}"
-            )
+            self.inference.state = "failed"
+            raise RuntimeError(f"Engines are still dead after recovery (ranks={still_dead})")
         if rebuilt:
             logger.info(f"{self._log_prefix} recovered engine ranks={sorted(rebuilt)}")
         return rebuilt
@@ -389,19 +544,44 @@ class MultiEngineManager:
         return self._onloaded
 
     def shutdown(self) -> None:
+        self.inference.transition("shutdown", self._shutdown_engines)
+
+    def _shutdown_engines(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
-        for rank in range(0, len(self.all_engines), self.nodes_per_engine):
-            engine = self.all_engines[rank]
-            if engine is not None:
-                try:
-                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={rank} shutdown failed (killing anyway): {exc}")
-                try:
-                    ray.kill(engine)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={rank} ray.kill failed: {exc}")
-                self.all_engines[rank] = None
-            self._remove_owned_pg(rank)
+        self._cleanup_slots(list(range(len(self.all_engines))))
         logger.info(f"{self._log_prefix} shutdown complete.")
+
+    def activate(self, tags: Optional[list[str]] = None) -> None:
+        self.onload(tags)
+
+    def deactivate(self) -> None:
+        self.offload()
+
+    def drain(self) -> None:
+        def pause() -> None:
+            dead = self._fanout("drain")
+            self._retire_engines(dead)
+
+        self.inference.transition("drain", pause)
+
+    @ray.method(concurrency_group="discovery")
+    def get_inference_snapshot(self) -> dict:
+        engines = []
+        for rank in range(0, len(self.all_engines), self.nodes_per_engine):
+            address = self._engine_addr_and_ports.get(rank, {})
+            host = address.get("host")
+            if host and ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            url = f"http://{host}:{address['port']}" if host and "port" in address else None
+            engines.append(engine_record(f"default/{rank // self.nodes_per_engine}", url, self._engine_state(rank)))
+        state = "ready" if any(e["direct_eligible"] for e in engines) else "dead"
+        aliases = []
+        for attr in ("genrm_model_path", "teacher_hf_checkpoint", "sglang_hf_checkpoint", "hf_checkpoint"):
+            value = getattr(self.args, attr, None)
+            if isinstance(value, str) and value and value not in aliases:
+                aliases.append(value)
+        return self.inference.snapshot(
+            {"default": {"state": state, "router_url": None, "engines": engines, "model_aliases": aliases}},
+            default_model="default",
+        )

@@ -240,19 +240,35 @@ class OpdManager:
     ) -> None:
         sample_list = list(samples) if isinstance(samples, Sequence) else [samples]
 
+        await self.prefill_teacher(sample_list)
+        await self.prefill_student(sample_list, encode_multimodal_inputs)
+        self.finish_prefill(sample_list)
+
+    async def prefill_teacher(self, samples: list[Sample], *, strict: bool = False) -> None:
         if self.opsd_worker is not None:
-            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in sample_list])
-
+            await asyncio.gather(*[self.opsd_worker.build_teacher_inputs(self.args, s) for s in samples])
         async with _create_teacher_client_session(self.args) as session:
-            fetch_results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in sample_list])
-            self._raise_if_all_failed(sample_list, fetch_results)
+            results = await asyncio.gather(*[self._teacher_prefill(s, session) for s in samples])
+        self._raise_if_all_failed(samples, results)
+        if strict and not all(results):
+            raise RuntimeError("Deferred Teacher failed to score every sample; training data was not published")
 
-            if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
-                await asyncio.gather(
-                    *[self._student_prefill(s, session, encode_multimodal_inputs) for s in sample_list]
-                )
+    async def prefill_student(self, samples: list[Sample], encode_multimodal_inputs=None) -> None:
+        if self.topk_worker is not None and self.topk_worker.spec.student_at_teacher:
+            async with _create_teacher_client_session(self.args) as session:
+                await asyncio.gather(*[self._student_prefill(s, session, encode_multimodal_inputs) for s in samples])
 
-        self._assemble_transfer(sample_list)
+    def finish_prefill(self, samples: list[Sample], *, strict: bool = False) -> None:
+        self._assemble_transfer(samples)
+        if strict:
+            for sample in samples:
+                length = int(sample.response_length or 0)
+                if length <= 0:
+                    continue
+                for field in self.schema_opd_transfer_data():
+                    value = getattr(sample, field, None)
+                    if value is None or len(value) != length:
+                        raise RuntimeError(f"Deferred OPD sample {sample.index} has incomplete {field}")
 
     async def _post_logprob(
         self,
@@ -312,7 +328,19 @@ class OpdManager:
             if mm_fields:
                 payload.update(mm_fields)
 
-        teacher_url = _pick_teacher_url(self.args, sample)
+        gateway = getattr(self.args, "opd_teacher_gateway_url", None)
+        if gateway:
+            teacher_url = gateway.rstrip("/") + "/generate"
+            if getattr(self.args, "opd_teacher_routes", None):
+                key = getattr(self.args, "opd_teacher_key", None) or "data_source"
+                metadata = sample.metadata or {}
+                if key not in metadata:
+                    raise ValueError(f"MOPD sample missing routing key {key!r}")
+                payload["model"] = metadata[key]
+            else:
+                payload["model"] = "default"
+        else:
+            teacher_url = _pick_teacher_url(self.args, sample)
         resp_obj = await self._post_logprob(session, teacher_url, payload, sample, "teacher prefill")
         if resp_obj is None:
             return False

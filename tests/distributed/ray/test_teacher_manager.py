@@ -146,3 +146,33 @@ def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
 
     with pytest.raises(RuntimeError, match="global restart"):
         manager.recover()
+
+
+def test_owned_teacher_pg_retained_until_last_worker_and_confirmed_release(monkeypatch):
+    module = _import_teacher_manager(monkeypatch)
+    cls = module.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(cls)
+    manager.nodes_per_engine = 2
+    manager.all_engines = [None, None]
+    pg = ("teacher-pg", [0, 1], [0, 0])
+    manager._replica_pgs = {0: pg}
+    manager._engine_placements = {0: (pg, True), 1: (pg, True)}
+    manager._pending_pg_cleanup = set()
+    manager._cleanup_pending = {0, 1}
+    manager._pg_remove_submitted = set()
+    manager._log_prefix = "teacher"
+    pg_module = importlib.import_module("ray.util.placement_group")
+    remove = MagicMock()
+    state = {"state": "PENDING"}
+    monkeypatch.setattr(pg_module, "remove_placement_group", remove)
+    monkeypatch.setattr(pg_module, "placement_group_table", lambda pg: state)
+    assert manager._remove_owned_pg(0) is True
+    remove.assert_not_called()
+    assert manager._replica_pgs == {0: pg}
+    assert manager._remove_owned_pg(1) is False
+    assert manager._replica_pgs == {0: pg}
+    state["state"] = "REMOVED"
+    assert manager._remove_owned_pg(1) is True
+    assert manager._replica_pgs == {}
+    assert manager._pending_pg_cleanup == set()
+    remove.assert_called_once_with("teacher-pg")
