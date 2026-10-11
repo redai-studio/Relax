@@ -282,16 +282,3 @@ Agentic 导出在 `Sample.spec_generations` 中携带已提交请求的 session 
 | `spec/legacy_sample_count` | 缺少生成记录和字段可用性信息的旧样本数 |
 
 `Sample.spec_info` 保留原计数字段名，新增 `missing_fields`。旧序列化数据仍可读取，但旧零值不能证明覆盖，旧共享前缀无法可靠去重，因此不混入新指标，只报告 `spec/legacy_sample_count`；只有旧样本时不输出比值。新版普通生成样本由 `SpecInfo.add` 保存覆盖信息，即使与 Agentic 样本混合也参与主指标。无需新增 CLI 参数。
-
-### 可复现 CPU 样例
-
-| 生成 | Accepted | Proposed | Verify | Completion |
-| --- | ---: | ---: | ---: | ---: |
-| A | 1 | 2 | 1 | 2 |
-| B | 9 | 10 | 2 | 10 |
-| C | 2 | 4 | 1 | 3 |
-| D（未导出） | 100 | 100 | 1 | 100 |
-
-仅 A、B 两个独立请求：接受率 **10/12 ≈ 83.33%**，length **12/3 = 4**。导出 A→B、A→C：去重后为 A、B、C，接受率 **12/16 = 0.75**，length **15/4 = 3.75**，覆盖完整。D 不计入，重复导出不会改变结果。
-
-`tests/test_agentic_speculative_metrics.py` 贯通 backend 结果累计、终态提交、显式轨迹导出、transport 和 JSON 往返，再将生产聚合结果与 `tests/fixtures/speculative_metrics.json` 对照。运行：`python -m pytest tests/utils/test_speculative_metrics.py tests/test_agentic_speculative_metrics.py -q`。测试使用本地 tokenizer 和可控 backend 结果，不需要 GPU、模型权重或运行中的 Ray 集群，不证明真实推理加速。

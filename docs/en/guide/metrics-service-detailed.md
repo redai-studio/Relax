@@ -282,16 +282,3 @@ Additional keys below have the `rollout/` prefix (or the existing eval prefix):
 | `spec/legacy_sample_count` | Samples without generation records or field-availability information |
 
 `Sample.spec_info` retains its existing counter names and gains `missing_fields`. Old serialized samples remain readable. Their zero-filled counters cannot prove coverage, and their shared prefixes cannot be deduplicated. They are excluded from the new ratios and counted under `spec/legacy_sample_count`; when only old samples are available, no ratio is emitted. New ordinary-generation samples retain coverage through `SpecInfo.add` and participate in the main ratios even in a mixed Agentic batch. No new CLI option is needed.
-
-### Reproducible CPU example
-
-| Generation | Accepted | Proposed | Verify | Completion |
-| --- | ---: | ---: | ---: | ---: |
-| A | 1 | 2 | 1 | 2 |
-| B | 9 | 10 | 2 | 10 |
-| C | 2 | 4 | 1 | 3 |
-| D (not exported) | 100 | 100 | 1 | 100 |
-
-Two independent requests A and B give acceptance **10/12**, approximately 83.33%, and length **12/3 = 4**. Exporting A→B and A→C gives three unique generations: acceptance **12/16 = 0.75**, length **15/4 = 3.75**, with full coverage. D does not contribute. Duplicating an export leaves these values unchanged.
-
-`tests/test_agentic_speculative_metrics.py` exercises backend result accumulation, terminal commit, explicit export, transport and JSON round trips, then compares the production aggregation result to `tests/fixtures/speculative_metrics.json`. Run it with `python -m pytest tests/utils/test_speculative_metrics.py tests/test_agentic_speculative_metrics.py -q`. The test uses a local tokenizer and backend results; it needs no GPU, model weights or running Ray cluster and makes no claim about decoding speedup.
