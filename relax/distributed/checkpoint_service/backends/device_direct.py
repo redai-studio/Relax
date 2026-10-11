@@ -18,7 +18,7 @@ import logging
 import re
 import socket
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from functools import lru_cache
@@ -33,9 +33,19 @@ import torch.distributed as dist
 from tqdm import tqdm
 from urllib3.exceptions import NewConnectionError
 
+from relax.agentic.session.lora_version import LoRAVersionError, versioned_lora_publication_enabled
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.checkpoint_service.backends.base import CommBackend, TensorFusion
 from relax.distributed.checkpoint_service.config import BackendType, RoleInfo
+from relax.distributed.checkpoint_service.lora_publication import (
+    AdapterSnapshot,
+    EngineReply,
+    LoRAPublisher,
+    RayLoRAVersionRegistryClient,
+    adapter_tensor_bytes,
+    classify_engine_response,
+    materialize_adapter_snapshot,
+)
 from relax.utils.device import device_module
 from relax.utils.distributed_utils import get_gloo_group, init_process_group
 from relax.utils.env import Envs
@@ -215,6 +225,8 @@ class DeviceDirectBackend(CommBackend):
         self._lora_sync = self._megatron.LoraAdapterSync(args, model) if self._lora_adapter_mode else None
         self._lora_adapter_full = None  # merge mode: per-call {base_prefix: {"in","out"}} full tensors
         self._lora_skip_rollout_base = False  # adapter mode: set per-call once base is synced
+        # Task 7: Agentic runs publish each adapter as an immutable version (staged, no pause/flush).
+        self._versioned_lora = versioned_lora_publication_enabled(args)
         self._lora_moe_etp_checked = False  # guard the (actor-side) MoE ETP=1 assertion to run once
 
     @staticmethod
@@ -631,8 +643,9 @@ class DeviceDirectBackend(CommBackend):
     def update_weights_for_rollout(self, rollout_only=False, actor_fwd_only=False) -> None:
         """Update weights used by rollout nodes.
 
-        Sequence: pause rollout generation, flush caches, gather and broadcast
-        model parameters (non-expert then expert), then resume generation.
+        Bootstrap and legacy syncs pause generation and flush caches around the
+        broadcast. Later versioned adapter publications keep generation
+        running.
         """
         self.weight_version += 1
 
@@ -674,8 +687,13 @@ class DeviceDirectBackend(CommBackend):
                     n_expert,
                 )
         self._lora_skip_rollout_base = self._lora_adapter_mode and self._lora_sync.base_sync_done
+        # §11.2: once a version is live, an adapter-only publication must not pause generation or
+        # flush the KV cache — that is exactly what lets Sessions bound to the previous version
+        # keep running while the new one is prepared. Rank-uniform (same args on every rank), so
+        # the barrier below stays in lockstep.
+        versioned_staged = self._versioned_lora and self._lora_sync.base_sync_done
 
-        if not actor_fwd_only:
+        if not actor_fwd_only and not versioned_staged:
             if dist.get_rank() == 0:
                 # Pause generation on all rollout nodes
                 logger.info("Pausing generation on all rollout nodes...")
@@ -755,17 +773,21 @@ class DeviceDirectBackend(CommBackend):
         # same NCCL group (no disk). Must run on ALL ranks (the export/gather inside are
         # collective); only rank 0 issues the HTTP fan-out and drives the broadcast.
         #
-        # The failure is captured rather than propagated on the spot: generation is currently
-        # PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
+        # The failure is captured rather than propagated on the spot: bootstrap/legacy generation
+        # is PAUSED (see /pause_generation above) and only rank 0 can fail here, so an immediate
         # raise would strand the engines paused forever AND leave every other rank blocked in
         # the barrier below waiting for a rank that already unwound. The verdict is shared
         # across ranks first, generation is resumed, and only then does everyone raise together.
         push_error: Exception | None = None
         if self._lora_adapter_mode and not actor_fwd_only:
             try:
-                self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
+                if not self._versioned_lora:
+                    self._push_lora_adapter_distributed(first_sync=not self._lora_sync.adapter_loaded)
+                else:
+                    # Bootstrap and later versions share the staged publication protocol.
+                    self._publish_lora_adapter_versioned()
             except Exception as e:  # noqa: BLE001 - re-raised below, after the engines are resumed
-                logger.exception("LoRA adapter push failed; resuming generation before aborting")
+                logger.exception("LoRA adapter push failed; completing rank synchronization before aborting")
                 push_error = e
             else:
                 self._lora_sync.adapter_loaded = True
@@ -780,7 +802,7 @@ class DeviceDirectBackend(CommBackend):
                 flag = torch.tensor([1 if push_error is not None else 0], dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=get_gloo_group())
                 push_failed = bool(flag.item())
-            if dist.get_rank() == 0:
+            if dist.get_rank() == 0 and not versioned_staged:
                 # Continue generation on all rollout nodes
                 logger.info("Resuming generation on all rollout nodes...")
                 self._batch_request("/continue_generation")
@@ -791,8 +813,7 @@ class DeviceDirectBackend(CommBackend):
                 # policy silently stops tracking the trained one.
                 raise RuntimeError(
                     "LoRA adapter push to the rollout engines failed; aborting the weight update "
-                    "instead of generating with a stale or missing adapter. Generation has been "
-                    "resumed so the engines are not left paused."
+                    "instead of generating with a stale or missing adapter. The engines are not left paused."
                 ) from push_error
             # NOTE: rollout proxy actors are intentionally kept alive across weight
             # updates so init_process_group_for_rollout can reuse them (and the NCCL
@@ -1252,60 +1273,217 @@ class DeviceDirectBackend(CommBackend):
         # Only rank 0 holds the full adapter and is src (rank 0) of self._model_update_groups
         # (== "slime-pp_0"); it drives the NCCL broadcast. Other ranks do not participate.
         if dist.get_rank() == 0:
-            names = list(merged.keys())
-            # Bucket like the base-weight path (_update_bucket_weights_from_distributed): a MoE
-            # adapter is multi-GB (e.g. 40 layers x 256 experts x rank 32 ~= 3.4 GiB in BF16), so
-            # staging the whole thing on the accelerator would spike this rank AND every receiving
-            # engine by the full adapter size — on the engine side that lands on top of the KV
-            # cache and OOMs mid-broadcast, which wedges every other participant until the NCCL
-            # timeout. The engine buckets by the same explicit counts, so both ends stay in step.
-            bucket_sizes = bucket_tensor_counts(
-                [merged[name].numel() * merged[name].element_size() for name in names],
-                self.args.update_weight_buffer_size,
-            )
-
             # Serialize with the base-weight broadcast lock to avoid NCCL deadlocks.
             while not ray.get(self.lock.acquire.remote()):
                 time.sleep(0.1)
             try:
-                payload = {
-                    "lora_name": LORA_ADAPTER_NAME,
-                    "config_dict": self._lora_sync.config_dict(),
-                    "names": names,
-                    "dtypes": [str(merged[name].dtype).replace("torch.", "") for name in names],
-                    "shapes": [list(merged[name].shape) for name in names],
-                    "bucket_sizes": bucket_sizes,
-                    "group_name": self._group_name,
-                    "pinned": False,
-                }
-                # Fan out metadata (non-blocking) so every engine enters the broadcast recv,
-                # then broadcast bucket by bucket, then confirm the remote loads completed.
-                futures = self._batch_request("/update_lora_from_distributed", payload)
-                offset = 0
-                for count in bucket_sizes:
-                    # NCCL needs contiguous device tensors; the bridge exports to CPU. Make
-                    # contiguous BEFORE the transfer so a non-contiguous tensor costs a host
-                    # copy rather than a second device allocation.
-                    bucket = [
-                        merged[name].contiguous().to(device=self.device) for name in names[offset : offset + count]
-                    ]
-                    handles = [dist.broadcast(t, 0, group=self._model_update_groups, async_op=True) for t in bucket]
-                    for handle in handles:
-                        handle.wait()
-                    # Release this bucket's device memory before staging the next one.
-                    handles.clear()
-                    bucket.clear()
-                    offset += count
-                ray.get(futures)
-                logger.info(
-                    "[lora-adapter] broadcast %d tensors in %d bucket(s) over %s",
-                    len(names),
-                    len(bucket_sizes),
-                    self._group_name,
+                self._broadcast_adapter_oneshot(
+                    merged,
+                    lora_name=LORA_ADAPTER_NAME,
+                    pinned=False,
+                    bucket_cap=self.args.update_weight_buffer_size,
                 )
             finally:
                 ray.get(self.lock.release.remote())
         self._lora_sync.prev_state = new_state
+
+    def _broadcast_adapter_oneshot(
+        self,
+        tensors: Mapping[str, torch.Tensor],
+        *,
+        lora_name: str,
+        pinned: bool,
+        bucket_cap: int,
+    ) -> None:
+        """rank 0 (== group src): one control request, then the bucketed NCCL
+        broadcast.
+
+        The caller holds the broadcast lock. ``bucket_cap`` is the legacy base-
+        weight buffer for the fixed-name path and the publication cap for the
+        versioned one; either way the bucket counts travel in the payload
+        because both ends must derive identical boundaries.
+        """
+
+        names = list(tensors)
+        # A MoE adapter is multi-GB (e.g. 40 layers x 256 experts x rank 32 ~= 3.4 GiB in BF16), so
+        # staging the whole thing on the accelerator would spike this rank AND every receiving
+        # engine by the full adapter size — on the engine side that lands on top of the KV cache
+        # and OOMs mid-broadcast, which wedges every other participant until the NCCL timeout.
+        bucket_sizes = bucket_tensor_counts(
+            [tensors[name].numel() * tensors[name].element_size() for name in names],
+            bucket_cap,
+        )
+        payload = {
+            "lora_name": lora_name,
+            "config_dict": self._lora_sync.config_dict(),
+            "names": names,
+            "dtypes": [str(tensors[name].dtype).replace("torch.", "") for name in names],
+            "shapes": [list(tensors[name].shape) for name in names],
+            "bucket_sizes": bucket_sizes,
+            "group_name": self._group_name,
+            "pinned": pinned,
+        }
+        # Fan out metadata (non-blocking) so every engine enters the broadcast recv, then
+        # broadcast bucket by bucket, then confirm the remote loads completed.
+        futures = self._batch_request("/update_lora_from_distributed", payload)
+        offset = 0
+        for count in bucket_sizes:
+            self._broadcast_adapter_bucket(tensors, names[offset : offset + count])
+            offset += count
+        ray.get(futures)
+        logger.info(
+            "[lora-adapter] broadcast %d tensors in %d bucket(s) over %s",
+            len(names),
+            len(bucket_sizes),
+            self._group_name,
+        )
+
+    def _broadcast_adapter_bucket(self, tensors: Mapping[str, torch.Tensor], names: Sequence[str]) -> None:
+        """Broadcast one bucket from rank 0 and release its device memory
+        afterwards."""
+
+        # NCCL needs contiguous device tensors; the snapshot/bridge lives on CPU. Make contiguous
+        # BEFORE the transfer so a non-contiguous tensor costs a host copy rather than a second
+        # device allocation.
+        bucket = [tensors[name].contiguous().to(device=self.device) for name in names]
+        handles = [dist.broadcast(t, 0, group=self._model_update_groups, async_op=True) for t in bucket]
+        for handle in handles:
+            handle.wait()
+        # Release this bucket's device memory before staging the next one.
+        handles.clear()
+        bucket.clear()
+
+    # ------------------------------------------------------------------
+    # Task 7: immutable versioned publication (Agentic adapter mode)
+    # ------------------------------------------------------------------
+
+    def _materialize_adapter_snapshot(self) -> Optional[AdapterSnapshot]:
+        """Collective: export + PP-gather the adapter once, then freeze it (§9.6).
+
+        Every rank must call this (both steps are collective); only rank 0 receives the frozen
+        snapshot, which is what the digest, the buckets and the bytes all come from.
+        """
+
+        all_params = dict(self._megatron.named_params_and_buffers(self.args, self.model, convert_to_global_name=False))
+        local_adapter = self._lora_sync.export_local_adapter(all_params)
+        merged = self._lora_sync.gather_full_adapter(local_adapter, all_gather=False)
+        if dist.get_rank() != 0:
+            return None
+        return materialize_adapter_snapshot(self._lora_sync.config_dict(), merged)
+
+    def _lora_publication_bucket_cap(self) -> int:
+        """§12 Phase 2: publication has its own soft cap, min'ed with the base-
+        weight buffer.
+
+        Inheriting the base default (512 MiB) alone would put a ~180 MiB
+        adapter in a single bucket and lose the scheduler re-entry the staged
+        protocol exists for.
+        """
+
+        return min(int(self.args.update_weight_buffer_size), int(self.args.lora_publication_bucket_size))
+
+    def _new_lora_publisher(self, snapshot: AdapterSnapshot, bucket_cap: int) -> LoRAPublisher:
+        fanout = _StagedEngineFanout(self.rollout_engines, float(self.timeout_seconds))
+        return LoRAPublisher(
+            fire=fanout.fire,
+            collect=fanout.collect,
+            # Every bucket's bytes come from this one snapshot, never from the live adapter again.
+            broadcast=lambda names, index: self._broadcast_adapter_bucket(snapshot.tensors, names),
+            registry=RayLoRAVersionRegistryClient.from_deployment(),
+            bucket_cap_bytes=bucket_cap,
+            group_name=self._group_name,
+        )
+
+    def _publish_lora_adapter_versioned(self) -> None:
+        """§11.2: publish the current adapter as a new immutable version.
+
+        Begins the candidate on every engine, streams it bucket by bucket while generation keeps
+        running on the previous version, then commits fleet-wide. Failure keeps the old default
+        and either leaves a retryable version (every engine confirmed absent) or fails the run
+        closed (ambiguous engine state). After bootstrap, capacity refusal skips this update;
+        the next sync tries a new version ID while Sessions keep using the published policy.
+        """
+
+        version_id = self.weight_version
+        snapshot = self._materialize_adapter_snapshot()
+        if snapshot is None:
+            return
+        bucket_cap = self._lora_publication_bucket_cap()
+        bucket_sizes = bucket_tensor_counts(adapter_tensor_bytes(snapshot), bucket_cap)
+        publisher = self._new_lora_publisher(snapshot, bucket_cap)
+        # Same lock as the base-weight broadcast: the buckets share the NCCL group.
+        while not ray.get(self.lock.acquire.remote()):
+            time.sleep(0.1)
+        try:
+            # The sync sequence identifies the publication, not its content.
+            # Publisher retries must explicitly reuse this ID. Re-entering
+            # update_weights_for_rollout increments weight_version and starts
+            # a new publication; this entrypoint does not retry failures in place.
+            outcome = publisher.publish(snapshot, bucket_sizes, version_id=version_id)
+        except LoRAVersionError as error:
+            if error.code != "CAPACITY_ERROR" or not (
+                self._lora_sync.base_sync_done and self._lora_sync.adapter_loaded
+            ):
+                raise
+            # Admission was refused before Begin/NCCL. Only a running policy may
+            # stay stale; bootstrap and unconfirmed engine state must still fail.
+            logger.warning(
+                "[lora-version] sync v=%d SKIPPED: CAPACITY_ERROR; keeping the published policy "
+                "and retrying on the next weight sync: %s",
+                version_id,
+                error,
+            )
+            return
+        finally:
+            ray.get(self.lock.release.remote())
+        logger.info(
+            "[lora-version] sync v=%d %s: version=%s buckets=%d cap=%.1f MiB",
+            version_id,
+            outcome.status,
+            outcome.lora_name,
+            outcome.bucket_count,
+            bucket_cap / 1024**2,
+        )
+
+
+class _StagedEngineFanout:
+    """One control request per rollout engine, classified into publisher
+    verdicts.
+
+    ``fire``/``collect`` are split because the staged protocol interleaves
+    them: every engine must already be blocked in the collective when the
+    source side broadcasts. Replies are classified (clean refusal vs ambiguous)
+    so a transport problem can never be mistaken for an engine that is simply
+    missing the candidate.
+    """
+
+    def __init__(self, engines: Dict[int, Any], timeout_seconds: float) -> None:
+        if set(engines) != {0, 1}:
+            raise ValueError("versioned LoRA publication requires the fixed rollout engine fleet {0, 1}")
+        self._engines = dict(engines)
+        self._timeout = timeout_seconds
+
+    def fire(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Non-blocking fan-out: engine id -> pending remote call."""
+
+        return {
+            f"engine{rank}": engine.make_request_ex.remote(endpoint, payload, timeout=self._timeout)
+            for rank, engine in self._engines.items()
+        }
+
+    def collect(self, pending: Dict[str, Any]) -> Dict[str, EngineReply]:
+        replies: Dict[str, EngineReply] = {}
+        for engine_id, future in pending.items():
+            try:
+                result = ray.get(future)
+            except Exception as exc:  # noqa: BLE001 - unreachable engine: state unknown
+                replies[engine_id] = EngineReply(False, f"{type(exc).__name__}: {exc}", ambiguous=True)
+                continue
+            replies[engine_id] = classify_engine_response(
+                result.get("status", 0),
+                result.get("body"),
+            )
+        return replies
 
 
 @ray.remote
@@ -1331,6 +1509,31 @@ class RolloutEngine:
         response = requests.get(f"{self.base_url}/health_generate", timeout=timeout)
         response.raise_for_status()
         return True
+
+    def make_request_ex(
+        self,
+        endpoint: str,
+        payload: Optional[Dict] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """POST like :meth:`make_request`, but report the HTTP status instead
+        of raising.
+
+        The staged LoRA publisher must separate a clean engine refusal (4xx:
+        the engine is alive and its control layer answered, so what it holds is
+        knowable) from an unreachable engine (transport error / 5xx: state
+        unknown, fail the run closed). Raising would erase that distinction: a
+        ``requests`` exception does not keep its response object across the Ray
+        hop.
+        """
+
+        endpoint = endpoint.lstrip("/")
+        response = requests.post(f"{self.base_url}/{endpoint}", json=payload or {}, timeout=timeout)
+        try:
+            body: Any = response.json()
+        except ValueError:
+            body = {"success": False, "error_message": response.text[:512]}
+        return {"status": response.status_code, "body": body}
 
     def make_request(self, endpoint: str, payload: Optional[Dict] = None) -> Any:
         """Send a synchronous HTTP POST to the rollout node and return JSON.

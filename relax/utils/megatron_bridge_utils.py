@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import contextvars
 import dataclasses
 from contextlib import contextmanager
@@ -100,8 +102,9 @@ def _splice_task_weight(task, backup):
 
 
 def _make_adapter_splice_wrapper(orig_fn):
-    def wrapped(self, megatron_model):
-        tasks_by_base = orig_fn(self, megatron_model)
+    # Preserve Bridge export options such as exclude_adapter_base_prefixes.
+    def wrapped(self, megatron_model, **kwargs):
+        tasks_by_base = orig_fn(self, megatron_model, **kwargs)
 
         backup = _adapter_splice_weights.get()
         if backup is None:

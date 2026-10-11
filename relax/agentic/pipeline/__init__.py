@@ -36,6 +36,7 @@ class SessionGroupProgress:
     takeable_session_ids: Tuple[str, ...]
     interrupted: bool
     protected: bool
+    error: str | None = None
 
 
 @dataclass(frozen=True)

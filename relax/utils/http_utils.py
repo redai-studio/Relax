@@ -314,7 +314,12 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
+async def post(url, payload, max_retries=MAX_RETRIES, headers=None, *, fallback_to_local: bool = True):
+    """POST via the configured transport.
+
+    Disable ``fallback_to_local`` when an uncertain distributed result must not
+    trigger a second send. This is independent of HTTP ``max_retries``.
+    """
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -329,6 +334,8 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
                 obj_ref = actor.do_post.remote(url, payload, max_retries, headers=headers)
                 return await obj_ref
         except Exception as e:
+            if not fallback_to_local:
+                raise
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
