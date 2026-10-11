@@ -33,6 +33,18 @@ Rollout 运行后台循环：
 3. Actor 推送新权重
 4. Actor 调用 `/end_update_weight` 恢复 rollout
 
+### 扩缩状态清理契约
+
+`ScaleOutStatusResponse` 与 `ScaleInStatusResponse` 均携带 `cleanup_required: bool` 字段，遵循与 Autoscaler 共享的三态清理契约：
+
+| 取值 | 含义 |
+|-------|---------|
+| `true` | 物理清理（引擎拆除 / placement group 释放）仍未完成；携带该标志的终态请求必须通过 reconcile 等待清理完成。 |
+| `false` | 权威清理已完成——所报状态背后不存在遗留的物理工作。 |
+| 缺失（旧 schema） | 未知；调用方不得将缺失视为已清理。共享 Autoscaler 将缺失字段视为 unknown，并在观察到显式 `false` 前保持终态请求 pending。 |
+
+Rollout 扩容/缩容的终态在报告前自行完成清理：扩容引擎要么继续服务（`ACTIVE`/`PARTIAL`），要么已回滚（`FAILED`/`CANCELLED`）；缩容 `COMPLETED` 表示引擎已移除、`FAILED` 表示移除已回滚——因此 rollout 终态响应报告 `cleanup_required: false`。显式声明该字段（而非省略）正是为了满足 Autoscaler 的「缺失 ≠ 已清理」契约。
+
 ## HTTP 端点
 
 <SwaggerUI specUrl="/Relax/openapi/rollout.json" />

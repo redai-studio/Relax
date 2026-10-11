@@ -33,6 +33,18 @@ In fully-async mode, the Rollout service coordinates with the Actor for weight u
 3. Actor pushes new weights
 4. Actor calls `/end_update_weight` to resume rollout
 
+### Scale Status Cleanup Contract
+
+Both `ScaleOutStatusResponse` and `ScaleInStatusResponse` carry a `cleanup_required: bool` field that follows the three-state cleanup contract shared with the Autoscaler:
+
+| Value | Meaning |
+|-------|---------|
+| `true` | Physical cleanup (engine teardown / placement-group release) is still pending; a terminal request with this flag must be reconciled until cleanup completes. |
+| `false` | Authoritative cleanup complete — no deferred physical work remains behind the reported status. |
+| absent (legacy schema) | Unknown; callers must not treat absence as clean. The shared Autoscaler treats a missing flag as unknown and keeps a terminal request pending until an explicit `false` is observed. |
+
+Rollout scale-out and scale-in terminal states own their cleanup before reporting: scale-out engines either serve (`ACTIVE`/`PARTIAL`) or were rolled back (`FAILED`/`CANCELLED`), and scale-in `COMPLETED` reports the engines removed while `FAILED` reports the removal rolled back — so terminal rollout responses report `cleanup_required: false`. The field is declared explicitly (rather than omitted) precisely because the Autoscaler's contract is "missing ≠ clean".
+
 ## HTTP Endpoints
 
 <SwaggerUI specUrl="/Relax/openapi/rollout.json" />

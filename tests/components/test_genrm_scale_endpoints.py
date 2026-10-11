@@ -1,0 +1,718 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+"""Unit tests for the GenRM Serve scale endpoints (Task 4).
+
+The endpoints are thin wrappers over ``GenRMScaleRegistry``; these tests
+drive the real (deployment-unwrapped) ``GenRM`` class methods without Ray:
+managers are ``SimpleNamespace`` fakes, engine discovery is injected per
+instance, and the module is imported through ``_dep_stubs`` which prefers
+real dependencies and only stubs the missing ones (fastapi/pydantic/ray and
+the placement-group/tokenizer bridge modules).
+
+Run: python -m unittest tests.components.test_genrm_scale_endpoints -v
+"""
+
+import asyncio
+import unittest
+from types import SimpleNamespace
+
+import ray
+
+from tests.utils._dep_stubs import import_genrm_component
+
+
+genrm_module = import_genrm_component()
+
+# The /metrics capacity query goes through ray.get with plain dicts from the
+# SimpleNamespace manager fakes; a real ray.get would spin up a local Ray
+# instance to reject them. Pass ray.get through for this module (same
+# direct-attribute pattern as test_genrm_scale_watcher.py).
+_orig_ray_get = ray.get
+
+
+def _passthrough_ray_get(ref, timeout=None, **kwargs):
+    return ref
+
+
+def setUpModule():
+    ray.get = _passthrough_ray_get
+
+
+def tearDownModule():
+    ray.get = _orig_ray_get
+
+
+# Deployment-unwrapped class (the @serve.deployment wrapper stores it).
+_GenRM = genrm_module.GenRM.func_or_class
+_GenRMScaleRequest = genrm_module.GenRMScaleRequest
+_GenRMScaleRegistry = genrm_module.GenRMScaleRegistry
+_HTTPException = genrm_module.HTTPException
+
+_ENGINES = [("192.0.2.1", 16001)]
+
+
+def _fake_manager(hooks: dict = None):
+    """A manager fake: only ``get_engine_hosts_ports`` and optional scale
+    hooks."""
+    manager = SimpleNamespace(
+        get_engine_hosts_ports=SimpleNamespace(remote=lambda: _ENGINES),
+    )
+    for name, remote in (hooks or {}).items():
+        setattr(manager, name, SimpleNamespace(remote=remote))
+    return manager
+
+
+def _replica(manager=None, engines=_ENGINES):
+    replica = object.__new__(_GenRM)
+    replica.genrm_managers = {"__default__": manager or _fake_manager()}
+    replica._scale_registry = _GenRMScaleRegistry()
+    replica._scale_registry.register_initial("__default__", 1)
+    replica._logger_instance = None  # Base.__init__ normally sets this
+    replica._engine_inflight = {}
+    replica._engine_served = {}
+    replica._engine_caches = {"__default__": genrm_module._EngineCacheState()}
+    if engines is not None:
+        replica._genrm_engine_list = lambda key: list(engines)
+    return replica
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestScaleOutEndpoint(unittest.TestCase):
+    def test_pending_with_manager_hook_detail_when_manager_lacks_hooks(self):
+        """Admitted operation stays PENDING and the response carries
+        detail='manager_scale_not_implemented' (GenRMManager has no scale
+        hooks)."""
+        replica = _replica()
+        response = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2)))
+        self.assertEqual(response.status, "PENDING")
+        self.assertIsNotNone(response.request_id)
+        self.assertEqual(response.current, 1)
+        self.assertEqual(response.detail, "manager_scale_not_implemented")
+        status = replica._scale_registry.get_status("scale_out", response.request_id)
+        self.assertEqual(status["status"], "PENDING")
+        self.assertEqual(status["detail"], "manager_scale_not_implemented")
+
+    def test_pending_without_detail_when_manager_hook_exists(self):
+        calls = []
+        replica = _replica(manager=_fake_manager({"execute_genrm_scale_out": lambda rid: calls.append(rid)}))
+        response = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2)))
+        self.assertEqual(response.status, "PENDING")
+        self.assertIsNone(response.detail)
+        self.assertEqual(calls, [response.request_id])  # fire-and-forget hook invoked
+
+    def test_noop_when_target_already_satisfied(self):
+        replica = _replica(engines=[("192.0.2.1", 16001), ("192.0.2.2", 16002)])
+        response = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2)))
+        self.assertEqual(response.status, "NOOP")
+        self.assertIsNone(response.request_id)  # NOOP carries no request_id (contract)
+        self.assertEqual(response.current, 2)
+
+    def test_idempotent_replay_returns_original_operation(self):
+        replica = _replica()
+        first = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2, idempotency_key="k")))
+        replay = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2, idempotency_key="k")))
+        self.assertEqual(replay.request_id, first.request_id)
+        self.assertEqual(replay.status, "PENDING")
+
+    def test_conflicting_fingerprint_is_409(self):
+        replica = _replica()
+        _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2, idempotency_key="k")))
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.scale_out(_GenRMScaleRequest(num_replicas=3, idempotency_key="k")))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_second_in_flight_request_is_409(self):
+        replica = _replica()
+        _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2)))
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.scale_out(_GenRMScaleRequest(num_replicas=3)))
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_target_below_initial_is_400(self):
+        replica = _replica()
+        replica._scale_registry.register_initial("__default__", 2)
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.scale_in(_GenRMScaleRequest(num_replicas=1)))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_unknown_model_is_400(self):
+        replica = _replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.scale_out(_GenRMScaleRequest(model_name="nope", num_replicas=2)))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+
+class TestScaleInEndpoint(unittest.TestCase):
+    def test_pending_then_state_machine_completes(self):
+        replica = _replica(engines=[("192.0.2.1", 16001), ("192.0.2.2", 16002)])
+        response = _run(replica.scale_in(_GenRMScaleRequest(num_replicas=1)))
+        self.assertEqual(response.status, "PENDING")
+        self.assertEqual(response.detail, "manager_scale_not_implemented")
+        request_id = response.request_id
+        for status in ("DRAINING", "REMOVING"):
+            replica._scale_registry.advance(request_id, status)
+        result = replica._scale_registry.finish(request_id, status="COMPLETED", current=1, ready=1, removed=1)
+        self.assertEqual(result["status"], "COMPLETED")
+
+    def test_noop_when_target_at_current(self):
+        replica = _replica(engines=[("192.0.2.1", 16001)])
+        response = _run(replica.scale_in(_GenRMScaleRequest(num_replicas=1)))
+        self.assertEqual(response.status, "NOOP")
+
+
+class TestStatusEndpoints(unittest.TestCase):
+    def test_unknown_request_id_is_404(self):
+        replica = _replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.get_scale_out_status("no-such-id"))
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_status_reports_operation_fields(self):
+        replica = _replica()
+        created = _run(replica.scale_out(_GenRMScaleRequest(num_replicas=2, timeout_secs=90.0)))
+        result = _run(replica.get_scale_out_status(created.request_id))
+        self.assertEqual(result.request_id, created.request_id)
+        self.assertEqual(result.status, "PENDING")
+        self.assertEqual(result.target, 2)
+        self.assertEqual(result.timeout_secs, 90.0)
+        self.assertEqual(result.model_name, "__default__")
+
+
+class TestEnginesEndpoint(unittest.TestCase):
+    def test_single_instance_flat_shape(self):
+        replica = _replica(engines=[("192.0.2.1", 16001), ("192.0.2.2", 16002)])
+        result = _run(replica.get_engines())
+        self.assertEqual(result["service"], "genrm")
+        self.assertEqual(result["current"], 2)
+        self.assertEqual(result["ready"], 2)
+        self.assertEqual(
+            result["engines"],
+            [
+                {"host": "192.0.2.1", "port": 16001, "inflight": 0, "served": 0},
+                {"host": "192.0.2.2", "port": 16002, "inflight": 0, "served": 0},
+            ],
+        )
+
+    def test_multi_instance_nested_shape(self):
+        replica = object.__new__(_GenRM)
+        replica.genrm_managers = {
+            "quality": _fake_manager(),
+            "safety": _fake_manager(),
+        }
+        replica._logger_instance = None
+        replica._engine_inflight = {}
+        replica._engine_served = {}
+        replica._genrm_engine_list = lambda key: [("192.0.2.1", 16001)] if key == "quality" else []
+        result = _run(replica.get_engines())
+        self.assertEqual(result["service"], "genrm")
+        self.assertEqual(result["instances"]["quality"]["current"], 1)
+        self.assertEqual(result["instances"]["safety"]["current"], 0)
+
+    def test_scale_routes_by_model_name(self):
+        """Multi-instance: model_name selects the instance and its registry slot."""
+        replica = object.__new__(_GenRM)
+        replica.genrm_managers = {"quality": _fake_manager(), "safety": _fake_manager()}
+        replica._scale_registry = _GenRMScaleRegistry()
+        replica._scale_registry.register_initial("quality", 1)
+        replica._scale_registry.register_initial("safety", 1)
+        replica._logger_instance = None
+        replica._genrm_engine_list = lambda key: [("192.0.2.1", 16001)]
+
+        response = _run(replica.scale_out(_GenRMScaleRequest(model_name="quality", num_replicas=2)))
+        self.assertEqual(response.status, "PENDING")
+        status = replica._scale_registry.get_status("scale_out", response.request_id)
+        self.assertEqual(status["model_name"], "quality")
+
+
+class TestMetricsDynamicCapacity(unittest.TestCase):
+    """/metrics must report the manager's live capacity, not the startup
+    spec: after an elastic scale-out the engine count changes at runtime."""
+
+    _SPEC = {"model_path": "/model", "num_gpus": 1, "num_gpus_per_engine": 1}
+
+    def _replica_with_spec(self, manager):
+        replica = _replica(manager=manager)
+        replica.instance_specs = {"__default__": dict(self._SPEC)}
+        return replica
+
+    def test_metrics_reflects_manager_capacity(self):
+        capacity = {"current": 2, "ready": 2, "occupied": 2, "pending_cleanup": 1}
+        manager = _fake_manager({"get_engine_capacity": lambda: capacity})
+        out = _run(self._replica_with_spec(manager).metrics())
+        self.assertEqual(out["num_engines"], 2)  # live current, not startup spec (1)
+        self.assertEqual(out["ready_engines"], 2)
+        self.assertEqual(out["occupied"], 2)
+        self.assertEqual(out["pending_cleanup"], 1)
+        self.assertNotIn("capacity_error", out)
+
+    def test_metrics_falls_back_to_startup_count_on_query_failure(self):
+        def boom():
+            raise RuntimeError("manager unreachable")
+
+        manager = _fake_manager({"get_engine_capacity": boom})
+        out = _run(self._replica_with_spec(manager).metrics())
+        self.assertEqual(out["num_engines"], 1)  # startup spec fallback
+        self.assertIn("capacity_error", out)
+        # No fabricated live numbers alongside the fallback.
+        self.assertNotIn("ready_engines", out)
+        self.assertNotIn("pending_cleanup", out)
+
+    def test_metrics_without_capacity_hook_keeps_startup_count(self):
+        replica = self._replica_with_spec(_fake_manager())  # no get_engine_capacity hook
+        out = _run(replica.metrics())
+        self.assertEqual(out["num_engines"], 1)
+        self.assertNotIn("capacity_error", out)
+
+
+class TestGenerateEngineAttribution(unittest.TestCase):
+    """/generate must attribute each reply to the engine that served it and
+    surface finish metadata — the basis for per-engine reward-consistency
+    evidence and truncation checks."""
+
+    def test_call_engine_stashes_final_engine(self):
+        replica = _replica()
+
+        async def fake_tracked(route_key, key, host, port, inflight_holder, messages, sampling_params=None):
+            return {"text": " Judgement: 1", "meta_info": {"finish_reason": {"type": "stop"}, "completion_tokens": 4}}
+
+        replica._call_engine_tracked = fake_tracked
+        out = _run(replica._call_engine(None, [{"role": "user", "content": "q"}]))
+        self.assertEqual(out["engine_host"], _ENGINES[0][0])
+        self.assertEqual(out["engine_port"], _ENGINES[0][1])
+        self.assertEqual(out["text"], " Judgement: 1")
+
+    def test_generate_response_exposes_engine_and_finish_metadata(self):
+        replica = _replica()
+
+        async def fake_call(route_key, messages, sampling_params=None):
+            return {
+                "text": " Judgement: 1 ",
+                "engine_host": "192.0.2.9",
+                "engine_port": 16007,
+                "meta_info": {"finish_reason": {"type": "length"}, "completion_tokens": 8},
+            }
+
+        replica._call_engine = fake_call
+        request = genrm_module.GenerateRequest(messages=[{"role": "user", "content": "q"}])
+        response = _run(replica.generate(request))
+        self.assertEqual(response.response, "Judgement: 1")
+        self.assertEqual(response.engine_host, "192.0.2.9")
+        self.assertEqual(response.engine_port, 16007)
+        self.assertEqual(response.finish_reason, "length")  # truncation is observable
+        self.assertEqual(response.completion_tokens, 8)
+
+    def test_generate_response_fields_default_to_none(self):
+        response = genrm_module.GenerateResponse(response="Judgement: 0")
+        self.assertIsNone(response.engine_host)
+        self.assertIsNone(response.engine_port)
+        self.assertIsNone(response.finish_reason)
+        self.assertIsNone(response.completion_tokens)
+
+
+class TestReconcileDrainFence(unittest.TestCase):
+    """Review finding: a failed progress query must not fall through to
+    reconcile.
+
+    The manager retires its recorded victim on the caller's drain proof alone,
+    so an unidentified victim (progress {} or victim None) is not a proof and
+    reconcile must fail closed instead.
+    """
+
+    def _dirty_scale_in(self, replica, manager):
+        """Register a terminal-dirty scale-in the reconcile path targets."""
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        replica._scale_registry.set_detail(request_id, "drain timed out")
+        # Force the dirty terminal state reconcile requires.
+        replica._scale_registry.finish(
+            request_id,
+            status="FAILED",
+            current=2,
+            ready=2,
+            failed=1,
+            cleanup_required=True,
+            error_message="drain timed out",
+        )
+        return request_id
+
+    def test_progress_query_failure_fails_closed(self):
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            raise TimeoutError("manager unreachable")
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        # The manager's reconcile must never run without a drain proof.
+        self.assertEqual(calls, [])
+
+    def test_unknown_victim_fails_closed(self):
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            # Reachable but the snapshot carries no victim identity.
+            return {"phase": "FAILED", "physical_done": True, "victim": None, "victim_rank": None}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(calls, [])
+
+    def test_identified_drained_victim_still_reconciles(self):
+        """Positive control: with a known victim at zero in-flight the
+        reconcile proceeds (regression guard for the fail-closed change)."""
+        victim = ("192.0.2.1", 16001)
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "FAILED", "physical_done": True, "victim": list(victim), "victim_rank": 1}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False, "victim_cleared": True}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+        # Victim has zero in-flight (no key recorded -> not counted).
+        replica._engine_inflight = {}
+
+        response = _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(calls, [request_id])
+        self.assertFalse(response.cleanup_required)
+
+    def test_completed_lifecycle_without_victim_reconciles(self):
+        """Review finding (re-review): a scale-in that physically completed
+        underneath a watcher which lost its progress RPCs until deadline leaves
+        the registry dirty (FAILED + cleanup_required) with the manager
+        reporting COMPLETED / physical_done / no victim.
+
+        The reconcile must accept that positive completion proof and release
+        the mutex instead of refusing forever.
+        """
+        calls = []
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "COMPLETED", "physical_done": True, "victim": None, "victim_rank": None}
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False, "victim_cleared": True}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        response = _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(calls, [request_id])
+        self.assertFalse(response.cleanup_required)
+        # The model mutex actually released.
+        self.assertFalse(replica._scale_registry.get_status("scale_in", request_id)["cleanup_required"])
+
+    def test_completed_without_physical_done_still_fails_closed(self):
+        """COMPLETED alone is not enough: the physical lifecycle fence must
+        also be confirmed before a victim-less snapshot may release."""
+
+        def _progress_remote(request_id, timeout=None):
+            return {"phase": "COMPLETED", "physical_done": False, "victim": None, "victim_rank": None}
+
+        calls = []
+
+        def _reconcile_remote(request_id):
+            calls.append(request_id)
+            return {"known": True, "in_progress": False, "cleanup_required": False}
+
+        manager = _fake_manager(
+            {
+                "get_scale_progress": _progress_remote,
+                "reconcile_scale_op": _reconcile_remote,
+            }
+        )
+        replica = _replica(manager)
+        request_id = self._dirty_scale_in(replica, manager)
+
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica.reconcile_scale_in(request_id))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(calls, [])
+        self.assertTrue(replica._scale_registry.get_status("scale_in", request_id)["cleanup_required"])
+
+
+class TestScaleSubmitCapacityContract(unittest.TestCase):
+    """Review findings: strict integer validation on the mutating request, and
+    fail-closed capacity on the scale path (never let a degraded snapshot
+    impersonate authoritative capacity)."""
+
+    def test_num_replicas_rejects_coercible_non_integers(self):
+        from pydantic import ValidationError
+
+        for bad in (True, "2", 2.0, 2.5):
+            with self.assertRaises(ValidationError):
+                _GenRMScaleRequest(num_replicas=bad)
+        # Plain ints still validate (gt=0).
+        self.assertEqual(_GenRMScaleRequest(num_replicas=3).num_replicas, 3)
+
+    def test_scale_submit_fails_closed_on_capacity_query_failure(self):
+        submits = []
+
+        def _capacity_remote():
+            raise TimeoutError("manager capacity query timed out")
+
+        def _hook_remote(request_id):
+            submits.append(request_id)
+            return None
+
+        manager = _fake_manager(
+            {
+                "get_engine_capacity": _capacity_remote,
+                "begin_scale_op": _hook_remote,
+                "execute_genrm_scale_out": _hook_remote,
+            }
+        )
+        replica = _replica(manager)
+        request = _GenRMScaleRequest(num_replicas=2)
+        with self.assertRaises(_HTTPException) as ctx:
+            _run(replica._genrm_scale("scale_out", request))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(submits, [])
+
+    def test_readonly_engines_still_degrades_when_capacity_fails(self):
+        def _capacity_remote():
+            raise TimeoutError("manager capacity query timed out")
+
+        manager = _fake_manager({"get_engine_capacity": _capacity_remote})
+        replica = _replica(manager)
+        # Read-only /engines keeps its degraded snapshot, not an error.
+        engines = _run(replica.get_engines())
+        self.assertEqual(engines["current"], 1)
+        self.assertEqual(engines["ready"], 1)
+
+
+class TestWatcherCrashCapacity(unittest.TestCase):
+    """Review finding: a watcher crash must not zero-fill capacity -- the
+    registry keeps the last known snapshot instead of inventing zeros."""
+
+    def test_crash_finish_keeps_last_known_capacity(self):
+        manager = _fake_manager()
+        replica = _replica(manager)
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        # Watcher crashes with an empty progress payload.
+        replica._finish_scale_from_progress("scale_in", request_id, "FAILED", {})
+        status = replica._scale_registry.get_status("scale_in", request_id)
+        self.assertEqual(status["status"], "FAILED")
+        self.assertEqual(status["current"], 2)
+        self.assertEqual(status["ready"], 2)
+        self.assertTrue(status["cleanup_required"])
+
+    def test_crash_after_polls_merges_freshest_observed_capacity(self):
+        """A watcher that crashes mid-flight carries the freshest observed
+        progress counts into its FAILED finish instead of dropping back to the
+        submit-time observation (review finding: missing != 0, and the freshest
+        reading beats the oldest one)."""
+
+        class _FlakyProgressManager:
+            def __init__(self):
+                self.calls = 0
+
+            def get_scale_progress(self, _request_id):
+                self.calls += 1
+                if self.calls >= 3:
+                    raise RuntimeError("progress poll exploded")
+                return {"phase": "REMOVING", "current": 1, "ready": 1, "removed": 1, "physical_done": False}
+
+        flaky = _FlakyProgressManager()
+        manager = _fake_manager()
+        manager.get_scale_progress = SimpleNamespace(remote=flaky.get_scale_progress)
+        replica = _replica(manager)
+        decision = replica._scale_registry.submit(
+            "scale_in", model_name="__default__", target=1, timeout_secs=60.0, current=2, ready=2
+        )
+        request_id = decision["request_id"]
+        with self.assertLogs("relax.components.genrm", level="ERROR"):
+            _run(replica._watch_scale_operation("scale_in", "__default__", request_id))
+        status = replica._scale_registry.get_status("scale_in", request_id)
+        self.assertEqual(status["status"], "FAILED")
+        # Freshest observed counts (current=1 from the last good poll), not
+        # the submit-time observation (2) and not zeros.
+        self.assertEqual(status["current"], 1)
+        self.assertEqual(status["ready"], 1)
+        self.assertEqual(status["removed"], 1)
+        self.assertTrue(status["cleanup_required"])
+        self.assertIn("watcher crashed", status["error_message"])
+
+
+class TestRequestSamplingSeed(unittest.TestCase):
+    """Product semantics: a stochastic scoring request draws its random stream
+    from a seed derived from (judge model, model-facing input, effective
+    sampling) -- identical requests produce identical verdicts on every
+    replica, independent of each engine's RNG-consumption history (adversarial
+    finding: server-level seeding alone flipped 2/50 verdicts across replicas
+    after diverged request histories)."""
+
+    SPEC = {
+        "model_path": "/models/qwen3-0.6b",
+        "sampling_config": {"temperature": 0.1, "top_p": 1.0, "top_k": -1, "max_response_len": 64},
+    }
+
+    def _replica(self):
+        replica = _replica()
+        replica.instance_specs = {"__default__": dict(self.SPEC)}
+        return replica
+
+    def test_stochastic_request_gets_a_stable_seed(self):
+        replica = self._replica()
+        first = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        second = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        self.assertIn("sampling_seed", first)
+        self.assertEqual(first["sampling_seed"], second["sampling_seed"])
+        self.assertIsInstance(first["sampling_seed"], int)
+        self.assertGreaterEqual(first["sampling_seed"], 0)
+        self.assertLessEqual(first["sampling_seed"], 2**31 - 1)  # int32-safe for SGLang
+
+    def test_seed_depends_on_input_and_sampling_and_model(self):
+        replica = self._replica()
+        base = replica._derive_sampling_seed("/m", [1, 2], {"temperature": 0.1})
+        self.assertNotEqual(base, replica._derive_sampling_seed("/m", [1, 3], {"temperature": 0.1}))
+        self.assertNotEqual(base, replica._derive_sampling_seed("/m", [1, 2], {"temperature": 0.2}))
+        self.assertNotEqual(base, replica._derive_sampling_seed("/other", [1, 2], {"temperature": 0.1}))
+
+    def test_greedy_request_gets_no_seed(self):
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"temperature": 0.0}, [1, 2, 3])
+        self.assertNotIn("sampling_seed", effective)
+        self.assertEqual(effective["temperature"], 0.0)
+
+    def test_explicit_caller_seed_is_respected(self):
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"sampling_seed": 12345}, [1, 2, 3])
+        self.assertEqual(effective["sampling_seed"], 12345)
+
+    def test_override_changes_the_seed_not_just_the_params(self):
+        """The seed is derived from the *effective* params, so an override that
+        changes sampling draws a different stream."""
+        replica = self._replica()
+        default = replica._effective_sampling(self.SPEC, None, [1, 2, 3])
+        overridden = replica._effective_sampling(self.SPEC, {"temperature": 0.7}, [1, 2, 3])
+        self.assertNotEqual(default["sampling_seed"], overridden["sampling_seed"])
+
+    def test_stochastic_min_p_is_rejected(self):
+        """Re-review finding: SGLang's deterministic sampling path (mandatory
+        for replica-invariant verdicts) does not implement min-p on the pinned
+        engine version; a stochastic request carrying min_p must fail closed at
+        the contract boundary instead of crashing the sampler."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"min_p": 0.1}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_greedy_min_p_is_allowed(self):
+        """Greedy requests never derive a seed (argmax path; min_p unused)."""
+        replica = self._replica()
+        effective = replica._effective_sampling(self.SPEC, {"temperature": 0.0, "min_p": 0.1}, [1, 2, 3])
+        self.assertNotIn("sampling_seed", effective)
+
+    def test_null_temperature_with_min_p_is_rejected(self):
+        """Re-review finding: ``{"temperature": null, "min_p": 0.1}`` slipped
+        through ``float(value or 0.0)`` as greedy, but the pinned SGLang
+        normalizes null temperature to 1.0 (stochastic) -- the request would
+        reach the engine and hit the unsupported seeded min-p path."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"temperature": None, "min_p": 0.1}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_null_temperature_alone_is_rejected(self):
+        """Null temperature delegates to the model default (stochastic,
+        unseeded) -- not bindable to the replica-invariant contract."""
+        replica = self._replica()
+        with self.assertRaises(_HTTPException) as ctx:
+            replica._effective_sampling(self.SPEC, {"temperature": None}, [1, 2, 3])
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_null_temperature_never_reaches_the_engine(self):
+        """The 422 fires before any engine HTTP call (bot-requested boundary
+        assertion)."""
+        replica = _replica()
+        replica.instance_specs = {"__default__": dict(self.SPEC)}
+        replica.tokenizers = {"__default__": SimpleNamespace(apply_chat_template=lambda *a, **k: [1, 2, 3])}
+        posts = []
+        replica._http_client = SimpleNamespace(post=lambda url, json=None: posts.append(url))
+        with self.assertRaises(_HTTPException):
+            _run(
+                replica._call_engine_tracked(
+                    None,
+                    "__default__",
+                    "192.0.2.1",
+                    16001,
+                    [("__default__", "192.0.2.1", 16001)],
+                    [{}],
+                    {"temperature": None, "min_p": 0.1},
+                )
+            )
+        self.assertEqual(posts, [])
+
+    def test_seed_semantics_is_content_deterministic(self):
+        """Product semantics, stated explicitly: the derived seed is a pure
+        function of (judge model, model-facing input, effective sampling).
+
+        Two independent stochastic requests with identical content draw the
+        same random stream on any replica -- content-deterministic stochastic
+        scoring, not merely replica-invariant retry.
+        """
+        replica = self._replica()
+        first = replica._effective_sampling(self.SPEC, None, [9, 9, 9])
+        second = replica._effective_sampling(self.SPEC, None, [9, 9, 9])
+        self.assertEqual(first["sampling_seed"], second["sampling_seed"])
+        # Different content draws a different stream (the function is not
+        # constant).
+        third = replica._effective_sampling(self.SPEC, None, [9, 9, 8])
+        self.assertNotEqual(first["sampling_seed"], third["sampling_seed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

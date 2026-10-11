@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "GenRM Service",
-    "description": "Generative Reward Model (GenRM) service for LLM-based response evaluation.\n\nUses SGLang engines to perform preference evaluation by comparing model responses against ground truth or quality standards.  The service accepts OpenAI-style chat messages and returns raw model judgements.\n\nGenRM is a passive HTTP service — unlike Actor or Rollout it does not run a background loop.  It only responds to incoming ``/generate`` requests.",
+    "description": "Generative Reward Model (GenRM) service for LLM-based response evaluation.\n\nUses SGLang engines to perform preference evaluation by comparing model responses against ground truth or quality standards.  The service accepts OpenAI-style chat messages and returns raw model judgements.\n\nGenRM has no autonomous training loop. It serves generation and lifecycle requests over HTTP and monitors accepted scaling operations asynchronously.",
     "version": "1.0.0"
   },
   "paths": {
@@ -69,7 +69,7 @@
     "/metrics": {
       "get": {
         "summary": "Metrics",
-        "description": "Metrics endpoint; reports per-instance stats.",
+        "description": "Metrics endpoint; reports per-instance stats with live capacity.\n\n``num_engines`` follows the manager's actual capacity (elastic scaling\nchanges it after startup); ``ready_engines``/``occupied``/\n``pending_cleanup`` use the same accounting as ``/engines``. When the\ncapacity query fails, the startup count is kept and ``capacity_error``\nis surfaced instead of fabricating numbers.",
         "operationId": "metrics_metrics_get",
         "responses": {
           "200": {
@@ -86,10 +86,547 @@
           }
         }
       }
+    },
+    "/scale_out": {
+      "post": {
+        "summary": "Scale Out",
+        "description": "Scale one GenRM instance to an absolute target engine count.",
+        "operationId": "scale_out_scale_out_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenRMScaleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scale_in": {
+      "post": {
+        "summary": "Scale In",
+        "description": "Scale one GenRM instance down to an absolute target engine count.",
+        "operationId": "scale_in_scale_in_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenRMScaleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/engines": {
+      "get": {
+        "summary": "Get Engines",
+        "description": "Discover engines per instance (``current`` = capacity, ``ready`` = routable).\n\nPer-engine ``inflight``/``served`` counters make routing visible to\nscale-operation evidence: after a scale-out both engines' ``served``\ncounts grow, after a scale-in the victim disappears from the list.",
+        "operationId": "get_engines_engines_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Engines Engines Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scale_out/{request_id}": {
+      "get": {
+        "summary": "Get Scale Out Status",
+        "operationId": "get_scale_out_status_scale_out__request_id__get",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scale_in/{request_id}": {
+      "get": {
+        "summary": "Get Scale In Status",
+        "operationId": "get_scale_in_status_scale_in__request_id__get",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scale_out/{request_id}/reconcile": {
+      "post": {
+        "summary": "Reconcile Scale Out",
+        "description": "Retry unfinished cleanup of a scale-out (no re-scaling).",
+        "operationId": "reconcile_scale_out_scale_out__request_id__reconcile_post",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleReconcileResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scale_in/{request_id}/reconcile": {
+      "post": {
+        "summary": "Reconcile Scale In",
+        "description": "Retry unfinished cleanup of a scale-in (fixed victim, no re-\nselection).",
+        "operationId": "reconcile_scale_in_scale_in__request_id__reconcile_post",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenRMScaleReconcileResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "GenRMScaleReconcileResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "direction": {
+            "type": "string",
+            "title": "Direction"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "cleanup_required": {
+            "type": "boolean",
+            "title": "Cleanup Required"
+          },
+          "victim_cleared": {
+            "type": "boolean",
+            "title": "Victim Cleared",
+            "default": false
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "direction",
+          "status",
+          "cleanup_required"
+        ],
+        "title": "GenRMScaleReconcileResponse",
+        "description": "Response model for GenRM scale-operation reconcile.\n\nReconcile continues the *original* operation (no new request ID, no victim\nre-selection, no re-scaling); it only retries unfinished resource cleanup.\n``cleanup_required`` therefore reports whether the model is still blocked\nfrom new scale operations after the attempt."
+      },
+      "GenRMScaleRequest": {
+        "properties": {
+          "model_name": {
+            "type": "string",
+            "title": "Model Name",
+            "description": "GenRM instance (route key) to scale",
+            "default": "default"
+          },
+          "num_replicas": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Num Replicas",
+            "description": "Target absolute total engine count (strict int: JSON true/\"2\"/2.0 are rejected 422, not coerced)"
+          },
+          "timeout_secs": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Secs",
+            "description": "Total timeout for the operation"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key",
+            "description": "Idempotency key for safe retries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "num_replicas"
+        ],
+        "title": "GenRMScaleRequest",
+        "description": "Request model for GenRM scale-out / scale-in.\n\n``num_replicas`` is the target *absolute* total engine count (not a delta).\nIdempotency is keyed on the request-body fingerprint (model_name,\nnum_replicas, timeout_secs): same key + same fingerprint returns the\noriginal operation; a keyed NOOP decision is replayed verbatim; a different\nfingerprint is rejected with 409."
+      },
+      "GenRMScaleResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "current": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current"
+          },
+          "ready": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ready"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "GenRMScaleResponse",
+        "description": "Response model for GenRM scale operations.\n\nNOOP responses intentionally carry no ``request_id`` (the decision is\nreplayed verbatim for keyed retries, per the Task 4 contract)."
+      },
+      "GenRMScaleStatusResponse": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "direction": {
+            "type": "string",
+            "title": "Direction"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "model_name": {
+            "type": "string",
+            "title": "Model Name"
+          },
+          "target": {
+            "type": "integer",
+            "title": "Target"
+          },
+          "timeout_secs": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout Secs"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "created_at": {
+            "type": "number",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "number",
+            "title": "Updated At"
+          },
+          "current": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current"
+          },
+          "ready": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ready"
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created",
+            "default": 0
+          },
+          "removed": {
+            "type": "integer",
+            "title": "Removed",
+            "default": 0
+          },
+          "failed": {
+            "type": "integer",
+            "title": "Failed",
+            "default": 0
+          },
+          "cleanup_required": {
+            "type": "boolean",
+            "title": "Cleanup Required",
+            "default": false
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "direction",
+          "status",
+          "model_name",
+          "target",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "GenRMScaleStatusResponse",
+        "description": "Response model for GenRM scale operation status queries."
+      },
       "GenerateRequest": {
         "properties": {
           "messages": {
@@ -144,12 +681,56 @@
           "response": {
             "type": "string",
             "title": "Response"
+          },
+          "engine_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine Host"
+          },
+          "engine_port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine Port"
+          },
+          "finish_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finish Reason"
+          },
+          "completion_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Tokens"
           }
         },
         "type": "object",
         "required": ["response"],
         "title": "GenerateResponse",
-        "description": "Response model for genRM generation.\n\nReturns the raw model response text."
+        "description": "Response model for genRM generation.\n\nReturns the raw model response text plus, when available, which engine\nserved the request and the SGLang finish metadata. This makes per-engine\nreward-consistency experiments and truncation checks possible without\ntouching the training path; clients that only read ``response`` are\nunaffected."
       },
       "HTTPValidationError": {
         "properties": {
