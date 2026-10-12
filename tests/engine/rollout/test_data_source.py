@@ -189,6 +189,14 @@ class TestDataSourceIntegration:
                 if os.path.exists(path):
                     os.unlink(path)
 
+    def test_shallow_copy_drops_generation_export_state(self, data_source_module):
+        from relax.utils.types import Sample
+
+        source = Sample(spec_generations=[{"version": 1, "generation_id": "old"}])
+        copied = data_source_module._shallow_copy_sample(source)
+
+        assert copied.spec_generations is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
