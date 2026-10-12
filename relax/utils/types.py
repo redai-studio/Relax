@@ -32,16 +32,6 @@ SPEC_COUNTER_KEYS = (
 )
 
 
-def spec_token_counts_reported(meta_info: dict[str, Any]) -> bool:
-    """Whether the backend reported speculative decoding counters for this
-    request.
-
-    ``get_spec_token_counts`` returns ``(0, 0)`` both for a missing report and
-    for a genuine zero, so coverage accounting needs this separate signal.
-    """
-    return any(key != "completion_token_num" for key in get_spec_counter_values(meta_info))
-
-
 def normalize_spec_counter_values(counters: dict[str, Any]) -> dict[str, int]:
     """Keep known non-negative integer counters, including explicit zeros."""
     normalized: dict[str, int] = {}

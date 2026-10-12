@@ -248,7 +248,14 @@ def test_spec_info_serialization_round_trips_nodes_and_report_flag():
 
     assert info.nodes == {"req_sess-a_0": _counters(1, 2), "req_sess-a_1": {}}
     assert info.counts_reported is True
-    assert Sample.SpecInfo.from_dict(info.to_dict()).to_dict() == info.to_dict()
+
+    restored = Sample.SpecInfo.from_dict(info.to_dict())
+    assert restored.nodes == info.nodes
+    assert restored.counts_reported is True
+    assert restored.spec_accept_token_num == 5
+    assert restored.spec_draft_token_num == 6
+    assert restored.spec_verify_ct == 7
+    assert restored.completion_token_num == 8
 
 
 def test_spec_info_deserializes_dumps_written_before_node_identities():

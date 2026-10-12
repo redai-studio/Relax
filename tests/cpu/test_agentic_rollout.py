@@ -404,6 +404,8 @@ def test_score_centering_forest_preserves_multiturn_and_branch_candidates() -> N
         np.testing.assert_array_equal(
             sample.rollout_topk_log_probs, [[-1.0, -2.0], [-np.inf, -np.inf], [-np.inf, -np.inf], [-0.5, -2.5]]
         )
+
+
 def _spec_counters(accept: int, propose: int, *, verify: int = 0, completion: int = 0) -> dict[str, int]:
     return {
         "spec_accept_token_num": accept,
