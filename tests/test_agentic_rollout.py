@@ -678,6 +678,40 @@ async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch
     assert "session_id" not in payloads[-1]
 
 
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+async def test_pd_generate_preserves_full_history_and_routing_key(monkeypatch, lifecycle_enabled) -> None:
+    calls = []
+
+    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
+        calls.append((url, payload, headers, fail_fast_no_workers))
+        return {
+            "output_ids": [4],
+            "meta_info": {"id": "r", "weight_version": "7", "finish_reason": {"type": "stop"}},
+        }
+
+    monkeypatch.setattr(runtime_mod, "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    adapter._args.sglang_router_policy = "consistent_hashing"
+    adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the PD router"))
+    result = await adapter.generate(
+        input_ids=[1, 2, 3],
+        sampling_params={"max_new_tokens": 4},
+        session_id="s",
+        request_id="r",
+        fail_fast_no_workers=True,
+    )
+
+    assert len(calls) == 1
+    url, payload, headers, fail_fast = calls[0]
+    assert url == "http://10.0.0.1:8000/generate"
+    assert payload["input_ids"] == [1, 2, 3] and payload["rid"] == "r"
+    assert "session_params" not in payload
+    assert payload.get("session_id") == ("s" if lifecycle_enabled else None)
+    assert headers == {"X-SMG-Routing-Key": "s"} and fail_fast is True
+    assert result.meta_info["weight_version"] == "7"
+    adapter._worker_urls.assert_not_awaited()
+
+
 async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
     async def fake_post(*_args, **_kwargs):
         request = httpx.Request("POST", "http://test/generate")
@@ -1108,8 +1142,10 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
+@pytest.mark.parametrize("history", [[], [100, 200]])
+async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, history):
     shard, _group, session, ir = _router_recovery_shard()
+    ir.history_rollout_token_prefix = history
     calls, sleeps = [], []
 
     async def generate(**kwargs):
@@ -1130,7 +1166,8 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
     await task
 
     assert len(calls) == 2 and calls[0]["request_id"] == calls[1]["request_id"]
-    assert calls[0]["input_ids"] == calls[1]["input_ids"] == [300]
+    assert calls[0]["input_ids"] == calls[1]["input_ids"] == history + [300]
+    assert calls[0]["sampling_params"] == calls[1]["sampling_params"] == {"max_new_tokens": 7}
     assert sleeps == [2.0]
     assert ir.pending_token_delta == [300, 7]
     assert ir.waiter.result() == {"ok": True}

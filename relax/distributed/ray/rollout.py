@@ -547,6 +547,7 @@ class EngineGroup:
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
 
     @property
@@ -711,6 +712,7 @@ class EngineGroup:
                 router_port=self.router_port,
                 skip_dcs_registration=self.skip_dcs_registration,
                 skip_router_registration=self.skip_router_registration,
+                **({"require_router_registration": True} if self.require_router_registration else {}),
             )
             self.engine_init_records[rank - self.rank_offset] = _EngineInitRecord(
                 init_ref,
@@ -720,7 +722,11 @@ class EngineGroup:
                     if "host" in engine_addr and "port" in engine_addr
                     else None
                 ),
-                router_cleanup=RouterWorkerCleanup(engine._actor_id.hex()),
+                router_cleanup=RouterWorkerCleanup(
+                    engine._actor_id.hex(),
+                    pd_worker_type=self.worker_type if self.require_router_registration else None,
+                    bootstrap_port=engine_addr.get("disaggregation_bootstrap_port"),
+                ),
             )
             init_handles.append(init_ref)
         return init_handles, port_cursors
@@ -876,6 +882,28 @@ class RolloutServer:
         """Recover dead engines across all active groups, overlapping init."""
         groups = list(self.engine_groups)
         dead_per_group = [[i for i, engine in enumerate(g.all_engines) if engine is None] for g in groups]
+
+        # Managed PD retains static IDs outside the engine actor. Confirm old
+        # registrations are gone before replacements can reuse their endpoints.
+        for group, dead_indices in zip(groups, dead_per_group, strict=True):
+            if not group.require_router_registration:
+                continue
+            for slot in dead_indices:
+                if slot % group.nodes_per_engine:
+                    continue
+                record = group.engine_init_records.get(slot)
+                if (
+                    record is None
+                    or not record.router_url
+                    or record.router_cleanup is None
+                    or not remove_dead_router_worker(
+                        f"http://{group.router_ip}:{group.router_port}",
+                        record.router_url,
+                        record.router_cleanup,
+                    )
+                ):
+                    self.num_new_engines = 0
+                    raise RuntimeError("Cannot recreate PD engine before its old router registration is removed")
 
         # FullyAsync can keep updating surviving DCS recipients while cleanup
         # is retried. Do not return None slots to the synchronous weight updater.
@@ -1182,10 +1210,21 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
-        self._stop_eviction_monitor()
-        for monitor in self._health_monitors:
-            monitor.stop()
-        self._shutdown_all_engines()
+        try:
+            # Signal every monitor before bounded joins so a stalled health
+            # RPC cannot consume the driver's entire shutdown budget.
+            self._stop_eviction_monitor(timeout=0.0)
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=0.0)
+            deadline = time.monotonic() + 5.0
+            self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
+            for monitor in self._health_monitors:
+                monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
+            self._shutdown_all_engines()
+        finally:
+            # Routers are child processes of this Ray actor, so its process
+            # owns the registry; the Controller driver's registry is separate.
+            stop_launched_routers()
 
     def _shutdown_all_engines(self, timeout: float = 15.0):
         """Shut down all SGLang engine actors and their child processes.
@@ -1219,10 +1258,12 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
 
-        # Wait for shutdown calls to complete with a timeout
+        # Bound the whole batch so router cleanup can finish before the driver's
+        # signal-exit watchdog, even when every engine is unresponsive.
+        deadline = time.monotonic() + timeout
         for engine, ref in shutdown_refs:
             try:
-                ray.get(ref, timeout=timeout)
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception as e:
                 logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
                 # Force-kill the Ray actor as a fallback
@@ -4434,14 +4475,16 @@ class RolloutManager(ReloadableMixin):
         self._eviction_monitor_thread.start()
         logger.info("[Eviction] Eviction monitor started (interval=%.1fs)", self._eviction_check_interval)
 
-    def _stop_eviction_monitor(self):
+    def _stop_eviction_monitor(self, timeout: float | None = None):
         """Stop the eviction monitor thread."""
         if self._eviction_monitor_thread is None:
             return
         self._eviction_monitor_stop.set()
-        self._eviction_monitor_thread.join(timeout=self._eviction_check_interval + 5)
+        self._eviction_monitor_thread.join(timeout=self._eviction_check_interval + 5 if timeout is None else timeout)
         if self._eviction_monitor_thread.is_alive():
-            logger.warning("[Eviction] Eviction monitor thread did not terminate in time")
+            if timeout != 0:
+                logger.warning("[Eviction] Eviction monitor thread did not terminate in time")
+            return
         self._eviction_monitor_thread = None
         logger.info("[Eviction] Eviction monitor stopped")
 
@@ -4716,15 +4759,27 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     return addr_and_ports, node_port_cursor
 
 
-def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
+def _start_router(
+    args,
+    *,
+    has_pd_disaggregation: bool = False,
+    force_new: bool = False,
+    initial_pd_workers: list[dict] | None = None,
+) -> tuple[str, int]:
     """Start sgl router or slime router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
     ``force_new`` is True (multi-model), always allocate a fresh port.
     """
-    if not force_new and args.sglang_router_ip is not None:
+    endpoint = (args.sglang_router_ip, args.sglang_router_port)
+    owns_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
+    if not force_new and args.sglang_router_ip is not None and not owns_endpoint:
+        if initial_pd_workers is not None:
+            raise ValueError("Cannot initialize static workers on an external router")
         return args.sglang_router_ip, args.sglang_router_port
+    if not force_new and owns_endpoint and any(proc.is_alive() for proc in _LAUNCHED_ROUTER_PROCESSES):
+        raise RuntimeError("A managed PD router is already running; reconcile it before another startup")
 
     # Determine the bind address (can be 0.0.0.0 / wildcard) and the connection
     # address (must be a reachable IP for engines).  When SLIME_HOST_IP is set
@@ -4749,6 +4804,28 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
         router_port = args.sglang_router_port
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
+
+    if owns_endpoint and not force_new:
+        # This address may already be held by remote SessionShard clients.
+        # Never replace it with the later owner's independently resolved IP.
+        router_ip, router_port = endpoint
+        bind_ip = getattr(args, "_relax_managed_pd_router_bind_ip", bind_ip)
+
+    # Agentic ingress creates SessionShard configs before RolloutManager owns
+    # the GPU engines. Publish a stable managed endpoint now; the owner starts
+    # the native P2C router there only after it has real healthy P/D workers.
+    if (
+        initial_pd_workers is None
+        and not force_new
+        and has_pd_disaggregation
+        and not args.use_slime_router
+        and not getattr(args, "debug_train_only", False)
+        and getattr(args, "router_decode_policy", None) == "power_of_two"
+    ):
+        args._relax_managed_pd_router_endpoint = (router_ip, router_port)
+        args._relax_managed_pd_router_bind_ip = bind_ip
+        logger.info("Reserve managed PD router endpoint %s:%s until engines are ready", router_ip, router_port)
+        return router_ip, router_port
 
     if args.use_slime_router:
         assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
@@ -4777,6 +4854,18 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
 
         if has_pd_disaggregation:
             router_args.pd_disaggregation = True
+        if initial_pd_workers is not None:
+            if not has_pd_disaggregation:
+                raise ValueError("Initial PD workers require PD disaggregation")
+            _validate_initial_pd_workers(initial_pd_workers)
+            router_args.prefill_urls = [
+                (worker["url"], worker["bootstrap_port"])
+                for worker in initial_pd_workers
+                if worker["worker_type"] == "prefill"
+            ]
+            router_args.decode_urls = [
+                worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"
+            ]
 
         logger.info(f"Launch router with args: {router_args}")
 
@@ -4786,11 +4875,117 @@ def _start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool 
     )
     process.daemon = True
     process.start()
+    _LAUNCHED_ROUTER_PROCESSES.append(process)
     time.sleep(3)
     assert process.is_alive()
-    _LAUNCHED_ROUTER_PROCESSES.append(process)
+    if initial_pd_workers is not None and not force_new:
+        args._relax_managed_pd_router_endpoint = (router_ip, router_port)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
 
+    return router_ip, router_port
+
+
+def _validate_initial_pd_workers(workers: list[dict]) -> None:
+    urls = [worker.get("url") for worker in workers]
+    if any(not isinstance(url, str) or not url.startswith(("http://", "https://")) for url in urls):
+        raise ValueError("Initial PD workers require real HTTP URLs")
+    if len({url.rstrip("/") for url in urls}) != len(urls):
+        raise ValueError("Initial PD worker URLs must be unique")
+    if any(worker.get("worker_type") not in {"prefill", "decode"} for worker in workers):
+        raise ValueError("Only P/D workers may enter the initial PD registry")
+    prefill = [worker for worker in workers if worker["worker_type"] == "prefill"]
+    decode = [worker for worker in workers if worker["worker_type"] == "decode"]
+    if not prefill or len(decode) < 2:
+        raise ValueError("Managed power-of-two startup needs a P and at least two real D engines")
+    if any(
+        type(worker.get("bootstrap_port")) is not int or not 1 <= worker["bootstrap_port"] <= 65535
+        for worker in prefill
+    ):
+        raise ValueError("Every initial P needs its effective bootstrap port")
+
+
+def _wait_pd_router_workers(router_ip: str, router_port: int, expected: list[dict], timeout: float = 60.0) -> dict:
+    """Return an exact, healthy static registry before publishing the
+    server."""
+    import requests
+
+    _validate_initial_pd_workers(expected)
+    specs = {worker["url"].rstrip("/"): worker for worker in expected}
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(
+                f"http://{router_ip}:{router_port}/workers",
+                timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+            )
+            response.raise_for_status()
+            workers = response.json().get("workers", [])
+            registry = {worker.get("url", "").rstrip("/"): worker for worker in workers}
+            if len(registry) != len(workers) or set(registry) - specs.keys():
+                raise ValueError("Static PD registry contains duplicate or unexpected workers")
+            if registry.keys() == specs.keys() and all(worker.get("is_healthy") is True for worker in workers):
+                for url, worker in registry.items():
+                    spec = specs[url]
+                    if (
+                        worker.get("worker_type") != spec["worker_type"]
+                        or not isinstance(worker.get("id"), str)
+                        or not worker["id"]
+                        or "@" in worker["id"]
+                        or (
+                            spec["worker_type"] == "prefill" and worker.get("bootstrap_port") != spec["bootstrap_port"]
+                        )
+                    ):
+                        raise ValueError("Static PD registry identity or bootstrap mismatch")
+                return registry
+        except requests.RequestException as error:
+            last_error = type(error).__name__
+        time.sleep(0.25)
+    raise TimeoutError(f"Static PD router workers did not become ready: {last_error}")
+
+
+def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_new: bool) -> tuple[str, int]:
+    entries = [(group, engine) for group in engine_groups for engine in group.engines if engine is not None]
+    specs = ray.get([engine.get_pd_router_worker_spec.remote() for _, engine in entries])
+    if any(
+        spec is None or spec["worker_type"] != group.worker_type
+        for (group, _), spec in zip(entries, specs, strict=True)
+    ):
+        raise ValueError("Initialized engines do not match the configured PD groups")
+    _validate_initial_pd_workers(specs)
+    reserved_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None)
+    router_ip, router_port = _start_router(
+        args,
+        has_pd_disaggregation=True,
+        force_new=force_new,
+        initial_pd_workers=specs,
+    )
+    if reserved_endpoint is not None and not force_new and (router_ip, router_port) != reserved_endpoint:
+        raise RuntimeError("Managed PD router changed an endpoint already published to SessionShard clients")
+    registry = _wait_pd_router_workers(router_ip, router_port, specs)
+    results = ray.get(
+        [
+            engine.bind_registered_pd_worker.remote(
+                router_ip,
+                router_port,
+                registry[spec["url"].rstrip("/")],
+            )
+            for (_, engine), spec in zip(entries, specs, strict=True)
+        ]
+    )
+    if not all(result is True for result in results):
+        raise RuntimeError("An initialized PD engine did not adopt its static registration")
+    for (group, engine), spec in zip(entries, specs, strict=True):
+        slot = next(index for index, current in enumerate(group.all_engines) if current is engine)
+        record = group.engine_init_records[slot]
+        worker = registry[spec["url"].rstrip("/")]
+        record.router_url = spec["url"]
+        record.router_cleanup.worker_id = worker["id"]
+        record.router_cleanup.pd_worker_type = spec["worker_type"]
+        record.router_cleanup.bootstrap_port = spec["bootstrap_port"]
+    for group in engine_groups:
+        group.router_ip, group.router_port = router_ip, router_port
+        group.skip_router_registration = False
     return router_ip, router_port
 
 
@@ -4802,7 +4997,7 @@ _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []
 
 
 def stop_launched_routers() -> int:
-    """Terminate every router process launched in this Controller lifetime.
+    """Terminate router processes owned by this process.
 
     Returns the number of processes that were alive and successfully killed —
     callers use this to decide whether to reset cached router endpoint state.
@@ -4827,6 +5022,7 @@ def stop_launched_routers() -> int:
                 killed += 1
         except Exception as e:
             logger.warning(f"Failed to terminate router pid={getattr(proc, 'pid', None)}: {e}")
+            survivors.append(proc)  # Retain ownership when cleanup could not be verified.
     _LAUNCHED_ROUTER_PROCESSES = survivors
     return killed
 
@@ -4883,7 +5079,38 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
+def _rollback_rollout_startup(groups: list[EngineGroup], routers_before: tuple) -> None:
+    """Close only native engine groups and routers created by this
+    invocation."""
+    global _LAUNCHED_ROUTER_PROCESSES
+    for group in reversed(groups):
+        if group.args.rollout_external:
+            continue
+        try:
+            group.shutdown_engines(set(range(len(group.all_engines))))
+        except Exception as error:
+            logger.warning("Failed to roll back engine group %s: %s", group.rank_offset, error)
+    created = [process for process in _LAUNCHED_ROUTER_PROCESSES if process not in routers_before]
+    previous = [process for process in _LAUNCHED_ROUTER_PROCESSES if process in routers_before]
+    _LAUNCHED_ROUTER_PROCESSES = created
+    try:
+        stop_launched_routers()
+    finally:
+        _LAUNCHED_ROUTER_PROCESSES = previous + _LAUNCHED_ROUTER_PROCESSES
+
+
 def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
+    """Start the deployment atomically, retaining ownership on failure."""
+    groups: list[EngineGroup] = []
+    routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
+    try:
+        return _start_rollout_servers_impl(args, pg, groups)
+    except Exception:
+        _rollback_rollout_startup(groups, routers_before)
+        raise
+
+
+def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> dict[str, RolloutServer]:
     """Start rollout servers: one per model, each with its own router.
 
     Each model defined in the sglang config gets its own router and set
@@ -4906,10 +5133,43 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         model_cfg.resolve(args)
 
         has_pd = model_cfg.has_pd_disaggregation
-        router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+        endpoint = (args.sglang_router_ip, args.sglang_router_port)
+        managed = (
+            model_idx > 0
+            or args.sglang_router_ip is None
+            or getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
+        )
+        defer_router = (
+            has_pd
+            and managed
+            and not args.use_slime_router
+            and getattr(args, "router_decode_policy", None) == "power_of_two"
+            and not args.debug_train_only
+        )
+        if defer_router:
+            if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
+                raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
+            if getattr(args, "router_dp_aware", False):
+                raise ValueError("Managed static PD startup does not support DP-aware worker identities")
+            decode_count = sum(
+                group.num_gpus // group.num_gpus_per_engine
+                for group in model_cfg.engine_groups
+                if group.worker_type == "decode"
+            )
+            if decode_count < 2 or any(group.worker_type == "regular" for group in model_cfg.engine_groups):
+                raise ValueError("Managed power-of-two startup requires at least two D engines and only PD groups")
+            if any(
+                group.overrides.get("dp_size", getattr(args, "sglang_dp_size", 1)) != 1
+                for group in model_cfg.engine_groups
+                if group.worker_type != "placeholder"
+            ):
+                raise ValueError("Managed static PD startup currently requires dp_size=1")
+            router_ip, router_port = None, None
+        else:
+            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
 
         # Write back for backward compat (first model only).
-        if model_idx == 0:
+        if model_idx == 0 and not defer_router:
             args.sglang_router_ip = router_ip
             args.sglang_router_port = router_port
 
@@ -4934,7 +5194,10 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 sglang_overrides=group_cfg.overrides,
                 router_ip=router_ip,
                 router_port=router_port,
+                skip_router_registration=defer_router,
+                require_router_registration=defer_router,
             )
+            started_groups.append(group)
             handles, port_cursors = group.start_engines(port_cursors)
             all_init_handles.extend(handles)
             engine_groups.append(group)
@@ -4949,6 +5212,11 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
                 log_interval=60.0,
             )
+
+        if defer_router:
+            router_ip, router_port = _start_managed_pd_router(args, engine_groups, force_new=(model_idx > 0))
+            if model_idx == 0:
+                args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
 
         servers[model_cfg.name] = RolloutServer(
             engine_groups=engine_groups,

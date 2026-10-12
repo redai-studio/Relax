@@ -3184,3 +3184,257 @@ diff --git a/python/sglang/srt/models/kimi_k3.py b/python/sglang/srt/models/kimi
 
      def post_load_weights(self):
          # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index 599b981..829e800 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -110,6 +110,28 @@ def maybe_release_metadata_buffer(
+         req.metadata_buffer_index = -1
+
+
++class _BootstrapDeadlinePoller:
++    """Include local bootstrap timeouts in the existing rank failure consensus."""
++
++    def __init__(self, req: Req, now: float, timeout: float):
++        self.req = req
++        self.now = now
++        self.timeout = timeout
++
++    def poll(self) -> KVPoll:
++        status = self.req.disagg_kv_sender.poll()
++        entry = self.req.time_stats.prefill_bootstrap_queue_entry_time
++        if (
++            status == KVPoll.Bootstrapping
++            and entry > 0
++            and self.now - entry > self.timeout
++        ):
++            # Failed is reduced with MIN across the existing CP/TP groups.
++            # All ranks must remove the same requests from their queues.
++            return KVPoll.Failed
++        return status
++
++
+ class PrefillBootstrapQueue:
+     """
+     Store the requests in bootstrapping
+@@ -394,6 +416,14 @@ class PrefillBootstrapQueue:
+             else:
+                 return [], []
+
++        now = time.perf_counter()
++        bootstrap_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        deadline_pollers = [
++            _BootstrapDeadlinePoller(req, now, bootstrap_timeout) for req in self.queue
++        ]
++
+         if self.pp_size > 1:
+             polls = poll_and_all_reduce_pp(
+                 (req.rid for req in self.queue),
+@@ -404,7 +434,7 @@ class PrefillBootstrapQueue:
+             uncovered = [i for i, poll in enumerate(polls) if poll is None]
+             if uncovered:
+                 local_polls = poll_and_all_reduce_attn_cp_tp_group(
+-                    [self.queue[i].disagg_kv_sender for i in uncovered],
++                    [deadline_pollers[i] for i in uncovered],
+                     self.scheduler.attn_cp_cpu_group,
+                     self.scheduler.attn_tp_cpu_group,
+                 )
+@@ -413,16 +443,11 @@ class PrefillBootstrapQueue:
+                         polls[i] = KVPoll.Failed
+         else:
+             polls = poll_and_all_reduce_attn_cp_tp_group(
+-                [req.disagg_kv_sender for req in self.queue],
++                deadline_pollers,
+                 self.scheduler.attn_cp_cpu_group,
+                 self.scheduler.attn_tp_cpu_group,
+             )
+
+-        bootstrap_timeout = float(
+-            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
+-        )
+-        now = time.perf_counter()
+-
+         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+             if poll is None:
+                 continue
+@@ -432,27 +457,6 @@ class PrefillBootstrapQueue:
+                 indices_to_remove.add(i)
+                 failed_reqs.append(req)
+             elif poll == KVPoll.Bootstrapping:
+-                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
+-                if entry_time > 0 and now - entry_time > bootstrap_timeout:
+-                    error_message = (
+-                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
+-                        f"for request rank={self.tp_rank} "
+-                        f"{req.rid=} {req.bootstrap_room=}"
+-                    )
+-                    logger.error(error_message)
+-                    prepare_abort(
+-                        req,
+-                        error_message,
+-                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
+-                    )
+-                    self.scheduler.output_streamer.stream_output(
+-                        [req], req.return_logprob
+-                    )
+-                    indices_to_remove.add(i)
+-                    failed_reqs.append(req)
+-                    if self.scheduler.metrics_reporter.enable_metrics:
+-                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+-                    continue
+                 if (
+                     req.prefill_attempt_count
+                     < self.scheduler.server_args.optimistic_prefill_attempts
+diff --git a/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py b/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py
+new file mode 100644
+index 0000000..0dad90f
+--- /dev/null
++++ b/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py
+@@ -0,0 +1,145 @@
++"""CPU regressions for PD bootstrap deadlines and rank-consistent queue removal."""
++
++import ast
++import logging
++import os
++import time
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from sglang.srt.disaggregation.base import KVPoll
++
++
++def _load_queue():
++    # Exercise the production queue method without importing GPU scheduler kernels.
++    path = (
++        Path(__file__).resolve().parents[4]
++        / "python/sglang/srt/disaggregation/prefill.py"
++    )
++    tree = ast.parse(path.read_text())
++    helper = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "_BootstrapDeadlinePoller"
++    )
++    queue = next(
++        node
++        for node in tree.body
++        if isinstance(node, ast.ClassDef) and node.name == "PrefillBootstrapQueue"
++    )
++    method = next(
++        node
++        for node in queue.body
++        if isinstance(node, ast.FunctionDef) and node.name == "pop_bootstrapped"
++    )
++    queue.body = [method]
++    module = ast.Module(
++        body=[
++            ast.ImportFrom(
++                module="__future__", names=[ast.alias(name="annotations")], level=0
++            ),
++            helper,
++            queue,
++        ],
++        type_ignores=[],
++    )
++    ast.fix_missing_locations(module)
++    namespace = {
++        "KVPoll": KVPoll,
++        "os": os,
++        "time": time,
++        "logger": logging.getLogger(__name__),
++        "should_force_retry": lambda req: False,
++    }
++    exec(compile(module, str(path), "exec"), namespace)
++    return namespace
++
++
++def _request(status=KVPoll.Bootstrapping, entry=100.0):
++    return SimpleNamespace(
++        rid="request",
++        disagg_kv_sender=SimpleNamespace(poll=lambda: status),
++        time_stats=SimpleNamespace(
++            prefill_bootstrap_queue_entry_time=entry, set_wait_queue_entry_time=Mock()
++        ),
++        prefill_attempt_count=0,
++        is_retracted=False,
++    )
++
++
++@pytest.mark.parametrize(
++    "status,entry,now,expected",
++    [
++        (KVPoll.Bootstrapping, 100.0, 701.0, KVPoll.Failed),
++        (KVPoll.Bootstrapping, 100.0, 700.0, KVPoll.Bootstrapping),
++        (KVPoll.Bootstrapping, 0.0, 1000.0, KVPoll.Bootstrapping),
++        (KVPoll.WaitingForInput, 100.0, 1000.0, KVPoll.WaitingForInput),
++        (KVPoll.Failed, 100.0, 101.0, KVPoll.Failed),
++    ],
++)
++def test_deadline_preserves_ready_and_native_failure(status, entry, now, expected):
++    namespace = _load_queue()
++    poller = namespace["_BootstrapDeadlinePoller"](_request(status, entry), now, 600.0)
++    assert poller.poll() == expected
++
++
++@pytest.mark.parametrize("pp_size", [1, 2])
++def test_one_rank_timeout_removes_request_on_all_ranks(monkeypatch, pp_size):
++    namespace = _load_queue()
++    monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++    monkeypatch.setattr(time, "perf_counter", lambda: 701.0)
++    requests = [_request(entry=100.0), _request(entry=102.0)]
++    # Only rank zero has expired; both must take the existing failure path.
++    peer_polls = [
++        namespace["_BootstrapDeadlinePoller"](req, 701.0, 600.0).poll()
++        for req in requests
++    ]
++    local_observations = []
++    for rank, req in enumerate(requests):
++
++        def reduce(pollers, cp_group, tp_group):
++            local = [poller.poll() for poller in pollers]
++            local_observations.append((rank, local))
++            return [min(local[0], peer_polls[1 - rank])]
++
++        namespace["poll_and_all_reduce_attn_cp_tp_group"] = reduce
++        namespace["poll_and_all_reduce_pp"] = lambda rids, state, good, bad: [
++            None for _ in rids
++        ]
++        queue = namespace["PrefillBootstrapQueue"]()
++        queue.queue = [req]
++        queue.pp_size = pp_size
++        queue.scheduler = SimpleNamespace(
++            attn_cp_cpu_group="cp",
++            attn_tp_cpu_group="tp",
++            handle_bootstrap_failure=Mock(),
++        )
++        ready, failed = queue.pop_bootstrapped(return_failed_reqs=True)
++        assert ready == [] and failed == [req] and queue.queue == []
++        queue.scheduler.handle_bootstrap_failure.assert_called_once_with(req)
++    assert local_observations == [(0, [KVPoll.Failed]), (1, [KVPoll.Bootstrapping])]
++
++
++def test_pp_consensus_ready_request_is_not_replaced_by_local_deadline(monkeypatch):
++    namespace = _load_queue()
++    monkeypatch.setattr(time, "perf_counter", lambda: 1000.0)
++    req = _request(entry=100.0)
++    namespace["poll_and_all_reduce_pp"] = lambda rids, state, good, bad: [
++        KVPoll.WaitingForInput
++    ]
++    namespace["poll_and_all_reduce_attn_cp_tp_group"] = Mock(
++        side_effect=AssertionError(
++            "PP-covered request must not enter another collective"
++        )
++    )
++    queue = namespace["PrefillBootstrapQueue"]()
++    queue.queue = [req]
++    queue.pp_size = 2
++    queue.scheduler = SimpleNamespace(handle_bootstrap_failure=Mock())
++    queue.finalize_bootstrap = lambda req: True
++    assert queue.pop_bootstrapped() == [req]
++    assert queue.queue == []
++    queue.scheduler.handle_bootstrap_failure.assert_not_called()
