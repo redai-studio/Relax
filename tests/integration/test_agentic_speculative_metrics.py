@@ -13,19 +13,15 @@ pytest tests/integration/test_agentic_speculative_metrics.py
 """
 
 import asyncio
-import importlib.util
 import json
-import sys
 import time
 from argparse import Namespace
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
-import relax.utils
 from relax.agentic.pipeline import TrainingFieldArtifact
 from relax.agentic.pipeline.runtime import BackendGenerateResult
 from relax.agentic.session.service import AgenticSessionShard
@@ -33,6 +29,9 @@ from relax.agentic.session.state import InflightRequest, MsgNode, RequestKind, S
 from relax.utils.metrics.speculative_metrics import compute_speculative_metrics
 from relax.utils.speculative import SpeculativeCounts
 from relax.utils.types import Sample
+
+
+rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
 
 
 class _Tokenizer:
@@ -137,36 +136,14 @@ def _export(shard: Any, session: SimpleNamespace, leaves: list[MsgNode]) -> list
 
 @pytest.fixture
 def rollout_logger(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    """Load the real logging entrypoints, replacing only external boundaries.
+    """Use the real rollout module, replacing tracking and dump I/O."""
+    monkeypatch.setattr(rollout.tracking_utils, "log", Mock())
+    monkeypatch.setattr(rollout.tracking_utils, "flush_metrics", Mock())
+    monkeypatch.setattr(rollout, "save_rollout_result_jsonl", Mock())
 
-    A private module name prevents cached mocks from leaking into other tests.
-    Neither compute_metrics_from_samples nor the speculative reducer is mocked.
-    """
-    constants = ModuleType("sglang.srt.constants")
-    for name in ("GPU_MEMORY_TYPE_CUDA_GRAPH", "GPU_MEMORY_TYPE_KV_CACHE", "GPU_MEMORY_TYPE_WEIGHTS"):
-        setattr(constants, name, name)
-    engine = ModuleType("relax.backends.sglang.sglang_engine")
-    engine.SGLangEngine = type("UnusedEngine", (), {})
-    tracking = ModuleType("relax.utils.tracking_utils")
-    tracking.log = Mock()
-    tracking.flush_metrics = Mock()
-    tracking.init_tracking = Mock()
-    monkeypatch.setitem(sys.modules, constants.__name__, constants)
-    monkeypatch.setitem(sys.modules, engine.__name__, engine)
-    monkeypatch.setitem(sys.modules, "transfer_queue", ModuleType("transfer_queue"))
-    monkeypatch.setitem(sys.modules, tracking.__name__, tracking)
-    monkeypatch.setattr(relax.utils, "tracking_utils", tracking, raising=False)
-    path = Path(__file__).resolve().parents[2] / "relax/distributed/ray/rollout.py"
-    name = "relax.distributed.ray._speculative_logging_test"
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "save_rollout_result_jsonl", Mock())
     # Performance accounting is unrelated to speculative accounting.
-    monkeypatch.setattr(module, "compute_perf_metrics_from_samples", lambda *args: {})
-    return module
+    monkeypatch.setattr(rollout, "compute_perf_metrics_from_samples", lambda *args: {})
+    return rollout
 
 
 def _log(module: ModuleType, samples: list[Sample], enabled: bool = False) -> dict[str, Any]:
