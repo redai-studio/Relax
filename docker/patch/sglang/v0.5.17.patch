@@ -3438,3 +3438,2095 @@ index 0000000..0dad90f
 +    assert queue.pop_bootstrapped() == [req]
 +    assert queue.queue == []
 +    queue.scheduler.handle_bootstrap_failure.assert_not_called()
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -382,6 +382,8 @@
+             logger.error(message)
+             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
++            if self.scheduler.enable_hicache_storage:
++                self.scheduler.tree_cache.release_aborted_request(req.rid)
+             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+             return True
+         return False
+@@ -593,6 +595,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+             self.waiting_queue.extend(
+                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+@@ -632,6 +635,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+             self.waiting_queue.extend(
+                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -202,6 +202,8 @@
+ 
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        # An allocated host buffer cannot be reused until its reader exits.
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+ 
+@@ -375,7 +377,7 @@
+         self.backup_queue = Queue()
+ 
+         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
+-        self.prefetch_revoke_queue: Queue[str] = Queue()
++        self.prefetch_revoke_queue: Queue[str | StorageOperation] = Queue()
+         self.ack_backup_queue: Queue[StorageOperation] = Queue()
+         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+ 
+@@ -641,6 +643,8 @@
+         )
+ 
+     def reset(self):
++        if self.enable_storage:
++            self._stop_storage_threads()
+         self.storage_stop_event.set()
+ 
+         self.write_queue.clear()
+@@ -1002,11 +1006,24 @@
+                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_transfer(operation)
+-                # operation terminated by controller, release pre-allocated memory
+-                self.append_host_mem_release(
+-                    operation.host_indices[operation.completed_tokens :]
+-                )
++                try:
++                    self._page_transfer(operation)
++                except Exception:
++                    # A failed file read must not kill the shared I/O worker or
++                    # leave wait_complete requests waiting forever. The transfer
++                    # has unwound: only its already-published prefix is usable;
++                    # hybrid callers still validate every component across TP.
++                    operation.mark_terminate()
++                    logger.warning(
++                        "HiCache prefetch I/O failed; terminating the operation.",
++                        exc_info=True,
++                    )
++                finally:
++                    # IO has unwound, including a failed Full or Mamba read.
++                    self.append_host_mem_release(
++                        operation.host_indices[operation.completed_tokens :]
++                    )
++                    operation.io_done.set()
+             except Empty:
+                 continue
+ 
+@@ -1061,7 +1078,12 @@
+                 if operation.is_terminated():
+                     hash_value, storage_hit_count = [], 0
+                 else:
+-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    try:
++                        hash_value, storage_hit_count = self._storage_hit_query(operation)
++                    except Exception:
++                        # Every rank must still enter the hit-count collective.
++                        hash_value, storage_hit_count = [], 0
++                        logger.warning("HiCache storage lookup failed; recomputing.", exc_info=True)
+                 storage_hit_count_tensor = torch.tensor(
+                     storage_hit_count, dtype=torch.int
+                 )
+@@ -1072,7 +1094,11 @@
+ 
+                 if storage_hit_count < self.prefetch_threshold:
+                     # not to prefetch if not enough benefits
+-                    self.prefetch_revoke_queue.put(operation.request_id)
++                    self.prefetch_revoke_queue.put(
++                        operation
++                        if getattr(operation, "revoke_with_operation", False)
++                        else operation.request_id
++                    )
+                     logger.debug(
+                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
+                     )
+@@ -1219,9 +1245,14 @@
+                 if operation is None:
+                     continue
+ 
+-                if not self.backup_skip:
+-                    self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    if not self.backup_skip:
++                        self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache storage backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    # The writer has exited; release its host lock even on failure.
++                    self.ack_backup_queue.put(operation)
+ 
+             except Empty:
+                 continue
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -978,6 +978,8 @@
+         self.skip_lock_node_ids: dict = {}
+         # The prefix length that is inserted into the tree cache
+         self.cache_protected_len: int = 0
++        # Protected chunked checkpoint whose write-through hit is deferred.
++        self._hicache_deferred_chunked_backup: Optional[tuple[int, int, int]] = None
+ 
+         # Whether or not if it is chunked. It increments whenever
+         # it is chunked, and decrement whenever chunked request is
+@@ -1611,6 +1613,7 @@
+         self.indexer_topk = None
+         self.last_node = None
+         self.cache_protected_len = 0
++        self._hicache_deferred_chunked_backup = None
+         self.num_matched_prefix_tokens = 0
+         self.swa_uuid_for_lock = None
+         self.swa_prefix_lock_released = False
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1704,6 +1704,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+ 
+             # Get the next batch to run
+@@ -1747,6 +1748,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+ 
+             # Get the next batch to run
+@@ -3979,6 +3981,11 @@
+         # sleep until next event
+         self.maybe_sleep_on_idle()
+ 
++    def _poll_paused_hicache(self) -> None:
++        # Pause stops generation, not in-flight DMA or storage reads.
++        if self.enable_hierarchical_cache:
++            self.tree_cache.check_hicache_events()
++
+     def is_fully_idle(self, for_health_check=False) -> bool:
+         # Health check piggybacks on running requests in process_output.
+         # Only running_batch + waiting_queue guarantee active GPU processing;
+@@ -4033,6 +4040,7 @@
+                 idle &= len(tc.ongoing_load_back) == 0
+                 if tc.enable_storage:
+                     idle &= len(tc.ongoing_prefetch) == 0
++                    idle &= not getattr(tc, "aborted_prefetch", ())
+                     idle &= len(tc.ongoing_backup) == 0
+ 
+         return idle
+diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+--- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
++++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import logging
+ import time
+ import traceback
+@@ -87,6 +88,93 @@
+     offload_tags: set = field(default_factory=set)
+     stashed_model_static_state: Any = None
+ 
++    def _file_weight_backend(self):
++        cache = getattr(self.scheduler, "tree_cache", None)
++        controller = getattr(cache, "cache_controller", None)
++        backend = getattr(controller, "storage_backend", None)
++        if backend is None or not hasattr(backend, "weight_namespace"):
++            return None
++        if not backend.weight_namespace:
++            raise RuntimeError("File L3 weight updates require an initialized cache namespace")
++        return backend
++
++    def _log_file_storage_lifecycle(self, event: str) -> None:
++        backend = self._file_weight_backend()
++        if backend is None:
++            return
++        logger.info("FILE_L3_LIFECYCLE %s", json.dumps({
++            "event": event, "tp_rank": self.scheduler.ps.tp_rank,
++            "namespace": backend.weight_namespace, "epoch": backend.weight_epoch,
++            "directory": getattr(backend, "file_path", None),
++            "offload_tags": sorted(self.offload_tags),
++        }, sort_keys=True))
++
++    @contextmanager
++    def _file_storage_weight_update(self):
++        backend = self._file_weight_backend()
++        outcome = {"success": False}
++        if backend is None:
++            yield outcome
++            return
++        cache = self.scheduler.tree_cache
++        controller = cache.cache_controller
++        try:
++            deadline = time.monotonic() + 10.0
++            while True:
++                cache.check_hicache_events()
++                states = torch.tensor([int(not self.is_fully_idle())], dtype=torch.int)
++                cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++                if not states[0].item():
++                    break
++                expired = torch.tensor([int(time.monotonic() >= deadline)], dtype=torch.int)
++                cache._all_reduce_attn_groups(expired, torch.distributed.ReduceOp.MAX)
++                if expired[0].item():
++                    raise RuntimeError("File L3 weight update requires a fully idle engine")
++                time.sleep(0.001)
++            error = None
++            try:
++                controller._stop_storage_threads()
++            except Exception as exc:
++                error = exc
++            states = torch.tensor([int(error is not None)], dtype=torch.int)
++            cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++            if states[0].item():
++                raise RuntimeError("File L3 storage workers did not stop on every rank") from error
++            backend.advance_weight_namespace()
++            error = None
++            try:
++                flushed = self.flush_cache(empty_cache=False)
++            except Exception as exc:
++                flushed, error = False, exc
++            states = torch.tensor([int(not flushed)], dtype=torch.int)
++            cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++            if states[0].item():
++                raise RuntimeError("File L3 cache flush failed before weight mutation") from error
++            digest = torch.tensor(list(hashlib.sha256(backend.weight_namespace.encode()).digest()), dtype=torch.int)
++            low, high = digest.clone(), digest.clone()
++            cache._all_reduce_attn_groups(low, torch.distributed.ReduceOp.MIN)
++            cache._all_reduce_attn_groups(high, torch.distributed.ReduceOp.MAX)
++            if not torch.equal(low, high):
++                raise RuntimeError("File L3 weight namespaces differ across ranks")
++            self._log_file_storage_lifecycle("before_weight_mutation")
++            mutation_error = None
++            try:
++                yield outcome
++            except BaseException as exc:
++                mutation_error = exc
++            states = torch.tensor([int(mutation_error is not None or not outcome["success"])], dtype=torch.int)
++            cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++            if states[0].item():
++                raise RuntimeError("Weight mutation failed; file L3 engine must be rebuilt") from mutation_error
++            self._log_file_storage_lifecycle("after_weight_mutation")
++        except BaseException:
++            # Partial mutation cannot safely resume generation or reuse the old
++            # namespace. The supervisor observes an engine failure, never a gain.
++            # Do not request graceful host-pool destruction: a failed stop may
++            # still own an IO pointer. Propagate to the scheduler's fatal path.
++            controller.storage_stop_event.set()
++            raise
++
+     @contextmanager
+     def _observe_weight_load(self, source: str) -> Iterator[None]:
+         # Edge-trigger weight_load_duration_seconds at the end of each
+@@ -95,7 +183,8 @@
+         # `source` distinguishes disk vs distributed vs tensor vs ipc.
+         t0 = time.perf_counter()
+         try:
+-            yield
++            with self._file_storage_weight_update() as outcome:
++                yield outcome
+         finally:
+             if self.metrics_collector is not None:
+                 self.metrics_collector.observe_weight_load(
+@@ -103,6 +192,10 @@
+                 )
+ 
+     def flush_cache_after_weight_update(self, recv_req) -> None:
++        if self._file_weight_backend() is not None:
++            # Already collectively flushed before mutation. A rank-local worker
++            # success must not select a second collective flush before agreement.
++            return
+         if recv_req.flush_cache:
+             flush_cache_success = self.flush_cache(
+                 empty_cache=recv_req.torch_empty_cache
+@@ -111,7 +204,7 @@
+ 
+     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+         """In-place update of the weights from disk."""
+-        with self._observe_weight_load("disk"):
++        with self._observe_weight_load("disk") as outcome:
+             success, message = self.tp_worker.update_weights_from_disk(recv_req)
+             tp_success = success
+             if success and self.draft_worker is not None:
+@@ -120,6 +213,7 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             if not success:
+                 logger.error(message)
++            outcome["success"] = bool(success)
+             return UpdateWeightFromDiskReqOutput(
+                 success=success, message=message, num_paused_requests=0
+             )
+@@ -142,19 +236,20 @@
+         recv_req: UpdateWeightsFromDistributedReqInput,
+     ) -> Tuple[bool, str]:
+         """Update the online model parameter."""
+-        with self._observe_weight_load("distributed"):
++        with self._observe_weight_load("distributed") as outcome:
+             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+             if success:
+                 self.flush_cache_after_weight_update(recv_req)
+             else:
+                 logger.error(message)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromDistributedReqOutput(
+                 success=success, message=message
+             )
+ 
+     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+         """Update the online model parameter from tensors."""
+-        with self._observe_weight_load("tensor"):
++        with self._observe_weight_load("tensor") as outcome:
+             if recv_req.disable_draft_model:
+                 worker = self.tp_worker
+             else:
+@@ -164,12 +259,14 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             else:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._file_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+ 
+     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+         """Update the online model parameter from IPC for checkpoint-engine integration."""
+-        with self._observe_weight_load("ipc"):
++        with self._observe_weight_load("ipc") as outcome:
+             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+             tp_success = success
+             if success and self.draft_worker is not None:
+@@ -178,7 +275,9 @@
+                 self.flush_cache_after_weight_update(recv_req)
+             if not success:
+                 logger.error(message)
+-            torch.distributed.barrier(group=self.tp_cpu_group)
++            if self._file_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
+             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
+ 
+     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+@@ -186,17 +285,20 @@
+         return GetWeightsByNameReqOutput(parameter=parameter)
+ 
+     def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+-        success, message = self.tp_worker.post_process_weights(recv_req)
+-        if (
+-            success
+-            and self.draft_worker is not None
+-            and hasattr(self.draft_worker, "post_process_weights")
+-        ):
+-            success, message = self.draft_worker.post_process_weights(recv_req)
+-        if not success:
+-            logger.error(message)
+-        torch.distributed.barrier(group=self.tp_cpu_group)
+-        return PostProcessWeightsReqOutput(success=success, message=message)
++        with self._file_storage_weight_update() as outcome:
++            success, message = self.tp_worker.post_process_weights(recv_req)
++            if (
++                success
++                and self.draft_worker is not None
++                and hasattr(self.draft_worker, "post_process_weights")
++            ):
++                success, message = self.draft_worker.post_process_weights(recv_req)
++            if not success:
++                logger.error(message)
++            if self._file_weight_backend() is None:
++                torch.distributed.barrier(group=self.tp_cpu_group)
++            outcome["success"] = bool(success)
++            return PostProcessWeightsReqOutput(success=success, message=message)
+ 
+     def _assert_weight_cache_inactive(self, op: str) -> None:
+         """Reject freeing/restoring model weights while the CUDA IPC weight
+@@ -258,6 +360,7 @@
+ 
+         torch.get_device_module().synchronize()
+ 
++        self._log_file_storage_lifecycle("after_release")
+         return ReleaseMemoryOccupationReqOutput()
+ 
+     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+@@ -299,9 +402,12 @@
+                     if queue is not None:
+                         queue.resume_memory_occupation()
+ 
++        self._log_file_storage_lifecycle("after_resume")
+         return ResumeMemoryOccupationReqOutput()
+ 
+     def check_weights(self, recv_req: CheckWeightsReqInput):
++        if recv_req.action == "reset_tensors" and self._file_weight_backend() is not None:
++            return CheckWeightsReqOutput(success=False, message="reset_tensors is disabled with file L3; use a full weight update")
+         try:
+             payload = self.tp_worker.model_runner.check_weights(
+                 action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
+diff --git a/python/sglang/srt/mem_cache/hicache_storage.py b/python/sglang/srt/mem_cache/hicache_storage.py
+--- a/python/sglang/srt/mem_cache/hicache_storage.py
++++ b/python/sglang/srt/mem_cache/hicache_storage.py
+@@ -375,6 +375,9 @@
+         attn_cp_size = storage_config.attn_cp_size
+         model_name = "-".join(model_name.split("/")) if model_name else ""
+         enable_pp = pp_size > 1
++        self.weight_namespace = ""
++        self.weight_epoch = 0
++        self.weight_incarnation = ""
+         self.config_suffix = f"_{model_name}"
+         if not is_mla_model:
+             self.config_suffix += f"_{tp_rank}_{tp_size}"
+@@ -430,8 +433,24 @@
+             ),
+         )
+ 
++    def initialize_weight_namespace(self, incarnation: str) -> None:
++        if self.weight_incarnation:
++            raise RuntimeError("file cache weight namespace already initialized")
++        if len(incarnation) != 32 or any(c not in "0123456789abcdef" for c in incarnation):
++            raise ValueError("invalid file cache incarnation")
++        self.weight_incarnation = incarnation
++        self.weight_namespace = f"{incarnation}-0"
++
++    def advance_weight_namespace(self) -> None:
++        if not self.weight_incarnation:
++            raise RuntimeError("file cache weight namespace not initialized")
++        # Caller must stop all storage readers and writers before this switch.
++        self.weight_epoch += 1
++        self.weight_namespace = f"{self.weight_incarnation}-{self.weight_epoch}"
++
+     def _get_suffixed_key(self, key: str) -> str:
+-        return key + self.config_suffix
++        prefix = self.weight_namespace + "." if self.weight_namespace else ""
++        return prefix + key + self.config_suffix
+ 
+     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+         if component_name is None or component_name in ("__default__", PoolName.KV):
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -130,6 +130,7 @@
+         self.request_id = request_id
+         self._lock = threading.Lock()
+         self._terminated_flag = False
++        self.io_done = threading.Event()
+         self.storage_hit_count = 0
+         self.start_time = time.monotonic()
+         super().__init__(
+@@ -353,6 +354,22 @@
+                 release_queue, transfer.host_indices, entry.host_pool.page_size
+             )
+ 
++    def release_unsubmitted_prefetch(self, extra_pools: list[PoolTransfer]) -> None:
++        """Roll back scheduler-owned buffers before any reader is submitted.
++
++        Local allocation can fail asymmetrically across TP. These buffers must
++        not enter release queues whose lengths are reduced with MIN.
++        """
++        for transfer in extra_pools:
++            entry = self.mem_pool_host.entry_map.get(transfer.name)
++            if (
++                entry is not None
++                and not entry.is_primary_index_anchor
++                and transfer.indices_from_pool is None
++                and transfer.host_indices is not None
++            ):
++                entry.host_pool.free(transfer.host_indices)
++
+     def reset(self):
+         super().reset()
+         if self.enable_storage:
+@@ -570,6 +587,8 @@
+         last_hash: Optional[str] = None,
+         prefix_keys: Optional[List[str]] = None,
+         extra_pools: Optional[list[PoolTransfer]] = None,
++        *,
++        revoke_with_operation: bool = False,
+     ) -> PrefetchOperation:
+         operation = PrefetchOperation(
+             request_id,
+@@ -578,6 +597,7 @@
+             prefix_keys=prefix_keys,
+             pool_transfers=extra_pools,
+         )
++        operation.revoke_with_operation = revoke_with_operation
+         self.prefetch_queue.put(operation)
+         return operation
+ 
+@@ -727,8 +747,12 @@
+                 operation = self.backup_queue.get(block=True, timeout=1)
+                 if operation is None:
+                     continue
+-                self._page_backup(operation)
+-                self.ack_backup_queue.put(operation)
++                try:
++                    self._page_backup(operation)
++                except Exception:
++                    logger.warning("HiCache hybrid backup failed; retaining host cache.", exc_info=True)
++                finally:
++                    self.ack_backup_queue.put(operation)
+             except Empty:
+                 continue
+ 
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -816,6 +816,23 @@
+             and node.hit_count >= self.write_through_threshold
+         )
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Account for one request's suppressed chunked write-through hit."""
++        node = self._node_arena.get(node_id)
++        if (
++            not self.enable_hicache
++            or node is None
++            or node is self.root_node
++            or node.backuped
++            or node.write_through_pending_id is not None
++            or node.component_data[ComponentType.FULL].lock_ref <= 0
++            or node.component_data[ComponentType.MAMBA].value is None
++        ):
++            return []
++        if self._inc_hit_count_and_check(node):
++            return [self._build_backup_kv_action(node)]
++        return []
++
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the insert, running to its first barrier or completion."""
+         # Insert walks are single-flight; a live walk means re-entrancy.
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+@@ -318,6 +318,10 @@
+         """Concatenate FULL device values from from_node up to (exclusive) until_node."""
+         ...
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Optional completion hook for a protected chunked Mamba checkpoint."""
++        return []
++
+     @abstractmethod
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the (single-flight) insert, running to its first barrier or completion."""
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -7,6 +7,8 @@
+ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+ 
+ import torch
++import uuid
++import hashlib
+ 
+ from sglang.srt.distributed.communication_tags import P2PTag
+ from sglang.srt.environ import envs
+@@ -296,6 +298,8 @@
+         self.enable_storage = False
+         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
++        self.aborted_prefetch: set[str] = set()
++        self._native_prefetch_sequence = 0
+         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+ 
+         if self.cache_controller is not None:
+@@ -342,6 +346,13 @@
+             storage_extra_config=storage_extra_config,
+             storage_prefetch_threshold=storage_prefetch_threshold,
+         )
++        if storage_backend == "file":
++            # Use one fresh namespace on every attention rank of this engine.
++            incarnation = torch.tensor(list(uuid.uuid4().bytes), dtype=torch.int)
++            self._all_reduce_attn_groups(incarnation, torch.distributed.ReduceOp.MIN)
++            self.cache_controller.storage_backend.initialize_weight_namespace(
++                bytes(incarnation.tolist()).hex()
++            )
+         # Tag HiCache enablement on the TreeCore.
+         if self.cache_controller is not None:
+             self.tree_core.set_hicache_enabled()
+@@ -602,6 +613,9 @@
+         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+             return
+ 
++        deferred_backup = req._hicache_deferred_chunked_backup
++        req._hicache_deferred_chunked_backup = None
++
+         if self.disable:
+             kv_indices = self.req_to_token_pool.req_to_token[
+                 req.req_pool_idx, :kv_len_to_handle
+@@ -666,6 +680,30 @@
+                 kv_indices[req.cache_protected_len :],
+                 start_pos=req.cache_protected_len,
+             )
++
++        if (
++            deferred_backup is not None
++            and is_insert
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and result is not None
++            and result.last_device_node == self.tree_core.root_node.id
++            and req.cache_protected_len > 0
++            and deferred_backup
++            == (self.tree_core.root_node.id, req.last_node, req.cache_protected_len)
++        ):
++            from sglang.srt.managers.schedule_batch import FINISH_ABORT
++
++            # The final short tail has no new Mamba checkpoint. Finish the
++            # suppressed chunked hit while the existing checkpoint is protected;
++            # never associate the request's current state with an older prefix.
++            finish_backup = getattr(self.tree_core, "finish_deferred_chunked_backup", None)
++            if (
++                finish_backup is not None
++                and req.finished_reason is not None
++                and not isinstance(req.finished_reason, FINISH_ABORT)
++            ):
++                self._apply_cache_actions(finish_backup(req.last_node))
+ 
+         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+ 
+@@ -789,6 +827,15 @@
+             req.prefix_indices = new_indices
+         req.cache_protected_len = len(new_indices)
+         req.last_node = new_last_node
++        req._hicache_deferred_chunked_backup = (
++            (self.tree_core.root_node.id, new_last_node, len(new_indices))
++            if chunked
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and len(new_indices) > 0
++            and new_last_node != self.tree_core.root_node.id
++            else None
++        )
+         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+         # carry the skip set so this node's dec releases only what we locked
+         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+@@ -1168,6 +1215,14 @@
+         if not self.enable_storage or self.cache_controller is None:
+             return
+ 
++        states = torch.tensor(
++            [int(req_id in self.ongoing_prefetch or req_id in self.aborted_prefetch)],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
++            return
++
+         extra_key = self.tree_core.prefetch_anchor_info(last_host_node_id)
+         prefetch_key = RadixKey(
+             new_input_tokens,
+@@ -1175,10 +1230,12 @@
+             is_bigram=self.tree_core.is_eagle,
+         ).page_aligned(self.page_size)
+         prefetch_length = len(prefetch_key)
+-        if (
+-            prefetch_length < self.prefetch_threshold
+-            or self.cache_controller.prefetch_rate_limited()
+-        ):
++        states = torch.tensor(
++            [int(prefetch_length < self.prefetch_threshold or self.cache_controller.prefetch_rate_limited())],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
+             return
+ 
+         anchor_lock_params = self.inc_host_lock_ref(last_host_node_id).to_dec_params()
+@@ -1211,9 +1268,12 @@
+         sidecar_xfers = self._build_sidecar_transfers(
+             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+         )
+-        if alloc_failed:
+-            self.cache_controller.append_host_mem_release(
+-                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
++        states = torch.tensor([int(alloc_failed)], dtype=torch.int)
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        if states[0].item():
++            # No reader owns these allocations; release locally on every rank.
++            self.cache_controller.release_unsubmitted_prefetch(
++                [x for xfers in comp_xfers.values() for x in xfers]
+             )
+             self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+             return
+@@ -1226,7 +1286,10 @@
+             last_hash,
+             prefix_keys,
+             extra_pools=aux_xfers or None,
+-        )
++            revoke_with_operation=True,
++        )
++        self._native_prefetch_sequence += 1
++        operation.native_sequence = self._native_prefetch_sequence
+         self.ongoing_prefetch[req_id] = _OngoingPrefetch(
+             last_host_node_id,
+             prefetch_key,
+@@ -1245,43 +1308,76 @@
+         )
+ 
+     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+-        if self.prefetch_stop_policy == "best_effort":
++        return self._prefetch_completion_status(operation)[0]
++
++    def _prefetch_completion_status(
++        self, operation: Optional[PrefetchOperation]
++    ) -> tuple[bool, bool]:
++        if operation is None:
++            can_terminate = True
++        else:
++            if len(operation.hash_value) == 0:
++                completed = False
++            else:
++                completed = (
++                    operation.completed_tokens == len(operation.hash_value) * self.page_size
++                )
++
++            if (
++                completed
++                and getattr(operation, "pool_transfers", None)
++                and not getattr(operation, "pool_transfers_done", True)
++            ):
++                completed = False
++
++            if self.prefetch_stop_policy == "wait_complete":
++                can_terminate = completed
++            elif self.prefetch_stop_policy == "timeout":
++                can_terminate = completed or self._prefetch_timeout_check_linear_func(
++                    operation
++                )
++            else:
++                can_terminate = True
++
++        has_host = operation is not None and operation.host_indices is not None
++        operation_terminated = operation is None or operation.is_terminated()
++        io_pending = has_host and not operation.io_done.is_set()
++        states = torch.tensor(
++            [1 - int(can_terminate), int(operation_terminated), int(io_pending),
++             int(not has_host)],
++            dtype=torch.int,
++        )
++        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++        stop_requested = states[0].item() == 0 or states[1].item() == 1
++        if stop_requested and operation is not None:
++            # Propagate stop to every reader. Buffers remain owned until all
++            # ranks exit I/O, including when a peer failed host allocation.
++            operation.mark_terminate()
++        return stop_requested and states[2].item() == 0, states[3].item() == 0
++
++    def check_prefetch_progress(self, req_id: str) -> bool:
++        if req_id in self.aborted_prefetch:
++            return False
++        info = self.ongoing_prefetch.get(req_id)
++        operation = info.operation if info is not None else None
++        ready, all_have_host = self._prefetch_completion_status(operation)
++        if not ready:
++            return False
++        if info is None:
+             return True
+-
+-        if len(operation.hash_value) == 0:
+-            completed = False
+-        else:
+-            completed = (
+-                operation.completed_tokens == len(operation.hash_value) * self.page_size
+-            )
+-
+-        if self.prefetch_stop_policy == "wait_complete":
+-            can_terminate = completed
+-        elif self.prefetch_stop_policy == "timeout":
+-            can_terminate = completed or self._prefetch_timeout_check_linear_func(
+-                operation
+-            )
+-        else:
+-            return True
+-        if (
+-            completed
+-            and getattr(operation, "pool_transfers", None)
+-            and not getattr(operation, "pool_transfers_done", True)
+-        ):
+-            can_terminate = False
+-
+-        operation_terminated = operation.is_terminated()
+-        states = torch.tensor(
+-            [1 - int(can_terminate), int(operation_terminated)],
+-            dtype=torch.int,
+-        )
+-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+-        can_terminate = states[0].item() == 0
+-        operation_terminated = states[1].item() == 1
+-        return can_terminate or operation_terminated
+-
+-    def check_prefetch_progress(self, req_id: str) -> bool:
+-        if req_id not in self.ongoing_prefetch:
++        if not all_have_host:
++            if operation.host_indices is None:
++                self._revoke_pending_prefetch(req_id)
++            else:
++                completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
++                self.cache_controller.append_host_mem_release(
++                    host_indices=info.host_indices[:completed_tokens],
++                    extra_pools=[x for xfers in info.comp_xfers.values() for x in xfers],
++                )
++                self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
++                del self.ongoing_prefetch[req_id]
++                self.cache_controller.prefetch_tokens_occupied -= len(info.prefetch_key)
++            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+             return True
+ 
+         (
+@@ -1292,13 +1388,6 @@
+             anchor_lock_params,
+             comp_xfers,
+         ) = self.ongoing_prefetch[req_id]
+-        if not self.can_terminate_prefetch(operation):
+-            return False
+-        if operation.host_indices is None:
+-            self.cache_controller.terminate_prefetch(operation)
+-            self._revoke_pending_prefetch(req_id)
+-            return True
+-
+         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+             operation
+         )
+@@ -1470,6 +1559,9 @@
+ 
+     def release_aborted_request(self, rid: str) -> None:
+         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
++        # Abort intent must survive local revocation so every rank participates
++        # in the same readiness collective, even when it owns no local reader.
++        self.aborted_prefetch.add(rid)
+         if rid not in self.ongoing_prefetch:
+             return
+ 
+@@ -1486,15 +1578,34 @@
+             self._revoke_pending_prefetch(rid)
+             return
+ 
+-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
+-        self._barrier_attn_groups()
+-        self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+-        del self.ongoing_prefetch[rid]
+-        self.cache_controller.append_host_mem_release(
+-            host_indices=host_indices[:completed_tokens],
+-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+-        )
+-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
++        self.cache_controller.terminate_prefetch(operation)
++
++    def _drain_aborted_prefetch(self) -> None:
++        for rid in sorted(self.aborted_prefetch):
++            info = self.ongoing_prefetch.get(rid)
++            operation = info.operation if info is not None else None
++            if operation is not None:
++                operation.mark_terminate()
++            io_pending = (
++                operation is not None
++                and operation.host_indices is not None
++                and not operation.io_done.is_set()
++            )
++            states = torch.tensor([int(io_pending)], dtype=torch.int)
++            self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++            if states[0].item() != 0:
++                continue
++            self.aborted_prefetch.discard(rid)
++            if info is None:
++                continue
++            completed_tokens, _ = self.cache_controller.terminate_prefetch(info.operation)
++            self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
++            del self.ongoing_prefetch[rid]
++            self.cache_controller.append_host_mem_release(
++                host_indices=info.host_indices[:completed_tokens],
++                extra_pools=[x for xfers in info.comp_xfers.values() for x in xfers],
++            )
++            self.cache_controller.prefetch_tokens_occupied -= len(info.prefetch_key)
+ 
+     def _revoke_pending_prefetch(self, req_id: str) -> None:
+         info = self.ongoing_prefetch.pop(req_id, None)
+@@ -1509,8 +1620,8 @@
+             comp_xfers,
+         ) = info
+         cc = self.cache_controller
+-        cc.append_host_mem_release(
+-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
++        cc.release_unsubmitted_prefetch(
++            [x for xfers in comp_xfers.values() for x in xfers]
+         )
+         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+         cc.prefetch_tokens_occupied = max(
+@@ -1539,43 +1650,48 @@
+                 yield item
+ 
+         def _drain_revoke():
+-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+-                self._revoke_pending_prefetch(req_id)
++            for operation in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
++                info = self.ongoing_prefetch.get(operation.request_id)
++                if info is not None and info.operation is operation:
++                    self._revoke_pending_prefetch(operation.request_id)
+ 
+         def _drain_and_alloc_storage_hit():
+             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                 req_id = operation.request_id
+                 info = self.ongoing_prefetch.get(req_id)
+-                if info is None:
+-                    # request already aborted/cleaned up, skip
++                owns_operation = info is not None and info.operation is operation
++                # The global StorageOperation counter is shared with backups;
++                # use our collectively enqueued sequence and checkpoint instead.
++                identity = repr((req_id, operation.native_sequence,
++                                 operation.storage_hit_count, operation.hash_value[-1:]))
++                signature = list(hashlib.sha256(identity.encode()).digest())
++                states = torch.tensor(
++                    [int(not owns_operation or operation.is_terminated()), *signature],
++                    dtype=torch.int,
++                )
++                low, high = states.clone(), states.clone()
++                self._all_reduce_attn_groups(low, torch.distributed.ReduceOp.MIN)
++                self._all_reduce_attn_groups(high, torch.distributed.ReduceOp.MAX)
++                if high[0].item() or not torch.equal(low[1:], high[1:]):
++                    if owns_operation:
++                        self._revoke_pending_prefetch(req_id)
+                     continue
+-                if operation.is_terminated():
+-                    # request was aborted while the storage query was in flight
+-                    self._revoke_pending_prefetch(req_id)
+-                    continue
+-
++
++                # All ranks must read the same Full/Mamba checkpoint. Do not
++                # shorten a hit independently to fit local host pressure.
+                 alloc_len = operation.storage_hit_count
+                 host_indices = cc.mem_pool_host.alloc(alloc_len)
+                 if host_indices is None:
+                     self.evict_host(alloc_len)
+                     host_indices = cc.mem_pool_host.alloc(alloc_len)
+-                if host_indices is None:
+-                    # Memory-pressure fallback: a shorter page-aligned prefix.
+-                    available_size = cc.mem_pool_host.available_size()
+-                    alloc_len = min(
+-                        operation.storage_hit_count,
+-                        available_size - (available_size % self.page_size),
+-                    )
+-                    if alloc_len >= self.prefetch_threshold:
+-                        host_indices = cc.mem_pool_host.alloc(alloc_len)
+-                if host_indices is None:
++                states = torch.tensor([int(host_indices is None)], dtype=torch.int)
++                self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
++                if states[0].item():
++                    if host_indices is not None:
++                        cc.mem_pool_host.free(host_indices)
+                     self._revoke_pending_prefetch(req_id)
+                     continue
+ 
+-                operation.storage_hit_count = alloc_len
+-                operation.hash_value = operation.hash_value[
+-                    : alloc_len // self.page_size
+-                ]
+                 operation.host_indices = host_indices
+                 self.ongoing_prefetch[req_id] = info._replace(host_indices=host_indices)
+                 cc.prefetch_buffer.put(operation)
+@@ -1968,6 +2084,8 @@
+                     extra_release_counts=extra_release_counts,
+                     log_metrics=True,
+                 )
++        if self.enable_storage:
++            self._drain_aborted_prefetch()
+         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+             self.storage_metrics_collector.log_storage_metrics(
+                 self.cache_controller.storage_backend.get_stats()
+diff --git a/test/registered/unit/mem_cache/test_native_chunked_hicache.py b/test/registered/unit/mem_cache/test_native_chunked_hicache.py
+new file mode 100644
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_native_chunked_hicache.py
+@@ -0,0 +1,334 @@
++"""CPU lifecycle regressions with native Full/Mamba trees and request pools.
++
++Only the DMA boundary is replaced; no CUDA tensors, model forward, or L3 I/O.
++The TP2 smoke separately validates physical backup and storage consumption.
++"""
++
++from array import array
++from types import SimpleNamespace as NS
++from unittest import TestCase, mock
++
++import torch
++import test_unified_radix_cache_unittest as native
++from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ScheduleBatch
++from sglang.srt.mem_cache.unified_cache.components import ComponentType as CT
++
++
++class ChunkedBackupNative(TestCase):
++    def setUp(self):
++        self.cfg = native.CacheConfig(
++            components=(CT.FULL, CT.MAMBA),
++            page_size=64,
++            num_layers=2,
++            full_attention_layer_ids=(1,),
++            kv_size=32768,
++            max_num_reqs=4,
++            max_context_len=9000,
++            head_num=1,
++            head_dim=8,
++            enable_mamba_extra_buffer=True,
++        )
++        pool_class = native.HybridReqToTokenPool
++
++        def pool(**kwargs):
++            kwargs["speculative_num_draft_tokens"] = None
++            return pool_class(**kwargs)
++
++        with (
++            mock.patch.object(native, "get_device", return_value="cpu"),
++            mock.patch.object(native, "HybridReqToTokenPool", side_effect=pool),
++        ):
++            self.cache, self.allocator, self.pool = native.build_fixture(self.cfg)
++        self.helper = native.UnifiedRadixCacheSuite()
++        self.helper.cfg = self.cfg
++        self.cache.tree_core.set_hicache_enabled()
++        self.cache.write_through_threshold = 1
++        self.cache.cache_controller = NS(write_policy="write_through")
++        self.backups = []
++        self.backup_lock_refs = []
++        patcher = mock.patch.object(
++            self.cache, "_execute_kv_backup", side_effect=self.copy_to_host
++        )
++        self.copy_mock = patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def copy_to_host(self, node_id, full, comp_xfers, sidecars):
++        node = self.cache.tree_core.node_by_id(node_id)
++        self.backup_lock_refs.append(node.component_data[CT.FULL].lock_ref)
++        mamba = comp_xfers.get(CT.MAMBA)
++        if mamba:
++            transfer = mamba[0]
++            self.assertTrue(
++                torch.equal(
++                    transfer.device_indices, node.component_data[CT.MAMBA].value
++                )
++            )
++            transfer.host_indices = transfer.device_indices.clone()
++        self.backups.append(
++            (node_id, len(full), mamba[0].device_indices.clone() if mamba else None)
++        )
++        return full.clone()
++
++    def chunk(self, *, chunked=True):
++        req = self.helper._make_req(self.pool)
++        req.origin_input_ids = array("q", range(1, 8194))
++        req.output_ids = array("q")
++        req.full_untruncated_fill_ids = req.origin_input_ids
++        req.set_extend_range(0, 8192)
++        values = self.allocator.alloc(8201)
++        self.pool.write((req.req_pool_idx, slice(0, 8201)), values)
++        req.kv_committed_len = 8192
++        req.last_node = self.cache.root_node.id
++        req.mamba_last_track_seqlen = 8192
++        self.cache.cache_unfinished_req(req, chunked=chunked)
++        return req
++
++    def finish(self, req, *, is_insert=True, reason=None, new_checkpoint=None):
++        # Last 1-token prefill does not cross a Mamba tracking boundary.
++        req.set_extend_range(8192, 8193)
++        self.cache.cache_unfinished_req(req)
++        req.output_ids = array("q", range(9001, 9009))
++        req.kv_committed_len = 8201
++        req.finished_reason = FINISH_LENGTH(8) if reason is None else reason
++        req.mamba_last_track_seqlen = new_checkpoint
++        self.cache.cache_finished_req(req, is_insert=is_insert, kv_len_to_handle=8201)
++
++    def test_8193_plus_8_completes_existing_8192_full_and_mamba_backup(self):
++        req = self.chunk()
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        saved = leaf.component_data[CT.MAMBA].value.clone()
++        self.assertEqual(req.cache_protected_len, 8192)
++        self.assertEqual(leaf.hit_count, 0)
++        self.assertFalse(self.backups)
++        self.assertIsNone(req.mamba_last_track_seqlen)
++        self.finish(req)
++        self.assertEqual(
++            [(n, length) for n, length, _ in self.backups], [(leaf.id, 8192)]
++        )
++        self.assertGreater(self.backup_lock_refs[0], 0)
++        self.assertTrue(torch.equal(saved, self.backups[0][2]))
++        self.assertTrue(leaf.backuped)
++        self.assertIsNotNone(leaf.component_data[CT.MAMBA].host_value)
++        self.assertEqual(leaf.hit_count, 1)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++        self.assertEqual(len(self.cache.ongoing_write_through), 1)
++
++    def test_nonchunked_insert_does_not_add_completion_hit(self):
++        req = self.chunk(chunked=False)
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++        self.assertEqual(len(self.backups), 1)
++        self.finish(req)
++        self.assertEqual(len(self.backups), 1)
++        self.assertEqual(leaf.hit_count, 1)
++
++    def test_nonempty_final_insert_uses_original_path_once(self):
++        req = self.chunk()
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        self.finish(req, new_checkpoint=8192)
++        self.assertEqual(len(self.backups), 1)
++        self.assertEqual(leaf.hit_count, 1)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_two_requests_share_checkpoint_and_reach_selective_threshold(self):
++        self.cache.write_through_threshold = 2
++        a, b = self.chunk(), self.chunk()
++        self.assertEqual(a.last_node, b.last_node)
++        leaf = self.cache.tree_core.node_by_id(a.last_node)
++        self.finish(a)
++        self.assertEqual(leaf.hit_count, 1)
++        self.assertFalse(self.backups)
++        self.finish(b)
++        self.assertEqual(leaf.hit_count, 2)
++        self.assertEqual(len(self.backups), 1)
++
++    def test_second_completion_skips_existing_host_and_pending(self):
++        a, b = self.chunk(), self.chunk()
++        self.finish(a)
++        leaf = self.cache.tree_core.node_by_id(b.last_node)
++        self.finish(b)
++        self.assertEqual(len(self.backups), 1)
++        self.assertEqual(leaf.hit_count, 1)
++
++    def test_abort_consumes_marker_without_backup(self):
++        req = self.chunk()
++        self.finish(req, reason=FINISH_ABORT("test abort"))
++        self.assertFalse(self.backups)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_no_insert_consumes_marker_without_backup(self):
++        req = self.chunk()
++        self.finish(req, is_insert=False)
++        self.assertFalse(self.backups)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_retract_discards_deferred_marker(self):
++        req = self.chunk()
++        self.assertIsNotNone(req._hicache_deferred_chunked_backup)
++        # The scheduler releases request KV bookkeeping before reset_for_retract.
++        req.kv = None
++        req.reset_for_retract()
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_shared_split_preserves_leaf_and_backs_up_ancestors_first(self):
++        req = self.chunk()
++        leaf_id = req.last_node
++        self.cache.write_through_threshold = 100
++        alternative = list(range(1, 4097)) + list(range(20001, 24097))
++        self.helper._insert(self.cache, self.allocator, self.pool, alternative)
++        self.assertFalse(self.backups)
++        self.assertEqual(req.last_node, leaf_id)
++        self.cache.write_through_threshold = 1
++        self.finish(req)
++        self.assertEqual(len(self.backups), 2)
++        self.assertEqual([length for _, length, _ in self.backups], [4096, 4096])
++        self.assertEqual(self.backups[-1][0], leaf_id)
++        self.assertIsNone(self.backups[0][2])
++        self.assertIsNotNone(self.backups[-1][2])
++        self.assertTrue(all(count > 0 for count in self.backup_lock_refs))
++
++    def test_shared_prefix_tracks_branch_not_fabricated_chunk_end(self):
++        a = self.chunk()
++        self.finish(a)
++        for ack_id in list(self.cache.ongoing_write_through):
++            self.cache._finish_write_through_ack(ack_id)
++        b = self.helper._make_req(self.pool)
++        b.origin_input_ids = array("q", list(range(1, 307)) + list(range(20001, 27888)))
++        b.output_ids = array("q")
++        b.full_untruncated_fill_ids = b.origin_input_ids
++        match = self.cache.match_prefix(
++            native.MatchPrefixParams(key=native.RadixKey(b.origin_input_ids))
++        )
++        self.helper._apply_match_to_req(b, match)
++        b.mamba_branching_seqlen = match.mamba_branching_seqlen
++        self.assertEqual(b.mamba_branching_seqlen, 256)
++        self.assertEqual(len(b.prefix_indices), 0)
++        b.set_extend_range(0, 8192)
++        values = self.allocator.alloc(8201)
++        self.pool.write((b.req_pool_idx, slice(0, 8201)), values)
++        b.kv_committed_len = 8192
++        tracked = ScheduleBatch._mamba_radix_cache_v2_req_prepare_for_extend(
++            NS(req_to_token_pool=self.pool), b
++        )
++        self.assertEqual(tracked.track_seqlen, 257)
++        self.assertEqual(b.mamba_last_track_seqlen, 256)
++        self.cache.cache_unfinished_req(b, chunked=True)
++        self.assertEqual(b.cache_protected_len, 256)
++        branch = self.cache.tree_core.node_by_id(b.last_node)
++        self.assertEqual(len(branch.key), 256)
++        self.assertIsNotNone(branch.component_data[CT.MAMBA].value)
++        self.finish(b)
++        # The final one-token chunk creates no 8192-token Mamba state.
++        # Full KV alone must never extend the reusable hybrid prefix.
++        match = self.cache.match_prefix(
++            native.MatchPrefixParams(key=native.RadixKey(b.origin_input_ids))
++        )
++        self.assertEqual(len(match.device_indices), 256)
++        self.assertIsNone(b._hicache_deferred_chunked_backup)
++        original = self.cache.match_prefix(
++            native.MatchPrefixParams(key=native.RadixKey(a.origin_input_ids))
++        )
++        self.assertEqual(len(original.device_indices), 8192)
++
++        # A later request reuses that real branching checkpoint and can track
++        # the remaining chunk at 8192, producing a complete suffix backup.
++        c = self.helper._make_req(self.pool)
++        c.origin_input_ids = b.origin_input_ids
++        c.output_ids = array("q")
++        c.full_untruncated_fill_ids = c.origin_input_ids
++        self.helper._apply_match_to_req(c, match)
++        c.mamba_branching_seqlen = match.mamba_branching_seqlen
++        c.cache_protected_len = 256
++        self.cache.inc_lock_ref(c.last_node)
++        self.pool.write((c.req_pool_idx, slice(0, 256)), c.prefix_indices)
++        self.pool.write((c.req_pool_idx, slice(256, 8201)), self.allocator.alloc(7945))
++        c.set_extend_range(256, 8193)
++        c.kv_committed_len = 8193
++        ScheduleBatch._mamba_radix_cache_v2_req_prepare_for_extend(
++            NS(req_to_token_pool=self.pool), c
++        )
++        self.assertEqual(c.mamba_last_track_seqlen, 8192)
++        self.cache.cache_unfinished_req(c)
++        self.assertEqual(c.cache_protected_len, 8192)
++        self.assertEqual([length for _, length, _ in self.backups], [8192, 7936])
++        self.assertIsNotNone(self.backups[-1][2])
++        self.finish(c)
++        self.assertEqual(len(self.backups), 2)
++
++    def test_pending_checkpoint_does_not_increment_hit_again(self):
++        req = self.chunk()
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        leaf.write_through_pending_id = leaf.id
++        self.finish(req)
++        self.assertEqual(leaf.hit_count, 0)
++        self.assertFalse(self.backups)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_stale_tree_marker_does_not_trigger_backup(self):
++        req = self.chunk()
++        _, node, length = req._hicache_deferred_chunked_backup
++        req._hicache_deferred_chunked_backup = (-1, node, length)
++        self.finish(req)
++        self.assertFalse(self.backups)
++
++    def test_missing_mamba_checkpoint_is_not_fabricated(self):
++        req = self.chunk()
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        saved = leaf.component_data[CT.MAMBA].value
++        leaf.component_data[CT.MAMBA].value = None
++        try:
++            self.assertEqual(
++                self.cache.tree_core.finish_deferred_chunked_backup(leaf.id), []
++            )
++            self.assertEqual(leaf.hit_count, 0)
++        finally:
++            leaf.component_data[CT.MAMBA].value = saved
++
++    def test_write_back_policy_is_unchanged(self):
++        req = self.chunk()
++        self.cache.tree_core.is_write_back = True
++        self.finish(req)
++        self.assertFalse(self.backups)
++
++    def test_no_hicache_does_not_record_deferred_hit(self):
++        self.cache.cache_controller = None
++        self.cache.tree_core.enable_hicache = False
++        req = self.chunk()
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++        self.finish(req)
++        self.assertFalse(self.backups)
++
++    def test_legacy_external_core_without_hook_preserves_completion(self):
++        req = self.chunk()
++        native_core = self.cache.tree_core
++
++        class ExternalCore:
++            def __getattr__(self, name):
++                if name == "finish_deferred_chunked_backup":
++                    raise AttributeError(name)
++                return getattr(native_core, name)
++
++        self.cache.tree_core = ExternalCore()
++        self.finish(req)
++        self.assertFalse(self.backups)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
++
++    def test_native_host_budget_rejection_does_not_commit_or_retry(self):
++        req = self.chunk()
++        leaf = self.cache.tree_core.node_by_id(req.last_node)
++        controller = NS(mem_pool_host=NS(available_size=lambda: 0), write=mock.Mock())
++        self.cache.cache_controller = controller
++        with (
++            mock.patch.object(
++                self.cache,
++                "_execute_kv_backup",
++                native.UnifiedRadixCache._execute_kv_backup.__get__(self.cache),
++            ),
++            mock.patch.object(self.cache, "evict_host", return_value=0) as evict,
++        ):
++            self.finish(req)
++        evict.assert_called_once_with(8192)
++        controller.write.assert_not_called()
++        self.assertFalse(leaf.backuped)
++        self.assertFalse(self.cache.ongoing_write_through)
++        self.assertIsNone(req._hicache_deferred_chunked_backup)
+diff --git a/test/registered/unit/mem_cache/test_native_file_hicache_budget.py b/test/registered/unit/mem_cache/test_native_file_hicache_budget.py
+new file mode 100644
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_native_file_hicache_budget.py
+@@ -0,0 +1,67 @@
++"""CPU file-backend checks with real quotas, files, epochs, and TP suffixes."""
++
++import torch
++
++from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
++
++
++def make_cache(path, rank, monkeypatch):
++    monkeypatch.setenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", str(path))
++    return HiCacheFile(
++        HiCacheStorageConfig(
++            tp_rank=rank,
++            tp_size=2,
++            pp_rank=0,
++            pp_size=1,
++            attn_cp_rank=0,
++            attn_cp_size=1,
++            is_mla_model=False,
++            enable_storage_metrics=False,
++            is_page_first_layout=True,
++            model_name="native-test",
++            extra_config={
++                "max_size": 256,
++                "min_free_space": 0,
++                "eviction_ratio": 0.75,
++                "enable_metadata_cache": False,
++            },
++        )
++    )
++
++
++def test_old_epochs_and_incarnations_share_quota_without_evicting_peer(
++    tmp_path, monkeypatch
++):
++    first, peer = [make_cache(tmp_path, rank, monkeypatch) for rank in range(2)]
++    for cache in (first, peer):
++        cache.initialize_weight_namespace("a" * 32)
++    page = torch.arange(16, dtype=torch.float32)
++    assert peer.set("peer", page)
++    peer_path = peer._get_component_path("peer")
++    for epoch in range(8):
++        assert first.set("prefix", page)
++        assert first.set("prefix.mamba", page)
++        assert first.exists("prefix") and first.exists("prefix.mamba")
++        assert sum(p.stat().st_size for p in tmp_path.glob("*_0_2.bin")) <= 256
++        assert peer.exists("peer")
++        assert torch.equal(peer.get("peer", torch.empty_like(page)), page)
++        first.advance_weight_namespace()
++        assert not first.exists("prefix")
++    restarted = make_cache(tmp_path, 0, monkeypatch)
++    restarted.initialize_weight_namespace("b" * 32)
++    assert not restarted.exists("prefix")
++    assert restarted.set("after-restart", page)
++    assert sum(p.stat().st_size for p in tmp_path.glob("*_0_2.bin")) <= 256
++    assert peer._get_component_path("peer") == peer_path
++    assert peer.exists("peer")
++
++
++def test_write_larger_than_quota_is_rejected_without_partial_file(
++    tmp_path, monkeypatch
++):
++    cache = make_cache(tmp_path, 0, monkeypatch)
++    cache.initialize_weight_namespace("a" * 32)
++    assert not cache.set("too-large", torch.ones(257, dtype=torch.uint8))
++    assert not list(tmp_path.iterdir())
++    assert cache.set("fits", torch.ones(64, dtype=torch.uint8))
++    assert not list(tmp_path.glob("*.tmp.*"))
+diff --git a/test/registered/unit/mem_cache/test_native_hicache_lifecycle.py b/test/registered/unit/mem_cache/test_native_hicache_lifecycle.py
+new file mode 100644
+--- /dev/null
++++ b/test/registered/unit/mem_cache/test_native_hicache_lifecycle.py
+@@ -0,0 +1,666 @@
++"""CPU regressions for native HiCache ownership and TP failure agreement.
++
++Load the actual methods without CUDA-only module imports. Gloo cases use two
++real processes; no collective is mocked in those tests.
++"""
++
++from __future__ import annotations
++
++import ast
++import datetime
++import hashlib
++import json
++import logging
++import multiprocessing
++import os
++import threading
++import time
++import traceback
++import uuid
++from collections import namedtuple
++from contextlib import contextmanager
++from pathlib import Path
++from queue import Empty, Queue
++from types import SimpleNamespace as NS
++
++import pytest
++import torch
++import torch.distributed as dist
++
++SOURCE = Path(__file__).resolve().parents[4] / "python/sglang/srt"
++LOGGER = logging.getLogger(__name__)
++Info = namedtuple(
++    "Info",
++    "anchor_node_id prefetch_key host_indices operation anchor_lock_params comp_xfers",
++)
++
++
++def methods(path, cls, names, **extra):
++    source = SOURCE / path
++    parsed = ast.parse(source.read_text())
++    klass = next(
++        n for n in parsed.body if isinstance(n, ast.ClassDef) and n.name == cls
++    )
++    selected = [
++        n for n in klass.body if isinstance(n, ast.FunctionDef) and n.name in names
++    ]
++    assert {n.name for n in selected} == set(names)
++    module = ast.Module(
++        body=[
++            ast.ImportFrom(
++                module="__future__", names=[ast.alias(name="annotations")], level=0
++            ),
++            *selected,
++        ],
++        type_ignores=[],
++    )
++    env = dict(
++        torch=torch,
++        threading=threading,
++        time=time,
++        hashlib=hashlib,
++        json=json,
++        logger=LOGGER,
++        Queue=Queue,
++        Empty=Empty,
++        os=os,
++        uuid=uuid,
++        contextmanager=contextmanager,
++        _OngoingPrefetch=Info,
++    )
++    env.update(extra)
++    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), env)
++    return type(cls, (), {name: env[name] for name in names})
++
++
++FILE_METHODS = [
++    "initialize_weight_namespace",
++    "advance_weight_namespace",
++    "_get_suffixed_key",
++    "_get_component_key",
++    "_get_component_path",
++    "get",
++    "set",
++    "exists",
++    "_collect_existing_component_keys",
++]
++
++
++def file_cache(tmp_path):
++    cls = methods(
++        "mem_cache/hicache_storage.py",
++        "HiCacheFile",
++        FILE_METHODS,
++        PoolName=NS(KV="kv"),
++    )
++    cache = cls()
++    cache.weight_namespace = cache.weight_incarnation = ""
++    cache.weight_epoch = 0
++    cache.config_suffix = "_model_0_2"
++    cache.file_path = str(tmp_path)
++    cache.metadata_cache = None
++    cache._evictor = NS(
++        touch=lambda *a: None,
++        reserve=lambda *a, **k: True,
++        commit=lambda *a: None,
++        abort=lambda *a: None,
++    )
++    return cache
++
++
++def test_full_and_mamba_file_keys_change_together(tmp_path):
++    cache = file_cache(tmp_path)
++    cache.initialize_weight_namespace("a" * 32)
++    values = torch.arange(16, dtype=torch.float32)
++    for key in ("prefix", "prefix.mamba"):
++        assert cache.set(key, values)
++        assert cache.exists(key)
++        assert torch.equal(cache.get(key, torch.empty_like(values)), values)
++    assert Path(cache._get_component_path("prefix", "mamba")).exists()
++    old = set(tmp_path.iterdir())
++    cache.advance_weight_namespace()
++    for key in ("prefix", "prefix.mamba"):
++        assert not cache.exists(key)
++        assert cache.get(key, torch.empty_like(values)) is None
++    assert set(tmp_path.iterdir()) == old  # Isolation does not pretend to delete files.
++    restarted = file_cache(tmp_path)
++    restarted.initialize_weight_namespace("b" * 32)
++    assert not restarted.exists("prefix")
++    with pytest.raises(RuntimeError):
++        restarted.initialize_weight_namespace("c" * 32)
++
++
++def test_short_read_and_atomic_write_failure(tmp_path, monkeypatch):
++    cache = file_cache(tmp_path)
++    cache.initialize_weight_namespace("a" * 32)
++    target = Path(cache._get_component_path("bad"))
++    target.write_bytes(b"short")
++    with pytest.raises(OSError):
++        cache.get("bad", torch.empty(16))
++    aborted = []
++    cache._evictor.abort = aborted.append
++    monkeypatch.setattr(
++        os, "replace", lambda *a: (_ for _ in ()).throw(OSError("disk full"))
++    )
++    assert not cache.set("new", torch.arange(16))
++    assert aborted == [cache._get_suffixed_key("new")]
++    assert not list(tmp_path.glob("*.tmp.*"))
++
++
++def operation(rid="r", count=8, sequence=1):
++    op = NS(
++        request_id=rid,
++        storage_hit_count=count,
++        native_sequence=sequence,
++        hash_value=[f"h{i}" for i in range(count)],
++        host_indices=None,
++        completed_tokens=0,
++        terminated=False,
++        io_done=threading.Event(),
++        pool_transfers=[],
++        pool_transfers_done=False,
++        start_time=time.monotonic(),
++    )
++    op.is_terminated = lambda: op.terminated
++    op.mark_terminate = lambda: setattr(op, "terminated", True)
++    return op
++
++
++def test_reader_exception_signals_completion_and_survives():
++    cls = methods(
++        "managers/cache_controller.py", "HiCacheController", ["prefetch_io_aux_func"]
++    )
++    cc = cls()
++    cc.prefetch_buffer, cc.storage_stop_event = Queue(), threading.Event()
++    released = []
++    cc.append_host_mem_release = lambda indices: released.extend(indices.tolist())
++    bad, good = operation("bad"), operation("good")
++    bad.host_indices, good.host_indices = torch.arange(8), torch.arange(8, 16)
++
++    def transfer(op):
++        if op is bad:
++            raise OSError("short Full or Mamba read")
++        op.completed_tokens = 8
++
++    cc._page_transfer = transfer
++    thread = threading.Thread(target=cc.prefetch_io_aux_func)
++    thread.start()
++    cc.prefetch_buffer.put(bad)
++    cc.prefetch_buffer.put(good)
++    try:
++        assert bad.io_done.wait(3) and good.io_done.wait(3)
++        assert bad.terminated and not good.terminated
++        assert released == list(range(8))
++        assert thread.is_alive()
++    finally:
++        cc.storage_stop_event.set()
++        cc.prefetch_buffer.put(None)
++        thread.join(3)
++    assert not thread.is_alive()
++
++
++@pytest.mark.parametrize(
++    "path,clsname",
++    [
++        ("managers/cache_controller.py", "HiCacheController"),
++        ("mem_cache/hybrid_cache/hybrid_cache_controller.py", "HybridCacheController"),
++    ],
++)
++def test_failed_backup_ack_releases_owner(path, clsname):
++    cls = methods(path, clsname, ["backup_thread_func"])
++    cc = cls()
++    cc.backup_queue, cc.ack_backup_queue, cc.storage_stop_event = (
++        Queue(),
++        Queue(),
++        threading.Event(),
++    )
++    cc.backup_skip = False
++    cc._page_backup = lambda op: (_ for _ in ()).throw(OSError("writer failed"))
++    op = operation()
++    thread = threading.Thread(target=cc.backup_thread_func)
++    thread.start()
++    try:
++        cc.backup_queue.put(op)
++        assert cc.ack_backup_queue.get(timeout=3) is op
++        assert thread.is_alive()
++    finally:
++        cc.storage_stop_event.set()
++        cc.backup_queue.put(None)
++        thread.join(3)
++
++
++UPDATES = [
++    "update_weights_from_disk",
++    "update_weights_from_distributed",
++    "update_weights_from_tensor",
++    "update_weights_from_ipc",
++    "post_process_weights",
++]
++WEIGHT_METHODS = [
++    "_file_weight_backend",
++    "_log_file_storage_lifecycle",
++    "_file_storage_weight_update",
++    "_observe_weight_load",
++    "flush_cache_after_weight_update",
++    *UPDATES,
++]
++
++
++def weight_manager(reduce=lambda tensor, op: None, failure=None):
++    outputs = {
++        name: lambda **kwargs: NS(**kwargs)
++        for name in [
++            "UpdateWeightFromDiskReqOutput",
++            "UpdateWeightsFromDistributedReqOutput",
++            "UpdateWeightsFromTensorReqOutput",
++            "UpdateWeightsFromIPCReqOutput",
++            "PostProcessWeightsReqOutput",
++        ]
++    }
++    cls = methods(
++        "managers/scheduler_components/weight_updater.py",
++        "SchedulerWeightUpdaterManager",
++        WEIGHT_METHODS,
++        **outputs,
++    )
++    manager = cls()
++    events = []
++    backend = NS(weight_namespace="a" * 32 + "-0", weight_epoch=0, file_path="test")
++
++    def advance():
++        backend.weight_epoch += 1
++        backend.weight_namespace = "a" * 32 + f"-{backend.weight_epoch}"
++        events.append("epoch")
++
++    backend.advance_weight_namespace = advance
++
++    def stop():
++        events.append("stop")
++        if failure == "stop":
++            raise RuntimeError("injected stop failure")
++
++    cc = NS(
++        storage_backend=backend,
++        _stop_storage_threads=stop,
++        storage_stop_event=threading.Event(),
++    )
++    cache = NS(
++        cache_controller=cc,
++        check_hicache_events=lambda: None,
++        _all_reduce_attn_groups=reduce,
++    )
++    manager.scheduler = NS(tree_cache=cache, ps=NS(tp_rank=0))
++    manager.is_fully_idle = lambda: failure != "busy"
++
++    def flush(**kwargs):
++        events.append("flush")
++        return failure != "flush"
++
++    manager.flush_cache = flush
++
++    def update(req):
++        events.append("mutate")
++        if failure == "raise":
++            raise ValueError("injected mutation failure")
++        return failure != "worker", "injected result"
++
++    manager.tp_worker = NS(**{name: update for name in UPDATES})
++    manager.draft_worker = None
++    manager.offload_tags = set()
++    manager.metrics_collector = None
++    manager.tp_cpu_group = None
++    return manager, backend, cc, events
++
++
++@pytest.mark.parametrize("entry", UPDATES)
++@pytest.mark.parametrize("failure", [None, "worker", "raise"])
++def test_all_weight_mutations_invalidate_before_mutating(entry, failure):
++    manager, backend, cc, events = weight_manager(failure=failure)
++    request = NS(flush_cache=False, torch_empty_cache=False, disable_draft_model=True)
++    if failure:
++        with pytest.raises(RuntimeError, match="must be rebuilt"):
++            getattr(manager, entry)(request)
++        assert cc.storage_stop_event.is_set()
++    else:
++        assert getattr(manager, entry)(request).success
++    assert events == ["stop", "epoch", "flush", "mutate"]
++    assert backend.weight_epoch == 1
++
++
++def test_file_backend_without_namespace_cannot_bypass_guard():
++    manager, backend, cc, _ = weight_manager()
++    backend.weight_namespace = ""
++    with pytest.raises(RuntimeError, match="initialized cache namespace"):
++        manager._file_weight_backend()
++    cc.storage_backend = None
++    assert manager._file_weight_backend() is None
++    cc.storage_backend = NS()
++    assert manager._file_weight_backend() is None
++
++
++class Pool:
++    def __init__(self, capacity=32):
++        self.capacity, self.freed = capacity, []
++
++    def alloc(self, count):
++        return torch.arange(count) if count <= self.capacity else None
++
++    def free(self, indices):
++        self.freed.extend(indices.tolist())
++
++
++class Key(list):
++    def __init__(self, tokens, **kwargs):
++        super().__init__(tokens)
++        self.token_ids = list(tokens)
++
++    def page_aligned(self, page):
++        return self
++
++
++NATIVE_METHODS = [
++    "prefetch_from_storage",
++    "_revoke_pending_prefetch",
++    "_drain_storage_control_queues_impl",
++    "_prefetch_completion_status",
++    "can_terminate_prefetch",
++    "_prefetch_timeout_check_linear_func",
++    "release_aborted_request",
++    "_drain_aborted_prefetch",
++]
++
++
++def native_cache(reduce, capacity=32, component_fails=False):
++    cls = methods(
++        "mem_cache/unified_radix_cache.py",
++        "UnifiedRadixCache",
++        NATIVE_METHODS,
++        RadixKey=Key,
++        PoolTransfer=lambda **kwargs: NS(**kwargs),
++        PoolName=NS(KV="full"),
++        BASE_COMPONENT_TYPE="full",
++        CacheTransferPhase=NS(PREFETCH="prefetch"),
++    )
++    cache = cls()
++    pool, auxiliary = Pool(capacity), Pool()
++    submitted, released, locks = [], [], []
++
++    def release(extra):
++        for transfer in extra:
++            auxiliary.free(transfer.host_indices)
++
++    def prefetch(rid, key, last_hash, prefix_keys, **kwargs):
++        op = operation(rid, len(key))
++        submitted.append(op)
++        return op
++
++    cc = NS(
++        mem_pool_host=pool,
++        prefetch_tokens_occupied=0,
++        prefetch_rate_limited=lambda: False,
++        prefetch=prefetch,
++        release_unsubmitted_prefetch=release,
++        prefetch_revoke_queue=Queue(),
++        prefetch_hit_queue=Queue(),
++        prefetch_buffer=Queue(),
++        ack_backup_queue=Queue(),
++        host_mem_release_queue=Queue(),
++        extra_host_mem_release_queues={},
++        terminate_prefetch=lambda op: (op.completed_tokens, op.hash_value),
++        append_host_mem_release=lambda **kwargs: released.append(kwargs),
++    )
++    cache.cache_controller = cc
++    cache.enable_storage, cache.enable_storage_metrics = True, False
++    cache.storage_metrics_collector = None
++    (
++        cache.ongoing_prefetch,
++        cache.ongoing_backup,
++        cache.prefetch_loaded_tokens_by_reqid,
++    ) = {}, {}, {}
++    cache.aborted_prefetch, cache._native_prefetch_sequence = set(), 0
++    cache._all_reduce_attn_groups = reduce
++    cache.page_size, cache.prefetch_threshold = 1, 1
++    (
++        cache.prefetch_stop_policy,
++        cache.prefetch_timeout_base,
++        cache.prefetch_timeout_per_page,
++    ) = "wait_complete", 1, 1
++    cache.evict_host = lambda count: None
++    cache.inc_host_lock_ref = lambda node: (
++        locks.append(node) or NS(to_dec_params=lambda: node)
++    )
++    cache.dec_host_lock_ref = lambda node, params: locks.remove(node)
++    cache.tree_components = ["full", "mamba"]
++    cache.components = {
++        "mamba": NS(
++            prepare_prefetch=lambda *a, **k: NS(
++                alloc_failed=component_fails,
++                host_indices=None if component_fails else torch.tensor([9]),
++            )
++        )
++    }
++    cache.tree_core = NS(
++        is_eagle=False,
++        prefetch_anchor_info=lambda node: None,
++        build_hicache_transfers=lambda *a, **k: [
++            NS(name="mamba", host_indices=k["host_indices"])
++        ],
++    )
++    cache._build_sidecar_transfers = lambda *args: []
++    return cache, pool, auxiliary, submitted, released, locks
++
++
++def test_abort_keeps_buffers_until_reader_finishes():
++    cache, _, auxiliary, submitted, released, locks = native_cache(lambda *a: None)
++    cache.prefetch_from_storage("r", 1, list(range(8)))
++    op = submitted[0]
++    op.host_indices = torch.arange(8)
++    op.completed_tokens = 3
++    cache.ongoing_prefetch["r"] = cache.ongoing_prefetch["r"]._replace(
++        host_indices=op.host_indices
++    )
++    cache.release_aborted_request("r")
++    cache._drain_aborted_prefetch()
++    assert "r" in cache.ongoing_prefetch and not released and locks
++    op.io_done.set()
++    cache._drain_aborted_prefetch()
++    assert not cache.ongoing_prefetch and not cache.aborted_prefetch and not locks
++    assert released[0]["host_indices"].tolist() == [0, 1, 2]
++    assert not auxiliary.freed  # The post-IO path queued ownership, not local rollback.
++
++
++def test_stale_queue_entry_does_not_revoke_new_request_with_same_id():
++    cache, _, auxiliary, submitted, _, locks = native_cache(lambda *a: None)
++    cache.prefetch_from_storage("r", 1, list(range(8)))
++    old = submitted[0]
++    cache._revoke_pending_prefetch("r")
++    cache.prefetch_from_storage("r", 2, list(range(8)))
++    new = submitted[-1]
++    cache.cache_controller.prefetch_revoke_queue.put(old)
++    cache.cache_controller.prefetch_hit_queue.put(old)
++    cache._drain_storage_control_queues_impl(1, 1, 0, 0, {}, False)
++    assert cache.ongoing_prefetch["r"].operation is new
++    assert locks == [2] and auxiliary.freed == [9]
++    cache.cache_controller.prefetch_hit_queue.put(new)
++    cache._drain_storage_control_queues_impl(0, 1, 0, 0, {}, False)
++    assert cache.cache_controller.prefetch_buffer.get_nowait() is new
++
++
++def test_pause_advances_native_hicache_events():
++    cls = methods("managers/scheduler.py", "Scheduler", ["_poll_paused_hicache"])
++    scheduler = cls()
++    events = []
++    scheduler.tree_cache = NS(check_hicache_events=lambda: events.append("poll"))
++    scheduler.enable_hierarchical_cache = True
++    scheduler._poll_paused_hicache()
++    assert events == ["poll"]
++
++
++def query_error_round(reduce, rank):
++    cls = methods(
++        "managers/cache_controller.py", "HiCacheController", ["prefetch_thread_func"]
++    )
++    cc = cls()
++    cc.prefetch_queue, cc.prefetch_revoke_queue, cc.prefetch_hit_queue = (
++        Queue(),
++        Queue(),
++        Queue(),
++    )
++    cc.storage_stop_event = threading.Event()
++    cc.storage_stop_event.set()  # Drain just the submitted item, then exit.
++    cc.prefetch_io_aux_func = lambda: None
++    cc._all_reduce_prefetch_groups = reduce
++    cc.prefetch_threshold = cc.page_size = 1
++
++    def query(op):
++        if rank == 1 and op.request_id == "bad":
++            raise OSError("one TP rank cannot query its SSD")
++        return ["a"] * 8, 8
++
++    cc._storage_hit_query = query
++    for name in ("bad", "good"):
++        op = operation(name)
++        op.revoke_with_operation = True
++        cc.prefetch_queue.put(op)
++        cc.prefetch_thread_func()
++        cc.prefetch_io_aux_thread.join(3)
++        if name == "bad":
++            assert cc.prefetch_revoke_queue.get_nowait() is op
++            assert cc.prefetch_hit_queue.empty()
++        else:
++            assert cc.prefetch_hit_queue.get_nowait() is op
++            assert op.storage_hit_count == 8
++
++
++def gloo_worker(rank, rendezvous, result_path, case):
++    try:
++        dist.init_process_group(
++            "gloo",
++            init_method=f"file://{rendezvous}",
++            rank=rank,
++            world_size=2,
++            timeout=datetime.timedelta(seconds=15),
++        )
++
++        def reduce(tensor, op):
++            dist.all_reduce(tensor, op=op, group=dist.group.WORLD)
++
++        if case == "query_error":
++            query_error_round(reduce, rank)
++        elif case.startswith("weight_"):
++            failure = case.removeprefix("weight_") if rank == 1 else None
++            manager, backend, cc, events = weight_manager(reduce, failure)
++            if case == "weight_namespace":
++                original = backend.advance_weight_namespace
++
++                def advance():
++                    original()
++                    if rank == 1:
++                        backend.weight_namespace = "b" * 32 + "-1"
++
++                backend.advance_weight_namespace = advance
++            try:
++                manager.update_weights_from_tensor(
++                    NS(flush_cache=False, disable_draft_model=True)
++                )
++            except RuntimeError:
++                assert cc.storage_stop_event.is_set()
++            else:
++                raise AssertionError("A peer failure was returned as success")
++        else:
++            capacity = (
++                (4 if case == "full_partial" else 0)
++                if rank == 1 and case.startswith("full_")
++                else 32
++            )
++            cache, pool, auxiliary, submitted, released, locks = native_cache(
++                reduce, capacity, component_fails=rank == 1 and case == "component"
++            )
++            if case == "rate" and rank == 1:
++                cache.cache_controller.prefetch_rate_limited = lambda: True
++            if case == "duplicate" and rank == 1:
++                cache.aborted_prefetch.add("r")
++            cache.prefetch_from_storage("r", 1, list(range(8)))
++            if case in {"component", "rate", "duplicate"}:
++                assert not submitted and not cache.ongoing_prefetch and not locks
++                assert not released
++            else:
++                op = submitted[0]
++                if case == "cancelled" and rank == 1:
++                    op.mark_terminate()
++                if case == "identity" and rank == 1:
++                    op.native_sequence += 1
++                cache.cache_controller.prefetch_hit_queue.put(op)
++                cache._drain_storage_control_queues_impl(0, 1, 0, 0, {}, False)
++                assert cache.cache_controller.prefetch_buffer.empty()
++                assert not cache.ongoing_prefetch and not locks
++                assert auxiliary.freed == [9]
++                assert not released
++            # The failure must not poison the next collectively enqueued request.
++            cache.aborted_prefetch.clear()
++            cache.cache_controller.prefetch_rate_limited = lambda: False
++            cache.components["mamba"].prepare_prefetch = lambda *a, **k: NS(
++                alloc_failed=False, host_indices=torch.tensor([10])
++            )
++            pool.capacity = 32
++            cache.prefetch_from_storage("next", 1, list(range(8)))
++            op = submitted[-1]
++            cache.cache_controller.prefetch_hit_queue.put(op)
++            cache._drain_storage_control_queues_impl(0, 1, 0, 0, {}, False)
++            assert cache.cache_controller.prefetch_buffer.get_nowait() is op
++            assert len(op.host_indices) == 8
++        Path(result_path).write_text("PASS")
++    except BaseException:
++        Path(result_path).write_text(traceback.format_exc())
++        raise
++    finally:
++        if dist.is_initialized():
++            dist.destroy_process_group()
++
++
++@pytest.mark.parametrize(
++    "case",
++    [
++        "component",
++        "rate",
++        "duplicate",
++        "full_partial",
++        "full_none",
++        "cancelled",
++        "identity",
++        "query_error",
++        "weight_stop",
++        "weight_flush",
++        "weight_worker",
++        "weight_raise",
++        "weight_namespace",
++    ],
++)
++def test_tp2_failure_agreement(tmp_path, case):
++    ctx = multiprocessing.get_context("spawn")
++    processes = [
++        ctx.Process(
++            target=gloo_worker,
++            args=(rank, str(tmp_path / "gloo"), str(tmp_path / f"{rank}.txt"), case),
++        )
++        for rank in range(2)
++    ]
++    for process in processes:
++        process.start()
++    deadline = time.monotonic() + 40
++    try:
++        for process in processes:
++            process.join(max(0, deadline - time.monotonic()))
++        for rank, process in enumerate(processes):
++            evidence = tmp_path / f"{rank}.txt"
++            assert process.exitcode == 0, (
++                evidence.read_text()
++                if evidence.exists()
++                else "TP process did not finish"
++            )
++            assert evidence.read_text() == "PASS"
++    finally:
++        for process in processes:
++            if process.is_alive():
++                process.terminate()
++                process.join(3)

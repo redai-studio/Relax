@@ -40,6 +40,8 @@ format and the client process exits when the remote run finishes.
 - `run_mini_swe_agent.sh`: original non-PD training entry point.
 - `run_mini_swe_agent_pd.sh`: 8-GPU, 2P2D TP2 training entry point.
 - `pd-2p2d-tp2.yaml`: pure PD engine allocation without hierarchical caching.
+- `run_mini_swe_agent_hicache.sh`: the same 8-GPU Mini SWE task with CPU or CPU+SSD caching on prefill engines.
+- `pd-hicache-cpu-2p2d-tp2.yaml` / `pd-hicache-ssd-2p2d-tp2.yaml`: native HiCache configurations.
 - `agent_server.py`: HTTP service that leases task rows, runs mini-swe-agent,
   controls execution concurrency, scores task output, and returns final results.
 - `agent_client.sh`: per-session cheap entrypoint launched by Relax.
@@ -160,6 +162,22 @@ driver owns the agent server so asynchronous submission keeps the server alive.
 See the [English PD guide](../../docs/en/guide/pd-disaggregation.md) or
 [中文 PD 指南](../../docs/zh/guide/pd-disaggregation.md) for general PD
 configuration, resource allocation, routing policies, and limitations.
+
+## Train with CPU and SSD caching
+
+`run_mini_swe_agent_hicache.sh` reuses the PD driver and Mini SWE training
+recipe. Set `HICACHE_TIER=cpu` for GPU+CPU caching, or `HICACHE_TIER=ssd`
+(the default) for GPU+CPU+SSD caching. Both use eight GPUs, two prefill and two
+decode engines, each TP2; only prefill engines enable HiCache.
+
+For SSD, set `RELAX_HICACHE_FILE_ROOT` to a new, empty absolute directory on
+local SSD before submitting through `scripts/entrypoint/ray-job.sh`. The entry
+point forwards this root to Ray workers and gives each prefill engine its own
+subdirectory. Plan host memory and storage budgets for all four prefill TP ranks.
+
+See the [English cache guide](../../docs/en/guide/hierarchical-cache.md) or
+[中文多级缓存指南](../../docs/zh/guide/hierarchical-cache.md) for launch commands,
+Full KV/Mamba consistency, per-rank budgets, and weight invalidation.
 
 ## Runtime data flow
 
