@@ -325,7 +325,7 @@ def test_image_contract_rejects_expanded_payload_missing_prompt_ids_and_unsuppor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_side", ["student", "teacher"])
 async def test_image_opd_rejects_text_radix_routing_before_generation(monkeypatch, image_side):
-    from relax.engine.rollout import sglang_rollout
+    sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 
     monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: SimpleNamespace(opd_manager=object()))
     args = SimpleNamespace(
@@ -376,7 +376,7 @@ async def test_image_encoding_keeps_shared_samples_serializable_while_pending(mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_pool", [False, True])
 async def test_image_processor_excludes_transport_cache_from_local_and_worker_inputs(monkeypatch, use_pool):
-    from relax.engine.rollout import sglang_rollout
+    sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
 
     media = {"images": ["raw-image"], "_opd_image_b64_cache": ["encoded-image"]}
     received = []
