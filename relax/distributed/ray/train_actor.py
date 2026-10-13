@@ -129,3 +129,20 @@ class TrainRayActor(RayActor):
         """Set the managed OPD teacher manager for coordinated
         offload/onload."""
         self.teacher_manager = teacher_manager
+
+    def lifecycle_coordinator(self, *, warm_rollout_kv: bool = True):
+        """Coordinator for the memory switches between training and the
+        inference models this actor was handed.
+
+        Built from the handles as they are now and the run's placement plan; it
+        keeps no state, so building one per switch is fine.
+        """
+        from relax.engine.inference.lifecycle import build_train_coordinator
+
+        return build_train_coordinator(
+            self.args,
+            rollout_manager=getattr(self, "rollout_manager", None),
+            genrm_managers=getattr(self, "genrm_manager", None),
+            teacher_manager=getattr(self, "teacher_manager", None),
+            warm_rollout_kv=warm_rollout_kv,
+        )

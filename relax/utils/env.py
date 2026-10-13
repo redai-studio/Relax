@@ -184,6 +184,11 @@ class Envs(metaclass=_EnvsMeta):
     ROLLOUT_IMAGE_FETCH_TIMEOUT_S = EnvProperty("ROLLOUT_IMAGE_FETCH_TIMEOUT_S", float, 10.0)
     ROLLOUT_IMAGE_FETCH_BACKOFF_S = EnvProperty("ROLLOUT_IMAGE_FETCH_BACKOFF_S", float, 0.5)
 
+    # ------------- Inference gateway -------------
+    INFERENCE_GATEWAY_SERVE_MAX_ONGOING_REQUESTS = EnvProperty(
+        "INFERENCE_GATEWAY_SERVE_MAX_ONGOING_REQUESTS", int, 256
+    )
+
     # ------------- DCS -------------
     DCS_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("DCS_SERVE_MAX_ONGOING_REQUESTS", int, 100)
 

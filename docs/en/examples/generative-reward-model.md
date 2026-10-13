@@ -27,7 +27,7 @@ Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three f
 | :-------------------------- | :--------------------- | :------------------------------- | :------------ | :------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
 | **Split**                   | Disjoint bundles       | Parallel (dedicated slice each)  | ✅ per sample | Auto — `rollout_num_gpus + genrm_num_gpus == actor_total`                                                      | Small GenRM; long-tail rollout (agentic, high-variance response length)                        |
 | **Shared / Co-resident**    | Same bundles           | Parallel (mem_fraction split)    | ✅ per sample | Auto — `rollout_num_gpus == genrm_num_gpus == actor_total`                                                     | Medium GenRM that benefits from full-cluster TP but still fits alongside Rollout               |
-| **Shared / Defer-swap**     | Same bundles           | Serialized (sleep-wake sequence) | ❌ deferred   | Opt-in — Shared bundles + `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` | GenRM much larger than policy; short-response RLVR / math (no rollout tail to hide GenRM behind) |
+| **Shared / Defer-swap**     | Same bundles           | Serialized (sleep-wake sequence) | ❌ deferred   | Opt-in — Shared bundles + `--defer-reward-to-post-process` (see [Deferred Scoring](#deferred-scoring))                   | GenRM much larger than policy; short-response RLVR / math (no rollout tail to hide GenRM behind) |
 
 ```
                  8-GPU Colocate (Split)
@@ -98,7 +98,7 @@ Under `--colocate`, how Rollout and GenRM cohabit the shared bundles has three f
  └─────────────────────────────────────────────────┘
 ```
 
-All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the HTTP call is batched once per rollout step from a userland `custom_reward_post_process` function; see [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
+All three colocate sub-modes reclaim every GPU for the Actor during training. Rollout produces candidate responses and (for Split and Shared / Co-resident) sends each one over HTTP to GenRM inline. In Shared / Defer-swap the whole batch is scored once per rollout step, after Rollout has released the GPUs; [Deferred Scoring](#deferred-scoring) describes the two ways to run it. See [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for the split-vs-defer trade-off matrix.
 
 ## Scripts
 
@@ -268,12 +268,14 @@ On `--colocate` with GenRM, the GPU layout picks Split vs Shared automatically:
 | `rollout_num_gpus == genrm_num_gpus == actor_total`  | **Shared** (same bundles) |
 | Anything else                                        | Rejected at startup with a clear error |
 
-Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time. See the [example README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
+Within Shared, the default is **Co-resident** (both engines held via `mem_fraction_static` split). Adding `--defer-reward-to-post-process` switches it to **Defer-swap** — sequenced sleep-wake, one engine holds full memory at a time (see [Deferred Scoring](#deferred-scoring)). See the [example README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md) for when to prefer defer-swap.
 :::
 
 ::: warning Set `mem_fraction_static` in Shared / Co-resident
 In Shared / Co-resident mode the two SGLang engines live on the same GPUs concurrently. You **must** size their `mem_fraction_static` so that the sum is < 1.0 (≤ 0.9 recommended; the rest covers cuda graphs and activations). Rollout reads `--sglang-mem-fraction-static` (or YAML overrides via `--sglang-config`); GenRM reads `mem_fraction_static` inside `--genrm-engine-config`. Shared / Defer-swap does not need the split — each engine can take ≈ 0.85 alone since they are never resident together.
 :::
+
+Under `--colocate`, GenRM and a Relax-managed OPD teacher (`--teacher-hf-checkpoint` or `--opd-teacher-routes`) are both placed on the bundles right after the Rollout region. If both hold GPU memory in the same phase, the run stops with a placement conflict error before any placement group is created. The combination is accepted only when GenRM scores inline and the teacher is deferred with `--opd-teacher-defer` (see [On-Policy Distillation](./on-policy-distillation.md#sglang-teacher-deployment)): the two then use those bundles at different times. An external teacher reached through `--opd-teacher-url` is not affected.
 
 **Fully-Async mode**:
 
@@ -287,6 +289,30 @@ python3 relax/entrypoints/train.py \
     --fully-async \
     --rm-type dapo-genrm
 ```
+
+### Deferred Scoring
+
+With `--defer-reward-to-post-process`, GenRM stays offloaded while Rollout generates and scores each finished batch in one go. This is what makes Shared / Defer-swap work: Rollout and GenRM take turns on the same GPUs, so each can use almost all of the GPU memory. There are two ways to run it.
+
+**Let Relax run it.** Pass `--defer-reward-to-post-process` together with your real reward function, and do not pass `--custom-reward-post-process-path`:
+
+```bash
+python3 relax/entrypoints/train.py \
+    --colocate \
+    --resource '{"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]}' \
+    --rollout-num-gpus 8 \
+    --genrm-model-path /path/to/genrm/model \
+    --genrm-num-gpus-per-engine 8 \
+    --rm-type dapo-genrm \
+    --defer-reward-to-post-process \
+    ...
+```
+
+Rollout then makes no reward call while it generates. When a batch is complete, Relax offloads Rollout, loads GenRM, calls the configured reward function for every sample that has no reward yet, and offloads GenRM again. The batch is published for training only after that; if scoring fails, none of it is published. Evaluation is scored the same way once all evaluation datasets have generated, and Rollout is loaded again afterwards.
+
+This needs GenRM in the same placement group as Rollout, that is `--colocate` with a Split or Shared layout. It is rejected at startup in `--fully-async` mode, where GenRM has GPUs of its own and nothing to swap, and with `--use-agentic-rollout`. It is also rejected together with `--dynamic-sampling-filter-path`: the filter judges each prompt group by its rewards as soon as the group has generated, and with deferred scoring the rewards do not exist yet.
+
+**Run it from your own hook.** Add `--custom-reward-post-process-path` and Relax leaves the swap to that function: it does not offload Rollout or load GenRM for scoring, and the inline reward call stays as configured (`--rm-type dummy` in the example). [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) is such a hook. Use this when you need scoring logic that the reward function interface does not cover, such as a custom prompt batch or a custom normalization.
 
 ## Multi-Instance GenRM (multiple judge models behind one service)
 
@@ -532,6 +558,19 @@ Response:
 }
 ```
 
+### Inference Endpoints
+
+Besides `/genrm/generate` with `messages`, the service exposes the endpoints every Relax inference role has:
+
+| Endpoint                                                      | Purpose                                                                                           |
+| :------------------------------------------------------------ | :------------------------------------------------------------------------------------------------ |
+| `GET /genrm/engines`                                          | Topology: every instance, its engines, their addresses and states                                 |
+| `GET /genrm/v1/models`                                        | The configured instances, in OpenAI model-list form                                               |
+| `POST /genrm/v1/chat/completions`, `/genrm/chat/completions`  | OpenAI-style chat request, forwarded to an engine of the instance named by `model` or `route_key` |
+| `POST /genrm/generate` without `messages`                     | A native SGLang `/generate` payload, forwarded the same way                                       |
+
+A request for an instance that is offloaded gets `503` with a `Retry-After` header; it does not wake the instance. A `model` or `route_key` that matches no instance gets `400` with the list of available instances.
+
 ### Use GenRMClient in Python
 
 ```python
@@ -580,6 +619,10 @@ Anything else (e.g., `rollout + genrm < actor_total`, or `rollout < actor_total 
 ### Shared Mode: OOM or Engine Init Fails
 
 If shared mode hits OOM during engine startup or cuda graph capture, lower `mem_fraction_static` for one or both engines so that the per-GPU sum stays ≤ 0.9. With large MoE GenRM models, you may also need to disable cuda graphs or reduce `max_context_len`.
+
+### "Physical placement mismatch"
+
+Before GenRM engines start, Relax checks that the GPUs of each engine are on one node and have contiguous GPU ids, because an engine is started on its first GPU and uses the ones that follow. The error names the engine and shows where its bundles really are. It usually means the per-node GPU count is not a multiple of `--genrm-num-gpus-per-engine`, or other jobs hold some GPUs of the node; fix the layout or free the GPUs.
 
 ### Engine Initialization Timeout
 

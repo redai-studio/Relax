@@ -390,7 +390,13 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
-    ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
+    stop_teacher_gateway = Mock()
+    ns = {
+        "logger": Mock(),
+        "ROLES": SimpleNamespace(rollout="rollout"),
+        "shutdown_managed_opd_teacher": stop_teacher,
+        "shutdown_managed_opd_teacher_gateway": stop_teacher_gateway,
+    }
     exec(compile(ast.Module(body=[method], type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
@@ -400,5 +406,6 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         _cleanup_s3_model_weights_after_init=Mock(),
     )
     ns["shutdown"](partial_controller)
+    stop_teacher_gateway.assert_called_once_with(teacher)
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()

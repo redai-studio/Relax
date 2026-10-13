@@ -255,3 +255,250 @@ def test_shutdown_removes_owned_placement_group_but_not_borrowed_one(_patch_ray,
     borrowing_manager = _FakeManager(num_slots=1, owns_pg=False)
     borrowing_manager.shutdown()
     assert removed_pgs == []
+
+
+class _RecordingCall(_RemoteCall):
+    def remote(self, **kwargs):
+        self._engine.remote_kwargs[self._method] = kwargs
+        return super().remote(**kwargs)
+
+
+class _RecordingEngine(_FakeEngine):
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.remote_kwargs: dict[str, dict] = {}
+
+    def __getattr__(self, method: str):
+        return _RecordingCall(self, method)
+
+
+class _HookedManager(MultiEngineManager):
+    """Every hook returns a distinctive value so the test can see where it ends
+    up."""
+
+    def __init__(self):
+        self.pg_tuple = ("shared-pg", [40, 41, 42, 43], [4, 5, 6, 7])
+        super().__init__(
+            SimpleNamespace(marker="args"),
+            num_slots=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[hooked]",
+        )
+
+    def _resolve_placement(self, rank):
+        return self.pg_tuple, False, rank * 2
+
+    def _ray_resource_kwargs(self, rank):
+        return {"num_cpus": 0.3, "num_gpus": 0.1}
+
+    def _allocate_engine_addr_and_ports(self, *, new_engines):
+        return {
+            rank: {"host": "h", "port": 9000 + rank, "nccl_port": 9100 + rank, "dist_init_addr": f"h:{9200 + rank}"}
+            for rank, _ in new_engines
+        }
+
+    def _build_engine_env_vars(self):
+        return {"SOME_ENV": "1"}
+
+    def _engine_ctor_args(self, rank):
+        return ("ctor-args", rank)
+
+    def _build_engine_ctor_kwargs(self, rank):
+        return {"extra": rank}
+
+    def _build_engine_init_kwargs(self, rank, addr_and_ports):
+        return {**addr_and_ports, "skip_dcs_registration": True}
+
+
+def test_multi_engine_manager_init_passes_hook_values_to_ray(_patch_ray, monkeypatch):
+    """Characterization: where each subclass hook's value ends up when the
+    base class brings engines up."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    creations: list[dict] = []
+
+    class _CapturingActor:
+        @classmethod
+        def options(cls, **options):
+            creations.append({"options": options})
+            return cls
+
+        @classmethod
+        def remote(cls, *args, **kwargs):
+            engine = _RecordingEngine(f"engine-{kwargs['rank']}")
+            creations[-1].update(ctor_args=args, ctor_kwargs=kwargs, engine=engine)
+            return engine
+
+    monkeypatch.setattr(mem.ray, "remote", lambda cls: _CapturingActor)
+
+    manager = _HookedManager()
+
+    assert len(creations) == 2
+    first, second = creations
+    # Ray resources and env vars come straight from the hooks.
+    assert {key: first["options"][key] for key in ("num_cpus", "num_gpus")} == {"num_cpus": 0.3, "num_gpus": 0.1}
+    assert first["options"]["runtime_env"] == {"env_vars": {"SOME_ENV": "1"}}
+    # Placement: the bundle index and base GPU id are looked up at the hook's gpu_index.
+    strategies = [creation["options"]["scheduling_strategy"] for creation in creations]
+    assert [strategy.placement_group for strategy in strategies] == ["shared-pg", "shared-pg"]
+    assert [strategy.placement_group_bundle_index for strategy in strategies] == [40, 42]
+    assert all(strategy.placement_group_capture_child_tasks for strategy in strategies)
+    # Constructor: hook args first, then rank / worker_type / base_gpu_id plus hook kwargs.
+    assert first["ctor_args"] == (("ctor-args", 0),)
+    assert first["ctor_kwargs"] == {"rank": 0, "worker_type": "regular", "base_gpu_id": 4, "extra": 0}
+    assert second["ctor_kwargs"] == {"rank": 1, "worker_type": "regular", "base_gpu_id": 6, "extra": 1}
+    # init(): the allocated address merged through the init-kwargs hook.
+    assert second["engine"].remote_kwargs["init"] == {
+        "host": "h",
+        "port": 9001,
+        "nccl_port": 9101,
+        "dist_init_addr": "h:9201",
+        "skip_dcs_registration": True,
+    }
+    assert manager.all_engines == [first["engine"], second["engine"]]
+    assert manager._engine_addr_and_ports[1]["port"] == 9001
+
+
+class _TwoNodeEngineManager(_FakeManager):
+    """Two slots (nodes) per logical engine, each slot on its own host."""
+
+    def __init__(self, num_slots: int):
+        MultiEngineManager.__init__(
+            self,
+            SimpleNamespace(),
+            num_slots=num_slots,
+            nodes_per_engine=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[two-node]",
+        )
+
+    _instance_owns_pg = False
+
+    def _allocate_engine_addr_and_ports(self, *, new_engines):
+        return {rank: {"host": f"node-{rank}", "port": 9000 + rank} for rank, _ in new_engines}
+
+
+def _named(manager):
+    from relax.engine.inference.discovery import model_snapshot_from_payload
+
+    return model_snapshot_from_payload("judge", manager.get_inference_snapshot())
+
+
+def test_multi_engine_manager_snapshot_lists_only_head_engines(_patch_ray):
+    manager = _TwoNodeEngineManager(num_slots=4)
+
+    model = _named(manager)
+
+    assert [engine.engine_id for engine in model.engines] == ["judge/0", "judge/1"]
+    assert [engine.base_url for engine in model.engines] == ["http://node-0:9000", "http://node-2:9002"]
+    assert all(engine.direct_eligible for engine in model.engines)
+    assert model.state.value == "ready" and model.router_url is None
+
+
+def test_multi_engine_manager_snapshot_revision_bumps_after_rebuild(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    initial = manager.get_inference_snapshot()["topology_revision"]
+    assert manager.get_inference_snapshot()["topology_revision"] == initial
+
+    manager._retire_engines([0])
+    dead = manager.get_inference_snapshot()
+    assert dead["engines"][0] == {"index": 0, "base_url": None, "state": "dead"}
+    assert dead["topology_revision"] > initial
+
+    manager.recover()
+    rebuilt = manager.get_inference_snapshot()
+    # Rebuilt on the same host/port, yet the revision still advances.
+    assert rebuilt["engines"][0] == {"index": 0, "base_url": "http://h:1", "state": "ready"}
+    assert rebuilt["topology_revision"] > dead["topology_revision"]
+
+
+def test_multi_engine_manager_snapshot_reports_draining_during_offload(_patch_ray, monkeypatch):
+    """A snapshot taken while an offload is in flight -- the manager actors
+    answer it from a separate concurrency group -- must not advertise engines
+    that are being drained."""
+    import relax.distributed.ray.multi_engine_manager as mem
+
+    manager = _FakeManager(num_slots=2)
+    resolve = mem.ray.get
+    seen: list[list[str]] = []
+
+    def get_and_snapshot(handle_or_list, timeout=None):
+        if not isinstance(handle_or_list, list) and handle_or_list[1] == "release_memory_occupation":
+            model = _named(manager)
+            seen.append([engine.state.value for engine in model.engines])
+            assert not any(engine.direct_eligible for engine in model.engines)
+        return resolve(handle_or_list, timeout=timeout)
+
+    monkeypatch.setattr(mem.ray, "get", get_and_snapshot)
+
+    manager.offload()
+
+    assert seen == [["draining", "draining"], ["draining", "draining"]]
+    assert [engine.state.value for engine in _named(manager).engines] == ["sleeping", "sleeping"]
+
+
+def test_multi_engine_manager_snapshot_marks_offloaded_engines_not_eligible(_patch_ray):
+    manager = _FakeManager(num_slots=2)
+    before = manager.get_inference_snapshot()["topology_revision"]
+
+    manager.offload()
+    model = _named(manager)
+
+    assert [engine.state.value for engine in model.engines] == ["sleeping", "sleeping"]
+    assert not any(engine.direct_eligible for engine in model.engines)
+    assert model.state.value == "sleeping"
+    # Sleeping changes whether a replica can serve, not where it is.
+    assert manager.get_inference_snapshot()["topology_revision"] == before
+
+    manager.onload()
+    assert all(engine.direct_eligible for engine in _named(manager).engines)
+
+
+class _PlannedManager(_FakeManager):
+    """A manager whose two 2-GPU engines are planned in the actor pool."""
+
+    def __init__(self, gpu_ids):
+        self._pg_tuple = ("shared-pg", list(range(8)), gpu_ids)
+        self._made = []
+        self._instance_owns_pg = False
+        MultiEngineManager.__init__(
+            self,
+            SimpleNamespace(
+                colocate=True,
+                hybrid=False,
+                rollout_num_gpus=4,
+                num_gpus_per_node=8,
+                resource={"actor": [1, 8], "rollout": [1, 4], "genrm": [1, 4]},
+                _genrm_instances_resolved={"judge": {"num_gpus": 4, "num_gpus_per_engine": 2}},
+            ),
+            num_slots=2,
+            engine_actor_cls=_FakeEngineActorCls,
+            log_prefix="[planned]",
+        )
+
+    def _physical_placement(self):
+        return "actor", self._pg_tuple
+
+
+def test_multi_engine_manager_validates_physical_layout_before_start(_patch_ray, monkeypatch):
+    from relax.distributed.ray import placement_physical
+    from relax.distributed.ray.placement_planner import PlacementError
+
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: dict.fromkeys(range(8), "node-a"))
+
+    # Bundles 6 and 7 of the judge's second engine got GPU 6 and GPU 9.
+    with pytest.raises(PlacementError, match="genrm/judge engine 1.*not contiguous"):
+        _PlannedManager(gpu_ids=[0, 1, 2, 3, 4, 5, 6, 9])
+    # Refused before anything was started: not even the engine with a valid layout exists.
+    assert _patch_ray.created == []
+
+    manager = _PlannedManager(gpu_ids=list(range(8)))
+    assert len(_patch_ray.created) == 2 and all(engine is not None for engine in manager.all_engines)
+
+
+def test_multi_engine_manager_without_a_planned_pool_skips_the_physical_check(_patch_ray, monkeypatch):
+    from relax.distributed.ray import placement_physical
+
+    monkeypatch.setattr(placement_physical, "bundle_nodes_of", lambda pg: pytest.fail("nothing to check"))
+
+    assert len(_FakeManager(num_slots=2).all_engines) == 2
