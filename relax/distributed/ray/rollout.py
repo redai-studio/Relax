@@ -992,7 +992,19 @@ class RolloutServer:
             logger.info(f"Removed dead external engine group {g_idx}")
 
         if all_handles:
-            ray.get(all_handles)
+            try:
+                ray.get(all_handles)
+            except Exception:
+                # init() may fail after the server is healthy but before its
+                # required router registration is ready. Retire the entire
+                # replacement batch, including pending multi-node peers, so
+                # the next recovery cannot mistake those handles for ready
+                # engines. Keep the new generation's records for route cleanup.
+                for group, dead_indices in zip(groups, dead_per_group, strict=True):
+                    if group.pg is not None and dead_indices:
+                        group.shutdown_engines(set(dead_indices))
+                self.num_new_engines = 0
+                raise
 
         release_handles = []
         new_engines_all = []

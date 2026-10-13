@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import asyncio
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -38,6 +39,32 @@ def test_controller_owner_lookup_timeout_is_bounded(monkeypatch, controller_modu
     controller.serve_dict = {controller_module.ROLES.rollout: SimpleNamespace(get_rollout_manager=unavailable)}
     monkeypatch.setattr(controller_module, "run", asyncio.run)
     assert not controller._dispose_rollout_manager(lookup_timeout=0.001)
+
+
+def test_controller_shutdown_disposes_rollout_owner(monkeypatch, controller_module):
+    controller = object.__new__(controller_module.Controller)
+    events = []
+    manager = SimpleNamespace(dispose=SimpleNamespace(remote=Mock(return_value="dispose-ref")))
+    service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
+    controller.serve_dict = {controller_module.ROLES.rollout: service}
+    controller._teacher_manager = None
+    controller._shutdown_agentic_rollout_services = lambda: events.append("agentic")
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    monkeypatch.setattr(controller_module, "run", asyncio.run)
+    get = Mock(side_effect=lambda *args, **kwargs: events.append("dispose"))
+    monkeypatch.setattr(controller_module.ray, "get", get)
+    monkeypatch.setattr(controller_module, "shutdown_managed_opd_teacher", lambda _: events.append("teacher"))
+    monkeypatch.setitem(
+        sys.modules,
+        "relax.distributed.ray.rollout",
+        SimpleNamespace(stop_launched_routers=lambda: events.append("routers") or 0),
+    )
+
+    controller.shutdown()
+
+    manager.dispose.remote.assert_called_once()
+    get.assert_called_once_with("dispose-ref", timeout=35.0)
+    assert events == ["dispose", "teacher", "agentic", "routers"]
 
 
 def test_global_restart_disposes_owner_before_deleting_deployments(monkeypatch, controller_module):

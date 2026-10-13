@@ -491,6 +491,31 @@ def _pd_worker(engine, **changes):
     }
 
 
+@pytest.mark.parametrize("registered", [False, True])
+def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_engine_module, registered):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    engine._skip_router_registration = False
+    engine.register_to_router = Mock(return_value=registered)
+    process = SimpleNamespace(pid=123, is_alive=lambda: False)
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
+    monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    server_args = {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}
+
+    if registered:
+        engine._init_normal(server_args, apply_policy_load_plan=False)
+    else:
+        with pytest.raises(RuntimeError, match="Required PD router registration failed"):
+            engine._init_normal(server_args, apply_policy_load_plan=False)
+
+    assert engine.process is process
+    launch.assert_called_once()
+    engine.register_to_router.assert_called_once_with(bootstrap_port=9000)
+
+
 @pytest.mark.parametrize("worker_type", ["prefill", "decode"])
 def test_pd_static_worker_adoption_does_not_post(monkeypatch, sglang_engine_module, worker_type):
     requests = _RouterRequests()
