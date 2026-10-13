@@ -1,131 +1,113 @@
 # Prefill–Decode Disaggregation
 
-Prefill–decode (PD) disaggregation assigns prompt processing and token generation to separate SGLang engines. In a multi-turn coding task, each tool result extends the prompt for the next model request. Separating these two phases lets the prefill engines process new context while decode engines generate responses. The benefit depends on prompt lengths, concurrency, and the cost of transferring KV state; PD is not a throughput guarantee.
+Prefill–decode (PD) disaggregation assigns prompt processing and token generation to separate SGLang engine pools. Each pool can then be sized for its workload.
 
-The [Mini SWE Agent PD script](../../../examples/mini_swe_agent/run_mini_swe_agent_pd.sh) runs Qwen3.5-35B-A3B on R2E-Gym tasks with **eight GPUs: two prefill engines and two decode engines, each using TP2**. It reuses the existing Mini SWE agent, sandbox, task data, reward computation, and GRPO training recipe. The original [non-PD script](../../../examples/mini_swe_agent/run_mini_swe_agent.sh) remains a separate entry point.
+| Phase | Work | Typical bottleneck |
+| --- | --- | --- |
+| Prefill | Process the prompt and build KV state | Compute |
+| Decode | Generate tokens using the accumulated KV state | Memory bandwidth |
 
-## GPU layout and request flow
+PD separates phases within rollout inference. Training and rollout scheduling is configured separately; see [Fully Async Training](./fully-async-training.md) for deployment on separate GPU pools.
 
-| Role during rollout | Engines | GPUs per engine | Total GPUs |
+## Enable PD
+
+Use the environment described in [Installation](./installation.md), including the matching SGLang patch. The selected model and transfer backend must support PD with your parallelism settings. When using Mooncake, prepare its dependencies and communication interfaces as described in the [SGLang PD guide](https://docs.sglang.io/docs/advanced_features/pd_disaggregation).
+
+For engines with the same GPU allocation, add the following arguments to your existing training configuration:
+
+```bash
+--rollout-num-gpus 8 \
+--rollout-num-gpus-per-engine 2 \
+--prefill-num-servers 2 \
+--sglang-router-prefill-policy consistent_hashing \
+--sglang-router-decode-policy power_of_two
+```
+
+`--prefill-num-servers` counts **engines**, not GPUs. Relax assigns the requested engines to prefill and uses the remaining rollout GPUs for decode. With PP1 and DP1, this example creates:
+
+| Role | Engines | GPUs per engine | Total GPUs |
 | --- | ---: | ---: | ---: |
 | Prefill | 2 | 2 (TP2) | 4 |
 | Decode | 2 | 2 (TP2) | 4 |
 
-The trainer and rollout engines use `--colocate` to share the same eight GPUs at different times. Megatron uses TP2, CP4, PP1, EP8, and expert TP1, as in the original Mini SWE recipe. PD separates phases **within rollout inference**; this example does not put training and rollout on separate GPU pools or enable fully async training.
+Eight GPUs is an example allocation. Choose engine sizes that fit the model and its KV state, and leave GPUs for both phases. With `--colocate`, also align the rollout allocation with the GPUs shared with training: in the usual configuration without a separate reward model or teacher, Relax sets the rollout GPU count to the Actor GPU count.
 
-1. Relax creates a Group of eight resident Sessions for one task.
-2. Each Session starts `agent_client.sh`, which asks `agent_server.py` to run Mini SWE in an Apptainer sandbox.
-3. Mini SWE sends its complete conversation to Relax's agentic Chat Completions API. The PD router selects a prefill engine and a decode engine; prefill state is transferred to decode for generation.
-4. The agent executes tools and repeats model requests. After submission, the server runs the task tests and returns a scalar reward. Relax exports the trajectory for GRPO.
-5. At the training boundary, Relax updates the weights of all prefill and decode engines before the next rollout.
+`--prefill-num-servers` and `--sglang-config` are mutually exclusive. Neither can be combined with `--rollout-external`. The `power_of_two` example also requires the topology described under [Routing and limits](#routing-and-limits).
 
-The recipe uses `consistent_hashing` for the general and prefill policies, keeping a Session routing key for prefill affinity. Decode uses `power_of_two`: the router compares two eligible decode workers when choosing where to generate. These policies do not reserve an engine for the lifetime of a Session.
+## Configure engine groups with YAML
 
-## Prepare the environment
-
-Use a **dedicated, single-node, eight-GPU Ray cluster** with enough GPU memory for Qwen3.5-35B-A3B at TP2, its KV state, and colocated training. Run the submission command on that node. The canonical Ray entry point cleans residual Relax workers and Serve applications, so run it only when the cluster is available for this job.
-
-Use the repository's training environment and its matching SGLang patch. The current `docker/patch/latest/sglang.patch` targets SGLang v0.5.17. The PD transfer backend is Mooncake; its dependencies must be available in the training environment. A running router alone does not establish that model initialization and state transfer work.
-
-Follow the [Mini SWE setup instructions](../../../examples/mini_swe_agent/README.md#prepare-the-mini-swe-agent-venv) to prepare the venv, parquet task data, Python wheels, and matching SIF images. Training uses `R2E-Gym-Lite`; the agent server also loads the configured `SWE-Bench-Lite` dataset at startup even when Eval is disabled. Use Bash 5.1 or newer, install Apptainer, and make `jq` and `curl` available. Place the Qwen3.5 checkpoint at `$MODEL_DIR/Qwen3.5-35B-A3B`.
-
-## Run the PD example
-
-Use new output directories for each run. Replace the paths, Ray head address, and network interface below with your environment:
-
-```bash
-cd /path/to/Relax
-
-export MINI_SWE_AGENT_VENV=/local/path/mini-swe-agent-venv
-export MODEL_DIR=/path/to/models
-export R2E_DATA_PATH=/path/to/r2e_data
-export R2E_SIF_DIR=/path/to/r2e_sifs
-export RUN_ID=mini-swe-pd-$(date +%Y%m%d-%H%M%S)
-export SAVE_DIR=/path/to/checkpoints/${RUN_ID}
-export EXP_ROOT=/path/to/experiments/${RUN_ID}
-export RAY_ADDRESS=<ray-head-ip>:6379
-export RAY_JOB_ADDRESS=http://<ray-head-ip>:8265
-export NCCL_SOCKET_IFNAME=<network-interface>
-
-NUM_ROLLOUT=3 ROLLOUT_BATCH_SIZE=1 RAY_NO_WAIT=1 \
-  bash scripts/entrypoint/ray-job.sh \
-  examples/mini_swe_agent/run_mini_swe_agent_pd.sh
-```
-
-Submission is asynchronous. The Ray driver starts the agent server, waits for HTTP readiness, then starts training from this checkout. The driver owns the server until training exits or the job is stopped. The server binds to the node address detected by the Ray entry point, using port `8765` by default; set `AGENT_SERVER_PORT` if that port is occupied.
-
-The command above runs three rollout/training iterations, with one task and eight samples per iteration. It is a small end-to-end run of the real task: the agent still has up to 40 model calls, a response limit of 8192 tokens per call, and a context limit of 32768 tokens. Task execution and scoring can take substantially longer than model generation alone.
-
-| Setting | Recipe default | Meaning |
-| --- | --- | --- |
-| `NUM_ROLLOUT` | `1000` | Number of rollout/training iterations; the command above sets `3` |
-| `ROLLOUT_BATCH_SIZE` | `16` | Task Groups per iteration; the command above sets `1` |
-| Samples per Group | `8` | Matches `r2e.datasets.train.samples` in `agent_config.yaml` |
-| `AGENT_SERVER_TRAIN_CONCURRENCY` | `ROLLOUT_BATCH_SIZE * 8` | Server slots; must cover all resident train Sessions |
-| `AGENT_SERVER_REWARD_CONCURRENCY` | `24` | Maximum simultaneous task-scoring executions |
-| `ENABLE_EVAL` | `0` | Optional SWE-Bench Eval every 100 iterations |
-| `AGENT_SERVER_EVAL_CONCURRENCY` | `64` | Separate Eval slots; at least `50` when Eval is enabled |
-| `MAX_RESPONSE_LEN` / `MAX_CONTEXT_LEN` | `8192` / `32768` | Per-call generation and context limits |
-
-The global training batch is `ROLLOUT_BATCH_SIZE * 8`. Keep the eight-sample Group size aligned with the agent server configuration. Reducing server slots below the resident Session count can prevent complete Groups from reaching their first model request; the script rejects this configuration. Eval also needs its dataset, SIF images, and the wheels required by the Eval setup commands.
-
-The agent's per-model-request timeout and Relax's agent-process active-time limit are both 7200 seconds; they protect different parts of execution. This recipe leaves prelaunch, partial rollout, session KV lifecycle, and program admission disabled.
-
-## PD configuration
-
-The script passes [pd-2p2d-tp2.yaml](../../../examples/mini_swe_agent/pd-2p2d-tp2.yaml) through `--sglang-config`:
+Use `--sglang-config` when you need explicit P/D allocations or per-group SGLang settings. Save the following as a YAML file accessible to the training process:
 
 ```yaml
-# 8 shared GPUs: two prefill engines and two decode engines, each with TP2.
 sglang:
   - name: default
     num_gpus_per_engine: 2
     engine_groups:
       - worker_type: prefill
         num_gpus: 4
-        overrides:
-          enable_hierarchical_cache: false
-          hicache_storage_backend: null
       - worker_type: decode
         num_gpus: 4
-        overrides:
-          enable_hierarchical_cache: false
-          hicache_storage_backend: null
-
 ```
 
-`num_gpus` is the total allocation for one role; `num_gpus_per_engine` splits it into engines. Four GPUs divided by two GPUs per engine creates two engines for each role. Both roles keep hierarchical caching disabled and leave its storage backend unset. Ordinary backend GPU caching follows SGLang's defaults; this example introduces no multi-level cache configuration.
+Replace `--prefill-num-servers 2` in the previous example with the path to that file:
 
-## Router startup and recovery
+```bash
+--sglang-config /path/to/pd-config.yaml
+```
 
-With `power_of_two` decode routing, Relax reserves the router endpoint before creating Agentic Sessions, starts the real prefill and decode engines, then starts the router with those workers. It confirms that every expected worker has the correct role, bootstrap port, and healthy registration before publishing the engine groups. An engine adopts its initial registration without adding itself a second time.
+The YAML describes the same two-prefill, two-decode allocation. The path above is a placeholder for your own file.
 
-This managed startup path requires native, framework-launched SGLang engines with `dp_size=1`, at least one prefill engine, and at least two decode engines. The example provides two of each. External engines, custom engine classes, DP-aware worker identities, and mixed regular/PD groups are outside this path. Use the fixed topology here; dynamic PD scale-out is not supported.
+- `num_gpus` is the total GPU allocation for a group. It must be divisible by that group's `num_gpus_per_engine`.
+- A group's `num_gpus_per_engine` overrides the model-level value, which otherwise falls back to `--rollout-num-gpus-per-engine`. Different P/D engine sizes still require support from the model and transfer backend.
+- The sum of all `num_gpus` values must match the effective `--rollout-num-gpus` allocation.
+- An optional group-level `overrides` mapping accepts SGLang `ServerArgs` field names, such as `mem_fraction_static`, without the `sglang_` prefix. These values override the corresponding `--sglang-*` arguments.
 
-The example enables Relax's fault tolerance. Before replacing a dead managed PD engine, the manager confirms that its old router registration is removed. Replacement registration must become healthy before recovery returns, and the training loop updates recovered engines' weights before the next rollout. If startup or registration validation fails, Relax cleans up the engines and router it owns. This does not promise that every in-flight Agent request survives an engine failure; the run may need a restart when the request cannot be recovered.
+## Request flow
 
-To use consistent hashing for decode while keeping the same eight-GPU task and topology, append this argument to the launch command:
+1. The SGLang router selects a prefill engine and a decode engine for the request.
+2. The prefill engine processes the prompt. SGLang transfers the resulting KV state to the decode engine through its transfer backend.
+3. The decode engine generates tokens, and the router returns the response to the caller.
+
+Relax configures the P/D worker roles, bootstrap ports, and router registration from the engine groups. The training weight-update path covers both prefill and decode engines.
+
+## Size the pools
+
+Long prompts and concurrent generation are useful workloads for evaluating PD: separating the phases can reduce interference between prompt processing and ongoing decode. Short prompts or low concurrency may not provide enough work to offset routing and KV-transfer overhead.
+
+Compare against a non-PD run with the same total rollout GPUs, model, request lengths, and concurrency. Measure end-to-end rollout time as well as queueing, time to first token, and decode throughput. Adjust the allocation according to the bottleneck:
+
+| Observation | Adjustment to evaluate |
+| --- | --- |
+| Prefill queues grow while decode has spare capacity | Allocate more engines to prefill |
+| Decode queues grow while prefill has spare capacity | Allocate more engines to decode |
+| Both pools remain saturated | Increase total resources or reduce request concurrency |
+| KV transfer dominates latency | Check the transfer backend, network interfaces, and bandwidth before changing the P/D ratio |
+
+With a fixed GPU budget, adding capacity to one pool reduces capacity in the other. Change the allocation between runs; runtime PD scale-out is not currently supported.
+
+## Routing and limits
+
+The example explicitly selects `consistent_hashing` for prefill and `power_of_two` for decode. To use consistent hashing for decode as well, replace the decode policy:
 
 ```bash
 --sglang-router-decode-policy consistent_hashing
 ```
 
-This uses the existing dynamic registration path. The managed static startup described above applies to `power_of_two`.
+For a Relax-managed router using `power_of_two` on decode, Relax starts the engines before starting the router with their addresses. It checks worker roles, prefill bootstrap ports, and healthy registration before making the deployment available. This startup path requires:
 
-## Follow progress and stop
+- Native SGLang engines launched by Relax, with at least one prefill engine and two decode engines.
+- `dp_size=1` on both sides and no DP-aware routing.
+- P/D worker groups without mixed `regular` workers; custom engine classes are not supported by this path.
 
-```bash
-ray job status --address "$RAY_JOB_ADDRESS" "$RUN_ID"
-ray job logs --address "$RAY_JOB_ADDRESS" "$RUN_ID"
-tail -f "$EXP_ROOT/agent_server/server.log"
+The managed startup sequence applies to the explicit `--sglang-router-decode-policy power_of_two` setting. Using `consistent_hashing` for decode follows the dynamic worker-registration path. Dynamic registration does not imply support for resizing P/D pools at runtime.
 
-ray job stop --address "$RAY_JOB_ADDRESS" "$RUN_ID"
-```
+PD uses the SGLang router; `--use-slime-router` does not support it.
 
-Look for successful task setup, repeated model/tool turns, completed Sessions with rewards, rollout export, and optimizer steps. For a PD run, confirm two prefill and two decode engines are registered and that their weight versions agree after each update. A submitted job or a ready agent server alone does not demonstrate a completed training cycle.
+## Troubleshooting
 
-The agent server writes logs and Session events under `$EXP_ROOT/agent_server`; Relax writes rollout details under `$EXP_ROOT/dump`. When training ends, the driver stops its server, whose shutdown handler cleans up its Sessions and Apptainer instances.
-
-If startup fails, inspect the job log and server log before resubmitting. A bind failure means the configured agent port is already in use. Missing parquet, SIF, or wheel errors belong to the Mini SWE setup. PD initialization or transfer errors require checking the model/backend version, Mooncake availability, and communication interfaces. For GPU OOM, first reduce `ROLLOUT_BATCH_SIZE`; preserve the 2P2D TP2 allocation while checking memory limits.
-
-For the resident Session and export contracts, see [Agentic Rollout](./agentic-rollout.md). For separate training and rollout scheduling, see [Fully Async](./fully-async-training.md).
+| Symptom | Check |
+| --- | --- |
+| GPU allocation error | Match the YAML total to the effective rollout GPU count and check each group's engine size |
+| Router startup or registration failure | Check P/D engine counts, worker roles, DP settings, and prefill bootstrap connectivity |
+| KV transfer timeout | Check model/backend compatibility, transfer dependencies, and communication interfaces |
+| GPU OOM | Reduce request concurrency or context length, then check per-engine memory settings |

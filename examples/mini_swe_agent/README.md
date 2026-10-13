@@ -158,8 +158,8 @@ original `run_mini_swe_agent.sh` is unchanged. Use the PD script through
 driver owns the agent server so asynchronous submission keeps the server alive.
 
 See the [English PD guide](../../docs/en/guide/pd-disaggregation.md) or
-[中文 PD 指南](../../docs/zh/guide/pd-disaggregation.md) for setup, the complete
-launch command, Group capacity settings, and cleanup.
+[中文 PD 指南](../../docs/zh/guide/pd-disaggregation.md) for general PD
+configuration, resource allocation, routing policies, and limitations.
 
 ## Runtime data flow
 
