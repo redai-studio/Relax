@@ -206,8 +206,7 @@ def test_managed_pd_adopts_registry_before_publishing_groups(monkeypatch, rollou
     assert all(group.skip_router_registration for group in groups)
 
 
-@pytest.mark.parametrize("phase", ["engine_init", "registry", "adoption"])
-def test_startup_failure_rolls_back_only_owned_resources(monkeypatch, rollout_module, phase):
+def test_startup_failure_rolls_back_only_owned_resources(monkeypatch, rollout_module):
     existing, created = Mock(), Mock()
     existing.is_alive.return_value = created.is_alive.return_value = True
     created.join.side_effect = lambda **kwargs: setattr(created.is_alive, "return_value", False)
@@ -219,10 +218,10 @@ def test_startup_failure_rolls_back_only_owned_resources(monkeypatch, rollout_mo
     def fail(args, pg, groups):
         groups.append(group)
         rollout_module._LAUNCHED_ROUTER_PROCESSES.append(created)
-        raise RuntimeError(phase)
+        raise RuntimeError("startup failed")
 
     monkeypatch.setattr(rollout_module, "_start_rollout_servers_impl", fail)
-    with pytest.raises(RuntimeError, match=phase):
+    with pytest.raises(RuntimeError, match="startup failed"):
         rollout_module.start_rollout_servers(_router_args(), None)
     shutdown.assert_called_once_with({0})
     created.terminate.assert_called_once()

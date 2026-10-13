@@ -646,40 +646,8 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     return adapter
 
 
-async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch) -> None:
-    payloads: list[dict[str, Any]] = []
-
-    async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
-        del url, headers, fail_fast_no_workers
-        payloads.append(dict(payload))
-        return {
-            "output_ids": [4],
-            "meta_info": {"output_token_logprobs": [], "finish_reason": {"type": "stop"}},
-        }
-
-    monkeypatch.setattr(runtime_mod, "post", fake_post)
-    adapter = _backend_adapter(lifecycle_enabled=True)
-    await adapter.generate(
-        input_ids=[1, 2, 3],
-        sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-1:0",
-    )
-    assert payloads[-1]["session_id"] == "session-9"
-    assert payloads[-1]["rid"] == "request-1:0"
-
-    adapter._session_lifecycle = False
-    await adapter.generate(
-        input_ids=[1, 2, 3],
-        sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-2:0",
-    )
-    assert "session_id" not in payloads[-1]
-
-
 @pytest.mark.parametrize("lifecycle_enabled", [False, True])
-async def test_pd_generate_preserves_full_history_and_routing_key(monkeypatch, lifecycle_enabled) -> None:
+async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
     calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
@@ -692,7 +660,7 @@ async def test_pd_generate_preserves_full_history_and_routing_key(monkeypatch, l
     monkeypatch.setattr(runtime_mod, "post", fake_post)
     adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
     adapter._args.sglang_router_policy = "consistent_hashing"
-    adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the PD router"))
+    adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the router"))
     result = await adapter.generate(
         input_ids=[1, 2, 3],
         sampling_params={"max_new_tokens": 4},
@@ -706,7 +674,10 @@ async def test_pd_generate_preserves_full_history_and_routing_key(monkeypatch, l
     assert url == "http://10.0.0.1:8000/generate"
     assert payload["input_ids"] == [1, 2, 3] and payload["rid"] == "r"
     assert "session_params" not in payload
-    assert payload.get("session_id") == ("s" if lifecycle_enabled else None)
+    if lifecycle_enabled:
+        assert payload["session_id"] == "s"
+    else:
+        assert "session_id" not in payload
     assert headers == {"X-SMG-Routing-Key": "s"} and fail_fast is True
     assert result.meta_info["weight_version"] == "7"
     adapter._worker_urls.assert_not_awaited()

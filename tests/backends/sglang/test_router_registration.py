@@ -7,6 +7,7 @@ import threading
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
 
@@ -612,39 +613,28 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
     engine.process = None  # Do not exercise the destructor with the fake pid.
 
 
-def test_pd_registration_lost_response_reconciles_without_another_post(monkeypatch, sglang_engine_module):
+@pytest.mark.parametrize(
+    "error,pending,post_count",
+    [
+        pytest.param(ReadTimeout("accepted but response lost"), True, 1, id="lost-response"),
+        pytest.param(ConnectTimeout("not connected"), False, 2, id="connect-timeout"),
+    ],
+)
+def test_pd_registration_retries_after_timeout(monkeypatch, sglang_engine_module, error, pending, post_count):
     from unittest.mock import Mock
-
-    import requests
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
-    post = Mock(side_effect=requests.ReadTimeout("accepted but response lost"))
+    post = Mock(side_effect=[error, _Response(202, {"worker_id": worker["id"]})])
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
     monkeypatch.setattr(sglang_engine_module.requests, "get", Mock(return_value=_Response(200, {"workers": [worker]})))
 
     assert not engine.register_to_router()
-    assert engine._router_registration_pending
+    assert engine._router_registration_pending is pending
     assert engine.register_to_router()
-    assert post.call_count == 1
-    assert engine._router_worker_id == worker["id"]
-
-
-def test_pd_registration_connect_timeout_allows_a_fresh_post(monkeypatch, sglang_engine_module):
-    from unittest.mock import Mock
-
-    import requests
-
-    engine = _pd_engine(sglang_engine_module)
-    worker = _pd_worker(engine)
-    post = Mock(side_effect=[requests.ConnectTimeout("not connected"), _Response(202, {"worker_id": worker["id"]})])
-    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
-    monkeypatch.setattr(sglang_engine_module.requests, "get", Mock(return_value=_Response(200, {"workers": [worker]})))
-
-    assert not engine.register_to_router()
+    assert post.call_count == post_count
     assert not engine._router_registration_pending
-    assert engine.register_to_router()
-    assert post.call_count == 2
+    assert engine._router_worker_id == worker["id"]
 
 
 def test_pd_dead_static_worker_removal_uses_retained_identity(monkeypatch, sglang_engine_module):
