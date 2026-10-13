@@ -621,12 +621,9 @@ class EngineGroup:
                     # OPD per-position token_ids logprob patch: default off, enabled
                     # via env (affects the student engine too, like the teacher).
                     "RELAX_OPD_PER_POS_TOKEN_IDS": "0",
-                    # OPD pre-expanded multimodal patch: passed through to the
-                    # student engine too, because advantage mode sends
-                    # opd_preexpanded_raw requests to the student (student-at-
-                    # teacher-topk prefill).  The patch makes the student SGLang
-                    # skip retokenize/detokenize for expanded input_ids + image_data.
-                    "RELAX_OPD_PREEXPANDED_PATCH": "0",
+                    # Native image OPD preserves sampled response IDs through
+                    # SGLang's processor; returned IDs are checked per request.
+                    "SGLANG_MM_AVOID_RETOKENIZE": "true",
                     # The TP memory-imbalance check is overly conservative under
                     # colocate (the actor occupies GPUs at engine init and is
                     # offloaded before rollout), so disable it. Recent SGLang reads

@@ -91,14 +91,12 @@ def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
 
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default
-    # "0"); set it so the test verifies the pass-through, not the default value.
-    monkeypatch.setenv("RELAX_OPD_PREEXPANDED_PATCH", "1")
+    monkeypatch.setenv("SGLANG_MM_AVOID_RETOKENIZE", "false")
     args = SimpleNamespace(fp16=True)
 
     env = teacher_manager._build_teacher_engine_env(args)
 
-    assert env["RELAX_OPD_PREEXPANDED_PATCH"] == "1"
+    assert env["SGLANG_MM_AVOID_RETOKENIZE"] == "true"
     assert env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
     assert env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"
     assert env["SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"

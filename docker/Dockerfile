@@ -173,6 +173,7 @@ RUN cd Megatron-LM && \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     git update-index --refresh && \
@@ -181,5 +182,7 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm sglang.patch; \
+    git apply --check sglang_per_pos_topk.patch && \
+    git apply sglang_per_pos_topk.patch && \
+    rm sglang.patch sglang_per_pos_topk.patch; \
 fi

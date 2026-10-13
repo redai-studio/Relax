@@ -27,6 +27,7 @@ SPECS: dict[str, TokenSelectionSpec] = {
 
 class LogprobResponse:
     def __init__(self, resp: dict | None):
+        self.response = resp or {}
         self.meta = (resp or {}).get("meta_info", {}) or {}
 
     @staticmethod
@@ -69,6 +70,8 @@ class LogprobResponse:
     def _decode_topk_2d(self, prefix: str, response_length: int | None, top_k: int):
         if top_k <= 0:
             return None
+        if f"{prefix}_shape" in self.meta:
+            return self.strict_topk(prefix, response_length, top_k)
         val = self._b64_decode(self.meta.get(f"{prefix}_val_b64"), "float32")
         n = val.size // top_k
         if n <= 0:
@@ -102,6 +105,80 @@ class LogprobResponse:
     def other_topk(self, response_length: int, top_k: int):
         pair = self._decode_topk_2d("input_token_ids_logprobs", response_length, top_k)
         return pair[1] if pair is not None else None
+
+    def validate_native_prefill(self, expected_ids: list[int], response_length: int) -> None:
+        from relax.utils.opd.opd_multimodal import validate_prompt_token_ids
+
+        validate_prompt_token_ids(self.response, expected_ids)
+        values = self.base_logprobs_1d()
+        ids = self._b64_decode(self.meta.get("input_token_logprobs_idx_b64"), "int32")
+        if not ids.size and self.meta.get("input_token_logprobs"):
+            ids = np.asarray([row[1] for row in self.meta["input_token_logprobs"]], dtype=np.int64)
+        if values is None or values.shape != (response_length + 1,) or ids.shape != (response_length + 1,):
+            raise ValueError("Native image OPD requires exactly R+1 input logprobs and token IDs.")
+        if not np.array_equal(ids[1:], expected_ids[-response_length:]):
+            raise ValueError("Native image OPD input logprob token IDs do not match the sampled response.")
+        # The leading None sentinel is represented as NaN by the legacy b64 encoder.
+        if not np.isfinite(values[1:]).all():
+            raise ValueError("Native image OPD returned non-finite response logprobs.")
+
+    def strict_topk(
+        self,
+        prefix: str,
+        response_length: int | None,
+        top_k: int,
+        expected_query_ids: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Decode every response position; never pad rows or silently take a
+        tail."""
+        null_prefix = 0 if prefix.startswith("output_") else 1
+        shape = self.meta.get(f"{prefix}_shape")
+        if shape is not None:
+            if response_length is None:
+                response_length = shape[0]
+            if shape != [response_length, top_k] or self.meta.get(f"{prefix}_null_prefix") != null_prefix:
+                raise ValueError(f"Invalid native {prefix} shape or null prefix.")
+            arrays = []
+            for field, dtype in (("val", "float32"), ("idx", "int32")):
+                key = f"{prefix}_{field}_flat_b64"
+                if key in self.meta:
+                    if self.meta.get(f"{key}_dtype") != dtype:
+                        raise ValueError(f"Unsupported {key} dtype.")
+                    arrays.append(self._b64_decode(self.meta[key], "<f4" if field == "val" else "<i4"))
+                else:
+                    arrays.append(np.asarray(self.meta.get(f"{prefix}_{field}_flat", []), dtype=dtype))
+            values, ids = arrays
+        elif f"{prefix}_val_b64" in self.meta:
+            values = self._b64_decode(self.meta[f"{prefix}_val_b64"], "float32")
+            ids = self._b64_decode(self.meta.get(f"{prefix}_idx_b64"), "int32")
+            for suffix in ("k", "len"):
+                lengths = self.meta.get(f"{prefix}_{suffix}")
+                if lengths is not None and lengths != [0] * null_prefix + [top_k] * response_length:
+                    raise ValueError(f"Invalid per-position lengths for {prefix}.")
+        else:
+            rows = self.meta.get(prefix)
+            if rows is None or len(rows) != response_length + null_prefix:
+                raise ValueError(f"Missing or misaligned {prefix} response rows.")
+            if null_prefix and rows[0] not in (None, []):
+                raise ValueError(f"Missing {prefix} null prefix.")
+            rows = rows[null_prefix:]
+            if any(row is None or len(row) != top_k for row in rows):
+                raise ValueError(f"Missing or incomplete {prefix} response row.")
+            values = np.asarray([item[0] for row in rows for item in row], dtype=np.float32)
+            ids = np.asarray([item[1] for row in rows for item in row], dtype=np.int32)
+        expected_size = response_length * top_k
+        if values.ndim != 1 or ids.ndim != 1 or values.size != expected_size or ids.size != expected_size:
+            raise ValueError(
+                f"Native image OPD requires {response_length} x {top_k} values AND IDs for {prefix}; "
+                "cross-topk queries require a verified per-position SGLang implementation."
+            )
+        values = values.reshape(response_length, top_k)
+        ids = ids.reshape(response_length, top_k)
+        if not np.isfinite(values).all() or np.any(ids < 0):
+            raise ValueError(f"Invalid token IDs or non-finite logprobs in {prefix}.")
+        if expected_query_ids is not None and not np.array_equal(ids, expected_query_ids):
+            raise ValueError(f"Per-position query token IDs differ from the returned {prefix} IDs.")
+        return ids, values
 
 
 def build_prefill_payload_base(input_ids: list[int], logprob_start_len: int) -> dict:
@@ -192,6 +269,7 @@ class TopkWorker:
             query_ids = self._flatten_other_topk_ids(student_topk_ids, response_length, self.top_k)
             if query_ids:
                 payload["token_ids_logprob"] = query_ids
+                payload["sampling_params"]["custom_params"] = {"relax_opd_token_ids_logprob_k": self.top_k}
         if mm_fields:
             payload.update(mm_fields)
         return payload
@@ -211,6 +289,7 @@ class TopkWorker:
             query_ids = self._flatten_other_topk_ids(teacher_topk_ids, response_length, self.top_k)
             if query_ids:
                 payload["token_ids_logprob"] = query_ids
+                payload["sampling_params"]["custom_params"] = {"relax_opd_token_ids_logprob_k": self.top_k}
         if mm_fields:
             payload.update(mm_fields)
         return payload

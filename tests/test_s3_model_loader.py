@@ -110,7 +110,6 @@ def sglang_engine_module(monkeypatch):
     env = ModuleType("relax.utils.env")
     env.Envs = SimpleNamespace(
         RELAX_OPTIMIZE_ROUTING_REPLAY=False,
-        RELAX_OPD_PREEXPANDED_PATCH=False,
         RELAX_OPD_PER_POS_TOKEN_IDS=False,
         RELAX_OPD_TOKEN_IDS_LOGPROB_K="0",
         RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,

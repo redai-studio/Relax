@@ -13,11 +13,10 @@ import torch.distributed as dist
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.utils.logging_utils import get_logger
-from relax.utils.opd import opd_opsd_worker
 
 
 if TYPE_CHECKING:
-    from relax.utils.types import RolloutBatch, Sample
+    from relax.utils.types import RolloutBatch
 
 
 logger = get_logger(__name__)
@@ -911,82 +910,6 @@ def validate_opd_args(args: Namespace, *, is_offline: bool, log: Any = logger) -
                 "single external teacher, or use the Relax-managed path: --teacher-hf-checkpoint "
                 "(single) / --opd-teacher-routes (multi) with a 'teacher' entry in --resource."
             )
-
-
-# ============================================================================
-# Multimodal image encoding helpers (raw base64 PNG for opd_preexpanded_raw)
-# ============================================================================
-
-
-def _to_jsonable(x):
-    """Convert a tensor / ndarray to nested Python lists for JSON transport."""
-    if x is None:
-        return None
-    tolist = getattr(x, "tolist", None)
-    return tolist() if callable(tolist) else x
-
-
-async def _encode_images_b64(raw_images: list, cache_key: str, mm_dict: dict | None) -> list[str]:
-    """Parallel-encode raw images to base64, with group-level dedup cache.
-
-    ``cache_key`` is the attribute name on the shared ``mm_dict`` to cache the
-    result (so 8 samples in a group encode each image at most once per step).
-    """
-    import asyncio
-
-    from relax.utils.data.processing_utils import async_encode_image_for_rollout_engine
-
-    if mm_dict is None:
-        return list(await asyncio.gather(*(async_encode_image_for_rollout_engine(img) for img in raw_images)))
-    cached = mm_dict.get(cache_key)
-    if cached is None:
-        cached = list(await asyncio.gather(*(async_encode_image_for_rollout_engine(img) for img in raw_images)))
-        mm_dict[cache_key] = cached
-    return cached
-
-
-async def build_teacher_preexpanded_image_data(sample: "Sample") -> list | None:
-    """Build image_data for the teacher forward request (OPSD path).
-
-    Ships raw base64 images + teacher image_grid_thw via
-    format=opd_preexpanded_raw. Returns None when there are no images (text-
-    only path).
-    """
-    image_b64_list = getattr(sample, "teacher_image_b64_list", None)
-    image_grid_thw = getattr(sample, "teacher_image_grid_thw", None)
-    if not image_b64_list or image_grid_thw is None:
-        return None
-    return [
-        {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
-            "images_b64": list(image_b64_list),
-            "image_grid_thw": _to_jsonable(image_grid_thw),
-        }
-    ]
-
-
-async def build_student_preexpanded_image_data(sample: "Sample") -> list | None:
-    """Build image_data for the student extra forward request (student-at-
-    teacher-topk).
-
-    The student SGLang has the same opd_preexpanded_raw patch. Ships raw base64
-    images (from sample.multimodal_inputs, cached) + student image_grid_thw.
-    Returns None for text-only samples.
-    """
-    student_mm_train_inputs = getattr(sample, "multimodal_train_inputs", None) or {}
-    image_grid_thw = student_mm_train_inputs.get("image_grid_thw")
-    student_mm_in = sample.multimodal_inputs or {}
-    raw_images = student_mm_in.get("images") or []
-    if image_grid_thw is None or not raw_images:
-        return None
-    cached = await _encode_images_b64(raw_images, "_student_image_b64_cache", student_mm_in)
-    return [
-        {
-            "format": opd_opsd_worker.PREEXPANDED_RAW_FORMAT,
-            "images_b64": cached,
-            "image_grid_thw": _to_jsonable(image_grid_thw),
-        }
-    ]
 
 
 def _get_opd_transfer_schema(args: Namespace) -> list[str]:

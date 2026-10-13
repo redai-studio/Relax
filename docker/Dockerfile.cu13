@@ -229,6 +229,7 @@ RUN . /etc/relax_build.env && \
     python /tmp/build_flashinfer_sampling.py
 
 COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
+COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     sha256sum sglang.patch > /etc/relax-sglang-patch.sha256 && \
@@ -238,7 +239,9 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     echo "Patch failed to apply cleanly. Please resolve conflicts." && \
     exit 1; \
     fi && \
-    rm sglang.patch; \
+    git apply --check sglang_per_pos_topk.patch && \
+    git apply sglang_per_pos_topk.patch && \
+    rm sglang.patch sglang_per_pos_topk.patch; \
 fi
 
 # Complete --no-deps installs, match Energon's fsspec, and retain audioread for multimodal imports.
