@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -136,13 +137,14 @@ def _router_args(**changes):
     )
 
 
-def test_managed_pd_keeps_endpoint_published_to_agentic_clients(monkeypatch, rollout_module):
+def test_managed_pd_defers_endpoint_until_owner_starts_router(monkeypatch, rollout_module):
     from sglang_router.launch_router import RouterArgs
 
     args = _router_args()
     monkeypatch.setattr(rollout_module, "get_host_info", lambda: ("host", "192.0.2.1"))
     monkeypatch.setattr(rollout_module, "Envs", SimpleNamespace(SLIME_HOST_IP=None))
-    monkeypatch.setattr(rollout_module, "find_available_port", lambda port: port)
+    find_port = Mock(side_effect=lambda port: port)
+    monkeypatch.setattr(rollout_module, "find_available_port", find_port)
     process = Mock()
     process.is_alive.return_value = True
     constructor = Mock(return_value=process)
@@ -150,13 +152,17 @@ def test_managed_pd_keeps_endpoint_published_to_agentic_clients(monkeypatch, rol
     router_args = SimpleNamespace()
     monkeypatch.setattr(RouterArgs, "from_cli_args", lambda *a, **k: router_args)
 
-    endpoint = rollout_module._start_router(args, has_pd_disaggregation=True)
+    assert rollout_module._start_router(args, has_pd_disaggregation=True) == (None, None)
     constructor.assert_not_called()
-    args.sglang_router_ip, args.sglang_router_port = endpoint
+    find_port.assert_not_called()
+    assert (args.sglang_router_ip, args.sglang_router_port) == (None, 3000)
     monkeypatch.setattr(rollout_module, "get_host_info", lambda: ("owner", "192.0.2.2"))
 
-    assert rollout_module._start_router(args, has_pd_disaggregation=True, initial_pd_workers=_specs()) == endpoint
-    assert router_args.host == "192.0.2.1" and router_args.port == 3000
+    assert rollout_module._start_router(args, has_pd_disaggregation=True, initial_pd_workers=_specs()) == (
+        "192.0.2.2",
+        3000,
+    )
+    assert router_args.host == "192.0.2.2" and router_args.port == 3000
     assert router_args.prefill_urls == [("http://p:8000", 9000)]
     assert router_args.decode_urls == ["http://d1:8000", "http://d2:8000"]
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [process]
@@ -206,7 +212,8 @@ def test_managed_pd_adopts_registry_before_publishing_groups(monkeypatch, rollou
     assert all(group.skip_router_registration for group in groups)
 
 
-def test_startup_failure_rolls_back_only_owned_resources(monkeypatch, rollout_module):
+@pytest.mark.parametrize("fail_at", ["engines", "publication", None])
+def test_startup_publishes_ready_router_or_rolls_back_owned_resources(monkeypatch, rollout_module, fail_at):
     existing, created = Mock(), Mock()
     existing.is_alive.return_value = created.is_alive.return_value = True
     created.join.side_effect = lambda **kwargs: setattr(created.is_alive, "return_value", False)
@@ -215,18 +222,34 @@ def test_startup_failure_rolls_back_only_owned_resources(monkeypatch, rollout_mo
     shutdown = Mock()
     monkeypatch.setattr(group, "shutdown_engines", shutdown)
 
-    def fail(args, pg, groups):
+    def start(args, pg, groups):
         groups.append(group)
         rollout_module._LAUNCHED_ROUTER_PROCESSES.append(created)
-        raise RuntimeError("startup failed")
+        if fail_at == "engines":
+            raise RuntimeError("startup failed")
+        args.sglang_router_ip, args.sglang_router_port = "ready-router", 3000
+        return {"default": group}
 
-    monkeypatch.setattr(rollout_module, "_start_rollout_servers_impl", fail)
-    with pytest.raises(RuntimeError, match="startup failed"):
-        rollout_module.start_rollout_servers(_router_args(), None)
-    shutdown.assert_called_once_with({0})
-    created.terminate.assert_called_once()
+    publish = Mock(side_effect=RuntimeError("startup failed") if fail_at == "publication" else None)
+    monkeypatch.setitem(sys.modules, "relax.agentic.rollout", SimpleNamespace(bind_agentic_router=publish))
+    monkeypatch.setattr(rollout_module, "_start_rollout_servers_impl", start)
+    args = _router_args(use_agentic_rollout=True)
+    if fail_at is None:
+        assert rollout_module.start_rollout_servers(args, None) == {"default": group}
+        shutdown.assert_not_called()
+        created.terminate.assert_not_called()
+        assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [existing, created]
+    else:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            rollout_module.start_rollout_servers(args, None)
+        shutdown.assert_called_once_with({0})
+        created.terminate.assert_called_once()
+        assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [existing]
     existing.terminate.assert_not_called()
-    assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [existing]
+    if fail_at == "engines":
+        publish.assert_not_called()
+    else:
+        publish.assert_called_once_with("ready-router", 3000)
 
 
 def test_router_cleanup_retains_failed_process_for_retry(rollout_module):

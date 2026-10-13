@@ -384,14 +384,18 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
 def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+    ]
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
     ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
-    exec(compile(ast.Module(body=[method], type_ignores=[]), "controller.py", "exec"), ns)
+    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
         serve_dict={},
@@ -399,6 +403,7 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
         _shutdown_agentic_rollout_services=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
+    partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()

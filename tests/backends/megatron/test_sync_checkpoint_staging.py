@@ -1,12 +1,9 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Round-trip the deployment patch against the installed Megatron/PyTorch
-writer."""
+"""Round-trip checkpoints through the installed Megatron/PyTorch writer."""
 
 import importlib.util
 import queue
-import shutil
-import subprocess
 import sys
 import time
 import weakref
@@ -17,26 +14,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
-ROOT = Path(__file__).resolve().parents[3]
-PATCH = ROOT / "docker/patch/megatron/sync-save-bounded-staging.patch"
 
 
 @pytest.fixture
-def writer_module(tmp_path, monkeypatch):
+def writer_module(monkeypatch):
     import megatron.core.dist_checkpointing.strategies.filesystem_async as original
 
-    relative = Path("megatron/core/dist_checkpointing/strategies")
-    destination = tmp_path / relative
-    destination.mkdir(parents=True)
-    for name in ("filesystem_async.py", "torch.py"):
-        shutil.copy2(Path(original.__file__).parent / name, destination / name)
-    check = subprocess.run(["git", "apply", "--check", str(PATCH)], cwd=tmp_path, capture_output=True)
-    if check.returncode == 0:
-        subprocess.run(["git", "apply", str(PATCH)], cwd=tmp_path, check=True)
-    else:
-        subprocess.run(["git", "apply", "--reverse", "--check", str(PATCH)], cwd=tmp_path, check=True)
     name = original.__name__
-    spec = importlib.util.spec_from_file_location(name, destination / "filesystem_async.py")
+    spec = importlib.util.spec_from_file_location(name, original.__file__)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)

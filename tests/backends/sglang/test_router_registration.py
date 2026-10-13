@@ -614,18 +614,30 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
 
 
 @pytest.mark.parametrize(
-    "error,pending,post_count",
+    "response,pending,post_count",
     [
         pytest.param(ReadTimeout("accepted but response lost"), True, 1, id="lost-response"),
         pytest.param(ConnectTimeout("not connected"), False, 2, id="connect-timeout"),
+        pytest.param(_Response(400), False, 2, id="bad-request"),
+        pytest.param(
+            _Response(500, {"error": "Job queue not initialized", "code": "INTERNAL_SERVER_ERROR"}),
+            False,
+            2,
+            id="queue-rejected",
+        ),
+        pytest.param(_Response(500), True, 1, id="unknown-server-error"),
+        pytest.param(_Response(503), True, 1, id="gateway-unavailable"),
+        pytest.param(_Response(408), True, 1, id="gateway-timeout"),
     ],
 )
-def test_pd_registration_retries_after_timeout(monkeypatch, sglang_engine_module, error, pending, post_count):
+def test_pd_registration_retries_only_unsubmitted_requests(
+    monkeypatch, sglang_engine_module, response, pending, post_count
+):
     from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
     worker = _pd_worker(engine)
-    post = Mock(side_effect=[error, _Response(202, {"worker_id": worker["id"]})])
+    post = Mock(side_effect=[response, _Response(202, {"worker_id": worker["id"]})])
     monkeypatch.setattr(sglang_engine_module.requests, "post", post)
     monkeypatch.setattr(sglang_engine_module.requests, "get", Mock(return_value=_Response(200, {"workers": [worker]})))
 

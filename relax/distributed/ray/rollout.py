@@ -4765,12 +4765,13 @@ def _start_router(
     has_pd_disaggregation: bool = False,
     force_new: bool = False,
     initial_pd_workers: list[dict] | None = None,
-) -> tuple[str, int]:
+) -> tuple[str | None, int | None]:
     """Start sgl router or slime router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
-    ``force_new`` is True (multi-model), always allocate a fresh port.
+    ``force_new`` is True (multi-model), always allocate a fresh port. Managed
+    P2C startup returns ``(None, None)`` until initial workers exist.
     """
     endpoint = (args.sglang_router_ip, args.sglang_router_port)
     owns_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
@@ -4780,6 +4781,18 @@ def _start_router(
         return args.sglang_router_ip, args.sglang_router_port
     if not force_new and owns_endpoint and any(proc.is_alive() for proc in _LAUNCHED_ROUTER_PROCESSES):
         raise RuntimeError("A managed PD router is already running; reconcile it before another startup")
+
+    if (
+        initial_pd_workers is None
+        and not force_new
+        and has_pd_disaggregation
+        and not args.use_slime_router
+        and not getattr(args, "debug_train_only", False)
+        and getattr(args, "router_decode_policy", None) == "power_of_two"
+    ):
+        # The owner chooses and binds the endpoint after engines are ready.
+        # SessionShards receive it only after the registry has been verified.
+        return None, None
 
     # Determine the bind address (can be 0.0.0.0 / wildcard) and the connection
     # address (must be a reachable IP for engines).  When SLIME_HOST_IP is set
@@ -4804,28 +4817,6 @@ def _start_router(
         router_port = args.sglang_router_port
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
-
-    if owns_endpoint and not force_new:
-        # This address may already be held by remote SessionShard clients.
-        # Never replace it with the later owner's independently resolved IP.
-        router_ip, router_port = endpoint
-        bind_ip = getattr(args, "_relax_managed_pd_router_bind_ip", bind_ip)
-
-    # Agentic ingress creates SessionShard configs before RolloutManager owns
-    # the GPU engines. Publish a stable managed endpoint now; the owner starts
-    # the native P2C router there only after it has real healthy P/D workers.
-    if (
-        initial_pd_workers is None
-        and not force_new
-        and has_pd_disaggregation
-        and not args.use_slime_router
-        and not getattr(args, "debug_train_only", False)
-        and getattr(args, "router_decode_policy", None) == "power_of_two"
-    ):
-        args._relax_managed_pd_router_endpoint = (router_ip, router_port)
-        args._relax_managed_pd_router_bind_ip = bind_ip
-        logger.info("Reserve managed PD router endpoint %s:%s until engines are ready", router_ip, router_port)
-        return router_ip, router_port
 
     if args.use_slime_router:
         assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
@@ -4953,15 +4944,12 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
     ):
         raise ValueError("Initialized engines do not match the configured PD groups")
     _validate_initial_pd_workers(specs)
-    reserved_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None)
     router_ip, router_port = _start_router(
         args,
         has_pd_disaggregation=True,
         force_new=force_new,
         initial_pd_workers=specs,
     )
-    if reserved_endpoint is not None and not force_new and (router_ip, router_port) != reserved_endpoint:
-        raise RuntimeError("Managed PD router changed an endpoint already published to SessionShard clients")
     registry = _wait_pd_router_workers(router_ip, router_port, specs)
     results = ray.get(
         [
@@ -5104,7 +5092,12 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
     groups: list[EngineGroup] = []
     routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
     try:
-        return _start_rollout_servers_impl(args, pg, groups)
+        servers = _start_rollout_servers_impl(args, pg, groups)
+        if getattr(args, "use_agentic_rollout", False):
+            from relax.agentic.rollout import bind_agentic_router
+
+            bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
+        return servers
     except Exception:
         _rollback_rollout_startup(groups, routers_before)
         raise

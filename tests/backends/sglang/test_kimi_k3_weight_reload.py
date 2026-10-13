@@ -1,74 +1,22 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CPU regression checks for K3 hooks in the repository's SGLang patch."""
+"""CPU regression checks for K3 hooks in the installed SGLang source."""
 
 import ast
-import importlib.util
-import os
-import subprocess
-import textwrap
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.backends.sglang.source_utils import sglang_source_path
+
 
 torch = pytest.importorskip("torch")
-PATCH = Path(__file__).resolve().parents[3] / "docker/patch/sglang/v0.5.17.patch"
-
-
-def _source_path(relative: str) -> Path:
-    root = os.environ.get("SGLANG_TEST_SOURCE_ROOT")
-    source_override = root is not None
-    if root is None:
-        spec = importlib.util.find_spec("sglang")
-        if spec is None:
-            pytest.skip("Requires SGLang source or SGLANG_TEST_SOURCE_ROOT")
-        root = str(Path(spec.origin).parent)
-    path = Path(root) / relative
-    if not path.exists():
-        if not source_override:
-            pytest.skip("Requires a SGLang version with Kimi K3")
-        pytest.fail(f"Missing SGLang source: {path}")
-    return path
-
-
-def _patch_section(relative: str) -> str:
-    header = f"diff --git a/python/sglang/{relative} b/python/sglang/{relative}\n"
-    return header + PATCH.read_text().split(header, 1)[1].split("\ndiff --git ", 1)[0]
 
 
 @pytest.fixture(scope="module")
-def kimi_source(tmp_path_factory):
-    # CI may still use the previous image. Apply the checked-in patch to an
-    # isolated copy instead of accidentally exercising its installed old hooks.
-    root = tmp_path_factory.mktemp("sglang-k3-reload")
-    relative = "srt/models/kimi_k3.py"
-    destination = root / "python/sglang" / relative
-    destination.parent.mkdir(parents=True)
-    destination.write_text(_source_path(relative).read_text())
-    patch = _patch_section(relative)
-    check = subprocess.run(["git", "apply", "--check", "-"], input=patch, text=True, cwd=root, capture_output=True)
-    if check.returncode == 0:
-        subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=root, check=True)
-    else:
-        # An already-patched image is supported, but a mismatched source must
-        # fail rather than silently dropping the regression checks.
-        subprocess.run(["git", "apply", "--reverse", "--check", "-"], input=patch, text=True, cwd=root, check=True)
-    return ast.parse(destination.read_text())
-
-
-def _added_patch_function(relative: str, name: str, namespace: dict):
-    # ModelRunner.post_process_weights is a complete added method in this patch;
-    # read it directly so an older installed implementation cannot win.
-    lines = _patch_section(relative).splitlines()
-    start = lines.index(f"+    def {name}(")
-    added = []
-    for line in lines[start:]:
-        if not line.startswith("+"):
-            break
-        added.append(line[1:])
-    return _function(ast.parse(textwrap.dedent("\n".join(added))), name, namespace)
+def kimi_source():
+    # CI rebuilds the image when docker/patch changes; exercise that artifact.
+    return ast.parse(sglang_source_path("srt/models/kimi_k3.py").read_text())
 
 
 def _function(tree: ast.AST, name: str, namespace: dict):
@@ -80,7 +28,7 @@ def _function(tree: ast.AST, name: str, namespace: dict):
 @pytest.fixture
 def hooks(kimi_source):
     ns = {"torch": torch, "ReplicatedLinear": object, "RMSNorm": object}
-    _function(ast.parse(_source_path("srt/layers/attn_residual.py").read_text()), "get_cw", ns)
+    _function(ast.parse(sglang_source_path("srt/layers/attn_residual.py").read_text()), "get_cw", ns)
     for name in ("PPMissingLayer", "KimiK3MoE", "KimiK3DeltaAttention"):
         ns[name] = type(name, (), {})
     return kimi_source, ns
@@ -253,8 +201,10 @@ def test_k3_runner_finishes_deferred_refresh_after_repack(monkeypatch):
         named_modules=lambda: [("expert", SimpleNamespace(quant_method=quant))],
     )
     runner = SimpleNamespace(device="cpu", model=model)
-    post_process = _added_patch_function(
-        "srt/model_executor/model_runner.py", "post_process_weights", {"torch": torch}
+    post_process = _function(
+        ast.parse(sglang_source_path("srt/model_executor/model_runner.py").read_text()),
+        "post_process_weights",
+        {"torch": torch},
     )
     assert post_process(runner, restore_weights_before_load=True)[0]
     assert calls == ["begin", "restore"]

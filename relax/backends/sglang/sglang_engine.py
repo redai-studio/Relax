@@ -1154,6 +1154,23 @@ class SGLangEngine(RayActor):
                     if required:
                         self._router_registration_pending = False
                     raise
+                if required and response.status_code >= 400:
+                    # Client rejections and the router's queue errors prove
+                    # that no registration was submitted. A gateway timeout
+                    # or an unrecognized server error can still hide acceptance.
+                    rejected = 400 <= response.status_code < 500 and response.status_code != 408
+                    if response.status_code == 500:
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            body = None
+                        rejected = (
+                            isinstance(body, dict)
+                            and body.get("code") == "INTERNAL_SERVER_ERROR"
+                            and isinstance(body.get("error"), str)
+                        )
+                    if rejected:
+                        self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
             if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:

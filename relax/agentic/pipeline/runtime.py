@@ -890,6 +890,16 @@ class RuntimeDomain:
 
         return sum(len(shard.group_streams) for shard in self._shards)
 
+    async def bind_router(self, router_ip: str, router_port: int) -> None:
+        """Wait until all Session owners can use the verified endpoint."""
+        handles = [shard.handle for shard in self._shards]
+        if self._admission_coordinator is not None:
+            handles.append(self._admission_coordinator)
+        await asyncio.wait_for(
+            asyncio.gather(*(handle.set_router_address.remote(router_ip, router_port) for handle in handles)),
+            timeout=getattr(self.args, "rollout_engine_init_timeout", 3600.0),
+        )
+
     @property
     def interrupted_group_ids(self) -> Tuple[str, ...]:
         """Derive close credit from current handles and Shard tokens."""
