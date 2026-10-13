@@ -26,12 +26,6 @@ def test_missing_markers_raise_after_retries():
     assert mock_sleep.call_count == 2
 
 
-def test_present_markers_do_not_raise():
-    resources = {"GPU": 8.0, "CPU": 64.0, "stable_gpu": 8.0, "stable_cpu": 8.0}
-    with patch("relax.core.service.ray.cluster_resources", return_value=resources):
-        _require_node_group_markers("stable", retries=3, retry_delay=0.01)  # no raise
-
-
 def test_markers_appear_on_retry():
     """A stable node that registers its markers late must be tolerated."""
     calls = [

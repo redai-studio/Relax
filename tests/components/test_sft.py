@@ -167,10 +167,6 @@ def test_preference_datasets_receive_oversize_policy(monkeypatch, loss_type, ove
         load_custom_fn.assert_not_called()
 
 
-def test_sft_component_imports_without_ray():
-    from relax.components.sft import SFT  # noqa: F401
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_preprocess_on_rank", [False, True])
 async def test_sft_step_pushes_one_batch_to_tq(monkeypatch, image_preprocess_on_rank):

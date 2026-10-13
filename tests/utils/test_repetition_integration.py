@@ -3,18 +3,18 @@
 """Exercise the real rollout metric function, dump writers and offline CLI on
 CPU."""
 
-import importlib.util
 import json
 import random
 import string
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
 from relax.entrypoints.diagnose_repetition import diagnose_dump, main
+from relax.utils.metrics import rollout_metrics as rollout_metrics_module
 from relax.utils.metrics.metric_utils import compression_ratio, has_repetition
 from relax.utils.training.train_dump_utils import (
     save_debug_rollout_data,
@@ -25,63 +25,6 @@ from relax.utils.types import Sample
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-@pytest.fixture
-def rollout_metrics_module(monkeypatch):
-    """Stub deployment-only imports; execute the complete real rollout module.
-
-    Metrics, Sample, dump serialization and the repetition detector stay real.
-    Load under a private name and restore imports to avoid polluting other
-    tests.
-    """
-    before = set(sys.modules)
-
-    def stub(name: str, **attributes: object) -> None:
-        module = ModuleType(name)
-        module.__dict__.update(attributes)
-        monkeypatch.setitem(sys.modules, name, module)
-        parent, _, attribute = name.rpartition(".")
-        if parent in sys.modules:
-            monkeypatch.setattr(sys.modules[parent], attribute, module, raising=False)
-
-    def unused(*args, **kwargs):
-        raise AssertionError("The CPU metrics test must not invoke deployment infrastructure")
-
-    stub("transfer_queue")
-    stub(
-        "sglang.srt.constants",
-        GPU_MEMORY_TYPE_CUDA_GRAPH="graph",
-        GPU_MEMORY_TYPE_KV_CACHE="kv",
-        GPU_MEMORY_TYPE_WEIGHTS="weights",
-    )
-    stub(
-        "relax.backends.sglang.sglang_engine",
-        SGLangEngine=object,
-        RouterWorkerCleanup=object,
-        remove_dead_router_worker=unused,
-    )
-    stub("relax.utils.tracking_utils", init_tracking=unused)
-    stub("relax.utils.opd.opd_utils", compute_mopd_metrics=lambda *args: {})
-    stub("relax.utils.utils", get_ray_accelerator_kwargs=unused)
-    stub("relax.distributed.ray.utils", NOSET_VISIBLE_DEVICES_ENV_VARS_LIST=[], Lock=object)
-    name = "relax.distributed.ray._repetition_test_rollout"
-    spec = importlib.util.spec_from_file_location(name, ROOT / "relax/distributed/ray/rollout.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    try:
-        spec.loader.exec_module(module)
-        yield module
-    finally:
-        monkeypatch.undo()
-        # Newly imported helpers may retain references to the temporary stubs.
-        for imported in set(sys.modules) - before:
-            if imported.startswith("relax."):
-                loaded = sys.modules.pop(imported)
-                parent, _, attribute = imported.rpartition(".")
-                package = sys.modules.get(parent)
-                if package is not None and getattr(package, attribute, None) is loaded:
-                    delattr(package, attribute)
 
 
 def _samples() -> list[Sample]:
@@ -102,7 +45,7 @@ def _samples() -> list[Sample]:
 
 
 @pytest.mark.parametrize("evaluation", [False, True])
-def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, rollout_metrics_module, evaluation) -> None:
+def test_repetition_real_rollout_metrics_dump_writers_and_cli(tmp_path, evaluation) -> None:
     samples = _samples()
     before = [sample.to_dict() for sample in samples]
     args = SimpleNamespace(

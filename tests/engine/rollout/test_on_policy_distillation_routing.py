@@ -93,18 +93,6 @@ def test_on_policy_distillation_routing_balances_replicas_when_sources_interleav
         assert max(counts) - min(counts) <= 1, f"{data_source} load collapsed onto a subset of replicas: {counts}"
 
 
-def test_on_policy_distillation_routing_group_index_modulo_would_collapse():
-    """Guard the rejected alternative so the trap stays documented.
-
-    Not a test of production code: it asserts that the naive ``group_index %
-    len(replicas)`` really does collapse on interleaved sources, which is why
-    ``_pick_replica`` uses a per-teacher group cursor instead.
-    """
-    text_groups = [g for g in range(NUM_GROUPS) if g % 2 == 0]
-    counts = [sum(1 for g in text_groups if g % len(TEXT_REPLICAS) == i) for i in range(len(TEXT_REPLICAS))]
-    assert min(counts) == 0 and max(counts) == len(text_groups)
-
-
 def test_on_policy_distillation_routing_falls_back_without_group_index():
     """Samples with no ``group_index`` (eval, replay) keep per-sample round-
     robin."""

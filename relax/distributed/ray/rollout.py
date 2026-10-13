@@ -14,7 +14,6 @@ import time
 import uuid
 from typing import Any, Optional
 
-import numpy as np
 import ray
 import sglang_router
 import transfer_queue as tq
@@ -25,6 +24,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.rollout_scale_types import (
+    ScaleInRequest,
+    ScaleInStatus,
+    ScaleOutMode,  # noqa: F401 - keep the existing import path
+    ScaleOutRequest,
+    ScaleOutStatus,
+)
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
 from relax.engine.rollout.base_types import call_rollout_fn
 from relax.utils import device as device_utils
@@ -42,18 +48,13 @@ from relax.utils.http_utils import (
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
-from relax.utils.metrics.metric_utils import (
-    compute_pass_rate,
-    compute_rollout_reward_metrics,
-    compute_rollout_step,
-    compute_rollout_stop_reason_and_turn_metrics,
-    compute_statistics,
-    dict_add_prefix,
-    has_repetition,
+from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
+from relax.utils.metrics.rollout_metrics import (
+    compute_metrics_from_samples,
+    compute_mopd_metrics,  # noqa: F401 - keep the existing import path
+    compute_perf_metrics_from_samples,
 )
-from relax.utils.misc import group_by, load_function
-from relax.utils.multimodal.stats import get_sample_multimodal_stats
-from relax.utils.opd.opd_utils import compute_mopd_metrics
+from relax.utils.misc import load_function
 from relax.utils.reload_utils import ReloadableMixin
 from relax.utils.s3_model_loader import (
     build_runai_streamer_env_for_load,
@@ -66,7 +67,6 @@ from relax.utils.training.train_dump_utils import (
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
-from relax.utils.types import Sample
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
@@ -242,185 +242,6 @@ class SglangConfig:
     @property
     def total_num_gpus(self) -> int:
         return sum(m.total_num_gpus for m in self.models)
-
-
-class ScaleOutStatus(str, enum.Enum):
-    """Status states for scale-out requests."""
-
-    PENDING = "PENDING"  # Request received, waiting to process
-    CREATING = "CREATING"  # (ray_native) Creating Ray actors and starting SGLang
-    CONNECTING = "CONNECTING"  # (external) Connecting to external engines
-    HEALTH_CHECKING = "HEALTH_CHECKING"  # Engines started, running health checks
-    WEIGHT_SYNCING = "WEIGHT_SYNCING"  # Engines healthy, syncing weights
-    READY = "READY"  # Weight sync complete, can accept requests
-    ACTIVE = "ACTIVE"  # Registered to router, processing requests
-    PARTIAL = "PARTIAL"  # Partial success: some replicas scaled, others timed out
-    FAILED = "FAILED"  # Scale-out failed
-    REMOVING = "REMOVING"  # Being removed (scale-in or rollback)
-    CANCELLED = "CANCELLED"  # Request cancelled by user
-
-
-class ScaleOutMode(str, enum.Enum):
-    """Scale-out mode."""
-
-    RAY_NATIVE = "ray_native"  # Create new engines in the same Ray cluster
-    EXTERNAL = "external"  # Connect to pre-existing external engines
-
-
-@dataclasses.dataclass
-class ScaleOutRequest:
-    """Represents a scale-out request and its state.
-
-    State Machine:
-        PENDING → CREATING/CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
-            ↓            ↓                    ↓                ↓           ↓
-        CANCELLED    CANCELLED/FAILED      FAILED           FAILED      REMOVING
-
-    PENDING and CREATING states can be cancelled (e.g. when waiting for Ray
-    autoscaler to provision resources).  FAILED state can retry with a new
-    request.
-
-    Mode is auto-detected: if num_replicas > 0, it's ray_native; if engine_urls is provided, it's external.
-    """
-
-    request_id: str  # UUID, unique identifier
-    status: ScaleOutStatus  # Current state in state machine
-    model_name: str = "default"  # Target model name
-
-    # ray_native mode parameters — num_replicas is the *effective* delta to create
-    # (after idempotency filtering: target_total - effective_current)
-    num_replicas: int = 0  # Number of engines to actually create (post-idempotency delta)
-
-    # external mode parameters — URLs already filtered for idempotency
-    engine_urls: list[str] = dataclasses.field(default_factory=list)  # External engine URLs
-
-    # Timeout settings
-    timeout_secs: float = 600.0  # Total timeout for the scale-out operation
-
-    # Metadata
-    created_at: float = 0.0  # Creation timestamp
-    updated_at: float = 0.0  # Last update timestamp
-
-    # Tracking information
-    engine_ids: list[str] = dataclasses.field(default_factory=list)  # Created/connected engine IDs
-    failed_engines: list[str] = dataclasses.field(default_factory=list)  # Failed engine IDs
-    error_message: Optional[str] = None  # Error details if failed
-    weight_version: Optional[str] = None  # Weight version after sync
-    # Deduped category names (e.g. "PROVISION_TIMEOUT") for the monitor to bucket.
-    failure_categories: list[str] = dataclasses.field(default_factory=list)
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = str(uuid.uuid4())
-        if self.created_at == 0.0:
-            self.created_at = time.time()
-        if self.updated_at == 0.0:
-            self.updated_at = self.created_at
-
-    def update_status(self, status: ScaleOutStatus, error_message: Optional[str] = None) -> None:
-        """Update the status and timestamp."""
-        self.status = status
-        self.updated_at = time.time()
-        if error_message:
-            self.error_message = error_message
-
-    def is_terminal(self) -> bool:
-        """Check if the request is in a terminal state."""
-        return self.status in (
-            ScaleOutStatus.FAILED,
-            ScaleOutStatus.ACTIVE,
-            ScaleOutStatus.PARTIAL,
-            ScaleOutStatus.CANCELLED,
-        )
-
-    def can_cancel(self) -> bool:
-        """Check if the request can be cancelled.
-
-        Cancellation is allowed in PENDING and CREATING states.  During
-        CREATING, the request may be waiting for Ray to schedule a placement
-        group (e.g. waiting for cluster auto-scaling).  Setting the status to
-        CANCELLED will be detected by the polling loop in
-        ``_scale_out_ray_native`` which will then clean up and abort.
-        """
-        return self.status in (ScaleOutStatus.PENDING, ScaleOutStatus.CREATING)
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary for API responses."""
-        return {
-            "request_id": self.request_id,
-            "status": self.status.value,
-            "model_name": self.model_name,
-            "num_replicas": self.num_replicas,
-            "engine_urls": self.engine_urls,
-            "engine_ids": self.engine_ids,
-            "failed_engines": self.failed_engines,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "error_message": self.error_message,
-            "weight_version": self.weight_version,
-            "failure_categories": self.failure_categories,
-        }
-
-
-class ScaleInStatus(str, enum.Enum):
-    PENDING = "PENDING"
-    DRAINING = "DRAINING"
-    REMOVING = "REMOVING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-
-
-@dataclasses.dataclass
-class ScaleInRequest:
-    request_id: str
-    status: ScaleInStatus
-    model_name: str = "default"
-    num_replicas: int = 0
-    engine_urls: list[str] = dataclasses.field(default_factory=list)
-    timeout_secs: float = 120.0
-    force: bool = False
-    dry_run: bool = False
-    created_at: float = 0.0
-    updated_at: float = 0.0
-    selected_engines: list[str] = dataclasses.field(default_factory=list)
-    removed_engines: list[str] = dataclasses.field(default_factory=list)
-    failed_engines: list[str] = dataclasses.field(default_factory=list)
-    error_message: Optional[str] = None
-
-    def __post_init__(self):
-        if not self.request_id:
-            self.request_id = str(uuid.uuid4())
-        if self.created_at == 0.0:
-            self.created_at = time.time()
-        if self.updated_at == 0.0:
-            self.updated_at = self.created_at
-
-    def update_status(self, status: ScaleInStatus, error_message: Optional[str] = None) -> None:
-        self.status = status
-        self.updated_at = time.time()
-        if error_message:
-            self.error_message = error_message
-
-    def is_terminal(self) -> bool:
-        return self.status in (ScaleInStatus.COMPLETED, ScaleInStatus.FAILED)
-
-    def to_dict(self) -> dict:
-        return {
-            "request_id": self.request_id,
-            "status": self.status.value,
-            "model_name": self.model_name,
-            "num_replicas": self.num_replicas,
-            "engine_urls": self.engine_urls,
-            "timeout_secs": self.timeout_secs,
-            "force": self.force,
-            "dry_run": self.dry_run,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "selected_engines": self.selected_engines,
-            "removed_engines": self.removed_engines,
-            "failed_engines": self.failed_engines,
-            "error_message": self.error_message,
-        }
 
 
 class EngineGroupLifecycle(str, enum.Enum):
@@ -5058,142 +4879,3 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
-
-
-def compute_metrics_from_samples(
-    args,
-    samples,
-    *,
-    rollout_id: int | None = None,
-    include_rloo_diagnostics: bool = True,
-):
-    if not samples:
-        return {}
-
-    rewarded_samples = [sample for sample in samples if sample.reward is not None]
-    reward_cat_key = args.log_reward_category
-    reward_category_samples = (
-        [sample for sample in rewarded_samples if isinstance(sample.reward, dict) and reward_cat_key in sample.reward]
-        if reward_cat_key is not None
-        else rewarded_samples
-    )
-    response_lengths = [sample.effective_response_length for sample in samples]
-    multimodal_stats = [get_sample_multimodal_stats(sample) for sample in samples]
-
-    log_dict = {}
-    log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
-    log_dict |= _compute_min_mean_max_stats([s["image_count"] for s in multimodal_stats], "image_count/")
-    log_dict |= _compute_min_mean_max_stats(
-        [s["multimodal_token_count"] for s in multimodal_stats], "multimodal_token_count/"
-    )
-    log_dict |= compute_rollout_reward_metrics(
-        args,
-        rewarded_samples,
-        include_rloo_diagnostics=include_rloo_diagnostics,
-    )
-    log_dict |= _compute_zero_std_metrics(args, rewarded_samples)
-    log_dict |= _compute_spec_metrics(args, samples)
-    log_dict |= _compute_prefix_cache_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, reward_category_samples)
-    log_dict |= compute_mopd_metrics(args, rewarded_samples)
-    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
-    log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
-    log_dict |= compute_rollout_stop_reason_and_turn_metrics(samples)
-    if rollout_id is not None and args.partial_rollout and not args.fully_async:
-        staleness_gaps = [rollout_id - sample.metadata.get("start_rollout_id", rollout_id) for sample in samples]
-        log_dict["staleness/avg"] = np.mean(staleness_gaps).item()
-        log_dict["staleness/max"] = np.max(staleness_gaps).item()
-        log_dict["staleness/min"] = np.min(staleness_gaps).item()
-        log_dict["global_batch_size"] = len({sample.index for sample in samples})
-    return log_dict
-
-
-def _compute_min_mean_max_stats(values: list[int], prefix: str) -> dict[str, float]:
-    if not values:
-        return {}
-    return {
-        f"{prefix}mean": np.mean(values).item(),
-        f"{prefix}max": np.max(values).item(),
-        f"{prefix}min": np.min(values).item(),
-    }
-
-
-def compute_perf_metrics_from_samples(args, samples, rollout_time):
-    non_generation_time = [sample.non_generation_time for sample in samples]
-
-    log_dict = {}
-    log_dict["rollout_time"] = rollout_time
-    if max(non_generation_time) > 0:
-        log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
-
-    def token_perf(response_lengths, non_generation_time, key=""):
-        max_response_length = max(response_lengths)
-        if args.rollout_num_gpus:
-            log_dict[f"{key}tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
-        log_dict[f"longest_{key}sample_tokens_per_sec"] = max_response_length / rollout_time
-
-        if max(non_generation_time) == 0:
-            return
-
-        non_generation_time = [
-            t for t, length in zip(non_generation_time, response_lengths, strict=True) if length == max_response_length
-        ]
-        mean_non_generation_time = sum(non_generation_time) / len(non_generation_time)
-
-        log_dict[f"longest_{key}sample_non_generation_time"] = mean_non_generation_time
-        log_dict[f"longest_{key}sample_tokens_per_sec_without_non_generation"] = max_response_length / (
-            rollout_time - mean_non_generation_time
-        )
-
-    token_perf([sample.response_length for sample in samples], non_generation_time, key="")
-    token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
-
-    return log_dict
-
-
-def _compute_zero_std_metrics(args, all_samples: list[Sample]):
-    # only compute in GRPO-like algorithms where one prompt has multiple responses
-    if args.advantage_estimator == "ppo":
-        return {}
-
-    def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
-        return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
-
-    all_sample_groups = group_by(all_samples, lambda s: s.group_index)
-    interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
-
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
-
-    return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
-
-
-def _compute_spec_metrics(args, all_samples: list[Sample]):
-    if getattr(args, "sglang_speculative_algorithm", None) is None:
-        return {}
-    num_samples = len(all_samples)
-    metrics = {}
-    metrics["spec_accept_rate"] = sum(sample.spec_info.spec_accept_rate for sample in all_samples) / num_samples
-    metrics["spec_accept_length"] = sum(sample.spec_info.spec_accept_length for sample in all_samples) / num_samples
-    return metrics
-
-
-def _compute_prefix_cache_metrics(args, all_samples: list[Sample]):
-    num_samples = len(all_samples)
-    metrics = {}
-    total_cached_tokens = sum(sample.prefix_cache_info.cached_tokens for sample in all_samples)
-    total_prompt_tokens = sum(sample.prefix_cache_info.total_prompt_tokens for sample in all_samples)
-
-    metrics["prefix_cache_hit_rate"] = total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0
-    metrics["avg_cached_tokens_per_sample"] = total_cached_tokens / num_samples
-    return metrics
-
-
-def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
-    reward_cat_key = args.log_reward_category
-    if reward_cat_key is None:
-        return {}
-
-    samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
-
-    return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
