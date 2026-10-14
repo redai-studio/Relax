@@ -112,3 +112,84 @@ The analyzer's grouping assumes the current fixed batches without dynamic filter
 Git ignores private configuration and common log, screenshot and cache directories; ignore rules are not redaction. Desktop screenshots, task content, agent logs and JSON exports can contain sensitive data and need separate review before publication. Never force-add private files. Configuration loading disables shell tracing, but do not print the private environment elsewhere.
 
 This recipe review does not certify the external OSWorld fork, sandbox image or historical Git commits as privacy-audited. In particular, the external fork contains deployment-specific default endpoints and needs separate review before redistribution.
+
+## CHANGELOG
+
+Experiments are listed in ascending launch-time order (UTC+8). Heading times correspond to experiment-name timestamps. Updates mean optimizer updates, indexed from zero. Results come from retained submission arguments and logs; script edits are not validated experiments.
+
+### 2026-10-11 18:33 — Initial integration experiment
+
+- **Configuration:** Qwen3-VL-8B-Thinking, 12 tasks × 8 trajectories, 10 rollouts with 3 updates each; LR `1e-6` / cosine, KL coefficient `0.02`, 32K training budget and context, full/uniform recomputation, optimizer CPU offload enabled.
+- **Result:** 9 updates logged before the SGLang engine refused connections during cache flushing; the job failed before completion. Ten rollouts allowed at most 30 updates, insufficient for the subsequently requested long run.
+- **Next:** Increase to 200 rollouts and adjust offload/recomputation. Agents own logical sessions and export model-visible contexts; 96 trajectories can produce over 1400 records without creating that many sandboxes.
+
+### 2026-10-11 22:58 — 200 rollouts, disable offload and reduce recomputation
+
+- **Change:** Rollouts 10 → 200; disable optimizer CPU offload; full → selective recomputation. Keep 32K training budget and context.
+- **Result:** CUDA OOM on the first training attempt; no completed optimizer update.
+- **Next:** Reduce the token budget and align length constraints.
+
+### 2026-10-12 01:15 — Reduce training budget to 16K
+
+- **Change:** `max_tokens_per_gpu: 32768 → 16384`; context remains 32768.
+- **Result:** Argument validation failed because training budget × CP was smaller than rollout context. Training did not start.
+
+### 2026-10-12 01:16 — Reduce rollout context to 16K
+
+- **Change:** `rollout_max_context_len: 32768 → 16384`.
+- **Result:** Argument validation failed again: the 16384 prompt limit equaled context length, leaving no generation token. Training did not start.
+
+### 2026-10-12 01:21 — Fix prompt/context constraints
+
+- **Change:** Prompt limit reduced to 16383; keep 16K context and training budget.
+- **Result:** One completed update, then another OOM. Not yet stable.
+- **Next:** Add MLP recomputation to reduce peak training memory.
+
+### 2026-10-12 02:01 — Add MLP recomputation
+
+- **Change:** Explicit selective recomputation of `core_attn mlp`.
+- **Result:** Actor initialization failed with an uncorrectable ECC error, before training. This was not a loss/reward failure.
+
+### 2026-10-12 02:07 — Resubmit after the ECC error
+
+- **Change:** Retain 16K budget/context, selective `core_attn mlp` recomputation and disabled optimizer CPU offload.
+- **Result:** Completed 57 updates (19 rollouts), maximum grad norm 2.854678, then deliberately stopped to correct rewards; did not finish 200 rollouts.
+- **Issue:** Reward semantics were not yet fully aligned with the handoff, so this curve is not a reproduction of that experiment.
+
+### 2026-10-12 15:42 — Restore handoff reward semantics
+
+- **Change:** Restore trajectory outcome shaping, eight-trajectory advantage normalization and export-count-weighted `rollout/raw_reward`. Retain LR `1e-6` / cosine, three updates per rollout and 16K training budget.
+- **Result:** Completed 21 updates (7 rollouts), maximum grad norm 4.100425, then deliberately stopped to align learning rate and training settings.
+- **Definition:** Shaped reward is `(success ? 1 : -1) - 0.05 × T/30 - 0.2 × I(T>=30)`. Session-deduplicated success rate is separate from raw reward.
+
+### 2026-10-12 21:02 — LR 5e-6 / constant, 32K, freeze vision
+
+- **Change:** LR `1e-6 → 5e-6`, cosine → constant, training budget 16K → 32K, freeze vision trunk. Retain three updates per rollout, KL `0.02`, reference updates every rollout and selective recomputation. Sandbox prelaunch remains disabled.
+- **Result:** Completed 147 updates (49 rollouts), then deliberately stopped for the prelaunch experiment. Four `grad_norm > 10` events occurred at updates 11, 35, 71 and 110, all the third update within their rollout. Maximum grad norm: 491186.094; maximum unscaled `train/kl_loss`: 14710.166.
+- **Finding:** Large spikes correlated with k3 KL outliers after repeated updates. Grad norm is logged before clipping; `clip_grad=1.0` does not require it to be below one.
+
+### 2026-10-13 22:15 — Enable sandbox prelaunch
+
+- **Change:** Enable `agentic-prelaunch`; active and prelaunch share 12 group permits, up to 96 sessions. Retain 32K, three updates per rollout and KL `0.02`.
+- **Result:** Logs contain 14 updates before stopping. The third update again spiked: grad norm 189.610, unscaled KL loss 2.846, weighted KL approximately 96.5% of total loss. Prelaunch did not eliminate this training stability issue.
+- **Next:** Reduce KL coefficient to `0.001` and updates per rollout to two. Without token-level or separate PG/KL gradients, no specific offending-token cause was established. No isolated prelaunch speedup was measured with other variables controlled.
+
+### 2026-10-14 00:58 — KL 0.001, two updates, 24K, dynamic filter enabled
+
+- **Change:** KL `0.02 → 0.001`; updates per rollout `3 → 2`, logical trajectories per update `32 → 48`; training budget `32K → 24K`; enable trajectory-outcome dynamic filtering. Retain LR `5e-6`, prelaunch, frozen vision and reference updates every rollout.
+- **Result:** Two updates completed, maximum grad norm 1.159800, no spike above ten. Deliberately stopped to disable filtering as requested. Too short to establish long-term stability or filtering benefit.
+
+### 2026-10-14 01:48 — Disable dynamic filter and continue training
+
+- **Change:** Only disable dynamic filtering; retain KL `0.001`, two updates per rollout, 24K, LR `5e-6` / constant, prelaunch and frozen vision.
+- **Snapshot at 2026-10-14 13:20:39:** 27 rollouts and 54 updates (0–53) completed. Grad norm minimum/mean/maximum: **0.561670 / 0.954595 / 1.337857**; **zero** events above ten. Maximum unscaled KL loss: **0.003474**. The previous large spikes did not recur in this window.
+- **Curves:** Rollout 0 → 26 raw reward `-0.403194 → 0.144336`, session success `48.96% → 80.21%`; latest actor training MFU approximately `74.39%`. Two endpoints do not establish monotonic improvement or independent evaluation. Actor MFU is not full-cycle utilization.
+- **Limits:** KL coefficient, update count and token budget changed together, so stability cannot be attributed solely to KL coefficient. The experiment was still running, not finished with 200 rollouts.
+
+### 2026-10-14 — Code and documentation cleanup during the active run, no restart
+
+- **Script-only change, not a live experiment:** Set training/log-prob budgets to 48K; the active run remains at 24K. Follow `create-training-script` for arrays, direct launch and automatic entrypoint detection; fix LR `5e-6`, 200 rollouts and two updates in the arguments, removing the indirect `OSWORLD_UPDATES_PER_ROLLOUT` variable. Retain blocking submission and disabled checkpoint writes.
+- **Metrics/dumps:** Distinguish sessions and exports; add session/task/turn/export and parse-attempt identifiers; fix raw reward plot labels/range; close metrics adapters on normal completion. These changes are not a new controlled experiment.
+- **Time audit at 12:15:20:** The first 24 step times totaled 10h 21m 18.736s, averaging **1553.281s per rollout**. Adding 3m 57.812s before timing began and 1m 27.839s pending the next report reconciled with Job runtime of 10h 26m 44.387s. Each point covers a rollout with two updates; cumulative timing for rollouts 1–23 differed from log intervals by only 0.458s.
+- **Public recipe:** Provide `env.example.sh`, directly load ignored `env.local.sh`, remove redundant `env.sh` and its ignore exception. Update bilingual instructions and reject missing/empty task manifests. Keep internal endpoints, credentials and private paths out of documentation.
+- **Validation:** All pre-commit hooks passed before commit; relevant tests: 61 passed, one opt-in live Ray Serve test skipped. Submission arguments were verified with isolated stubs; the latest 48K script has not completed real GPU validation. Shared-prefix training, broadcasts and GPU-to-CPU copies were analyzed without implementing new optimization algorithms.

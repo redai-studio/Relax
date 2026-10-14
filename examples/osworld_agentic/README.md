@@ -112,3 +112,84 @@ python examples/osworld_agentic/scripts/analyze_run.py \
 Git 忽略私有配置、常见日志/截图/缓存目录，但忽略规则不是数据脱敏机制。桌面截图、任务内容、agent 日志及导出 JSON 可能包含敏感信息，发布前应单独审查；不要强制添加私有文件。加载私有配置时禁用 shell tracing，仍不应把整个私有环境打印到日志。
 
 本 recipe 的审查不代表外部 OSWorld fork、沙箱镜像或历史 Git 提交已完成隐私审计。尤其外部 fork 含部署相关默认端点，公开分发该依赖前应单独审查。
+
+## CHANGELOG
+
+以下按实验启动时间升序记录，时区为 UTC+8。日期后的时间对应实验名中的启动时间；“更新”指优化器更新，编号从 0 开始。只记录可由保留的提交参数和日志确认的结果，脚本修改不算已验证实验。
+
+### 2026-10-11 18:33 — 初始集成实验
+
+- **配置**：Qwen3-VL-8B-Thinking，12 任务 × 8 条轨迹；`num_rollout=10`、每轮 3 次更新；LR `1e-6` / cosine；KL 系数 `0.02`；训练预算和 rollout context 均为 32K；full/uniform recompute，optimizer CPU offload 开启。
+- **结果**：日志记录 9 次更新，随后 SGLang engine 在 flush cache 时连接拒绝，任务失败，未完成计划。这里的 10 rollouts 最多对应 30 次更新；这个短配置不满足后续长期训练需求。
+- **后续**：延长至 200 rollouts，并调整 offload/recompute。Agent 按逻辑 session 管理沙箱、按模型可见上下文导出训练记录；96 条轨迹可以对应 1400 多条训练记录，不代表同等数量的沙箱。
+
+### 2026-10-11 22:58 — 200 rollouts，关闭 offload、减少重计算
+
+- **相对上次**：`num_rollout: 10 → 200`；关闭 optimizer CPU offload；full recompute 改为 selective；训练预算与 rollout context 暂保留 32K。
+- **结果**：首次训练发生 CUDA OOM，没有完成优化器更新。
+- **后续**：降低单卡 token 预算，补齐长度配置之间的约束。
+
+### 2026-10-12 01:15 — 训练预算降至 16K
+
+- **相对上次**：`max_tokens_per_gpu: 32768 → 16384`，rollout context 仍为 32768。
+- **结果**：启动参数校验失败：`max_tokens_per_gpu × CP` 小于 rollout context；没有进入训练。
+
+### 2026-10-12 01:16 — Rollout context 降至 16K
+
+- **相对上次**：`rollout_max_context_len: 32768 → 16384`。
+- **结果**：再次在参数校验阶段失败：prompt 上限仍为 16384，与 context 相等，未给生成 token 留空间；没有进入训练。
+
+### 2026-10-12 01:21 — 修正 prompt/context 约束
+
+- **相对上次**：prompt 上限改为 16383，保持 16K context 和 16K 单卡训练预算。
+- **结果**：完成 1 次更新后再次 OOM，尚不能稳定运行。
+- **后续**：增加 MLP 重计算以降低训练峰值显存。
+
+### 2026-10-12 02:01 — 增加 MLP 重计算
+
+- **相对上次**：selective recompute 显式使用 `core_attn mlp`。
+- **结果**：Actor 初始化阶段遇到 `uncorrectable ECC error`，没有进入训练。这次失败不是训练 loss 或奖励导致的。
+
+### 2026-10-12 02:07 — ECC 报错后重新提交
+
+- **相对上次**：保留 16K 预算、16K context、`core_attn mlp` selective recompute 和关闭 optimizer CPU offload 的组合。
+- **结果**：完成 57 次更新（19 rollouts），最大 grad norm 2.854678，之后主动停止以修正奖励逻辑；不是跑满 200 rollouts。
+- **问题**：当时的奖励口径尚未完整对齐交接版，不能将该曲线当成交接实验的复现结果。
+
+### 2026-10-12 15:42 — 恢复交接版奖励口径
+
+- **相对上次**：恢复轨迹 outcome shaping、8 条轨迹组内 advantage 标准化，以及按导出记录数加权的 `rollout/raw_reward`。保留 LR `1e-6` / cosine、每轮 3 次更新、16K 训练预算。
+- **结果**：完成 21 次更新（7 rollouts），最大 grad norm 4.100425；随后主动停止，继续对齐学习率和训练配置。
+- **口径**：shaped reward 为 `(成功 ? 1 : -1) - 0.05 × T/30 - 0.2 × I(T>=30)`。成功率另按 session 去重统计，不能和 `rollout/raw_reward` 混用。
+
+### 2026-10-12 21:02 — LR 5e-6 / constant，32K，冻结 vision
+
+- **相对上次**：LR `1e-6 → 5e-6`，cosine → constant；训练 token 预算 16K → 32K；冻结 vision trunk。保留每轮 3 次更新、KL `0.02`、reference 每 rollout 更新、selective recompute；未开启 sandbox prelaunch。
+- **结果**：完成 147 次更新（49 rollouts）后主动停止，进入预启动实验。出现 4 次 `grad_norm > 10`：更新 11、35、71、110，均是所在 rollout 的第 3 次更新；最大 grad norm 491186.094，最大未乘系数的 `train/kl_loss` 14710.166。
+- **发现**：大梯度尖峰与重复更新后的 k3 KL 异常值相关。grad norm 是裁剪前值，`clip_grad=1.0` 不代表该指标必须小于 1。
+
+### 2026-10-13 22:15 — 开启 sandbox prelaunch
+
+- **相对上次**：开启 `agentic-prelaunch`，active 和预启动共享 12 个 group permits，最多 96 个 session；其余保留 32K、每轮 3 次更新、KL `0.02`。
+- **结果**：停止前日志记录 14 次更新。第 3 次更新再次出现尖峰：grad norm 189.610、未乘系数的 KL loss 2.846，KL 项约占该点 total loss 的 96.5%。预启动没有消除这个训练稳定性问题。
+- **后续**：将 KL 系数降至 `0.001`，每轮更新次数减至 2。没有逐 token 或分离 PG/KL 梯度证据，暂不把 KL 异常归因到具体 token；也未得到控制其他变量后的 prelaunch 独立加速比。
+
+### 2026-10-14 00:58 — KL 0.001、每轮 2 次更新、24K，开启 dynamic filter
+
+- **相对上次**：KL `0.02 → 0.001`；每轮更新 `3 → 2`，每次更新的逻辑轨迹数 `32 → 48`；训练预算 `32K → 24K`；开启基于轨迹 outcome 的 dynamic filter。保留 LR `5e-6`、prelaunch、冻结 vision 和每 rollout 更新 reference。
+- **结果**：完成 2 次更新，最大 grad norm 1.159800，未出现大于 10 的尖峰；随后按要求主动停止并关闭 dynamic filter。窗口过短，不能据此判断长期稳定性或过滤收益。
+
+### 2026-10-14 01:48 — 关闭 dynamic filter，开始持续训练
+
+- **相对上次**：仅关闭 dynamic filter；保留 KL `0.001`、每轮 2 次更新、24K、LR `5e-6` / constant、prelaunch 和冻结 vision。
+- **结果快照：2026-10-14 13:20:39**：完成 27 rollouts、54 次更新（0–53）；grad norm 最小/平均/最大为 **0.561670 / 0.954595 / 1.337857**，`grad_norm > 10` 为 **0 次**；最大未乘系数的 KL loss **0.003474**。该窗口内原来的大幅梯度尖峰未再出现。
+- **曲线**：rollout 0 → 26，raw reward `-0.403194 → 0.144336`，session 成功率 `48.96% → 80.21%`；最新 actor training MFU 约 `74.39%`。首尾两个点不代表单调上涨或独立评测成绩，actor MFU 也不代表整个 rollout 周期的利用率。
+- **结论范围**：KL 系数、更新次数和 token 预算共同变化，不能把稳定性改善单独归因于 KL 系数；实验仍在运行，尚未完成 200 rollouts。
+
+### 2026-10-14 — 当前实验期间的代码与文档整理，未重启
+
+- **脚本修改，未实跑**：训练/log-prob token 上限改为 48K；当前运行仍是 24K。按 `create-training-script` 整理数组、直接启动和自动入口识别；固定 LR `5e-6`、200 rollouts、每轮 2 次更新，移除间接变量 `OSWORLD_UPDATES_PER_ROLLOUT`。保留默认阻塞提交、不保存 checkpoint 的要求。
+- **监控与 dump**：区分 session 与导出记录，补齐 session/task/turn/export 和解析重试标识；修正 raw reward 图的名称与纵轴；正常完成时关闭 metrics adapters。这些改动不构成一次新的对照实验。
+- **时间审计，12:15:20 快照**：24 个 `perf/step_time` 合计 10小时21分18.736秒，平均 **1553.281 秒/rollout**；加计时前初始化 3分57.812秒及尚未上报的尾段 1分27.839秒，与 Job 总时长 10小时26分44.387秒对齐。该指标每 rollout 一个点，包含两次更新；rollout 1–23 的累计时间与日志跨度仅差 0.458 秒。
+- **开源整理**：提供 `env.example.sh`，直接读取忽略的 `env.local.sh`，删除多余 `env.sh` 及其忽略例外；更新中英文文档，缺失/空任务清单明确报错。未公开内部端点、密钥或私有路径。
+- **验证结果**：提交前全部 pre-commit 通过，相关测试 61 passed、1 个 opt-in live Ray Serve 测试 skipped。隔离环境验证过脚本提交参数；48K 尚未完成真实 GPU 训练验证。共享前缀训练、广播和 GPU→CPU 拷贝仅做分析，没有实施新的优化算法。
