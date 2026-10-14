@@ -55,6 +55,9 @@ def _args(estimator="grpo", **overrides):
         n_samples_per_prompt=4,
         reward_key="score",
         use_critic=False,
+        kl_coef=0.0,
+        kl_loss_coef=0.0,
+        use_kl_loss=False,
         fully_async=False,
         hybrid=False,
         dynamic_sampling_filter_path=None,
@@ -391,3 +394,86 @@ def test_yaml_rejects_removed_sft_objective(arguments_module, tmp_path):
 
     with pytest.raises(ValueError, match="sft_objective has been removed.*--loss-type"):
         arguments_module.apply_custom_config_overrides(args)
+
+
+@pytest.mark.parametrize("source", ["cli", "yaml"])
+@pytest.mark.parametrize("estimator", ["grpo", "ppo"])
+def test_arguments_reject_conflicting_kl_coefficients(arguments_module, tmp_path, source, estimator):
+    from tests.utils.test_arguments_opd_teacher_colocate import _opd_args
+
+    args = _opd_args()
+    args.advantage_estimator = estimator
+    args.ref_load = str(tmp_path)
+    if source == "yaml":
+        args.custom_config_path = _write_yaml(tmp_path, "kl_coef: 0.1\nkl_loss_coef: 0.2\n")
+    else:
+        args.kl_coef = 0.1
+        args.kl_loss_coef = 0.2
+
+    with pytest.raises(AssertionError, match="Only one of kl_coef and kl_loss_coef can be set"):
+        arguments_module.slime_validate_args(args)
+
+
+@pytest.mark.parametrize("source", ["cli", "yaml"])
+@pytest.mark.parametrize(
+    ("kl_coef", "kl_loss_coef", "use_kl_loss"),
+    [(0.1, 0.0, False), (0.0, 0.2, True), (0.0, 0.0, False)],
+)
+def test_arguments_sync_ppo_keeps_kl_disabled_after_overrides(
+    arguments_module, tmp_path, source, kl_coef, kl_loss_coef, use_kl_loss
+):
+    from tests.utils.test_arguments_opd_teacher_colocate import _opd_args
+
+    args = _opd_args()
+    args.advantage_estimator = "ppo"
+    args.ref_load = str(tmp_path)
+    if source == "yaml":
+        args.custom_config_path = _write_yaml(
+            tmp_path,
+            f"kl_coef: {kl_coef}\nkl_loss_coef: {kl_loss_coef}\nuse_kl_loss: {str(use_kl_loss).lower()}\n",
+        )
+    else:
+        args.kl_coef, args.kl_loss_coef, args.use_kl_loss = kl_coef, kl_loss_coef, use_kl_loss
+
+    arguments_module.slime_validate_args(args)
+
+    assert args.use_critic is True
+    assert args.kl_coef == 0.0
+    assert args.use_kl_loss is False
+    # Existing normalization disables the switch, not the loss coefficient.
+    assert args.kl_loss_coef == kl_loss_coef
+
+
+@pytest.mark.parametrize("fully_async, hybrid", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("kl_coef, kl_loss_coef, use_kl_loss", [(0.1, 0.0, False), (0.0, 0.2, True)])
+def test_arguments_yaml_preserves_valid_grpo_kl_options(
+    arguments_module, tmp_path, fully_async, hybrid, kl_coef, kl_loss_coef, use_kl_loss
+):
+    args = _overridable_args(
+        tmp_path,
+        f"kl_coef: {kl_coef}\nkl_loss_coef: {kl_loss_coef}\nuse_kl_loss: {str(use_kl_loss).lower()}\n",
+        fully_async=fully_async,
+        hybrid=hybrid,
+    )
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert (args.kl_coef, args.kl_loss_coef, args.use_kl_loss) == (kl_coef, kl_loss_coef, use_kl_loss)
+
+
+@pytest.mark.parametrize("fully_async, hybrid", [(True, False), (True, True)])
+def test_arguments_yaml_does_not_apply_sync_ppo_normalization_to_async_modes(
+    arguments_module, tmp_path, fully_async, hybrid
+):
+    args = _overridable_args(
+        tmp_path,
+        "kl_coef: 0.1\n",
+        advantage_estimator="ppo",
+        use_critic=True,
+        fully_async=fully_async,
+        hybrid=hybrid,
+    )
+
+    arguments_module.apply_custom_config_overrides(args)
+
+    assert args.kl_coef == 0.1

@@ -1477,6 +1477,13 @@ class AgenticSessionShard:
             resolve_chat_api_base_url(),
         )
 
+    async def set_router_address(self, router_ip: str, router_port: int) -> None:
+        """Bind the ready managed router before any Session is launched."""
+        endpoint = (self.args.sglang_router_ip, self.args.sglang_router_port)
+        if endpoint[0] is not None and endpoint != (router_ip, router_port):
+            raise RuntimeError("Cannot replace a SessionShard router within its lifecycle")
+        self.args.sglang_router_ip, self.args.sglang_router_port = router_ip, router_port
+
     def _notify_state_change(self, group: Optional[ResidentGroup] = None) -> None:
         """Advance the Shard event cursor after owned refs change."""
 
@@ -3279,11 +3286,12 @@ def deploy_agentic_chat_api_services(
     resolved_config = _resolve_sglang_config(config)
     router_ip, router_port = _start_router(
         config,
-        has_pd_disaggregation=resolved_config.has_pd_disaggregation,
+        has_pd_disaggregation=resolved_config.models[0].has_pd_disaggregation,
         force_new=False,
     )
-    config.sglang_router_ip = router_ip
-    config.sglang_router_port = router_port
+    if router_ip is not None:
+        config.sglang_router_ip = router_ip
+        config.sglang_router_port = router_port
 
     global _DEPLOYED_ADMISSION_COORDINATOR
 

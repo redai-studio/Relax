@@ -3526,6 +3526,11 @@ def _validate_lora_vision_scope(args) -> None:
     )
 
 
+def validate_kl_coefficients(args: argparse.Namespace) -> None:
+    """Reject simultaneous reward-side and loss-side KL coefficients."""
+    assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+
+
 def _normalize_sync_ppo_kl_args(args) -> bool:
     """Disable KL options that have no ref-logprob producer in sync PPO."""
     is_sync_ppo = (
@@ -3538,6 +3543,12 @@ def _normalize_sync_ppo_kl_args(args) -> bool:
 
     args.use_kl_loss = False
     args.kl_coef = 0.0
+    logger.warning(
+        "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
+        "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
+        "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
+        "Drop these KL options from the launch script to silence this warning."
+    )
     return True
 
 
@@ -3768,6 +3779,10 @@ def apply_custom_config_overrides(args) -> None:
             "Pass --loss-type on the command line instead of overriding it from YAML."
         )
 
+    # Check before normalization, as on the CLI path: conflicting coefficients
+    # must not become valid merely because sync PPO later disables reward KL.
+    validate_kl_coefficients(args)
+
     if is_offline_mode(args):
         return
 
@@ -3785,9 +3800,9 @@ def apply_custom_config_overrides(args) -> None:
     # the frozen function owns a constraint the spec deliberately does not
     # restate.
     #
+    # KL coefficient exclusion and sync PPO normalization are also repeated here.
     # What it does NOT cover, and a YAML file can still move: the `--ref-load`
-    # existence check, the `kl_coef`/`kl_loss_coef` exclusion assert,
-    # `_normalize_sync_ppo_kl_args`, the fully-async resource checks, the
+    # existence check, the fully-async resource checks, the
     # `rollout_batch_size` derivation, and the over-sampling assert. All of
     # them run before the merge and none is an algorithm validator. Closing
     # that class properly means merging the YAML *before* validation rather
@@ -3830,6 +3845,7 @@ def apply_custom_config_overrides(args) -> None:
             f"critic setup than the one already derived. Pass --advantage-estimator on the command line instead "
             f"of overriding it from YAML."
         )
+    _normalize_sync_ppo_kl_args(args)
 
 
 def _validate_ref_load(args: argparse.Namespace) -> None:
@@ -4093,7 +4109,7 @@ def slime_validate_args(args):
             "(the predict pass reuses the SFT eval data source)."
         )
 
-    assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+    validate_kl_coefficients(args)
 
     _validate_reinforce_plus_plus_args(args, is_offline)
 
@@ -4318,14 +4334,7 @@ def slime_validate_args(args):
     # deploy a separate reference service. Either KL option would make
     # advantages / actor request a field that never arrives and hang in
     # TQ.get_meta, so disable both for the currently supported sync topology.
-    if _normalize_sync_ppo_kl_args(args):
-        logger.warning(
-            "Synchronous PPO (--advantage-estimator ppo) does not support --use-kl-loss or "
-            "--kl-coef != 0 because its service graph has no producer for ref_log_probs. "
-            "Auto-disabling --use-kl-loss and resetting --kl-coef to 0.0. "
-            "Drop these KL options from the launch script to silence this warning."
-        )
-    elif args.use_critic and args.use_kl_loss:
+    if not _normalize_sync_ppo_kl_args(args) and args.use_critic and args.use_kl_loss:
         # Preserve the existing behavior outside the synchronous topology.
         logger.warning("PPO does not support --use-kl-loss. Auto-disabling --use-kl-loss.")
         args.use_kl_loss = False

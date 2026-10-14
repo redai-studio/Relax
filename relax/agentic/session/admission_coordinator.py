@@ -107,10 +107,17 @@ class AdmissionCoordinator:
         self._poll_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        if not self._program_admission:
+        if not self._program_admission or not self._router_ip or not self._router_port or self._poll_task is not None:
             return
         await self._reconcile_once()
         self._poll_task = asyncio.create_task(self._poll_loop(), name="agentic-admission-reconcile")
+
+    async def set_router_address(self, router_ip: str, router_port: int) -> None:
+        """Start admission polling once the managed router is ready."""
+        if self._router_ip is not None and (self._router_ip, self._router_port) != (router_ip, router_port):
+            raise RuntimeError("Cannot replace an admission router within its lifecycle")
+        self._router_ip, self._router_port = router_ip, router_port
+        await self.start()
 
     async def acquire_request_permit(self, permit_id: str) -> bool:
         if self._cancelled_request_permits.pop(permit_id, False):

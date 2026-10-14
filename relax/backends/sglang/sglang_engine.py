@@ -57,6 +57,8 @@ class RouterWorkerCleanup:
     actor_id: str
     worker_id: str | None = None
     delete_requested: bool = False
+    pd_worker_type: str | None = None
+    bootstrap_port: int | None = None
 
 
 def remove_dead_router_worker(
@@ -83,6 +85,21 @@ def remove_dead_router_worker(
             raise ValueError("invalid Router worker list")
         return rows
 
+    def owns_worker(row: dict) -> bool:
+        if row.get("url") != worker_url or not row.get("id"):
+            return False
+        if cleanup.pd_worker_type is not None:
+            # The manager retained this exact static registration before the
+            # actor died. Router health may lag behind confirmed actor death.
+            if row.get("worker_type") != cleanup.pd_worker_type or (
+                cleanup.pd_worker_type == "prefill" and row.get("bootstrap_port") != cleanup.bootstrap_port
+            ):
+                return False
+            if cleanup.worker_id is not None:
+                return str(row["id"]) == cleanup.worker_id
+            return row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+        return row.get("is_healthy") is False and row.get("metadata", {}).get("relax_actor_id") == cleanup.actor_id
+
     try:
         rows = workers()
         matches = [row for row in rows if router_worker_base_url(row.get("url", "")) == worker_url]
@@ -92,22 +109,19 @@ def remove_dead_router_worker(
             if len(matches) != 1 or matches[0].get("url") != worker_url:
                 return False  # DP rank URLs or ambiguous ownership.
             candidate = matches[0]
-            if (
-                candidate.get("is_healthy") is not False
-                or not candidate.get("id")
-                or candidate.get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
-            ):
+            if not owns_worker(candidate):
                 return False
             cleanup.worker_id = str(candidate["id"])
         # Never target another generation even if it now occupies the same URL.
         owned = [row for row in rows if str(row.get("id", "")) == cleanup.worker_id]
         if owned:
-            if (
-                len(owned) != 1
-                or owned[0].get("url") != worker_url
-                or owned[0].get("is_healthy") is not False
-                or owned[0].get("metadata", {}).get("relax_actor_id") != cleanup.actor_id
+            if cleanup.pd_worker_type is not None and (
+                len(matches) != 1
+                or matches[0].get("url") != worker_url
+                or str(matches[0].get("id", "")) != cleanup.worker_id
             ):
+                return False  # Router removal is URL-based even at its ID endpoint.
+            if len(owned) != 1 or not owns_worker(owned[0]):
                 return False
             if not cleanup.delete_requested:
                 detail = requests.get(f"{router_url}/workers/{quote(cleanup.worker_id, safe='')}", timeout=remaining())
@@ -506,6 +520,7 @@ class SGLangEngine(RayActor):
         init_external_kwargs: Optional[dict] = None,
         skip_dcs_registration: bool = False,
         skip_router_registration: bool = False,
+        require_router_registration: bool = False,
     ) -> dict[str, str | int | None]:
         """Initialize the SGLang engine.
 
@@ -518,6 +533,7 @@ class SGLangEngine(RayActor):
         self.router_ip = router_ip if router_ip is not None else self.args.sglang_router_ip
         self.router_port = router_port if router_port is not None else self.args.sglang_router_port
         self._skip_router_registration = skip_router_registration
+        self._require_router_registration = require_router_registration
 
         host = host or get_host_info()[1]
 
@@ -663,14 +679,19 @@ class SGLangEngine(RayActor):
             warm_hf_checkpoint_page_cache(server_args_dict.get("model_path"))
 
         server_args_dict = {**server_args_dict, "host": server_args_dict["host"].strip("[]")}
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
-
-        bootstrap_port = (
-            server_args_dict.get("disaggregation_bootstrap_port") if self.worker_type == "prefill" else None
+        server_args = ServerArgs(**server_args_dict)
+        self._router_bootstrap_port = (
+            server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
+        self._router_dp_size = server_args.dp_size
+        self.process = launch_server_process(server_args)
+
+        bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False
         if not self._skip_router_registration:
-            self.register_to_router(bootstrap_port=bootstrap_port)
+            registered = self.register_to_router(bootstrap_port=bootstrap_port)
+            if getattr(self, "_require_router_registration", False) and self.node_rank == 0 and not registered:
+                raise RuntimeError("Required PD router registration failed")
 
     def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float | None = None):
         """Make a POST request to the specified endpoint with the given
@@ -955,10 +976,12 @@ class SGLangEngine(RayActor):
             return
 
         logger.info(f"Shutdown engine {self.server_host}:{self.server_port}...")
-        self.unregister_from_router()
-        # external rollout has no process
-        if hasattr(self, "process"):
-            kill_process_tree(self.process.pid)
+        try:
+            self.unregister_from_router(timeout=5.0)
+        finally:
+            process = getattr(self, "process", None)
+            if process is not None:
+                kill_process_tree(process.pid)
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -982,6 +1005,74 @@ class SGLangEngine(RayActor):
             return None
         return f"http://{self.server_host}:{self.server_port}"
 
+    def get_pd_router_worker_spec(self) -> dict | None:
+        """Describe a healthy node-0 engine for managed static PD startup."""
+        if self.node_rank != 0:
+            return None
+        if self.worker_type not in {"prefill", "decode"} or getattr(self, "_router_dp_size", None) != 1:
+            raise ValueError("Managed static PD startup requires a P/D engine with dp_size=1")
+        bootstrap_port = getattr(self, "_router_bootstrap_port", None)
+        if self.worker_type == "prefill" and (type(bootstrap_port) is not int or not 1 <= bootstrap_port <= 65535):
+            raise ValueError("Prefill bootstrap port is unavailable")
+        return {"url": self.get_url(), "worker_type": self.worker_type, "bootstrap_port": bootstrap_port}
+
+    def bind_registered_pd_worker(self, router_ip: str, router_port: int, worker: dict) -> bool:
+        """Adopt an existing static worker without issuing a second POST."""
+        if not router_ip or type(router_port) is not int or not 1 <= router_port <= 65535:
+            raise ValueError("A reachable router endpoint is required")
+        expected = self.get_pd_router_worker_spec()
+        if expected is None:
+            raise ValueError("Only node-0 engines may adopt a router worker")
+        worker_id = worker.get("id")
+        if (
+            worker.get("url", "").rstrip("/") != expected["url"].rstrip("/")
+            or worker.get("worker_type") != expected["worker_type"]
+            or worker.get("is_healthy") is not True
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or "@" in worker_id
+            or (self.worker_type == "prefill" and worker.get("bootstrap_port") != expected["bootstrap_port"])
+        ):
+            raise ValueError("Router worker does not match the initialized PD engine")
+        self.router_ip, self.router_port = router_ip, router_port
+        self._router_worker_id = worker_id
+        self._router_unregister_submitted = False
+        self._skip_router_registration = False
+        return True
+
+    def _wait_for_registered_pd_worker(self, timeout: float = 60.0) -> None:
+        """Recovery must reach a healthy registry entry before init
+        succeeds."""
+        deadline = time.monotonic() + timeout
+        expected = self.get_pd_router_worker_spec()
+        if expected is None:
+            return
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+                )
+                response.raise_for_status()
+                matches = [
+                    worker
+                    for worker in response.json().get("workers", [])
+                    if worker.get("url", "").rstrip("/") == expected["url"].rstrip("/")
+                ]
+                if len(matches) > 1:
+                    raise ValueError("Duplicate PD worker URL in router registry")
+                if len(matches) == 1 and matches[0].get("is_healthy") is True:
+                    registered_id = self._router_worker_id
+                    if registered_id is not None and matches[0].get("id") != registered_id:
+                        raise ValueError("PD worker registration ID changed before readiness")
+                    self.bind_registered_pd_worker(self.router_ip, self.router_port, matches[0])
+                    return
+            except requests.RequestException as error:
+                last_error = type(error).__name__
+            time.sleep(0.25)
+        raise TimeoutError(f"PD worker did not become ready in the router: {last_error}")
+
     def get_pid_and_node_id(self) -> dict:
         """Return the PID and Ray node ID of this engine.
 
@@ -996,13 +1087,27 @@ class SGLangEngine(RayActor):
         return {"pid": os.getpid(), "node_id": node_id}
 
     def register_to_router(self, bootstrap_port: int | None = None, strict: bool = True) -> bool:
-        if self.node_rank != 0 or not self.router_ip or not self.router_port:
+        required = getattr(self, "_require_router_registration", False)
+        if self.node_rank != 0:
             return True
+        if not self.router_ip or not self.router_port:
+            return not required
         if self.is_evicted():
             return False
 
         worker_url = f"http://{self.server_host}:{self.server_port}"
         try:
+            if required and (
+                getattr(self, "_router_registration_pending", False)
+                or (self._router_worker_id is not None and not self._router_unregister_submitted)
+            ):
+                # A POST may be accepted before health registration completes.
+                # Retry its readiness check, not the mutation that creates a worker.
+                self._wait_for_registered_pd_worker()
+                self._router_registration_pending = False
+                return True
+            if required and self.worker_type == "prefill" and bootstrap_port is None:
+                bootstrap_port = self._router_bootstrap_port
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
                 if self.worker_type != "regular":
                     msg = "pd disaggregation is not supported in old router or slime router."
@@ -1019,15 +1124,44 @@ class SGLangEngine(RayActor):
                     "url": worker_url,
                     "worker_type": self.worker_type,
                 }
-                if getattr(self, "_is_scaled_out", False) and parse(sglang_router.__version__) >= parse("0.3.0"):
+                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
+                    "0.3.0"
+                ):
                     payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
                 if self.worker_type == "prefill" and bootstrap_port is not None:
                     payload["bootstrap_port"] = bootstrap_port
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
-                    json=payload,
-                    timeout=30,
-                )
+                if required:
+                    # The router may accept the worker before its HTTP response
+                    # is lost. Reconcile that mutation instead of posting twice.
+                    self._router_registration_pending = True
+                    self._router_worker_id = None
+                try:
+                    response = requests.post(
+                        f"http://{self.router_ip}:{self.router_port}/workers",
+                        json=payload,
+                        timeout=30,
+                    )
+                except ConnectTimeout:
+                    if required:
+                        self._router_registration_pending = False
+                    raise
+                if required and response.status_code >= 400:
+                    # Client rejections and the router's queue errors prove
+                    # that no registration was submitted. A gateway timeout
+                    # or an unrecognized server error can still hide acceptance.
+                    rejected = 400 <= response.status_code < 500 and response.status_code != 408
+                    if response.status_code == 500:
+                        try:
+                            body = response.json()
+                        except ValueError:
+                            body = None
+                        rejected = (
+                            isinstance(body, dict)
+                            and body.get("code") == "INTERNAL_SERVER_ERROR"
+                            and isinstance(body.get("error"), str)
+                        )
+                    if rejected:
+                        self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
             if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
@@ -1053,6 +1187,10 @@ class SGLangEngine(RayActor):
                 if self._router_worker_id is None:
                     logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
+            if required:
+                self._router_registration_pending = True
+                self._wait_for_registered_pd_worker()
+                self._router_registration_pending = False
             logger.info(f"Registered engine {worker_url} to router {self.router_ip}:{self.router_port}")
             return True
         except Exception as e:
@@ -1102,22 +1240,22 @@ class SGLangEngine(RayActor):
             if router_version <= parse("0.2.1") or self.args.use_slime_router:
                 response = requests.post(
                     f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             elif router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             elif self._router_worker_id is not None:
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(self._router_worker_id, safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             else:
                 workers_response = requests.get(
                     f"http://{self.router_ip}:{self.router_port}/workers",
-                    timeout=30,
+                    timeout=timeout,
                 )
                 workers_response.raise_for_status()
                 all_workers = workers_response.json().get("workers", [])
@@ -1149,7 +1287,7 @@ class SGLangEngine(RayActor):
                     return False
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(str(worker_id), safe='')}",
-                    timeout=30,
+                    timeout=timeout,
                 )
             if response.status_code != 404:
                 response.raise_for_status()

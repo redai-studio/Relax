@@ -107,50 +107,13 @@ def test_rollout_stop_reason_fallback_and_precedence(metadata, expected_reason):
 
 
 def test_compute_metrics_from_samples_empty_input():
-    pytest.importorskip("megatron.core")
-
-    from relax.distributed.ray.rollout import compute_metrics_from_samples
+    from relax.utils.metrics.rollout_metrics import compute_metrics_from_samples
 
     assert compute_metrics_from_samples(None, []) == {}
 
 
-def test_compute_metrics_from_samples_reports_agentic_metrics(monkeypatch):
-    pytest.importorskip("megatron.core")
-
-    import relax.distributed.ray.rollout as rollout_module
-
-    # Keep this integration test focused on stop-reason and turn metrics rather
-    # than requiring the full training configuration used by unrelated metrics.
-    monkeypatch.setattr(
-        rollout_module,
-        "compute_rollout_reward_metrics",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        rollout_module,
-        "_compute_zero_std_metrics",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        rollout_module,
-        "_compute_spec_metrics",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        rollout_module,
-        "_compute_prefix_cache_metrics",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        rollout_module,
-        "_compute_reward_cat_metrics",
-        lambda *_args, **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        rollout_module,
-        "compute_mopd_metrics",
-        lambda *_args, **_kwargs: {},
-    )
+def test_compute_metrics_from_samples_reports_agentic_metrics():
+    import relax.utils.metrics.rollout_metrics as rollout_module
 
     samples = [
         Sample(
@@ -173,7 +136,7 @@ def test_compute_metrics_from_samples_reports_agentic_metrics(monkeypatch):
         ),
     ]
 
-    args = SimpleNamespace(log_reward_category=None)
+    args = SimpleNamespace(log_reward_category=None, reward_key=None, log_passrate=False, advantage_estimator="ppo")
     metrics = rollout_module.compute_metrics_from_samples(args, samples)
 
     assert metrics["stop_reason/env_done/count"] == 1

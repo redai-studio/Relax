@@ -220,3 +220,23 @@ def test_health_monitor_soft_causes_share_single_counter(monkeypatch):
     m._check_engine_health(0, engine)
     assert m._consecutive_failures[0] == 2
     m._kill_engine.assert_called_once_with(rollout_engine_id=0)
+
+
+def test_bounded_stop_retains_live_thread_state_until_cleanup_finishes():
+    monitor = _monitor()
+    thread = mock.Mock()
+    thread.is_alive.return_value = True
+    monitor._thread = thread
+    monitor._stop_event = threading.Event()
+    monitor._pause_event = threading.Event()
+    monitor._pause_event.set()
+    monitor._is_checking_enabled = True
+
+    monitor.stop(timeout=0.0)
+    thread.join.assert_called_once_with(timeout=0.0)
+    assert monitor._thread is thread and monitor._stop_event.is_set()
+    assert not monitor._pause_event.is_set() and not monitor._is_checking_enabled
+
+    thread.is_alive.return_value = False
+    monitor.stop(timeout=0.1)
+    assert monitor._thread is None and monitor._stop_event is None

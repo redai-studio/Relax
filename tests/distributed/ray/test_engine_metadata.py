@@ -510,7 +510,18 @@ def configure_actor_creation(monkeypatch, engines):
     return actor_class
 
 
-@pytest.mark.parametrize("mode", ["initial", "initial_external", "recover", "native_scale_out", "native_recover"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "initial",
+        "initial_external",
+        "recover",
+        "native_scale_out",
+        "native_recover",
+        "managed_pd_initial",
+        "managed_pd_recover",
+    ],
+)
 def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatch, zero_wait_get, mode):
     live, first, second = make_engine(), make_engine(), make_engine()
     manager, group = make_manager([live, None, None], [engine_metadata(pid=1)])
@@ -520,7 +531,8 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     group.rank_offset = 5
     group.is_scaled_out = mode in ("native_scale_out", "native_recover")
     group.skip_dcs_registration = mode == "native_scale_out"
-    group.skip_router_registration = group.is_scaled_out
+    group.skip_router_registration = group.is_scaled_out or mode == "managed_pd_initial"
+    group.require_router_registration = mode.startswith("managed_pd")
     if mode == "native_recover":
         group.sglang_overrides = {"host": "::1", "port": 32000}
     group.pg = (object(), list(range(8)), list(range(8)))
@@ -583,6 +595,10 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     assert actor_class.options.return_value.remote.call_count == 2
     assert first_ref.reads == second_ref.reads == 0
     assert cursors == ({0: 30000} if mode == "initial_external" else {0: 31000})
+    for engine in [first, second]:
+        kwargs = engine.init.remote.call_args.kwargs
+        assert kwargs["skip_router_registration"] is group.skip_router_registration
+        assert kwargs.get("require_router_registration", False) is group.require_router_registration
     for engine in [live, first, second]:
         engine.get_url.remote.assert_not_called()
         engine.get_pid_and_node_id.remote.assert_not_called()

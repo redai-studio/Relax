@@ -1137,6 +1137,21 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
+    def _dispose_rollout_manager(self, lookup_timeout: float = 5.0, dispose_timeout: float = 35.0) -> bool:
+        """Ask the owning actor to release engines and routers before deleting
+        its deployment."""
+        service = self.serve_dict.get(ROLES.rollout)
+        if service is None:
+            return True
+        try:
+            rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=lookup_timeout))
+            ray.get(rollout_manager.dispose.remote(), timeout=dispose_timeout)
+            logger.info("RolloutManager disposal completed in its owning actor.")
+            return True
+        except Exception as e:
+            logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
+            return False
+
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
         processes.
@@ -1149,14 +1164,7 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
-        # Shut down rollout engines via RolloutManager.dispose()
-        if ROLES.rollout in self.serve_dict:
-            try:
-                rollout_manager = run(self.serve_dict[ROLES.rollout].get_rollout_manager())
-                ray.get(rollout_manager.dispose.remote(), timeout=30)
-                logger.info("RolloutManager disposed — SGLang engines shut down.")
-            except Exception as e:
-                logger.warning(f"Failed to dispose RolloutManager: {e}")
+        self._dispose_rollout_manager()
 
         shutdown_managed_opd_teacher(self._teacher_manager)
 
@@ -1382,6 +1390,9 @@ class Controller:
         # the workers.  Without this, the main thread stays blocked on stale
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
+
+        # The rollout actor owns router subprocesses; dispose before deleting its handle.
+        self._dispose_rollout_manager()
 
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():

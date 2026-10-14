@@ -7,6 +7,7 @@ import threading
 from types import ModuleType, SimpleNamespace
 
 import pytest
+from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
 
@@ -14,7 +15,7 @@ from relax.utils.http_utils import router_worker_base_url
 @pytest.fixture()
 def sglang_engine_module(monkeypatch):
     ray = ModuleType("ray")
-    ray.get_runtime_context = lambda: SimpleNamespace()
+    ray.get_runtime_context = lambda: SimpleNamespace(get_actor_id=lambda: "replacement-actor")
     monkeypatch.setitem(sys.modules, "ray", ray)
 
     sglang_router = ModuleType("sglang_router")
@@ -470,3 +471,289 @@ def test_unregister_timeout_allows_a_later_retry(monkeypatch, sglang_engine_modu
 
     assert not engine.unregister_from_router(wait_for_removal=True, timeout=1.0)
     assert engine._router_unregister_submitted is False
+
+
+def _pd_engine(module, worker_type="prefill"):
+    engine = _make_engine(module)
+    engine.worker_type = worker_type
+    engine._router_dp_size = 1
+    engine._router_bootstrap_port = 9000 if worker_type == "prefill" else None
+    engine._require_router_registration = True
+    return engine
+
+
+def _pd_worker(engine, **changes):
+    return {
+        **engine.get_pd_router_worker_spec(),
+        "id": "physical-worker-id",
+        "is_healthy": True,
+        **changes,
+    }
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_engine_module, registered):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    engine._skip_router_registration = False
+    engine.register_to_router = Mock(return_value=registered)
+    process = SimpleNamespace(pid=123, is_alive=lambda: False)
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
+    monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
+    monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    server_args = {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}
+
+    if registered:
+        engine._init_normal(server_args, apply_policy_load_plan=False)
+    else:
+        with pytest.raises(RuntimeError, match="Required PD router registration failed"):
+            engine._init_normal(server_args, apply_policy_load_plan=False)
+
+    assert engine.process is process
+    launch.assert_called_once()
+    engine.register_to_router.assert_called_once_with(bootstrap_port=9000)
+
+
+@pytest.mark.parametrize("worker_type", ["prefill", "decode"])
+def test_pd_static_worker_adoption_does_not_post(monkeypatch, sglang_engine_module, worker_type):
+    requests = _RouterRequests()
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    engine = _pd_engine(sglang_engine_module, worker_type)
+    engine._skip_router_registration = True
+
+    assert engine.bind_registered_pd_worker("new-router", 30001, _pd_worker(engine))
+
+    assert requests.posts == []
+    assert engine._router_worker_id == "physical-worker-id"
+    assert not engine._skip_router_registration
+    assert (engine.router_ip, engine.router_port) == ("new-router", 30001)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"id": "dp@0"},
+        {"id": ""},
+        {"url": "http://different:8000"},
+        {"worker_type": "decode"},
+        {"is_healthy": False},
+        {"bootstrap_port": 9001},
+    ],
+)
+def test_pd_adoption_rejects_identity_mismatch(sglang_engine_module, changes):
+    engine = _pd_engine(sglang_engine_module)
+    with pytest.raises(ValueError, match="does not match"):
+        engine.bind_registered_pd_worker("router", 30000, _pd_worker(engine, **changes))
+    assert engine._router_worker_id is None
+
+
+def test_pd_recovery_waits_for_health_and_reuses_effective_bootstrap(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    worker = _pd_worker(engine)
+    post = Mock(return_value=_Response(202, {"worker_id": worker["id"]}))
+    get = Mock(
+        side_effect=[
+            _Response(200, {"workers": [{**worker, "is_healthy": False}]}),
+            _Response(200, {"workers": [worker]}),
+        ]
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+
+    assert engine.register_to_router()
+
+    assert post.call_count == 1 and get.call_count == 2
+    assert post.call_args.kwargs["json"]["bootstrap_port"] == 9000
+    assert not engine._router_registration_pending
+
+
+def test_pd_recovery_retries_readiness_without_duplicate_post(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    worker = _pd_worker(engine)
+    post = Mock(return_value=_Response(202, {"worker_id": worker["id"]}))
+    get = Mock(return_value=_Response(200, {"workers": [{**worker, "is_healthy": False}]}))
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+    monkeypatch.setattr(sglang_engine_module.requests, "get", get)
+    monkeypatch.setattr(sglang_engine_module, "time", _Clock())
+
+    assert not engine.register_to_router()
+    assert engine._router_registration_pending
+    get.return_value = _Response(200, {"workers": [worker]})
+    assert engine.register_to_router()
+    assert post.call_count == 1
+    assert not engine._router_registration_pending
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "wrong_id", "wrong_role", "wrong_bootstrap"])
+def test_pd_recovery_never_publishes_mismatched_registration(monkeypatch, sglang_engine_module, invalid):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    worker = _pd_worker(engine)
+    registered = dict(worker)
+    if invalid == "wrong_id":
+        registered["id"] = "different-registration"
+    elif invalid == "wrong_role":
+        registered["worker_type"] = "decode"
+    elif invalid == "wrong_bootstrap":
+        registered["bootstrap_port"] = 9001
+    workers = [registered, registered] if invalid == "duplicate" else [registered]
+    monkeypatch.setattr(
+        sglang_engine_module.requests, "post", Mock(return_value=_Response(202, {"worker_id": worker["id"]}))
+    )
+    monkeypatch.setattr(sglang_engine_module.requests, "get", Mock(return_value=_Response(200, {"workers": workers})))
+
+    assert not engine.register_to_router()
+    assert engine._router_registration_pending
+    assert engine._router_worker_id == worker["id"]
+
+
+def test_required_pd_registration_needs_router(sglang_engine_module):
+    engine = _pd_engine(sglang_engine_module)
+    engine.router_ip = None
+    assert not engine.register_to_router()
+
+
+def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, sglang_engine_module):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    engine.args.rollout_external = False
+    engine.process = SimpleNamespace(pid=123)
+    unregister = Mock(side_effect=RuntimeError("router is unavailable"))
+    killed = Mock()
+    monkeypatch.setattr(engine, "unregister_from_router", unregister)
+    monkeypatch.setattr(sglang_engine_module, "kill_process_tree", killed)
+    with pytest.raises(RuntimeError, match="router is unavailable"):
+        engine.shutdown()
+    unregister.assert_called_once_with(timeout=5.0)
+    killed.assert_called_once_with(123)
+    engine.process = None  # Do not exercise the destructor with the fake pid.
+
+
+@pytest.mark.parametrize(
+    "response,pending,post_count",
+    [
+        pytest.param(ReadTimeout("accepted but response lost"), True, 1, id="lost-response"),
+        pytest.param(ConnectTimeout("not connected"), False, 2, id="connect-timeout"),
+        pytest.param(_Response(400), False, 2, id="bad-request"),
+        pytest.param(
+            _Response(500, {"error": "Job queue not initialized", "code": "INTERNAL_SERVER_ERROR"}),
+            False,
+            2,
+            id="queue-rejected",
+        ),
+        pytest.param(_Response(500), True, 1, id="unknown-server-error"),
+        pytest.param(_Response(503), True, 1, id="gateway-unavailable"),
+        pytest.param(_Response(408), True, 1, id="gateway-timeout"),
+    ],
+)
+def test_pd_registration_retries_only_unsubmitted_requests(
+    monkeypatch, sglang_engine_module, response, pending, post_count
+):
+    from unittest.mock import Mock
+
+    engine = _pd_engine(sglang_engine_module)
+    worker = _pd_worker(engine)
+    post = Mock(side_effect=[response, _Response(202, {"worker_id": worker["id"]})])
+    monkeypatch.setattr(sglang_engine_module.requests, "post", post)
+    monkeypatch.setattr(sglang_engine_module.requests, "get", Mock(return_value=_Response(200, {"workers": [worker]})))
+
+    assert not engine.register_to_router()
+    assert engine._router_registration_pending is pending
+    assert engine.register_to_router()
+    assert post.call_count == post_count
+    assert not engine._router_registration_pending
+    assert engine._router_worker_id == worker["id"]
+
+
+def test_pd_dead_static_worker_removal_uses_retained_identity(monkeypatch, sglang_engine_module):
+    worker = {
+        "id": "static-p",
+        "url": "http://worker:8000",
+        "worker_type": "prefill",
+        "bootstrap_port": 9000,
+        "is_healthy": True,
+    }
+    requests = _RouterRequests(worker_lists=[[worker], []])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.RouterWorkerCleanup(
+        "dead-actor",
+        worker_id="static-p",
+        pd_worker_type="prefill",
+        bootstrap_port=9000,
+    )
+    assert sglang_engine_module.remove_dead_router_worker("http://router:3000", worker["url"], cleanup)
+    assert requests.deletes == ["http://router:3000/workers/static-p"]
+
+
+@pytest.mark.parametrize("mismatch", ["id", "role", "bootstrap", "url"])
+def test_pd_dead_static_cleanup_never_removes_another_worker(monkeypatch, sglang_engine_module, mismatch):
+    worker = {
+        "id": "static-p",
+        "url": "http://worker:8000",
+        "worker_type": "prefill",
+        "bootstrap_port": 9000,
+        "is_healthy": False,
+    }
+    key = {"id": "id", "role": "worker_type", "bootstrap": "bootstrap_port", "url": "url"}[mismatch]
+    worker[key] = {"id": "other-id", "role": "decode", "bootstrap": 9001, "url": "http://other:8000"}[mismatch]
+    requests = _RouterRequests(worker_lists=[[worker]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.RouterWorkerCleanup(
+        "dead-actor",
+        worker_id="static-p",
+        pd_worker_type="prefill",
+        bootstrap_port=9000,
+    )
+    assert not sglang_engine_module.remove_dead_router_worker("http://router:3000", "http://worker:8000", cleanup)
+    assert requests.deletes == []
+
+
+def test_pd_replacement_dying_before_init_return_is_removed_by_actor_label(monkeypatch, sglang_engine_module):
+    worker = {
+        "id": "replacement-p",
+        "url": "http://worker:8000",
+        "worker_type": "prefill",
+        "bootstrap_port": 9000,
+        "is_healthy": True,
+        "metadata": {"relax_actor_id": "replacement-actor"},
+    }
+    requests = _RouterRequests(worker_lists=[[worker], []])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.RouterWorkerCleanup(
+        "replacement-actor",
+        pd_worker_type="prefill",
+        bootstrap_port=9000,
+    )
+    assert sglang_engine_module.remove_dead_router_worker("http://router:3000", worker["url"], cleanup)
+    assert cleanup.worker_id == "replacement-p"
+    assert requests.deletes == ["http://router:3000/workers/replacement-p"]
+
+
+@pytest.mark.parametrize("new_url", ["http://worker:8000", "http://worker:8000@0"])
+def test_pd_id_cleanup_rejects_url_shared_with_another_generation(monkeypatch, sglang_engine_module, new_url):
+    old = {
+        "id": "static-p",
+        "url": "http://worker:8000",
+        "worker_type": "prefill",
+        "bootstrap_port": 9000,
+        "is_healthy": False,
+    }
+    requests = _RouterRequests(worker_lists=[[old, {**old, "id": "new-p", "url": new_url}]])
+    monkeypatch.setattr(sglang_engine_module, "requests", requests)
+    cleanup = sglang_engine_module.RouterWorkerCleanup(
+        "dead-actor",
+        worker_id="static-p",
+        pd_worker_type="prefill",
+        bootstrap_port=9000,
+    )
+    assert not sglang_engine_module.remove_dead_router_worker("http://router:3000", old["url"], cleanup)
+    assert requests.deletes == []

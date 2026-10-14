@@ -1,65 +1,88 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""controller.register_all_serve colocate gating for SFT-with-rollout.
+"""Exercise Controller's SFT colocate decision without starting Ray
+services."""
 
-The colocate gate previously checked ``hasattr(ROLES, "rollout")`` against
-``process_role(config)``. SFT returns ``ROLES_SFT_ONLY`` (no ``rollout`` attr),
-so even when ``register_sft_rollout`` injected ``ROLES.rollout`` via
-``extra_roles``, colocate stayed off. These tests pin the fix: the gate must
-inspect the union of ``list(ROLES) + extra_roles``.
-"""
-
-import sys
+import ast
+import builtins
 from argparse import Namespace
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 
-def _registry_or_skip():
-    try:
-        from relax.core.registry import ROLES, ROLES_SFT_ONLY
-    except (ImportError, AssertionError) as exc:
-        pytest.skip(f"relax.core.registry unavailable: {exc}")
-    return ROLES, ROLES_SFT_ONLY
+@pytest.fixture(params=[False, True], ids=["stdlib-strenum", "fallback-strenum"])
+def registry_roles(request):
+    # Execute the production enum definitions without importing backend components.
+    path = Path(__file__).resolve().parents[2] / "relax/core/registry.py"
+    tree = ast.parse(path.read_text())
+    definitions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Try)
+        or (isinstance(node, ast.ImportFrom) and node.module == "enum")
+        or (isinstance(node, ast.ClassDef) and node.name in {"ROLES", "ROLES_SFT_ONLY"})
+    ]
+
+    def import_enum(name, globals=None, locals=None, fromlist=(), level=0):
+        if request.param and name == "enum" and "StrEnum" in fromlist:
+            raise ImportError("Exercise the pre-Python-3.11 fallback")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    namespace = {"__name__": "_test_registry_roles", "__builtins__": dict(vars(builtins), __import__=import_enum)}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["ROLES"], namespace["ROLES_SFT_ONLY"]
 
 
-def test_register_sft_rollout_injects_rollout_role():
-    from relax.core.optional_roles import register_sft_rollout
+@pytest.mark.parametrize("with_rollout, expected_colocate", [(True, True), (False, False)])
+def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, with_rollout, expected_colocate):
+    # Execute the actual method; only its external collaborators are replaced.
+    # Stop at resource validation, before placement groups/services are created.
+    path = Path(__file__).resolve().parents[2] / "relax/core/controller.py"
+    tree = ast.parse(path.read_text())
+    controller_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Controller")
+    method = next(
+        n for n in controller_class.body if isinstance(n, ast.FunctionDef) and n.name == "register_all_serve"
+    )
+    ROLES, ROLES_SFT_ONLY = registry_roles
+    algo = {role: object() for role in [*ROLES_SFT_ONLY, ROLES.rollout]}
+    namespace = {
+        "validate_ppo_config": Mock(),
+        "maybe_start_managed_opd_teacher": Mock(return_value=(None, None)),
+        "resolve_sft_algo_key": Mock(return_value="sft"),
+        "ALGOS": {"sft": algo},
+        "process_role": Mock(return_value=ROLES_SFT_ONLY),
+        "validate_sft_resource": Mock(),
+        "register_extra_roles": Mock(return_value=[ROLES.rollout] if with_rollout else []),
+        "load_function": Mock(return_value=object),
+        "create_data_source_actor": Mock(return_value=object()),
+        "logger": Mock(),
+        "relax_utils": Mock(),
+        "_build_train_start_config": Mock(return_value={}),
+        "_actor_rollout_pg_roles": Mock(return_value=["actor", "rollout"]),
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
 
-    ROLES, _ = _registry_or_skip()
+    class ReachedResourceValidation(Exception):
+        pass
 
-    config = Namespace(loss_type="sft", sft_predict_interval=10)
-    algo: dict = {}
-    extras = register_sft_rollout(config, algo)
-    assert extras == [ROLES.rollout]
-    assert ROLES.rollout in algo
+    controller = Namespace(
+        config=Namespace(
+            colocate=True,
+            resource={role: (1, 1) for role in algo},
+            data_source_path="test.data_source",
+        ),
+        runtime_env=None,
+        _health_manager=Mock(),
+        _maybe_resolve_num_rollout=Mock(),
+        _validate_gpu_resources=Mock(side_effect=ReachedResourceValidation),
+    )
+    with pytest.raises(ReachedResourceValidation):
+        namespace["register_all_serve"](controller)
 
-
-def test_register_sft_rollout_noop_without_predict_interval():
-    from relax.core.optional_roles import register_sft_rollout
-
-    config = Namespace(loss_type="sft", sft_predict_interval=None)
-    algo: dict = {}
-    assert register_sft_rollout(config, algo) == []
-    assert algo == {}
-
-
-@pytest.mark.skipif(sys.version_info < (3, 11), reason="enum.StrEnum stringifies differently before Python 3.11")
-def test_sft_role_set_with_extra_rollout_supports_colocate():
-    """Mirrors register_all_serve's colocate check post-fix."""
-    ROLES, ROLES_SFT_ONLY = _registry_or_skip()
-
-    extra_roles = [ROLES.rollout]
-    role_names = {str(r) for r in list(ROLES_SFT_ONLY) + extra_roles}
-    assert "actor" in role_names
-    assert "rollout" in role_names
-    # Pre-fix would have been `hasattr(ROLES_SFT_ONLY, "rollout")` → False
-    assert not hasattr(ROLES_SFT_ONLY, "rollout")
-
-
-def test_sft_role_set_without_rollout_blocks_colocate():
-    _, ROLES_SFT_ONLY = _registry_or_skip()
-
-    extra_roles: list = []
-    role_names = {str(r) for r in list(ROLES_SFT_ONLY) + extra_roles}
-    assert "rollout" not in role_names
+    roles, colocate, pg_roles = controller._validate_gpu_resources.call_args.args
+    namespace["_actor_rollout_pg_roles"].assert_called_once_with(controller.config)
+    assert pg_roles == ["actor", "rollout"]
+    assert colocate is expected_colocate
+    assert {str(role) for role, *_ in roles} == ({"sft", "actor", "rollout"} if with_rollout else {"sft", "actor"})

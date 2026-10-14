@@ -763,6 +763,11 @@ def shutdown_agentic_resident_pipeline() -> None:
             _shutdown_resident_async_loop()
 
 
+def bind_agentic_router(router_ip: str, router_port: int) -> None:
+    """Publish the ready router on the resident Pipeline's event loop."""
+    _run_on_resident_async_loop(get_agentic_resident_pipeline().runtime_domain.bind_router(router_ip, router_port))
+
+
 def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:
     turns_by_sample = [sample.metadata[TRACE_KEY]["turns"] for sample in samples]
     if not turns_by_sample:

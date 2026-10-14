@@ -37,7 +37,9 @@ format and the client process exits when the remote run finishes.
 
 ## Files
 
-- `run_mini_swe_agent.sh`: training entry point.
+- `run_mini_swe_agent.sh`: original non-PD training entry point.
+- `run_mini_swe_agent_pd.sh`: 8-GPU, 2P2D TP2 training entry point.
+- `pd-2p2d-tp2.yaml`: pure PD engine allocation without hierarchical caching.
 - `agent_server.py`: HTTP service that leases task rows, runs mini-swe-agent,
   controls execution concurrency, scores task output, and returns final results.
 - `agent_client.sh`: per-session cheap entrypoint launched by Relax.
@@ -146,6 +148,18 @@ processes:
 
 Keep these values in a single `--agent-env` occurrence. The Relax argument uses a
 list value, so repeating `--agent-env` can drop earlier entries.
+
+## Train with prefill–decode disaggregation
+
+`run_mini_swe_agent_pd.sh` uses the same Mini SWE task pipeline with two prefill
+and two decode engines, each TP2, sharing eight GPUs with the trainer. The
+original `run_mini_swe_agent.sh` is unchanged. Use the PD script through
+`scripts/entrypoint/ray-job.sh` on a dedicated single-node Ray cluster; its Ray
+driver owns the agent server so asynchronous submission keeps the server alive.
+
+See the [English PD guide](../../docs/en/guide/pd-disaggregation.md) or
+[中文 PD 指南](../../docs/zh/guide/pd-disaggregation.md) for general PD
+configuration, resource allocation, routing policies, and limitations.
 
 ## Runtime data flow
 

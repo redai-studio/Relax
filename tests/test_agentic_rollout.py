@@ -8,6 +8,7 @@ import time
 from argparse import Namespace
 from collections import deque
 from contextlib import asynccontextmanager
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -646,36 +647,48 @@ def _backend_adapter(*, lifecycle_enabled: bool) -> SGLangBackendAdapter:
     return adapter
 
 
-async def test_generate_sends_session_id_only_when_lifecycle_enabled(monkeypatch) -> None:
-    payloads: list[dict[str, Any]] = []
+@pytest.mark.parametrize("lifecycle_enabled", [False, True])
+async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypatch, lifecycle_enabled) -> None:
+    calls = []
 
     async def fake_post(url, payload, headers=None, fail_fast_no_workers=False):
-        del url, headers, fail_fast_no_workers
-        payloads.append(dict(payload))
+        calls.append((url, payload, headers, fail_fast_no_workers))
         return {
             "output_ids": [4],
-            "meta_info": {"output_token_logprobs": [], "finish_reason": {"type": "stop"}},
+            "meta_info": {"id": "r", "weight_version": "7", "finish_reason": {"type": "stop"}},
         }
 
     monkeypatch.setattr(runtime_mod, "post", fake_post)
-    adapter = _backend_adapter(lifecycle_enabled=True)
-    await adapter.generate(
+    adapter = _backend_adapter(lifecycle_enabled=lifecycle_enabled)
+    adapter._args.sglang_router_ip = None
+    shard = object.__new__(AgenticSessionShard.__ray_metadata__.modified_class)
+    shard.args = adapter._args
+    await shard.set_router_address("10.0.0.1", 8000)
+    await shard.set_router_address("10.0.0.1", 8000)
+    with pytest.raises(RuntimeError, match="Cannot replace"):
+        await shard.set_router_address("other-router", 8000)
+    adapter._args.sglang_router_policy = "consistent_hashing"
+    adapter._worker_urls = AsyncMock(side_effect=AssertionError("generation must use the router"))
+    result = await adapter.generate(
         input_ids=[1, 2, 3],
         sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-1:0",
+        session_id="s",
+        request_id="r",
+        fail_fast_no_workers=True,
     )
-    assert payloads[-1]["session_id"] == "session-9"
-    assert payloads[-1]["rid"] == "request-1:0"
 
-    adapter._session_lifecycle = False
-    await adapter.generate(
-        input_ids=[1, 2, 3],
-        sampling_params={"max_new_tokens": 4},
-        session_id="session-9",
-        request_id="request-2:0",
-    )
-    assert "session_id" not in payloads[-1]
+    assert len(calls) == 1
+    url, payload, headers, fail_fast = calls[0]
+    assert url == "http://10.0.0.1:8000/generate"
+    assert payload["input_ids"] == [1, 2, 3] and payload["rid"] == "r"
+    assert "session_params" not in payload
+    if lifecycle_enabled:
+        assert payload["session_id"] == "s"
+    else:
+        assert "session_id" not in payload
+    assert headers == {"X-SMG-Routing-Key": "s"} and fail_fast is True
+    assert result.meta_info["weight_version"] == "7"
+    adapter._worker_urls.assert_not_awaited()
 
 
 async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
@@ -844,6 +857,97 @@ def _admission_coordinator(*, max_wait_s: float = 30.0, capacity: int = 100):
     coordinator._cancelled_tickets = {}
     coordinator._counters = {}
     return coordinator_cls, coordinator
+
+
+async def test_admission_waits_for_router_before_starting_polling() -> None:
+    _, coordinator = _admission_coordinator()
+    coordinator._program_admission = True
+    coordinator._router_ip = None
+    coordinator._router_port = 3000
+    coordinator._poll_task = None
+    coordinator._client = SimpleNamespace(aclose=AsyncMock())
+    coordinator._reconcile_once = AsyncMock()
+    coordinator._poll_loop = AsyncMock(side_effect=asyncio.Event().wait)
+    try:
+        await coordinator.start()
+        coordinator._reconcile_once.assert_not_awaited()
+        assert coordinator._poll_task is None
+        await coordinator.set_router_address("ready-router", 3000)
+        poll_task = coordinator._poll_task
+        await coordinator.set_router_address("ready-router", 3000)
+        assert poll_task is not None and coordinator._poll_task is poll_task
+        coordinator._reconcile_once.assert_awaited_once()
+        assert (coordinator._router_ip, coordinator._router_port) == ("ready-router", 3000)
+        with pytest.raises(RuntimeError, match="Cannot replace"):
+            await coordinator.set_router_address("other-router", 3000)
+    finally:
+        await coordinator.shutdown()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_runtime_router_publication_waits_for_every_owner(fails) -> None:
+    gates = [asyncio.Event() for _ in range(3)]
+
+    async def bind(index, _ip, _port):
+        await gates[index].wait()
+        if fails and index == 2:
+            raise RuntimeError("owner unavailable")
+
+    handles = [
+        SimpleNamespace(set_router_address=SimpleNamespace(remote=AsyncMock(side_effect=partial(bind, i))))
+        for i in range(3)
+    ]
+    runtime = RuntimeDomain(
+        Namespace(rollout_engine_init_timeout=1.0),
+        "train",
+        [SimpleNamespace(handle=handle) for handle in handles[:2]],
+        concurrency=1,
+        admission_coordinator=handles[2],
+    )
+    task = asyncio.create_task(runtime.bind_router("ready-router", 3000))
+    try:
+        await _wait_until(lambda: all(handle.set_router_address.remote.await_count for handle in handles))
+        gates[0].set()
+        gates[1].set()
+        await asyncio.sleep(0)
+        assert not task.done()
+        gates[2].set()
+        if fails:
+            with pytest.raises(RuntimeError, match="owner unavailable"):
+                await task
+        else:
+            await task
+        for handle in handles:
+            handle.set_router_address.remote.assert_awaited_once_with("ready-router", 3000)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("first_model_pd", [False, True])
+def test_agentic_ingress_keeps_requested_port_while_deferring_router(monkeypatch, first_model_pd) -> None:
+    from relax.agentic.session import service
+
+    rollout = ModuleType("relax.distributed.ray.rollout")
+    rollout._resolve_sglang_config = lambda _args: SimpleNamespace(
+        models=[SimpleNamespace(has_pd_disaggregation=first_model_pd), SimpleNamespace(has_pd_disaggregation=True)]
+    )
+    endpoint = (None, None) if first_model_pd else ("ingress-router", 3131)
+    rollout._start_router = MagicMock(return_value=endpoint)
+    monkeypatch.setitem(sys.modules, rollout.__name__, rollout)
+    monkeypatch.setattr(service, "AdmissionCoordinator", MagicMock())
+    monkeypatch.setattr(service, "AgenticChatAPIService", MagicMock())
+    monkeypatch.setattr(service, "create_agentic_session_shards", MagicMock(return_value=()))
+    monkeypatch.setattr(service.ray, "get", lambda _ref: None)
+    monkeypatch.setattr(service.serve, "run", MagicMock())
+    monkeypatch.setattr(service, "_DEPLOYED_ADMISSION_COORDINATOR", None)
+    args = Namespace(sglang_router_ip=None, sglang_router_port=3131)
+
+    service.deploy_agentic_chat_api_services(config=args, runtime_env={})
+
+    rollout._start_router.assert_called_once_with(args, has_pd_disaggregation=first_model_pd, force_new=False)
+    assert args.sglang_router_ip == endpoint[0]
+    assert args.sglang_router_port == 3131
 
 
 async def test_admission_coordinator_bypasses_protected_and_degraded_requests() -> None:
@@ -1108,8 +1212,10 @@ async def test_agentic_persistent_router_503_fails_after_one_wait(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
+@pytest.mark.parametrize("history", [[], [100, 200]])
+async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch, history):
     shard, _group, session, ir = _router_recovery_shard()
+    ir.history_rollout_token_prefix = history
     calls, sleeps = [], []
 
     async def generate(**kwargs):
@@ -1130,7 +1236,8 @@ async def test_agentic_router_503_waits_once_without_losing_prefix(monkeypatch):
     await task
 
     assert len(calls) == 2 and calls[0]["request_id"] == calls[1]["request_id"]
-    assert calls[0]["input_ids"] == calls[1]["input_ids"] == [300]
+    assert calls[0]["input_ids"] == calls[1]["input_ids"] == history + [300]
+    assert calls[0]["sampling_params"] == calls[1]["sampling_params"] == {"max_new_tokens": 7}
     assert sleeps == [2.0]
     assert ir.pending_token_delta == [300, 7]
     assert ir.waiter.result() == {"ok": True}

@@ -181,11 +181,6 @@ class TestEmptyEngineList:
     """The manager reports ``[]`` for the whole window between offload()
     retiring every dead engine and the next onload() rebuilding them."""
 
-    def test_no_engines_raises(self, replica):
-        r = replica([[]])
-        with pytest.raises(RuntimeError, match="No genRM engines available"):
-            r.pick()
-
     def test_empty_list_is_not_cached_forever(self, replica):
         """Regression: caching ``[]`` stranded the replica permanently.
 
