@@ -377,37 +377,6 @@ def _resolve_external_model_arch(package_name):
     return None
 
 
-def _launch_server_with_file_cache_directory(
-    server_args: ServerArgs, worker_type: str, rank: int
-) -> multiprocessing.Process:
-    """Give explicitly opted-in single-node P engines independent L3 quotas."""
-    if worker_type != "prefill" or server_args.hicache_storage_backend != "file":
-        return launch_server_process(server_args)
-    root = Envs.RELAX_HICACHE_FILE_ROOT
-    if not root:
-        return launch_server_process(server_args)
-    if server_args.nnodes != 1 or server_args.node_rank != 0 or server_args.dp_size != 1:
-        raise ValueError("Per-engine file cache root currently requires single-node DP1 prefill")
-    if not os.path.isabs(root) or not os.path.isdir(root) or not isinstance(rank, int) or rank < 0:
-        raise ValueError("Per-engine file cache requires an existing absolute run root and logical engine rank")
-    directory = os.path.join(root, f"prefill-engine-{rank:04d}")
-    os.makedirs(directory, exist_ok=True)
-    key = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
-    previous = os.environ.get(key)
-    try:
-        os.environ[key] = directory
-        logger.info("File HiCache engine rank=%s storage_directory=%s", rank, directory)
-        # Both TP schedulers inherit this P-engine directory; native TP suffixes
-        # retain independent per-rank accounting. Restore the actor environment
-        # so recovery never nests an already-derived path.
-        return launch_server_process(server_args)
-    finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
-
-
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     multiprocessing.set_start_method("spawn", force=True)
 
@@ -712,7 +681,7 @@ class SGLangEngine(RayActor):
             server_args.disaggregation_bootstrap_port if self.worker_type == "prefill" else None
         )
         self._router_dp_size = server_args.dp_size
-        self.process = _launch_server_with_file_cache_directory(server_args, self.worker_type, self.rank)
+        self.process = launch_server_process(server_args)
 
         bootstrap_port = self._router_bootstrap_port
         # Only register to router if skip_router_registration=False

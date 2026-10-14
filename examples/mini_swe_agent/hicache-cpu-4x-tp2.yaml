@@ -1,0 +1,21 @@
+# Eight shared GPUs: four regular engines, each TP2, with CPU HiCache.
+# Qwen3.5 Unified Full KV + Mamba, single-node DP1.
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+      - worker_type: regular
+        num_gpus: 8
+        overrides:
+          mamba_radix_cache_strategy: extra_buffer
+          mamba_track_interval: 256
+          chunked_prefill_size: 8192
+          page_size: 64
+          max_mamba_cache_size: 666
+          enable_hierarchical_cache: true
+          hicache_ratio: 2.0
+          hicache_size: 0
+          hicache_write_policy: write_through
+          hicache_io_backend: direct
+          hicache_mem_layout: page_first_direct
+          hicache_storage_backend: null

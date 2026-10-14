@@ -149,7 +149,6 @@ class _Clock:
 def _make_engine(sglang_engine_module):
     engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
     engine.args = SimpleNamespace(use_slime_router=False)
-    engine.rank = 0
     engine.node_rank = 0
     engine.worker_type = "regular"
     engine.router_ip = "router"
@@ -504,12 +503,7 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
     monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
-    server_args = {
-        "host": "worker",
-        "disaggregation_bootstrap_port": 9000,
-        "dp_size": 1,
-        "hicache_storage_backend": None,
-    }
+    server_args = {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}
 
     if registered:
         engine._init_normal(server_args, apply_policy_load_plan=False)

@@ -1,20 +1,19 @@
-# Hierarchical Cache
+# CPU Cache
 
-Hierarchical caching extends reusable prompt state beyond GPU memory. SGLang HiCache backs up prefixes to CPU memory and can use a storage backend for additional capacity. Later requests can restore evicted prefixes instead of computing them again. This can help workloads with repeated long prompts, such as multi-turn conversations and agents; the benefit depends on reuse and the cost of moving data.
+CPU caching extends reusable prompt state from GPU memory into host memory. SGLang HiCache restores prefixes evicted from the GPU, reducing repeated prefill work. Multi-turn conversations and agents that repeatedly submit long prefixes can benefit; actual gains depend on prefix reuse and transfer costs.
 
-| Tier | Location | How a request uses it |
+| Tier | Location | Request behavior |
 | --- | --- | --- |
-| L1 | GPU memory | Reuse resident prefix state directly |
-| L2 | CPU memory | Restore a backed-up prefix to GPU after GPU eviction |
-| L3, optional | Storage backend, such as local SSD or a distributed store | Read a stored prefix into CPU memory, then restore it to GPU |
+| L1 | GPU memory | Reuse a resident prefix directly |
+| L2 | CPU memory | Restore a backed-up prefix to the GPU after device eviction |
 
-Hierarchical caching controls where prefix state is kept. [PD disaggregation](./pd-disaggregation.md) controls which engines process prompts and generate tokens. The two can be configured together; neither requires a particular agent framework or training algorithm.
+**CPU cache works independently in regular deployment and can also be combined with [PD disaggregation](./pd-disaggregation.md).** A regular engine handles both prefill and decode; PD assigns these stages to separate engines. Cache placement and engine topology are independent settings. This guide and its recipes support GPU+CPU caching only; L3 storage is outside this change.
 
-## Enable CPU caching
+## Regular deployment
 
-Use the environment and matching SGLang patch from [Installation](./installation.md). The model's cache implementation must support the selected HiCache layout and parallelism settings. Relax forwards `--sglang-*` arguments to SGLang.
+Use the environment and SGLang patch from the [installation guide](./installation.md). Confirm that your model's cache implementation supports the chosen HiCache layout and parallel configuration. Relax forwards SGLang settings through `--sglang-*` options.
 
-To enable CPU caching on engines that share the same settings, add these arguments to an existing training configuration:
+When all regular engines use the same cache settings, add these options to an existing training recipe:
 
 ```bash
 --sglang-enable-hierarchical-cache \
@@ -22,9 +21,29 @@ To enable CPU caching on engines that share the same settings, add these argumen
 --sglang-hicache-write-policy write_through
 ```
 
-With `hicache_storage_backend` left unset, this enables GPU+CPU caching. `write_through` backs up eligible prefixes to CPU memory, and `hicache_ratio` sizes the host pool relative to its device pool. Capacity and model-specific state are discussed below.
+Leave `hicache_storage_backend` unset or `null`. These options require no prefill/decode groups, PD router, or storage directory. `write_through` backs up eligible prefixes to CPU memory; `hicache_ratio` sizes host pools relative to their corresponding device pools.
 
-For PD, configure the prefill and decode groups separately through `--sglang-config`. The following example adds CPU caching to the prefill side of the allocation used in the [PD guide](./pd-disaggregation.md#configure-engine-groups-with-yaml):
+Alternatively, use `--sglang-config` to configure CPU cache on regular engines:
+
+```yaml
+sglang:
+  - name: default
+    num_gpus_per_engine: 2
+    engine_groups:
+      - worker_type: regular
+        num_gpus: 8
+        overrides:
+          enable_hierarchical_cache: true
+          hicache_ratio: 2.0
+          hicache_write_policy: write_through
+          hicache_storage_backend: null
+```
+
+With PP1 and DP1, this creates four TP2 regular engines. Group `overrides` use SGLang field names and take precedence over corresponding command-line options. GPU count and TP2 are recipe choices; add any model-specific cache settings separately.
+
+## PD deployment
+
+PD deployments can configure the two sides separately. This example enables CPU cache only on prefill engines:
 
 ```yaml
 sglang:
@@ -46,79 +65,42 @@ sglang:
           disaggregation_decode_enable_radix_cache: false
 ```
 
-Save the YAML and pass its path with `--sglang-config /path/to/pd-cache.yaml`. With PP1 and DP1, it creates two prefill and two decode engines, each TP2. Eight GPUs is an example allocation; adapt the groups to the model and available resources. Group-level `overrides` use SGLang field names and take precedence over the corresponding CLI arguments. Add any cache settings required by the model separately.
+Select the saved YAML with `--sglang-config /path/to/cpu-cache.yaml`. This creates two prefill and two decode engines, each TP2. Disabling cache on decode engines is a choice in this PD recipe; it does not restrict regular engines. See the [PD guide](./pd-disaggregation.md#routing-and-limits) for managed PD resource, routing, and parallelism constraints.
 
-## Add a storage tier
+## Compatibility and capacity
 
-`hicache_storage_backend` selects L3 independently of CPU caching. SGLang provides `file`, `mooncake`, `hf3fs`, `nixl`, and other backends, as well as dynamic backend loading. Their dependencies, supported cache components, and sharing semantics differ; use the [HiCache documentation](https://docs.sglang.io/docs/advanced_features/hicache) for the SGLang version in your environment.
+Each request matches the selected engine's local prefix tree. A GPU hit is reused directly; a CPU hit is restored to the GPU; missing or incompatible state is recomputed. Hybrid models may require both attention KV pages and recurrent state such as Mamba checkpoints. Participating ranks must hold compatible state for the same prefix and weights. A prefill chunk boundary does not guarantee a reusable checkpoint at that boundary.
 
-For a local file backend, replace the prefill group's storage settings with:
+Each DP replica owns its prefix tree and GPU/CPU pools. TP ranks in a replica hold their shards and coordinate cache operations; Attention DP similarly partitions local state by attention-DP group. Routing a request to another replica does not transfer its cache hits. The Mini SWE recipes include regular TP2 engines, 2P2D TP2, and 1P1D with attention DP2 × TP2 and EP4; these are specific layouts, not general CPU cache parallelism limits.
 
-```yaml
-hicache_storage_backend: file
-hicache_storage_prefetch_policy: wait_complete
-hicache_storage_backend_extra_config: '{"enable_metadata_cache": false, "max_size": 34359738368, "min_free_space": 68719476736, "eviction_ratio": 0.9}'
-```
+The DP2 PD recipe requires the paired router fix described in the [Mini SWE example](../../../examples/mini_swe_agent/README.md#train-with-cpu-caching). It uses a stable session key for DP-aware consistent hashing on both sides. P/D owners can differ: the router must pass each engine's selected rank and tell decode which prefill rank supplies KV. Verify both actual ranks and host restores on each prefill DP rank. A stable decode rank alone does not prove prefill cache affinity. CPU cache itself does not require PD or this routing policy.
 
-These are example settings: `max_size` allows 32 GiB per storage-owning rank, `min_free_space` requires 64 GiB free on the backing filesystem, and `eviction_ratio` targets 90% of the quota after eviction. They are not whole-job budgets. `wait_complete` waits for the storage prefetch to finish; it can improve reuse but adds latency when IO is slow.
-
-For Relax-managed native prefill engines, create a dedicated absolute directory on local SSD and pass it to **Ray workers** as `RELAX_HICACHE_FILE_ROOT`. Merge the following into the job's runtime environment, replacing the path with your own:
-
-```yaml
-env_vars:
-  RELAX_HICACHE_FILE_ROOT: /local/ssd/relax-cache/run-001
-```
-
-The root must already exist. Relax creates `prefill-engine-0000`, `prefill-engine-0001`, and so on below it, using each engine's logical rank. Setting the variable only on the submitter does not configure remote workers. This directory helper applies only to `file` on native prefill engines and currently requires a single-node engine with `dp_size=1`; it does not manage regular, external, or custom engines.
-
-The file backend keeps its LRU and quota accounting inside each process. Separate engine directories keep eviction and quota ownership clear. TP ranks within an engine use native filename suffixes to distinguish shards; MLA uses a single storage owner for replicated data. With two TP2 prefill engines storing separate shards and the quota above, the aggregate file budget is 128 GiB. The 64 GiB free-space threshold is shared by the filesystem, not reserved again for each rank.
-
-Sharing L3 across engines is possible with a suitable backend and compatible cache keys. Pointing independent file-backend instances at one directory does not provide coordinated eviction or quotas, and the current per-engine weight namespace does not enable cross-engine reuse. Stop the job and its workers before removing its cache directory.
-
-## Request flow and cache compatibility
-
-1. The selected engine matches the request against its local prefix cache.
-2. A GPU hit is reused directly; CPU state is restored when the matching prefix is no longer on GPU.
-3. If a storage backend is configured, a storage hit can restore missing host state before loading it to GPU.
-4. Missing or incompatible state is recomputed through prefill.
-
-For hybrid models, the reusable state can include both attention KV pages and recurrent state such as Mamba checkpoints. Recovery requires compatible state for the same prefix and weights on all participating ranks. KV files alone may be insufficient, and a chunk's length does not guarantee a checkpoint at its end.
-
-Each DP replica has its own prefix tree and GPU/CPU pools. TP ranks within a replica hold shards of that replica's state and coordinate cache operations. Attention DP similarly separates local state by attention-DP group. A request routed to another replica does not automatically inherit an L1/L2 hit; reuse across replicas depends on routing or a shared storage tier.
-
-DP1 is a limit of the directory helper above and of the managed static PD startup described in the [PD guide](./pd-disaggregation.md#routing-and-limits). It is not a general restriction of hierarchical caching. Removing that check alone would not add per-DP storage accounting or DP-aware PD routing.
-
-## Capacity and weight updates
-
-| Setting | Effect |
+| Setting | Purpose |
 | --- | --- |
-| `hicache_ratio` | Host-pool capacity relative to the corresponding device pool |
-| `hicache_size` | Fixed host-pool size in GB; a positive value overrides the ratio |
-| `hicache_write_policy` | When eligible prefixes are backed up, for example `write_through` |
-| `hicache_io_backend` / `hicache_mem_layout` | GPU↔CPU transfer mechanism and host layout; select a combination supported by the model |
-| `hicache_storage_prefetch_policy` | When to wait for or stop storage prefetch |
-| `hicache_storage_backend_extra_config` | Backend-specific configuration, including file quotas |
+| `hicache_ratio` | Host capacity relative to the corresponding device pool |
+| `hicache_size` | Fixed host capacity in GB; a positive value overrides the ratio |
+| `hicache_write_policy` | When eligible prefixes are backed up, such as `write_through` |
+| `hicache_io_backend` / `hicache_mem_layout` | GPU↔CPU transfer method and host layout; choose a model-supported combination |
 
-`max_total_tokens` is optional. When omitted, SGLang derives GPU token-pool capacity from its memory budget. Set it when an explicit cap is needed, such as a controlled capacity comparison. It is neither a required HiCache setting nor a per-request output limit. Since a ratio-sized host pool follows device capacity, changing the GPU pool can also change CPU memory use.
+`max_total_tokens` is an optional capacity cap. Without it, SGLang derives GPU token-pool capacity from its memory budget. Set it explicitly for controlled capacity comparisons; it is neither a CPU cache requirement nor a per-request output limit.
 
-Budget host memory across all engines and ranks, including every cache component. Hybrid models may allocate substantial recurrent-state pools in addition to KV. Add training offload, weights, Ray, and OS usage, and check both startup allocation logs and container limits. `hicache_ratio=2` is a capacity ratio, not a two-gigabyte or whole-machine limit. The `direct` IO option controls GPU/CPU transfers; it does not mean file reads bypass the OS page cache.
+Budget host memory across every cache-enabled engine and rank, including both KV and recurrent state pools, training offload, weights, Ray, and the operating system. `hicache_ratio=2` means a capacity ratio, not 2 GB or a machine-wide limit. At equal per-rank capacities, four TP2 regular engines require twice the host-pool budget of the 2P2D recipe above. Check actual allocation logs and container limits.
 
-RL changes model weights between rollout iterations, so cached states must be invalidated when their weights change. For file L3, the repository's SGLang v0.5.17 patch creates a new namespace at engine startup and advances it on weight updates, after draining active cache IO. Old files become unreachable by new requests but remain on disk until eviction. Restarted engines start with a cold namespace; ordinary offload/onload without a weight change preserves that namespace. Other storage backends do not automatically receive this file-specific namespace management.
+## RL weight updates and pausing
 
-Cancellation also needs to preserve buffer ownership: an aborted request can still have a storage read in flight. Its buffers remain owned until IO finishes. This lets cache completion be drained before cache reset or a weight update.
+CPU cache contents depend on model weights. Relax's weight synchronization pauses engines and flushes GPU/CPU prefix caches before updating weights, preventing new weights from reusing old prefixes. Engine restarts also start with empty caches. Use the framework lifecycle for training offload/onload.
 
-## Check cache use and diagnose problems
+Pausing generation does not complete pending GPU↔CPU transfers. The accompanying patch continues processing cache completion events while regular and prefill engines are paused, so in-flight buffers can be released safely before flush. For Full KV+Mamba models with chunked prefill, it also preserves CPU backup of a protected checkpoint before a final short tail, without fabricating missing Mamba state.
 
-Inspect each engine's effective settings, host allocations, and storage directory. Distinguish GPU hits, CPU restoration, and L3 restoration; the existence of cache files alone does not establish that a request used them. Where available, native generation responses expose `cached_tokens_details` with `device`, `host`, and `storage` counts. Combine these with IO metrics and complete rollout time.
+## Verify hits and troubleshoot
+
+Inspect actual engine roles, `enable_hierarchical_cache`, host allocations, and `hicache_storage_backend=null`. Native generation responses can attribute hits through `cached_tokens_details.device` and `.host`; `.storage` should be zero in this CPU configuration. Details may be `null` for a zero-hit response. A host-pool allocation alone does not prove CPU restoration: also check H2D counters and output correctness.
 
 | Symptom | Check |
 | --- | --- |
-| No CPU or storage hits | The prefix may still fit on GPU, be too short for a checkpoint, have been invalidated by weights, or reach another engine |
-| Files exist but storage hits stay zero | Check namespace, complete cache components across ranks, and whether L1/L2 already serves the prefix |
-| Host allocation failure | Sum all component pools across engines/ranks, then include training offload and container limits |
-| File writes fail or stop | Check permissions, quota, filesystem free space, and storage-worker errors |
-| Restoration is slower than recomputation | Compare prefix length, IO and transfer costs, and prefetch waiting time |
+| No CPU hits | Prefix still on GPU, insufficient checkpoint length, weight invalidation, or routing to another engine |
+| Host allocation failure | All component pools across engines/ranks, training offload, and container limits |
+| Flush waits | Remaining requests, GPU/CPU transfers, or unprocessed completion events |
+| Restore slower than recompute | Prefix length, transfer costs, and full rollout time |
 
-For performance comparisons, keep the model, requests, concurrency, and GPU/CPU budgets consistent. Larger cache capacity can reduce repeated prefill, but storage latency or time spent in tools may dominate end-to-end rollout.
-
-For a complete agent training recipe, see the [Mini SWE example](../../../examples/mini_swe_agent/README.md#train-with-cpu-and-ssd-caching), including its launch commands and model-specific YAML. General task concurrency and export behavior are covered in [Agentic Rollout](./agentic-rollout.md).
+The [Mini SWE example](../../../examples/mini_swe_agent/README.md#train-with-cpu-caching) includes regular and PD launch commands and Qwen3.5-specific YAML. See [Agentic Rollout](./agentic-rollout.md) for concurrency and export contracts. Functional validation does not establish a speedup; performance comparisons require equal models, requests, concurrency, and cache capacities, plus independent repeated runs.

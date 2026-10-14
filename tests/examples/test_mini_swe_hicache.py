@@ -55,61 +55,71 @@ def submission(tmp_path):
         "ROLLOUT_BATCH_SIZE": "1",
         "AGENT_SERVER_TRAIN_CONCURRENCY": "8",
         "ENABLE_EVAL": "0",
-        "RELAX_HICACHE_FILE_ROOT": str(tmp_path / "ssd"),
     }
     return example, env
 
 
-@pytest.mark.parametrize("tier", ["cpu", "ssd"])
-def test_hicache_submission_preserves_pd_driver_and_forwards_storage_root(submission, tier):
+@pytest.mark.parametrize("deployment", [None, "regular", "pd"])
+def test_hicache_submission_selects_topology_and_preserves_runtime(submission, deployment):
     example, env = submission
+    env.pop("HICACHE_DEPLOYMENT", None)
+    if deployment is not None:
+        env["HICACHE_DEPLOYMENT"] = deployment
     result = subprocess.run(
-        ["bash", str(example / "run_mini_swe_agent_hicache.sh")],
-        env={**env, "HICACHE_TIER": tier},
-        capture_output=True,
-        text=True,
+        ["bash", str(example / "run_mini_swe_agent_hicache.sh")], env=env, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
     args = json.loads(Path(env["CAPTURE"]).read_text())
     config_values = [args[i + 1] for i, arg in enumerate(args) if arg == "--sglang-config"]
-    assert config_values[-1] == str(example / f"pd-hicache-{tier}-2p2d-tp2.yaml")
+    config = "pd-hicache-cpu-2p2d-tp2.yaml" if deployment == "pd" else "hicache-cpu-4x-tp2.yaml"
+    assert config_values[-1] == str(example / config)
     runtime = json.loads(args[args.index("--runtime-env-json") + 1])
-    assert runtime["env_vars"]["RELAX_HICACHE_FILE_ROOT"] == env["RELAX_HICACHE_FILE_ROOT"]
     assert runtime["env_vars"]["PYTHONPATH"].endswith("isolated-sglang")
     assert args[args.index("--") + 1 : args.index("--") + 4] == [
         "bash",
         str(example / "run_mini_swe_agent_pd.sh"),
         "--ray-driver",
     ]
-    assert args[args.index("--sglang-router-decode-policy") + 1] == "power_of_two"
 
 
-def test_ssd_launch_rejects_reusing_a_nonempty_run_directory(submission):
+def test_hicache_submission_rejects_unknown_deployment(submission):
     example, env = submission
-    cache = Path(env["RELAX_HICACHE_FILE_ROOT"])
-    cache.mkdir()
-    (cache / "existing.bin").write_bytes(b"keep")
     result = subprocess.run(
-        ["bash", str(example / "run_mini_swe_agent_hicache.sh")], env=env, capture_output=True, text=True
+        ["bash", str(example / "run_mini_swe_agent_hicache.sh")],
+        env={**env, "HICACHE_DEPLOYMENT": "unknown"},
+        capture_output=True,
+        text=True,
     )
-    assert result.returncode != 0 and "empty cache directory" in result.stderr
-    assert (cache / "existing.bin").read_bytes() == b"keep"
+    assert result.returncode != 0 and "regular or pd" in result.stderr
     assert not Path(env["CAPTURE"]).exists()
 
 
-def test_cpu_and_ssd_examples_differ_only_in_native_storage_settings():
-    configs = [yaml.safe_load((EXAMPLE / f"pd-hicache-{tier}-2p2d-tp2.yaml").read_text()) for tier in ("cpu", "ssd")]
-    for config in configs:
-        model = config["sglang"][0]
-        assert model["num_gpus_per_engine"] == 2
-        prefill, decode = model["engine_groups"]
-        assert prefill["num_gpus"] == decode["num_gpus"] == 4
-        assert prefill["overrides"]["enable_hierarchical_cache"]
-        assert not decode["overrides"]["enable_hierarchical_cache"]
-        assert decode["overrides"]["hicache_storage_backend"] is None
-        for group in (prefill, decode):
-            assert not any("session" in key for key in group["overrides"])
-        for key in list(prefill["overrides"]):
-            if key.startswith("hicache_storage_"):
-                del prefill["overrides"][key]
-    assert configs[0] == configs[1]
+@pytest.mark.parametrize(
+    ("filename", "roles", "gpus", "engine_gpus", "attention_dp"),
+    [
+        ("hicache-cpu-4x-tp2.yaml", ["regular"], [8], 2, 1),
+        ("pd-hicache-cpu-2p2d-tp2.yaml", ["prefill", "decode"], [4, 4], 2, 1),
+        ("pd-hicache-cpu-1p1d-dp2-tp2-ep4.yaml", ["prefill", "decode"], [4, 4], 4, 2),
+    ],
+)
+def test_cpu_cache_examples_support_both_topologies(filename, roles, gpus, engine_gpus, attention_dp):
+    model = yaml.safe_load((EXAMPLE / filename).read_text())["sglang"][0]
+    assert model["num_gpus_per_engine"] == engine_gpus
+    groups = model["engine_groups"]
+    assert [group["worker_type"] for group in groups] == roles
+    assert [group["num_gpus"] for group in groups] == gpus
+    for group in groups:
+        overrides = group["overrides"]
+        assert overrides["hicache_storage_backend"] is None
+        assert overrides["enable_hierarchical_cache"] == (group["worker_type"] != "decode")
+        if attention_dp > 1:
+            assert overrides["dp_size"] == attention_dp
+            assert overrides["enable_dp_attention"] is True
+            assert overrides["ep_size"] == 4
+            assert engine_gpus // attention_dp == 2
+        if group["worker_type"] != "decode":
+            assert overrides["mamba_radix_cache_strategy"] == "extra_buffer"
+            assert overrides["mamba_track_interval"] % overrides["page_size"] == 0
+            assert overrides["hicache_write_policy"] == "write_through"
+            assert overrides["chunked_prefill_size"] // attention_dp == 8192
+            assert overrides["max_mamba_cache_size"] // attention_dp == 666

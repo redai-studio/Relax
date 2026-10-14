@@ -1,0 +1,159 @@
+diff --git a/src/routers/http/pd_router.rs b/src/routers/http/pd_router.rs
+--- a/src/routers/http/pd_router.rs
++++ b/src/routers/http/pd_router.rs
+@@ -76,7 +76,7 @@
+         headers: Option<Vec<(String, String)>>,
+     ) -> Response {
+         let workers = self.worker_registry.get_prefill_workers();
+-        let first_worker_url = workers.first().map(|w| w.url().to_string());
++        let first_worker_url = workers.first().map(|w| w.base_url().to_string());
+ 
+         if let Some(worker_url) = first_worker_url {
+             self.proxy_to_worker(worker_url, endpoint, headers).await
+@@ -557,6 +557,29 @@
+         }
+     }
+ 
++    // Keep physical endpoints separate from virtual DP identities. Preserve the raw
++    // request so native extensions such as routed_experts survive the round trip.
++    fn prepare_dp_requests(
++        request: Value,
++        prefill: &dyn Worker,
++        decode: &dyn Worker,
++    ) -> (Value, Value) {
++        let mut prefill_request = request.clone();
++        let mut decode_request = request;
++        if let (Some(rank), Some(object)) = (prefill.dp_rank(), prefill_request.as_object_mut()) {
++            object.insert("routed_dp_rank".to_string(), Value::from(rank));
++        }
++        if let Some(object) = decode_request.as_object_mut() {
++            if let Some(rank) = decode.dp_rank() {
++                object.insert("routed_dp_rank".to_string(), Value::from(rank));
++            }
++            if let Some(rank) = prefill.dp_rank() {
++                object.insert("disagg_prefill_dp_rank".to_string(), Value::from(rank));
++            }
++        }
++        (prefill_request, decode_request)
++    }
++
+     // Internal method that performs the actual dual dispatch (without retry logic)
+     async fn execute_dual_dispatch_internal(
+         &self,
+@@ -578,20 +601,22 @@
+         inject_trace_context_http(&mut headers_with_trace);
+         let headers = Some(&headers_with_trace);
+ 
+-        // Build both requests
++        // Build both requests with their independently selected DP owners.
++        let (prefill_json, decode_json) =
++            Self::prepare_dp_requests(json_request, prefill.as_ref(), decode.as_ref());
+         let prefill_request = self.build_post_with_headers(
+             &self.client,
+-            prefill.url(),
++            prefill.base_url(),
+             context.route,
+-            &json_request,
++            &prefill_json,
+             headers,
+             false,
+         );
+         let decode_request = self.build_post_with_headers(
+             &self.client,
+-            decode.url(),
++            decode.base_url(),
+             context.route,
+-            &json_request,
++            &decode_json,
+             headers,
+             false,
+         );
+@@ -1271,11 +1296,11 @@
+             }
+         };
+ 
+-        let prefill_url = format!("{}/health_generate", prefill.url());
++        let prefill_url = format!("{}/health_generate", prefill.base_url());
+         let (prefill_result, decode_result) = tokio::join!(
+             self.client.get(&prefill_url).send(),
+             self.client
+-                .get(format!("{}/health_generate", decode.url()))
++                .get(format!("{}/health_generate", decode.base_url()))
+                 .send()
+         );
+ 
+@@ -1522,6 +1547,36 @@
+ mod tests {
+     use super::*;
+     use crate::core::{BasicWorkerBuilder, WorkerType};
++
++    #[test]
++    fn test_pd_dp_requests_select_independent_owners() {
++        let prefill = crate::core::DPAwareWorkerBuilder::new("http://p:8000", 1, 2)
++            .worker_type(WorkerType::Prefill { bootstrap_port: Some(8998) })
++            .build();
++        let decode = crate::core::DPAwareWorkerBuilder::new("http://d:8000", 0, 2)
++            .worker_type(WorkerType::Decode)
++            .build();
++        let request = serde_json::json!({"input_ids": [1, 2], "routed_experts": "raw-r3", "routed_dp_rank": 7});
++        let (p, d) = PDRouter::prepare_dp_requests(request, &prefill, &decode);
++        assert_eq!(p["routed_dp_rank"], 1);
++        assert_eq!(d["routed_dp_rank"], 0);
++        assert_eq!(d["disagg_prefill_dp_rank"], 1);
++        assert!(p.get("disagg_prefill_dp_rank").is_none());
++        assert_eq!(p["routed_experts"], "raw-r3");
++        assert_eq!(d["routed_experts"], "raw-r3");
++        assert_eq!(prefill.base_url(), "http://p:8000");
++        assert_eq!(prefill.bootstrap_host(), "p");
++    }
++
++    #[test]
++    fn test_pd_dp1_requests_preserve_native_fields() {
++        let prefill = BasicWorkerBuilder::new("http://p:8000").build();
++        let decode = BasicWorkerBuilder::new("http://d:8000").build();
++        let request = serde_json::json!({"input_ids": [1], "custom_native_field": {"value": 3}});
++        let (p, d) = PDRouter::prepare_dp_requests(request.clone(), &prefill, &decode);
++        assert_eq!(p, request);
++        assert_eq!(d, request);
++    }
+ 
+     fn create_test_pd_router() -> PDRouter {
+         let worker_registry = Arc::new(WorkerRegistry::new());
+diff --git a/src/core/worker_builder.rs b/src/core/worker_builder.rs
+--- a/src/core/worker_builder.rs
++++ b/src/core/worker_builder.rs
+@@ -316,7 +316,13 @@
+             builder = builder.api_key(api_key);
+         }
+ 
+-        let base_worker = builder.build();
++        let mut base_worker = builder.build();
++        // Keep per-rank identity and metrics, but use the physical host for KV bootstrap.
++        base_worker.metadata.bootstrap_host = url::Url::parse(&self.base_url)
++            .or_else(|_| url::Url::parse(&format!("http://{}", self.base_url)))
++            .ok()
++            .and_then(|url| url.host_str().map(str::to_owned))
++            .unwrap_or_else(|| "localhost".to_string());
+         DPAwareWorker::with_base_worker(base_worker, self.base_url, self.dp_rank, self.dp_size)
+     }
+ }
+@@ -432,6 +438,19 @@
+     }
+ 
+     #[test]
++    fn test_dp_aware_bootstrap_host_uses_physical_url() {
++        for (url, host) in [("http://127.0.0.1:8080", "127.0.0.1"), ("http://prefill:8080", "prefill")] {
++            let worker = DPAwareWorkerBuilder::new(url, 1, 2)
++                .worker_type(WorkerType::Prefill { bootstrap_port: Some(8998) })
++                .build();
++            assert_eq!(worker.url(), format!("{url}@1"));
++            assert_eq!(worker.base_url(), url);
++            assert_eq!(worker.bootstrap_host(), host);
++            assert_eq!(worker.bootstrap_port(), Some(8998));
++        }
++    }
++
++    #[test]
+     fn test_dp_aware_worker_builder_minimal() {
+         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
+ 

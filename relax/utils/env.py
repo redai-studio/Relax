@@ -240,9 +240,6 @@ class Envs(metaclass=_EnvsMeta):
     # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
     RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
-    # Per-run root for native prefill file HiCache; engine ranks use subdirectories.
-    RELAX_HICACHE_FILE_ROOT = EnvProperty("RELAX_HICACHE_FILE_ROOT", str, None)
-
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
     RELAX_KERNEL_CACHE_LOCAL_DIR = EnvProperty("RELAX_KERNEL_CACHE_LOCAL_DIR", str, None)
