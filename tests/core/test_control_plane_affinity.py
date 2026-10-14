@@ -46,7 +46,7 @@ def test_transfer_queue_required_node_resource(
     autoscaler_enabled,
     expected_resource,
 ):
-    from relax.core import controller as controller_module
+    controller_module = load_controller_with_stubbed_dependencies("_test_tq_control_plane_affinity_controller")
 
     config = _elastic_args(
         tmp_path,
@@ -62,6 +62,7 @@ def test_transfer_queue_required_node_resource(
     monkeypatch.setattr(controller_module, "resolve_sft_algo_key", lambda _: "dapo")
     monkeypatch.setattr(controller_module, "compute_dp_size", lambda _: 1)
     monkeypatch.setattr(controller_module, "IdentityWindowSampler", lambda **_: object())
+    monkeypatch.setattr(controller_module, "reap_unusable_tq_controller", lambda: None)
 
     def init_transfer_queue(conf):
         captured["conf"] = conf

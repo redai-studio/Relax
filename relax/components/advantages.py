@@ -6,7 +6,6 @@ from argparse import Namespace
 from typing import Any, Dict
 
 import torch
-import transfer_queue as tq
 from ray import serve
 from tensordict import TensorDict
 
@@ -17,6 +16,7 @@ from relax.utils.opd.opd_utils import (
     apply_opd_to_advantages,
     consume_opd_advantage_data,
 )
+from relax.utils.tq.lifecycle import attach_tq_client
 from relax.utils.training.ppo_utils import compute_approx_kl
 
 
@@ -33,8 +33,10 @@ class Advantages(Base):
         self._lock = threading.RLock()
         self.healthy = healthy
 
-        tq.init(self.config.tq_config)
-        self.data_system_client = tq.get_client()
+        self.data_system_client = attach_tq_client(
+            self.config.tq_config,
+            role="advantages",
+        )
         self.step = 0
 
     async def run(self) -> None:
