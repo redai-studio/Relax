@@ -170,14 +170,65 @@ recipe. Set `HICACHE_TIER=cpu` for GPU+CPU caching, or `HICACHE_TIER=ssd`
 (the default) for GPU+CPU+SSD caching. Both use eight GPUs, two prefill and two
 decode engines, each TP2; only prefill engines enable HiCache.
 
-For SSD, set `RELAX_HICACHE_FILE_ROOT` to a new, empty absolute directory on
-local SSD before submitting through `scripts/entrypoint/ray-job.sh`. The entry
-point forwards this root to Ray workers and gives each prefill engine its own
-subdirectory. Plan host memory and storage budgets for all four prefill TP ranks.
+The supplied YAML targets Qwen3.5-35B-A3B with Unified Full KV and Mamba state,
+single-node DP1, and the repository's patched SGLang v0.5.17. Complete the venv,
+data, and SIF setup above, then set the paths for this run:
+
+```bash
+cd /path/to/Relax
+
+export MINI_SWE_AGENT_VENV=/local/path/mini-swe-agent-venv
+export MODEL_DIR=/path/to/models
+export R2E_DATA_PATH=/path/to/r2e_data
+export R2E_SIF_DIR=/path/to/r2e_sifs
+export RUN_ID=mini-swe-cache-$(date +%Y%m%d-%H%M%S)
+export SAVE_DIR=/path/to/checkpoints/${RUN_ID}
+export EXP_ROOT=/path/to/experiments/${RUN_ID}
+export RAY_ADDRESS=<ray-head-ip>:6379
+export RAY_JOB_ADDRESS=http://<ray-head-ip>:8265
+export NCCL_SOCKET_IFNAME=<network-interface>
+```
+
+Submit on a dedicated single-node Ray cluster; the canonical Ray entry point
+performs cluster cleanup. For GPU+CPU caching:
+
+```bash
+HICACHE_TIER=cpu NUM_ROLLOUT=3 ROLLOUT_BATCH_SIZE=1 RAY_NO_WAIT=1 \
+  bash scripts/entrypoint/ray-job.sh \
+  examples/mini_swe_agent/run_mini_swe_agent_hicache.sh
+```
+
+For GPU+CPU+SSD caching, choose a new, empty absolute directory on local SSD:
+
+```bash
+export RELAX_HICACHE_FILE_ROOT=/local/ssd/relax-cache/${RUN_ID}
+
+HICACHE_TIER=ssd NUM_ROLLOUT=3 ROLLOUT_BATCH_SIZE=1 RAY_NO_WAIT=1 \
+  bash scripts/entrypoint/ray-job.sh \
+  examples/mini_swe_agent/run_mini_swe_agent_hicache.sh
+```
+
+Use new run and output paths for each submission. The wrapper forwards the
+cache root to Ray workers and gives each prefill engine its own subdirectory.
+The PD driver keeps the agent server alive until training ends. The commands
+above run three training iterations, each with one task group and eight samples.
+
+The [CPU YAML](./pd-hicache-cpu-2p2d-tp2.yaml) and
+[SSD YAML](./pd-hicache-ssd-2p2d-tp2.yaml) use a 64-token page size, a 256-token
+Mamba tracking interval, an 8192-token prefill chunk, and 666 GPU Mamba slots
+per prefill rank. These are recipe choices. Neither YAML caps `max_total_tokens`;
+SGLang derives the GPU token-pool capacity from its memory budget. Set
+`SGLANG_MAX_TOTAL_TOKENS` when an explicit cap is needed for a controlled run.
+
+Plan CPU memory for both Full KV and Mamba host pools across all four prefill
+TP ranks, plus training offload and other processes. `hicache_ratio=2.0` scales
+with device capacity, so use actual startup allocations to budget memory.
+The SSD configuration allows 32 GiB of files per rank, or 128 GiB across the
+four prefill ranks, and requires 64 GiB free on the backing filesystem.
 
 See the [English cache guide](../../docs/en/guide/hierarchical-cache.md) or
-[中文多级缓存指南](../../docs/zh/guide/hierarchical-cache.md) for launch commands,
-Full KV/Mamba consistency, per-rank budgets, and weight invalidation.
+[中文多级缓存指南](../../docs/zh/guide/hierarchical-cache.md) for general cache
+configuration, DP and storage sharing, capacity planning, and weight invalidation.
 
 ## Runtime data flow
 

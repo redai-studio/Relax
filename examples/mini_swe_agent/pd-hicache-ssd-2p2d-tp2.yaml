@@ -11,7 +11,6 @@ sglang:
           mamba_track_interval: 256
           chunked_prefill_size: 8192
           page_size: 64
-          max_total_tokens: 196608
           max_mamba_cache_size: 666
           enable_hierarchical_cache: true
           hicache_ratio: 2.0
@@ -30,7 +29,6 @@ sglang:
           mamba_track_interval: 256
           chunked_prefill_size: 8192
           page_size: 64
-          max_total_tokens: 196608
           enable_hierarchical_cache: false
           hicache_storage_backend: null
           disaggregation_decode_enable_radix_cache: false
