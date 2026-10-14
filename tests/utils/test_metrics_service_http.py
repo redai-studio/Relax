@@ -14,6 +14,19 @@ from pathlib import Path
 import pytest
 
 
+async def test_metrics_service_finishes_writers_once():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from relax.utils.metrics.service import MetricsService
+
+    writer = Mock()
+    instance = SimpleNamespace(_finished=False, _adapters={"clearml": writer})
+    await MetricsService.func_or_class.finish(instance)
+    await MetricsService.func_or_class.finish(instance)
+    writer.finish.assert_called_once_with()
+
+
 async def test_metrics_service_discovery_cancels_timed_out_serve_request(monkeypatch):
     import asyncio
     from types import SimpleNamespace

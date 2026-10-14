@@ -128,6 +128,7 @@ class MetricsService:
         self._rollout_handle_task: asyncio.Task[Any] | None = None
         self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
         self._adapters = {}
+        self._finished = False
 
         if getattr(config, "use_tensorboard", False):
             try:
@@ -339,6 +340,15 @@ class MetricsService:
         except Exception as e:
             logger.error(f"Failed to report step {request.step}: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def finish(self) -> None:
+        """Close metric writers after successful training, before Serve
+        stops."""
+        if self._finished:
+            return
+        for adapter in self._adapters.values():
+            await asyncio.to_thread(adapter.finish)
+        self._finished = True
 
     async def _discover_sglang_engines(self) -> Dict[str, Any]:
         # MetricsService starts before Rollout. Resolve lazily and retry on

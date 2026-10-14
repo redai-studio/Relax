@@ -57,3 +57,39 @@ def test_rollout_summary_record_includes_token_and_agent_stats():
     assert record["image_token_count"] == 16
     assert record["multimodal_token_count"] == 16
     assert record["agent_turns"] == 2
+
+
+def test_rollout_summary_distinguishes_session_steps_from_export_turns():
+    sample = Sample(
+        session_id="session-a",
+        metadata={
+            "session_id": "stale-id",
+            "rollout_turns": 1,
+            "agent_turns": 24,
+            "task_id": "task-a",
+            "turn_index": 3,
+            "export_index": 4,
+            "parse_attempt": 1,
+            "accepted_for_execution": False,
+            "private_metadata": "must not be exported",
+        },
+    )
+
+    record = _sample_to_summary_record(sample, rollout_id=7, idx=4)
+
+    assert record["agent_turns"] == record["export_turns"] == 1
+    assert record["session_agent_turns"] == 24
+    assert record["session_id"] == "session-a"
+    assert record["task_id"] == "task-a"
+    assert record["turn_index"] == 3
+    assert record["export_index"] == 4
+    assert record["parse_attempt"] == 1
+    assert record["accepted_for_execution"] is False
+    assert "private_metadata" not in record
+
+
+def test_rollout_summary_uses_metadata_session_id_when_sample_has_none():
+    record = _sample_to_summary_record(Sample(metadata={"session_id": "session-a"}), rollout_id=0, idx=0)
+
+    assert record["session_id"] == "session-a"
+    assert "session_agent_turns" not in record
