@@ -647,12 +647,9 @@ class SGLangEngine(RayActor):
 
         if Envs.RELAX_OPD_PER_POS_TOKEN_IDS:
             os.environ["RELAX_FORCE_LOGPROBS_BASE64"] = "1"
-            top_k = getattr(self.args, "opd_log_prob_top_k", 0)
-            if top_k:
-                os.environ["RELAX_OPD_TOKEN_IDS_LOGPROB_K"] = str(top_k)
             logger.info(
-                "Set RELAX_FORCE_LOGPROBS_BASE64=1, RELAX_OPD_TOKEN_IDS_LOGPROB_K=%s (topk enabled)",
-                Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
+                "Set RELAX_FORCE_LOGPROBS_BASE64=1 (opd_log_prob_top_k=%s; query K is sent per request)",
+                getattr(self.args, "opd_log_prob_top_k", 0),
             )
 
         # Set SGLang external model/processor package env vars so the spawned

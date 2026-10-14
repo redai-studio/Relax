@@ -58,7 +58,7 @@ _FALSE_VALUES = frozenset({"0", "f", "false", "n", "no", "off"})
 
 # A variable whose name contains one of these has its value masked in
 # diagnostics. Substring matching, deliberately over-inclusive: masking a
-# non-secret (`RELAX_OPD_TOKEN_IDS_LOGPROB_K` is a top-k count, not a
+# non-secret (`RELAX_KERNEL_CACHE_KEY` is a cache identifier, not a
 # credential) only costs a line of diagnostic output, while missing a real
 # credential writes it to the log verbatim.
 _SENSITIVE_ENV_MARKERS: Tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PASSWD", "AUTH")
@@ -109,8 +109,7 @@ class EnvProperty:
 
     Resolution is lazy on purpose: several call sites write to ``os.environ``
     and read the value back later in the same process (``LOCAL_RANK`` in
-    ``distributed/ray/train_actor.py``, ``RELAX_OPD_TOKEN_IDS_LOGPROB_K`` in
-    ``backends/sglang/sglang_engine.py``), so values must not be frozen at
+    ``distributed/ray/train_actor.py``), so values must not be frozen at
     import time. An unset *or empty* variable resolves to ``default``; a set but
     unparseable one raises ``ValueError``.
 
@@ -201,7 +200,6 @@ class Envs(metaclass=_EnvsMeta):
 
     # ------------- OPD / SGLang patches -------------
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
-    RELAX_OPD_TOKEN_IDS_LOGPROB_K = EnvProperty("RELAX_OPD_TOKEN_IDS_LOGPROB_K", str, "0")
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
 

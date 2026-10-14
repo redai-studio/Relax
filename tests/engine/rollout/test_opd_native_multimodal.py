@@ -276,6 +276,29 @@ def test_strict_cross_topk_rejects_shifted_query_ids():
         LogprobResponse(response).strict_topk("input_token_ids_logprobs", 2, 2, np.array([[0, 5], [7, 9]]))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side", ["student", "teacher"])
+@pytest.mark.parametrize("reorder", ["positions", "tokens"])
+async def test_native_cross_prefill_rejects_reordered_query_ids(processor_state, side, reorder):
+    sample = _sample()
+    query_ids = np.array([[0, 5], [7, 9]], dtype=np.int32)
+    returned_ids = query_ids[::-1] if reorder == "positions" else query_ids[:, ::-1]
+    response = _response(
+        sample.tokens,
+        input_token_ids_logprobs=[None] + [[[-1.0, int(token)] for token in row] for row in returned_ids],
+    )
+    session = _Session(response)
+    with pytest.raises(ValueError, match="query token IDs differ"):
+        if side == "student":
+            sample.teacher_topk_token_ids = query_ids
+            await _manager(opd_token_selection="teacher_topk")._student_prefill(sample, session, None)
+        else:
+            sample.student_topk_token_ids = query_ids
+            await _manager(opd_token_selection="student_topk")._teacher_prefill(sample, session)
+    assert sample.student_at_teacher_topk_log_probs is None
+    assert sample.teacher_at_student_topk_log_probs is None
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_native_student_rollout_topk_requires_complete_rows(packed):
     sample = _sample()
@@ -320,6 +343,103 @@ def test_image_contract_rejects_expanded_payload_missing_prompt_ids_and_unsuppor
         validate_prompt_token_ids({}, sample.tokens)
     with pytest.raises(ValueError, match="audio/video"):
         image_inputs({"images": [object()], "videos": [object()]})
+
+
+@pytest.fixture
+def native_generate(monkeypatch):
+    sglang_rollout = pytest.importorskip("relax.engine.rollout.sglang_rollout", exc_type=ModuleNotFoundError)
+    args = SimpleNamespace(
+        ci_test=False,
+        sglang_router_ip="unused",
+        sglang_router_port=1,
+        use_slime_router=False,
+        use_rollout_routing_replay=False,
+        sglang_router_policy="round_robin",
+        sglang_speculative_algorithm=None,
+    )
+    state = SimpleNamespace(
+        tokenizer=SimpleNamespace(
+            image_token_id=99,
+            audio_token_id=98,
+            video_token_id=97,
+            pad_token_id=0,
+            encode=lambda text, **kwargs: [1, 99, 2],
+        ),
+        processor=SimpleNamespace(image_token_id=99),
+        opd_manager=_manager(),
+    )
+    output = {
+        "prompt_token_ids": [1, 99, 99, 99, 2],
+        "output_ids": [10, 11],
+        "text": "response",
+        "meta_info": {"output_token_logprobs": [[-0.2, 10], [-0.3, 11]], "finish_reason": {"type": "stop"}},
+    }
+    requests = []
+
+    async def process(state, args, prompt, media):
+        return [1, 99, 99, 99, 2], {"image_grid_thw": [[1, 2, 6]]}, 0.0
+
+    async def post(args, state, url, payload, headers, evaluation):
+        requests.append(copy.deepcopy(payload))
+        return output
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "_run_image_processor", process)
+    monkeypatch.setattr(sglang_rollout, "_post_generation", post)
+    sample = Sample(prompt="image prompt", multimodal_inputs={"images": [object()]})
+    sample._pre_encoded_mm = {"image_data": ["student-image"]}
+    return sglang_rollout, args, sample, state, output, requests
+
+
+@pytest.mark.asyncio
+async def test_native_generate_sends_collapsed_ids_and_preserves_expanded_sample(native_generate):
+    rollout, args, sample, _, _, requests = native_generate
+    assert await rollout.generate(args, sample, {"max_new_tokens": 2}) is sample
+    assert requests[0]["input_ids"] == [1, 99, 2]
+    assert requests[0]["return_prompt_token_ids"] is True
+    assert requests[0]["image_data"] == ["student-image"]
+    assert sample.tokens == [1, 99, 99, 99, 2, 10, 11]
+    assert sample.rollout_tokens == [1, 99, 2, 10, 11]
+    assert sample.rollout_log_probs == pytest.approx([-0.2, -0.3])
+    assert sample.response_length == 2
+    assert sample.status == Sample.Status.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_native_generate_rejects_expanded_request_before_posting(native_generate):
+    rollout, args, sample, state, _, requests = native_generate
+    state.tokenizer.encode = lambda text, **kwargs: [1, 99, 99, 99, 2]
+    with pytest.raises(ValueError, match="one collapsed placeholder"):
+        await rollout.generate(args, sample, {"max_new_tokens": 2})
+    assert not requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_ids", [None, [1, 99, 99, 99, 3]])
+async def test_native_generate_rejects_missing_or_changed_prompt_ids(native_generate, prompt_ids):
+    rollout, args, sample, _, output, _ = native_generate
+    if prompt_ids is None:
+        del output["prompt_token_ids"]
+    else:
+        output["prompt_token_ids"] = prompt_ids
+    with pytest.raises(ValueError, match="return_prompt_token_ids|expanded input IDs differ"):
+        await rollout.generate(args, sample, {"max_new_tokens": 2})
+    assert sample.response_length == 0
+    assert sample.rollout_log_probs is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_token", [99, 98, 97])
+async def test_native_generate_rejects_sampled_media_tokens_before_replacement(native_generate, media_token):
+    rollout, args, sample, _, output, _ = native_generate
+    output["output_ids"] = [media_token]
+    output["meta_info"]["output_token_logprobs"] = [[-0.2, media_token]]
+    with pytest.raises(ValueError, match="cannot replace sampled media tokens"):
+        await rollout.generate(args, sample, {"max_new_tokens": 2})
+    assert sample.tokens == [1, 99, 99, 99, 2]
+    assert sample.rollout_tokens == [1, 99, 2]
+    assert sample.response_length == 0
+    assert sample.rollout_log_probs is None
 
 
 @pytest.mark.asyncio

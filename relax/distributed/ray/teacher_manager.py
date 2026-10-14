@@ -38,7 +38,6 @@ def _build_teacher_engine_env(args) -> dict[str, str]:
         # Native multimodal OPD must preserve the supplied response token IDs.
         "SGLANG_MM_AVOID_RETOKENIZE": "true",
         "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
-        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
