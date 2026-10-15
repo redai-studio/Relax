@@ -64,6 +64,11 @@ def is_sft_mode(args: Namespace) -> bool:
     return getattr(args, "loss_type", None) == "sft"
 
 
+def is_i2i_sft(args: Namespace) -> bool:
+    """Image-edit supervision uses its own data contract within SFT."""
+    return is_sft_mode(args) and getattr(args, "generation_task", None) == "i2i"
+
+
 def is_dpo_mode(args: Namespace) -> bool:
     """Return whether the normalized training objective is DPO."""
     return getattr(args, "loss_type", None) == "dpo"
@@ -196,8 +201,18 @@ def should_use_sft_chunked(args: Namespace) -> bool:
     return is_sft_mode(args) and getattr(args, "sft_chunked_logits", False)
 
 
+def sft_partition_prefix(args: Namespace) -> str:
+    """Keep image SFT queue state isolated across Controller attempts."""
+    if is_i2i_sft(args):
+        attempt_id = getattr(args, "_i2i_sft_attempt_id", None)
+        if not attempt_id:
+            raise ValueError("Image SFT queue attempt must be initialized before starting workers")
+        return f"sft_{attempt_id}_"
+    return "sft_" if is_offline_mode(args) else "train_"
+
+
 def sft_partition_id(args: Namespace, step: int) -> str:
-    return f"sft_{step}" if is_offline_mode(args) else f"train_{step}"
+    return f"{sft_partition_prefix(args)}{step}"
 
 
 def sft_tq_num_shards(args: Namespace) -> int:

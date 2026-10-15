@@ -1,10 +1,18 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import pickle
 from argparse import Namespace
 
 import pytest
 
-from relax.engine.sft.runtime import resolve_sft_split_indices, should_skip_sft_weight_management
+from relax.engine.sft.bootstrap import resolve_sft_num_rollout
+from relax.engine.sft.runtime import (
+    resolve_sft_split_indices,
+    sft_partition_id,
+    sft_partition_ids,
+    sft_partition_prefix,
+    should_skip_sft_weight_management,
+)
 
 
 def test_resolve_sft_split_indices_is_deterministic_and_disjoint():
@@ -71,3 +79,35 @@ def test_sft_keeps_weight_management_for_consumers_and_other_losses(overrides, c
     args = Namespace(**{"loss_type": "sft", "mtp_only_training": mtp_only_training, **overrides})
 
     assert not should_skip_sft_weight_management(args, **consumers)
+
+
+def test_image_sft_attempt_is_shared_with_workers_and_changes_on_restore():
+    args = Namespace(
+        loss_type="sft",
+        generation_task="i2i",
+        i2i_sft_config={"dataset_size": 19},
+        global_batch_size=8,
+        num_epoch=2,
+        num_rollout=None,
+    )
+    resolve_sft_num_rollout(args)
+    worker_args = pickle.loads(pickle.dumps(args))
+    previous = sft_partition_id(args, 10)
+    assert previous == sft_partition_id(worker_args, 10)
+    assert sft_partition_ids(worker_args, 10) == [previous]
+    assert previous.startswith(sft_partition_prefix(args))
+
+    resolve_sft_num_rollout(args)
+    assert sft_partition_id(args, 10) != previous
+    assert not previous.startswith(sft_partition_prefix(args))
+    assert args.num_rollout == 6
+
+
+def test_image_sft_partition_requires_shared_attempt():
+    with pytest.raises(ValueError, match="initialized before starting workers"):
+        sft_partition_id(Namespace(loss_type="sft", generation_task="i2i"), 10)
+
+
+@pytest.mark.parametrize("loss_type,prefix", [("sft", "sft_"), ("dpo", "sft_"), ("rm", "sft_"), ("policy", "train_")])
+def test_partition_naming_preserves_non_image_modes(loss_type, prefix):
+    assert sft_partition_id(Namespace(loss_type=loss_type), 10) == f"{prefix}10"

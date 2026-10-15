@@ -16,8 +16,9 @@ orchestrator. Three responsibilities:
 """
 
 from argparse import Namespace
+from uuid import uuid4
 
-from relax.engine.sft.runtime import is_offline_mode, is_preference_mode, resolve_sft_eval_split
+from relax.engine.sft.runtime import is_i2i_sft, is_offline_mode, is_preference_mode, resolve_sft_eval_split
 from relax.utils.logging_utils import get_logger
 
 
@@ -42,6 +43,21 @@ def resolve_sft_num_rollout(config: Namespace) -> dict | None:
     Must run before any actor is launched. No-op for online RL.
     """
     if not is_offline_mode(config):
+        return
+
+    if is_i2i_sft(config):
+        import math
+
+        size = config.i2i_sft_config["dataset_size"]
+        config.num_rollout_per_epoch = math.ceil(size / config.global_batch_size)
+        if config.num_epoch is not None:
+            steps = config.num_rollout_per_epoch * config.num_epoch
+            config.num_rollout = min(config.num_rollout, steps) if config.num_rollout is not None else steps
+        if config.num_rollout is None or config.num_rollout <= 0:
+            raise ValueError("Image SFT requires positive --num-rollout or --num-epoch")
+        # Shared by producer and training workers. A checkpoint restore must
+        # not reuse unconsumed partitions from a previous Controller attempt.
+        config._i2i_sft_attempt_id = uuid4().hex
         return
 
     custom_dataset_class_path = getattr(config, "custom_dataset_class_path", None)

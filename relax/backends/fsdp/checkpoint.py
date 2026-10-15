@@ -90,11 +90,12 @@ def _rank() -> int:
     return dist.get_rank(get_gloo_group())
 
 
-def _save_rng(ckpt_dir: str) -> None:
-    """Persist this rank's RNG state (best-effort) for deterministic resume.
+def _save_rng(ckpt_dir: str, *, strict: bool = False) -> None:
+    """Persist this rank's RNG state for deterministic resume.
 
     Each rank owns its own generator under pure DP, so RNG is written per rank.
-    Best-effort: an RNG-write failure must not fail the checkpoint.
+    Legacy callers remain best-effort; strict callers collectively reject a
+    checkpoint when any rank fails to persist its state.
     """
     try:
         state: Dict[str, Any] = {
@@ -109,10 +110,20 @@ def _save_rng(ckpt_dir: str) -> None:
 
             state["numpy"] = _np.random.get_state()
         except Exception:
-            pass
+            if strict:
+                raise
         torch.save(state, os.path.join(ckpt_dir, f"rng_rank{_rank()}.pt"))
     except Exception as e:
+        if strict:
+            raise
         logger.warning(f"RNG state save skipped: {e}")
+
+
+def _rng_paths(ckpt_dir: str) -> List[str]:
+    import torch.distributed as dist
+
+    world = dist.get_world_size(dist.group.WORLD) if dist.is_initialized() else 1
+    return [os.path.join(ckpt_dir, f"rng_rank{rank}.pt") for rank in range(world)]
 
 
 def _load_rng(ckpt_dir: str) -> None:
@@ -171,6 +182,7 @@ def save_checkpoint(
     adapter_contract: Dict[str, Any],
     adapter_only: bool = False,
     is_rank0: bool = True,
+    require_rng_state: bool = False,
 ) -> str:
     """Save a committed checkpoint and return its directory.
 
@@ -183,6 +195,9 @@ def save_checkpoint(
     the base is reloaded from ``--model-path`` on resume, so persisting it every
     interval would multiply a sub-GB adapter into a >100 GB full-model snapshot.
     :func:`load_checkpoint` must be called with the matching flag.
+
+    ``require_rng_state`` rejects RNG failures collectively and requires every
+    rank's RNG file before publication or an idempotent return.
     """
     task_root = _task_root(save_dir, task)
     ckpt_dir = os.path.join(task_root, iter_dir_name(iteration))
@@ -200,6 +215,8 @@ def save_checkpoint(
             for name in expected:
                 with open(os.path.join(ckpt_dir, name), encoding="utf-8") as f:
                     existing[name] = json.load(f)
+            if require_rng_state and any(not os.path.isfile(path) for path in _rng_paths(ckpt_dir)):
+                raise RuntimeError("Committed checkpoint is missing required per-rank RNG state")
             if existing == expected:
                 decision = {"action": "return"}
             else:
@@ -283,10 +300,20 @@ def save_checkpoint(
 
     # Each rank persists its own RNG state in the staging directory for
     # deterministic resume.
-    _save_rng(staging_dir)
+    rng_error: Exception | None = None
+    try:
+        if require_rng_state:
+            _save_rng(staging_dir, strict=True)
+        else:
+            _save_rng(staging_dir)
+    except Exception as exc:
+        rng_error = exc
     # Do not let rank 0 rename staging while another rank still has its RNG file
     # open. The agreement collective also serves as the required barrier.
-    _all_ranks_ok(1)
+    if not _all_ranks_ok(0 if rng_error is not None else 1):
+        if rng_error is not None:
+            raise rng_error
+        raise RuntimeError(f"Checkpoint RNG write failed on another rank; not committing {ckpt_dir}.")
 
     publish_error: Exception | None = None
     if is_rank0:
@@ -304,6 +331,8 @@ def save_checkpoint(
                 weight_manifest_path,
                 adapter_contract_path,
             ]
+            if require_rng_state:
+                required_paths.extend(_rng_paths(staging_dir))
             missing = [path for path in required_paths if not os.path.isfile(path)]
             if missing:
                 raise RuntimeError(f"Checkpoint publication is missing required files: {missing}.")
@@ -415,9 +444,24 @@ def load_checkpoint(
         options=options,
     )
     state_dict: Dict[str, Any] = {"model": model_sd}
+    uninitialized_optimizer_params: list[str] = []
     if optimizer is not None:
+        # get_state_dict initializes a fresh Adam optimizer for every parameter.
+        # A saved optimizer is lazy: parameters that never received a gradient
+        # legitimately have no state. Request only saved entries from DCP,
+        # while retaining strict checks for every field of initialized entries.
+        metadata_keys = dcp.FileSystemReader(fsdp_dir).read_metadata().state_dict_metadata
+        for name in list(optim_sd.get("state", {})):
+            prefix = f"optim.state.{name}"
+            if not any(key == prefix or key.startswith(prefix + ".") for key in metadata_keys):
+                uninitialized_optimizer_params.append(name)
+                del optim_sd["state"][name]
         state_dict["optim"] = optim_sd
     dcp.load(state_dict, checkpoint_id=fsdp_dir)
+    for name in uninitialized_optimizer_params:
+        # Empty state preserves lazy initialization if the parameter is used
+        # later, and satisfies strict FQN matching without inventing moments.
+        state_dict["optim"]["state"][name] = {}
     set_state_dict(
         model,
         optimizers=optimizer if optimizer is not None else [],

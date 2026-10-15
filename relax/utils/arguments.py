@@ -3012,6 +3012,8 @@ def _pre_parse_mode():
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
     temp_parser.add_argument("--skip-hf-validate", action="store_true", default=False)
+    temp_parser.add_argument("--loss-type", default=None)
+    temp_parser.add_argument("--generation-task", default=None)
     temp_args, _ = temp_parser.parse_known_args()
     return temp_args
 
@@ -3069,7 +3071,10 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     add_slime_arguments = get_slime_extra_args_provider(add_custom_arguments)
 
     pre = _pre_parse_mode()
-    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    image_sft = is_i2i_sft(pre)
+    skip_sglang = pre.debug_train_only or pre.load_debug_rollout_data is not None or image_sft
 
     # Phase 1: Parse sglang args independently (separate parser, parse_known_args).
     # Skipped when sglang servers are not needed.
@@ -3091,13 +3096,15 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         skip_hf_validate=(
             pre.debug_rollout_only
             or pre.skip_hf_validate
+            or image_sft
             or (model_source is not None and is_s3_uri(model_source.uri))
         ),
     )
 
     # Merge pre-parsed args into the main namespace
     for key, value in vars(pre).items():
-        setattr(args, key, value)
+        if key not in ("loss_type", "generation_task"):
+            setattr(args, key, value)
 
     # Merge sglang args into the main namespace
     if sglang_ns is not None:
@@ -3135,7 +3142,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
 
     configure_sft_data_pipeline(args)
 
-    if not args.debug_train_only:
+    if not skip_sglang:
         sglang_validate_args(args)
 
     if getattr(args, "colocate_expert_weight_routing", False) and (
@@ -4018,6 +4025,8 @@ def slime_validate_args(args):
     if not hasattr(args, "use_gloo_process_groups"):
         args.use_gloo_process_groups = getattr(args, "enable_gloo_process_groups", False)
 
+    from relax.engine.sft.runtime import is_i2i_sft
+
     if args.loss_type in ("sft_loss", "sft-loss"):
         warnings.warn(
             f"--loss-type {args.loss_type} is deprecated; use --loss-type sft instead. "
@@ -4062,7 +4071,7 @@ def slime_validate_args(args):
     if args.max_staleness < 0:
         raise ValueError("--max-staleness must be >= 0.")
 
-    if getattr(args, "lora_rank", 0) > 0:
+    if getattr(args, "lora_rank", 0) > 0 and not is_i2i_sft(args):
         if getattr(args, "lora_merge_mode", False) and getattr(args, "lora_adapter_mode", False):
             raise ValueError(
                 "--lora-merge-mode and --lora-adapter-mode are mutually exclusive; pick one LoRA rollout path."
@@ -4187,38 +4196,45 @@ def slime_validate_args(args):
 
     validate_opd_args(args, is_offline=is_offline, log=logger)
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-                if is_dpo_mode(args):
-                    args.finetune = True
-                    args.no_load_optim = True
-                    args.no_load_rng = True
-                    if getattr(args, "ref_ckpt_step", None) is not None:
-                        args.ckpt_step = args.ref_ckpt_step
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
+    if is_i2i_sft(args):
+        # DCP lives below i2i_sft/iter_*; a Megatron marker must not erase --load.
+        if args.train_backend != "fsdp":
+            raise ValueError("Image SFT requires --train-backend fsdp")
+        if args.start_rollout_id is None:
             args.start_rollout_id = 0
     else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+        if args.megatron_to_hf_mode == "bridge":
+            if (
+                args.load is not None
+                and os.path.exists(args.load)
+                and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+            ):
+                # If is a Megatron checkpoint, won't use bridge to load hf weight.
+                pass
+            else:
+                if args.load is None:
+                    args.load = args.ref_load or args.hf_checkpoint
+                    if is_dpo_mode(args):
+                        args.finetune = True
+                        args.no_load_optim = True
+                        args.no_load_rng = True
+                        if getattr(args, "ref_ckpt_step", None) is not None:
+                            args.ckpt_step = args.ref_ckpt_step
+                # If is a HF checkpoint, set start_rollout_id to 0 here.
+                args.start_rollout_id = 0
+        else:
+            if (
+                args.load is None
+                or not os.path.exists(args.load)
+                or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+            ):
+                args.no_load_optim = True
+                args.no_load_rng = True
+                args.finetune = True
+                args.load = args.ref_load
+                if args.ref_ckpt_step is not None:
+                    args.ckpt_step = args.ref_ckpt_step
+                args.start_rollout_id = 0
 
     if args.eval_interval is not None:
         if is_offline:
@@ -4424,7 +4440,7 @@ def slime_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size:
+        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
@@ -4432,7 +4448,7 @@ def slime_validate_args(args):
             )
         # The controller installs SeqlenBalancedSampler for offline training, so keep the
         # Megatron data path in DP-balanced mode as well.
-        if not args.balance_data:
+        if not args.balance_data and not is_i2i_sft(args):
             logger.info("--loss-type %s: auto-enabling --balance-data for DP-balanced batching.", args.loss_type)
             args.balance_data = True
         from relax.engine.sft.runtime import validate_preference_args
