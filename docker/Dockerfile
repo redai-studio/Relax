@@ -101,6 +101,25 @@ RUN cd /tmp/int4_qat && \
     rm -rf /tmp/int4_qat
 
 ARG TRAIN_IMAGE=train
+# Build the patched router against the same Python/libc as the final image.
+FROM ${TRAIN_IMAGE} as router_builder
+
+ARG ROUTER_RUST_VERSION=1.97.1
+ARG ROUTER_BUILD_JOBS=16
+ENV PATH=/root/.cargo/bin:${PATH} \
+    CARGO_BUILD_JOBS=${ROUTER_BUILD_JOBS} \
+    CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libssl-dev pkg-config protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl --proto '=https' --tlsv1.2 --fail --location https://sh.rustup.rs -o /tmp/rustup-init.sh && \
+    sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "${ROUTER_RUST_VERSION}" && \
+    python -m pip install --no-cache-dir "maturin==1.9.6"
+COPY docker/patch/sglang-router /tmp/router-patch
+COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
+RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
+
 FROM ${TRAIN_IMAGE} as relax
 
 WORKDIR /root
@@ -148,15 +167,14 @@ COPY docker/patch/fla/0.5.2-kda-backward-precision.patch /tmp/fla-kda-backward-p
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("fla").origin).parent.parent)')" && \
     patch --batch --forward -p1 < /tmp/fla-kda-backward-precision.patch
 
-# sgl-router: override the official wheel (pulled by requirements.txt above) with
-# slime's r3-capable fork. The official sglang-router drops the routed_experts
-# field on the /generate round-trip, breaking R3 (rollout routing replay,
-# --use-rollout-routing-replay) with a step-0 deadlock; this fork carries the
-# `support r3` passthrough patch. Must run AFTER the requirements install so it
-# wins.
-RUN pip install --no-cache-dir --force-reinstall --no-deps \
-        https://github.com/zhuzilin/sgl-router/releases/download/v0.3.2-9daabcd/sglang_router-0.3.2-cp38-abi3-manylinux_2_28_x86_64.whl && \
-    python -c "import sglang_router; assert 'slime' in sglang_router.__version__, sglang_router.__version__"
+# Install the R3 + PD DP-aware router after requirements, including external TRAIN_IMAGE builds.
+COPY --from=router_builder /opt/router-wheels /tmp/router-wheels
+RUN python -m pip install --no-cache-dir --force-reinstall --no-deps /tmp/router-wheels/*.whl && \
+    python -c "import json, importlib.resources as r, sglang_router; from sglang_router import sglang_router_rs; \
+        b = json.loads(r.files('sglang_router').joinpath('_relax_build.json').read_text()); \
+        assert sglang_router.__version__ == b['version'] == '0.3.2+slime.dpaware'; \
+        assert b['source_commit'] == '9daabcd801c861088d93b8ce8a2a831490ce4bee'; print(b)" && \
+    rm -rf /tmp/router-wheels
 
 
 COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
