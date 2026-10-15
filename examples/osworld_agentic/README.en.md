@@ -19,18 +19,16 @@ The training and agent entry scripts read `env.local.sh` directly. No additional
 
 ## Prerequisites
 
-1. Prepare the training image, Megatron, SGLang, Ray and model weights using the [Relax installation guide](../../docs/en/guide/installation.md). This configuration needs eight GPUs on one node with sufficient memory; requirements vary with trajectories. The script fixes `MEGATRON=/root/Megatron-LM`; edit that line for another image. All workers need identical code, dependencies and accessible paths.
+1. Prepare the training image, Megatron, SGLang, Ray and model weights using the [Relax installation guide](../../docs/en/guide/installation.md). The script detects an existing cluster with `ray status` and queries the Ray API for 8 or 16 GPUs. Without a cluster, it starts single-node Ray through `local.sh`. Memory requirements vary with trajectories. The script fixes `MEGATRON=/root/Megatron-LM`; edit that line for another image. All workers need identical code, dependencies and accessible paths.
 
 2. Install the external OSWorld fork at the revision inspected for this recipe:
 
    ```bash
    git clone https://github.com/fxsc03/OSWorld-main-nex.git /data/OSWorld-main-nex
    git -C /data/OSWorld-main-nex checkout 50b4a85778cfc13ce00e3bf63a3cd08bd260fb96
-   python3 -m venv /data/osworld-venv
-   /data/osworld-venv/bin/python -m pip install -r /data/OSWorld-main-nex/requirements.txt qwen-agent
    ```
 
-   Keep the agent environment separate to avoid replacing training dependencies. Host installation does not install guest dependencies: the Nex template needs desktop applications, LibreOffice/UNO, MCP tools and task assets. Follow the fork's Nex deployment documentation to validate networking, task reset and evaluators.
+   Set `DATA_DIR` to a persistent shared directory available at the same path on every node. The first training launch creates `${DATA_DIR}/osworld-agent-venv`, installs Agent dependencies, and writes a completion marker. Later launches do not reinstall it. Before submitting training, the script builds a reusable archive to avoid remote small-file reads, then extracts it to `/tmp/relax-osworld-agent-envs/<version>/` on every live Ray node and waits for all copies to be ready. Agents use the node-local Python instead of loading the venv from shared storage. Unchanged local copies are reused; missing copies are rebuilt automatically after a Pod restart. After manually updating shared dependencies, run `touch "${DATA_DIR}/osworld-agent-venv/.relax-agent-ready"` to create a new cache version on the next launch. The venv reuses the training image's PyTorch packages and installs other dependencies separately; nodes must use compatible Python versions and training images. To change dependencies, prepare another environment and explicitly set `OSWORLD_AGENT_PYTHON` to its Python. Host installation does not install guest dependencies: the Nex template needs desktop applications, LibreOffice/UNO, MCP tools and task assets. Follow the fork's Nex deployment documentation to validate networking, task reset and evaluators.
 
 3. Create private configuration once, without overwriting an existing file:
 
@@ -40,7 +38,9 @@ The training and agent entry scripts read `env.local.sh` directly. No additional
    chmod 600 env.local.sh
    ```
 
-   Fill in `OSWORLD_REPO`, `OSWORLD_AGENT_PYTHON`, `NEX_API_BASE`, `NEX_WORKSPACE_ID`, `NEX_API_KEY`, and `NEX_TEMPLATE` (or `NEX_TEMPLATE_ID`). `MCP_SRC_ROOT` is the repository root containing `mcp/`. The external Nex client contains deployment-specific defaults, so the agent entry requires explicit Nex settings.
+   Fill in `OSWORLD_REPO`, `NEX_API_BASE`, `NEX_WORKSPACE_ID`, `NEX_API_KEY`, and `NEX_TEMPLATE` (or `NEX_TEMPLATE_ID`). `MCP_SRC_ROOT` is the repository root containing `mcp/`. The external Nex client contains deployment-specific defaults, so the agent entry requires explicit Nex settings.
+
+   Leave `OSWORLD_AGENT_PYTHON` unset to use the default. An explicit value selects an already prepared environment without automatic installation or copying; a launch-time value takes precedence over `env.local.sh`. Do not use `/tmp` for an environment that must survive across jobs.
 
    The private file must be readable at the same path on all agent workers. Ignored files are not uploaded with Ray code packages; provision them securely or configure worker environments beforehand. Do not put credentials in command lines or runtime-env JSON, which may appear in Jobs metadata or logs.
 
@@ -64,24 +64,24 @@ bash examples/osworld_agentic/scripts/run-qwen3vl-8B-osworld-8xgpu.sh
 
 ## Current parameters
 
-| Setting                                  | Value                                                                                        |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Initial model                            | Qwen3-VL-8B-Thinking                                                                         |
-| Algorithm                                | GRPO, custom trajectory advantages, TIS                                                      |
-| Sampling                                 | 12 groups × 8 trajectories = 96 per rollout                                                  |
-| Updates                                  | 2 per rollout; 200 rollouts                                                                  |
-| Learning rate                            | 5e-6, constant                                                                               |
-| KL                                       | k3, coefficient 0.001; reference updated every rollout                                       |
-| PPO clip                                 | Lower/upper both 0.2                                                                         |
-| Training parallelism                     | TP4 / PP1 / CP1; DP2 on eight GPUs                                                           |
-| Per-GPU training / log-prob token budget | Both 49152; not the model context limit                                                      |
-| Rollout context / response limit         | 16384 / 8192 tokens                                                                          |
-| SGLang                                   | 2 GPUs per engine, static memory fraction 0.7, consistent hashing                            |
-| Memory                                   | Vision trunk frozen; selective `core_attn mlp` recomputation; optimizer CPU offload disabled |
-| Sandboxes                                | Prelaunch enabled; active and prelaunch share 12 group permits, up to 96 sessions            |
-| Dynamic filter                           | Disabled                                                                                     |
-| Agent                                    | Up to 30 turns, 2-image history, session timeout 21600 seconds                               |
-| Checkpoints                              | Disabled; each launch starts from initial weights without optimizer resume                   |
+| Setting                                  | Value                                                                                    |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Initial model                            | Qwen3-VL-8B-Thinking                                                                     |
+| Algorithm                                | GRPO, custom trajectory advantages, TIS                                                  |
+| Sampling                                 | 12 groups × 8 trajectories = 96 per rollout                                              |
+| Updates                                  | 2 per rollout; 200 rollouts                                                              |
+| Learning rate                            | 5e-6, constant                                                                           |
+| KL                                       | k3, coefficient 0.001; reference updated every rollout                                   |
+| PPO clip                                 | Lower/upper both 0.2                                                                     |
+| Training parallelism                     | TP4 / PP1 / CP1; DP2 on 8 GPUs, DP4 on 16 GPUs                                           |
+| Per-GPU training / log-prob token budget | Both 24576; not the model context limit                                                  |
+| Rollout context / response limit         | 16384 / 8192 tokens                                                                      |
+| SGLang                                   | 2 GPUs per engine, static memory fraction 0.7, consistent hashing                        |
+| Memory                                   | Vision trunk frozen; selective `core_attn` recomputation; optimizer CPU offload disabled |
+| Sandboxes                                | Prelaunch enabled; active and prelaunch share 12 group permits, up to 96 sessions        |
+| Dynamic filter                           | Disabled                                                                                 |
+| Agent                                    | Up to 30 turns, 2-image history, session timeout 21600 seconds                           |
+| Checkpoints                              | Disabled; each launch starts from initial weights without optimizer resume               |
 
 Actor and rollout are colocated on the same eight physical GPUs. Session concurrency does not guarantee an identical Nex instance count: retries and delayed server-side cleanup still require quota monitoring.
 
@@ -152,7 +152,7 @@ Experiments are listed in ascending launch-time order (UTC+8). Heading times cor
 
 ### 2026-10-12 02:07 — Resubmit after the ECC error
 
-- **Change:** Retain 16K budget/context, selective `core_attn mlp` recomputation and disabled optimizer CPU offload.
+- **Change:** Retain 16K budget/context, selective `core_attn` recomputation and disabled optimizer CPU offload.
 - **Result:** Completed 57 updates (19 rollouts), maximum grad norm 2.854678, then deliberately stopped to correct rewards; did not finish 200 rollouts.
 - **Issue:** Reward semantics were not yet fully aligned with the handoff, so this curve is not a reproduction of that experiment.
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-# Qwen3-VL-8B OSWorld GRPO on 8 colocated GPUs (TP4 train / TP2 rollout).
+# Qwen3-VL-8B OSWorld GRPO on 8 or 16 auto-detected colocated GPUs (TP4 train / TP2 rollout).
 # Usage (configure env.local.sh first):
 #   bash examples/osworld_agentic/scripts/run-qwen3vl-8B-osworld-8xgpu.sh
 # MODEL_DIR: initial models; DATA_DIR: datasets; SAVE_DIR: persistent diagnostics.
@@ -14,7 +14,7 @@ RELAX_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRIPT_DIR="${RELAX_ROOT}/examples/osworld_agentic"
 # Keep launch-time roots authoritative when loading an older private config.
 declare -A launch_roots=()
-for root_name in MODEL_DIR DATA_DIR SAVE_DIR; do
+for root_name in MODEL_DIR DATA_DIR SAVE_DIR OSWORLD_AGENT_PYTHON; do
     if [[ -v "${root_name}" ]]; then
         launch_roots["${root_name}"]="${!root_name}"
     fi
@@ -42,21 +42,69 @@ for root_name in MODEL_DIR DATA_DIR SAVE_DIR; do
             ;;
     esac
 done
+cache_default_agent_env=0
+if [ -z "${OSWORLD_AGENT_PYTHON:-}" ]; then
+    cache_default_agent_env=1
+    bash "${SCRIPT_DIR}/scripts/prepare_agent_env.sh"
+    export OSWORLD_AGENT_PYTHON="${DATA_DIR}/osworld-agent-venv/bin/python"
+fi
+if ! command -v "${OSWORLD_AGENT_PYTHON}" >/dev/null 2>&1; then
+    echo "OSWORLD_AGENT_PYTHON is not executable: ${OSWORLD_AGENT_PYTHON}" >&2
+    exit 1
+fi
 export RELAX="${RELAX_ROOT}"
 export PYTHONPATH="${RELAX}:${MEGATRON}:${PYTHONPATH:-}"
 cd "${RELAX}"
-# Let the standard entrypoint detect an existing cluster before local startup.
+# Prefer the existing cluster; only bootstrap locally when ray status fails.
 export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 if [ -z "${RELAX_ENTRYPOINT_MODE:-}" ]; then
     set +u
-    source "${RELAX}/scripts/entrypoint/local.sh"
+    if ray status >/dev/null 2>&1; then
+        source "${RELAX}/scripts/entrypoint/ray-job.sh"
+    else
+        source "${RELAX}/scripts/entrypoint/local.sh"
+    fi
     set +x
     set -u
 fi
+# Query total resources, not currently available GPUs or the local CUDA count.
+# ray.init(address=...) connects to the cluster and never starts a new one.
+cluster_info=$(python3 - <<'PY_RAY'
+import os
+
+import ray
+
+context = ray.init(address=os.environ["RAY_ADDRESS"], log_to_driver=False)
+try:
+    gpu_count = ray.cluster_resources().get("GPU", 0)
+    if gpu_count not in (8, 16):
+        raise SystemExit(f"OSWorld requires 8 or 16 cluster GPUs; found {gpu_count}")
+    gpu_nodes = [n["Resources"]["GPU"] for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0]
+    if len(set(gpu_nodes)) != 1 or gpu_nodes[0] % 4:
+        raise SystemExit(f"OSWorld requires uniform GPU nodes divisible by TP4; found {gpu_nodes}")
+    dashboard = context.address_info["webui_url"]
+    if not dashboard:
+        raise SystemExit("Ray cluster has no Jobs dashboard address")
+    if not dashboard.startswith(("http://", "https://")):
+        dashboard = "http://" + dashboard
+    print(int(gpu_count), int(gpu_nodes[0]), dashboard, ray.get_runtime_context().gcs_address)
+finally:
+    ray.shutdown()
+PY_RAY
+)
+read -r CLUSTER_GPUS GPUS_PER_NODE CLUSTER_JOBS_ADDRESS CLUSTER_GCS_ADDRESS <<< "${cluster_info}"
+export RAY_ADDRESS="${CLUSTER_GCS_ADDRESS}"
+export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-${RAY_JOB_ADDRESS:-${CLUSTER_JOBS_ADDRESS}}}"
+echo "OSWorld: ${CLUSTER_GPUS} cluster GPUs, TP4 / DP$((CLUSTER_GPUS / 4)), Jobs ${RAY_JOBS_ADDRESS}"
+if [ "${cache_default_agent_env}" -eq 1 ]; then
+    agent_python=$(python3 "${SCRIPT_DIR}/scripts/cache_agent_env.py" "${DATA_DIR}/osworld-agent-venv")
+    export OSWORLD_AGENT_PYTHON="${agent_python}"
+fi
+unset cache_default_agent_env
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 source "${RELAX}/scripts/models/qwen3-vl-8B.sh"
 
-export EXP_NAME="${EXP_NAME:-qwen3vl-8b-osworld-8xgpu}"
+export EXP_NAME="${EXP_NAME:-qwen3vl-8b-osworld-${CLUSTER_GPUS}xgpu}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/osworld-agentic}"
 now=$(date "+%Y%m%d-%H%M%S")
 export OSWORLD_RUN_TAG="osworld-outcome-${now}"
@@ -82,7 +130,7 @@ runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name in (
     "PYTHONPATH", "MASTER_ADDR", "MASTER_PORT", "RAY_ADDRESS",
-    "OSWORLD_REPO", "OSWORLD_CACHE_DIR", "MCP_SRC_ROOT", "OSWORLD_RUN_TAG", "TENSORBOARD_DIR",
+    "OSWORLD_AGENT_PYTHON", "OSWORLD_REPO", "OSWORLD_CACHE_DIR", "MCP_SRC_ROOT", "OSWORLD_RUN_TAG", "TENSORBOARD_DIR",
 ):
     env[name] = os.environ[name]
 env.update({
@@ -94,6 +142,8 @@ env.update({
         "rollout_result", os.environ["OSWORLD_RUN_TAG"], "reward_dump.jsonl",
     ),
     "MALLOC_MMAP_THRESHOLD_": "131072", "MALLOC_ARENA_MAX": "2",
+    # GPU nodes may expose different RDMA devices; all ranks need the same transport.
+    "NCCL_NET": "Socket", "NCCL_IB_DISABLE": "1",
     "SGLANG_USE_CUDA_IPC_TRANSPORT": "0", "SGLANG_MM_BUFFER_SIZE_MB": "0",
     "SGLANG_MM_FEATURE_CACHE_MB": "4096",
     "SGLANG_VLM_CACHE_SIZE_MB": "4096", "SGLANG_MM_THREAD_WORKERS": "8",
@@ -168,8 +218,8 @@ PERF_ARGS=(
     --freeze-vision-model
     --distributed-timeout-minutes 15
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 49152
-    --log-probs-max-tokens-per-gpu 49152
+    --max-tokens-per-gpu 24576
+    --log-probs-max-tokens-per-gpu 24576
     --no-rope-fusion
     --tensor-model-parallel-size 4
     --sequence-parallel
@@ -182,7 +232,7 @@ PERF_ARGS=(
     --attention-backend flash
     --balance-data
     --recompute-granularity selective
-    --recompute-modules core_attn mlp
+    --recompute-modules core_attn
 )
 SGLANG_ARGS=(
     # Avoid the CUDA IPC / GPU feature-hash path that stalled the previous run.
@@ -199,8 +249,9 @@ WANDB_ARGS=(
     --tb-experiment-name "${EXP_NAME}-${now}"
 )
 RESOURCE_ARGS=(
-    # Colocation shares eight physical GPUs; role counts are not additive.
-    --resource '{"actor": [1, 8], "rollout": [1, 8]}'
+    --num-gpus-per-node "${GPUS_PER_NODE}"
+    # Colocation shares the detected physical GPUs; role counts are not additive.
+    --resource "{\"actor\": [1, ${CLUSTER_GPUS}], \"rollout\": [1, ${CLUSTER_GPUS}]}"
     --max-staleness 0
     --num-data-storage-units 1
     --colocate

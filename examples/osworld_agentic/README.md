@@ -19,18 +19,16 @@
 
 ## 准备环境
 
-1. 按 [Relax 安装文档](../../docs/zh/guide/installation.md)准备训练镜像、Megatron、SGLang、Ray 和模型权重。此配置需要单节点 8 张有足够显存的 GPU；显存需求随轨迹变化。脚本固定 `MEGATRON=/root/Megatron-LM`，其他镜像需修改该行。所有 worker 必须能访问相同路径、相同版本的代码与依赖。
+1. 按 [Relax 安装文档](../../docs/zh/guide/installation.md)准备训练镜像、Megatron、SGLang、Ray 和模型权重。脚本通过 `ray status` 检测现有集群，并用 Ray API 识别 8 或 16 张 GPU；没有集群时通过 `local.sh` 启动单机 Ray。显存需求随轨迹变化。脚本固定 `MEGATRON=/root/Megatron-LM`，其他镜像需修改该行。所有 worker 必须能访问相同路径、相同版本的代码与依赖。
 
 2. 准备 OSWorld fork。下面固定到本 recipe 检查的版本：
 
    ```bash
    git clone https://github.com/fxsc03/OSWorld-main-nex.git /data/OSWorld-main-nex
    git -C /data/OSWorld-main-nex checkout 50b4a85778cfc13ce00e3bf63a3cd08bd260fb96
-   python3 -m venv /data/osworld-venv
-   /data/osworld-venv/bin/python -m pip install -r /data/OSWorld-main-nex/requirements.txt qwen-agent
    ```
 
-   使用独立 agent Python 环境，避免外部依赖覆盖训练环境。宿主环境安装不能替代沙箱内的依赖：Nex 模板仍需提供桌面应用、LibreOffice/UNO、MCP 工具及任务所需文件。请按该 fork 的 Nex 部署说明验证模板、网络和任务 reset/evaluator。
+   将 `DATA_DIR` 设置为所有节点同路径可访问的持久共享目录。首次运行训练脚本会在 `${DATA_DIR}/osworld-agent-venv` 创建 Agent 环境并安装依赖，完成后写入标记；后续启动不再安装。提交训练前，脚本将持久环境打包为可复用归档，避免跨节点逐个读取小文件，再解包到每个在线 Ray 节点的 `/tmp/relax-osworld-agent-envs/<版本>/`，所有节点准备完成后才提交任务；每个 Agent 使用节点本地 Python，不从共享盘加载 venv。环境未变化时复用本地副本，Pod 重启导致副本丢失时自动重新复制。手动更新共享环境依赖后，执行 `touch "${DATA_DIR}/osworld-agent-venv/.relax-agent-ready"`，使下次启动创建新版本副本。环境复用训练镜像已有的 PyTorch 包，其他依赖安装在 venv 中；各节点需使用兼容的 Python 和训练镜像。需要更换依赖时，准备新环境并用 `OSWORLD_AGENT_PYTHON` 显式指定其 Python。宿主环境安装不能替代沙箱内的依赖：Nex 模板仍需提供桌面应用、LibreOffice/UNO、MCP 工具及任务所需文件。请按该 fork 的 Nex 部署说明验证模板、网络和任务 reset/evaluator。
 
 3. 在 recipe 目录复制配置，仅首次执行，不要覆盖已有私有文件：
 
@@ -40,7 +38,9 @@
    chmod 600 env.local.sh
    ```
 
-   填写 `OSWORLD_REPO`、`OSWORLD_AGENT_PYTHON`、`NEX_API_BASE`、`NEX_WORKSPACE_ID`、`NEX_API_KEY` 和 `NEX_TEMPLATE`（或 `NEX_TEMPLATE_ID`）。`MCP_SRC_ROOT` 是包含 `mcp/` 的仓库根目录。外部 Nex client 含部署相关默认值，因此 agent 入口要求显式提供 Nex 配置，不依赖这些默认值。
+   填写 `OSWORLD_REPO`、`NEX_API_BASE`、`NEX_WORKSPACE_ID`、`NEX_API_KEY` 和 `NEX_TEMPLATE`（或 `NEX_TEMPLATE_ID`）。`MCP_SRC_ROOT` 是包含 `mcp/` 的仓库根目录。外部 Nex client 含部署相关默认值，因此 agent 入口要求显式提供 Nex 配置，不依赖这些默认值。
+
+   `OSWORLD_AGENT_PYTHON` 默认无需填写。若显式设置，脚本直接使用该已准备好的环境，不自动安装或复制；启动时传入的值优先于 `env.local.sh`。不要将需要跨任务复用的环境放在 `/tmp`。
 
    私有文件必须在所有 agent worker 的相同路径可读。若使用 Ray 上传代码，被忽略的文件不会随代码上传，需另外安全部署；也可预先在 worker 环境配置。不要通过 runtime-env JSON 或命令行传递密钥，相关参数可能进入 Jobs 元数据与日志。
 
@@ -64,26 +64,26 @@ bash examples/osworld_agentic/scripts/run-qwen3vl-8B-osworld-8xgpu.sh
 
 ## 当前正式参数
 
-| 配置                           | 值                                                                                   |
-| ------------------------------ | ------------------------------------------------------------------------------------ |
-| 初始模型                       | Qwen3-VL-8B-Thinking                                                                 |
-| 算法                           | GRPO，自定义轨迹级 advantage，TIS                                                    |
-| 每轮采样                       | 12 组 × 每组 8 条 = 96 条轨迹                                                        |
-| 更新次数                       | 每 rollout 2 次，共 200 rollouts                                                     |
-| 学习率                         | 5e-6，constant                                                                       |
-| KL                             | k3，系数 0.001，ref 每 rollout 更新                                                  |
-| PPO clip                       | 下/上界均 0.2                                                                        |
-| 训练并行                       | TP4 / PP1 / CP1，8 卡下 DP2                                                          |
-| 单卡训练 / log-prob token 预算 | 均为 49152；不是模型上下文长度                                                       |
-| Rollout 上下文 / response 上限 | 16384 / 8192 tokens                                                                  |
-| SGLang                         | 每引擎 2 GPU，static memory fraction 0.7，consistent hashing                         |
-| 显存策略                       | 冻结 vision trunk；selective recompute `core_attn mlp`；optimizer CPU offload 未开启 |
-| 沙箱                           | prelaunch 开启；active 与预启动共享 12 个 group permits，最多 96 个 session          |
-| Dynamic filter                 | 关闭                                                                                 |
-| Agent                          | 最多 30 轮，图像历史 2 张，session timeout 21600 秒                                  |
-| Checkpoint                     | 关闭；每次启动从初始模型开始，不恢复优化器状态                                       |
+| 配置                           | 值                                                                               |
+| ------------------------------ | -------------------------------------------------------------------------------- |
+| 初始模型                       | Qwen3-VL-8B-Thinking                                                             |
+| 算法                           | GRPO，自定义轨迹级 advantage，TIS                                                |
+| 每轮采样                       | 12 组 × 每组 8 条 = 96 条轨迹                                                    |
+| 更新次数                       | 每 rollout 2 次，共 200 rollouts                                                 |
+| 学习率                         | 5e-6，constant                                                                   |
+| KL                             | k3，系数 0.001，ref 每 rollout 更新                                              |
+| PPO clip                       | 下/上界均 0.2                                                                    |
+| 训练并行                       | TP4 / PP1 / CP1，8 卡 DP2、16 卡 DP4                                             |
+| 单卡训练 / log-prob token 预算 | 均为 24576；不是模型上下文长度                                                   |
+| Rollout 上下文 / response 上限 | 16384 / 8192 tokens                                                              |
+| SGLang                         | 每引擎 2 GPU，static memory fraction 0.7，consistent hashing                     |
+| 显存策略                       | 冻结 vision trunk；selective recompute `core_attn`；optimizer CPU offload 未开启 |
+| 沙箱                           | prelaunch 开启；active 与预启动共享 12 个 group permits，最多 96 个 session      |
+| Dynamic filter                 | 关闭                                                                             |
+| Agent                          | 最多 30 轮，图像历史 2 张，session timeout 21600 秒                              |
+| Checkpoint                     | 关闭；每次启动从初始模型开始，不恢复优化器状态                                   |
 
-Actor 与 rollout colocate，共用 8 张物理 GPU。session 并发限制不等于 Nex 服务端实例计数保证：创建重试、服务端回收延迟仍需结合 Nex 配额监控。
+Actor 与 rollout colocate，共用检测到的 8 或 16 张物理 GPU。session 并发限制不等于 Nex 服务端实例计数保证：创建重试、服务端回收延迟仍需结合 Nex 配额监控。
 
 ## 奖励、轨迹与指标
 

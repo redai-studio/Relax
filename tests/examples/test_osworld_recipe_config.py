@@ -62,9 +62,10 @@ def test_manifest_selects_requested_tasks(tmp_path):
     assert rows[0]["extra_info"]["task_id"] == "known"
 
 
+@pytest.mark.parametrize("gpu_count", [8, 16])
 @pytest.mark.parametrize("no_wait", [False, True])
 @pytest.mark.parametrize("external_entrypoint", [False, True])
-def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, external_entrypoint):
+def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, external_entrypoint, gpu_count):
     """Run the real recipe against fake entrypoint/Ray executables only."""
     import json
     import shutil
@@ -83,6 +84,23 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
         "export RELAX_ENTRYPOINT_MODE=local\n"
         'export RUNTIME_ENV_JSON=\'{"env_vars":{"ENTRY_SENTINEL":"kept"},"working_dir":"kept"}\'\n'
     )
+    shutil.copyfile(repo / "scripts/entrypoint/local.sh", repo / "scripts/entrypoint/ray-job.sh")
+    (repo / "ray.py").write_text(
+        "import os\nfrom types import SimpleNamespace\n"
+        "def init(**kwargs): return SimpleNamespace(address_info={'webui_url':'head:8265'})\n"
+        "def cluster_resources(): return {'GPU':int(os.environ['TEST_GPUS'])}\n"
+        "def nodes(): return [{'Alive':True,'Resources':{'GPU':8}}] * (int(os.environ['TEST_GPUS'])//8)\n"
+        "def get_runtime_context(): return SimpleNamespace(gcs_address='head:6379')\n"
+        "def shutdown(): pass\n"
+    )
+    (recipe / "scripts/prepare_agent_env.sh").write_text(
+        'mkdir -p "$DATA_DIR/osworld-agent-venv/bin"\n'
+        'ln -s "$(command -v python3)" "$DATA_DIR/osworld-agent-venv/bin/python"\n'
+    )
+    (recipe / "scripts/cache_agent_env.py").write_text(
+        "import sys\nassert sys.argv[1].endswith('/osworld-agent-venv')\n"
+        "print('/tmp/test-local-agent-env/bin/python')\n"
+    )
     secret = "private-test-api-key-never-log"
     (recipe / "env.local.sh").write_text(f'export OSWORLD_REPO="{tmp_path}/external"\nexport NEX_API_KEY="{secret}"\n')
     data = tmp_path / "data with spaces"
@@ -93,6 +111,7 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     ray = bin_dir / "ray"
     ray.write_text(
         "#!/usr/bin/env python3\nimport json, os, sys\n"
+        'if sys.argv[1:] == ["status"]: sys.exit(0)\n'
         'assert sys.argv[1:3] == ["job", "submit"]\n'
         'with open(os.environ["CAPTURE_ARGS"], "w") as f: json.dump(sys.argv[1:], f)\n'
     )
@@ -104,6 +123,7 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
         "MODEL_DIR": str(tmp_path / "models with spaces"),
         "DATA_DIR": str(data),
         "SAVE_DIR": str(tmp_path / "outputs with spaces"),
+        "TEST_GPUS": str(gpu_count),
         "CAPTURE_ARGS": str(capture),
         "WORKING_DIR": str(repo),
     }
@@ -120,6 +140,7 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     runtime = json.loads(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--runtime-env-json=")))
     assert runtime["working_dir"] == "kept"
     assert runtime["env_vars"]["ENTRY_SENTINEL"] == "kept"
+    assert runtime["env_vars"]["OSWORLD_AGENT_PYTHON"] == "/tmp/test-local-agent-env/bin/python"
     assert secret not in json.dumps(argv) + result.stdout + result.stderr
     train = argv[argv.index("--") + 1 :]
     assert train[:3] == ["python3", "-m", "relax.entrypoints.train"]
@@ -127,13 +148,14 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
         "--lr": "5e-6",
         "--num-rollout": "200",
         "--num-steps-per-rollout": "2",
-        "--max-tokens-per-gpu": "49152",
-        "--log-probs-max-tokens-per-gpu": "49152",
+        "--max-tokens-per-gpu": "24576",
+        "--log-probs-max-tokens-per-gpu": "24576",
         "--kl-loss-coef": "0.001",
         "--tb-project-name": "Relax/osworld-agentic",
         "--prompt-data": str(data / "osworld/train.parquet"),
     }.items():
         assert train[train.index(flag) + 1] == expected
+    assert json.loads(train[train.index("--resource") + 1]) == {"actor": [1, gpu_count], "rollout": [1, gpu_count]}
     assert "--save" not in train and "--load" not in train
     assert "--agentic-prelaunch" in train
     assert "--freeze-vision-model" in train

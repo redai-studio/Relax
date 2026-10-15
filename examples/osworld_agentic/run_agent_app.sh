@@ -5,9 +5,13 @@ set -eu
 set +x  # Private configuration must not appear in per-session logs.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+agent_python="${OSWORLD_AGENT_PYTHON:-}"
 if [ -f "${SCRIPT_DIR}/env.local.sh" ]; then
     source "${SCRIPT_DIR}/env.local.sh"
 fi
+# The launcher's resolved environment takes precedence over private defaults.
+export OSWORLD_AGENT_PYTHON="${agent_python:-${OSWORLD_AGENT_PYTHON:-${DATA_DIR:?Set DATA_DIR}/osworld-agent-venv/bin/python}}"
+unset agent_python
 : "${OSWORLD_REPO:?Set OSWORLD_REPO in env.local.sh}"
 export OSWORLD_CACHE_DIR="${OSWORLD_CACHE_DIR:-${OSWORLD_REPO}/cache}"
 export MCP_SRC_ROOT="${MCP_SRC_ROOT:-${OSWORLD_REPO}}"
@@ -32,6 +36,6 @@ if [ -n "${AGENT_DEBUG_LOG_DIR:-}" ]; then
     exec >> "${AGENT_DEBUG_LOG_DIR}/${RELAX_SESSION_ID}.log" 2>&1
 fi
 
-exec "${OSWORLD_AGENT_PYTHON:-python}" -m app.agent \
+exec "${OSWORLD_AGENT_PYTHON}" -B -m app.agent \
     --input-json "${RELAX_INPUT_JSON}" \
     --output-json "${RELAX_OUTPUT_JSON}"

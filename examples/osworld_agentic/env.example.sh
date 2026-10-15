@@ -7,8 +7,9 @@ export OSWORLD_REPO="/path/to/OSWorld-main-nex"
 export OSWORLD_CACHE_DIR="${OSWORLD_REPO}/cache"
 # Repository root containing mcp/, NOT the mcp/ directory itself.
 export MCP_SRC_ROOT="${OSWORLD_REPO}"
-# Use a separate OSWorld environment to avoid replacing training dependencies.
-export OSWORLD_AGENT_PYTHON="/path/to/osworld-venv/bin/python"
+# Default: persist ${DATA_DIR}/osworld-agent-venv; cache it in /tmp on each Ray node.
+# Optional override for an already prepared environment, accessible on all nodes:
+# export OSWORLD_AGENT_PYTHON="/path/to/osworld-venv/bin/python"
 
 export NEX_API_BASE="https://nex.example.com/api/v1"
 export NEX_WORKSPACE_ID="your-workspace-id"
