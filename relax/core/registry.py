@@ -11,6 +11,9 @@ except ImportError:
             return self.value
 
 
+from argparse import Namespace
+from typing import Any
+
 from relax.algorithms import ALGORITHM_SPECS, algorithm_needs_critic
 from relax.components.actor import Actor
 from relax.components.actor_fwd import ActorFwd
@@ -145,3 +148,17 @@ def process_role(config):
         return ROLES
     else:
         return ROLES_COLOCATE
+
+
+def resolve_algorithm(config: Namespace) -> dict[str, Any]:
+    """Resolve model-independent SFT orchestration for registration and
+    restart."""
+    from relax.engine.sft.bootstrap import resolve_sft_algo_key
+    from relax.engine.sft.runtime import is_i2i_sft
+
+    algo = ALGOS[resolve_sft_algo_key(config)].copy()
+    if is_i2i_sft(config):
+        from relax.components.image_sft import ImageSFT
+
+        algo[ROLES.sft] = ImageSFT
+    return algo
