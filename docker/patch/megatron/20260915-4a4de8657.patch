@@ -784,7 +784,14 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
          params = []
          for group in self.param_groups:
              params.extend(group["params"])
-@@ -370,11 +375,11 @@
+@@ -276,4 +281,6 @@
+                     cpu_copy = True
+                 if self.param_update_in_fp32 and param.dtype != torch.float32:
+                     param = param.detach().clone().float()
++                    if cpu_copy and self.pin_cpu_params:
++                        param = param.pin_memory()
+                     param_to_fp32_param[orig_param] = param
+@@ -370,11 +377,11 @@
          if not self.param_update_in_fp32:
              return
          for param, v in self.state.items():
@@ -801,7 +808,7 @@ diff --git a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py b/megatr
  
      def update_fp32_param_by_new_param(self):
          """
-@@ -382,6 +387,16 @@
+@@ -382,6 +389,16 @@
          """
          for param, fp32_param in self.param_to_fp32_param.items():
              fp32_param.data.copy_(param)
