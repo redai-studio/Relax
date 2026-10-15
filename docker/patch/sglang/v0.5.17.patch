@@ -4107,3 +4107,39 @@ new file mode 100644
 +        req.normalize_batch_and_arguments()
 +    assert [req[index].routed_dp_rank for index in range(2)] == [1, 1]
 +    assert all(req[index].data_parallel_rank is None for index in range(2))
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -833,13 +833,29 @@
+         if sizes is not None:
+             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+             return
++    # BF16 partial sums depend on the destination rank's reduction order.
++    # Accumulate in FP32, then keep the attention-TP all-gather in the original
++    # dtype: all-gather only copies values and needs no wider accumulator.
++    reduce_input = input
++    if input.dtype == torch.bfloat16:
++        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
++            reduce_input = input.float()
+     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+-        get_tp_group().reduce_scatter_tensor(output, input)
++        reduce_output = output
++        if reduce_input.dtype != output.dtype:
++            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
++                reduce_output = torch.empty_like(output, dtype=reduce_input.dtype)
++        get_tp_group().reduce_scatter_tensor(reduce_output, reduce_input)
++        if reduce_output is not output:
++            output.copy_(reduce_output)
+     else:
+-        scattered_local_tokens = input.tensor_split(
++        scattered_local_tokens = reduce_input.tensor_split(
+             get_tensor_model_parallel_world_size()
+         )[get_tensor_model_parallel_rank()]
+-        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
++        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, reduce_input)
++        if scattered_local_tokens.dtype != output.dtype:
++            with use_symmetric_memory(get_attn_tp_group(), disabled=not is_dp_max_padding()):
++                scattered_local_tokens = scattered_local_tokens.to(output.dtype)
+         get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+ 
+ 
