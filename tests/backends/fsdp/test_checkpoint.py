@@ -58,6 +58,12 @@ def _checkpoint_failure_worker(rank: int, save_dir: str, failure_phase: str, que
             raise OSError("state preparation OOM")
 
         ckpt.get_state_dict = _fail_state
+    if failure_phase == "rng" and rank == 1:
+
+        def _fail_rng(*_args, **_kwargs):
+            raise OSError("RNG disk full")
+
+        ckpt._save_rng = _fail_rng
     try:
         ckpt.save_checkpoint(
             save_dir,
@@ -69,8 +75,9 @@ def _checkpoint_failure_worker(rank: int, save_dir: str, failure_phase: str, que
             weight_sync_manifest={},
             adapter_contract={},
             is_rank0=rank == 0,
+            require_rng_state=failure_phase.startswith("rng"),
         )
-        queue.put((rank, "unexpected-success"))
+        queue.put((rank, "success"))
     except Exception as exc:
         queue.put((rank, f"{type(exc).__name__}: {exc}"))
     finally:
@@ -125,6 +132,95 @@ def test_checkpoint_metadata_failure_is_not_committed(_dist, tmp_path, monkeypat
         )
     ckpt_dir = os.path.join(str(tmp_path), "t2i", ckpt.iter_dir_name(9))
     assert not os.path.exists(os.path.join(ckpt_dir, ckpt.COMMITTED_MARKER))
+
+
+def test_rng_write_failure_is_strict_only_when_requested(tmp_path, monkeypatch):
+    def _fail(*_args, **_kwargs):
+        raise OSError("RNG disk full")
+
+    monkeypatch.setattr(torch, "save", _fail)
+    ckpt._save_rng(str(tmp_path))
+    with pytest.raises(OSError, match="RNG disk full"):
+        ckpt._save_rng(str(tmp_path), strict=True)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_checkpoint_numpy_rng_failure_preserves_legacy_default(_dist, tmp_path, monkeypatch, strict):
+    import numpy as np
+
+    model, opt = _trained_model()
+
+    def _fail():
+        raise OSError("numpy RNG unavailable")
+
+    monkeypatch.setattr(np.random, "get_state", _fail)
+    kwargs = dict(trainer_state={}, weight_sync_manifest={}, adapter_contract={})
+    if strict:
+        with pytest.raises(OSError, match="numpy RNG unavailable"):
+            ckpt.save_checkpoint(str(tmp_path), "sft", 1, model, opt, require_rng_state=True, **kwargs)
+        assert ckpt.find_latest_committed(str(tmp_path), "sft") is None
+        assert not (tmp_path / "latest_checkpointed_iteration.txt").exists()
+    else:
+        directory = ckpt.save_checkpoint(str(tmp_path), "sft", 1, model, opt, **kwargs)
+        assert os.path.isfile(os.path.join(directory, "COMMITTED"))
+
+
+def test_strict_checkpoint_requires_rng_on_idempotent_return(_dist, tmp_path):
+    model, opt = _trained_model()
+    kwargs = dict(trainer_state={"completed_steps": 1}, weight_sync_manifest={}, adapter_contract={})
+    directory = ckpt.save_checkpoint(str(tmp_path), "sft", 1, model, opt, require_rng_state=True, **kwargs)
+    rng = os.path.join(directory, "rng_rank0.pt")
+    assert os.path.isfile(rng)
+    assert ckpt.save_checkpoint(str(tmp_path), "sft", 1, model, opt, require_rng_state=True, **kwargs) == directory
+    os.unlink(rng)
+    with pytest.raises(RuntimeError, match="missing required per-rank RNG"):
+        ckpt.save_checkpoint(str(tmp_path), "sft", 1, model, opt, require_rng_state=True, **kwargs)
+
+
+def test_strict_rng_failure_exits_all_ranks_without_commit(tmp_path):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(target=_checkpoint_failure_worker, args=(rank, str(tmp_path), "rng", queue)) for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("checkpoint rank hung after non-rank-0 RNG failure")
+        assert process.exitcode == 0
+    results = sorted(queue.get(timeout=2) for _ in range(2))
+    assert "RuntimeError: Checkpoint RNG write failed on another rank" in results[0][1]
+    assert "OSError: RNG disk full" in results[1][1]
+    assert ckpt.find_latest_committed(str(tmp_path), "t2i") is None
+    assert not os.path.exists(os.path.join(str(tmp_path), "latest_checkpointed_iteration.txt"))
+
+
+def test_strict_rng_success_publishes_all_rank_files(tmp_path):
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(target=_checkpoint_failure_worker, args=(rank, str(tmp_path), "rng-success", queue))
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("strict RNG checkpoint success hung")
+        assert process.exitcode == 0
+    assert sorted(queue.get(timeout=2) for _ in range(2)) == [(0, "success"), (1, "success")]
+    directory = tmp_path / "t2i" / ckpt.iter_dir_name(11)
+    assert (directory / "COMMITTED").is_file()
+    for rank in range(2):
+        state = torch.load(directory / f"rng_rank{rank}.pt", map_location="cpu", weights_only=False)
+        assert {"torch", "python", "numpy", "cuda"} <= state.keys()
 
 
 def test_checkpoint_waits_for_all_rng_writes_before_publish(_dist, tmp_path, monkeypatch):
@@ -462,3 +558,33 @@ def test_export_hf_reads_the_full_ft_checkpoint(_dist, tmp_path):
     exported = load_file(os.path.join(out, "diffusion_pytorch_model.safetensors"))
     assert sorted(exported) == ["bias", "weight"]
     assert torch.allclose(exported["weight"], model.weight.detach())
+
+
+def test_full_checkpoint_restores_lazy_optimizer_state(tmp_path, _dist) -> None:
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    model.weight.square().sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    ckpt.save_checkpoint(
+        str(tmp_path),
+        "lazy",
+        1,
+        model,
+        optimizer,
+        trainer_state={"next_batch": 1},
+        weight_sync_manifest={},
+        adapter_contract={},
+    )
+    restored = torch.nn.Linear(3, 2)
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.01)
+    ckpt.load_checkpoint(str(tmp_path), "lazy", 1, restored, restored_optimizer)
+    assert not restored_optimizer.state.get(restored.bias)
+    for candidate, optim in ((model, optimizer), (restored, restored_optimizer)):
+        # Activate the previously unused parameter after resume.
+        (candidate.weight.square().sum() + candidate.bias.square().sum()).backward()
+        optim.step()
+    for expected, actual in zip(model.parameters(), restored.parameters(), strict=True):
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        for key, value in optimizer.state[expected].items():
+            torch.testing.assert_close(value, restored_optimizer.state[actual][key], rtol=0, atol=0)

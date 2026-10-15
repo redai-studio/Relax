@@ -98,6 +98,15 @@ def test_pipeline_accepts_partial_non_sft_arguments():
     assert not hasattr(args, "sft_async_prepack")
 
 
+def test_pipeline_i2i_fsdp_does_not_require_megatron_arguments():
+    args = SimpleNamespace(loss_type="sft", generation_task="i2i", train_backend="fsdp", max_staleness=1)
+    configure_sft_data_pipeline(args)
+    assert not args.per_rank_fetch
+    assert not args.sft_async_prepack
+    assert not args.sft_train_data_prefetch
+    assert not args.sft_image_preprocess_on_rank
+
+
 def test_pipeline_selection_runs_after_custom_and_backend_validation():
     tree = ast.parse(_SOURCE.read_text())
     parse = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_parse_args_impl")
