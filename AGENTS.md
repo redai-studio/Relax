@@ -45,9 +45,29 @@ configs/env.yaml         运行时环境配置
 
 修改代码时重点关注：`relax/utils/utils.py`、`relax/components/`、`relax/core/controller.py`、`relax/entrypoints/train.py`。
 
+## Architecture
+
+基于 Ray Serve 的服务编排分为三层：
+
+1. **Controller**（`relax/core/controller.py`）：顶层训练循环、服务编排与健康监控。
+2. **Service**（`relax/core/service.py`）：生命周期管理、GPU placement group 与 Ray Serve deployment 封装。
+3. **Components**（`relax/components/`）：Actor、Critic、Rollout、Advantages、GenRM、ActorFwd 等具体 RL 服务。
+
+两种执行模式：
+
+- **Colocate（Sync）**：Actor 与 Rollout 分时复用相同 GPU。
+- **Fully Async**：各角色使用独立 GPU 集群，通过 TransferQueue 流式传输数据。
+
+关键子系统：
+
+- **Backends**（`relax/backends/`）：Megatron 训练后端（TP/PP/CP/EP）与 SGLang 推理引擎。
+- **Engine**（`relax/engine/`）：Rollout 生成、可插拔奖励函数（`engine/rewards/`）、数据过滤与请求路由。
+- **Distributed**（`relax/distributed/`）：Ray 集群管理与 DCS（基于 NCCL broadcast 的权重同步）。
+- **Algorithm Registry**（`relax/core/registry.py`）：算法名称到组件角色的映射。
+
 ## Code Standards
 
-- Ruff 格式化，行宽 119，`isort` 管理导入（配置见 `pyproject.toml`）
+- Ruff 格式化，行宽 119，双引号，`isort` 管理导入并将 `relax` 视为 first-party（配置见 `pyproject.toml`）
 - `relax/` 下所有 `.py` 须含版权头：`# Copyright (c) 2026 Relax Authors. All Rights Reserved.`
 - pre-commit 对 `transfer_queue/` 排除大部分检查
 - 日志统一用 `relax.utils.logging_utils.get_logger(__name__)`，禁止 `print` / `logging.getLogger`
@@ -93,13 +113,17 @@ CRITICAL: 以下规则不可违反。
 ## Development Workflow
 
 ```bash
+pip install -e .                    # 以开发模式安装
 pip install -r requirements.txt
 pre-commit run --all-files           # lint + format（等同 make format）
 pytest tests/                        # 测试
+pytest tests/<test_file>.py::<test_name>  # 运行单个测试
+make test                           # 等同 pytest tests/
+make docs-dev                       # 启动 VitePress 文档开发服务器
 ```
 
 - 提交遵循 Conventional Commits（`feat:`, `fix:`, `docs:`），详见 `git-commit` skill
-- 仅创建本地 commit，不 push
+- 默认仅创建本地 commit；用户授权 push 或创建 PR 时，遵循 `relax-github-workflow` skill
 - 测试命名：`test_<module>_<behavior>()`，GPU 测试用 `@pytest.mark.skipif` 优雅跳过
 
 ## Distributed Code Rules
@@ -113,23 +137,25 @@ pytest tests/                        # 测试
 
 ## Configuration & Launching
 
-训练通过 `relax/utils/arguments.py` 的命令行参数配置（扩展 Megatron-LM 解析器）。
+训练入口为 `python relax/entrypoints/train.py [args]`，通过 `relax/utils/arguments.py` 的命令行参数配置（扩展 Megatron-LM 解析器）。
 
 ## Domain experts & skills
 
 Fire the appropriate **expert subagent** or **load a skill** based on what you're working on. Experts are read-only consultants with deep domain knowledge; skills are step-by-step implementation guides.
 
-| Working on...                                | Fire subagent      | Load skill        |
-| -------------------------------------------- | ------------------ | ----------------- |
-| Megatron backend (TP/PP/CP/EP)               | `megatron-expert`  |                   |
-| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)      | `algorithm-expert` |                   |
-| Task Launch & service deployment             | `launcher-expert`  |                   |
-| Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                   |
-| Development & code changes                   | `ray-expert`       | `dev`             |
-| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout` |
-| Distributed training hang debugging          | `ray-expert`       | `debug-hang`      |
-| Code review of git changes                   | --                 | `code-review`     |
-| Creating new skills                          | --                 | `creating-skills` |
-| Git commits                                  | --                 | `git-commit`      |
+| Working on...                                | Fire subagent      | Load skill              |
+| -------------------------------------------- | ------------------ | ----------------------- |
+| Megatron backend (TP/PP/CP/EP)               | `megatron-expert`  |                         |
+| RL algorithms (GRPO/PPO/DAPO/GSPO/SAPO)      | `algorithm-expert` |                         |
+| Task Launch & service deployment             | `launcher-expert`  |                         |
+| Ray framework (Core, Serve, Jobs, placement) | `ray-expert`       |                         |
+| Development & code changes                   | `ray-expert`       | `dev`                   |
+| Agentic rollout integration, runtime & hangs | `agentic-expert`   | `agentic-rollout`       |
+| Distributed training hang debugging          | `ray-expert`       | `debug-hang`            |
+| Code review of git changes                   | --                 | `code-review`           |
+| Creating new skills                          | --                 | `creating-skills`       |
+| Git commits                                  | --                 | `git-commit`            |
+| GitHub contribution, PRs & review follow-up  | --                 | `relax-github-workflow` |
+| GitHub required checks & CI operations       | --                 | `relax-github-ci`       |
 
 **How to fire an expert**: task(subagent_type="megatron-expert", load_skills=\[\], run_in_background=true, prompt="...")

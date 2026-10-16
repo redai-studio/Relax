@@ -69,6 +69,22 @@ def test_tensor_rewards_preserve_mains_detached_advantages(cp_disabled, estimato
     assert all(not value.requires_grad for value in returns)
 
 
+def test_grpo_accepts_ragged_token_reward_tensors():
+    inputs = _inputs(lengths=(3, 2))
+    rewards = [
+        torch.tensor([1.0, 2.0, 3.0], requires_grad=True),
+        torch.tensor([4.0, 5.0], requires_grad=True),
+    ]
+
+    advantages, returns = compute_advantages_and_returns(_args("grpo"), rewards=rewards, **inputs)
+
+    for actual, expected in zip(returns, rewards, strict=True):
+        assert torch.equal(actual, expected)
+        assert actual.dtype == torch.float32
+        assert not actual.requires_grad
+    assert advantages is not returns
+
+
 def test_reward_tensor_conversion_preserves_mains_independent_storage():
     rewards = torch.tensor([1.5, -2.0])
     converted = advantages_module._as_reward_tensor(rewards, _inputs()["kl"])

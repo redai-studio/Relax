@@ -46,16 +46,48 @@ try:
     # so the delegate path (fuse-linear / gate-off) runs the original verbatim.
     _ORIG_PROCESS_MTP_LOSS = _mtp_mod.process_mtp_loss
     _ORIG_PROCESS_MTP_LOSS_PARAMETERS = set(inspect.signature(_ORIG_PROCESS_MTP_LOSS).parameters)
+    _ROLL_TENSOR_PARAMETERS = set(inspect.signature(roll_tensor).parameters)
     _MTP_TRACKER_PARAMETERS = set(inspect.signature(MTPLossLoggingHelper.save_loss_to_tracker).parameters)
     _COMPUTE_MTP_ACCEPTANCE_COUNTS = getattr(_mtp_mod, "_compute_mtp_acceptance_counts", None)
 
-    def _call_original_process_mtp_loss(*args, tp_group=None, input_ids=None, **kwargs):
-        """Delegate across Megatron versions that added TP group/input IDs."""
+    def _call_original_process_mtp_loss(*args, tp_group=None, input_ids=None, sequence_roll_context=None, **kwargs):
+        """Delegate across Megatron versions with different MTP roll APIs."""
         if "tp_group" in _ORIG_PROCESS_MTP_LOSS_PARAMETERS:
             kwargs["tp_group"] = tp_group
         if "input_ids" in _ORIG_PROCESS_MTP_LOSS_PARAMETERS:
             kwargs["input_ids"] = input_ids
+        if "sequence_roll_context" in _ORIG_PROCESS_MTP_LOSS_PARAMETERS:
+            kwargs["sequence_roll_context"] = sequence_roll_context
         return _ORIG_PROCESS_MTP_LOSS(*args, **kwargs)
+
+    def _roll_mtp_labels_and_mask(
+        labels: torch.Tensor,
+        loss_mask: torch.Tensor,
+        cp_group=None,
+        packed_seq_params=None,
+        sequence_roll_context=None,
+        roll_depth: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preserve packed CP roll metadata while supporting the legacy scalar
+        API."""
+        if "tensors" in _ROLL_TENSOR_PARAMETERS:
+            labels, loss_mask = roll_tensor(
+                [labels, loss_mask],
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=sequence_roll_context,
+                sequence_fields=["labels", "loss_mask"],
+                roll_depth=roll_depth,
+            )
+            return labels, loss_mask, loss_mask.sum()
+
+        labels, _ = roll_tensor(labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params)
+        loss_mask, num_tokens = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        return labels, loss_mask, num_tokens
 
     @torch._dynamo.disable
     def _chunked_head_ce(
@@ -213,6 +245,7 @@ try:
         packed_seq_params=None,
         scale_logits_fn=None,
         input_ids=None,
+        sequence_roll_context=None,
     ):
         """Chunked drop-in for ``process_mtp_loss`` (native CE branch only).
 
@@ -239,30 +272,39 @@ try:
                 packed_seq_params=packed_seq_params,
                 scale_logits_fn=scale_logits_fn,
                 input_ids=input_ids,
+                sequence_roll_context=sequence_roll_context,
             )
 
-        # ---- chunked native path (mirrors upstream lines 650-723 exactly) ----
+        # ---- chunked native path ----
         hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
         hidden_states = hidden_states_list[0]
-
-        if labels is None:
-            return hidden_states
 
         mtp_labels = labels.clone()
         if loss_mask is None:
             loss_mask = torch.ones_like(mtp_labels)
 
+        # Relax controls each detach path separately from upstream mtp_detach_heads.
+        if getattr(config, "mtp_detach_lm_head", True):
+            output_weight = (output_weight if output_weight is not None else output_layer.weight).detach()
+
         # per-token count BEFORE rolling (used by the per-token-loss normalization).
         original_num_tokens = loss_mask.sum()
 
         chunk_size = _resolve_chunk_size()
+        collect_acceptance = (
+            is_training
+            and _COMPUTE_MTP_ACCEPTANCE_COUNTS is not None
+            and getattr(MTPLossLoggingHelper, "should_collect_acceptance", lambda: True)()
+        )
 
         for mtp_layer_number in range(config.mtp_num_layers):
-            mtp_labels, _ = roll_tensor(
-                mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
-            )
-            loss_mask, num_tokens = roll_tensor(
-                loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            mtp_labels, loss_mask, num_tokens = _roll_mtp_labels_and_mask(
+                mtp_labels,
+                loss_mask,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
+                roll_depth=mtp_layer_number,
             )
 
             # Chunked head+CE (dynamo-disabled) -> per-token loss [b, s].
@@ -276,13 +318,12 @@ try:
                 scale_logits_fn,
                 chunk_size,
                 tp_group=tp_group,
-                loss_mask=loss_mask if is_training else None,
+                loss_mask=loss_mask if collect_acceptance else None,
             )
 
             # ---- identical to upstream from here (operates on [b, s], no vocab dim) ----
             mtp_loss = loss_mask * mtp_loss
-            # Upstream logs the UNSCALED per-depth loss (before mtp_loss_scale) and
-            # only folds the scale into the gradient path — mirror that exactly.
+            # Preserve the scaled logging contract of Relax's Docker Megatron patch.
             if is_training:
                 _save_mtp_loss_to_tracker(mtp_loss, num_tokens, mtp_layer_number, config, correct, total)
             mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers

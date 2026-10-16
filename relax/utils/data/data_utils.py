@@ -26,7 +26,7 @@ import multiprocessing
 import os
 import re
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -583,7 +583,7 @@ def filter_long_prompts(
                     executor.submit(_check_sample_length_worker, sample, max_length): sample for sample in samples
                 }
                 for future in tqdm.tqdm(
-                    as_completed(futures),
+                    futures,
                     total=len(futures),
                     desc=f"check sample length...(num_proc={actual_workers})",
                 ):

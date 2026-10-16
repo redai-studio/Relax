@@ -12,22 +12,23 @@ import torch
 
 from relax.engine.sft.dataset.multimodal import (
     SFTMultimodalMediaLoadError,
-    _fetch_media,
     has_multimodal_content,
     preprocess_multimodal,
     preprocess_multimodal_async,
+    sample_media_paths,
 )
 from relax.engine.sft.dataset.sample import (
     CanonicalMessage,
     CanonicalSample,
 )
+from relax.utils.data.processor_pool import MediaLoadError, _load_media_for_worker
 
 
 @pytest.fixture(autouse=True)
 def stub_processor_pool_module(monkeypatch):
     processor_pool = ModuleType("relax.utils.data.processor_pool")
-    processor_pool.prepare_mm_inputs_for_ipc = MagicMock(side_effect=lambda mm_inputs: mm_inputs)
-    processor_pool.process_sample_in_worker = MagicMock()
+    processor_pool.MediaLoadError = MediaLoadError
+    processor_pool.process_sample_from_paths_in_worker = MagicMock()
     monkeypatch.setitem(sys.modules, "relax.utils.data.processor_pool", processor_pool)
 
     import relax.utils.data as data_package
@@ -86,12 +87,7 @@ def test_preprocess_image_calls_processor_pool():
         {"pixel_values": torch.zeros(1, 3, 224, 224), "image_grid_thw": torch.tensor([[1, 16, 16]])},
     )
     fake_executor.submit.return_value = fake_future
-    with patch("relax.engine.sft.dataset.multimodal._fetch_media") as mock_fetch:
-        mock_fetch.return_value = (
-            {"images": [b"fake_bytes"]},
-            "<|vision_start|><|image_pad|><|vision_end|>describe\ncat",
-        )
-        prompt_ids, mm_inputs = preprocess_multimodal(_image_sample(), processor_pool=fake_pool)
+    prompt_ids, mm_inputs = preprocess_multimodal(_image_sample(), processor_pool=fake_pool)
     assert prompt_ids == [1, 2, 3]
     assert "pixel_values" in mm_inputs
     assert "image_grid_thw" in mm_inputs
@@ -103,18 +99,49 @@ def test_preprocess_without_pool_when_multimodal_raises():
         preprocess_multimodal(_image_sample(), processor_pool=None)
 
 
-def test_preprocess_wraps_media_loader_error(monkeypatch):
-    load_image = MagicMock(side_effect=AssertionError("missing"))
+def _patch_loaders(monkeypatch, load_image):
     for kind in ("image", "video", "audio"):
         module_name = f"relax.utils.multimodal.{kind}_utils"
         loader_module = ModuleType(module_name)
         setattr(loader_module, f"load_{kind}", load_image if kind == "image" else MagicMock())
         monkeypatch.setitem(sys.modules, module_name, loader_module)
 
-    with pytest.raises(SFTMultimodalMediaLoadError, match=r"image position=0.*row_index=0") as exc_info:
-        _fetch_media(_image_sample(), "<image>")
+
+def test_worker_media_loader_loads_images_without_video_or_audio_dependencies(monkeypatch):
+    image_utils = ModuleType("relax.utils.multimodal.image_utils")
+    image_utils.load_image = MagicMock(return_value="decoded image")
+    monkeypatch.setitem(sys.modules, image_utils.__name__, image_utils)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.video_utils", None)
+    monkeypatch.setitem(sys.modules, "relax.utils.multimodal.audio_utils", None)
+
+    assert _load_media_for_worker({"image": ["cat.png"], "video": [], "audio": []}) == {"images": ["decoded image"]}
+    image_utils.load_image.assert_called_once_with("cat.png")
+
+
+def test_worker_media_loader_reports_position(monkeypatch):
+    load_image = MagicMock(side_effect=AssertionError("missing"))
+    _patch_loaders(monkeypatch, load_image)
+
+    with pytest.raises(MediaLoadError, match="image position=0") as exc_info:
+        _load_media_for_worker({"image": ["/tmp/cat.png"], "video": [], "audio": []})
     load_image.assert_called_once_with("/tmp/cat.png")
     assert isinstance(exc_info.value.__cause__, AssertionError)
+
+
+def test_preprocess_wraps_worker_media_load_error():
+    pool = MagicMock()
+    pool.executor.submit.return_value.result.side_effect = MediaLoadError(
+        "failed to load image position=0: '/data/missing.jpg'"
+    )
+    with pytest.raises(SFTMultimodalMediaLoadError, match=r"image position=0.*row_index=0") as exc_info:
+        preprocess_multimodal(_image_sample(), processor_pool=pool)
+    assert isinstance(exc_info.value.__cause__, MediaLoadError)
+
+
+def test_sample_media_paths_keeps_kind_and_order():
+    paths = sample_media_paths(_image_sample())
+    assert paths["image"] == ["/tmp/cat.png"]
+    assert paths["video"] == [] and paths["audio"] == []
 
 
 @pytest.mark.asyncio
@@ -136,12 +163,7 @@ async def test_preprocess_multimodal_async_dispatches_to_executor():
         pool.calls += 1
         return expected_prompt_ids, expected_inputs
 
-    with (
-        patch("relax.engine.sft.dataset.multimodal._fetch_media") as fetch_mock,
-        patch("relax.utils.data.processor_pool.process_sample_in_worker", side_effect=_fake_worker),
-        patch("relax.utils.data.processor_pool.prepare_mm_inputs_for_ipc", side_effect=lambda mm: mm),
-    ):
-        fetch_mock.return_value = ({"images": [b"fake"]}, "rendered text")
+    with patch("relax.utils.data.processor_pool.process_sample_from_paths_in_worker", side_effect=_fake_worker):
         prompt_ids, mm_inputs = await preprocess_multimodal_async(_image_sample(), processor_pool=pool)
 
     pool.executor.shutdown(wait=True)

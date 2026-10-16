@@ -1,5 +1,9 @@
 # Security and Reliability Checklist (Relax Project)
 
+Contents: [Input/output](#inputoutput-safety), [races](#race-conditions), [runtime](#runtime-risks), [distributed systems](#distributed-system-risks-relax-specific).
+
+Establish the trust boundary, reachable failure or interleaving, and impact. Examples illustrate mechanisms, not a requirement to add a handler or lock at every call site. Check whether an owning layer already enforces the contract.
+
 ## Input/Output Safety
 
 ### Command Injection
@@ -64,7 +68,7 @@ if os.path.exists(filepath):
     with open(filepath) as f:  # may be deleted between check and open
         data = f.read()
 
-# Good: handle exception
+# If absence is a valid result, handle it at the operation
 try:
     with open(filepath) as f:
         data = f.read()
@@ -74,8 +78,8 @@ except FileNotFoundError:
 
 ### Async Race Conditions
 
-- Shared state between coroutines without `asyncio.Lock()`
-- Multiple `await` calls without synchronization
+- Shared mutable state can change across an `await`, violating an invariant used after resumption
+- Show the conflicting operations and scheduling mode before recommending a lock; serial ownership or independent state may already prevent the race
 
 ______________________________________________________________________
 
@@ -106,12 +110,12 @@ ______________________________________________________________________
 ### Ray Actor Safety
 
 - Actors sharing state without proper synchronization
-- Missing error handling for actor failures
+- Actor failures bypass the intended failure propagation, retry, or cleanup policy
 - Resource leaks in actor lifecycle
 
 ### Process Group Operations
 
-- Collective ops (all_reduce, broadcast) not called by all ranks → hang
+- Required members of a process group do not participate in compatible collective operations → hang
 - Mismatched tensor shapes across ranks
 - Deadlocks from incorrect operation ordering
 

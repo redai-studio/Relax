@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional
 import ray
 
 from relax.core.node_group_affinity import with_control_plane_affinity
-from relax.utils.async_utils import run
 from relax.utils.logging_utils import get_logger
 
 
@@ -247,7 +246,10 @@ class HealthChecker:
 
         def _runner():
             try:
-                run(self._check_loop())
+                # Recovery stops the shared async loop before shutting Ray down.
+                # Run checks on this thread's own loop so that recovery can join
+                # the shared loop thread instead of attempting to join itself.
+                asyncio.run(self._check_loop())
             except Exception as e:
                 logger.error(f"Health checker error: {e}")
 
@@ -266,6 +268,8 @@ class HealthChecker:
 
         self._stop_event.set()
         logger.debug("Signaling health checker to stop")
+        if threading.current_thread() is self._thread:
+            return
         self._thread.join(timeout)
 
         if not self._thread.is_alive():

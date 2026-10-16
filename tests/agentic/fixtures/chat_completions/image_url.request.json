@@ -1,0 +1,20 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is this?"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://example.com/cat.png"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 64
+}

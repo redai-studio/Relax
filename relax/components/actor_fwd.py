@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import asyncio
 import threading
 from argparse import Namespace
 from typing import Any, Optional
@@ -10,6 +9,7 @@ import transfer_queue as tq
 from fastapi import FastAPI
 from ray import serve
 
+from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
 from relax.distributed.ray.placement_group import allocate_train_group
 
@@ -32,9 +32,7 @@ class ActorFwd(Base):
 
         # Threading primitives so the computation loop doesn't block the Serve/FastAPI thread
         self._stop_event = threading.Event()
-        self._run_thread = None
-        self._done_event: Optional[asyncio.Event] = None
-        self._thread_error: Optional[Exception] = None
+        self._loop_runner = BackgroundLoopRunner()
         tq.init(self.config.tq_config)
         self.data_system_client = tq.get_client()
         self.actor_model = allocate_train_group(args=config, num_gpus=num_gpus, pg=pgs, runtime_env=runtime_env)
@@ -42,31 +40,13 @@ class ActorFwd(Base):
         self.step = 0
 
     async def run(self) -> None:
-        if self._run_thread is not None and self._run_thread.is_alive():
-            if self._done_event is not None:
-                await self._done_event.wait()
-            return
+        await self._loop_runner.run(self._background_run, before_start=self._reset_consumption)
+
+    def _reset_consumption(self) -> None:
         self.data_system_client.reset_consumption(
             partition_id=f"train_{self.step}",
             task_name="actor_log_probs" if self.role == "actor_fwd" else "ref_log_probs",
         )
-        loop = asyncio.get_running_loop()
-        self._done_event = asyncio.Event()
-
-        def _thread_target():
-            try:
-                self._background_run()
-            except Exception as exc:
-                self._thread_error = exc
-            finally:
-                loop.call_soon_threadsafe(self._done_event.set)
-
-        self._thread_error = None
-        self._run_thread = threading.Thread(target=_thread_target, daemon=True)
-        self._run_thread.start()
-        await self._done_event.wait()
-        if self._thread_error is not None:
-            raise self._thread_error
 
     def _background_run(self) -> None:
         try:
@@ -116,22 +96,17 @@ class ActorFwd(Base):
 
     async def stop(self) -> None:
         self._stop_event.set()
-        if self._run_thread is not None:
-            # First try: wait a short time for the thread to notice the stop flag
-            self._run_thread.join(timeout=5)
-            if self._run_thread.is_alive():
-                self._logger.warning(
-                    f"{self.role} background thread did not stop within 5s "
-                    "(likely blocked in compute/recv_weight), waiting longer..."
+        if not await self._loop_runner.join(timeout=5):
+            self._logger.warning(
+                f"{self.role} background thread did not stop within 5s "
+                "(likely blocked in compute/recv_weight), waiting longer..."
+            )
+            # Wait for the current compute/NCCL operation; timeout does not cancel it.
+            if not await self._loop_runner.join(timeout=600):
+                self._logger.error(
+                    f"{self.role} background thread still alive after 600s. "
+                    "Proceeding with restart anyway — stale thread may leak."
                 )
-                # Second try: give it enough time to finish the current
-                # compute step or NCCL operation (up to 10 minutes)
-                self._run_thread.join(timeout=600)
-                if self._run_thread.is_alive():
-                    self._logger.error(
-                        f"{self.role} background thread still alive after 600s. "
-                        "Proceeding with restart anyway — stale thread may leak."
-                    )
 
     def recv_weight_fully_async(self) -> None:
         self.actor_model.recv_weight_fully_async(0)

@@ -58,7 +58,7 @@ _FALSE_VALUES = frozenset({"0", "f", "false", "n", "no", "off"})
 
 # A variable whose name contains one of these has its value masked in
 # diagnostics. Substring matching, deliberately over-inclusive: masking a
-# non-secret (`RELAX_OPD_TOKEN_IDS_LOGPROB_K` is a top-k count, not a
+# non-secret (`RELAX_KERNEL_CACHE_KEY` is a cache identifier, not a
 # credential) only costs a line of diagnostic output, while missing a real
 # credential writes it to the log verbatim.
 _SENSITIVE_ENV_MARKERS: Tuple[str, ...] = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "PASSWD", "AUTH")
@@ -109,8 +109,7 @@ class EnvProperty:
 
     Resolution is lazy on purpose: several call sites write to ``os.environ``
     and read the value back later in the same process (``LOCAL_RANK`` in
-    ``distributed/ray/train_actor.py``, ``RELAX_OPD_TOKEN_IDS_LOGPROB_K`` in
-    ``backends/sglang/sglang_engine.py``), so values must not be frozen at
+    ``distributed/ray/train_actor.py``), so values must not be frozen at
     import time. An unset *or empty* variable resolves to ``default``; a set but
     unparseable one raises ``ValueError``.
 
@@ -200,9 +199,7 @@ class Envs(metaclass=_EnvsMeta):
     LOGNAME = EnvProperty("LOGNAME", str, None)
 
     # ------------- OPD / SGLang patches -------------
-    RELAX_OPD_PREEXPANDED_PATCH = EnvProperty("RELAX_OPD_PREEXPANDED_PATCH", bool, False)
     RELAX_OPD_PER_POS_TOKEN_IDS = EnvProperty("RELAX_OPD_PER_POS_TOKEN_IDS", bool, False)
-    RELAX_OPD_TOKEN_IDS_LOGPROB_K = EnvProperty("RELAX_OPD_TOKEN_IDS_LOGPROB_K", str, "0")
     RELAX_OPTIMIZE_ROUTING_REPLAY = EnvProperty("RELAX_OPTIMIZE_ROUTING_REPLAY", bool, False)
     RELAX_FORCE_LOGPROBS_BASE64 = EnvProperty("RELAX_FORCE_LOGPROBS_BASE64", bool, False)
 
@@ -221,6 +218,27 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_LORA_A_INIT_METHOD = EnvProperty("RELAX_LORA_A_INIT_METHOD", str, "")
     RELAX_LORA_EXCLUDE_FROZEN_MODULES = EnvProperty("RELAX_LORA_EXCLUDE_FROZEN_MODULES", bool, False)
     RELAX_LORA_SHARE_EXPERT_ADAPTERS = EnvProperty("RELAX_LORA_SHARE_EXPERT_ADAPTERS", bool, None)
+
+    # ------------- DeepSeek-V4 MXFP4 QAT -------------
+    # Used only by relax.models.deepseek_v4.provider.model_provider;
+    # these settings do not enable QAT without selecting that custom model provider.
+    # "native" (default): SFT V3, native P2 FP8 weights and configurable expert/indexer precision.
+    # "stock_fp8": MXFP4 experts + stock TE FP8 GEMM/FP32 scales, no P2 overrides or indexer simulation.
+    # stock_fp8 requires NVTE_FP8_BLOCK_SCALING_FP32_SCALES=1; overrides EXPERT_COMPUTE and INDEXER below.
+    RELAX_DSV4_FP4_MODE = EnvProperty("RELAX_DSV4_FP4_MODE", str, "native")
+    # native mode routed expert GEMM: "bf16" (default) or "fp8" (P2 weights). Both use MXFP4 effective weights.
+    RELAX_DSV4_FP4_EXPERT_COMPUTE = EnvProperty("RELAX_DSV4_FP4_EXPERT_COMPUTE", str, "bf16")
+    # native mode: enable MXFP4 QDQ on indexer Q/K after Hadamard (bool; default False).
+    RELAX_DSV4_FP4_INDEXER = EnvProperty("RELAX_DSV4_FP4_INDEXER", bool, False)
+    # Round final indexer scores to BF16 values, retaining FP32 storage (bool; default True).
+    # Only applies when INDEXER is enabled; does not change the accumulation precision.
+    RELAX_DSV4_FP4_BF16_SCORES = EnvProperty("RELAX_DSV4_FP4_BF16_SCORES", bool, True)
+    # Directory for CPU-sampled FP32 master / recomputed MXFP4 update statistics (per-process/optimizer JSONL).
+    # Unset or empty disables these statistics; this is not the model checkpoint directory.
+    RELAX_DSV4_FP4_STATS_DIR = EnvProperty("RELAX_DSV4_FP4_STATS_DIR", str, None)
+    # Positive integer (default 10): record every N successful local optimizer updates, not global steps.
+    # Initialization/resume also records a fresh comparison baseline; requires STATS_DIR.
+    RELAX_DSV4_FP4_STATS_INTERVAL = EnvProperty("RELAX_DSV4_FP4_STATS_INTERVAL", int, 10)
 
     # ------------- Compiled kernel cache -------------
     RELAX_KERNEL_CACHE_DIR = EnvProperty("RELAX_KERNEL_CACHE_DIR", str, None)
@@ -354,10 +372,13 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_REPRO_PROFILE_EXIT_AFTER_DUMP = EnvProperty("RELAX_REPRO_PROFILE_EXIT_AFTER_DUMP", str, "0")
     RELAX_REPRO_PROFILE_STEPS = EnvProperty("RELAX_REPRO_PROFILE_STEPS", int, 50)
     RELAX_REPRO_PROFILE_WARMUP = EnvProperty("RELAX_REPRO_PROFILE_WARMUP", int, 5)
+    RELAX_DEBUG_DSV4_CP_P2P_WARMUP = EnvProperty("RELAX_DEBUG_DSV4_CP_P2P_WARMUP", bool, False)
+    RELAX_DEBUG_DSV4_PP_GROUP_WARMUP = EnvProperty("RELAX_DEBUG_DSV4_PP_GROUP_WARMUP", bool, False)
 
     # ------------- NCCL / FP8 -------------
     NCCL_CUMEM_ENABLE = EnvProperty("NCCL_CUMEM_ENABLE", str, "0")
     NVTE_FP8_BLOCK_SCALING_FP32_SCALES = EnvProperty("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", str, "1")
+    RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID = EnvProperty("RELAX_FP8_BF16_SENDER_PRESERVE_UE8M0_GRID", str, "0")
 
 
 def iter_env_properties() -> Iterator[Tuple[str, EnvProperty]]:
@@ -407,8 +428,7 @@ def validate_env(extra_env: Optional[Mapping[str, str]] = None) -> None:
 
     1. A *declared* variable whose value cannot be parsed raises. Resolution is
        lazy, so a bad value would otherwise surface at an arbitrary later point
-       — inside a hot loop, or at the import of
-       ``utils/opd/opd_sglang_patch.py`` — rather than at startup. This one is
+       — inside a hot loop or a worker import — rather than at startup. This one is
        fatal because the run will genuinely misbehave: ``RELAX_TGD_PROFILE=ture``
        is not profiling anything.
     2. A variable under :data:`OWNED_ENV_PREFIXES` that no :class:`EnvProperty`

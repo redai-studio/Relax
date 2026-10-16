@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for DCS weight conversion logic in DeviceDirectBackend.
+"""Tests for DCS weight conversion through BridgeConverter.
 
 All tests call **real** project functions or construct **real** Bridge mapping
 objects — no hand-written logic duplication.
@@ -10,10 +10,10 @@ Covers:
 - ``strip_param_name_prefix``, ``remove_padding``, ``quantize_params``
 """
 
-import re
 from argparse import Namespace
 from contextlib import contextmanager
-from typing import Dict, List, Tuple
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,7 +21,7 @@ import torch
 
 # Skip the whole module when Megatron (or its Bridge) isn't installed — e.g. on
 # the CPU-only CI runner. All tests here exercise real Bridge mapping objects
-# and the DeviceDirectBackend, which imports ``megatron.core`` at module level.
+# and BridgeConverter, which imports ``megatron.core`` at module level.
 pytest.importorskip("megatron.core")
 pytest.importorskip("megatron.bridge")
 pytest.importorskip("megatron.bridge.models.conversion.param_mapping")
@@ -52,6 +52,7 @@ Qwen35ExpertMLPGateUpProjMapping = ExpertMLPGateUpProjMapping
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix  # noqa: E402
 from relax.backends.megatron.weight_conversion.processors import quantize_params, remove_padding  # noqa: E402
+from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter  # noqa: E402
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -158,43 +159,25 @@ def _make_qwen35_expert_down_mapping(layer_idx: int, expert_id: int) -> Qwen35Ex
     return m
 
 
-def _apply_expert_postprocessing(
-    converted_dict: Dict[str, torch.Tensor],
+def _convert_mapping_output(
+    converted_dict: dict[str, torch.Tensor],
     megatron_param_name: str,
     bridge_expert_transposes_down: bool = True,
-) -> List[Tuple[str, torch.Tensor]]:
-    """Apply the same expert weight post-processing as
-    ``_convert_to_hf_bridge``.
+) -> list[tuple[str, torch.Tensor]]:
+    """Run actual conversion with a supplied Bridge mapping result.
 
-    Mirrors the production logic in device_direct.py.
+    Only the mapping call is replaced; expert splitting, transposes, name
+    resolution and unquantized output all execute production code.
     """
-    converted_named_tensors = list(converted_dict.items())
-    expert_id_match = re.search(r"weight(\d+)", megatron_param_name)
-    if expert_id_match is not None:
-        expert_id = expert_id_match.group(1)
-        postprocessed: list[tuple[str, torch.Tensor]] = []
-        for hf_name, tensor in converted_named_tensors:
-            if hf_name.endswith(".experts.gate_up_proj"):
-                base = hf_name[: -len(".gate_up_proj")]
-                if tensor.ndim == 3:
-                    gate_tensor = tensor[0].transpose(-1, -2).contiguous()
-                    up_tensor = tensor[1].transpose(-1, -2).contiguous()
-                else:
-                    gate_tensor, up_tensor = tensor.chunk(2, dim=0)
-                postprocessed.append((f"{base}.{expert_id}.gate_proj.weight", gate_tensor))
-                postprocessed.append((f"{base}.{expert_id}.up_proj.weight", up_tensor))
-            elif hf_name.endswith(".experts.down_proj"):
-                base = hf_name[: -len(".down_proj")]
-                if tensor.ndim == 2 and not bridge_expert_transposes_down:
-                    postprocessed.append((f"{base}.{expert_id}.down_proj.weight", tensor))
-                else:
-                    postprocessed.append(
-                        (f"{base}.{expert_id}.down_proj.weight", tensor.transpose(-1, -2).contiguous())
-                    )
-            else:
-                postprocessed.append((hf_name, tensor))
-        converted_named_tensors = postprocessed
-    return converted_named_tensors
+    converter = BridgeConverter(_make_args(), model=[], quantization_config=None)
+    mapping = SimpleNamespace(megatron_to_hf=Mock(return_value=converted_dict))
+    converter._bridge_task_map = {
+        megatron_param_name: SimpleNamespace(mapping=mapping, megatron_module=None),
+    }
+    converter._bridge_expert_transposes_down = bridge_expert_transposes_down
+    result = converter.convert(megatron_param_name, torch.empty(0))
+    mapping.megatron_to_hf.assert_called_once()
+    return result
 
 
 # ─── Tests for real Bridge mapping megatron_to_hf output ──────────────────────
@@ -305,7 +288,7 @@ class TestBridgePostProcessingCorrectness:
             mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=expert_id)
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
-        postprocessed = _apply_expert_postprocessing(
+        postprocessed = _convert_mapping_output(
             bridge_output, f"decoder.layers.0.mlp.experts.linear_fc1.weight{expert_id}"
         )
 
@@ -339,7 +322,7 @@ class TestBridgePostProcessingCorrectness:
             mapping = _make_expert_down_mapping(layer_idx=0, expert_id=expert_id)
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
-        postprocessed = _apply_expert_postprocessing(
+        postprocessed = _convert_mapping_output(
             bridge_output, f"decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
         )
 
@@ -370,7 +353,7 @@ class TestBridgePostProcessingCorrectness:
                 with _patch_gather_from_ep_ranks():
                     mapping_fc1 = _make_expert_gate_up_mapping(layer_idx, expert_id)
                     bridge_fc1 = mapping_fc1.megatron_to_hf(megatron_fc1, None)
-                post_fc1 = _apply_expert_postprocessing(
+                post_fc1 = _convert_mapping_output(
                     bridge_fc1, f"decoder.layers.{layer_idx}.mlp.experts.linear_fc1.weight{expert_id}"
                 )
                 assert (
@@ -387,7 +370,7 @@ class TestBridgePostProcessingCorrectness:
                 with _patch_gather_from_ep_ranks():
                     mapping_fc2 = _make_expert_down_mapping(layer_idx, expert_id)
                     bridge_fc2 = mapping_fc2.megatron_to_hf(megatron_fc2, None)
-                post_fc2 = _apply_expert_postprocessing(
+                post_fc2 = _convert_mapping_output(
                     bridge_fc2, f"decoder.layers.{layer_idx}.mlp.experts.linear_fc2.weight{expert_id}"
                 )
                 assert (
@@ -407,7 +390,7 @@ class TestBridgePostProcessingCorrectness:
         bridge_output = m.megatron_to_hf(w, None)
 
         # No expert_id in name → post-processing is a no-op
-        postprocessed = _apply_expert_postprocessing(
+        postprocessed = _convert_mapping_output(
             bridge_output, "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight"
         )
         assert len(postprocessed) == 1
@@ -426,7 +409,7 @@ class TestBridgePostProcessingCorrectness:
         fused = torch.randn(H * 2, D)
         bridge_output = m.megatron_to_hf(fused, None)
 
-        postprocessed = _apply_expert_postprocessing(bridge_output, "decoder.layers.0.mlp.linear_fc1.weight")
+        postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.linear_fc1.weight")
         assert len(postprocessed) == 2
         gate_expected, up_expected = fused.chunk(2, dim=0)
         assert postprocessed[0][0] == "model.layers.0.mlp.gate_proj.weight"
@@ -514,7 +497,7 @@ class TestExpertWeightEdgeCases:
             mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
             bridge_output = mapping.megatron_to_hf(param, None)
 
-        postprocessed = _apply_expert_postprocessing(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
+        postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
         assert postprocessed[0][0].endswith(".experts.0.gate_proj.weight")
         assert postprocessed[1][0].endswith(".experts.0.up_proj.weight")
 
@@ -531,9 +514,7 @@ class TestExpertWeightEdgeCases:
             mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=127)
             bridge_output = mapping.megatron_to_hf(param, None)
 
-        postprocessed = _apply_expert_postprocessing(
-            bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight127"
-        )
+        postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight127")
         assert postprocessed[0][0].endswith(".experts.127.gate_proj.weight")
 
     def test_contiguous_after_postprocessing(self):
@@ -545,7 +526,7 @@ class TestExpertWeightEdgeCases:
             mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
             bridge_output = mapping.megatron_to_hf(torch.randn(H * 2, D), None)
 
-        postprocessed = _apply_expert_postprocessing(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
+        postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
         for _, tensor in postprocessed:
             assert tensor.is_contiguous()
 
@@ -560,9 +541,7 @@ class TestExpertWeightEdgeCases:
                 mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
                 bridge_output = mapping.megatron_to_hf(param, None)
 
-            postprocessed = _apply_expert_postprocessing(
-                bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0"
-            )
+            postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
             for _, tensor in postprocessed:
                 assert tensor.dtype == dtype
 
@@ -577,7 +556,7 @@ class TestExpertWeightEdgeCases:
             mapping = _make_expert_gate_up_mapping(layer_idx=0, expert_id=0)
             bridge_output = mapping.megatron_to_hf(param, None)
 
-        postprocessed = _apply_expert_postprocessing(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
+        postprocessed = _convert_mapping_output(bridge_output, "decoder.layers.0.mlp.experts.linear_fc1.weight0")
         total_numel = sum(t.numel() for _, t in postprocessed)
         assert total_numel == original_numel
 
@@ -644,7 +623,7 @@ class TestQwen35PostProcessingCorrectness:
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
         megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc1.weight{expert_id}"
-        postprocessed = _apply_expert_postprocessing(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+        postprocessed = _convert_mapping_output(bridge_output, megatron_name, bridge_expert_transposes_down=False)
 
         assert len(postprocessed) == 2
         assert postprocessed[0][0].endswith(f".experts.{expert_id}.gate_proj.weight")
@@ -665,7 +644,7 @@ class TestQwen35PostProcessingCorrectness:
             bridge_output = mapping.megatron_to_hf(megatron_param, None)
 
         megatron_name = f"language_model.decoder.layers.0.mlp.experts.linear_fc2.weight{expert_id}"
-        postprocessed = _apply_expert_postprocessing(bridge_output, megatron_name, bridge_expert_transposes_down=False)
+        postprocessed = _convert_mapping_output(bridge_output, megatron_name, bridge_expert_transposes_down=False)
 
         assert len(postprocessed) == 1
         assert postprocessed[0][0].endswith(f".experts.{expert_id}.down_proj.weight")

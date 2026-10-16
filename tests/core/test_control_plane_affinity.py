@@ -36,6 +36,47 @@ class _FakeActorClass:
         return MagicMock()
 
 
+@pytest.mark.parametrize(
+    ("autoscaler_enabled", "expected_resource"),
+    [(True, "stable_cpu"), (False, None)],
+)
+def test_transfer_queue_required_node_resource(
+    monkeypatch,
+    tmp_path,
+    autoscaler_enabled,
+    expected_resource,
+):
+    from relax.core import controller as controller_module
+
+    config = _elastic_args(
+        tmp_path,
+        fully_async=False,
+        use_dynamic_batch_size=False,
+        balance_data=False,
+        polling_mode=False,
+        num_data_storage_units=2,
+    )
+    if not autoscaler_enabled:
+        config.autoscaler_config = None
+    captured = {}
+    monkeypatch.setattr(controller_module, "resolve_sft_algo_key", lambda _: "dapo")
+    monkeypatch.setattr(controller_module, "compute_dp_size", lambda _: 1)
+    monkeypatch.setattr(controller_module, "IdentityWindowSampler", lambda **_: object())
+
+    def init_transfer_queue(conf):
+        captured["conf"] = conf
+        return conf
+
+    monkeypatch.setattr(controller_module.tq, "init", init_transfer_queue)
+    controller = object.__new__(controller_module.Controller)
+    controller.config = config
+
+    controller._initialize_data_system()
+
+    assert captured["conf"].controller.required_node_resource == expected_resource
+    assert captured["conf"].backend.SimpleStorage.required_node_resource == expected_resource
+
+
 def test_health_status_requests_stable_cpu(monkeypatch, tmp_path):
     fake = type("FakeHealthStatus", (_FakeActorClass,), {})
     monkeypatch.setattr(health_system, "HealthStatus", fake)
@@ -87,7 +128,8 @@ def test_rollout_data_source_requests_stable_cpu(monkeypatch, tmp_path):
     assert captured["config"] is args
 
 
-def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path):
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkeypatch, tmp_path, loss_type):
     captured = {}
     node_id = "a" * 56
     rollout_module = ModuleType("relax.distributed.ray.rollout")
@@ -108,7 +150,7 @@ def test_rollout_manager_keeps_node_affinity_and_requests_matching_marker(monkey
     )
     args = _elastic_args(
         tmp_path,
-        loss_type="sft",
+        loss_type=loss_type,
         num_rollout_per_epoch=1,
         check_weight_update_equal=False,
         offload_rollout=False,

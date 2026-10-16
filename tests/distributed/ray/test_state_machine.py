@@ -1,29 +1,20 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Tests for ScaleOutRequest / ScaleInRequest state machines, status enums, and
-configuration dataclasses."""
+"""CPU tests for scale request states and their serialized API responses."""
 
-import time
+import pickle
+from types import SimpleNamespace
 
 import pytest
 
-
-try:
-    from relax.distributed.ray.rollout import (
-        EngineGroupConfig,
-        ModelConfig,
-        ScaleInRequest,
-        ScaleInStatus,
-        ScaleOutMode,
-        ScaleOutRequest,
-        ScaleOutStatus,
-    )
-
-    HAS_DEPS = True
-except ImportError:
-    HAS_DEPS = False
-
-pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
+from relax.distributed.ray import rollout_scale_types
+from relax.distributed.ray.rollout_scale_types import (
+    ScaleInRequest,
+    ScaleInStatus,
+    ScaleOutMode,
+    ScaleOutRequest,
+    ScaleOutStatus,
+)
 
 
 # ============================== ScaleOutStatus ==============================
@@ -92,10 +83,11 @@ class TestScaleOutRequest:
         assert req.engine_ids == []
         assert req.failed_engines == []
 
-    def test_update_status_changes_timestamp(self):
+    def test_update_status_changes_timestamp(self, monkeypatch):
+        monkeypatch.setattr(rollout_scale_types, "time", SimpleNamespace(time=lambda: 10.0))
         req = ScaleOutRequest(request_id="x", status=ScaleOutStatus.PENDING)
         old_ts = req.updated_at
-        time.sleep(0.01)
+        monkeypatch.setattr(rollout_scale_types, "time", SimpleNamespace(time=lambda: 20.0))
         req.update_status(ScaleOutStatus.CREATING)
         assert req.status == ScaleOutStatus.CREATING
         assert req.updated_at > old_ts
@@ -278,110 +270,55 @@ class TestScaleInRequest:
         assert req.failed_engines == []
 
 
-# ========================== EngineGroupConfig ===============================
+@pytest.mark.parametrize(
+    "request_cls, status",
+    [(ScaleOutRequest, ScaleOutStatus.PENDING), (ScaleInRequest, ScaleInStatus.PENDING)],
+)
+def test_scale_request_serialization_roundtrip_preserves_fields(request_cls, status):
+    request = request_cls(
+        request_id="roundtrip",
+        status=status,
+        created_at=10.0,
+        updated_at=12.0,
+        timeout_secs=17.0,
+        engine_urls=["http://engine.test:8000"],
+        error_message="earlier failure",
+    )
+    restored = pickle.loads(pickle.dumps(request))
+    assert type(restored) is request_cls
+    assert restored == request
+    assert restored.to_dict() == request.to_dict()
+    assert restored.timeout_secs == 17.0
 
 
-class TestEngineGroupConfig:
-    @pytest.mark.parametrize("wt", ["regular", "prefill", "decode", "placeholder"])
-    def test_valid_worker_types(self, wt):
-        cfg = EngineGroupConfig(worker_type=wt, num_gpus=4)
-        assert cfg.worker_type == wt
-
-    def test_invalid_worker_type(self):
-        with pytest.raises(AssertionError, match="Invalid worker_type"):
-            EngineGroupConfig(worker_type="bad", num_gpus=4)
-
-    def test_zero_gpus(self):
-        with pytest.raises(AssertionError, match="num_gpus must be > 0"):
-            EngineGroupConfig(worker_type="regular", num_gpus=0)
-
-    def test_negative_gpus(self):
-        with pytest.raises(AssertionError, match="num_gpus must be > 0"):
-            EngineGroupConfig(worker_type="regular", num_gpus=-1)
-
-    def test_optional_fields_defaults(self):
-        cfg = EngineGroupConfig(worker_type="regular", num_gpus=4)
-        assert cfg.num_gpus_per_engine is None
-        assert cfg.overrides == {}
-
-    def test_optional_fields_set(self):
-        cfg = EngineGroupConfig(
-            worker_type="regular",
-            num_gpus=4,
-            num_gpus_per_engine=2,
-            overrides={"model_path": "/m"},
-        )
-        assert cfg.num_gpus_per_engine == 2
-        assert cfg.overrides == {"model_path": "/m"}
+@pytest.mark.parametrize(
+    "request_cls, status",
+    [(ScaleOutRequest, ScaleOutStatus.PENDING), (ScaleInRequest, ScaleInStatus.PENDING)],
+)
+def test_scale_request_mutable_defaults_are_not_shared(request_cls, status):
+    first = request_cls(request_id="first", status=status)
+    second = request_cls(request_id="second", status=status)
+    first.engine_urls.append("http://engine.test:8000")
+    first.failed_engines.append("failed")
+    assert second.engine_urls == []
+    assert second.failed_engines == []
 
 
-# ============================= ModelConfig ==================================
-
-
-class TestModelConfig:
-    def test_resolve_defaults(self):
-        args = type(
-            "Args",
-            (),
-            {
-                "rollout_num_gpus_per_engine": 4,
-                "hf_checkpoint": "/default/model",
-                "sglang_hf_checkpoint": None,
-            },
-        )()
-        cfg = ModelConfig(
-            name="actor",
-            engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=8),
-            ],
-        )
-        cfg.resolve(args)
-        assert cfg.engine_groups[0].num_gpus_per_engine == 4
-        assert cfg.engine_groups[0].overrides["model_path"] == "/default/model"
-
-    def test_resolve_per_group_override(self):
-        args = type(
-            "Args",
-            (),
-            {
-                "rollout_num_gpus_per_engine": 4,
-                "hf_checkpoint": "/default/model",
-                "sglang_hf_checkpoint": None,
-            },
-        )()
-        cfg = ModelConfig(
-            name="actor",
-            num_gpus_per_engine=2,
-            engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=4, num_gpus_per_engine=8),
-            ],
-        )
-        cfg.resolve(args)
-        # Per-group override takes precedence
-        assert cfg.engine_groups[0].num_gpus_per_engine == 8
-
-    def test_has_pd_disaggregation(self):
-        cfg_no = ModelConfig(
-            name="m",
-            engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=4)],
-        )
-        assert cfg_no.has_pd_disaggregation is False
-
-        cfg_yes = ModelConfig(
-            name="m",
-            engine_groups=[
-                EngineGroupConfig(worker_type="prefill", num_gpus=4),
-                EngineGroupConfig(worker_type="decode", num_gpus=4),
-            ],
-        )
-        assert cfg_yes.has_pd_disaggregation is True
-
-    def test_total_num_gpus(self):
-        cfg = ModelConfig(
-            name="m",
-            engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=4),
-                EngineGroupConfig(worker_type="regular", num_gpus=8),
-            ],
-        )
-        assert cfg.total_num_gpus == 12
+@pytest.mark.parametrize("empty_error", [None, ""])
+@pytest.mark.parametrize(
+    "request_cls, initial, updated",
+    [
+        (ScaleOutRequest, ScaleOutStatus.FAILED, ScaleOutStatus.CREATING),
+        (ScaleInRequest, ScaleInStatus.FAILED, ScaleInStatus.DRAINING),
+    ],
+)
+def test_scale_request_updates_preserve_existing_error_and_timestamp_contract(
+    monkeypatch, request_cls, initial, updated, empty_error
+):
+    request = request_cls(request_id="request", status=initial, created_at=10.0, error_message="original")
+    monkeypatch.setattr(rollout_scale_types, "time", SimpleNamespace(time=lambda: 30.0))
+    request.update_status(updated, empty_error)
+    assert request.status is updated
+    assert request.created_at == 10.0
+    assert request.updated_at == 30.0
+    assert request.error_message == "original"

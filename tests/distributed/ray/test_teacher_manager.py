@@ -18,8 +18,9 @@ def _install_teacher_manager_stubs(monkeypatch):
     sglang_engine = ModuleType("relax.backends.sglang.sglang_engine")
     sglang_engine.SGLangEngine = object
 
-    service = ModuleType("relax.core.service")
-    service.create_placement_group = MagicMock()
+    # Import the real factory before installing the optional engine stubs.
+    placement = importlib.import_module("relax.distributed.ray.placement_group")
+    monkeypatch.setattr(placement, "create_placement_group", MagicMock())
 
     rollout = ModuleType("relax.distributed.ray.rollout")
     rollout._allocate_rollout_engine_addr_and_ports_normal = MagicMock()
@@ -31,7 +32,6 @@ def _install_teacher_manager_stubs(monkeypatch):
     http_utils.find_available_port = MagicMock(return_value=15000)
 
     monkeypatch.setitem(sys.modules, "relax.backends.sglang.sglang_engine", sglang_engine)
-    monkeypatch.setitem(sys.modules, "relax.core.service", service)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.rollout", rollout)
     monkeypatch.setitem(sys.modules, "relax.distributed.ray.utils", ray_utils)
     monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
@@ -91,14 +91,12 @@ def test_teacher_gpu_index_uses_teacher_relative_bundle_offset(monkeypatch):
 
 def test_teacher_env_matches_rollout_genrm_stability_envs(monkeypatch):
     teacher_manager = _import_teacher_manager(monkeypatch)
-    # RELAX_OPD_PREEXPANDED_PATCH is passed through from the driver env (default
-    # "0"); set it so the test verifies the pass-through, not the default value.
-    monkeypatch.setenv("RELAX_OPD_PREEXPANDED_PATCH", "1")
+    monkeypatch.setenv("SGLANG_MM_AVOID_RETOKENIZE", "false")
     args = SimpleNamespace(fp16=True)
 
     env = teacher_manager._build_teacher_engine_env(args)
 
-    assert env["RELAX_OPD_PREEXPANDED_PATCH"] == "1"
+    assert env["SGLANG_MM_AVOID_RETOKENIZE"] == "true"
     assert env["SGLANG_JIT_DEEPGEMM_PRECOMPILE"] == "false"
     assert env["SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"
     assert env["SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK"] == "true"
@@ -146,3 +144,31 @@ def test_dedicated_teacher_recovery_requires_global_restart(monkeypatch):
 
     with pytest.raises(RuntimeError, match="global restart"):
         manager.recover()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("affinity", [False, True])
+def test_teacher_placement_uses_distributed_factory_and_preserves_ownership(monkeypatch, shared, affinity):
+    teacher_manager = _import_teacher_manager(monkeypatch)
+    placement = importlib.import_module("relax.distributed.ray.placement_group")
+    assert teacher_manager.create_placement_group is placement.create_placement_group
+    manager_cls = teacher_manager.TeacherManager.__ray_metadata__.modified_class
+    manager = object.__new__(manager_cls)
+    manager.args = SimpleNamespace(enable_affinity=affinity, rollout_num_gpus=4)
+    manager.gpus_per_replica = 2
+    manager._shared_pg = shared
+    manager._bundle_offset = 2
+    manager._shared_pg_tuple = ("shared", [0, 1], [0, 1])
+    placement.create_placement_group.return_value = ("dedicated", [0, 1], [0, 1])
+
+    pg, owned, gpu_index = manager._resolve_placement(1)
+
+    assert owned is (not shared)
+    if shared:
+        assert pg is manager._shared_pg_tuple
+        assert gpu_index == 8
+        placement.create_placement_group.assert_not_called()
+    else:
+        assert pg is placement.create_placement_group.return_value
+        assert gpu_index == 0
+        placement.create_placement_group.assert_called_once_with(num_gpus=2, node_group_affinity=affinity)

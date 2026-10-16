@@ -103,7 +103,7 @@ We provide conversion scripts for OpenR1 and AVQA datasets in `scripts/tools/`:
 ```bash
 python scripts/tools/process_openr1.py \
   --input-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001.parquet \
-  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001-test.parquet
+  --output-dir /root/multimodal-open-r1-8k-verified/data/train-00000-of-00001_converted_noextract.parquet
 
 # --md-dir points to the directory containing image and audio files,
 # used to join relative paths into absolute paths.

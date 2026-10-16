@@ -34,7 +34,9 @@ export default function sourceLinks(md: MarkdownRenderer, options: SourceLinksOp
     try {
       const targetStats = statSync(targetPath, { throwIfNoEntry: false })
       if (!targetStats) {
-        console.warn(`[source-links] ${documentPath}: "${href}" points to missing target ${targetPath}`)
+        console.warn(
+          `[source-links] ${documentPath}: "${href}" points to missing target ${targetPath}`
+        )
         return href
       }
 

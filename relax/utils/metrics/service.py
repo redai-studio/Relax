@@ -1,13 +1,17 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import asyncio
 import os
 import threading
 from argparse import Namespace
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from typing import Any, Dict, List, Optional, Union
 
 import wandb
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 from ray import serve
 
@@ -17,12 +21,22 @@ from relax.utils.metrics.adapters.apprise import _AppriseAdapter
 from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
 from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
 from relax.utils.metrics.adapters.wandb import _is_offline_mode
+from relax.utils.metrics.sglang_exporter import SGLangMetricsExporter
 from relax.utils.metrics.timeline_trace import TimelineTraceAdapter
 
 
 logger = get_logger(__name__)
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def normalize_metrics_root(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    # Serve mounts this app at /metrics. Normalize the bare prefix without a
+    # redirect; an empty FastAPI route cannot be wrapped by serve.ingress.
+    if request.scope["path"] == request.scope.get("root_path", ""):
+        request.scope["path"] += "/"
+    return await call_next(request)
 
 
 # Special key to mark timeline events in metrics
@@ -111,6 +125,8 @@ class MetricsService:
         self.role = role
 
         self.metrics_buffer = MetricsBuffer()
+        self._rollout_handle_task: asyncio.Task[Any] | None = None
+        self._sglang_exporter = SGLangMetricsExporter(self._discover_sglang_engines)
         self._adapters = {}
 
         if getattr(config, "use_tensorboard", False):
@@ -323,6 +339,28 @@ class MetricsService:
         except Exception as e:
             logger.error(f"Failed to report step {request.step}: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def _discover_sglang_engines(self) -> Dict[str, Any]:
+        # MetricsService starts before Rollout. Resolve lazily and retry on
+        # later scrapes if the application is not available yet.
+        task = self._rollout_handle_task
+        if task is None or (task.done() and task.exception() is not None):
+            task = self._rollout_handle_task = asyncio.create_task(asyncio.to_thread(serve.get_app_handle, "rollout"))
+        # A scrape timeout must not spawn more threads while a lookup is stuck.
+        handle = await asyncio.shield(task)
+        response = handle.get_engines.remote()
+        try:
+            return await response
+        except asyncio.CancelledError:
+            response.cancel()
+            raise
+
+    @app.get("/")
+    async def prometheus_metrics(self) -> Response:
+        """Expose SGLang metrics and scrape status in Prometheus text
+        format."""
+        body = await self._sglang_exporter.scrape()
+        return Response(content=body, headers={"Content-Type": CONTENT_TYPE_LATEST})
 
     @app.get("/health")
     async def health(self) -> Dict[str, Any]:

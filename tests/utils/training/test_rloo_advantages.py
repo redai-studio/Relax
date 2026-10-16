@@ -148,24 +148,19 @@ def test_post_process_rewards_rloo_groups_by_group_index(monkeypatch):
     for gi in (0, 1, 0, 1, 0, 1, 0, 1):
         samples.append(_make_sample(reward=float(gi), group_index=gi))
     args = _fake_args(n_samples_per_prompt=4)
-    raw, normalized = post_process_rewards(args, samples)
-    # Group 0: all rewards 0.0 → all advantages 0
-    # Group 1: all rewards 1.0 → all advantages 0
-    assert all(r == 0.0 for r in raw[0::2])  # group 0 raw
-    assert all(r == 1.0 for r in raw[1::2])  # group 1 raw
+    normalized = post_process_rewards(args, samples)
     # Constant groups → zero advantage
     assert all(n == 0.0 for n in normalized)
 
 
-def test_post_process_rewards_rloo_raw_rewards_unchanged(monkeypatch):
+def test_post_process_rewards_rloo_leave_one_out_values(monkeypatch):
     _install_fake_megatron(monkeypatch)
     from relax.utils.utils import post_process_rewards
 
     raw_rewards = [0.0, 1.0, 0.0, 1.0]
     samples = [_make_sample(reward=r, group_index=0) for r in raw_rewards]
     args = _fake_args(n_samples_per_prompt=4)
-    raw, normalized = post_process_rewards(args, samples)
-    assert raw == raw_rewards
+    normalized = post_process_rewards(args, samples)
     # RLOO: (4/3)*(r - 0.5)
     expected = [(4 / 3) * (r - 0.5) for r in raw_rewards]
     for got, exp in zip(normalized, expected, strict=True):
@@ -212,7 +207,7 @@ def test_post_process_rewards_grpo_unchanged_by_rloo_addition(monkeypatch):
     raw_rewards = [0.0, 1.0, 0.0, 1.0]
     samples = [_make_sample(reward=r, group_index=0) for r in raw_rewards]
     grpo_args = _fake_args(advantage_estimator="grpo", n_samples_per_prompt=4)
-    _, grpo_norm = post_process_rewards(grpo_args, samples)
+    grpo_norm = post_process_rewards(grpo_args, samples)
     # GRPO with std normalization: (r - mean) / (std + 1e-6)
     import numpy as np
 

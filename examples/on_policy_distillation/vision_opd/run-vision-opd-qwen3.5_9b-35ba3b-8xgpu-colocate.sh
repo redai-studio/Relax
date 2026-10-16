@@ -11,7 +11,7 @@ set -ex
 set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
-export RELAX_OPD_PREEXPANDED_PATCH=1
+export SGLANG_MM_AVOID_RETOKENIZE=true
 # export RELAX_OPD_PER_POS_TOKEN_IDS=1
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")

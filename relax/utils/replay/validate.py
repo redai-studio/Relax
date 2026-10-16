@@ -56,7 +56,7 @@ def validate_bundle(path: str | Path) -> ValidationResult:
 
 
 def _validate_unknown_fields(path: Path, result: ValidationResult) -> None:
-    """Warn on metadata fields the V1 reader does not understand.
+    """Warn on metadata fields the V2 reader does not understand.
 
     A bundle may carry fields introduced by a newer-but-same-major schema; the
     reader must not silently drop them, so they surface as warnings.
@@ -68,7 +68,7 @@ def _validate_unknown_fields(path: Path, result: ValidationResult) -> None:
             continue  # the reader's own load() will produce the authoritative error
         unknown = sorted(set(data) - set(allowed))
         if unknown:
-            result.add_warning(f"{filename} has unknown field(s) {unknown}; the V1 reader will ignore them")
+            result.add_warning(f"{filename} has unknown field(s) {unknown}; the V2 reader will ignore them")
 
 
 def _validate_producer(bundle: LoadedBundle, result: ValidationResult) -> None:
@@ -104,10 +104,10 @@ def _validate_capabilities(bundle: LoadedBundle, result: ValidationResult) -> No
         if contract.capability == StageCapability.UNSUPPORTED:
             result.add_warning(f"stage {stage.value!r} is unsupported in this bundle")
     if config.advantage_estimator != "grpo":
-        result.add_error(f"unsupported advantage_estimator {config.advantage_estimator!r} (V1 supports GRPO only)")
+        result.add_error(f"unsupported advantage_estimator {config.advantage_estimator!r} (V2 supports GRPO only)")
     context_parallel = bundle.index.identity.rank.get("cp", 1)
     if context_parallel != 1:
-        result.add_error(f"unsupported context parallel cp={context_parallel} (V1 supports CP=1 only)")
+        result.add_error(f"unsupported context parallel cp={context_parallel} (V2 supports CP=1 only)")
 
 
 def _validate_numerics(bundle: LoadedBundle, result: ValidationResult) -> None:

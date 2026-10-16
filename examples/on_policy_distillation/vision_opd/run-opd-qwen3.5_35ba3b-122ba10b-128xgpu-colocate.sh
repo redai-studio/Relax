@@ -4,7 +4,7 @@ set -ex
 set -o pipefail
 
 export NCCL_NVLS_ENABLE=0
-export RELAX_OPD_PREEXPANDED_PATCH=1
+export SGLANG_MM_AVOID_RETOKENIZE=true
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 

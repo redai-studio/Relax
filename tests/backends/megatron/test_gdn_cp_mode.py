@@ -14,6 +14,7 @@ import ast
 import inspect
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -101,9 +102,17 @@ def test_validate_linear_cp_mode_rejects_chunkwise_with_allgather_cp():
 
 
 @pytest.mark.parametrize("cp_kwargs", [{"context_parallel_size": 2}, {"dynamic_context_parallel": True}])
-def test_validate_linear_cp_mode_rejects_chunkwise_deterministic_when_cp_may_exceed_one(cp_kwargs):
+@pytest.mark.parametrize("variant", ["gated_delta_net", "gdn"])
+def test_validate_linear_cp_mode_rejects_chunkwise_deterministic_when_cp_may_exceed_one(cp_kwargs, variant):
     with pytest.raises(ValueError, match="deterministic"):
-        _validate_linear_cp_mode(_args(linear_cp_mode="chunkwise", deterministic_mode=True, **cp_kwargs))
+        _validate_linear_cp_mode(
+            _args(
+                experimental_attention_variant=variant,
+                linear_cp_mode="chunkwise",
+                deterministic_mode=True,
+                **cp_kwargs,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +164,7 @@ def _isolate_gdn_forward_patch():
     GatedDeltaNet._dcp_patched = orig_patched_flag
 
 
-def _install_dispatcher_with_spies():
+def _install_dispatcher_with_spies(*, native=False):
     """Install the dispatcher over a spy for the original MCore forward."""
     calls = {"orig": 0}
 
@@ -163,9 +172,12 @@ def _install_dispatcher_with_spies():
         calls["orig"] += 1
         return "orig", hidden_states
 
-    GatedDeltaNet.forward = spy_orig
-    GatedDeltaNet._dcp_patched = False
-    gdn_model._patch_gdn_for_dynamic_cp()
+    legacy_gdn = type("LegacyGatedDeltaNet", (), {"forward": spy_orig})
+    if native:
+        legacy_gdn._prepare_input_for_gated_delta_rule = lambda self: None
+    with patch("megatron.core.ssm.gated_delta_net.GatedDeltaNet", legacy_gdn):
+        gdn_model._patch_gdn_for_dynamic_cp("all_gather" if native else None)
+    GatedDeltaNet.forward = legacy_gdn.forward
     return calls
 
 
@@ -194,6 +206,77 @@ def test_dispatcher_all_gather_cp_gt_1_goes_to_relax_fallback():
     with pytest.raises(AssertionError, match=r"packed \(thd\) sequences"):
         GatedDeltaNet.forward(m, "hs", None, None, psp)
     assert calls == {"orig": 0}
+
+
+@pytest.mark.parametrize("sp_size", [1, 2])
+def test_native_all_gather_uses_full_sequence_prep_and_preserves_gradients(monkeypatch, sp_size):
+    """The native prep must see gathered tokens and TP-local, unsharded
+    heads."""
+    native_gdn = type(
+        "NativeGatedDeltaNet",
+        (),
+        {
+            "forward": lambda *args, **kwargs: pytest.fail("native CP forward bypassed the fallback"),
+            "_prepare_input_for_gated_delta_rule": lambda *args: None,
+        },
+    )
+    with patch("megatron.core.ssm.gated_delta_net.GatedDeltaNet", native_gdn):
+        gdn_model._patch_gdn_for_dynamic_cp("all_gather")
+    module = _fake_gdn_module(linear_cp_mode="all_gather", static_cp_size=2)
+    module.sp_size = sp_size
+    hidden = torch.arange(6.0).reshape(6, 1, 1).requires_grad_(True)
+    cu = torch.tensor([0, 8 * sp_size, 12 * sp_size], dtype=torch.int32)
+    packed = _fake_packed_seq_params(cp_group=_FakeGroup(2), local_cp_size=2)
+    module._resolve_thd_cu_seqlens = lambda params, length, size: (cu, cu)
+    module.in_proj = lambda value: (value.repeat(sp_size, 1, 1), None)
+    monkeypatch.setattr(gdn_model, "_gdn_cp_gather_full", lambda value, *args: value.repeat(2, 1, 1), raising=False)
+    monkeypatch.setattr(gdn_model, "_assert_gdn_full_recompute", lambda: None)
+
+    def prepare(value, batch, seq_len, **kwargs):
+        assert value.shape == (12 * sp_size, 1, 1)
+        assert (batch, seq_len) == (1, 12 * sp_size)
+        assert kwargs == {
+            "cp_size_headwise": 1,
+            "cp_group_headwise": None,
+            "cu_seqlens_q": cu,
+            "chunkwise_cp_context": None,
+            "packed_seq_params": packed,
+        }
+        value = value.transpose(0, 1).unsqueeze(-1)
+        return value, value, value, torch.ones_like(value), value, value
+
+    module.pre_gated_delta_rule = prepare
+    module.gated_delta_rule = lambda q, k, value, **kwargs: (value * 3, None)
+    module._apply_gated_norm = lambda value, gate: value * gate
+    module.out_proj = lambda value: (value, None)
+    before = (module.cp_size, module.pg_collection.cp, module.config.linear_cp_mode)
+    out, bias = native_gdn.forward(module, hidden, None, packed_seq_params=packed)
+    full = hidden.repeat(2 * sp_size, 1, 1) * 3
+    indices = torch.cat(
+        [
+            torch.arange(owner * (end - start) // 4 + start, (owner + 1) * (end - start) // 4 + start)
+            for start, end in zip(cu[:-1], cu[1:])
+            for owner in (0, 3)
+        ]
+    )
+    expected = full[indices]
+    torch.testing.assert_close(out, expected)
+    assert bias is None
+    got_grad = torch.autograd.grad(out.sum(), hidden)[0]
+    expected_grad = torch.autograd.grad(expected.sum(), hidden)[0]
+    torch.testing.assert_close(got_grad, expected_grad)
+    assert before == (module.cp_size, module.pg_collection.cp, module.config.linear_cp_mode)
+
+
+@pytest.mark.parametrize("mode", ["headwise", "chunkwise"])
+def test_native_all_gather_wrapper_preserves_other_modes(mode):
+    calls = _install_dispatcher_with_spies(native=True)
+    module = _fake_gdn_module(linear_cp_mode=mode, static_cp_size=4)
+    packed = _fake_packed_seq_params(cp_group=_FakeGroup(2), local_cp_size=2)
+    out = GatedDeltaNet.forward(module, "hidden", None, packed_seq_params=packed)
+    assert calls == {"orig": 1}
+    assert out == ("orig", "hidden")
+    assert module.cp_size == 4 and module.config.linear_cp_mode == mode
 
 
 def test_dispatcher_prefers_dynamic_group_over_static_group():
@@ -248,9 +331,14 @@ def test_all_gather_fallback_rejects_deterministic_mode():
 
 
 @pytest.mark.parametrize("mode", ["headwise", "chunkwise", "all_gather"])
-def test_gdn_modes_reject_contiguous_attention_packing(mode):
+@pytest.mark.parametrize("variant", ["gated_delta_net", "gdn"])
+def test_gdn_modes_reject_contiguous_attention_packing(mode, variant):
     with pytest.raises(ValueError, match="allgather-cp"):
-        _validate_linear_cp_mode(_args(linear_cp_mode=mode, context_parallel_size=2, allgather_cp=True))
+        _validate_linear_cp_mode(
+            _args(
+                experimental_attention_variant=variant, linear_cp_mode=mode, context_parallel_size=2, allgather_cp=True
+            )
+        )
 
 
 def test_default_chunkwise_does_not_restrict_non_gdn_models():
@@ -261,11 +349,12 @@ def test_default_chunkwise_does_not_restrict_non_gdn_models():
     )
 
 
-def test_bridge_validation_uses_provider_attention_variant():
+@pytest.mark.parametrize("variant", ["gated_delta_net", "gdn"])
+def test_bridge_validation_uses_provider_attention_variant(variant):
     args = _args(experimental_attention_variant=None, allgather_cp=True, context_parallel_size=2)
     _validate_linear_cp_mode(args)
     provider = SimpleNamespace(
-        experimental_attention_variant="gated_delta_net", linear_cp_mode="chunkwise", context_parallel_size=2
+        experimental_attention_variant=variant, linear_cp_mode="chunkwise", context_parallel_size=2
     )
     with pytest.raises(ValueError, match="allgather-cp"):
         _validate_linear_cp_mode(args, provider)
@@ -366,22 +455,36 @@ def test_chunkwise_config_only_requires_heads_divisible_by_tp():
 
 
 def test_all_gather_config_uses_the_tp_only_head_rule():
-    """`--linear-cp-mode=all_gather` must be constructible on a non-divisible
-    geometry.
-
-    Relax's all-gather fallback keeps GDN weights TP-only, so declaring it
-    should relax the head check exactly as chunkwise does.
-    """
-    cfg = _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="all_gather")
+    """Explicit all_gather must construct even when heads do not divide
+    TP*CP."""
+    try:
+        cfg = _gdn_config(tensor_model_parallel_size=2, context_parallel_size=16, linear_cp_mode="all_gather")
+    except (AssertionError, ValueError) as exc:
+        if not hasattr(GatedDeltaNet, "_resolve_thd_cu_seqlens") and all(
+            name in str(exc) for name in ("linear_cp_mode", "headwise", "chunkwise")
+        ):
+            pytest.skip("installed MCore lacks all_gather support; rebuild with the current Relax Megatron patch")
+        raise
     assert cfg.linear_num_key_heads == 16 and cfg.linear_num_value_heads == 32
+
+
+def test_native_all_gather_config_does_not_enable_kda():
+    pytest.importorskip("megatron.core.ssm.gated_delta_net.common", reason="requires native GDN-family config")
+    with pytest.raises(ValueError, match="linear_cp_mode"):
+        _gdn_config(
+            experimental_attention_variant="kda",
+            linear_num_value_heads=16,
+            context_parallel_size=2,
+            linear_cp_mode="all_gather",
+        )
 
 
 def test_config_rejects_unresolved_and_unknown_linear_cp_mode():
     """MCore only accepts the three concrete execution modes."""
     for bad in ("auto", "allgather", "chunk", ""):
-        with pytest.raises(AssertionError, match="linear_cp_mode"):
+        with pytest.raises((AssertionError, ValueError), match="linear_cp_mode"):
             _gdn_config(context_parallel_size=2, linear_cp_mode=bad)
-        with pytest.raises(AssertionError, match="linear_cp_mode"):
+        with pytest.raises((AssertionError, ValueError), match="linear_cp_mode"):
             _gdn_config(context_parallel_size=4, tensor_model_parallel_size=2, linear_cp_mode=bad)
 
 

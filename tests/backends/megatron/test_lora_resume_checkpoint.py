@@ -2,6 +2,7 @@
 
 import json
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -168,19 +169,62 @@ def test_hf_checkpoint_identity_covers_pytorch_bin(tmp_path):
     assert identity["shard_stat_sha256"]
 
 
-def test_lightweight_resume_loads_hf_base_before_lora_dcp(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("tracker", "ckpt_step", "direct_path", "loss_type", "directory"),
+    [
+        ("7", None, False, "sft", "iter_0000007"),
+        ("17", 42, False, "rm", "iter_0000042"),
+        # Megatron treats ckpt_step=0 as unset; metadata must follow the same tracker.
+        ("17", 0, False, "rm", "iter_0000017"),
+        ("release", None, False, "sft", "release"),
+        (None, None, True, "sft", "iter_0000007"),
+    ],
+)
+def test_lightweight_resume_loads_hf_base_before_lora_dcp(
+    monkeypatch, tmp_path, tracker, ckpt_step, direct_path, loss_type, directory
+):
+    import megatron.core
+
     resume_path = tmp_path / "checkpoint"
-    resume_path.mkdir()
-    (resume_path / "latest_checkpointed_iteration.txt").write_text("7")
+    checkpoint_dir = resume_path / directory
+    checkpoint_dir.mkdir(parents=True)
+    if tracker is not None:
+        (resume_path / "latest_checkpointed_iteration.txt").write_text(tracker)
+    (checkpoint_dir / "common.pt").touch()
     args = SimpleNamespace(
-        load=str(resume_path), hf_checkpoint="/models/base", dist_ckpt_strictness="assume_ok_unexpected"
+        load=str(checkpoint_dir if direct_path else resume_path),
+        hf_checkpoint="/models/base",
+        dist_ckpt_strictness="assume_ok_unexpected",
+        ckpt_step=ckpt_step,
+        loss_type=loss_type,
+        hidden_size=1024,
     )
     marker = {"format_version": 1}
+    common = {
+        "args": SimpleNamespace(
+            loss_type=loss_type,
+            head_type=checkpoint.REWARD_MODEL_HEAD_TYPE if loss_type == "rm" else None,
+            checkpoint_role="actor",
+            **{checkpoint._LORA_CHECKPOINT_METADATA_ATTR: marker},
+        )
+    }
     calls = []
-
+    common_loads = []
+    tensor_metadata_loads = []
+    monkeypatch.setattr(
+        megatron.core,
+        "dist_checkpointing",
+        SimpleNamespace(
+            check_is_distributed_checkpoint=lambda path: Path(path) == checkpoint_dir,
+            load_common_state_dict=lambda path: common_loads.append(Path(path)) or common,
+            load_tensors_metadata=lambda path: (
+                tensor_metadata_loads.append(Path(path))
+                or {"model.output_layer.weight": SimpleNamespace(global_shape=(1, 1024))}
+            ),
+        ),
+    )
     monkeypatch.setattr(checkpoint, "get_args", lambda: args)
     monkeypatch.setattr(checkpoint, "_alias_renamed_transfer_queue_enum", lambda: None)
-    monkeypatch.setattr(checkpoint, "_read_lora_checkpoint_metadata", lambda _path: marker)
     monkeypatch.setattr(checkpoint, "_validate_lora_model_state_load", lambda _model: nullcontext())
     monkeypatch.setattr(
         checkpoint,
@@ -198,6 +242,9 @@ def test_lightweight_resume_loads_hf_base_before_lora_dcp(monkeypatch, tmp_path)
     assert [call[0] for call in calls] == ["validate", "hf", "dcp"]
     assert calls[-1] == ("dcp", True)
     assert args.dist_ckpt_strictness == "assume_ok_unexpected"
+    assert common_loads == [checkpoint_dir]
+    assert tensor_metadata_loads == ([checkpoint_dir] if loss_type == "rm" else [])
+    assert calls[0][3] is marker
 
 
 def test_lightweight_resume_preserves_hybrid_optimizer_step(monkeypatch):
@@ -256,6 +303,33 @@ def test_lightweight_save_syncs_hybrid_optimizer_checkpoint_step():
 
     assert optimizer.param_groups[0]["step"] == 7
     assert optimizer.cpu_optimizers[0].param_groups[0]["step"] == 7
+
+
+def test_lightweight_save_syncs_all_hybrid_steps_in_chained_optimizer() -> None:
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from megatron.core.optimizer.optimizer import ChainedOptimizer
+
+    children = []
+    for step in (7, 11):
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = object.__new__(HybridDeviceOptimizer)
+        optimizer.state = {parameter: {"step": torch.tensor(float(step))}}
+        optimizer.param_groups = [{"params": [parameter], "step": 1}]
+        optimizer.cpu_optimizers = [SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])]
+        optimizer.gpu_optimizer = SimpleNamespace(param_groups=[{"params": [parameter], "step": 1}])
+        children.append(SimpleNamespace(optimizer=optimizer))
+
+    # Use MCore's real property contract: .optimizer asserts for multiple children.
+    # Bypass initialization because this only tests traversal, not GPU optimizer setup.
+    chained = object.__new__(ChainedOptimizer)
+    chained.chained_optimizers = children
+
+    checkpoint._sync_hybrid_optimizer_checkpoint_steps(SimpleNamespace(optimizer=chained))
+
+    for child, step in zip(children, (7, 11), strict=True):
+        assert child.optimizer.param_groups[0]["step"] == step
+        assert child.optimizer.cpu_optimizers[0].param_groups[0]["step"] == step
+        assert child.optimizer.gpu_optimizer.param_groups[0]["step"] == step
 
 
 def test_lightweight_resume_restores_step_after_distributed_parameter_load(monkeypatch):

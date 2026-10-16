@@ -11,6 +11,7 @@ import torch
 
 from relax.engine.sft.dataset.streaming import ProcessedSample
 from relax.engine.sft.runtime import resolve_sft_split_indices
+from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,7 @@ def _make_args(global_batch_size=4, max_tokens_per_gpu=128, num_rollout=1):
         seed=42,
         max_staleness=0,
         sft_async_prepack=False,
+        sft_image_preprocess_on_rank=False,
         custom_dataset_class_path=None,
     )
 
@@ -123,12 +125,51 @@ def test_sft_eval_size_randomly_splits_and_restricts_the_shuffled_train_pool(mon
     fake_ds.get_batch_by_indices.assert_called_once_with(eval_indices)
 
 
-def test_sft_component_imports_without_ray():
-    from relax.components.sft import SFT  # noqa: F401
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+@pytest.mark.parametrize("oversize_strategy", [None, "truncate_right", "custom"])
+def test_preference_datasets_receive_oversize_policy(monkeypatch, loss_type, oversize_strategy):
+    from relax.components import sft as sft_module
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
+    dataset_factory = MagicMock(return_value=fake_ds)
+    custom_fn = MagicMock()
+    load_custom_fn = MagicMock(return_value=custom_fn)
+    monkeypatch.setattr(sft_module, "PreferenceStreamingDataset", dataset_factory)
+    monkeypatch.setattr(sft_module, "load_function", load_custom_fn)
+    args = _make_args()
+    args.loss_type = loss_type
+    args.preference_chosen_key = "chosen"
+    args.preference_rejected_key = "rejected"
+    args.preference_max_length = 1024
+    args.preference_max_completion_length = 512
+    if oversize_strategy is not None:
+        args.sft_oversize_strategy = oversize_strategy
+    args.sft_oversize_custom_function_path = "test.custom"
+    args.eval_prompt_data = ["heldout", "/fake/eval.jsonl"]
+    sft = sft_module.SFT.func_or_class.__new__(sft_module.SFT.func_or_class)
+    sft.config = args
+    sft.step = 0
+    sft._dataset = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+
+    sft._init_data_pipeline()
+
+    calls = dataset_factory.call_args_list
+    assert [call.kwargs["path"] for call in calls] == [args.prompt_data, ["/fake/eval.jsonl"]]
+    for call in calls:
+        assert call.kwargs["oversize_strategy"] == (oversize_strategy or "keep")
+        assert call.kwargs["oversize_custom_fn"] is (custom_fn if oversize_strategy == "custom" else None)
+        assert call.kwargs["pair_capacity"] == args.max_tokens_per_gpu
+    if oversize_strategy == "custom":
+        load_custom_fn.assert_called_once_with("test.custom")
+    else:
+        load_custom_fn.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
+@pytest.mark.parametrize("image_preprocess_on_rank", [False, True])
+async def test_sft_step_pushes_one_batch_to_tq(monkeypatch, image_preprocess_on_rank):
     from relax.components.sft import SFT
 
     _patch_pipeline_dependencies(monkeypatch)
@@ -139,6 +180,7 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client, raising=False)
 
     args = _make_args(global_batch_size=4)
+    args.sft_image_preprocess_on_rank = image_preprocess_on_rank
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -165,6 +207,10 @@ async def test_sft_step_pushes_one_batch_to_tq(monkeypatch):
     assert "loss_masks" in pushed_data
     assert "total_lengths" in pushed_data
     assert "response_lengths" in pushed_data
+    if image_preprocess_on_rank:
+        assert list(pushed_data[SFT_IMAGE_REFS_FIELD]) == [None] * 4
+    else:
+        assert SFT_IMAGE_REFS_FIELD not in pushed_data
     assert kwargs_call.get("partition_id") == "sft_0"
     assert kwargs_call.get("custom_meta") == [{"total_lengths": 8}] * 4
 
@@ -183,6 +229,7 @@ async def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
     monkeypatch.setattr("relax.components.sft.tq.get_client", lambda: fake_client)
 
     args = _make_args(global_batch_size=4)
+    args.sft_image_preprocess_on_rank = True
     args.sft_async_prepack = True
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
@@ -210,6 +257,8 @@ async def test_sft_step_pushes_sharded_batches_to_tq(monkeypatch):
     assert seen_partitions == ["sft_0_shard_0_of_2", "sft_0_shard_1_of_2"]
     seen_meta = [c.kwargs.get("custom_meta") for c in fake_client.async_put.call_args_list]
     assert seen_meta == [[{"total_lengths": 8}] * 2, [{"total_lengths": 8}] * 2]
+    for call in fake_client.async_put.call_args_list:
+        assert list(call.kwargs["data"][SFT_IMAGE_REFS_FIELD]) == [None, None]
     assert _sft_train_partitions_in_flight(seen_partitions) == 1
 
 
@@ -381,6 +430,7 @@ async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch
 
     monkeypatch.setattr(sft_module, "print_first_sample", MagicMock())
     args = _make_args(global_batch_size=4)
+    args.sft_image_preprocess_on_rank = True
     producer_cls = sft_module._SFTBatchProducerActor.__ray_metadata__.modified_class
     producer = producer_cls(args, shard_id=0, num_shards=2, prefetch_num_workers=1)
     producer._dataset = _FakeDataset()
@@ -395,6 +445,8 @@ async def test_sft_remote_batch_producer_reprimes_before_second_step(monkeypatch
     await producer.produce_partition(1, "sft_1_shard_0_of_2", 4, False)
     producer._dataset._prefetch.set_index_order.assert_called_once_with([4, 5])
     assert producer.data_system_client.async_put.await_count == 2
+    for call in producer.data_system_client.async_put.await_args_list:
+        assert list(call.kwargs["data"][SFT_IMAGE_REFS_FIELD]) == [None, None]
 
 
 def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(monkeypatch):
@@ -432,6 +484,49 @@ def test_sft_remote_eval_size_initializes_eval_dataset_without_train_overlap(mon
     assert sft._eval_indices == eval_indices
     fake_ds.restrict_training_indices.assert_not_called()
     assert [sample.source_idx for sample in sft._build_eval_batches()] == list(eval_indices)
+
+
+@pytest.mark.parametrize("remote_pipeline", [False, True])
+def test_sft_independent_eval_propagates_rank_image_preprocessing(monkeypatch, remote_pipeline):
+    from relax.components.sft import SFT
+
+    fake_ds, _ = _patch_pipeline_dependencies(monkeypatch)
+    dataset_calls = []
+
+    def make_dataset(**kwargs):
+        dataset_calls.append(kwargs)
+        return fake_ds
+
+    monkeypatch.setattr("relax.components.sft.SFTStreamingDataset", make_dataset)
+    args = _make_args(global_batch_size=2)
+    args.eval_prompt_data = "/fake/eval.jsonl"
+    args.multimodal_keys = {"image": "images"}
+    args.sft_image_preprocess_on_rank = True
+
+    SFTCls = SFT.func_or_class
+    sft = SFTCls.__new__(SFTCls)
+    sft.config = args
+    sft.role = "sft"
+    sft.step = 0
+    sft._dataset = None
+    sft._eval_dataset = None
+    sft._eval_indices = None
+    sft._batch_producers = []
+    sft._train_size = len(fake_ds)
+    sft._tokenizer = None
+    sft._processor_pool = None
+    sft._logger_instance = MagicMock()
+    sft._runtime_env = None
+
+    if remote_pipeline:
+        sft._init_remote_eval_pipeline()
+    else:
+        sft._should_use_remote_batch_producer = MagicMock(return_value=False)
+        sft._init_data_pipeline()
+
+    eval_kwargs = dataset_calls[-1]
+    assert eval_kwargs["path"] == ["/fake/eval.jsonl"]
+    assert eval_kwargs["image_preprocess_on_rank"] is True
 
 
 @pytest.mark.asyncio
@@ -482,8 +577,9 @@ async def test_sft_remote_step_produces_eval_before_advancing_step(monkeypatch):
     sft._stop_event = MagicMock()
     sft._stop_event.is_set = MagicMock(return_value=False)
 
-    async def _maybe_produce_eval():
+    async def _maybe_produce_eval(completed_steps):
         assert sft.step == 0
+        assert completed_steps == 1
 
     sft._maybe_produce_eval = AsyncMock(side_effect=_maybe_produce_eval)
 
@@ -544,6 +640,7 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
 
     args = _make_args(global_batch_size=4)
     args.eval_interval = 1
+    args.eval_prompt_data = "/fake/eval.jsonl"
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = args
@@ -560,14 +657,15 @@ async def test_sft_eval_rejects_source_with_no_valid_samples(monkeypatch):
     sft._stop_event.is_set = MagicMock(return_value=False)
 
     with pytest.raises(RuntimeError, match="source produced 0 valid samples"):
-        await sft._maybe_produce_eval()
+        await sft._maybe_produce_eval(completed_steps=1)
 
     fake_client.async_put.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("n_real", [1, 3, 4, 5, 8])
-async def test_classification_eval_pads_without_dropping_real_samples(n_real):
+@pytest.mark.parametrize("image_preprocess_on_rank", [False, True])
+async def test_classification_eval_pads_without_dropping_real_samples(n_real, image_preprocess_on_rank):
     from relax.components.sft import SFT
 
     samples = [
@@ -587,10 +685,13 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     SFTCls = SFT.func_or_class
     sft = SFTCls.__new__(SFTCls)
     sft.config = SimpleNamespace(
+        loss_type="sft",
+        eval_size=n_real,
         eval_interval=1,
         global_batch_size=4,
         task_type="seq_cls",
-        multimodal_keys=None,
+        multimodal_keys={"image": "images"} if image_preprocess_on_rank else None,
+        sft_image_preprocess_on_rank=image_preprocess_on_rank,
         sft_eval_chunk_drain_timeout_sec=1,
     )
     sft.step = 0
@@ -599,14 +700,70 @@ async def test_classification_eval_pads_without_dropping_real_samples(n_real):
     sft._build_eval_batches = MagicMock(return_value=samples)
     sft._wait_for_partition_drained = AsyncMock(return_value=True)
 
-    await sft._maybe_produce_eval()
+    await sft._maybe_produce_eval(completed_steps=1)
 
     expected_chunks = (n_real + 3) // 4
     assert fake_client.async_put.await_count == expected_chunks
     weights = torch.cat([call.kwargs["data"]["sample_weights"] for call in fake_client.async_put.call_args_list])
     assert weights.tolist() == [1.0] * n_real + [0.0] * (expected_chunks * 4 - n_real)
+    for call in fake_client.async_put.call_args_list:
+        if image_preprocess_on_rank:
+            assert list(call.kwargs["data"][SFT_IMAGE_REFS_FIELD]) == [None] * 4
+        else:
+            assert SFT_IMAGE_REFS_FIELD not in call.kwargs["data"]
     partition_ids = [call.kwargs["partition_id"] for call in fake_client.async_put.call_args_list]
-    assert partition_ids == [f"sft_eval_0_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+    assert partition_ids == [f"sft_eval_1_n{expected_chunks}_{idx}" for idx in range(expected_chunks)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+@pytest.mark.parametrize(("n_pairs", "dp_size"), [(1, 1), (2, 2), (6, 2), (10, 2)])
+async def test_preference_eval_preserves_pairs_and_partial_batches(loss_type, n_pairs, dp_size):
+    from relax.components.sft import SFT
+    from relax.engine.sft.dataset.preference import ProcessedPreferencePair
+
+    pairs = [
+        ProcessedPreferencePair(
+            pair_id=idx,
+            chosen_tokens=torch.tensor([idx, 100]),
+            rejected_tokens=torch.tensor([idx, 101]),
+            chosen_loss_mask=torch.tensor([1]),
+            rejected_loss_mask=torch.tensor([1]),
+            chosen_total_length=2,
+            rejected_total_length=2,
+            chosen_prompt_length=1,
+            rejected_prompt_length=1,
+            chosen_completion_length=1,
+            rejected_completion_length=1,
+            source_idx=idx,
+        )
+        for idx in reversed(range(n_pairs))
+    ]
+    sft = SFT.func_or_class.__new__(SFT.func_or_class)
+    sft.config = SimpleNamespace(
+        loss_type=loss_type,
+        eval_size=n_pairs,
+        eval_interval=1,
+        global_batch_size=4,
+        data_parallel_size=dp_size,
+        multimodal_keys=None,
+    )
+    sft.step = 20
+    sft.data_system_client = SimpleNamespace(async_put=AsyncMock())
+    sft._logger_instance = MagicMock()
+    sft._build_eval_batches = MagicMock(return_value=pairs)
+    sft._wait_for_partition_drained = AsyncMock(return_value=True)
+
+    await sft._maybe_produce_eval(completed_steps=21)
+
+    chunks = sft.data_system_client.async_put.call_args_list
+    expected_sizes = [4] * (n_pairs // 4) + ([n_pairs % 4] if n_pairs % 4 else [])
+    assert [len(call.kwargs["data"]["pair_ids"]) for call in chunks] == expected_sizes
+    assert [call.kwargs["partition_id"] for call in chunks] == [
+        f"sft_eval_21_n{len(chunks)}_p{n_pairs}_{idx}" for idx in range(len(chunks))
+    ]
+    chosen = [tokens.tolist() for call in chunks for tokens in call.kwargs["data"]["chosen_tokens"]]
+    assert chosen == [pair.chosen_tokens.tolist() for pair in pairs]
 
 
 @pytest.mark.asyncio

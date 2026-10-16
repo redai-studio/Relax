@@ -134,6 +134,38 @@ FLOPS_TEST_CONFIGS = {
 
 
 FLOPS_TEST_VL_CONFIGS = {
+    "qwen3_vl": {
+        # Exact config of Qwen/Qwen3-VL-4B-Instruct. Note head_dim=128 is set
+        # explicitly and num_attention_heads * head_dim (32 * 128 = 4096) !=
+        # hidden_size (2560), so head_dim must be read from the config.
+        "config": {
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 2560,
+                "vocab_size": 151936,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 8,
+                "num_attention_heads": 32,
+                "head_dim": 128,
+                "intermediate_size": 9728,
+            },
+            "vision_config": {
+                "num_heads": 16,
+                "depth": 24,
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "out_hidden_size": 2560,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "in_channels": 3,
+                "patch_size": 16,
+                "deepstack_visual_indexes": [5, 11, 17],
+            },
+        },
+        "batch_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
+        "images_seqlens_list": [[512, 1024, 2048], [4096, 4096, 4096]],
+        "expected_tflops_list": [110225906466816 / 1e12, 415025911037952 / 1e12],
+    },
     "qwen3_5": {
         "config": {
             "model_type": "qwen3_5",

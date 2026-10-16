@@ -119,7 +119,7 @@ spec:
     name: sglang-external-engines  # 指向 SGLang Deployment
   minReplicaCount: 2               # 最小引擎数
   maxReplicaCount: 16              # 最大引擎数
-  cooldownPeriod: 300              # 缩容冷却期（秒）
+  cooldownPeriod: 300              # 仅在缩容到 0 时生效
   pollingInterval: 30              # 评估间隔（秒）
   advanced:
     horizontalPodAutoscalerConfig:
@@ -406,9 +406,9 @@ K8s 发送 SIGTERM
 |---|---|---|
 | `terminationGracePeriodSeconds` | 180s | 必须 > drain timeout + shutdown timeout + 轮询开销 |
 | `--scale-in-drain-timeout` (Relax) | 30s (默认) | 等待在途请求完成的超时 |
-| `--scale-in-shutdown-timeout` (Relax) | 20s (默认) | 引擎优雅关闭超时 |
+| `--scale-in-shutdown-timeout` (Relax) | 30s (默认) | 引擎优雅关闭超时 |
 | preStop `MAX_WAIT` | 150s | 需 < `terminationGracePeriodSeconds` |
-| KEDA `cooldownPeriod` | 300s | 缩容冷却期，防止频繁扩缩 |
+| KEDA `cooldownPeriod` | 300s | 缩容到 0 前的冷却时间；`minReplicaCount` > 0 时不生效 |
 
 ______________________________________________________________________
 

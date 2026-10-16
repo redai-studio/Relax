@@ -9,27 +9,14 @@ import json
 import pytest
 import torch
 
-from relax.utils.replay.adapters.reward import replay_reward_post_process
-from relax.utils.replay.bundle import BundleReader
 from relax.utils.replay.report import StageStatus
 from relax.utils.replay.runner import replay
 from relax.utils.replay.validate import validate_bundle
 from tests.utils.replay.helpers import (
     DEFAULT_LOSS,
-    NORMALIZED_REWARDS,
     build_grpo_bundle,
     resign_metadata_checksums,
 )
-
-
-def test_reward_group_normalization_reference(tmp_path):
-    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
-    loaded = BundleReader(bundle).load()
-    ctx: dict = {}
-    result = replay_reward_post_process(loaded, ctx)
-
-    assert result.status == StageStatus.PASS
-    assert ctx["reward.post_process"] == pytest.approx(NORMALIZED_REWARDS)
 
 
 def test_replay_passes_on_valid_bundle(tmp_path):
@@ -39,15 +26,6 @@ def test_replay_passes_on_valid_bundle(tmp_path):
     assert report.passed is True
     assert report.first_divergent_stage is None
     assert all(stage.status != StageStatus.FAIL for stage in report.stages)
-
-
-def test_reward_pr65_fixture(tmp_path):
-    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle", pr65_bug=True)
-    report = replay(bundle)
-
-    assert report.first_divergent_stage == "reward.post_process"
-    reward_stage = next(stage for stage in report.stages if stage.stage == "reward.post_process")
-    assert reward_stage.status == StageStatus.FAIL
 
 
 def test_loss_ratio_one_reference(tmp_path):
@@ -68,7 +46,7 @@ def test_loss_ratio_not_one(tmp_path):
 @pytest.mark.parametrize(
     ("corrupt", "first_stage", "kwargs"),
     [
-        ("reward", "reward.raw", {}),
+        ("reward", "advantage.estimate", {}),
         (
             "mask_token",
             "loss.policy",
@@ -117,19 +95,6 @@ def test_replay_unsupported_cp_fails(tmp_path):
 
     with pytest.raises(ValueError, match="unsupported replay topology"):
         replay(bundle)
-
-
-def test_replay_missing_expected_fails(tmp_path):
-    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle")
-    expected_path = bundle / "expected.json"
-    expected = json.loads(expected_path.read_text(encoding="utf-8"))
-    del expected["reward.post_process"]
-    expected_path.write_text(json.dumps(expected), encoding="utf-8")
-    resign_metadata_checksums(bundle)
-
-    report = replay(bundle)
-    assert report.passed is False
-    assert report.first_divergent_stage == "reward.post_process"
 
 
 def test_replay_loss_value_skipped_on_grpo(tmp_path):

@@ -8,7 +8,6 @@ from collections.abc import Callable, Iterable
 from functools import lru_cache
 from typing import Any, Dict
 
-import ray
 import torch
 
 from relax.utils.http_utils import is_port_available
@@ -74,6 +73,8 @@ def exec_command(cmd: str, capture_output: bool = False) -> str | None:
 
 
 def get_current_node_ip():
+    import ray
+
     address = ray._private.services.get_node_ip_address()
     # strip ipv6 address
     address = address.strip("[]")

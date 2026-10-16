@@ -64,10 +64,9 @@ class Sample:
     teacher_prompt: str | list[dict[str, str]] | None = None
     teacher_multimodal_inputs: dict[str, Any] | None = None
     teacher_tokens: list[int] | None = None  # expanded teacher_prompt_tokens + response_tokens
+    teacher_rollout_tokens: list[int] | None = None  # collapsed teacher prompt + the same response tokens
     teacher_prompt_length: int | None = None  # number of teacher prompt tokens in teacher_tokens (expanded)
     teacher_image_data: dict[str, list] | None = None  # base64-encoded teacher media for SGLang payload
-    teacher_image_b64_list: list[str] | None = None  # raw base64-PNG list for OPD pre-expanded teacher path
-    teacher_image_grid_thw: Any = None  # HF processor image_grid_thw, [[t, h, w], ...]
 
     class Status(Enum):
         PENDING = "pending"

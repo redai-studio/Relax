@@ -1,5 +1,7 @@
 # SFT 训练
 
+纯文本持续预训练请参考 [CPT 训练](cpt-training.md)，通过 `--sft-training-mode cpt` 复用本管线。
+
 本指南展示 Relax 中监督微调（SFT）的完整流程，覆盖 [`scripts/training/sft/`](../../../scripts/training/sft/) 下的生成式 SFT、[`examples/seq_cls_sft/`](../../../examples/seq_cls_sft/) 下的原生序列分类 SFT、模型与数据准备、启动命令以及常用调参方法。
 
 开始之前，请先完成[安装](./installation.md)。
@@ -401,7 +403,6 @@ Pokemon 8 GPU 脚本：
 --tensor-model-parallel-size 2
 --pipeline-model-parallel-size 1
 --context-parallel-size 1
---per-rank-fetch
 --num-data-storage-units 8
 --resource '{"sft": [1, 0], "actor": [1, 8], "rollout": [1, 8]}'
 ```
@@ -429,15 +430,13 @@ env_vars:
   RELAX_SFT_TQ_SHARDS: "2"
 ```
 
-同时在训练参数中开启 async prepack：
+在训练参数中配置在途 step 预算：
 
 ```bash
---per-rank-fetch
---sft-async-prepack
 --sft-max-in-flight-steps 4
 ```
 
-`--sft-max-in-flight-steps 4` 只是示例；async prepack 要求该值至少为 2，或者等价地设置 `--max-staleness >= 1`。这个环境变量本身不会开启 prepack；未使用 `--loss-type sft --sft-async-prepack` 时会被忽略。
+Megatron SFT 自动开启 per-rank fetch。至少允许两个在途 step 时，NCCL、THD、PP=1、CP=1、VPP 关闭且未启用动态 CP 或 routing/indexer replay 的配置自动使用 async prepack；图片数据优先使用图片预取，其他不满足条件的配置使用普通预取。单步预算保持同步。`--sft-max-in-flight-steps 4` 只是预算示例；该环境变量仅在自动选中 async prepack 时生效。
 
 使用 `N` 个 shard 时，`--global-batch-size` 和每个 DP rank 的本地 batch（`global_batch_size / data_parallel_size`）都必须能被 `N` 整除。例如 global batch size 为 32、DP size 为 8 时，本地 batch 为 4，因此可以设置 2 或 4 个 shard，不能设置 3 个。
 
@@ -531,7 +530,7 @@ bash scripts/entrypoint/spmd-multinode.sh \
 | `--sft-prefetch-buffer-size` | 从 256 往上调 | 缓存更多已渲染样本。 |
 | `--sft-prefetch-num-workers` | 调大 | 提高图片解码和多模态 I/O 并行度。 |
 | `--sft-prefetch-chunk-size` | 调大 | 一次派发更多预取样本，但会增加内存压力。 |
-| `--per-rank-fetch` | 多 GPU 时开启 | 让 TP/PP rank 直接从 TransferQueue 拉数据，需配足 `--num-data-storage-units`。 |
+| per-rank fetch | Megatron SFT 自动开启 | 让 TP/PP rank 直接从 TransferQueue 拉数据，需配足 `--num-data-storage-units`。 |
 | `--max-staleness` | I/O 重时调大 | 允许 producer 提前生产。Pokemon 8 GPU 脚本使用 `--max-staleness 4`。 |
 | `RELAX_SFT_TQ_SHARDS` | 从 2 开始 | 并行化满足条件的 async-prepack producer。仅当数据准备是瓶颈且 batch 满足整除约束时再增加。 |
 

@@ -135,9 +135,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "messages"
-        ],
+        "required": ["messages"],
         "title": "GenerateRequest",
         "description": "Request model for genRM generation (OpenAI chat format).\n\nAccepts a list of messages in OpenAI format with optional sampling params."
       },
@@ -149,9 +147,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "response"
-        ],
+        "required": ["response"],
         "title": "GenerateResponse",
         "description": "Response model for genRM generation.\n\nReturns the raw model response text."
       },
@@ -180,10 +176,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "role",
-          "content"
-        ],
+        "required": ["role", "content"],
         "title": "Message",
         "description": "Single chat message."
       },
@@ -220,11 +213,7 @@
           }
         },
         "type": "object",
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
+        "required": ["loc", "msg", "type"],
         "title": "ValidationError"
       }
     }

@@ -4,8 +4,8 @@
 import ray
 
 from relax.backends.sglang.sglang_engine import SGLangEngine
-from relax.core.service import create_placement_group
 from relax.distributed.ray.multi_engine_manager import MultiEngineManager
+from relax.distributed.ray.placement_group import create_placement_group
 from relax.distributed.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from relax.utils.env import Envs
@@ -35,12 +35,9 @@ def _resolve_teacher_gpu_index(
 
 def _build_teacher_engine_env(args) -> dict[str, str]:
     env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
-        # OPD patches default off; enabled only when the corresponding env flag is
-        # passed through from the driver. RELAX_OPD_PREEXPANDED_PATCH affects the
-        # teacher engine only; RELAX_OPD_PER_POS_TOKEN_IDS affects teacher + student.
-        "RELAX_OPD_PREEXPANDED_PATCH": str(int(Envs.RELAX_OPD_PREEXPANDED_PATCH)),
+        # Native multimodal OPD must preserve the supplied response token IDs.
+        "SGLANG_MM_AVOID_RETOKENIZE": "true",
         "RELAX_OPD_PER_POS_TOKEN_IDS": str(int(Envs.RELAX_OPD_PER_POS_TOKEN_IDS)),
-        "RELAX_OPD_TOKEN_IDS_LOGPROB_K": Envs.RELAX_OPD_TOKEN_IDS_LOGPROB_K,
         "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",

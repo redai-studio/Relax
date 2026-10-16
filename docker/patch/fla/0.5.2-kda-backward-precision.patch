@@ -1,0 +1,56 @@
+--- a/fla/ops/kda/chunk_intra.py
++++ b/fla/ops/kda/chunk_intra.py
+@@ -468,6 +468,9 @@
+     p_b = beta + o_c * HV
+     b_b = tl.load(p_b, mask=m_c, other=0.0)
+ 
++    # Gate gradients subtract q/dq and k/dk products before a reverse cumsum.
++    # Default TF32 truncation in these FP32 dots leaks into small gate gradients.
++    # Keep Tensor Cores while retaining FP32-like accuracy with three TF32 products.
+     b_dq2 = tl.zeros([BC, BK], dtype=tl.float32)
+     b_dk2 = tl.zeros([BC, BK], dtype=tl.float32)
+     if i_i > 0:
+@@ -489,8 +492,8 @@
+             b_dAqk = tl.load(p_dAqk, mask=m_dAf, other=0.0)
+             b_dAkk = tl.load(p_dAkk, mask=m_dAf, other=0.0)
+             # [BC, BK]
+-            b_dq2 += tl.dot(b_dAqk, b_kg)
+-            b_dk2 += tl.dot(b_dAkk, b_kg)
++            b_dq2 += tl.dot(b_dAqk, b_kg, input_precision="tf32x3")
++            b_dk2 += tl.dot(b_dAkk, b_kg, input_precision="tf32x3")
+         b_gqn = exp2(b_g - b_gn)
+         b_dq2 *= b_gqn
+         b_dk2 *= b_gqn
+@@ -528,8 +531,8 @@
+         exp_neg_b_g_diag_qk = tl.where(m_j_diag_qk, exp2(-b_g_diag_qk), 0.)
+ 
+         b_k_exp_diag_qk = b_k * exp_neg_b_g_diag_qk
+-        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
+-        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk) * exp_b_g_diag_qk
++        b_dq2 += tl.dot(b_dAqk_diag_qk, b_k_exp_diag_qk, input_precision="tf32x3") * exp_b_g_diag_qk
++        b_dk2 += tl.dot(b_dAkk_diag_qk, b_k_exp_diag_qk, input_precision="tf32x3") * exp_b_g_diag_qk
+     else:
+         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+             # [BC]
+@@ -595,8 +598,8 @@
+             b_kbg = b_kb * tl.where(m_j[:, None], b_gkn, 0)
+             # [BC, BK]
+             # (SY 09/17) important to not use bf16 here to have a good precision.
+-            b_dkt += tl.dot(b_dAqk, b_qg)
+-            b_dkt += tl.dot(b_dAkk, b_kbg)
++            b_dkt += tl.dot(b_dAqk, b_qg, input_precision="tf32x3")
++            b_dkt += tl.dot(b_dAkk, b_kbg, input_precision="tf32x3")
+         b_dkt *= exp2(b_gn - b_g)
+     o_dA = i_ti * HV*BT + i_i * BC + o_i
+     p_qj = q + i_ti * H*K + o_k
+@@ -633,8 +636,8 @@
+         b_q_exp = b_q * exp_b_g_diag_kk
+         b_kb_exp = b_k * b_b[:, None] * exp_b_g_diag_kk
+ 
+-        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp) * exp_neg_b_g_diag_kk
+-        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp) * exp_neg_b_g_diag_kk
++        b_dkt += tl.dot(b_dAqk_diag_kk, b_q_exp, input_precision="tf32x3") * exp_neg_b_g_diag_kk
++        b_dkt += tl.dot(b_dAkk_diag_kk, b_kb_exp, input_precision="tf32x3") * exp_neg_b_g_diag_kk
+     else:
+         for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
+             # [BC,]

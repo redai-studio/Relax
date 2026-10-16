@@ -44,7 +44,7 @@ def _rloo_cp_worker(rank, world_size, init_file):
     try:
         torch.manual_seed(0)
         base_length = 2 * world_size * 4
-        response_lengths = [base_length, base_length * 2, base_length * 3]
+        response_lengths = [base_length, base_length * 2, 0]
         prompt_lengths = [2 * world_size * (sample_index + 1) for sample_index in range(3)]
         total_lengths = [
             prompt_length + response_length
@@ -71,7 +71,8 @@ def _rloo_cp_worker(rank, world_size, init_file):
         local_ownership = []
         for total_length, response_length, full_loss in zip(total_lengths, response_lengths, full_losses, strict=True):
             response_slices = _response_slices(total_length, response_length, rank, world_size)
-            local_losses.append(torch.cat([full_loss[response_slice] for response_slice in response_slices]))
+            local_parts = [full_loss[response_slice] for response_slice in response_slices]
+            local_losses.append(torch.cat(local_parts) if local_parts else full_loss.new_empty(0))
             ownership = torch.zeros(response_length, dtype=torch.int64)
             for response_slice in response_slices:
                 ownership[response_slice] += 1

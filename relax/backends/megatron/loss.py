@@ -15,6 +15,7 @@ from relax.algorithms import get_algorithm
 from relax.algorithms.advantages import compute_advantages_and_returns as compute_advantages_and_returns_impl
 from relax.algorithms.policy import compute_policy_loss_for
 from relax.algorithms.spec import ALGORITHM_SPECS
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils.distributed_utils import distributed_masked_normalize, distributed_masked_whiten
 from relax.utils.misc import load_function
 from relax.utils.opd.opd_utils import (
@@ -31,6 +32,15 @@ from relax.utils.training.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
 )
+from relax.utils.training.preference_utils import (
+    build_preference_pair_indices,
+    dpo_pair_loss,
+    dpo_rewards,
+    masked_sequence_sums,
+    preference_accuracy,
+    reward_model_pair_loss,
+    select_packed_sequence_scores,
+)
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -41,6 +51,29 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+
+
+def normalize_reduced_loss_metrics(keys: list[str], values: list[float]) -> dict[str, float]:
+    """Normalize all-reduced metric numerators without dividing by zero.
+
+    Per-token training can legitimately produce a batch with no effective loss
+    tokens (for example, all responses are empty or fully masked). Such a batch
+    has zero metric numerators and represents a no-signal step, so report
+    zeros. A nonzero numerator with a zero denominator indicates an
+    inconsistent reducer and must fail loudly.
+    """
+    if len(keys) + 1 != len(values):
+        raise ValueError(f"Expected one denominator plus {len(keys)} metric values, got {len(values)} values.")
+
+    denominator = values[0]
+    numerators = values[1:]
+    if denominator == 0:
+        nonzero_keys = [key for key, value in zip(keys, numerators, strict=True) if value != 0]
+        if nonzero_keys:
+            raise RuntimeError(f"Zero loss-metric denominator with nonzero numerator(s): {nonzero_keys}.")
+        return dict.fromkeys(keys, 0.0)
+
+    return {key: value / denominator for key, value in zip(keys, numerators, strict=True)}
 
 
 def get_responses(
@@ -83,7 +116,7 @@ def get_responses(
     # this slicer — slicing itself is dtype-agnostic; that caller casts to fp32
     # per sub-chunk. All other paths (RL, SFT legacy logits, SFT eval PPL)
     # produce real fp32 logits and must stay strict.
-    if args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False):
+    if is_sft_mode(args) and getattr(args, "sft_chunked_logits", False):
         assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16), f"{logits.dtype}"
     else:
         assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -112,14 +145,14 @@ def get_responses(
             else:
                 end += total_length
                 start = end - response_length
-            if response_length == total_length:
+            if response_length == total_length and response_length > 0:
                 # SFT branch; see relax.utils.sft_utils.compute_sft_response_chunk.
                 from relax.utils.sft_utils import compute_sft_response_chunk
 
                 logits_chunk, tokens_chunk = compute_sft_response_chunk(logits, tokens, start, end)
             else:
                 logits_chunk = logits[start - 1 : end - 1]
-                tokens_chunk = tokens[-response_length:]
+                tokens_chunk = tokens[total_length - response_length : total_length]
         elif args.allgather_cp:
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
@@ -181,7 +214,7 @@ def get_responses(
         if (
             apply_temperature
             and args.rollout_temperature != 1.0
-            and not (args.loss_type == "sft" and getattr(args, "sft_chunked_logits", False))
+            and not (is_sft_mode(args) and getattr(args, "sft_chunked_logits", False))
         ):
             logits_chunk = logits_chunk / args.rollout_temperature
 
@@ -445,8 +478,13 @@ def get_log_probs_and_entropy(
     if gather_topk_token_ids is not None:
         res["topk_log_probs"] = topk_log_probs_list
 
-    # we need to turn the all gather kv into zigzag ring attn kv
-    if args.allgather_cp:
+    # we need to turn the all gather kv into zigzag ring attn kv. Guard on
+    # cp_world_size > 1 (matching the loss_function guard below): at CP=1 each
+    # rank already holds the full sequence and get_responses returned per-sample
+    # log_probs of length response_length, so redistribution is a no-op — and
+    # its prompt_length==0 (SFT) path would otherwise mis-pad the first sample
+    # by +1 (logit_global_start=-1 at seq_start=0).
+    if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         _allgather_cp_redistribute(
             res,
             logits=logits,
@@ -819,6 +857,9 @@ def policy_loss_function(
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
+    # OPD uses the original batch masks, even when TIS replaces the policy reducer below.
+    opd_metric_reducer = sum_of_sample_mean
+
     if isinstance(batch["advantages"], list):
         advantages = torch.cat(batch["advantages"], dim=0)
     else:
@@ -1052,6 +1093,7 @@ def policy_loss_function(
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,
         batch=batch,
+        metric_reducer=opd_metric_reducer,
         log_probs=log_probs,
         old_log_probs=old_log_probs,
         log_probs_and_entropy=log_probs_and_entropy,
@@ -1247,6 +1289,117 @@ def sft_loss_function(
     )
 
 
+def dpo_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute a pair-summed DPO objective using explicit pair identity."""
+    if len(batch["response_lengths"]) % 2 != 0:
+        raise ValueError("DPO micro-batch must contain an even number of chosen/rejected branches")
+    _, values = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        with_entropy=False,
+        max_seq_lens=batch.get("max_seq_lens", None),
+        padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
+    )
+    policy_token_log_probs = values["log_probs"]
+
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("DPO batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+
+    policy_sums = masked_sequence_sums(policy_token_log_probs, batch["loss_masks"], logits.device)
+    policy_chosen = policy_sums.index_select(0, chosen_index)
+    policy_rejected = policy_sums.index_select(0, rejected_index)
+    reference_free = bool(args.dpo_reference_free)
+    if reference_free:
+        reference_chosen = reference_rejected = None
+    else:
+        reference_values = batch.get("ref_log_probs")
+        if reference_values is None:
+            raise ValueError("standard DPO batch is missing frozen-reference log-probabilities")
+        reference_sums = masked_sequence_sums(reference_values, batch["loss_masks"], logits.device)
+        reference_chosen = reference_sums.index_select(0, chosen_index)
+        reference_rejected = reference_sums.index_select(0, rejected_index)
+    pair_losses = dpo_pair_loss(
+        policy_chosen,
+        policy_rejected,
+        reference_chosen=reference_chosen,
+        reference_rejected=reference_rejected,
+        beta=args.dpo_beta,
+        reference_free=reference_free,
+    )
+    chosen_rewards = dpo_rewards(policy_chosen, reference_chosen, beta=args.dpo_beta)
+    rejected_rewards = dpo_rewards(policy_rejected, reference_rejected, beta=args.dpo_beta)
+    # pair_losses is never empty: build_preference_pair_indices raises on an
+    # empty micro-batch, so no gradient-safety fallback is needed here.
+    loss = pair_losses.sum()
+    reward_margin = chosen_rewards - rejected_rewards
+    strict, tie, tie_aware = preference_accuracy(reward_margin)
+    metrics = {
+        "dpo/loss": pair_losses.detach().sum(),
+        "dpo/logps_chosen": policy_chosen.detach().sum(),
+        "dpo/logps_rejected": policy_rejected.detach().sum(),
+        "dpo/reward_chosen": chosen_rewards.detach().sum(),
+        "dpo/reward_rejected": rejected_rewards.detach().sum(),
+        "dpo/reward_margin": reward_margin.detach().sum(),
+        "dpo/strict_accuracy": strict.to(torch.float32).detach().sum(),
+        "dpo/tie_rate": tie.to(torch.float32).detach().sum(),
+        "dpo/tie_aware_accuracy": tie_aware.detach().sum(),
+    }
+    metrics["dpo/pair_accuracy"] = metrics["dpo/strict_accuracy"]
+    if not reference_free:
+        metrics["dpo/ref_logps_chosen"] = reference_chosen.detach().sum()
+        metrics["dpo/ref_logps_rejected"] = reference_rejected.detach().sum()
+    return loss, metrics
+
+
+def reward_model_loss_function(
+    args: Namespace,  # noqa: ARG001
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],  # noqa: ARG001
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute pair-summed Bradley-Terry loss over adjacent chosen/rejected
+    branches."""
+    if len(batch["total_lengths"]) % 2 != 0:
+        raise ValueError("reward-model micro-batch must contain an even number of chosen/rejected branches")
+    scores = select_packed_sequence_scores(logits, batch["total_lengths"])
+    pair_ids = batch.get("preference_branch_pair_ids")
+    branch_is_chosen = batch.get("preference_is_chosen")
+    if pair_ids is None or branch_is_chosen is None:
+        raise ValueError("reward-model batch is missing preference pair identity fields")
+    chosen_indices, rejected_indices = build_preference_pair_indices(pair_ids, branch_is_chosen)
+    chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
+    rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
+    chosen_scores = scores.index_select(0, chosen_index)
+    rejected_scores = scores.index_select(0, rejected_index)
+    pair_losses = reward_model_pair_loss(chosen_scores, rejected_scores)
+    margins = chosen_scores - rejected_scores
+    loss = pair_losses.sum()
+    return loss, {
+        "rm/loss": pair_losses.detach().sum(),
+        "rm/score_chosen_mean": chosen_scores.detach().sum(),
+        "rm/score_rejected_mean": rejected_scores.detach().sum(),
+        "rm/score_margin_mean": margins.detach().sum(),
+        "rm/accuracy": (margins > 0).to(torch.float32).detach().sum(),
+        "rm/_score_chosen_second_moment": chosen_scores.detach().square().sum(),
+        "rm/_score_rejected_second_moment": rejected_scores.detach().square().sum(),
+    }
+
+
 def get_sequence_classification_outputs(
     args: Namespace,
     batch: RolloutBatch,
@@ -1399,8 +1552,8 @@ def loss_function(
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
-    Selects one of "policy_loss", "value_loss", "sft", or a custom loss
-    function based on `args.loss_type`, computes the loss and metrics, then
+    Selects the loss function based on `args.loss_type`, computes the loss
+    and metrics, then
     rescales the loss by micro-batch and parallelism factors to integrate with
     Megatron's gradient accumulation.
 
@@ -1426,7 +1579,8 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [denominator, metric1, metric2, ...]). The
           denominator is the token count for per-token loss and a zero
-          placeholder for sample-mean loss.
+          placeholder for sample-mean loss. "num_tokens" separately carries
+          the effective token count used to detect no-signal steps.
     """
     # CP-local token count (tokens whose loss this rank actually contributes).
     # Summed across the CP group in finalize_model_grads / the metric all-reduce,
@@ -1466,6 +1620,10 @@ def loss_function(
                 func = policy_loss_function
             case "value_loss":
                 func = value_loss_function
+            case "dpo":
+                func = dpo_loss_function
+            case "rm":
+                func = reward_model_loss_function
             case "sft":
                 if getattr(args, "task_type", "causal_lm") == "seq_cls":
                     func = sequence_classification_loss_function
@@ -1567,5 +1725,6 @@ def loss_function(
         {
             "keys": list(log.keys()),
             "values": log_values,
+            "num_tokens": effective_num_tokens,
         },
     )

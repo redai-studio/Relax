@@ -13,6 +13,7 @@ from tensordict import TensorDict
 
 from relax.algorithms import get_algorithm
 from relax.algorithms.rewards import REWARD_NORMALIZERS
+from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.device import get_ray_accelerator_name
 from relax.utils.env import KERNEL_CACHE_ENV_NAMES, Envs, validate_env
 from relax.utils.logging_utils import get_logger
@@ -24,39 +25,31 @@ logger = get_logger(__name__)
 CURRENT_ROLLOUT_BATCH = []
 
 
-def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
-    """Extract per-image ViT token counts from multimodal_train_inputs.
+def _extract_image_grids(multimodal_train_inputs) -> list[tuple[int, int, int]]:
+    """Keep original CPU (T,H,W) geometry for model-specific FLOPs estimates.
 
-    Accepts either:
-      - ``list[dict | None]``: per-sample dicts (pre-batch format)
-      - ``dict``: concatenated tensors (post-``prepare_batch`` format)
-
-    For each image, the ViT input sequence length = H * W (repeated T times
-    along the temporal axis).
+    MoonViT attends over T*H*W before temporal pooling; a list of per-frame H*W
+    lengths loses this information. Called on rollout metadata, before the
+    training batch moves tensors to the accelerator.
     """
-    if isinstance(multimodal_train_inputs, dict):
-        grid_thw = multimodal_train_inputs.get("image_grid_thw")
-        if grid_thw is None:
-            return []
-        if isinstance(grid_thw, torch.Tensor):
-            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-            return seqlens.tolist()
-        return [int(h * w) for t, h, w in grid_thw for _ in range(int(t))]
-
-    images_seqlens: list[int] = []
-    for mm_input in multimodal_train_inputs:
+    inputs = [multimodal_train_inputs] if isinstance(multimodal_train_inputs, dict) else multimodal_train_inputs
+    grids: list[tuple[int, int, int]] = []
+    for mm_input in inputs:
         if mm_input is None:
             continue
-        grid_thw = mm_input.get("image_grid_thw")
-        if grid_thw is None:
+        grid = mm_input.get("image_grid_thw")
+        if grid is None:
             continue
-        if isinstance(grid_thw, torch.Tensor):
-            seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-            images_seqlens.extend(seqlens.tolist())
-        elif isinstance(grid_thw, (list, np.ndarray)):
-            for t, h, w in grid_thw:
-                images_seqlens.extend([int(h * w)] * int(t))
-    return images_seqlens
+        if isinstance(grid, torch.Tensor):
+            grid = grid.tolist()
+        grids.extend((int(t), int(h), int(w)) for t, h, w in grid)
+    return grids
+
+
+def _extract_images_seqlens(multimodal_train_inputs) -> list[int]:
+    """Legacy per-frame H*W counts; keep existing non-K3 estimator
+    semantics."""
+    return [h * w for t, h, w in _extract_image_grids(multimodal_train_inputs) for _ in range(t)]
 
 
 def _extract_audio_seqlens(multimodal_train_inputs) -> list[int]:
@@ -104,9 +97,8 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         custom_convert_func = load_function(custom_convert_path)
         return custom_convert_func(args, samples)
 
-    raw_rewards, rewards = post_process_rewards(args, samples)
+    rewards = post_process_rewards(args, samples)
 
-    assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
     if any(isinstance(reward, list) for reward in rewards):
@@ -124,9 +116,6 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
         # some reward model, e.g. remote rm, may return multiple rewards,
         # we could use key to select the reward.
         "rewards": rewards,
-        "raw_reward": raw_rewards,
-        # Semantic group index (prompt group for GRPO reward normalization); needed
-        # by the per-rollout replay capture to recompute reward.post_process.
         "group_index": [sample.group_index if sample.group_index is not None else 0 for sample in samples],
         "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
         "sample_indices": sample_indices,
@@ -166,6 +155,26 @@ def convert_samples_to_train_data(args: Any, samples: list[Sample] | list[list[S
     if samples[0].rollout_routed_experts is not None:
         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
+    if getattr(args, "use_rollout_indexer_replay", False):
+        indexer_topk = [getattr(sample, "rollout_indexer_topk", None) for sample in samples]
+        if any(value is None for value in indexer_topk):
+            raise RuntimeError("Every training sample must contain rollout_indexer_topk when replay is enabled")
+        widths = set()
+        for sample, value in zip(samples, indexer_topk, strict=False):
+            if not isinstance(value, np.ndarray):
+                raise TypeError(f"rollout_indexer_topk must be a numpy array, got {type(value)}")
+            if value.ndim != 2 or value.shape[0] != len(sample.tokens) - 1:
+                raise RuntimeError(
+                    "rollout_indexer_topk must be a 2-D array with one row per input token except the last, "
+                    f"got replay={value.shape}, tokens={len(sample.tokens)}"
+                )
+            if value.dtype != np.int32:
+                raise RuntimeError(f"rollout_indexer_topk must use int32, got {value.dtype}")
+            widths.add(value.shape[1])
+        if len(widths) != 1:
+            raise RuntimeError(f"Inconsistent rollout_indexer_topk widths in one batch: {sorted(widths)}")
+        train_data["rollout_indexer_topk"] = indexer_topk
+
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
@@ -195,33 +204,31 @@ def build_rollout_custom_meta(rollout_batch: Any) -> list[dict[str, int]]:
 
 
 def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
-    """Return raw rewards and post-processed rewards consumed by training.
+    """Return post-processed rewards consumed by training.
 
     Returns:
-        Tuple[List[float], List[float]]
+        List[float | List[float]]
     """
+    # NOTE(wulumeng): Keep this single-return contract. This function previously returned
+    # (raw_rewards, post_processed_rewards); it now intentionally returns only
+    # post_processed_rewards.
     if args.custom_reward_post_process_path is not None:
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        processed_rewards = custom_reward_post_process_func(args, samples)
-        if isinstance(processed_rewards, tuple) and len(processed_rewards) == 2:
-            return processed_rewards
-        raw_rewards = [sample.get_reward_value(args) for sample in samples]
-        return raw_rewards, processed_rewards
+        return custom_reward_post_process_func(args, samples)
+
+    if getattr(args, "agentic_custom_advantage_path", None) is not None:
+        return [sample.custom_advantage for sample in samples]
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    # This explicit custom-advantage hook replaces the registered reward
-    # normalizer wholesale by design.
-    if getattr(args, "agentic_custom_advantage_path", None) is not None:
-        return raw_rewards, [sample.custom_advantage for sample in samples]
 
     if not args.rewards_normalization:
-        return raw_rewards, raw_rewards
+        return raw_rewards
 
     # Which normalization to apply is declared by the algorithm registry rather
     # than by a whitelist of estimator names maintained here.
     spec = get_algorithm(args.advantage_estimator)
     normalizer = REWARD_NORMALIZERS[spec.reward_normalizer]
-    return raw_rewards, normalizer(args, samples, raw_rewards)
+    return normalizer(args, samples, raw_rewards)
 
 
 def dict_to_tensordict(
@@ -301,6 +308,16 @@ def dict_to_tensordict(
             ]
             result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
             continue
+        if key == "rollout_indexer_topk":
+            # Normalize each replay payload to 2-D (seq_i, flattened replay width)
+            # so NestedTensor jagged layout can handle variable seq_len efficiently.
+            # This avoids NonTensorStack wrapping which forces slow pickle serialization
+            # during dist.broadcast_object_list (~377 MB pickle -> ~14s overhead).
+            tensors = [
+                torch.from_numpy(np.ascontiguousarray(arr.reshape(arr.shape[0], -1))).to(torch.int32) for arr in value
+            ]
+            result[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+            continue
         if key == "trajectory_refs":
             # Serialized Ray ObjectRefs are padded to a fixed width per batch.
             # Keep them as dense uint8 so TransferQueue and the rank-0 broadcast
@@ -316,7 +333,9 @@ def dict_to_tensordict(
         if depth == 0:  # empty list []
             tensor = torch.empty(0)
         elif depth == 1:
-            if key == "multimodal_train_inputs":
+            if key in MULTIMODAL_PAYLOAD_FIELDS:
+                # Per-sample dicts (or image-ref descriptors) must stay Python
+                # objects; tensorizing them would lose the nested structure.
                 tensor = value
             else:
                 tensor = _to_tensor_1d(

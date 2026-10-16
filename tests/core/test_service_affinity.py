@@ -12,8 +12,8 @@ from relax.core.service import Service, _require_node_group_markers, create_plac
 
 def test_missing_markers_raise_after_retries():
     with (
-        patch("relax.core.service.ray.cluster_resources", return_value={"GPU": 8.0, "CPU": 64.0}),
-        patch("relax.core.service.time.sleep") as mock_sleep,
+        patch("relax.distributed.ray.placement_group.ray.cluster_resources", return_value={"GPU": 8.0, "CPU": 64.0}),
+        patch("relax.distributed.ray.placement_group.time.sleep") as mock_sleep,
     ):
         with pytest.raises(RuntimeError) as exc:
             _require_node_group_markers("stable", retries=3, retry_delay=0.01)
@@ -26,12 +26,6 @@ def test_missing_markers_raise_after_retries():
     assert mock_sleep.call_count == 2
 
 
-def test_present_markers_do_not_raise():
-    resources = {"GPU": 8.0, "CPU": 64.0, "stable_gpu": 8.0, "stable_cpu": 8.0}
-    with patch("relax.core.service.ray.cluster_resources", return_value=resources):
-        _require_node_group_markers("stable", retries=3, retry_delay=0.01)  # no raise
-
-
 def test_markers_appear_on_retry():
     """A stable node that registers its markers late must be tolerated."""
     calls = [
@@ -39,8 +33,8 @@ def test_markers_appear_on_retry():
         {"GPU": 8.0, "CPU": 64.0, "stable_gpu": 8.0, "stable_cpu": 8.0},  # then present
     ]
     with (
-        patch("relax.core.service.ray.cluster_resources", side_effect=calls),
-        patch("relax.core.service.time.sleep"),
+        patch("relax.distributed.ray.placement_group.ray.cluster_resources", side_effect=calls),
+        patch("relax.distributed.ray.placement_group.time.sleep"),
     ):
         _require_node_group_markers("stable", retries=3, retry_delay=0.01)  # no raise
 
@@ -64,15 +58,15 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
     cr_mock = MagicMock(return_value=cluster_resources or {"GPU": 8.0, "CPU": 64.0})
 
     with (
-        patch("relax.core.service.device_utils.get_ray_accelerator_name", return_value="GPU"),
-        patch("relax.core.service.get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
-        patch("relax.core.service.placement_group", side_effect=_fake_placement_group),
-        patch("relax.core.service.PlacementGroupSchedulingStrategy", MagicMock()),
-        patch("relax.core.service.InfoActor", MagicMock()),
-        patch("relax.core.service.ray.get", side_effect=_fake_ray_get),
-        patch("relax.core.service.ray.kill", MagicMock()),
-        patch("relax.core.service.ray.cluster_resources", cr_mock),
-        patch("relax.core.service.time.sleep"),
+        patch("relax.distributed.ray.placement_group.device_utils.get_ray_accelerator_name", return_value="GPU"),
+        patch("relax.distributed.ray.placement_group.get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
+        patch("relax.distributed.ray.placement_group.placement_group", side_effect=_fake_placement_group),
+        patch("relax.distributed.ray.placement_group.PlacementGroupSchedulingStrategy", MagicMock()),
+        patch("relax.distributed.ray.placement_group.InfoActor", MagicMock()),
+        patch("relax.distributed.ray.placement_group.ray.get", side_effect=_fake_ray_get),
+        patch("relax.distributed.ray.placement_group.ray.kill", MagicMock()),
+        patch("relax.distributed.ray.placement_group.ray.cluster_resources", cr_mock),
+        patch("relax.distributed.ray.placement_group.time.sleep"),
     ):
         pg, reordered_indices, reordered_gpu_ids = create_placement_group(
             num_gpus, node_group_affinity=node_group_affinity
@@ -240,3 +234,56 @@ def test_service_deferred_deploy_keeps_placement_group_ownership():
 
     with pytest.raises(RuntimeError, match="already been deployed"):
         service.deploy()
+
+
+def test_placement_factory_legacy_exports_are_identical():
+    from relax.distributed.ray import placement_group as placement
+
+    assert create_placement_group is placement.create_placement_group
+    assert _require_node_group_markers is placement._require_node_group_markers
+
+
+def test_placement_sorts_nodes_numerically_then_gpu_and_releases_only_info_actors(monkeypatch):
+    from relax.distributed.ray import placement_group as placement
+
+    monkeypatch.delenv("RELAX_INITIAL_NODE_GROUP", raising=False)
+    pg = MagicMock()
+    info_actors = [MagicMock() for _ in range(4)]
+    coordinates = [("192.0.2.10", 0), ("192.0.2.2", 3), ("192.0.2.2", 1), ("192.0.2.10", 2)]
+    with (
+        patch.object(placement.device_utils, "get_ray_accelerator_name", return_value="GPU"),
+        patch.object(placement, "get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
+        patch.object(placement, "placement_group", return_value=pg) as factory,
+        patch.object(placement, "InfoActor") as info,
+        patch.object(placement, "PlacementGroupSchedulingStrategy") as strategy,
+        patch.object(placement.ray, "get", side_effect=[None, coordinates]),
+        patch.object(placement.ray, "kill") as kill,
+    ):
+        info.options.return_value.remote.side_effect = info_actors
+        result = create_placement_group(4)
+
+    assert result == (pg, [2, 1, 0, 3], [1, 3, 0, 2])
+    factory.assert_called_once_with([{"GPU": 1, "CPU": 1}] * 4, strategy="PACK")
+    assert [entry.kwargs["placement_group_bundle_index"] for entry in strategy.call_args_list] == [0, 1, 2, 3]
+    assert all(entry.kwargs["placement_group"] is pg for entry in strategy.call_args_list)
+    assert [entry.args[0] for entry in kill.call_args_list] == info_actors
+
+
+def test_service_reuses_shared_pg_without_factory_or_cleanup():
+    shared_pg = (MagicMock(), [0], [0])
+    with (
+        patch("relax.core.service.create_placement_group") as factory,
+        patch("relax.core.service.remove_placement_group") as remove,
+        patch.object(Service, "_deploy"),
+    ):
+        service = Service(
+            cls=MagicMock(),
+            role="actor",
+            healthy=MagicMock(),
+            config=Namespace(enable_affinity=True),
+            num_gpus=1,
+            actor_rollout_pgs=shared_pg,
+        )
+        assert service._ensure_placement_group() is shared_pg
+    factory.assert_not_called()
+    remove.assert_not_called()

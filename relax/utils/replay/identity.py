@@ -3,7 +3,7 @@
 """Identity model and dependency closure.
 
 Expands a sample/group/batch selection to its semantic-group closure and
-refuses to guess when membership is missing (PR #65: physical batch ≠ group).
+refuses to guess when membership is missing.
 """
 
 from __future__ import annotations
@@ -30,6 +30,14 @@ def sample_integrity_problems(record: SampleRecord) -> list[tuple[str, str]]:
                 f"response_length {record.response_length}",
             )
         )
+    if isinstance(record.reward, list) and len(record.reward) != record.response_length:
+        problems.append(
+            (
+                "reward_length",
+                f"sample {record.sample_id!r} reward length {len(record.reward)} != "
+                f"response_length {record.response_length}",
+            )
+        )
     return problems
 
 
@@ -39,7 +47,6 @@ class Closure:
 
     sample_ids: list[str] = field(default_factory=list)
     group_ids: set[str] = field(default_factory=set)
-    cohort_ids: set[str] = field(default_factory=set)
 
 
 def _sample_to_group(record: SampleRecord) -> str:
@@ -119,7 +126,6 @@ def expand_selection(
     return Closure(
         sample_ids=ordered,
         group_ids=closure_group_ids,
-        cohort_ids=closure_group_ids,  # GRPO CP=1: semantic group == normalization cohort
     )
 
 

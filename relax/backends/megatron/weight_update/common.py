@@ -17,7 +17,7 @@ from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
 
-def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor:
+def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
     """All-gather TP-sharded param to full tensor.
 
     expert_bias→param, non-TP/duplicated→param.data. Uses expert-TP for
@@ -34,7 +34,12 @@ def all_gather_param(args, name: str, param: torch.nn.Parameter) -> torch.Tensor
             # NOTE: qwen3.5 vision_model is a megatron module
             return param
 
-    assert hasattr(param, "tensor_model_parallel"), f"{name} does not have tensor_model_parallel attribute"
+    if not hasattr(param, "tensor_model_parallel"):
+        assert not isinstance(param, torch.nn.Parameter), f"{name} does not have tensor_model_parallel attribute"
+        # Ordinary persistent buffers are replicated. A buffer carrying
+        # Megatron TP metadata continues through the regular gather path.
+        return param
+
     if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
         return param.data
 
@@ -201,11 +206,12 @@ def named_params_and_buffers(
     model: Sequence[torch.nn.Module],
     convert_to_global_name: bool = True,
     translate_gpu_to_cpu: bool = False,
+    include_persistent_buffers: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     if convert_to_global_name:
-        ans = _named_params_and_buffers_global(args, model)
+        ans = _named_params_and_buffers_global(args, model, include_persistent_buffers=include_persistent_buffers)
     else:
-        ans = _named_params_and_buffers_vanilla(model)
+        ans = _named_params_and_buffers_vanilla(model, include_persistent_buffers=include_persistent_buffers)
 
     if translate_gpu_to_cpu:
         ans = ((name, _maybe_get_cpu_backup(tensor)) for name, tensor in ans)
@@ -235,7 +241,29 @@ def _maybe_get_cpu_backup(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _named_params_and_buffers_vanilla(model: Sequence[torch.nn.Module]) -> Iterator[tuple[str, torch.Tensor]]:
+def _named_buffers_for_weight_update(
+    model_module: torch.nn.Module, include_persistent_buffers: bool
+) -> Iterator[tuple[str, torch.Tensor]]:
+    if include_persistent_buffers:
+        # Match Megatron Bridge: checkpoint state includes persistent buffers,
+        # but excludes runtime caches and counters registered as non-persistent.
+        for module_prefix, module in model_module.named_modules():
+            non_persistent = getattr(module, "_non_persistent_buffers_set", ())
+            for local_name, buffer in module.named_buffers(recurse=False):
+                if local_name in non_persistent:
+                    continue
+                name = f"{module_prefix}.{local_name}" if module_prefix else local_name
+                yield name, buffer
+        return
+
+    for name, buffer in model_module.named_buffers():
+        if "expert_bias" in name:
+            yield name, buffer
+
+
+def _named_params_and_buffers_vanilla(
+    model: Sequence[torch.nn.Module], include_persistent_buffers: bool = False
+) -> Iterator[tuple[str, torch.Tensor]]:
     for vp_stage, model_module in enumerate(model):
 
         def _compute_fqn(name, vp_stage=vp_stage):
@@ -244,15 +272,12 @@ def _named_params_and_buffers_vanilla(model: Sequence[torch.nn.Module]) -> Itera
         for name, param in model_module.named_parameters():
             yield _compute_fqn(name), param
 
-        for name, buffer in model_module.named_buffers():
-            # TODO shall we handle (almost) all buffers like Megatron Bridge
-            if "expert_bias" not in name:
-                continue
+        for name, buffer in _named_buffers_for_weight_update(model_module, include_persistent_buffers):
             yield _compute_fqn(name), buffer
 
 
 def _named_params_and_buffers_global(
-    args: Namespace, model: Sequence[torch.nn.Module]
+    args: Namespace, model: Sequence[torch.nn.Module], include_persistent_buffers: bool = False
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield (global_name, param/buffer) with consistent names across PP/EP.
 
@@ -327,11 +352,8 @@ def _named_params_and_buffers_global(
             else:
                 yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", param
 
-        # treat expert bias as normal parameters
-        for name, buffer in model_module.named_buffers():
-            # TODO shall we handle (almost) all buffers like Megatron Bridge
-            if "expert_bias" not in name:
-                continue
+        # Treat selected model-state buffers needed by rollout as normal parameters.
+        for name, buffer in _named_buffers_for_weight_update(model_module, include_persistent_buffers):
             # for model without ddp wrap
             if not name.startswith("module.module."):
                 name = "module." + name

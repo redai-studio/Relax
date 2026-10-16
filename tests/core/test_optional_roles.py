@@ -35,11 +35,12 @@ def test_register_sft_rollout_noop_without_flag():
     assert algo == {}
 
 
-def test_register_sft_rollout_noop_for_non_sft_algorithms():
-    """RL configs must never get rollout added by this hook."""
+@pytest.mark.parametrize("loss_type", ["policy_loss", "dpo", "rm"])
+def test_register_sft_rollout_noop_for_non_sft_algorithms(loss_type):
+    """Only ordinary SFT supports the generation prediction hook."""
     from relax.core.optional_roles import register_sft_rollout
 
-    config = Namespace(loss_type="policy_loss", sft_predict_interval=10)
+    config = Namespace(loss_type=loss_type, sft_predict_interval=10)
     algo: dict = {}
 
     assert register_sft_rollout(config, algo) == []

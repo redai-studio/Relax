@@ -33,6 +33,8 @@ if [ "${R2E_SETUP_SKIP_DOWNLOADS:-0}" != "1" ]; then
    mkdir -p "${R2E_DATA_PATH}/wheels"
    uv run --no-project --with pip python -m pip download --no-deps --only-binary=:all: \
       -d "${R2E_DATA_PATH}/wheels" chardet==5.2.0
+   uv run --no-project --with pip python -m pip download --no-deps --only-binary=:all: \
+      -d "${R2E_DATA_PATH}/wheels" chardet==5.0.0
 
    hf download R2E-Gym/R2E-Gym-Lite --repo-type dataset --include 'data/train-*.parquet' \
       --local-dir "${R2E_DATA_PATH}/R2E-Gym-Lite"

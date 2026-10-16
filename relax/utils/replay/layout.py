@@ -4,7 +4,7 @@
 
 Pure CPU: topology, shard offsets, DP completeness, and canonical-tensor
 reconstruction (or explicit rejection). No Ray/Megatron/torch.distributed. CP>1
-stays unsupported in the frozen V1 matrix until parity evidence exists.
+stays unsupported in the frozen V2 matrix until parity evidence exists.
 """
 
 from __future__ import annotations
@@ -239,7 +239,7 @@ def cp_capability(stage: StageId, cp: int, *, reconstructable: bool) -> StageCap
     """Resolve the replay capability of stage for a context-parallel topology.
 
     CP=1 is unsharded. CP>1 requires reconstructable shard offsets; the frozen
-    V1 capability matrix does not yet endorse a recompute verdict for CP>1, so
+    V2 capability matrix does not yet endorse a recompute verdict for CP>1, so
     this returns unsupported even when the layout is reconstructable — the
     mechanism exists, but the evidence does not.
     """

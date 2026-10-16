@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import asyncio
 import threading
 import time
 from argparse import Namespace
@@ -11,6 +10,7 @@ import transfer_queue as tq
 from ray import serve
 from ray.serve.schema import LoggingConfig
 
+from relax.components.background_loop import BackgroundLoopRunner
 from relax.components.base import Base
 from relax.distributed.coordination import RolloutOffloadBarrier
 from relax.distributed.ray.placement_group import allocate_train_group
@@ -56,9 +56,7 @@ class Critic(Base):
         # user-event-loop probe stays green; without this the sync
         # `_wait_for_rollout_data` sleep hangs the async replica and it gets
         # restarted mid-run.
-        self._run_thread: Optional[threading.Thread] = None
-        self._done_event: Optional[asyncio.Event] = None
-        self._thread_error: Optional[Exception] = None
+        self._loop_runner = BackgroundLoopRunner()
 
     def set_barriers(
         self,
@@ -70,37 +68,20 @@ class Critic(Base):
         self._rollout_barrier = rollout
 
     async def run(self) -> None:
-        if self._run_thread is not None and self._run_thread.is_alive():
-            if self._done_event is not None:
-                await self._done_event.wait()
-            if self._thread_error is not None:
-                raise self._thread_error
-            return
+        await self._loop_runner.run(self._background_run)
 
-        loop = asyncio.get_running_loop()
-        self._done_event = asyncio.Event()
-        self._thread_error = None
-
-        def _thread_target():
+    def _background_run(self) -> None:
+        try:
+            self.train()
+        except Exception as exc:
+            error_msg = f"Critic training failed at step {self.step}: {type(exc).__name__}: {str(exc)}"
+            self._logger.exception(error_msg)
             try:
-                self.train()
-            except Exception as exc:
-                error_msg = f"Critic training failed at step {self.step}: {type(exc).__name__}: {str(exc)}"
-                self._logger.exception(error_msg)
-                try:
-                    self.healthy.report_error.remote("critic", error_msg)
-                except Exception:
-                    pass
-                if not getattr(self.config, "use_health_check", False):
-                    self._thread_error = exc
-            finally:
-                loop.call_soon_threadsafe(self._done_event.set)
-
-        self._run_thread = threading.Thread(target=_thread_target, daemon=True)
-        self._run_thread.start()
-        await self._done_event.wait()
-        if self._thread_error is not None:
-            raise self._thread_error
+                self.healthy.report_error.remote("critic", error_msg)
+            except Exception:
+                pass
+            if not getattr(self.config, "use_health_check", False):
+                raise
 
     def _wait_for_rollout_data(self) -> None:
         """Block until this round's rollout data is ready and rollout is

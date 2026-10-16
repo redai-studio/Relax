@@ -42,7 +42,15 @@ OPD supports four token-selection strategies that determine which tokens are use
 | `teacher_topk` | — | ✅ | — | ✅ | Compute KL on teacher top-K token set |
 | `union` | ✅ | ✅ | ✅ | ✅ | Compute KL on the union of student and teacher top-K sets, most comprehensive |
 
-Use `--opd-token-selection` to specify the mode and `--opd-log-prob-top-k` for the top-K size. For all modes except `student_sampled`, the environment variable `RELAX_OPD_PER_POS_TOKEN_IDS=1` must be set.
+Use `--opd-token-selection` to specify the mode and `--opd-log-prob-top-k` for the top-K size. Set `RELAX_OPD_PER_POS_TOKEN_IDS=1` for compact base64 transport in top-K runs. Cross-model queries require Relax's independent per-position SGLang patch, included in the v0.5.17 training images; stock SGLang uses the same query IDs at every position.
+
+## Native Image Requests
+
+Image OPD, OPSD, and MOPD use SGLang v0.5.17 with `SGLANG_MM_AVOID_RETOKENIZE=true`. Requests contain collapsed prompt IDs, unchanged sampled response IDs, and standard image data. The client processor determines the expanded prompt length used to select response logprobs. Student and teacher tokenizers and image processors must be compatible, including image resizing settings. This path supports images; audio and video inputs are rejected.
+
+When OPSD overrides the teacher prompt without a teacher media override, it reuses student images. An explicit empty teacher media mapping selects text-only teacher input. Student cross-top-K prefill always uses student images.
+
+Direct teacher endpoints and the student router must preserve `return_prompt_token_ids`. Relax compares the complete expanded sequence and returned response/query IDs before using logprobs. Missing or mismatched IDs fail the request. The text-based `RadixTreeMiddleware` is unsupported for this path. Image requests cannot remap response EOS IDs or replace sampled media tokens; configure media stop tokens when needed. See the [OPD example setup](https://github.com/redai-studio/Relax/tree/main/examples/on_policy_distillation) for the independent top-K patch and environment settings.
 
 ## Two Application Methods: adv and loss
 

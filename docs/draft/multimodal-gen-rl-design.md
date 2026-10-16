@@ -347,7 +347,6 @@ tracks.image_x_next
     "trajectory_slots": int64[N],
     "policy_versions": int64[N],
     "advantages": float32[N],
-    "raw_reward": float32[N],
     "total_lengths": int64[N],
     "skip_optimizer_step": int64[N],   # 退化轮标记（初版设计未包含）
 }

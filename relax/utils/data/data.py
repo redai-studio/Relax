@@ -113,15 +113,22 @@ class Dataset(BaseDataset):
         return len(self.samples)
 
 
-def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
-    # use first fit to get the number of micro batches
-    batches = []
-    for length in total_lengths:
+def get_first_fit_partitions(total_lengths: list[int], max_tokens_per_gpu: int) -> list[list[int]]:
+    """Pack indices in input order; oversized samples get their own bin."""
+    batches: list[int] = []
+    partitions: list[list[int]] = []
+    for index, length in enumerate(total_lengths):
         for i in range(len(batches)):
             if batches[i] + length <= max_tokens_per_gpu:
                 batches[i] += length
+                partitions[i].append(index)
                 break
         else:
             batches.append(length)
+            partitions.append([index])
 
-    return len(batches)
+    return partitions
+
+
+def get_minimum_num_micro_batch_size(total_lengths: list[int], max_tokens_per_gpu: int) -> int:
+    return len(get_first_fit_partitions(total_lengths, max_tokens_per_gpu))

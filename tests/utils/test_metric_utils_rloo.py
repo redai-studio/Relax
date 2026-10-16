@@ -104,6 +104,10 @@ def test_non_rloo_estimator_omits_rloo_diagnostics():
 
 def test_eval_logger_disables_training_rloo_diagnostics(monkeypatch):
     pytest.importorskip("megatron.core")
+    try:
+        from sglang.srt.server_args import ServerArgs  # noqa: F401
+    except ImportError as exc:
+        pytest.skip(f"SGLang server dependencies are unavailable: {exc}")
 
     import relax.distributed.ray.rollout as rollout_module
 

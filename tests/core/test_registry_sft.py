@@ -31,17 +31,11 @@ def _registry_module():
     return importlib.import_module("relax.core.registry")
 
 
-def test_algos_has_sft_entry():
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_process_role_returns_sft_only_for_offline_training(loss_type):
     registry = _registry_module()
 
-    assert "sft" in registry.ALGOS
-    assert "actor" in registry.ALGOS["sft"]
-
-
-def test_process_role_returns_sft_only_when_loss_type_sft():
-    registry = _registry_module()
-
-    roles = registry.process_role(_cfg(loss_type="sft"))
+    roles = registry.process_role(_cfg(loss_type=loss_type))
     assert roles is registry.ROLES_SFT_ONLY
     assert {r.value for r in roles} == {"actor", "sft"}
 
@@ -65,12 +59,6 @@ def test_roles_main_enum_includes_sft():
     registry = _registry_module()
 
     assert registry.ROLES.sft.value == "sft"
-
-
-def test_roles_sft_only_includes_actor_and_sft():
-    registry = _registry_module()
-
-    assert {r.value for r in registry.ROLES_SFT_ONLY} == {"actor", "sft"}
 
 
 def test_algos_sft_has_sft_class_wired():

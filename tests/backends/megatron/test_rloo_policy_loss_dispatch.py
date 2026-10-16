@@ -95,14 +95,45 @@ def test_policy_loss_function_dispatches_rloo_objective(monkeypatch):
     assert torch.allclose(log_probs.grad, -advantages)
 
 
-def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkeypatch):
-    """Exercise the production reducer and returned Megatron token normalizer
-    with unequal non-empty responses."""
-    response_lengths = [2, 4]
-    masks = [
-        torch.tensor([1.0, 1.0], dtype=torch.float64),
-        torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float64),
-    ]
+@pytest.mark.parametrize(
+    ("response_lengths", "masks"),
+    [
+        (
+            [2, 4],
+            [
+                torch.tensor([1.0, 1.0], dtype=torch.float64),
+                torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float64),
+            ],
+        ),
+        (
+            [2, 4],
+            [
+                torch.tensor([1.0, 0.0], dtype=torch.float64),
+                torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float64),
+            ],
+        ),
+        (
+            [2, 0],
+            [
+                torch.tensor([1.0, 1.0], dtype=torch.float64),
+                torch.empty(0, dtype=torch.float64),
+            ],
+        ),
+        (
+            [2, 4],
+            [torch.zeros(2, dtype=torch.float64), torch.zeros(4, dtype=torch.float64)],
+        ),
+    ],
+    ids=[
+        "unequal-nonempty-responses",
+        "unequal-with-fully-masked-response",
+        "unequal-with-empty-response",
+        "fully-masked-batch",
+    ],
+)
+def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkeypatch, response_lengths, masks):
+    """Exercise the production reducer and returned Megatron token
+    normalizer."""
     num_tokens = sum(response_lengths)
     log_probs = torch.tensor(
         [-0.2, -0.4, -0.1, -0.3, -0.5, -0.7][:num_tokens],
@@ -153,7 +184,7 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
         "dynamic_cp_rank": 0,
     }
 
-    token_sum_loss, normalizer, _ = loss_module.loss_function(
+    token_sum_loss, normalizer, logging = loss_module.loss_function(
         args,
         batch,
         num_microbatches=1,
@@ -163,12 +194,21 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     flat_mask = torch.cat(masks)
     expected_token_sum = -(advantages * log_probs * flat_mask).sum()
     expected_num_tokens = flat_mask.sum()
-    expected_final_loss = expected_token_sum / expected_num_tokens
-    final_loss = token_sum_loss / normalizer
 
     assert torch.allclose(token_sum_loss, expected_token_sum)
     assert normalizer.dtype == torch.int
     assert torch.allclose(normalizer.to(expected_num_tokens.dtype), expected_num_tokens)
+
+    if expected_num_tokens == 0:
+        assert token_sum_loss.item() == 0.0
+        assert normalizer.item() == 0.0
+        assert torch.count_nonzero(logging["values"]).item() == 0
+        token_sum_loss.backward()
+        assert torch.equal(log_probs.grad, torch.zeros_like(log_probs))
+        return
+
+    expected_final_loss = expected_token_sum / expected_num_tokens
+    final_loss = token_sum_loss / normalizer
     assert torch.allclose(final_loss, expected_final_loss)
 
     first_length = response_lengths[0]
@@ -186,3 +226,65 @@ def test_rloo_unequal_lengths_use_global_token_scalar_and_gradient_oracle(monkey
     final_loss.backward()
     expected_gradient = -(advantages * flat_mask) / expected_num_tokens
     assert torch.allclose(log_probs.grad, expected_gradient)
+
+
+def test_get_responses_cp1_returns_matching_empty_chunks_for_empty_response():
+    args = SimpleNamespace(
+        qkv_format="thd",
+        allgather_cp=False,
+        rollout_temperature=1.0,
+        loss_type="policy_loss",
+    )
+    logits = torch.randn(1, 3, 11, dtype=torch.float32)
+    tokens = torch.tensor([3, 5, 7])
+
+    chunks = list(
+        loss_module.get_responses(
+            logits,
+            args=args,
+            unconcat_tokens=[tokens],
+            total_lengths=[3],
+            response_lengths=[0],
+            dynamic_cp_size=1,
+            dynamic_cp_rank=0,
+        )
+    )
+
+    assert len(chunks) == 1
+    logits_chunk, tokens_chunk = chunks[0]
+    assert logits_chunk.shape == (0, 11)
+    assert tokens_chunk.shape == (0,)
+
+
+def test_zero_token_metrics_reject_nonzero_numerator():
+    with pytest.raises(RuntimeError, match="nonzero numerator.*pg_loss"):
+        loss_module.normalize_reduced_loss_metrics(["loss", "pg_loss"], [0.0, 0.0, 1.0])
+
+
+@pytest.mark.parametrize("is_dummy", [False, True])
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_loss_function_exports_effective_tokens_independent_of_metric_denominator(
+    monkeypatch, is_dummy, calculate_per_token_loss
+):
+    monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
+    args = SimpleNamespace(
+        mtp_only_training=True,
+        calculate_per_token_loss=calculate_per_token_loss,
+        qkv_format="thd",
+        recompute_loss_function=False,
+        allgather_cp=False,
+        global_batch_size=1,
+    )
+    batch = {
+        "total_lengths": [4],
+        "response_lengths": [3],
+        "loss_masks": [torch.tensor([1.0, 0.0, 1.0])],
+        "dynamic_cp_size": 1,
+        "dynamic_cp_rank": 0,
+        "__is_dummy__": is_dummy,
+    }
+
+    _, _, logging = loss_module.loss_function(args, batch, 1, torch.ones(1, requires_grad=True))
+
+    assert logging["num_tokens"].item() == (0 if is_dummy else 2)
+    assert logging["values"][0].item() == (2 if calculate_per_token_loss and not is_dummy else 0)

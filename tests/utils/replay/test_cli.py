@@ -1,11 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""CLI entry point tests.
-
-Happy-path replay, sample/batch selection and PR #65 localization are covered
-by the runner tests. This module only checks argv wiring, exit codes and the
---step resolver unique to the CLI.
-"""
+"""CLI entry point tests."""
 
 from __future__ import annotations
 
@@ -35,7 +30,7 @@ def test_cli_validate_invalid(tmp_path):
 
 
 def test_cli_replay_divergent(tmp_path):
-    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle", pr65_bug=True)
+    bundle, _, _ = build_grpo_bundle(tmp_path / "bundle", corrupt="reward")
     assert main(["replay", str(bundle)]) == 1
 
 

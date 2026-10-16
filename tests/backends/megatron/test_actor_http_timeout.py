@@ -70,7 +70,7 @@ def test_run_step_evaluation_probes_carry_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod, "get_serve_url", lambda *_a, **_k: "http://svc:0")
     monkeypatch.setattr(actor_mod.requests, "get", _record_get(calls))
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
-    monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    monkeypatch.setattr(actor_mod, "is_offline_mode", lambda _args: False)
 
     shell = _shell()
     shell.args = Namespace(rollout_http_timeout=17.0)
@@ -106,7 +106,7 @@ def test_run_step_evaluation_ends_update_weight_even_if_evaluate_fails(monkeypat
     monkeypatch.setattr(actor_mod, "get_serve_url", lambda *_a, **_k: "http://svc:0")
     monkeypatch.setattr(actor_mod.requests, "get", _get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
-    monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    monkeypatch.setattr(actor_mod, "is_offline_mode", lambda _args: False)
 
     shell = _shell()
     shell.rollout_manager = object()  # non-None -> has_rollout
@@ -125,7 +125,7 @@ def test_run_step_evaluation_swallows_timeout(monkeypatch):
     monkeypatch.setattr(actor_mod, "get_serve_url", lambda *_a, **_k: "http://svc:0")
     monkeypatch.setattr(actor_mod.requests, "get", _timeout_get)
     monkeypatch.setattr(actor_mod.dist, "get_rank", lambda *_a, **_k: 0)
-    monkeypatch.setattr(actor_mod, "is_sft_mode", lambda _args: False)
+    monkeypatch.setattr(actor_mod, "is_offline_mode", lambda _args: False)
 
     shell = _shell()
     shell.rollout_manager = object()

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import argparse
 import asyncio
 import json
@@ -43,6 +45,8 @@ class SlimeRouter:
         self.worker_request_counts: dict[str, int] = {}
         # URL -> Consecutive Failures
         self.worker_failure_counts: dict[str, int] = {}
+        # Distinguish a replacement worker from requests to its previous URL owner.
+        self._worker_generations: dict[str, object] = {}
         # Quarantined workers excluded from routing pool
         self.dead_workers: set[str] = set()
         self.max_weight_version = None
@@ -82,7 +86,9 @@ class SlimeRouter:
         """Setup all the HTTP routes."""
         # sglang-router api
         self.app.post("/add_worker")(self.add_worker)
+        self.app.post("/remove_worker")(self.remove_worker)
         self.app.get("/list_workers")(self.list_workers)
+        self.app.get("/workers")(self.list_worker_records)
         self.app.post("/retrieve_from_text")(self.retrieve_from_text)
         # Catch-all route for proxying to SGLang - must be registered LAST
         self.app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])(self.proxy)
@@ -110,12 +116,15 @@ class SlimeRouter:
                 self._evict_idle_sticky()
 
                 urls = [u for u in self.worker_request_counts if u not in self.dead_workers]
+                generations = {url: self._worker_generations[url] for url in urls}
                 if not urls:
                     continue
 
                 results = await asyncio.gather(*(self._check_worker_health(url) for url in urls))
 
                 for url, is_healthy in results:
+                    if self._worker_generations.get(url) is not generations[url]:
+                        continue
                     if not is_healthy:
                         failures = self.worker_failure_counts.get(url, 0) + 1
                         self.worker_failure_counts[url] = failures
@@ -154,6 +163,7 @@ class SlimeRouter:
         # Forward all other paths to SGLang router
         routing_key = request.headers.get(self.sticky_header) if self.sticky_enabled else None
         worker_url = self._use_url(routing_key)
+        generation = self._worker_generations[worker_url]
         url = f"{worker_url}/{path}"
 
         # Get request body and headers
@@ -195,7 +205,8 @@ class SlimeRouter:
                     await response.aclose()
 
         finally:
-            self._finish_url(worker_url)
+            if self._worker_generations.get(worker_url) is generation:
+                self._finish_url(worker_url)
 
     async def add_worker(self, request: Request):
         """Add a new worker to the router.
@@ -218,14 +229,38 @@ class SlimeRouter:
                 status_code=400, content={"error": "worker_url is required (use query ?url=... or JSON body)"}
             )
 
-        # Add if new, keep a simple request count per worker
-        if worker_url not in self.worker_request_counts:
-            self.worker_request_counts[worker_url] = 0
-            self.worker_failure_counts[worker_url] = 0
-            if self.verbose:
-                print(f"[slime-router] Added new worker: {worker_url}")
+        self._remove_worker_state(worker_url)
+        self.worker_request_counts[worker_url] = 0
+        self.worker_failure_counts[worker_url] = 0
+        self._worker_generations[worker_url] = object()
+        if self.verbose:
+            logger.info(f"[slime-router] Registered worker: {worker_url}")
 
         return {"status": "success", "worker_urls": self.worker_request_counts}
+
+    def _remove_worker_state(self, worker_url: str) -> None:
+        self.worker_request_counts.pop(worker_url, None)
+        self.worker_failure_counts.pop(worker_url, None)
+        self._worker_generations.pop(worker_url, None)
+        self.dead_workers.discard(worker_url)
+        for key in [key for key, entry in self.sticky_map.items() if entry[0] == worker_url]:
+            del self.sticky_map[key]
+
+    async def remove_worker(self, request: Request) -> JSONResponse:
+        """Synchronously unregister a worker; repeated removal is harmless."""
+        worker_url = request.query_params.get("url") or request.query_params.get("worker_url")
+        if not worker_url:
+            body = await request.body()
+            payload = json.loads(body) if body else {}
+            worker_url = payload.get("url") or payload.get("worker_url")
+        if not worker_url:
+            return JSONResponse(status_code=400, content={"error": "worker_url is required"})
+        self._remove_worker_state(worker_url)
+        return JSONResponse(content={"status": "success", "worker_urls": self.worker_request_counts})
+
+    async def list_worker_records(self, request: Request) -> dict:
+        """Support the engine's unregister completion polling protocol."""
+        return {"workers": [{"url": url} for url in self.worker_request_counts]}
 
     async def list_workers(self, request: Request):
         """List all registered workers."""

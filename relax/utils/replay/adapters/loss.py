@@ -3,7 +3,7 @@
 """Policy-loss replay adapter.
 
 Reuses compute_policy_loss and restates CP=1 sum_of_sample_mean (per-sample
-masked mean, then summed). KL-loss, OPD and TIS are out of V1.
+masked mean, then summed). KL-loss, OPD and TIS are out of V2.
 """
 
 from __future__ import annotations

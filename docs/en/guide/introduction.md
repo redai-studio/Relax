@@ -59,6 +59,28 @@ Unlike traditional VLM single-turn QA, **Agentic VLM** achieves closed-loop iter
 - **Flexible termination conditions**: Supports combinations of three termination mechanisms: `max_turns` (maximum interaction turns), token budget (truncate when available token budget is exhausted), and `env done` (environment signals task completion)
 - **Typical Application**: DeepEyes task—Agentic Multi-Turn GRPO Training using Qwen3-VL-30B-A3B
 
+## Model Configurations and Examples
+
+The following models have configurations or integration code in this repository. Training modes and constraints are described by the linked scripts and guides; model configurations are collected in [`scripts/models/`](../../../scripts/models/).
+
+| Model | Scope | Configuration / guide |
+|---|---|---|
+| Qwen2.5 | Text | [7B](../../../scripts/models/qwen25-7B.sh) |
+| Qwen3 | Text | [0.6B](../../../scripts/models/qwen3-0.6B.sh), [1.7B](../../../scripts/models/qwen3-1.7B.sh), [4B](../../../scripts/models/qwen3-4B.sh), [8B](../../../scripts/models/qwen3-8B.sh), [32B](../../../scripts/models/qwen3-32B.sh), [30B-A3B](../../../scripts/models/qwen3-30B-A3B.sh) |
+| GLM4.7 | Text | [30B-A3B](../../../scripts/models/glm4.7-30B-A3B.sh) |
+| GLM5 | Text | [744B-A40B](../../../scripts/models/glm5-744B-A40B.sh) |
+| DeepSeek-V4-Flash | Text | [Flash](../../../scripts/models/deepseek-v4-flash.sh) |
+| Gemma4 | Text recipes | [26B-A4B](../../../scripts/models/gemma4-26B.sh), [31B](../../../scripts/models/gemma4-31B.sh) |
+| Qwen3-VL | Vision + language | [2B](../../../scripts/models/qwen3-vl-2B.sh), [4B](../../../scripts/models/qwen3-vl-4B.sh), [8B](../../../scripts/models/qwen3-vl-8B.sh), [30B-A3B](../../../scripts/models/qwen3-vl-30B-A3B.sh) |
+| Qwen3.5 | Vision + language | [4B](../../../scripts/models/qwen35-4B.sh), [9B](../../../scripts/models/qwen35-9B.sh), [27B](../../../scripts/models/qwen35-27B.sh), [35B-A3B](../../../scripts/models/qwen35-35B-A3B.sh), [122B-A10B](../../../scripts/models/qwen35-122B-A10B.sh), [397B-A17B](../../../scripts/models/qwen35-397B-A17B.sh) |
+| Qwen3.6 | Vision + language | [27B](../../../scripts/models/qwen36-27B.sh), [35B-A3B](../../../scripts/models/qwen36-35B-A3B.sh) |
+| Qwen3.8 | Vision + language | [27B](../../../scripts/models/qwen38-27B.sh) |
+| Kimi K2.6 | Vision + language | [K2.6](../../../scripts/models/kimi-k2.6.sh) |
+| Kimi K3 | Multimodal full-parameter / LoRA SFT and export | [K3](../../../scripts/models/kimi-k3.sh) · [Training and export guide](../../../examples/models/kimi-k3/README.md) |
+| dots.mocr | OCR / document understanding | [3B](../../../scripts/models/dotsocr2.sh) |
+| Qwen3-Omni | Text + vision + audio | [30B-A3B](../../../scripts/models/qwen3-omni-30B-A3B.sh) |
+| Qwen-Image | Text-to-image diffusion RL | [Training guide](./diffusion-generative-rl.md) |
+
 ## Project Structure
 
 ```

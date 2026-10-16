@@ -472,7 +472,7 @@ ______________________________________________________________________
 | Parameter                     | Type  | Default | Description                                                                       |
 | ----------------------------- | ----- | ------- | --------------------------------------------------------------------------------- |
 | `--scale-in-drain-timeout`    | float | `30`    | Drain timeout (seconds) — force-abort in-flight requests after this duration      |
-| `--scale-in-shutdown-timeout` | float | `20`    | Graceful engine shutdown timeout (seconds) — falls back to `ray.kill` if exceeded |
+| `--scale-in-shutdown-timeout` | float | `30`    | Graceful engine shutdown timeout (seconds) — falls back to `ray.kill` if exceeded |
 
 ### Configuration Example
 

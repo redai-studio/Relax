@@ -5,6 +5,7 @@ import ipaddress
 import json
 import multiprocessing
 import random
+import re
 import socket
 from collections.abc import Iterable
 from urllib.parse import urlsplit
@@ -18,6 +19,51 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 MAX_RETRIES = 6
+
+
+def is_expected_sglang_499(error: httpx.HTTPStatusError) -> bool:
+    """Return whether an HTTP error is SGLang's pre-dispatch abort.
+
+    In SGLang v0.5.17 a ``/generate`` request that is aborted before it reaches
+    the scheduler raises ``RequestAbortedError`` with status ``499`` and body
+    ``{"error": {"message": "Request <rid> was aborted"}}``. Match the full
+    response shape so unrelated gateway/client 499 responses remain visible.
+    """
+    response = error.response
+    if response.status_code != 499:
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        # A non-JSON 499 body (e.g. an nginx "client closed request" page) is not
+        # the SGLang abort contract — keep it visible.
+        return False
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if not isinstance(error, dict):
+        # A gateway 499 whose "error" is a string/list/number is not the SGLang
+        # abort contract — keep it visible rather than crashing on ``.get``.
+        return False
+    message = error.get("message", "")
+    # Anchored full match on SGLang's RequestAbortedError text; <rid> is a single
+    # non-space token. Fail-safe: anything else surfaces as a real error.
+    return isinstance(message, str) and re.fullmatch(r"Request \S+ was aborted", message) is not None
+
+
+def is_router_no_available_workers(error: httpx.HTTPStatusError) -> bool:
+    """Match the router response emitted before a request is dispatched."""
+    if error.response.status_code != 503:
+        return False
+    try:
+        body = error.response.json()
+    except ValueError:
+        return False
+    return (
+        isinstance(body, dict)
+        and isinstance(body.get("error"), dict)
+        and body["error"].get("code") == "no_available_workers"
+    )
 
 
 def find_available_port(base_port: int):
@@ -197,7 +243,7 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
+async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
     retry_count = 0
     while retry_count < max_retries:
         response = None
@@ -215,6 +261,8 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
             if isinstance(e, httpx.HTTPStatusError):
                 response_text = e.response.text
                 status_code = e.response.status_code
+                if fail_fast_no_workers and is_router_no_available_workers(e):
+                    raise
                 is_retryable_http_error = status_code >= 500 or status_code in {408, 409, 425, 429}
                 if not is_retryable_http_error:
                     logger.info(
@@ -239,6 +287,16 @@ async def _post(client, url, payload, max_retries=MAX_RETRIES, headers=None):
         break
 
     return output
+
+
+async def _post_with_error_envelope(
+    client, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False
+):
+    """Carry HTTP errors across Ray without pickling httpx.HTTPStatusError."""
+    try:
+        return 0, await _post(client, url, payload, max_retries, headers, fail_fast_no_workers)
+    except httpx.HTTPStatusError as error:
+        return error.response.status_code, error.response.text
 
 
 def init_http_client(args):
@@ -289,8 +347,10 @@ def _init_ray_distributed_post(args):
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=MAX_RETRIES, headers=None):
-            return await _post(self._client, url, payload, max_retries, headers=headers)
+        async def do_post(self, url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
+            return await _post_with_error_envelope(
+                self._client, url, payload, max_retries, headers, fail_fast_no_workers
+            )
 
     # Create actors per node
     created = []
@@ -314,7 +374,7 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
+async def post(url, payload, max_retries=MAX_RETRIES, headers=None, fail_fast_no_workers=False):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -326,13 +386,26 @@ async def post(url, payload, max_retries=MAX_RETRIES, headers=None):
                 # `min(32, cpu+4)`), which becomes a hard upper bound on the
                 # number of in-flight POSTs that can be waited on in parallel
                 # and produces large tail latencies under high concurrency.
-                obj_ref = actor.do_post.remote(url, payload, max_retries, headers=headers)
-                return await obj_ref
+                obj_ref = actor.do_post.remote(url, payload, max_retries, headers, fail_fast_no_workers)
+                status_code, result = await obj_ref
+                if status_code:
+                    request = httpx.Request("POST", url)
+                    response = httpx.Response(status_code, request=request, text=result)
+                    response.raise_for_status()
+                return result
         except Exception as e:
+            # A reconstructed HTTPStatusError means SGLang (or a gateway) already
+            # returned a real HTTP response for THIS request — it is not a
+            # Ray-actor/transport fault. Do NOT fall back to a local re-send:
+            # that would double the logical attempt and, for an SGLang
+            # pre-dispatch 499, hide the real error the 499 mapping needs to
+            # see. Only transport/actor failures fall back to the local client.
+            if isinstance(e, httpx.HTTPStatusError):
+                raise
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries, headers=headers)
+    return await _post(_http_client, url, payload, max_retries, headers, fail_fast_no_workers)
 
 
 async def get(url, max_retries=MAX_RETRIES):

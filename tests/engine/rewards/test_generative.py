@@ -230,9 +230,9 @@ def test_post_process_keeps_the_raw_reward_on_the_sample():
         s.train_metadata = {"group_index": 0, "trajectory_slot": slot, "manifest": {"outputs": []}}
 
     args = _post_process_args()
-    raw_rewards, advantages = post_process(args, samples)
+    advantages = post_process(args, samples)
 
-    assert raw_rewards == [0.0, 1.0, 2.0, 3.0]
+    raw_rewards = [0.0, 1.0, 2.0, 3.0]
     assert [s.reward for s in samples] == raw_rewards
     assert [s.get_reward_value(SimpleNamespace(reward_key=None)) for s in samples] == raw_rewards
     # The advantage is returned to the caller (it rides the TQ 'advantages'
@@ -272,7 +272,7 @@ def test_post_process_uses_explicit_batch_advantage_mode():
         s.train_metadata = {"group_index": slot // 2, "manifest": {"outputs": []}}
 
     args = _post_process_args(generative_advantage_std_mode="batch")
-    _, advantages = post_process(args, samples)
+    advantages = post_process(args, samples)
 
     expected = float(0.5 / torch.tensor([0.0, 1.0, 2.0, 3.0]).std())
     assert advantages == pytest.approx([-expected, expected, -expected, expected], abs=1e-5)
