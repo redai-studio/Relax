@@ -1,0 +1,20 @@
+dataset:
+  database:
+    backend:
+      type: none
+  max_runner_concurrency: 1
+  cpu_runner_url: null
+  gpu_runner_url: null
+  registry:
+    - module_path: sandbox.datasets.live_code_bench
+      class_name: LiveCodeBenchDataset
+      dataset_tables:
+        live_code_bench_v1: code_eval_live_code_bench_v1
+sandbox:
+  # Isolation is provided by the outer Apptainer instance, including network.
+  isolation: none
+  cleanup_process: false
+  restore_bash: false
+  max_concurrency: 1
+common:
+  logging_color: false

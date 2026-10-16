@@ -1,0 +1,35 @@
+Bootstrap: docker
+From: python:3.12-slim-bookworm
+
+# Build from a directory containing the pinned SandboxFusion checkout.
+# SandboxFusion revision: 469de0845cb7d665bc68044d541aa3aa28c5b30a
+%files
+    SandboxFusion /opt/sandboxfusion
+    sandboxfusion.yaml /opt/sandboxfusion/sandbox/configs/gagar.yaml
+
+%post
+    set -eu
+    python -m venv /opt/grader
+    /opt/grader/bin/pip install --no-cache-dir mini-swe-agent==2.4.1
+    python -m venv /opt/sf
+    /opt/sf/bin/pip install --no-cache-dir 'pydantic>=2.4,<2.7' 'fastapi>=0.103,<0.104' \
+        'uvicorn>=0.25,<0.26' 'structlog>=23.1,<24' 'psutil>=5.9,<6' \
+        'aiofiles>=23.2,<24' 'aiohttp>=3.9,<4' 'tenacity>=8.4,<9' \
+        'databases[aiomysql,aiosqlite]>=0.9,<0.10' 'transformers>=4.44,<5' \
+        'numpy>=2,<3' pyyaml httpx pytest sortedcontainers
+    mkdir -p /opt/relax/examples/gagar /workspace /candidates /input /genrm
+    chmod 1777 /workspace
+
+%environment
+    export PATH=/opt/sf/bin:/usr/local/bin:/usr/bin:/bin
+    export PYTHONPATH=/opt/relax:/opt/sandboxfusion
+    export SANDBOX_CONFIG=gagar
+    export MSWEA_CONFIGURED=true
+    export MSWEA_SILENT_STARTUP=true
+    export OMP_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export PYTHONDONTWRITEBYTECODE=1
+
+%startscript
+    exec sleep infinity
