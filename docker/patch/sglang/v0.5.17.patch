@@ -3530,3 +3530,24 @@ diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers
          get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
  
  
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1137,7 +1137,16 @@
+             else:
+                 assert output.shape == output_shape
+ 
+-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
++            # Variable-size MoE partial sums need FP32 accumulation just like
++            # the fixed-size DP combine. Write back into the original buffer.
++            reduce_input = input_
++            reduce_output = output
++            if input_.dtype == torch.bfloat16:
++                reduce_input = input_.float()
++                reduce_output = torch.empty_like(output, dtype=torch.float32)
++            pynccl_comm.reduce_scatter(reduce_output, reduce_input, sizes=sizes)
++            if reduce_output is not output:
++                output.copy_(reduce_output)
+             return output
+ 
+     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
