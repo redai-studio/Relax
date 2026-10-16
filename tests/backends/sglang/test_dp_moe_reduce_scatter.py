@@ -25,7 +25,14 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
     output = torch.empty((sizes[rank] if variable else rows // dp_size, width), dtype=dtype)
 
     def reduce_scatter(destination, value):
-        assert destination.dtype == value.dtype
+        expected_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
+        assert destination.dtype == value.dtype == expected_dtype
+        assert value.shape == (rows, width)
+        assert destination.shape == (rows // tp_size, width)
+        assert value.numel() == destination.numel() * tp_size
+        torch.testing.assert_close(
+            value, torch.full((rows, width), contribution[rank], dtype=expected_dtype), rtol=0, atol=0
+        )
         # Emulate destination-dependent low-precision cancellation. Accumulator
         # precision comes from the actual tensor supplied to the collective.
         order = [(rank + offset + 1) % tp_size for offset in range(tp_size)]
@@ -37,6 +44,9 @@ def _combine(rank: int, dp_size: int, dtype, *, variable: bool = False):
 
     def all_gather(destination, value):
         assert destination.dtype == value.dtype
+        assert value.shape == (rows // tp_size, width)
+        assert destination.shape == (rows // dp_size, width)
+        assert destination.numel() == value.numel() * (tp_size // dp_size)
         destination.copy_(value.repeat(2, 1))
         calls.append(("all_gather", value.dtype, destination.dtype))
 
