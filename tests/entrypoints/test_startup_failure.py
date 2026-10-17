@@ -3,6 +3,7 @@
 """CPU regressions for startup failure propagation and bounded cleanup."""
 
 import ast
+import asyncio
 import concurrent.futures
 import os
 import signal
@@ -13,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
@@ -381,7 +382,7 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
     assert call.kwargs["args"] == (1,)
 
 
-def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
+def test_controller_partial_startup_cleans_teacher_and_driver_routers(monkeypatch):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
     methods = [
@@ -406,4 +407,46 @@ def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
-    stop_routers.assert_called_once()
+    stop_routers.assert_called_once_with()
+
+
+@pytest.mark.parametrize("manager_fails", [False, True])
+def test_controller_shutdown_cleans_routers_in_both_processes(monkeypatch, manager_fails):
+    tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
+    ]
+    stop_routers = Mock(return_value=1)
+    monkeypatch.setitem(
+        sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
+    )
+    dispose_ref = object()
+    dispose_remote = Mock(return_value=dispose_ref)
+    manager = SimpleNamespace(dispose=SimpleNamespace(remote=dispose_remote))
+    service = SimpleNamespace(get_rollout_manager=AsyncMock(return_value=manager))
+    ray_get = Mock(side_effect=RuntimeError("Manager unavailable") if manager_fails else None)
+    ns = {
+        "logger": Mock(),
+        "ROLES": SimpleNamespace(rollout="rollout"),
+        "asyncio": asyncio,
+        "run": asyncio.run,
+        "ray": SimpleNamespace(get=ray_get),
+        "shutdown_managed_opd_teacher": Mock(),
+    }
+    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
+    controller = SimpleNamespace(
+        serve_dict={"rollout": service},
+        _teacher_manager=None,
+        _shutdown_agentic_rollout_services=Mock(),
+        _cleanup_s3_model_weights_after_init=Mock(),
+    )
+    controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(controller)
+
+    ns["shutdown"](controller)
+
+    dispose_remote.assert_called_once_with()
+    ray_get.assert_called_once_with(dispose_ref, timeout=35.0)
+    stop_routers.assert_called_once_with()
