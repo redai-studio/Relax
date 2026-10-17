@@ -401,7 +401,10 @@ def test_local_recovery_resumes_existing_task_without_restarting_service():
 
 
 @pytest.mark.parametrize("role,global_restart", [("actor", True), ("rollout", True), ("sft", False)])
-def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart):
+def test_recovery_dispatch_signals_only_after_work_finishes(role, global_restart, monkeypatch):
+    from relax.core import registry
+
+    monkeypatch.setattr(registry, "resolve_algorithm", lambda config: {role: object})
     ctrl = controller_fixture()
     roles = SimpleNamespace(**{name: name for name in ("actor", "rollout", "actor_fwd", "critic", "reference")})
     ns = dict(

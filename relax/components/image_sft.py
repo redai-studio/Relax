@@ -6,13 +6,13 @@ from contextlib import suppress
 from typing import Any
 
 import torch
-import transfer_queue as tq
 from ray import serve
 from tensordict import TensorDict
 
 from relax.components.base import Base
 from relax.engine.sft.image import ImageBatchSampler
 from relax.engine.sft.runtime import sft_partition_id, sft_partition_prefix
+from relax.utils.tq.lifecycle import attach_tq_client
 
 
 @serve.deployment
@@ -23,8 +23,8 @@ class ImageSFT(Base):
         self._partition_prefix = sft_partition_prefix(config)
         self.step = getattr(config, "start_rollout_id", 0) or 0
         self.sampler = ImageBatchSampler(config.i2i_sft_config["dataset_size"], config.global_batch_size, config.seed)
-        tq.init(config.tq_config)
-        self.client = tq.get_client()
+        self.data_system_client = attach_tq_client(config.tq_config, role=role)
+        self.client = self.data_system_client
         self._stop_event = asyncio.Event()
         self._run_task: asyncio.Task | None = None
 
