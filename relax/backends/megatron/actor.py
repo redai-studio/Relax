@@ -2094,8 +2094,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if use_indexer_replay:
             IndexerReplay.finish_step(expect_backward=self.args.recompute_granularity == "full")
 
-        # update the cpu actor weight to the latest model
-        if hasattr(self, "weights_backuper"):
+        # Refresh snapshots for rollout sync, model switching, or SFT prediction.
+        if hasattr(self, "weights_backuper") and (
+            not is_sft_mode(self.args)
+            or self.weights_backuper.backup_tags != ["actor"]
+            or self.args.sft_predict_interval is not None
+        ):
             self.weights_backuper.backup("actor")
 
         # Update ref model if needed
