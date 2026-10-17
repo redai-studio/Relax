@@ -126,6 +126,22 @@
 }
 
 /**
+ * Component: MathJax
+ * -------------------------------------------------------------------------- */
+
+/* Keep long inline and display equations scrollable within the text column. */
+.vp-doc mjx-container {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.vp-doc mjx-container[display='true'] {
+  display: block;
+}
+
+/**
  * Component: Medium Zoom
  * -------------------------------------------------------------------------- */
 
