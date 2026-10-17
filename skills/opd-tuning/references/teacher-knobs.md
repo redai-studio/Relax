@@ -259,7 +259,7 @@ teacher 请求是 `max_new_tokens=0` 的**纯 prefill**
 - **Verify**：`grep "Ray runtime env" <log>` —— 要看 **actor** 那一行（job env 会被覆盖）。
   OPD patch 类的变量还可以直接看 engine 启动日志里那行
   `Launching SGLang server with independently-gated patches: ...`。
-- **Skip when**：`TeacherManager` 硬编码转发到 teacher engine 的那几个变量，
+- **Skip when**：`relax/engine/inference/config_adapters.py` 的 `_build_teacher_engine_env` 硬编码转发到 teacher engine 的那几个变量，
   这一跳不用再列 —— 但它们仍然要先到达 driver，`ray job submit` 那层照样要管。
 
 ## R-T10 — `--teacher-sglang-max-running-requests` 与客户端并发

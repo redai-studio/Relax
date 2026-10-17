@@ -9,6 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+from relax.engine.inference.placement import PlacementBinding
 from relax.utils.env import Envs
 from relax.utils.utils import get_ray_accelerator_kwargs
 
@@ -68,7 +69,8 @@ class RayTrainGroup:
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
-        pg, reordered_bundle_indices, _reordered_gpu_ids = pg
+        binding = PlacementBinding.require(pg)
+        pg, reordered_bundle_indices = binding.pg, binding.bundle_indices
 
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
@@ -194,8 +196,10 @@ class RayTrainGroup:
     def clear_memory(self):
         ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
 
-    def set_rollout_manager(self, rollout_manager: Any):
-        ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
+    def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any):
+        ray.get(
+            [actor.set_rollout_handles.remote(rollout_worker, inference_manager) for actor in self._actor_handlers]
+        )
 
     def set_genrm_manager(self, genrm_manager: Any):
         """Set the genRM manager for coordinated offload/onload.

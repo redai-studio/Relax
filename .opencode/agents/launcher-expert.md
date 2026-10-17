@@ -48,14 +48,15 @@ Relax 的服务编排、部署生命周期、资源分配和健康管理。For p
 
 Colocate 模式：共享 PG + sleep/wake 机制切换训练/推理，需 `--offload-train`.
 
-## RolloutManager
+## 推理控制面
 
-位置: `relax/distributed/ray/rollout.py`
-
-管理 SGLang 推理引擎：
-
-- 引擎类型: `regular` · `prefill` · `decode` · `placeholder`
-- 生命周期: 启动 SGLang → 健康探测 → 生成样本 → 权重更新 → 可选重启/缩放
+- `InferenceManager`（`relax/distributed/ray/inference_manager.py`）：每个任务一个、钉在 head 节点的 CPU Ray Actor，
+  持有 Rollout / GenRM / Teacher 的引擎池、服务发现快照、请求准入与生命周期（`activate` · `drain` · `deactivate` · `shutdown`）
+- `RolloutEnginePool`（`relax/distributed/ray/rollout.py`）：Manager 内的 Rollout 引擎池
+  - 引擎类型: `regular` · `prefill` · `decode` · `placeholder`
+  - 生命周期: 启动 SGLang → 健康探测 → 权重更新 → 可选重启/缩放
+- `RolloutWorker`（`relax/distributed/ray/rollout_worker.py`）：承载生成、评估与 rollout 数据流，通过 Manager 访问引擎
+- `InferenceGateway`（`relax/components/inference_gateway.py`）：各角色的 `/<role>` 入口，`GET /engines` 默认返回 v2 服务发现格式
 
 关联: `relax/distributed/ray/actor_group.py` (`RayTrainGroup`)
 
@@ -65,12 +66,12 @@ Colocate 模式：共享 PG + sleep/wake 机制切换训练/推理，需 `--offl
 
 - 周期性 ping 所有已注册服务
 - 不健康时触发 `on_unhealthy` 回调自动恢复
-- RolloutManager 使用 `concurrency_groups` 隔离健康检查 RPC
+- `InferenceManager` 用 `concurrency_groups={"rollout": 8}` 隔离 rollout 操作与生命周期 RPC
 
 ## 数据管道
 
 ```
-RolloutDataSource → RolloutManager → SGLang → 奖励计算
+RolloutDataSource → RolloutWorker → (InferenceManager) SGLang → 奖励计算
   → TransferQueueController → SimpleStorageUnit
     → TransferQueueClient → TrainRayActor
 ```
@@ -98,7 +99,9 @@ RolloutDataSource → RolloutManager → SGLang → 奖励计算
 | `relax/core/service.py` | Service 生命周期 + PG |
 | `relax/components/` | Actor / Rollout / GenRM 等实现 |
 | `relax/utils/health_system.py` | 健康监控 |
-| `relax/distributed/ray/rollout.py` | RolloutManager |
+| `relax/distributed/ray/inference_manager.py` | InferenceManager |
+| `relax/distributed/ray/rollout.py` | RolloutEnginePool |
+| `relax/distributed/ray/rollout_worker.py` | RolloutWorker |
 | `relax/distributed/ray/actor_group.py` | RayTrainGroup |
 | `relax/distributed/ray/placement_group.py` | PG 工具 |
 | `transfer_queue/` | 分布式数据管道 |

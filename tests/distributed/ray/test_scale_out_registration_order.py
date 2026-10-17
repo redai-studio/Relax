@@ -10,7 +10,12 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import EngineFinalizeResult, ScaleOutRequest, ScaleOutStatus
+    from relax.distributed.ray.rollout import (
+        EngineFinalizeResult,
+        PlacementOwner,
+        ScaleOutRequest,
+        ScaleOutStatus,
+    )
     from relax.utils.scale_utils import ScaleOutFailure, ScaleOutFailureCategory
 
     HAS_DEPS = True
@@ -66,7 +71,7 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -92,6 +97,50 @@ async def test_ray_native_finalizer_failure_rolls_back_precreated_group():
 
 
 @pytest.mark.asyncio
+async def test_ray_native_replica_uses_manager_owned_planned_slice():
+    manager = create_test_manager()
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._finalize_engine_group_registration = AsyncMock(
+        return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
+    )
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    created = {}
+
+    def make_group(**kwargs):
+        created.update(kwargs)
+        group = SimpleNamespace(engines=[make_mock_engine()], all_engines=[make_mock_engine()])
+        group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
+        return group
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=make_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=1,
+            gpus_per_engine=1,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is False
+    assert created["pg_owner"] is PlacementOwner.MANAGER
+    assert created["placement"].reserved_size == 1
+    assert created["placement"].referenced_offsets == (0,)
+
+
+@pytest.mark.asyncio
 async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
     args = make_mock_args(num_gpus_per_node=8, rollout_num_gpus_per_engine=16)
     manager = create_test_manager(args=args)
@@ -111,7 +160,10 @@ async def test_ray_native_multinode_replica_allocates_one_slot_per_actor():
     manager._finalize_engine_group_registration = AsyncMock(return_value=EngineFinalizeResult(True, group=group))
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    # Two nodes of eight GPUs, probed bundle by bundle.
+    info_actor.get_ip_gpu_and_node_id.remote.side_effect = [
+        AwaitableValue((f"10.0.0.{index // 8 + 1}", index % 8, f"node-{index // 8}")) for index in range(16)
+    ]
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -155,7 +207,7 @@ async def test_ray_native_scale_out_inherits_canonical_model_override():
     manager = create_test_manager(args=args, servers={"default": server})
     request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
     engine = make_mock_engine()
-    group = SimpleNamespace(engines=[engine])
+    group = SimpleNamespace(engines=[engine], all_engines=[engine])
     group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
     manager._finalize_engine_group_registration = AsyncMock(
         return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
@@ -163,7 +215,7 @@ async def test_ray_native_scale_out_inherits_canonical_model_override():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("192.0.2.2", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("192.0.2.2", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -291,7 +343,7 @@ async def test_engine_init_timeout_propagates_as_provision_timeout():
     manager._rollback_engines = AsyncMock()
 
     info_actor = MagicMock()
-    info_actor.get_ip_and_gpu_id.remote.return_value = AwaitableValue(("10.0.0.1", 0))
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
     info_actor_class = MagicMock()
     info_actor_class.options.return_value.remote.return_value = info_actor
 
@@ -390,3 +442,275 @@ def test_error_message_is_bounded_and_scrubbed():
     assert "and 3 more" in msg
     # Stable category prefixes are surfaced.
     assert "weight sync failed" in msg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["finalize", "no_handles", "unexpected"])
+async def test_ray_native_failed_replica_releases_its_planned_slice(failure):
+    """The caller removes a failed replica's placement group; its ledger entry
+    must not outlive it."""
+    manager = create_test_manager()
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._finalize_engine_group_registration = AsyncMock(
+        return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
+    )
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    planned = []
+
+    def make_group(**kwargs):
+        planned.append(kwargs["placement"])
+        group = SimpleNamespace(engines=[make_mock_engine()], all_engines=[make_mock_engine()])
+        if failure == "no_handles":
+            group.start_engines = MagicMock(return_value=([], {}))
+        elif failure == "unexpected":
+            group.start_engines = MagicMock(side_effect=RuntimeError("actor creation failed"))
+        else:
+            group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
+        return group
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", side_effect=make_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=1,
+            gpus_per_engine=1,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is False
+    assert len(planned) == 1
+    assert manager._planner.allocations() == ()
+    manager._rollback_engines.assert_awaited_once()
+
+
+# ============== rollback that cannot confirm the engines stopped ============
+
+
+@pytest.mark.asyncio
+async def test_rollback_confirms_only_engines_that_stopped():
+    import ray
+
+    from relax.distributed.ray.rollout import EngineGroup
+
+    manager = create_test_manager()
+    stuck, dead, killed, clean = (make_mock_engine() for _ in range(4))
+    for engine in (stuck, killed):
+        engine.shutdown.remote.side_effect = RuntimeError("timeout")
+    dead.shutdown.remote.side_effect = ray.exceptions.RayActorError()
+    group = MagicMock(spec=EngineGroup)
+    group.all_engines = [stuck, dead, killed, clean]
+
+    with patch(
+        "relax.distributed.ray.rollout.ray.kill",
+        side_effect=lambda engine: (_ for _ in ()).throw(RuntimeError("kill failed")) if engine is stuck else None,
+    ):
+        stopped = await manager._rollback_engines(group)
+
+    assert stopped is False
+    # Only the engine that is neither shut down, dead nor killed keeps its slot.
+    assert group.all_engines == [stuck, None, None, None]
+
+
+async def _strand_one_replica(manager, pg):
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._finalize_engine_group_registration = AsyncMock(
+        return_value=EngineFinalizeResult(False, reason=ScaleOutFailure(ScaleOutFailureCategory.WEIGHT_SYNC_FAILED))
+    )
+    manager._rollback_engines = AsyncMock(return_value=False)
+    info_actor = MagicMock()
+    info_actor.get_ip_gpu_and_node_id.remote.return_value = AwaitableValue(("10.0.0.1", 0, "node-0"))
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    group = SimpleNamespace(engines=[make_mock_engine()], all_engines=[make_mock_engine()])
+    group.start_engines = MagicMock(return_value=([AwaitableValue(None)], {}))
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", return_value=group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=pg,
+            replica_idx=0,
+            num_gpus=1,
+            gpus_per_engine=1,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+    assert result.success is False
+    # The tests drive retries themselves; the background one is tested apart.
+    manager._stop_stranded_retry()
+    return group
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_rollback_keeps_the_slice_group_and_placement_group():
+    manager = create_test_manager()
+    pg = object()
+
+    group = await _strand_one_replica(manager, pg)
+
+    (held,) = manager._planner.allocations()
+    assert manager._stranded_replicas == [(group, held, pg)]
+    # The scale-out caller leaves a stranded replica's placement group alone.
+    with patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg:
+        manager._remove_replica_pg(pg)
+        manager._remove_replica_pg(object())
+    assert remove_pg.call_count == 1 and remove_pg.call_args.args[0] is not pg
+
+
+@pytest.mark.asyncio
+async def test_stranded_replica_is_given_back_once_a_retry_stops_it():
+    manager = create_test_manager()
+    pg = object()
+    group = await _strand_one_replica(manager, pg)
+
+    with patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg:
+        assert await manager.retry_stranded_replicas() == 1
+        assert len(manager._planner.allocations()) == 1 and manager._stranded_replicas
+        remove_pg.assert_not_called()
+
+        manager._rollback_engines = AsyncMock(return_value=True)
+        assert await manager.retry_stranded_replicas() == 0
+
+    manager._rollback_engines.assert_awaited_once_with(group)
+    assert manager._planner.allocations() == () and manager._stranded_replicas == []
+    remove_pg.assert_called_once_with(pg)
+
+
+@pytest.mark.asyncio
+async def test_stranded_replica_falls_back_to_placement_group_removal_only_at_shutdown():
+    manager = create_test_manager()
+    pg = object()
+    await _strand_one_replica(manager, pg)
+
+    with patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg:
+        assert await manager.retry_stranded_replicas(final=True) == 1
+
+    remove_pg.assert_called_once_with(pg)
+    assert manager._planner.allocations() == () and manager._stranded_replicas == []
+
+
+def test_rollout_role_shutdown_stops_its_models_then_reports_stranded_replicas():
+    from relax.distributed.ray.inference_manager import InferenceManager
+    from relax.engine.inference.config import InferenceModelSpec
+    from relax.engine.inference.types import Role
+
+    manager = InferenceManager()
+    stopped = []
+    model = SimpleNamespace(
+        model_spec=InferenceModelSpec("default", "/tmp/policy"), shutdown=lambda planner: stopped.append("default")
+    )
+    manager.register(Role.ROLLOUT, {"default": model}, observe=False)
+    pool = MagicMock()
+    pool.retry_stranded_replicas = AsyncMock(return_value=1)
+    manager._rollout_pool = pool
+
+    with pytest.raises(RuntimeError, match="1 scale-out replicas of rollout could not be confirmed stopped"):
+        manager.shutdown(Role.ROLLOUT)
+
+    pool.retry_stranded_replicas.assert_awaited_once_with(final=True)
+    assert stopped == ["default"] and Role.ROLLOUT not in manager.registered_roles()
+
+
+@pytest.mark.asyncio
+async def test_stranded_replica_is_retried_in_the_background_until_it_stops(monkeypatch):
+
+    from relax.distributed.ray import rollout as rollout_module
+
+    monkeypatch.setattr(rollout_module, "STRANDED_RETRY_INTERVAL_S", 0.01)
+    manager = create_test_manager()
+    pg = object()
+    await _strand_one_replica(manager, pg)
+    attempts = []
+
+    async def rollback(group):
+        attempts.append(group)
+        return len(attempts) > 1
+
+    manager._rollback_engines = rollback
+    with patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg:
+        manager._strand(manager._stranded_replicas.pop())
+        thread = manager._stranded_retry_thread
+        thread.join(5.0)
+
+    # No scaling request was needed: the retry gave the replica back and quit.
+    assert not thread.is_alive() and manager._stranded_retry_thread is None
+    assert len(attempts) == 2 and manager._stranded_replicas == []
+    assert manager._planner.allocations() == ()
+    remove_pg.assert_called_once_with(pg)
+
+
+def test_stop_monitors_stops_the_stranded_replica_retry(monkeypatch):
+    from relax.distributed.ray import rollout as rollout_module
+
+    monkeypatch.setattr(rollout_module, "STRANDED_RETRY_INTERVAL_S", 3600.0)
+    manager = create_test_manager()
+    manager._stop_eviction_monitor = MagicMock()
+    manager._strand((MagicMock(), MagicMock(), object()))
+    thread = manager._stranded_retry_thread
+    assert thread.is_alive()
+
+    manager.stop_monitors()
+
+    assert not thread.is_alive() and manager._stranded_retry_thread is None
+    # The replica stays for the final retry at role shutdown.
+    assert len(manager._stranded_replicas) == 1
+
+
+@pytest.mark.asyncio
+async def test_ray_native_replica_with_a_bad_binding_starts_no_engine():
+    """A replica whose TP2 slot lands on two nodes is refused at planning;
+    nothing is reserved and the caller still owns the placement group."""
+    manager = create_test_manager()
+    server = make_rollout_server()
+    request = ScaleOutRequest(request_id="test", status=ScaleOutStatus.CREATING)
+    manager._rollback_engines = AsyncMock()
+
+    info_actor = MagicMock()
+    info_actor.get_ip_gpu_and_node_id.remote.side_effect = [
+        AwaitableValue(("10.0.0.1", 0, "node-a")),
+        AwaitableValue(("192.0.2.2", 0, "node-b")),
+    ]
+    info_actor_class = MagicMock()
+    info_actor_class.options.return_value.remote.return_value = info_actor
+    engine_group = MagicMock()
+
+    with (
+        patch("relax.distributed.ray.rollout.EngineGroup", engine_group),
+        patch("relax.distributed.ray.rollout.ray.kill"),
+    ):
+        result = await manager._bring_up_single_replica(
+            request=request,
+            srv=server,
+            pg=object(),
+            replica_idx=0,
+            num_gpus=2,
+            gpus_per_engine=2,
+            engine_offset=1,
+            sort_key=lambda item: item,
+            InfoActor=info_actor_class,
+        )
+
+    assert result.success is False
+    assert "spans nodes" in result.reason.detail
+    engine_group.assert_not_called()
+    manager._rollback_engines.assert_not_awaited()
+    assert manager._planner.allocations() == ()
+    assert manager._stranded_replicas == []

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import asyncio
 import threading
 
@@ -44,10 +46,25 @@ def shutdown_async_loop(timeout: float = 5.0):
     if async_loop is None:
         return
     inst = async_loop
-    async_loop = None
+    if inst._thread is threading.current_thread():
+        raise RuntimeError("The async loop must be shut down from another thread")
     loop = inst.loop
+
+    async def drain() -> None:
+        tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Complete cancellation callbacks before stopping, including the Future
+    # awaited by run() in the training thread.
+    asyncio.run_coroutine_threadsafe(drain(), loop).result(timeout=timeout)
     loop.call_soon_threadsafe(loop.stop)
     inst._thread.join(timeout=timeout)
+    if inst._thread.is_alive():
+        raise TimeoutError("The async loop did not stop before Ray shutdown")
+    loop.close()
+    async_loop = None
 
 
 def run(coro):

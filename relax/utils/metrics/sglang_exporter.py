@@ -40,35 +40,45 @@ class _Snapshot:
 
 
 def _discover_engines(data: dict[str, Any]) -> tuple[list[_Engine], bool]:
-    """Validate discovery; an incomplete observation is never a healthy empty
-    pool."""
+    """Validate v2 discovery; an incomplete observation is never a healthy
+    empty pool."""
     models = data["models"]
     observation = data["observation"]
-    if not isinstance(models, dict) or not isinstance(observation, dict):
+    if data.get("schema_version") != 2 or not isinstance(models, dict) or not isinstance(observation, dict):
         raise ValueError("Invalid engine discovery response")
     complete, issues = observation["complete"], observation["issues"]
     if type(complete) is not bool or not isinstance(issues, list) or complete != (not issues):
         raise ValueError("Invalid engine observation")
 
     engines: dict[str, _Engine] = {}
+
+    def add(model: str, engine: Any, worker_type: Any) -> None:
+        if not isinstance(engine, dict):
+            raise ValueError("Invalid engine")
+        # Only head nodes publish a base_url; dead replicas are not scraped.
+        if engine.get("state") == "dead" or not engine.get("base_url"):
+            return
+        url = engine["base_url"].rstrip("/")
+        address = urlsplit(url)
+        if address.scheme not in ("http", "https") or not address.hostname or address.username:
+            raise ValueError("Invalid engine URL")
+        if not isinstance(worker_type, str):
+            raise ValueError("Invalid engine worker type")
+        engines.setdefault(url, _Engine(url, model, worker_type))
+
     for model, info in models.items():
-        if not isinstance(info["engine_groups"], list):
-            raise ValueError("Invalid engine groups")
-        for group in info["engine_groups"]:
-            if not isinstance(group["engines"], list):
-                raise ValueError("Invalid engines")
-            for engine in group["engines"]:
-                # Multi-node engines expose HTTP only on node_rank 0.
-                if engine.get("status") != "active" or not engine.get("url"):
-                    continue
-                url = engine["url"].rstrip("/")
-                address = urlsplit(url)
-                if address.scheme not in ("http", "https") or not address.hostname or address.username:
-                    raise ValueError("Invalid engine URL")
-                worker_type = group.get("worker_type", "regular")
-                if not isinstance(worker_type, str):
-                    raise ValueError("Invalid engine worker type")
-                engines.setdefault(url, _Engine(url, model, worker_type))
+        if not isinstance(info["engines"], list) or not isinstance(info.get("pd_workers", []), list):
+            raise ValueError("Invalid engines")
+        router_url = (info.get("router_url") or "").rstrip("/")
+        pd_workers = info.get("pd_workers", [])
+        for engine in info["engines"]:
+            # A PD model publishes its Router as one service replica; its
+            # SGLang servers are the PD workers below.
+            if pd_workers and isinstance(engine, dict) and (engine.get("base_url") or "").rstrip("/") == router_url:
+                continue
+            add(model, engine, "regular")
+        for worker in pd_workers:
+            add(model, worker, worker.get("worker_type") if isinstance(worker, dict) else None)
     return list(engines.values()), complete
 
 

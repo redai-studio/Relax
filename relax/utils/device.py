@@ -299,6 +299,19 @@ def get_visible_devices_env_var() -> str:
     return _spec(_current_accelerator()).visible_devices_env
 
 
+def visible_device_index(device_id: int) -> int:
+    """The index a process inheriting this one's visible devices addresses
+    ``device_id`` by, the way the SGLang engine maps its base GPU.
+
+    Without a visible-devices list the index is the device ID itself.
+    """
+    value = get_visible_devices()
+    if not value:
+        return device_id
+    visible = [int(item) for item in value.split(",") if item.strip()]
+    return visible.index(device_id) if device_id in visible else device_id
+
+
 def get_visible_devices() -> Optional[str]:
     """Return the value of the visible-devices environment variable, or
     None."""

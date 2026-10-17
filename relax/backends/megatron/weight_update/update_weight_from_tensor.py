@@ -16,6 +16,7 @@ from ray.actor import ActorHandle
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
+from relax.utils.colocate_alignment import ColocateAlignmentError, check_colocate_alignment, local_device_identity
 from relax.utils.device import make_current_torch_device
 from relax.utils.distributed_utils import get_gloo_group
 from relax.utils.logging_utils import get_logger
@@ -40,6 +41,15 @@ from .update_weight_from_distributed import (
 
 
 logger = get_logger(__name__)
+
+
+def _shares_training_gpus(args: Any) -> bool:
+    """Whether same-node engines run on their training ranks' own GPUs.
+
+    Hybrid gives rollout its own GPUs and hands weights to them over CUDA IPC
+    across GPUs, so only plain colocation must pair ranks with engines by GPU.
+    """
+    return not getattr(args, "hybrid", False)
 
 
 class UpdateWeightFromTensor:
@@ -135,9 +145,13 @@ class UpdateWeightFromTensor:
             for info in ray.get([engine.get_pid_and_node_id.remote() for engine in rollout_engines])
         ]
         local_actor_node_id = ray.get_runtime_context().get_node_id()
-        gathered_actor_node_ids: list[str | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered_actor_node_ids, local_actor_node_id, group=get_gloo_group())
-        actor_node_id_set = {nid for nid in gathered_actor_node_ids if nid}
+        local_device = (
+            local_actor_node_id,
+            local_device_identity(device_utils.get_torch_device_module().current_device()),
+        )
+        gathered_actor_devices: list[tuple[str, str] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_actor_devices, local_device, group=get_gloo_group())
+        actor_node_id_set = {device[0] for device in gathered_actor_devices if device and device[0]}
 
         colocate_engine_nums = 0
         for engine_node_id in engine_node_ids:
@@ -174,6 +188,13 @@ class UpdateWeightFromTensor:
 
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
+        if _shares_training_gpus(self.args):
+            self._check_colocate_alignment(
+                gathered_actor_devices,
+                rollout_engines[:colocate_engine_nums],
+                colocate_gpu_offsets,
+                colocate_gpu_counts,
+            )
 
         if self._route_experts:
             placement = (tuple(colocate_gpu_offsets), tuple(colocate_gpu_counts))
@@ -229,6 +250,30 @@ class UpdateWeightFromTensor:
             end = start + colocate_gpu_counts[i]
             if start <= dist.get_rank() < end:
                 self._ipc_engine = engine
+
+    @staticmethod
+    def _check_colocate_alignment(
+        rank_devices: Sequence[tuple[str, str]],
+        engines: Sequence[ActorHandle],
+        offsets: Sequence[int],
+        counts: Sequence[int],
+    ) -> None:
+        """Refuse to build IPC groups unless each colocated engine's workers
+        sit on its training ranks' GPUs.
+
+        Runs on every connect, never per sync. Every rank sees the same
+        gathered devices and engine reports, so every rank raises together.
+        """
+        if not engines:
+            return
+        identities = ray.get([engine.get_device_identity.remote() for engine in engines])
+        problems, unverified = check_colocate_alignment(rank_devices, identities, offsets, counts)
+        if problems:
+            raise ColocateAlignmentError(
+                "Colocated weight sync would pair training ranks with engines on other GPUs: " + "; ".join(problems)
+            )
+        if unverified and dist.get_rank(group=get_gloo_group()) == 0:
+            logger.warning(f"Colocated engines {unverified} report no devices; their GPU alignment is unchecked")
 
     @torch.no_grad()
     def update_weights(self) -> None:

@@ -38,7 +38,7 @@ BaseDataset (ABC)
 │                                                           │                 │
 │                                                           ▼                 │
 │                      ┌─────────────────────────────────────────────────┐    │
-│                      │           RolloutManager.generate()             │    │
+│                      │           RolloutWorker.generate()              │    │
 │                      │   - get_samples(num_samples)                    │    │
 │                      │   - Iterates until rollout_batch_size reached   │    │
 │                      └─────────────────────────────────────────────────┘    │

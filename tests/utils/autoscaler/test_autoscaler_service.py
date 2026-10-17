@@ -14,8 +14,8 @@ from relax.utils.autoscaler.metrics_collector import AggregatedMetrics
 from relax.utils.autoscaler.scaling_decision import ScalingAction, ScalingDecision, ScalingDecisionEngine
 
 
-# Underlying class behind the @serve.deployment decorator.
-_ServiceCls = getattr(AutoscalerService, "func_or_class", AutoscalerService)
+# Business class beneath Serve's ASGI wrapper; these tests do not run ASGI.
+_ServiceCls = AutoscalerService.func_or_class.__bases__[0]
 
 
 class _FakeResp:
@@ -372,6 +372,58 @@ def test_fetch_engines_multinode_counts_logical_engines_only():
     assert observation == {"complete": True, "issues": []}
     assert [e["id"] for e in engines] == ["engine_0", "engine_2"]
     assert len(engines) == 2  # logical engines, NOT 4 physical node actors
+
+
+def _v2_payload(engines, issues=()):
+    return {
+        "schema_version": 2,
+        "models": {"default": {"engines": engines}},
+        "observation": {"complete": not issues, "issues": list(issues)},
+    }
+
+
+def test_fetch_engines_requests_and_reads_v2_discovery():
+    payload = _v2_payload(
+        [
+            {"engine_id": "default/replica-0", "base_url": "http://e0", "state": "ready"},
+            {"engine_id": "default/replica-1", "base_url": "http://e1", "state": "dead"},
+            {"engine_id": "default/replica-2", "base_url": None, "state": "starting"},
+            {"engine_id": "default/replica-3", "base_url": "http://e3", "state": "starting"},
+        ]
+    )
+    session = _FakeSession(get_payload=payload)
+
+    engines, observation = asyncio.run(_service(session)._fetch_engines())
+
+    assert session.get_urls == ["http://rollout/engines?schema_version=2"]
+    assert observation == {"complete": True, "issues": []}
+    assert [(e["id"], e["url"], e["status"]) for e in engines] == [
+        ("default/replica-0", "http://e0", "ready"),
+        ("default/replica-3", "http://e3", "starting"),
+    ]
+
+
+def test_fetch_engines_v2_incomplete_observation_is_passed_through():
+    issue = {"scope": "default/0/1", "reason": "init_pending"}
+    payload = _v2_payload([{"engine_id": "default/replica-0", "base_url": "http://e0", "state": "ready"}], [issue])
+
+    _, observation = asyncio.run(_service(_FakeSession(get_payload=payload))._fetch_engines())
+
+    assert observation == {"complete": False, "issues": [issue]}
+
+
+@pytest.mark.parametrize(
+    "model",
+    [None, {}, {"engines": {}}, {"engines": [None]}, {"engines": [{"base_url": "http://e0", "state": "ready"}]}],
+)
+def test_fetch_engines_rejects_invalid_v2_containers(model):
+    payload = _v2_payload([])
+    payload["models"]["default"] = model
+
+    _, observed = asyncio.run(_service(_FakeSession(get_payload=payload))._fetch_engines())
+
+    assert observed["complete"] is False
+    assert observed["issues"][0]["reason"] == "observation_protocol_invalid"
 
 
 def test_evaluate_reconciles_pending_when_no_engines():

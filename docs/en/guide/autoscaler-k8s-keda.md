@@ -55,7 +55,7 @@ ______________________________________________________________________
 │  ┌──────────────────────────────────────┐                       │
 │  │  Relax Training Cluster (Ray)        │                       │
 │  │  ┌─────────────────────────────┐     │                       │
-│  │  │ Rollout Service (FastAPI)   │     │                       │
+│  │  │ Rollout Gateway (/rollout)  │     │                       │
 │  │  │ POST /rollout/scale_out     │     │                       │
 │  │  │ POST /rollout/scale_in      │     │                       │
 │  │  │ GET  /rollout/engines       │     │                       │
@@ -381,7 +381,7 @@ K8s creates the Pod
   → The postStart hook starts in parallel and polls /health until it is ready
   → SGLang ready
   → postStart calls POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager runs:
+  → Relax InferenceManager (RolloutEnginePool) runs:
       CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
   → The engine starts receiving traffic
 ```
@@ -392,7 +392,7 @@ K8s creates the Pod
 K8s sends SIGTERM
   → The preStop hook handles the signal
   → Call POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager runs:
+  → Relax InferenceManager (RolloutEnginePool) runs:
       PENDING → DRAINING (stop new traffic and wait for in-flight requests)
              → REMOVING (deregister the engine)
              → COMPLETED
@@ -531,7 +531,7 @@ ______________________________________________________________________
 | KEDA scaling events | `kubectl describe scaledobject sglang-engine-scaler` |
 | Current HPA metrics | `kubectl get hpa -n relax-training -o wide` |
 | Pod scaling history | `kubectl get events -n relax-training --field-selector reason=SuccessfulRescale` |
-| Relax engine list | `GET /rollout/engines` |
+| Relax engine list | `GET /rollout/engines` (v2 format; add `?schema_version=1` for the legacy format) |
 | Relax scale_out requests | `GET /rollout/scale_out` |
 | Relax scale_in requests | `GET /rollout/scale_in` |
 

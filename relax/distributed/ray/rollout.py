@@ -3,8 +3,10 @@
 # pyright: reportMissingTypeArgument=false, reportCallIssue=false, reportOptionalMemberAccess=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportUninitializedInstanceVariable=false, reportOptionalIterable=false, reportFunctionMemberAccess=false, reportPossiblyUnboundVariable=false, reportOperatorIssue=false, reportIndexIssue=false, reportReturnType=false
 
 import asyncio
+import copy
 import dataclasses
 import enum
+import functools
 import logging
 import multiprocessing
 import os
@@ -12,17 +14,21 @@ import random
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import ray
+import requests
 import sglang_router
-import transfer_queue as tq
-import yaml
 from packaging.version import parse
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
-from relax.backends.sglang.sglang_engine import RouterWorkerCleanup, SGLangEngine, remove_dead_router_worker
+from relax.backends.sglang.sglang_engine import (
+    EngineMemoryStateUnknown,
+    RouterWorkerCleanup,
+    SGLangEngine,
+    remove_dead_router_worker,
+)
 from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.rollout_scale_types import (
     ScaleInRequest,
@@ -32,7 +38,30 @@ from relax.distributed.ray.rollout_scale_types import (
     ScaleOutStatus,
 )
 from relax.distributed.ray.rollout_validation import validate_server_group_gpu_indices
-from relax.engine.rollout.base_types import call_rollout_fn
+from relax.engine.inference.config import (
+    EngineGroupSpec,
+    EngineGroupTopology,
+    InferenceModelSpec,
+    SglangConfig,
+    replicas_from_slots,
+)
+from relax.engine.inference.phase_plans import PHASE_GENERATE
+from relax.engine.inference.placement import (
+    PlacementBinding,
+    PlacementGroupView,
+    PlacementOwner,
+    PlacementPlanner,
+    PlacementRequest,
+    PlacementSlice,
+)
+from relax.engine.inference.types import (
+    LifecycleState,
+    ModelSnapshot,
+    ReplicaSnapshot,
+    Role,
+    TopologyEvents,
+    WeightSource,
+)
 from relax.utils import device as device_utils
 from relax.utils import scale_utils, tracking_utils
 from relax.utils.env import Envs
@@ -40,14 +69,10 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
     init_http_client,
-    post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
-from relax.utils.metrics.metric_checker import MetricChecker
 from relax.utils.metrics.metric_utils import compute_pass_rate, compute_rollout_step, dict_add_prefix
 from relax.utils.metrics.rollout_metrics import (
     compute_metrics_from_samples,
@@ -55,15 +80,9 @@ from relax.utils.metrics.rollout_metrics import (
     compute_perf_metrics_from_samples,
 )
 from relax.utils.misc import load_function
-from relax.utils.reload_utils import ReloadableMixin
-from relax.utils.s3_model_loader import (
-    build_runai_streamer_env_for_load,
-    prepare_model_maybe_update_args,
-)
+from relax.utils.s3_model_loader import build_runai_streamer_env_for_load
 from relax.utils.scale_utils import PrecheckProbeCategory, ScaleOutFailure, ScaleOutFailureCategory
-from relax.utils.tracking_utils import init_tracking
 from relax.utils.training.train_dump_utils import (
-    save_debug_rollout_data,
     save_eval_summary_jsonl,
     save_rollout_result_jsonl,
 )
@@ -76,6 +95,25 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = get_logger(__name__)
+
+# An engine process can die on its own (e.g. SGLang's scheduler watchdog
+# SIGQUITs the server after a CUDA-level hang); the next call into it then
+# raises one of these, including through ray.get, which re-raises a class that
+# inherits from the original cause. An engine whose memory release or resume
+# was not confirmed is handled the same way: only stopping it frees the memory.
+# Everything else is a real bug.
+_ENGINE_DEAD_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    ray.exceptions.RayActorError,
+    EngineMemoryStateUnknown,
+)
+
+
+def _is_engine_dead(exc: BaseException) -> bool:
+    return isinstance(exc, _ENGINE_DEAD_EXCEPTIONS)
 
 
 def _resolve_rollout_engine_class(args):
@@ -92,158 +130,6 @@ def _resolve_rollout_engine_class(args):
     return SGLangEngine
 
 
-@dataclasses.dataclass
-class EngineGroupConfig:
-    """Configuration for a single engine group.
-
-    Attributes:
-        worker_type: One of "regular", "prefill", "decode", or "placeholder".
-                     "placeholder" reserves GPU slots without creating engines.
-        num_gpus: Total number of GPUs for this group.
-        num_gpus_per_engine: GPUs per engine for this group.  Overrides the
-                             model-level or global ``--rollout-num-gpus-per-engine``.
-        overrides: Optional dict of SGLang ``ServerArgs`` field overrides.
-                   These are applied on top of the base CLI ``--sglang-*``
-                   arguments in ``_compute_server_args``.
-    """
-
-    worker_type: str
-    num_gpus: int
-    num_gpus_per_engine: int | None = None
-    overrides: dict = dataclasses.field(default_factory=dict)
-
-    def __post_init__(self):
-        valid_types = {"regular", "prefill", "decode", "placeholder"}
-        assert self.worker_type in valid_types, (
-            f"Invalid worker_type '{self.worker_type}', must be one of {valid_types}"
-        )
-        assert self.num_gpus > 0, f"num_gpus must be > 0, got {self.num_gpus}"
-
-
-@dataclasses.dataclass
-class ModelConfig:
-    """Configuration for a single model deployment.
-
-    Attributes:
-        name: Unique name for this model (e.g. "actor", "reward").
-        model_path: HF checkpoint path.  Falls back to ``args.hf_checkpoint``.
-        num_gpus_per_engine: Default GPUs per engine for all groups in this
-                             model.  Individual groups can override.
-        engine_groups: Engine group configurations for this model.
-    """
-
-    name: str
-    model_path: str | None = None
-    num_gpus_per_engine: int | None = None
-    engine_groups: list[EngineGroupConfig] = dataclasses.field(default_factory=list)
-
-    def resolve(self, args) -> None:
-        """Resolve per-group defaults from model-level then args-level
-        values."""
-        default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
-        # `args.sglang_hf_checkpoint` lets INT4 QAT runs point SGLang at the
-        # source compressed-tensors directory while training-side consumers
-        # keep using the auto-cast `args.hf_checkpoint` (BF16 cache).
-        default_model_path = self.model_path or args.sglang_hf_checkpoint or args.hf_checkpoint
-        for g in self.engine_groups:
-            if g.num_gpus_per_engine is None:
-                g.num_gpus_per_engine = default_gpus_per_engine
-            # Inject model_path into overrides so _compute_server_args picks it up.
-            if "model_path" not in g.overrides:
-                g.overrides["model_path"] = default_model_path
-
-    @property
-    def has_pd_disaggregation(self) -> bool:
-        return any(g.worker_type in ("prefill", "decode") for g in self.engine_groups)
-
-    @property
-    def total_num_gpus(self) -> int:
-        return sum(g.num_gpus for g in self.engine_groups)
-
-
-@dataclasses.dataclass
-class SglangConfig:
-    """Configuration for SGLang engine deployment.
-
-    Loaded from ``--sglang-config`` YAML file.
-
-    **Config format**::
-
-        sglang:
-          - name: actor
-            model_path: /path/to/actor
-            num_gpus_per_engine: 2
-            engine_groups:
-              - worker_type: prefill
-                num_gpus: 4
-                num_gpus_per_engine: 2
-              - worker_type: decode
-                num_gpus: 8
-                num_gpus_per_engine: 4
-          - name: reward
-            model_path: /path/to/reward
-            engine_groups:
-              - worker_type: regular
-                num_gpus: 4
-
-    Each model gets its own router.  ``placeholder`` groups reserve GPU
-    slots without creating engines.  ``overrides`` are ``ServerArgs``
-    field names applied on top of the base ``--sglang-*`` CLI args.
-    """
-
-    models: list[ModelConfig]
-
-    @staticmethod
-    def from_yaml(path: str) -> "SglangConfig":
-        with open(path) as f:
-            data = yaml.safe_load(f)
-
-        assert "sglang" in data, (
-            f"sglang config must have a 'sglang' key, got {list(data.keys())}. "
-            f"Wrap your engine_groups inside a model entry under 'sglang'."
-        )
-        models = []
-        for m in data["sglang"]:
-            groups = [EngineGroupConfig(**g) for g in m.get("engine_groups", [])]
-            models.append(
-                ModelConfig(
-                    name=m["name"],
-                    model_path=m.get("model_path"),
-                    num_gpus_per_engine=m.get("num_gpus_per_engine"),
-                    engine_groups=groups,
-                )
-            )
-        return SglangConfig(models=models)
-
-    @staticmethod
-    def from_prefill_num_servers(args) -> "SglangConfig":
-        """Build a config equivalent to the legacy --prefill-num-servers
-        flag."""
-        total_gpus = args.rollout_num_gpus
-        prefill_gpus = args.prefill_num_servers * args.rollout_num_gpus_per_engine
-        decode_gpus = total_gpus - prefill_gpus
-        assert decode_gpus > 0, f"No decode GPUs: total {total_gpus}, prefill {prefill_gpus}"
-        return SglangConfig(
-            models=[
-                ModelConfig(
-                    name="default",
-                    engine_groups=[
-                        EngineGroupConfig(worker_type="prefill", num_gpus=prefill_gpus),
-                        EngineGroupConfig(worker_type="decode", num_gpus=decode_gpus),
-                    ],
-                )
-            ]
-        )
-
-    @property
-    def has_pd_disaggregation(self) -> bool:
-        return any(m.has_pd_disaggregation for m in self.models)
-
-    @property
-    def total_num_gpus(self) -> int:
-        return sum(m.total_num_gpus for m in self.models)
-
-
 class EngineGroupLifecycle(str, enum.Enum):
     ACTIVE = "ACTIVE"
     DRAINING = "DRAINING"
@@ -255,10 +141,12 @@ class EngineGroupLifecycle(str, enum.Enum):
 class _EngineInitRecord:
     # Replace only this generation's value, never a shared slot from a GET.
     value: ray.ObjectRef | dict[str, str | int | None]
-    pending_router_registration: bool = False
     # Internal cleanup target, not readiness metadata exposed by /engines.
     router_url: str | None = None
     router_cleanup: RouterWorkerCleanup | None = None
+    # A DCS replacement serves only once every PP source confirmed it received
+    # a full weight sync; a per-bucket weight version does not prove that.
+    awaiting_weight_sync: bool = False
 
 
 def _get_engine_actor_states() -> Any | None:
@@ -273,6 +161,12 @@ def _get_engine_actor_states() -> Any | None:
     except Exception:
         logger.error("Engine observation requires Ray local actor state support", exc_info=True)
         return None
+
+
+@functools.cache
+def _cached_engine_actor_states() -> Any | None:
+    """The Ray actor-state capability, probed once per process."""
+    return _get_engine_actor_states()
 
 
 def _read_local_actor_state(engine: Any, actor_states: Any | None) -> tuple[str, str | None]:
@@ -353,7 +247,7 @@ class EngineGroup:
     """
 
     args: Any
-    pg: Any  # (placement_group, reordered_bundle_indices, reordered_gpu_ids)
+    pg: Any  # PlacementBinding
     all_engines: list
     num_gpus_per_engine: int
     num_new_engines: int
@@ -363,13 +257,62 @@ class EngineGroup:
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
+    model_id: str = "default"  # the model this group serves; part of every replica identity
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
     lifecycle_status: EngineGroupLifecycle = EngineGroupLifecycle.ACTIVE
     eviction_requested: bool = False
+    spec: EngineGroupTopology | None = None
+    placement: PlacementSlice | None = None
+    pg_owner: PlacementOwner = PlacementOwner.MANAGER
+    on_topology_change: Callable[[], None] | None = dataclasses.field(default=None, repr=False)
+    # Static roles (GenRM, Teacher) run the plain SGLangEngine with their role
+    # and weight source, their own process environment and port range.
+    engine_cls: Any = None
+    engine_kwargs: dict = dataclasses.field(default_factory=dict)
+    env_vars: dict | None = None
+    base_port: int | None = None
+    ray_num_gpus: float = 0.2
+    # Engines scale-in confirmed removed from the Router, by node-0 index, with
+    # the handle that was removed: a retried scale-in skips the Router for an
+    # engine it could not stop, which may no longer answer.
+    router_removed: dict[int, Any] = dataclasses.field(default_factory=dict, repr=False)
     require_router_registration: bool = False  # Verify managed PD registration before publication
     engine_init_records: dict[int, _EngineInitRecord] = dataclasses.field(default_factory=dict)
+
+    def notify_topology_change(self) -> None:
+        if self.on_topology_change is not None:
+            self.on_topology_change()
+
+    def __post_init__(self) -> None:
+        if self.spec is None:
+            self.spec = EngineGroupTopology(
+                f"group-{self.rank_offset}",
+                replicas_from_slots(
+                    self.model_id,
+                    len(self.all_engines),
+                    self.nodes_per_engine,
+                    first_slot=self.rank_offset,
+                ),
+            )
+        elif sum(len(replica.node_ranks) for replica in self.spec.replicas) != len(self.all_engines):
+            raise ValueError("EngineGroup slots do not match its replica specification")
+
+    def replica_identity(self, slot: int) -> str:
+        """The stable identity of the replica whose first engine is ``slot``.
+
+        ``slot`` indexes ``all_engines``, so it is the head of a logical
+        replica. The identity comes from the spec the group was created with,
+        never from the group's current position, which scale-in shifts.
+        """
+        index = slot // self.nodes_per_engine
+        replicas = self.spec.replicas if self.spec is not None else ()
+        if index < len(replicas):
+            return replicas[index].replica_id
+        # A group that outgrew its spec (engines appended without a respec)
+        # still needs a name that cannot collide with the recorded ones.
+        return f"{self.model_id}/replica-{self.rank_offset + slot}"
 
     @property
     def nodes_per_engine(self):
@@ -400,7 +343,12 @@ class EngineGroup:
 
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
 
-        pg, reordered_bundle_indices, reordered_gpu_ids = self.pg
+        if self.placement is None:
+            # Engines run only on a slice the planner resolved and checked;
+            # re-deriving it here would bypass that check.
+            raise ValueError(f"Engine group {self.model_id}/{self.worker_type} has no planned placement slice")
+        binding = PlacementBinding.require(self.pg)
+        pg, reordered_gpu_ids = binding.pg, binding.gpu_ids
 
         validate_server_group_gpu_indices(
             worker_type=self.worker_type,
@@ -413,27 +361,25 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
-        RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
+        RolloutRayActor = ray.remote(self.engine_cls or _resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
-        for i in range(len(self.all_engines)):
+        for i in (rank for replica in self.spec.replicas for rank in replica.node_ranks):
             if self.all_engines[i] is not None:
                 continue
 
             self.engine_init_records.pop(i, None)
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = self.ray_num_gpus
             num_cpus = num_gpus
 
-            # Get the base GPU ID from placement group using gpu_offset.
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
+            base_gpu_id = int(self.placement.gpu_ids[i])
 
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                placement_group_bundle_index=self.placement.bundle_indices[i],
             )
 
             env_vars = dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1") | {
@@ -476,6 +422,9 @@ class EngineGroup:
             )
             if getattr(self.args, "fp16", False):
                 env_vars["SGLANG_MAMBA_CONV_DTYPE"] = "float16"
+            if self.env_vars is not None:
+                # A static model carries its whole engine environment.
+                env_vars = dict(self.env_vars)
 
             accelerator_kwargs = get_ray_accelerator_kwargs(num_gpus)
             rollout_engine = RolloutRayActor.options(
@@ -493,6 +442,7 @@ class EngineGroup:
                 sglang_overrides=self.sglang_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
                 register_sigterm_handler=self.is_scaled_out,
+                **self.engine_kwargs,
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -510,7 +460,7 @@ class EngineGroup:
         else:
             # Compute base_port from the maximum cursor across all nodes that
             # this group's engines may land on (conservative: just use global max).
-            base_port = max(port_cursors.values()) if port_cursors else find_available_port(15000)
+            base_port = max(port_cursors.values()) if port_cursors else find_available_port(self.base_port or 15000)
             addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
                 args=self.args,
                 rollout_engines=rollout_engines,
@@ -534,7 +484,6 @@ class EngineGroup:
             )
             self.engine_init_records[rank - self.rank_offset] = _EngineInitRecord(
                 init_ref,
-                pending_router_registration=self.is_scaled_out and self.skip_router_registration,
                 router_url=(
                     f"http://{_wrap_ipv6(engine_addr['host'])}:{engine_addr['port']}"
                     if "host" in engine_addr and "port" in engine_addr
@@ -548,13 +497,6 @@ class EngineGroup:
             )
             init_handles.append(init_ref)
         return init_handles, port_cursors
-
-    def offload(self):
-        """Fire release_memory_occupation on all engines (non-blocking).
-
-        Returns a list of Ray ObjectRefs.
-        """
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
 
     def onload(self, tags: list[str] | None = None):
         """Fire resume_memory_occupation on all engines (non-blocking).
@@ -580,19 +522,29 @@ class EngineGroup:
                 failed_indices.add(i)
         return failed_indices
 
-    def shutdown_engines(self, indices: set[int]) -> None:
+    def shutdown_engines(self, indices: set[int], *, strict: bool = False) -> None:
         """Shutdown engines at the given indices.
 
         This removes the engines from the group and unregisters them from
-        router and DCS.
+        router and DCS. With ``strict``, an engine whose SGLang processes may
+        still hold GPU memory (its shutdown failed while the actor was alive,
+        or it could not be killed) keeps its handle, and a RuntimeError is
+        raised once the rest are shut down. It is then not killed: only its own
+        shutdown can stop those processes, so a retry can still free them.
         """
+        self.notify_topology_change()
+        failed = []
         for i in indices:
             engine = self.all_engines[i]
             if engine is not None:
+                released = True
                 try:
                     ray.get(engine.shutdown.remote(), timeout=10)
                 except Exception as e:
                     logger.warning(f"Failed to shutdown engine {i}: {e}")
+                    # A dead actor cannot stop its processes any more; a live
+                    # one that failed or timed out may not have.
+                    released = not strict or isinstance(e, ray.exceptions.RayActorError)
                 try:
                     ray.get(engine.unregister_dcs.remote(), timeout=10)
                 except Exception as e:
@@ -601,12 +553,20 @@ class EngineGroup:
                     ray.get(engine.unregister_from_router.remote(), timeout=10)
                 except Exception as e:
                     logger.warning(f"Failed to unregister engine {i} from router: {e}")
+                if not released:
+                    failed.append(i)
+                    continue
                 try:
                     ray.kill(engine)
                 except Exception as e:
                     logger.warning(f"Failed to kill engine {i}: {e}")
+                    if strict:
+                        failed.append(i)
+                        continue
             self.all_engines[i] = None
             logger.info(f"Shutdown engine at index {i}")
+        if failed:
+            raise RuntimeError(f"Engines {sorted(failed)} may still hold GPU memory after shutdown")
 
 
 @dataclasses.dataclass
@@ -644,6 +604,12 @@ class RolloutServer:
     router_ip: str | None = None
     router_port: int | None = None
     model_name: str = "default"
+    model_spec: InferenceModelSpec | None = None
+    # A static-weight pool (GenRM, Teacher) retires engines that die during a
+    # memory transition and rebuilds them on onload; rollout relies on its
+    # health monitor and the training-side weight sync instead.
+    static: bool = False
+    onloaded: bool = True
 
     @property
     def engines(self):
@@ -677,12 +643,16 @@ class RolloutServer:
         ``engines``.
 
         Accounts for placeholder groups that occupy GPU slots without creating
-        engines.
+        engines. A planned group reads each engine's first slot from its slice;
+        an external group has no placement group, so its offsets name no GPU.
         """
         offsets = []
         for g in self.engine_groups:
             for j in range(len(g.engines)):
-                offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
+                if g.placement is not None:
+                    offsets.append(g.placement.referenced_offsets[j * g.nodes_per_engine])
+                else:
+                    offsets.append(g.gpu_offset + j * g.num_gpus_per_engine)
         return offsets
 
     @property
@@ -801,6 +771,10 @@ class RolloutServer:
                 continue
             handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
+            if getattr(g.args, "fully_async", False) and not self.static:
+                for slot in dead_per_group[g_idx]:
+                    if (record := g.engine_init_records.get(slot)) is not None:
+                        record.awaiting_weight_sync = True
 
         for g_idx in reversed(groups_to_remove):
             group = groups.pop(g_idx)
@@ -831,7 +805,7 @@ class RolloutServer:
                 continue
             logger.info(f"Recovered {g.num_new_engines} dead rollout engines (worker_type={g.worker_type})")
             assert g.num_new_engines == len(dead_indices), "num_new_engines does not match dead_indices length"
-            if g.args.offload_rollout and dead_indices:
+            if g.args.offload_rollout and dead_indices and not self.static:
                 new_engines = [g.all_engines[i] for i in dead_indices]
                 release_handles.extend(engine.release_memory_occupation.remote() for engine in new_engines)
                 new_engines_all.extend(new_engines)
@@ -843,59 +817,302 @@ class RolloutServer:
             )
 
     def offload(self):
-        """Release memory occupation across all groups (concurrent)."""
-        handles = []
-        for g in self.engine_groups:
-            handles.extend(g.offload())
-        return ray.get(handles) if handles else []
+        """Release memory occupation across all groups (concurrent).
+
+        Returns only once every engine has confirmed its release, or has been
+        stopped. The pool stays onloaded until then, so a retry after a failed
+        release releases the rest; an engine skips a release it already made.
+        An engine that died, timed out, or whose release was not confirmed is
+        retired, and the offload fails unless its shutdown is confirmed, since
+        it may still hold the GPUs.
+        """
+        if self.static and not self.onloaded:
+            return []
+        self._retire(self._call_heads("release_memory_occupation"))
+        self.onloaded = False
+        return []
+
+    def abort_requests(self) -> None:
+        """Abort everything the live engines run; a forced drain calls it.
+
+        Each engine's abort is best-effort and never raises; a dead engine runs
+        nothing.
+        """
+        self._call_heads("abort_requests")
 
     def onload(self, tags: list[str] | None = None):
         """Resume memory occupation across all groups (concurrent)."""
-        handles = []
+        if self.static:
+            # Engines that died while asleep are rebuilt fully loaded; only the
+            # survivors are resumed. An engine resumes only memory it released,
+            # so one still resident after a failed release is only reopened.
+            rebuilt = self._rebuild()
+            dead = self._call_heads("resume_memory_occupation", skip=rebuilt, tags=tags)
+            if dead:
+                self._retire(dead, degrade=True)
+                self._rebuild()
+            result = []
+        elif (
+            tags == [GPU_MEMORY_TYPE_WEIGHTS]
+            and self.model_spec is not None
+            and self.model_spec.fault_tolerance_enabled
+        ):
+            # Monitoring is paused while asleep. Retire dead handles here so
+            # the following recovery can rebuild and reconnect weight sync.
+            self._retire(self._call_heads("resume_memory_occupation", tags=tags), degrade=True)
+            result = []
+        else:
+            handles = []
+            for g in self.engine_groups:
+                handles.extend(g.onload(tags))
+            result = ray.get(handles) if handles else []
+        if tags is None or GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.onloaded = True
+        return result
+
+    def _call_heads(self, method: str, *, skip: frozenset = frozenset(), **kwargs) -> list[tuple[EngineGroup, int]]:
+        """Call ``method`` on every live head engine; return the dead ones.
+
+        One ray.get per handle: a batched get aborts on the first failure and
+        loses which engine raised. Every engine answers before any other
+        failure is raised.
+        """
+        pending = []
         for g in self.engine_groups:
-            handles.extend(g.onload(tags))
-        return ray.get(handles) if handles else []
+            for i in range(0, len(g.all_engines), g.nodes_per_engine):
+                if g.all_engines[i] is not None and (id(g), i) not in skip:
+                    pending.append((g, i, getattr(g.all_engines[i], method).remote(**kwargs)))
+        dead = []
+        failure: Exception | None = None
+        for g, i, ref in pending:
+            try:
+                ray.get(ref)
+            except Exception as exc:
+                if not _is_engine_dead(exc):
+                    failure = failure or exc
+                    continue
+                logger.warning(f"[{self.model_name}] engine {g.rank_offset + i} died during {method}: {exc}")
+                dead.append((g, i))
+        if failure is not None:
+            raise failure
+        return dead
 
+    def _retire(self, dead: list[tuple[EngineGroup, int]], *, degrade: bool = False) -> None:
+        """Shut down engines that failed or timed out, trying all before
+        raising.
 
-# In-process singleton set inside RolloutManager.__init__. Only meaningful
-# from code running inside the RolloutManager actor's own process (e.g., a
-# custom_reward_post_process function loaded there). Cross-process access
-# must go through the Ray handle.
-_LOCAL_ROLLOUT_MANAGER: "RolloutManager | None" = None
+        An engine whose shutdown is not confirmed may still hold its GPUs, so
+        it keeps its handle (see :meth:`EngineGroup.shutdown_engines`) and no
+        engine is rebuilt on top of it. With ``degrade`` the pool logs that and
+        serves with the rest; a later offload retries the shutdown.
+        """
+        errors = []
+        for g, i in dead:
+            try:
+                g.shutdown_engines(set(range(i, i + g.nodes_per_engine)), strict=True)
+            except RuntimeError as exc:
+                errors.append(exc)
+        if not errors:
+            return
+        if not degrade:
+            raise errors[0]
+        logger.error(f"[{self.model_name}] continuing without engines that may still hold GPUs: {errors}")
 
-
-def get_local_rollout_manager() -> "RolloutManager":
-    # Read via sys.modules to defend against the case where an importer of
-    # this module gets a different module-object namespace than the one
-    # RolloutManager.__init__ wrote into (cloudpickle can create parallel
-    # namespaces when materializing @ray.remote classes in workers).
-    import sys as _sys
-
-    mgr = getattr(_sys.modules[__name__], "_LOCAL_ROLLOUT_MANAGER", None)
-    if mgr is None:
-        raise RuntimeError(
-            "get_local_rollout_manager() called outside the RolloutManager "
-            "actor process, or before it finished __init__. "
-            f"module_id={id(_sys.modules[__name__])}, pid={os.getpid()}"
+    def _rebuild(self) -> frozenset:
+        """Rebuild dead engines of a fault-tolerant static pool; return
+        them."""
+        if self.model_spec is None or not self.model_spec.fault_tolerance_enabled:
+            return frozenset()
+        holes = {(id(g), i) for g in self.engine_groups for i, e in enumerate(g.all_engines) if e is None}
+        if not holes:
+            return frozenset()
+        try:
+            self.recover()
+        except Exception as exc:
+            # Degrade rather than escalate: N-1 engines beat a global restart.
+            if not any(self.engines):
+                raise
+            logger.error(f"[{self.model_name}] engine rebuild failed, continuing degraded: {exc}")
+        return frozenset(
+            (id(g), i) for g in self.engine_groups for i, e in enumerate(g.all_engines) if (id(g), i) in holes and e
         )
-    return mgr
+
+    def health_check(self) -> bool:
+        return bool(self.engines) and all(not g.healthcheck_engines() for g in self.engine_groups if g.engines)
+
+    def get_urls(self) -> list[str]:
+        return [url for url in ray.get([e.get_url.remote() for e in self.engines if e is not None]) if url]
+
+    def get_engine_hosts_ports(self) -> list[tuple[str, int]]:
+        hosts_ports = []
+        for url in self.get_urls():
+            host, port = url.split("://", 1)[-1].rsplit(":", 1)
+            hosts_ports.append((host, int(port)))
+        return hosts_ports
+
+    def shutdown(self, planner: PlacementPlanner | None = None) -> None:
+        """Stop every engine and give back the placement this server holds.
+
+        A group whose engines may still hold GPU memory keeps its placement;
+        the other groups are still stopped, and the first failure is raised
+        once they are.
+        """
+        failure: Exception | None = None
+        for g in self.engine_groups:
+            try:
+                g.shutdown_engines(set(range(len(g.all_engines))), strict=True)
+            except Exception as exc:
+                failure = failure or exc
+                continue
+            if planner is not None and g.placement is not None:
+                if planner.release(g.placement).remove_placement_group:
+                    from ray.util.placement_group import remove_placement_group
+
+                    remove_placement_group(g.pg[0])
+        if failure is not None:
+            raise failure
+
+    def observe(self, serving: bool = True) -> ModelSnapshot:
+        """Observe replica health, Router registration and weight versions.
+
+        A replica is READY only with a healthy server registered at the Router
+        (and, for policy weights, a real weight version); PD prefill/decode
+        workers fold into one Router-backed service replica and are reported
+        separately for diagnosis. ``serving`` is the manager's verdict on
+        whether the model may serve; without it nothing is READY and no engine
+        is registered at the Router.
+        """
+        serving = self.onloaded and serving
+        policy = self.model_spec is None or self.model_spec.needs_weight_update
+        actor_states = _cached_engine_actor_states()
+        replicas = []
+        issues: list[tuple[str, str]] = []
+        router_members_ready = True
+        pd_workers: dict[str, list[ReplicaSnapshot]] = {"prefill": [], "decode": []}
+        for group_index, group in enumerate(tuple(self.engine_groups)):
+            if group.worker_type == "placeholder":
+                continue
+            for replica_index in range(0, len(group.all_engines), group.nodes_per_engine):
+                nodes = group.all_engines[replica_index : replica_index + group.nodes_per_engine]
+                head = nodes[0] if nodes else None
+                alive = len(nodes) == group.nodes_per_engine and all(node is not None for node in nodes)
+                # Local evidence first: a dead actor or an unfinished init is
+                # known without a probe, which would only wait on that actor.
+                slots = range(replica_index, replica_index + len(nodes))
+                records = [group.engine_init_records.get(slot) for slot in slots]
+                skip_probe = False
+                head_metadata = None
+                for slot, node, record in zip(slots, nodes, records, strict=True):
+                    if node is None:
+                        continue
+                    metadata, state, issue = _read_engine_metadata(group, slot, node, record, actor_states)
+                    if slot == replica_index:
+                        head_metadata = metadata
+                    if issue is None:
+                        continue
+                    issues.append((f"{self.model_name}/{group_index}/{group.rank_offset + slot}", issue))
+                    if state == "DEAD":
+                        alive = False
+                    skip_probe = skip_probe or issue == "init_pending"
+                # Recorded by the head, which alone joins DCS and the Router.
+                confirmed = records[0] is None or not records[0].awaiting_weight_sync
+                if not confirmed:
+                    issues.append(
+                        (
+                            f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}",
+                            "weight_sync_unconfirmed",
+                        )
+                    )
+                observation = {}
+                probe_failed = False
+                if alive and not skip_probe:
+                    try:
+                        result = ray.get(
+                            head.get_inference_observation.remote(ensure_router=serving and confirmed), timeout=45
+                        )
+                        observation = result if isinstance(result, dict) else {}
+                    except Exception as e:
+                        # The actor is alive with valid metadata, so its state is
+                        # unknown, not dead: keep this generation's endpoint for
+                        # diagnosis and report the observation incomplete.
+                        logger.warning(f"Observation of {group.replica_identity(replica_index)} failed: {e!r}")
+                        probe_failed = True
+                        issues.append(
+                            (f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}", "probe_failed")
+                        )
+                        if isinstance(head_metadata, dict):
+                            observation = {"base_url": head_metadata.get("url")}
+                if any(
+                    slot >= len(group.all_engines)
+                    or group.all_engines[slot] is not node
+                    or group.engine_init_records.get(slot) is not record
+                    for slot, node, record in zip(slots, nodes, records, strict=True)
+                ):
+                    # The slot was replaced while it was observed; the evidence
+                    # belongs to the old generation.
+                    issues.append(
+                        (f"{self.model_name}/{group_index}/{group.rank_offset + replica_index}", "generation_changed")
+                    )
+                    observation = {}
+                version = observation.get("weight_version")
+                ready = bool(
+                    alive
+                    and confirmed
+                    and observation.get("healthy")
+                    and observation.get("router_registered")
+                    and (not policy or version not in (None, "", "default"))
+                    and group.lifecycle_status == EngineGroupLifecycle.ACTIVE
+                )
+                if (observation.get("router_registered") and not ready) or not alive or probe_failed:
+                    # An unreachable worker may still be registered at the Router.
+                    router_members_ready = False
+                replica = ReplicaSnapshot(
+                    group.replica_identity(replica_index),
+                    LifecycleState.READY if ready else (LifecycleState.STARTING if alive else LifecycleState.DEAD),
+                    observation.get("base_url"),
+                    version,
+                )
+                pd_workers.get(group.worker_type, replicas).append(replica)
+        router_url = f"http://{self.router_ip}:{self.router_port}" if self.router_ip and self.router_port else None
+        if any(pd_workers.values()):
+            workers = [worker for values in pd_workers.values() for worker in values]
+            versions = {worker.weight_version for worker in workers if worker.state == LifecycleState.READY}
+            pd_ready = all(any(w.state == LifecycleState.READY for w in values) for values in pd_workers.values())
+            pd_ready = pd_ready and (len(versions) == 1 or not policy)
+            replicas.append(
+                ReplicaSnapshot(
+                    f"{self.model_name}/pd-service",
+                    LifecycleState.READY if pd_ready else LifecycleState.STARTING,
+                    router_url,
+                    next(iter(versions)) if len(versions) == 1 else None,
+                )
+            )
+        versions = {replica.weight_version for replica in replicas if replica.state == LifecycleState.READY}
+        ready = bool(
+            serving
+            and router_members_ready
+            and router_url
+            and (len(versions) == 1 if policy else any(r.state == LifecycleState.READY for r in replicas))
+        )
+        return ModelSnapshot(
+            self.model_name,
+            tuple(replicas),
+            router_url,
+            LifecycleState.READY if ready else (LifecycleState.STARTING if self.onloaded else LifecycleState.SLEEPING),
+            ready,
+            required_weight_version=next(iter(versions)) if policy and len(versions) == 1 else None,
+            pd_workers=tuple((kind, worker) for kind, workers in pd_workers.items() for worker in workers),
+            issues=tuple(issues),
+        )
 
 
-@ray.remote(
-    concurrency_groups={
-        "health_monitoring": 1,
-        "scale_out": 8,
-        "scale_in": 8,
-        "scale_coordination": 1,
-        "recover_rollout_engines": 1,
-    }
-)
-class RolloutManager(ReloadableMixin):
-    """The class to run rollout and convert rollout data to training data.
+class RolloutEnginePool:
+    """Engine pool for the rollout role: creation, placement, health, weight
+    sync, elastic scale-out/scale-in and shutdown.
 
-    Inherits ReloadableMixin to provide hot-reload capabilities, supporting:
-    - reload_module(module_name): Reload the specified module
-    - get_loaded_modules(): Retrieve information about loaded modules
+    Holds every engine actor handle and every GPU resource the rollout role
+    owns.  The generation workload never touches this object directly;
+    :class:`InferenceManager` owns this pool and dispatches engine operations.
     """
 
     # Scale-out weight-sync tunables; see relax.utils.env.Envs for semantics/defaults.
@@ -906,86 +1123,43 @@ class RolloutManager(ReloadableMixin):
     _SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS = Envs.RELAX_SCALE_WEIGHT_SYNC_PRECHECK_MAX_ATTEMPTS
     _WEIGHT_SYNC_MAX_INIT_ATTEMPTS = Envs.RELAX_WEIGHT_SYNC_MAX_INIT_ATTEMPTS
 
-    def __init__(self, args, pg, data_source=None):
+    def __init__(
+        self,
+        args,
+        pg,
+        *,
+        planner: PlacementPlanner,
+        events: TopologyEvents,
+        startup_leftovers: dict | None = None,
+    ):
+        """Create the rollout engines in the task's placement ledger, the only
+        one; the inference manager registers ``servers`` once this returns.
+
+        ``events`` receives every change to the engines; the pool never calls
+        the manager. ``startup_leftovers`` receives what a failed startup could
+        not stop; see ``start_servers``.
+        """
         self.pg = pg
         self.args = args
-        self._engine_actor_states = _get_engine_actor_states()
-        self._dynamic_global_batch_size = None
-
-        init_tracking(args, primary=False)
-
-        self.data_source = data_source
-
-        tq.init(self.args.tq_config)
-        self.data_system_client = tq.get_client()
-
-        logger.info(f"import {self.args.rollout_function_path} as generate_rollout function.")
-        logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
-        self.generate_rollout = load_function(self.args.rollout_function_path)
-        self.eval_generate_rollout = load_function(self.args.eval_function_path)
-        self.custom_reward_post_process_func = None
-        if self.args.custom_reward_post_process_path is not None:
-            self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
-        self.custom_convert_samples_to_train_data_func = None
-        if self.args.custom_convert_samples_to_train_data_path is not None:
-            self.custom_convert_samples_to_train_data_func = load_function(
-                self.args.custom_convert_samples_to_train_data_path
-            )
-
-        if self.args.use_agentic_rollout:
-            from relax.agentic.rollout import init_agentic_resident_pipeline
-
-            init_agentic_resident_pipeline(self.args, self.data_source, self.data_system_client)
-
-        if self.args.debug_train_only:
-            self.servers: dict[str, RolloutServer] = {}
-        else:
-            init_http_client(args)
-            self.servers = start_rollout_servers(args, pg)
+        self._planner = planner
+        self._events = events
+        self._training_weight_updating = False
+        self._scale_out_weight_updating = False
+        self._engine_lifecycle_lock = threading.RLock()
+        # Scale-out replicas whose rollback could not confirm their engines
+        # stopped: (group, planned slice, placement group). Their slice and
+        # group stay held until a retry stops them.
+        self._stranded_replicas: list[tuple[EngineGroup, PlacementSlice, Any]] = []
+        # Guards the list against the background retry thread, which runs
+        # only while some replica is stranded.
+        self._stranded_lock = threading.Lock()
+        self._stranded_retry_stop = threading.Event()
+        self._stranded_retry_thread: threading.Thread | None = None
+        # Created before the engines start: once they run, nothing here may
+        # fail, or the manager would never learn of them.
         self.rollout_engine_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
-        self.rollout_id = -1
-        self._metric_checker = MetricChecker.maybe_create(args)
-        self._tokenizer = None  # Lazy-initialized tokenizer for debug data saving
-        self._engine_lifecycle_lock = threading.RLock()
-        existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
-        self._next_engine_rank = max(
-            (group.rank_offset + len(group.all_engines) for group in existing_groups),
-            default=0,
-        )
-
-        self._health_monitors = []
-        if not self.args.debug_train_only and self.args.use_fault_tolerance:
-            for srv in self.servers.values():
-                for group in srv.engine_groups:
-                    monitor = RolloutHealthMonitor(group, args)
-                    monitor.start()
-                    self._health_monitors.append(monitor)
-            self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
-        self.status = None
-
-        # In-process singleton so user code running inside this actor (notably
-        # custom_reward_post_process_func loaded and invoked on the rollout
-        # actor's event loop) can call offload()/onload() directly without a
-        # self-remote call that would deadlock.
-        # We must write into sys.modules[__name__] explicitly: when Ray/cloudpickle
-        # reconstructs the @ray.remote class in the worker, __init__.__globals__
-        # can be a namespace distinct from sys.modules['relax.distributed.ray.rollout'],
-        # so a plain `global _LOCAL_ROLLOUT_MANAGER` write becomes invisible to
-        # any code that imports the module the normal way.
-        import sys as _sys
-
-        _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
-
-        # Elastic scale-out tracking
-        self._scale_out_requests: dict[str, ScaleOutRequest] = {}
-        self._port_cursors: dict[int, int] = {}
-
-        # Elastic scale-in tracking
-        self._scale_in_requests: dict[str, ScaleInRequest] = {}
-        self._training_weight_updating: bool = False
-        self._scale_out_weight_updating: bool = False
         # Distributed mutex shared with the Actor process to ensure DCS weight
         # sync (update_weights_fully_async) and sglang remote instance weight sync
         # (_sync_weights_from_seed_engine) never run concurrently.
@@ -993,6 +1167,38 @@ class RolloutManager(ReloadableMixin):
         self._weight_sync_lock = Lock.options(
             **with_control_plane_affinity(self.args, {"num_cpus": 1, "num_gpus": 0})
         ).remote()
+        self._engine_actor_states = _get_engine_actor_states()
+        if self.args.debug_train_only:
+            self.servers: dict[str, RolloutServer] = {}
+        else:
+            init_http_client(args)
+            self.servers = start_rollout_servers(args, pg, planner=self._planner, leftovers=startup_leftovers)
+        for name, server in self.servers.items():
+            for group in server.engine_groups:
+                group.on_topology_change = lambda name=name: self._events.changed(name)
+        existing_groups = [group for srv in self.servers.values() for group in srv.engine_groups]
+        self._next_engine_rank = max(
+            (group.rank_offset + len(group.all_engines) for group in existing_groups),
+            default=0,
+        )
+
+        self._health_monitors = []
+        if not self.args.debug_train_only:
+            for srv in self.servers.values():
+                if srv.model_spec is None or not srv.model_spec.fault_tolerance_enabled:
+                    continue
+                for group in srv.engine_groups:
+                    monitor = RolloutHealthMonitor(group, args)
+                    monitor.start()
+                    self._health_monitors.append(monitor)
+            self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
+
+        # Elastic scale-out tracking
+        self._scale_out_requests: dict[str, ScaleOutRequest] = {}
+        self._port_cursors: dict[int, int] = {}
+
+        # Elastic scale-in tracking
+        self._scale_in_requests: dict[str, ScaleInRequest] = {}
 
         # GC config: max terminal requests to keep per dict
         self._max_terminal_requests = 100
@@ -1003,6 +1209,12 @@ class RolloutManager(ReloadableMixin):
         self._eviction_check_interval = getattr(args, "eviction_check_interval", 10.0)
         if not self.args.debug_train_only:
             self._start_eviction_monitor()
+
+    def _plan_placement(self, requests, placement_group):
+        return self._planner.plan(requests, placement_group)
+
+    def _release_placement(self, placement):
+        return self._planner.release(placement)
 
     def _reserve_engine_ranks(self, count: int, alignment: int = 1) -> int:
         """Allocate ranks monotonically so a removed elastic rank is not
@@ -1017,7 +1229,17 @@ class RolloutManager(ReloadableMixin):
         with self._engine_lifecycle_lock:
             return self._training_weight_updating or self._scale_out_weight_updating
 
-    def _try_ci_fault_injection(self):
+    def weights_changing(self) -> bool:
+        """Whether a weight update holds the topology lease or a scale-out is
+        syncing new engines; the manager keeps rollout closed meanwhile."""
+        return self._is_weight_updating
+
+    def _topology_settled(self) -> None:
+        """Report that the engines changed; the manager observes them again."""
+        for name in self.servers:
+            self._events.settled(name)
+
+    def inject_ci_fault(self):
         """Try to inject fault during generate (when health monitor is
         running)."""
         if not self._ci_fault_injection_pending:
@@ -1039,70 +1261,19 @@ class RolloutManager(ReloadableMixin):
             except Exception as e:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
-    def dispose(self):
-        try:
-            # Signal every monitor before bounded joins so a stalled health
-            # RPC cannot consume the driver's entire shutdown budget.
-            self._stop_eviction_monitor(timeout=0.0)
-            for monitor in self._health_monitors:
-                monitor.stop(timeout=0.0)
-            deadline = time.monotonic() + 5.0
-            self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
-            for monitor in self._health_monitors:
-                monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
-            self._shutdown_all_engines()
-        finally:
-            # Routers are child processes of this Ray actor, so its process
-            # owns the registry; the Controller driver's registry is separate.
-            stop_launched_routers()
-
-    def _shutdown_all_engines(self, timeout: float = 15.0):
-        """Shut down all SGLang engine actors and their child processes.
-
-        This method is called during dispose() to ensure SGLang subprocesses
-        (scheduler, detokenizer, etc.) are properly terminated when training
-        completes, instead of being orphaned.
-        """
-        if not self.servers:
-            return
-
-        all_engines = []
-        for srv in self.servers.values():
-            for group in srv.engine_groups:
-                for engine in group.all_engines:
-                    if engine is not None:
-                        all_engines.append(engine)
-
-        if not all_engines:
-            return
-
-        logger.info(f"[Shutdown] Shutting down {len(all_engines)} SGLang engine(s)...")
-
-        # Step 1: Call shutdown() on each engine to kill child processes
-        # (sglang::scheduler, sglang::detokenizer, etc.)
-        shutdown_refs = []
-        for engine in all_engines:
-            try:
-                ref = engine.shutdown.remote()
-                shutdown_refs.append((engine, ref))
-            except Exception as e:
-                logger.warning(f"[Shutdown] Failed to call shutdown on engine: {e}")
-
-        # Bound the whole batch so router cleanup can finish before the driver's
-        # signal-exit watchdog, even when every engine is unresponsive.
-        deadline = time.monotonic() + timeout
-        for engine, ref in shutdown_refs:
-            try:
-                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
-            except Exception as e:
-                logger.warning(f"[Shutdown] Engine shutdown timed out or failed: {e}")
-                # Force-kill the Ray actor as a fallback
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
-
-        logger.info(f"[Shutdown] All {len(all_engines)} SGLang engine(s) shut down.")
+    def stop_monitors(self):
+        """Stop the background threads; the manager then shuts the engines
+        down."""
+        # Signal every monitor before bounded joins so a stalled health
+        # RPC cannot consume the driver's entire shutdown budget.
+        self._stop_eviction_monitor(timeout=0.0)
+        for monitor in self._health_monitors:
+            monitor.stop(timeout=0.0)
+        deadline = time.monotonic() + 5.0
+        self._stop_eviction_monitor(timeout=max(0.0, deadline - time.monotonic()))
+        self._stop_stranded_retry()
+        for monitor in self._health_monitors:
+            monitor.stop(timeout=max(0.0, deadline - time.monotonic()))
 
     @property
     def server(self) -> RolloutServer | None:
@@ -1127,11 +1298,13 @@ class RolloutManager(ReloadableMixin):
 
     def get_rollout_engines_and_lock(self, model_name: str | None = None):
         srv = self._get_server(model_name)
-        engines = srv.engines if srv else []
-        gpu_counts = srv.engine_gpu_counts if srv else []
-        gpu_offsets = srv.engine_gpu_offsets if srv else []
-        num_new = srv.num_new_engines if srv else 0
-        return engines, self.rollout_engine_lock, num_new, gpu_counts, gpu_offsets
+        return (
+            srv.engines if srv else [],
+            self.rollout_engine_lock,
+            srv.num_new_engines if srv else 0,
+            srv.engine_gpu_counts if srv else [],
+            srv.engine_gpu_offsets if srv else [],
+        )
 
     def get_weight_sync_lock(self):
         """Return the distributed Lock actor used to serialise DCS weight sync
@@ -1142,256 +1315,28 @@ class RolloutManager(ReloadableMixin):
         """
         return self._weight_sync_lock
 
-    def get_dynamic_global_batch_size(self):
-        """Return the actual sample count from the last rollout step.
+    def confirm_weight_sync(self, actor_ids: list[str]) -> int:
+        """Release replacements every PP source fully synced for publication.
 
-        Used by training side to compute correct batch_size for TQ fetch when
-        use_dynamic_global_batch_size is enabled.
+        ``actor_ids`` are the DCS recipients common to all PP sources of one
+        completed sync. A replacement is matched by its actor, so a later
+        generation in the same slot is never confirmed by an earlier sync.
+        Returns how many were released.
         """
-        assert self._dynamic_global_batch_size is not None, (
-            "get_dynamic_global_batch_size called before first generate()"
-        )
-        return self._dynamic_global_batch_size
-
-    def get_num_rollout_per_epoch(self):
-        assert self.args.rollout_global_dataset
-        return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
-
-    async def generate(self, rollout_id):
-        self.rollout_id = rollout_id
-        self.health_monitoring_resume()
-        if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
-            self._try_ci_fault_injection()
-        output = await asyncio.to_thread(
-            call_rollout_fn,
-            self.generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-            evaluation=False,
-        )
-        if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
-            self._dynamic_global_batch_size = len(
-                {sample.index for sample_group in output.samples for sample in sample_group}
-            )
-
-    async def eval(self, rollout_id):
-        self.health_monitoring_resume()
-
-        # TODO: add fault tolerance to eval
-        result = await asyncio.to_thread(
-            call_rollout_fn,
-            self.eval_generate_rollout,
-            self.args,
-            rollout_id,
-            self.data_source,
-            self.data_system_client,
-            evaluation=True,
-        )
-        data = result.data
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
-
-    async def run_predict(self, train_step: int) -> None:
-        """Periodic SFT predict pass entry point.
-
-        Ensures KV/cuda-graph is onloaded (no-op if already on), then delegates
-        to ``run_predict_loop`` which renders the eval set, batches calls to
-        ``self.generate_predict``, and writes
-        ``<args.save>/predict/predictions_step_<train_step>.jsonl``.
-
-        Mirrors the ``eval`` method: does NOT proactively offload afterward —
-        the next training step's actor↔rollout coordination drives state
-        transitions, same as PPL eval.
-        """
-        from relax.engine.sft.predict.loop import run_predict_loop
-
-        await self.onload_kv()
-        await run_predict_loop(self, self.args, train_step)
-
-    async def generate_predict(
-        self,
-        prompts: list[str],
-        multimodal_inputs_list: list[dict | None] | None = None,
-    ) -> list[str]:
-        """Generate completions for ``prompts`` concurrently.
-
-        POSTs all prompts at once in round-robin order directly to engine
-        workers, bypassing the router. Predict prompts share a long fixed
-        prefix (``<|vision_start|><|image_pad|><|vision_end|>...``); cache-
-        aware routing would pin every request to the engine that first
-        cached the prefix, defeating multi-engine throughput.
-
-        ``multimodal_inputs_list`` is a parallel list of dicts (or ``None``)
-        carrying images/videos/audio for each prompt; encoded inline and
-        merged into the payload, mirroring the RL ``generate()`` path.
-        """
-        import sglang_router
-        from packaging.version import parse
-
-        from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
-
-        self.health_monitoring_resume()
-
-        router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
-            response = await get(f"{router_base}/list_workers")
-            worker_urls = response["urls"]
-        else:
-            response = await get(f"{router_base}/workers")
-            worker_urls = [w["url"] for w in response["workers"]]
-        worker_urls = router_worker_base_urls(worker_urls)
-        if not worker_urls:
-            worker_urls = [router_base]
-
-        # Reuse the shared --eval-* sampling args (no SFT-predict-specific
-        # flags). Defaults preserve the original SFT predict behaviour
-        # (greedy, max_new_tokens=512) when --eval-* is not provided.
-        eval_temperature = getattr(self.args, "eval_temperature", None)
-        eval_max_response_len = getattr(self.args, "eval_max_response_len", None)
-        eval_top_p = getattr(self.args, "eval_top_p", None)
-        sampling_params = {
-            "temperature": 0.0 if eval_temperature is None else eval_temperature,
-            "max_new_tokens": 512 if eval_max_response_len is None else eval_max_response_len,
-            "top_p": 1.0 if eval_top_p is None else eval_top_p,
-        }
-        if multimodal_inputs_list is None:
-            multimodal_inputs_list = [None] * len(prompts)
-
-        async def _one(idx: int, prompt: str, mm: dict | None) -> str:
-            url = f"{worker_urls[idx % len(worker_urls)]}/generate"
-            payload: dict[str, Any] = {"text": prompt, "sampling_params": sampling_params}
-            if mm:
-                encoded_mm, _ = await _encode_multimodal_inputs(mm)
-                payload.update(encoded_mm)
-            output = await post(url, payload)
-            if isinstance(output, dict) and "text" in output:
-                return output["text"]
-            if isinstance(output, str):
-                return output
-            return str(output)
-
-        return await asyncio.gather(
-            *[_one(i, p, m) for i, (p, m) in enumerate(zip(prompts, multimodal_inputs_list, strict=True))]
-        )
-
-    async def save(self, rollout_id):
-        await self.data_source.save.remote(rollout_id)
-
-    async def load(self, rollout_id=None):
-        try:
-            await self.data_source.load.remote(rollout_id)
-        except Exception as e:
-            logger.warning(f"Failed to load data source: {e}")
-
-    async def offload(self):
-        self._offload_local()
-
-    def _offload_local(self):
-        """Sync body of offload(); safe to call directly from code running
-        inside this actor's process (e.g. custom_reward_post_process)."""
-        if self.status == "offload":
-            logger.info("Rollout already offloaded; skipping")
-            return
-        self.health_monitoring_pause()
+        synced = set(actor_ids)
+        released = 0
         for srv in self.servers.values():
-            srv.offload()
-        self.status = "offload"
-
-    async def onload(self, tags: list[str] | None = None):
-        self._onload_local(tags)
-
-    def _onload_local(self, tags: list[str] | None = None):
-        """Sync body of onload(); safe to call directly from code running
-        inside this actor's process (e.g. custom_reward_post_process)."""
-        for srv in self.servers.values():
-            srv.onload(tags)
-        # Full onload transitions status; per-tag calls leave status for the
-        # dedicated wrappers below (onload_weights / onload_kv).
-        if tags is None:
-            self.status = "onload"
-
-    async def onload_weights(self):
-        await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])
-
-    async def onload_kv(self):
-        await self.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH])
-        self.status = "onload"
-
-    def get_status(self):
-        return self.status
-
-    @ray.method(concurrency_group="recover_rollout_engines")
-    def recover_rollout_engines(self, model_name: str | None = None):
-        """Restart any dead rollout engines and update num_new_engines for
-        update_weights detection."""
-        self.health_monitoring_pause()
-        srv = self._get_server(model_name)
-        if self.rollout_id == -1 or srv is None:
-            engines = srv.engines if srv else []
-            gpu_counts = srv.engine_gpu_counts if srv else []
-            gpu_offsets = srv.engine_gpu_offsets if srv else []
-            return engines, self.rollout_engine_lock, (srv.num_new_engines if srv else 0), gpu_counts, gpu_offsets
-
-        srv.recover()
-        return (
-            srv.engines,
-            self.rollout_engine_lock,
-            srv.num_new_engines,
-            srv.engine_gpu_counts,
-            srv.engine_gpu_offsets,
-        )
-
-    @ray.method(concurrency_group="recover_rollout_engines")
-    def register_recovered_engines(self, synced_actor_ids: list[str]) -> None:
-        """Publish only current recovered generations that completed weight
-        sync."""
-        synced = set(synced_actor_ids)
-        with self._engine_lifecycle_lock:
-            if not self._training_weight_updating:
-                return
-            for srv in self.servers.values():
-                for group in srv.engine_groups:
-                    if (
-                        not group.is_scaled_out
-                        or group.pg is None
-                        or group.lifecycle_status is not EngineGroupLifecycle.ACTIVE
-                    ):
-                        continue
-                    for slot, engine in enumerate(group.all_engines):
-                        record = group.engine_init_records.get(slot)
-                        if (
-                            engine is None
-                            or engine._actor_id.hex() not in synced
-                            or record is None
-                            or not record.pending_router_registration
-                        ):
-                            continue
-                        metadata, _, issue = _read_engine_metadata(
-                            group, slot, engine, record, self._engine_actor_states
-                        )
-                        if issue is not None or metadata is None or metadata["url"] is None:
-                            continue
-                        try:
-                            if ray.get(engine.is_evicted.remote(), timeout=5):
-                                continue
-                            if ray.get(engine.register_to_router.remote(), timeout=35) is not True:
-                                raise RuntimeError("Router rejected recovered engine")
-                        except Exception:
-                            logger.warning(
-                                "[Recovery] Router publication failed for actor=%s; retry after next weight sync",
-                                engine._actor_id.hex(),
-                                exc_info=True,
-                            )
-                            continue
-                        record.pending_router_registration = False
-                        logger.info(
-                            "[Recovery] Registered weight-synced engine rank=%s actor=%s url=%s to Router",
-                            group.rank_offset + slot,
-                            engine._actor_id.hex(),
-                            metadata["url"],
-                        )
+            for group in srv.engine_groups:
+                changed = False
+                for slot, record in group.engine_init_records.items():
+                    engine = group.all_engines[slot] if slot < len(group.all_engines) else None
+                    if record.awaiting_weight_sync and engine is not None and engine._actor_id.hex() in synced:
+                        record.awaiting_weight_sync = False
+                        changed = True
+                        released += 1
+                if changed:
+                    group.notify_topology_change()
+        return released
 
     def clear_num_new_engines(self, model_name: str | None = None):
         # when fault tolerance is not enabled, we need to manually clear num_new_engines after update_weights
@@ -1399,12 +1344,10 @@ class RolloutManager(ReloadableMixin):
         if srv:
             srv.num_new_engines = 0
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_pause(self) -> None:
         for monitor in self._health_monitors:
             monitor.pause()
 
-    @ray.method(concurrency_group="health_monitoring")
     def health_monitoring_resume(self) -> None:
         for monitor in self._health_monitors:
             monitor.resume()
@@ -1413,7 +1356,6 @@ class RolloutManager(ReloadableMixin):
         refs = [engine.check_weights.remote(action=action) for engine in self.rollout_engines]
         return await asyncio.gather(*refs)
 
-    @ray.method(concurrency_group="health_monitoring")
     def set_force_unhealthy(self, engine_id: int) -> None:
         """Set ``_force_unhealthy`` on a specific rollout engine for debug.
 
@@ -1428,27 +1370,6 @@ class RolloutManager(ReloadableMixin):
             raise ValueError(f"Engine {engine_id} is already None (dead)")
         ray.get(engine.set_force_unhealthy.remote(True))
         logger.info(f"set_force_unhealthy: engine {engine_id} marked as unhealthy")
-
-    @property
-    def tokenizer(self):
-        """Lazy-initialized tokenizer for debug data saving."""
-        if self._tokenizer is None:
-            try:
-                from relax.utils.data.processing_utils import load_tokenizer
-
-                prepare_model_maybe_update_args(self.args, completeness="metadata")
-                self._tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
-                logger.info(f"Loaded tokenizer from {self.args.hf_checkpoint}")
-            except Exception as e:
-                logger.warning(f"Failed to load tokenizer: {e}")
-        return self._tokenizer
-
-    def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
-        """Save debug rollout data using shared utility function."""
-        save_debug_rollout_data(self.args, data, rollout_id, evaluation, tokenizer=self.tokenizer)
-
-    def set_train_parallel_config(self, config: dict):
-        self.train_parallel_config = config
 
     # ===================== Elastic Rollout Scale-Out Methods =====================
 
@@ -1505,7 +1426,7 @@ class RolloutManager(ReloadableMixin):
             ValueError: If the address format is invalid
         """
         # Strip scheme prefix so callers can pass full URLs
-        addr = RolloutManager._normalize_engine_addr(addr)
+        addr = RolloutEnginePool._normalize_engine_addr(addr)
         if addr.startswith("["):
             # IPv6 bracket notation: [::1]:8000
             bracket_end = addr.find("]")
@@ -1601,7 +1522,11 @@ class RolloutManager(ReloadableMixin):
                         }
         return None
 
-    @ray.method(concurrency_group="scale_coordination")
+    def _require_elastic(self, model_name: str) -> None:
+        srv = self._get_server(model_name)
+        if srv is not None and srv.model_spec is not None and not srv.model_spec.elastic_enabled:
+            raise ValueError(f"Model '{model_name}' is not elastic; its engine pool cannot be scaled")
+
     def create_scale_out_request(
         self,
         model_name: str = "default",
@@ -1631,6 +1556,7 @@ class RolloutManager(ReloadableMixin):
         Returns:
             Dict with request_id and initial status (or NOOP if idempotent no-op)
         """
+        self._require_elastic(model_name)
         # Auto-detect mode: if num_replicas > 0, use ray_native; otherwise use external
         if num_replicas > 0:
             scale_mode = ScaleOutMode.RAY_NATIVE
@@ -1759,7 +1685,6 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_out")
     async def execute_scale_out(self, request_id: str) -> None:
         """Execute a previously created scale-out request. Meant to be called
         via .remote() (fire-and-forget).
@@ -1780,6 +1705,9 @@ class RolloutManager(ReloadableMixin):
         if request.status != ScaleOutStatus.PENDING:
             logger.warning(f"Scale-out request {request_id} is not in PENDING state: {request.status}")
             return
+
+        # A stranded replica from an earlier request gets another stop attempt.
+        await self.retry_stranded_replicas()
 
         # Auto-detect mode: if num_replicas > 0, it's ray_native; if engine_urls is provided, it's external
         if request.num_replicas > 0:
@@ -1837,6 +1765,8 @@ class RolloutManager(ReloadableMixin):
             logger.error(f"[ScaleOut] Model '{request.model_name}' not found")
             return
 
+        per_replica_pgs: list[Any] = []
+        committed_pg_indices: set[int] = set()
         try:
             # Step 1: Update status
             request.update_status(ScaleOutStatus.CREATING)
@@ -1855,7 +1785,6 @@ class RolloutManager(ReloadableMixin):
 
             # Step 2: Create one PG per replica so that replicas with available
             # resources can proceed immediately without waiting for the others.
-            per_replica_pgs = []
             for i in range(request.num_replicas):
                 num_gpus = gpus_per_engine
                 accel_resource = device_utils.get_ray_accelerator_name()
@@ -1927,7 +1856,7 @@ class RolloutManager(ReloadableMixin):
                         except Exception as e:
                             logger.warning(f"[ScaleOut] PG for replica {idx} failed: {e}")
                             pending_indices.discard(idx)
-                            failed_replica_ids.append(f"replica_{idx}")
+                            failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_FAILED))
                             try:
                                 ray.util.remove_placement_group(per_replica_pgs[idx])
@@ -1975,27 +1904,24 @@ class RolloutManager(ReloadableMixin):
                             # Should not normally happen since _bring_up_single_replica
                             # catches exceptions internally, but handle defensively.
                             logger.exception(f"[ScaleOut] Unexpected exception during parallel bring-up: {result}")
-                            failed_replica_ids.append(f"replica_{replica_idx_for_result}")
+                            failed_replica_ids.append(
+                                f"scale-out/{request.request_id}/replica-{replica_idx_for_result}"
+                            )
                             failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED))
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[replica_idx_for_result])
-                            except Exception:
-                                pass
+                            self._remove_replica_pg(per_replica_pgs[replica_idx_for_result])
                             continue
                         idx, success, reason, engine_offset = result
                         if success:
                             engine_id = f"engine_{engine_offset}"
                             succeeded_engine_ids.append(engine_id)
+                            committed_pg_indices.add(idx)
                             logger.info(f"[ScaleOut] ✅ Replica {idx} successfully brought up as {engine_id}")
                         else:
-                            failed_replica_ids.append(f"replica_{idx}")
+                            failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                             if reason:
                                 failure_reasons.append(reason)
                             logger.warning(f"[ScaleOut] ❌ Replica {idx} failed during bring-up: {reason}")
-                            try:
-                                ray.util.remove_placement_group(per_replica_pgs[idx])
-                            except Exception:
-                                pass
+                            self._remove_replica_pg(per_replica_pgs[idx])
 
                 if not newly_ready and pending_indices:
                     elapsed_now = time.time() - start_time
@@ -2009,7 +1935,7 @@ class RolloutManager(ReloadableMixin):
             # Phase B: Handle remaining pending PGs (timed out)
             for idx in list(pending_indices):
                 logger.warning(f"[ScaleOut] Replica {idx} timed out waiting for resources")
-                failed_replica_ids.append(f"replica_{idx}")
+                failed_replica_ids.append(f"scale-out/{request.request_id}/replica-{idx}")
                 failure_reasons.append(ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
                 try:
                     ray.util.remove_placement_group(per_replica_pgs[idx])
@@ -2022,6 +1948,9 @@ class RolloutManager(ReloadableMixin):
             )
 
         except Exception as e:
+            for idx, pg in enumerate(per_replica_pgs):
+                if idx not in committed_pg_indices:
+                    self._remove_replica_pg(pg)
             # Surface only the exception type, never its args (may leak); full exc logged below.
             failure = ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, type(e).__name__)
             request.failure_categories = scale_utils._scale_out_failure_categories([failure])
@@ -2047,6 +1976,8 @@ class RolloutManager(ReloadableMixin):
         on failure where ``reason`` describes the specific failure (engine init /
         provision timeout / finalize root cause). On failure, engines are rolled back
         but the placement group is NOT removed (caller is responsible for PG cleanup).
+        A replica whose engines the rollback cannot confirm stopped is kept as
+        stranded, with its slice, and its placement group must be left alone.
 
         Args:
             request: The parent scale-out request.
@@ -2065,9 +1996,14 @@ class RolloutManager(ReloadableMixin):
         """
         info_actors = []
         new_group = None
+        placement = None
+        succeeded = False
+        stranded = False
         try:
             # Step 1: Probe GPU topology
             logger.info(f"[ScaleOut] Replica {replica_idx}: probing GPU topology for {num_gpus} GPUs...")
+            from relax.distributed.ray.placement_group import INFO_ACTOR_RUNTIME_ENV as info_actor_runtime_env
+
             accelerator_kwargs = get_ray_accelerator_kwargs(1)
             for i in range(num_gpus):
                 info_actors.append(
@@ -2076,24 +2012,38 @@ class RolloutManager(ReloadableMixin):
                             placement_group=pg,
                             placement_group_bundle_index=i,
                         ),
+                        runtime_env=info_actor_runtime_env,
                         **accelerator_kwargs,
                     ).remote()
                 )
-            gpu_ids = await asyncio.gather(*[actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+            probes = await asyncio.gather(*[actor.get_ip_gpu_and_node_id.remote() for actor in info_actors])
             for actor in info_actors:
                 ray.kill(actor)
             info_actors = []
 
-            bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_gpus)]
-            sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-            pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-            pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-            pg_tuple = (pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids)
+            from relax.distributed.ray.placement_group import build_placement_binding
 
+            binding = build_placement_binding(pg, probes, sort_key=sort_key)
             logger.info(
                 f"[ScaleOut] Replica {replica_idx}: GPU topology probed, "
-                f"bundle_indices={pg_reordered_bundle_indices}, gpu_ids={pg_reordered_gpu_ids}"
+                f"bundle_indices={list(binding.bundle_indices)}, gpu_ids={list(binding.gpu_ids)}, "
+                f"node_ids={list(binding.node_ids)}"
             )
+
+            # Planned against the probed binding, so a slot that is not one
+            # node over consecutive GPUs is refused before any engine starts.
+            placement = self._plan_placement(
+                (
+                    PlacementRequest(
+                        group_id=f"scale-out/{request.request_id}/replica-{replica_idx}",
+                        worker_type="regular",
+                        num_gpus=num_gpus,
+                        num_gpus_per_engine=gpus_per_engine,
+                        num_gpus_per_node=self.args.num_gpus_per_node,
+                    ),
+                ),
+                placement_group_view(binding, PlacementOwner.MANAGER),
+            )[0]
 
             # Step 2: Create EngineGroup (skip router registration during init).
             # Inherit model/config overrides from the original regular group. Runtime may have
@@ -2120,25 +2070,29 @@ class RolloutManager(ReloadableMixin):
             actors_per_replica = max(1, gpus_per_engine // self.args.num_gpus_per_node)
             new_group = EngineGroup(
                 args=self.args,
-                pg=pg_tuple,
+                pg=binding,
                 all_engines=[None] * actors_per_replica,
                 num_gpus_per_engine=gpus_per_engine,
                 num_new_engines=0,
                 worker_type="regular",
                 rank_offset=engine_offset,
-                gpu_offset=0,
+                gpu_offset=placement.reserved_offset,
                 sglang_overrides=dict(template_group.sglang_overrides),
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
+                model_id=srv.model_name,
                 is_scaled_out=True,
                 skip_dcs_registration=True,  # Will be done in _finalize_engine_group_registration
                 skip_router_registration=True,  # Will be done in _finalize_engine_group_registration
+                placement=placement,
+                pg_owner=PlacementOwner.MANAGER,
             )
 
             # Step 3: Start engines
             init_handles, self._port_cursors = new_group.start_engines(self._port_cursors)
             if not init_handles:
                 logger.error(f"[ScaleOut] Replica {replica_idx}: no init handles returned")
+                stranded = not await self._rollback_engines(new_group)
                 return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_NO_HANDLES))
 
             # Step 4: Wait for engine init
@@ -2148,11 +2102,11 @@ class RolloutManager(ReloadableMixin):
             except asyncio.TimeoutError:
                 # Elastic node couldn't bring the engine up in time → provision timeout.
                 logger.error(f"[ScaleOut] Replica {replica_idx}: engine init timed out after {remaining_timeout:.0f}s")
-                await self._rollback_engines(new_group)
+                stranded = not await self._rollback_engines(new_group)
                 return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.PROVISION_TIMEOUT))
             except Exception as e:
                 logger.error(f"[ScaleOut] Replica {replica_idx}: engine init failed: {e}")
-                await self._rollback_engines(new_group)
+                stranded = not await self._rollback_engines(new_group)
                 return ScaleResult(False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED, str(e)))
 
             # Step 5: Finalize registration (health check → weight sync → DCS → router → server)
@@ -2167,12 +2121,13 @@ class RolloutManager(ReloadableMixin):
             if not result.success:
                 # Keep the pre-created group: the finalizer returns None on
                 # failure, but these engine actors still require rollback.
-                await self._rollback_engines(new_group)
+                stranded = not await self._rollback_engines(new_group)
                 return ScaleResult(
                     False, result.reason or ScaleOutFailure(ScaleOutFailureCategory.UNKNOWN, "finalize failed")
                 )
             new_group = result.group
 
+            succeeded = True
             return ScaleResult(True)
 
         except Exception as e:
@@ -2180,7 +2135,7 @@ class RolloutManager(ReloadableMixin):
             if new_group is not None:
                 if new_group in srv.engine_groups:
                     srv.engine_groups.remove(new_group)
-                await self._rollback_engines(new_group)
+                stranded = not await self._rollback_engines(new_group)
             for actor in info_actors:
                 try:
                     ray.kill(actor)
@@ -2189,6 +2144,17 @@ class RolloutManager(ReloadableMixin):
             return ScaleResult(
                 False, ScaleOutFailure(ScaleOutFailureCategory.ENGINE_INIT_FAILED, f"{type(e).__name__}: {e}")
             )
+        finally:
+            if stranded:
+                # Removing the placement group is not relied on to stop what
+                # the rollback could not: keep the slice, the group and the
+                # handles for ``retry_stranded_replicas``; the caller leaves the
+                # placement group alone.
+                self._strand((new_group, placement, pg))
+            elif not succeeded and placement is not None:
+                # The caller removes this replica's placement group; its ledger
+                # entry goes with it.
+                self._release_placement(placement)
 
     async def _scale_out_external(self, request: ScaleOutRequest) -> None:
         """Execute scale-out in external mode.
@@ -2467,21 +2433,22 @@ class RolloutManager(ReloadableMixin):
                 gpu_offset=0,
                 router_ip=router_ip,
                 router_port=router_port,
+                model_id=srv.model_name,
                 is_scaled_out=True,
                 skip_dcs_registration=False,  # Already registered above
+                pg_owner=PlacementOwner.EXTERNAL,
             )
         else:
             # Mark DCS registration as done (for ray_native mode)
             engine_group.skip_dcs_registration = False
-        for record in engine_group.engine_init_records.values():
-            record.pending_router_registration = False
 
         # Step 6: Add to server
         srv.engine_groups.append(engine_group)
+        engine_group.on_topology_change = lambda name=request.model_name: self._events.changed(name)
         engine_group.num_new_engines = 0
 
         # Step 7: Register health monitor
-        if self.args.use_fault_tolerance:
+        if srv.model_spec is not None and srv.model_spec.fault_tolerance_enabled:
             monitor = RolloutHealthMonitor(engine_group, self.args)
             monitor.start()
             self._health_monitors.append(monitor)
@@ -2491,6 +2458,7 @@ class RolloutManager(ReloadableMixin):
             f"Total engine_groups: {len(srv.engine_groups)}, "
             f"total engines: {sum(len(g.all_engines) for g in srv.engine_groups)}"
         )
+        self._topology_settled()
         return EngineFinalizeResult(True, group=engine_group)
 
     def _update_scale_out_final_status(
@@ -3288,7 +3256,7 @@ class RolloutManager(ReloadableMixin):
             logger.warning(f"[HealthCheck] Health check failed with exception: {e}")
             return False
 
-    async def _rollback_engines(self, engines_or_group) -> None:
+    async def _rollback_engines(self, engines_or_group) -> bool:
         """Rollback failed engines.
 
         Steps:
@@ -3296,15 +3264,18 @@ class RolloutManager(ReloadableMixin):
         2. Graceful shutdown (unregisters from router + kills sglang process)
         3. Force-kill Ray actor only if shutdown fails
 
+        Returns whether every engine is confirmed stopped: shut down, already
+        dead, or killed. A group's confirmed engines leave their slots, so a
+        retry only touches the rest.
+
         Args:
             engines_or_group: List of engines or EngineGroup
         """
-        if isinstance(engines_or_group, EngineGroup):
-            engines = engines_or_group.all_engines
-        else:
-            engines = engines_or_group
+        group = engines_or_group if isinstance(engines_or_group, EngineGroup) else None
+        engines = group.all_engines if group is not None else engines_or_group
 
-        for engine in engines:
+        all_stopped = True
+        for index, engine in enumerate(list(engines)):
             if engine is None:
                 continue
             try:
@@ -3312,22 +3283,116 @@ class RolloutManager(ReloadableMixin):
                 await asyncio.wait_for(engine.unregister_dcs.remote(), timeout=10)
             except Exception as e:
                 logger.warning(f"Failed to unregister DCS for engine during rollback: {e}")
-            shutdown_ok = False
+            stopped = False
             try:
                 # Graceful shutdown (unregisters from router + kills sglang process)
                 await asyncio.wait_for(engine.shutdown.remote(), timeout=30)
-                shutdown_ok = True
+                stopped = True
+            except ray.exceptions.RayActorError as e:
+                logger.warning(f"Engine was already dead during rollback: {e}")
+                stopped = True
             except Exception as e:
                 logger.warning(f"Failed to shutdown engine during rollback: {e}")
             # Force-kill Ray actor only as a last resort (if shutdown failed or
             # we need to ensure the actor is fully cleaned up).
-            if not shutdown_ok:
+            if not stopped:
                 try:
                     ray.kill(engine)
+                    stopped = True
                 except Exception as e:
                     logger.warning(f"Failed to kill engine actor during rollback: {e}")
+            if not stopped:
+                all_stopped = False
+            elif group is not None:
+                group.all_engines[index] = None
+        return all_stopped
 
-    @ray.method(concurrency_group="scale_out")
+    async def retry_stranded_replicas(self, *, final: bool = False) -> int:
+        """Retry stopping scale-out replicas a rollback could not stop; give
+        back the slice and placement group of each one that stops now.
+
+        With ``final`` (the role is shutting down, so there is no later retry)
+        a replica that still does not stop has its placement group removed as a
+        last resort, and is given back too.
+
+        Returns how many were still not confirmed stopped.
+        """
+        # Take the list, so a concurrent retry never stops the same replica.
+        with self._stranded_lock:
+            stranded, self._stranded_replicas = self._stranded_replicas, []
+        unstopped = 0
+        for group, placement, pg in stranded:
+            if not await self._rollback_engines(group):
+                unstopped += 1
+                if not final:
+                    with self._stranded_lock:
+                        self._stranded_replicas.append((group, placement, pg))
+                    continue
+                logger.error(
+                    "[ScaleOut] A stranded scale-out replica could not be stopped at shutdown; "
+                    "removing its placement group as a last resort"
+                )
+            self._release_placement(placement)
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception as e:
+                logger.warning(f"[ScaleOut] Failed to remove placement group of a stranded replica: {e}")
+        if self._stranded_replicas:
+            logger.error(
+                f"[ScaleOut] {len(self._stranded_replicas)} scale-out replicas still may hold GPUs; "
+                "their placement stays reserved"
+            )
+        return unstopped
+
+    def _is_stranded(self, pg: Any) -> bool:
+        with self._stranded_lock:
+            return any(held is pg for _, _, held in self._stranded_replicas)
+
+    def _strand(self, replica: tuple[EngineGroup, PlacementSlice, Any]) -> None:
+        """Keep a replica the rollback could not stop, and make sure the
+        background retry runs."""
+        with self._stranded_lock:
+            self._stranded_replicas.append(replica)
+            if self._stranded_retry_thread is not None and self._stranded_retry_thread.is_alive():
+                return
+            self._stranded_retry_stop.clear()
+            self._stranded_retry_thread = threading.Thread(
+                target=self._stranded_retry_loop, name="StrandedReplicaRetry", daemon=True
+            )
+            self._stranded_retry_thread.start()
+
+    def _stranded_retry_loop(self) -> None:
+        """Retry stranded replicas until none is left or the pool stops, so
+        their GPUs do not wait for the next scaling request."""
+        while not self._stranded_retry_stop.wait(timeout=STRANDED_RETRY_INTERVAL_S):
+            try:
+                asyncio.run(self.retry_stranded_replicas())
+            except Exception:
+                logger.exception("[ScaleOut] Unhandled error while retrying stranded replicas")
+            with self._stranded_lock:
+                if not self._stranded_replicas:
+                    self._stranded_retry_thread = None
+                    return
+
+    def _stop_stranded_retry(self) -> None:
+        thread = self._stranded_retry_thread
+        if thread is None:
+            return
+        self._stranded_retry_stop.set()
+        thread.join(timeout=STRANDED_RETRY_JOIN_TIMEOUT_S)
+        if thread.is_alive():
+            logger.warning("[ScaleOut] Stranded replica retry thread did not terminate in time")
+        self._stranded_retry_thread = None
+
+    def _remove_replica_pg(self, pg: Any) -> None:
+        """Remove a failed replica's placement group unless it is stranded."""
+        if self._is_stranded(pg):
+            return
+        try:
+            ray.util.remove_placement_group(pg)
+        except Exception:
+            pass
+
     def get_scale_out_status(self, request_id: str) -> Optional[dict]:
         """Get the status of a scale-out request.
 
@@ -3340,7 +3405,6 @@ class RolloutManager(ReloadableMixin):
         request = self._scale_out_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_out")
     def cancel_scale_out(self, request_id: str) -> Optional[dict]:
         """Cancel a scale-out request.
 
@@ -3365,22 +3429,36 @@ class RolloutManager(ReloadableMixin):
         logger.info(f"Scale-out request {request_id} cancelled (was in {previous_status} state)")
         return request.to_dict()
 
+    def get_primary_router_address(self) -> dict:
+        """The router of the first model, as written back into ``args``.
+
+        ``start_rollout_servers`` records this endpoint on the args object it
+        was given. When the pool runs in the task owner's process that object
+        is not the rollout role's, so the role reads the endpoint from here.
+        """
+        if not self.servers:
+            return {"router_ip": None, "router_port": None}
+        first = next(iter(self.servers.values()))
+        return {"router_ip": first.router_ip, "router_port": first.router_port}
+
     def get_router_address(self, model_name: str = "default") -> dict:
         srv = self.servers.get(model_name)
         if srv is None:
             return {"router_ip": None, "router_port": None}
         return {"router_ip": srv.router_ip, "router_port": srv.router_port}
 
-    @ray.method(concurrency_group="scale_out")
-    def get_engines_info(self, model_name: Optional[str] = None) -> dict:
+    def get_engines_info(self, model_name: Optional[str] = None, status_filter: Optional[str] = None) -> dict:
         """Get information about all engines.
 
         Args:
             model_name: Model name to query (optional, default: all models)
+            status_filter: Filter engines by ``active`` or ``dead`` status.
 
         Returns:
             Dict with engine information
         """
+        if status_filter not in (None, "active", "dead"):
+            raise ValueError("status_filter must be one of: active, dead")
         issues: list[dict[str, str]] = []
         result = {"models": {}, "total_engines": 0, "observation": {"complete": True, "issues": issues}}
 
@@ -3407,24 +3485,28 @@ class RolloutManager(ReloadableMixin):
                 }
 
                 for j, engine in enumerate(list(group.all_engines)):
+                    status = "active" if engine is not None else "dead"
                     record = group.engine_init_records.get(j)
+                    # Observe every slot, so a filtered view still reports an incomplete pool.
+                    metadata, state, issue = _read_engine_metadata(group, j, engine, record, self._engine_actor_states)
+                    if issue is not None:
+                        issues.append({"scope": f"{name}/{i}/{group.rank_offset + j}", "reason": issue})
+                    if status_filter is not None and status_filter != status:
+                        continue
                     engine_info = {
                         "rank": group.rank_offset + j,
-                        "status": "active" if engine is not None else "dead",
+                        "status": status,
                     }
-                    metadata, state, issue = _read_engine_metadata(group, j, engine, record, self._engine_actor_states)
                     engine_info["actor_state"] = state
                     if metadata is not None:
                         engine_info["pid"] = metadata["pid"]
                         engine_info["node_id"] = metadata["node_id"]
                         if metadata["url"] is not None:
                             engine_info["url"] = metadata["url"]
-                    if issue is not None:
-                        issues.append({"scope": f"{name}/{i}/{group.rank_offset + j}", "reason": issue})
                     group_info["engines"].append(engine_info)
 
                 model_info["engine_groups"].append(group_info)
-                model_info["total_engines"] += len(group.all_engines)
+                model_info["total_engines"] += len(group_info["engines"])
 
             result["models"][name] = model_info
             result["total_engines"] += model_info["total_engines"]
@@ -3432,7 +3514,6 @@ class RolloutManager(ReloadableMixin):
         result["observation"]["complete"] = not issues
         return result
 
-    @ray.method(concurrency_group="scale_out")
     def list_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -3499,7 +3580,6 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    @ray.method(concurrency_group="scale_out")
     async def cancel_all_scale_out_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None, dry_run: bool = False
     ) -> dict:
@@ -3607,9 +3687,11 @@ class RolloutManager(ReloadableMixin):
 
         return result
 
-    @ray.method(concurrency_group="scale_in")
-    def set_weight_updating(self, is_updating: bool) -> bool:
+    def _set_weight_updating(self, is_updating: bool) -> bool:
         """Acquire or release the fully-async topology lease.
+
+        Only ``InferenceManager.begin_weight_update`` / ``end_weight_update``
+        drive it, so the lease and the Manager's admission stay in step.
 
         A DRAINING group owns the scale-in fence, so a new update must retry.
         An update admitted first may finish; scale-in waits for this owner to
@@ -3625,7 +3707,6 @@ class RolloutManager(ReloadableMixin):
             self._training_weight_updating = is_updating
             return True
 
-    @ray.method(concurrency_group="scale_in")
     async def sync_weights_for_scaled_out_engines(
         self,
         model_name: str = "default",
@@ -3715,7 +3796,6 @@ class RolloutManager(ReloadableMixin):
                 "error_message": str(e),
             }
 
-    @ray.method(concurrency_group="scale_coordination")
     def create_scale_in_request(
         self,
         model_name: str = "default",
@@ -3725,6 +3805,7 @@ class RolloutManager(ReloadableMixin):
         force: bool = False,
         dry_run: bool = False,
     ) -> dict:
+        self._require_elastic(model_name)
         # Mutual exclusion: reject if any scale operation is in progress
         active = self._find_active_scale_request()
         if active is not None:
@@ -3802,7 +3883,6 @@ class RolloutManager(ReloadableMixin):
             self._gc_terminal_requests()
         return request.to_dict()
 
-    @ray.method(concurrency_group="scale_in")
     async def execute_scale_in(self, request_id: str) -> None:
         request = self._scale_in_requests.get(request_id)
         if request is None:
@@ -3812,6 +3892,8 @@ class RolloutManager(ReloadableMixin):
             logger.warning(f"Scale-in request {request_id} is not in PENDING state: {request.status}")
             return
 
+        # A stranded scale-out replica gets another stop attempt.
+        await self.retry_stranded_replicas()
         await self._scale_in(request)
 
     async def _scale_in(self, request: ScaleInRequest) -> None:
@@ -4043,15 +4125,18 @@ class RolloutManager(ReloadableMixin):
                 logger.warning(f"[ScaleIn] Failed to unregister DCS for engine {engine_id}: {result}")
             shutdown_targets.append(target)
 
-        await asyncio.gather(
+        stopped = await asyncio.gather(
             *[
                 self._shutdown_engine_actors(group, engine_id, live_actors, shutdown_timeout)
                 for group, _, engine_id, live_actors in shutdown_targets
             ]
         )
-        for _, _, engine_id, _ in shutdown_targets:
-            removed.append(engine_id)
-            logger.info(f"[ScaleIn] Removed engine {engine_id}")
+        for (_, _, engine_id, _), ok in zip(shutdown_targets, stopped):
+            if ok:
+                removed.append(engine_id)
+                logger.info(f"[ScaleIn] Removed engine {engine_id}")
+            else:
+                failed.append(engine_id)
 
         self._cleanup_engine_groups(srv)
         return removed, failed
@@ -4075,6 +4160,9 @@ class RolloutManager(ReloadableMixin):
             if engine is None:
                 return
             engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
+            if group.router_removed.get(node0_idx) is engine:
+                logger.info(f"[ScaleIn] Engine {engine_id} was already removed from the router")
+                return
 
             router_removal_timeout = max(5.0, min(timeout, 30.0))
             removed = await asyncio.wait_for(
@@ -4086,6 +4174,7 @@ class RolloutManager(ReloadableMixin):
             )
             if not removed:
                 raise RuntimeError(f"Router did not remove engine {engine_id}")
+            group.router_removed[node0_idx] = engine
             logger.info(f"[ScaleIn] Removed engine {engine_id} from router")
 
             for monitor in self._health_monitors:
@@ -4155,7 +4244,14 @@ class RolloutManager(ReloadableMixin):
         engine_id: str,
         live_actors: list[tuple[int, object]],
         shutdown_timeout: float,
-    ) -> None:
+    ) -> bool:
+        """Stop the engine's actors and report whether all of them stopped.
+
+        An actor that is neither shut down, already dead nor killed keeps its
+        slot, so its group and placement stay held and a retry can stop it.
+        """
+        group.notify_topology_change()
+
         async def _shutdown(engine):
             return await asyncio.wait_for(engine.shutdown.remote(), timeout=shutdown_timeout)
 
@@ -4163,17 +4259,29 @@ class RolloutManager(ReloadableMixin):
             *[_shutdown(engine) for _, engine in live_actors],
             return_exceptions=True,
         )
+        kept = set()
         for (i, engine), result in zip(live_actors, shutdown_results):
             if isinstance(result, BaseException):
                 logger.warning(f"[ScaleIn] Failed to shutdown engine {engine_id}[{i}]: {result}")
+                if isinstance(result, ray.exceptions.RayActorError):
+                    continue
                 try:
                     ray.kill(engine)
                 except Exception as e:
-                    logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]: {e}")
+                    logger.warning(f"[ScaleIn] Failed to kill engine actor {engine_id}[{i}]; keeping it: {e}")
+                    kept.add(i)
 
         with self._engine_lifecycle_lock:
             for i, _ in live_actors:
-                group.all_engines[i] = None
+                if i not in kept:
+                    group.all_engines[i] = None
+            # Drop the Router record of engines that are gone; it only serves a
+            # retry of an engine still held.
+            for node0_idx in list(group.router_removed):
+                if group.engines[node0_idx] is None:
+                    del group.router_removed[node0_idx]
+        self._topology_settled()
+        return not kept
 
     async def _remove_engine(self, group, node0_idx: int, shutdown_timeout: float) -> None:
         engine_id = f"group_{group.rank_offset}_engine_{node0_idx}"
@@ -4207,7 +4315,14 @@ class RolloutManager(ReloadableMixin):
             monitor.stop()
 
         for group in groups_to_remove:
-            if group.pg is not None:
+            # Ownership decides removal: a Controller-owned or external group is
+            # only given back in the ledger, never destroyed here.
+            remove_pg = group.pg_owner is PlacementOwner.MANAGER
+            if group.placement is not None:
+                release = self._release_placement(group.placement)
+                if release.slices:
+                    remove_pg = release.remove_placement_group
+            if group.pg is not None and remove_pg:
                 try:
                     ray.util.remove_placement_group(group.pg[0])
                 except Exception as e:
@@ -4216,14 +4331,13 @@ class RolloutManager(ReloadableMixin):
                 group.lifecycle_status = EngineGroupLifecycle.REMOVED
 
         if groups_to_remove:
+            self._topology_settled()
             logger.info(f"[ScaleIn] Cleaned up {len(groups_to_remove)} empty engine groups")
 
-    @ray.method(concurrency_group="scale_in")
     def get_scale_in_status(self, request_id: str) -> Optional[dict]:
         request = self._scale_in_requests.get(request_id)
         return request.to_dict() if request else None
 
-    @ray.method(concurrency_group="scale_in")
     def list_all_scale_in_requests(
         self, model_name: Optional[str] = None, status_filter: Optional[str] = None
     ) -> list[dict]:
@@ -4595,14 +4709,17 @@ def _start_router(
     *,
     has_pd_disaggregation: bool = False,
     force_new: bool = False,
+    launched: list[multiprocessing.Process] | None = None,
     initial_pd_workers: list[dict] | None = None,
 ) -> tuple[str | None, int | None]:
     """Start sgl router or slime router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
-    ``force_new`` is True (multi-model), always allocate a fresh port. Managed
-    P2C startup returns ``(None, None)`` until initial workers exist.
+    ``force_new`` is True (multi-model), always allocate a fresh port. A
+    process this call launches is also appended to ``launched``, so a caller
+    can stop exactly what it started. Managed P2C startup returns ``(None,
+    None)`` until initial workers exist.
     """
     endpoint = (args.sglang_router_ip, args.sglang_router_port)
     owns_endpoint = getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
@@ -4697,9 +4814,13 @@ def _start_router(
     )
     process.daemon = True
     process.start()
+    # Record it before anything else can fail, so a failed startup can stop it.
     _LAUNCHED_ROUTER_PROCESSES.append(process)
+    if launched is not None:
+        launched.append(process)
     time.sleep(3)
-    assert process.is_alive()
+    if not process.is_alive():
+        raise RuntimeError(f"Router process exited during startup (exitcode={process.exitcode})")
     if initial_pd_workers is not None and not force_new:
         args._relax_managed_pd_router_endpoint = (router_ip, router_port)
     logger.info(f"Router launched locally at {bind_ip}:{router_port} (connection address: {router_ip})")
@@ -4766,7 +4887,54 @@ def _wait_pd_router_workers(router_ip: str, router_port: int, expected: list[dic
     raise TimeoutError(f"Static PD router workers did not become ready: {last_error}")
 
 
-def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_new: bool) -> tuple[str, int]:
+def _defers_pd_router(args, model_cfg: InferenceModelSpec, model_idx: int) -> bool:
+    """Whether ``model_cfg`` uses managed static PD startup, validating that it
+    can.
+
+    A power-of-two decode policy cannot start with an empty worker set, so the
+    Router is launched once the P/D engines are ready, seeded with them.
+    """
+    endpoint = (args.sglang_router_ip, args.sglang_router_port)
+    managed = (
+        model_idx > 0
+        or args.sglang_router_ip is None
+        or getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
+    )
+    if not (
+        model_cfg.has_pd_disaggregation
+        and managed
+        and not args.use_slime_router
+        and getattr(args, "router_decode_policy", None) == "power_of_two"
+        and not args.debug_train_only
+    ):
+        return False
+    if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
+        raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
+    if getattr(args, "router_dp_aware", False):
+        raise ValueError("Managed static PD startup does not support DP-aware worker identities")
+    decode_count = sum(
+        group.num_gpus // group.num_gpus_per_engine
+        for group in model_cfg.engine_groups
+        if group.worker_type == "decode"
+    )
+    if decode_count < 2 or any(group.worker_type == "regular" for group in model_cfg.engine_groups):
+        raise ValueError("Managed power-of-two startup requires at least two D engines and only PD groups")
+    if any(
+        group.overrides.get("dp_size", getattr(args, "sglang_dp_size", 1)) != 1
+        for group in model_cfg.engine_groups
+        if group.worker_type != "placeholder"
+    ):
+        raise ValueError("Managed static PD startup currently requires dp_size=1")
+    return True
+
+
+def _start_managed_pd_router(
+    args,
+    engine_groups: list[EngineGroup],
+    *,
+    force_new: bool,
+    launched: list[multiprocessing.Process] | None = None,
+) -> tuple[str, int]:
     entries = [(group, engine) for group in engine_groups for engine in group.engines if engine is not None]
     specs = ray.get([engine.get_pd_router_worker_spec.remote() for _, engine in entries])
     if any(
@@ -4779,6 +4947,7 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
         args,
         has_pd_disaggregation=True,
         force_new=force_new,
+        launched=launched,
         initial_pd_workers=specs,
     )
     registry = _wait_pd_router_workers(router_ip, router_port, specs)
@@ -4821,10 +4990,22 @@ def stop_launched_routers() -> int:
     Returns the number of processes that were alive and successfully killed —
     callers use this to decide whether to reset cached router endpoint state.
     """
+    return stop_router_processes(list(_LAUNCHED_ROUTER_PROCESSES))
+
+
+def stop_router_processes(processes: list[multiprocessing.Process]) -> int:
+    """Terminate ``processes`` among the launched routers, leaving the rest.
+
+    Returns the number of processes that were alive and successfully killed.
+    """
     global _LAUNCHED_ROUTER_PROCESSES
+    targets = {id(proc) for proc in processes}
     killed = 0
     survivors: list[multiprocessing.Process] = []
     for proc in _LAUNCHED_ROUTER_PROCESSES:
+        if id(proc) not in targets:
+            survivors.append(proc)
+            continue
         try:
             if not proc.is_alive():
                 continue
@@ -4898,156 +5079,330 @@ def _wait_engine_init_with_progress(
     logger.info(f"[engine-init-barrier:{model_name}] all {total} engines ready")
 
 
-def _rollback_rollout_startup(groups: list[EngineGroup], routers_before: tuple) -> None:
-    """Close only native engine groups and routers created by this
-    invocation."""
-    global _LAUNCHED_ROUTER_PROCESSES
-    for group in reversed(groups):
-        if group.args.rollout_external:
-            continue
-        try:
-            group.shutdown_engines(set(range(len(group.all_engines))))
-        except Exception as error:
-            logger.warning("Failed to roll back engine group %s: %s", group.rank_offset, error)
-    created = [process for process in _LAUNCHED_ROUTER_PROCESSES if process not in routers_before]
-    previous = [process for process in _LAUNCHED_ROUTER_PROCESSES if process in routers_before]
-    _LAUNCHED_ROUTER_PROCESSES = created
+def rollout_role_models(args) -> list[InferenceModelSpec]:
+    """The rollout models declared by the SGLang config, resolved."""
+    config = _resolve_sglang_config(args)
+    # Rollout is the only elastic role, unless its Router is a fixed pool.
+    return [
+        dataclasses.replace(
+            model.resolved(args),
+            elastic_enabled=not getattr(args, "use_slime_router", False),
+            fault_tolerance_enabled=bool(getattr(args, "use_fault_tolerance", False)),
+            # Debug-rollout-only never syncs weights: the checkpoint the engines
+            # load is final, so they join the Router at start and are READY
+            # without a policy weight version.
+            **({"weight_source": WeightSource.STATIC} if getattr(args, "debug_rollout_only", False) else {}),
+        )
+        for model in config.models
+    ]
+
+
+def start_rollout_servers(
+    args, pg, *, planner: PlacementPlanner, leftovers: dict[str, RolloutServer] | None = None
+) -> dict[str, RolloutServer]:
+    """Start the rollout models declared by the SGLang config; see
+    ``start_servers`` for ``leftovers``."""
+    # Rollout holds the front of a shared placement group; roles placed behind
+    # it (split Teacher/GenRM) may already be recorded when it starts.
+    return start_servers(
+        args,
+        rollout_role_models(args),
+        planner=planner,
+        pg=pg,
+        bundle_offset=0 if pg is not None else None,
+        leftovers=leftovers,
+    )
+
+
+def _group_id(role: Role, model_name: str, group_index: int) -> str:
+    # The ledger is shared by every role of the task, so a group id carries its
+    # role: a Teacher and a Rollout model may both be called "default".
+    return f"{role.value}/{model_name}/group-{group_index}"
+
+
+def _placement_requests(
+    args, models: list[InferenceModelSpec], *, role: Role, bundle_offset: int | None, phase: str
+) -> list[PlacementRequest]:
+    requests = []
+    # An explicit offset lays out every group of this call back to back from it,
+    # instead of appending behind whatever other roles already hold in the phase.
+    next_offset = bundle_offset
+    for model in models:
+        for group_index, group in enumerate(model.engine_groups):
+            requests.append(
+                PlacementRequest(
+                    group_id=_group_id(role, model.name, group_index),
+                    worker_type=group.worker_type,
+                    num_gpus=group.num_gpus,
+                    num_gpus_per_engine=group.num_gpus_per_engine,
+                    num_gpus_per_node=args.num_gpus_per_node,
+                    phase=phase,
+                    bundle_offset=next_offset,
+                    active=group.worker_type != "placeholder",
+                )
+            )
+            if next_offset is not None:
+                next_offset += group.num_gpus
+    return requests
+
+
+def placement_group_view(pg: Any, owner: PlacementOwner) -> PlacementGroupView:
+    """The planner view of a ready placement group, with its node binding."""
+    return PlacementGroupView.from_binding(PlacementBinding.require(pg), owner)
+
+
+def placement_preview(
+    args,
+    models: list[InferenceModelSpec],
+    *,
+    role: Role,
+    pg: Any = None,
+    bundle_offset: int | None = None,
+    phase: str = PHASE_GENERATE,
+    **_: Any,
+) -> tuple[PlacementGroupView, list[PlacementRequest]]:
+    """What :func:`start_servers` would plan, for a dry run before any engine
+    starts.
+
+    Takes the same placement arguments; ``pg`` may also be a view standing in
+    for a group not created yet. Without ``pg`` the view stands in for the
+    dedicated group ``start_servers`` would create, sized to fit.
+    """
+    requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
+    if isinstance(pg, PlacementGroupView):
+        # A preflight stand-in for a group that does not exist yet.
+        return pg, requests
+    if pg is not None:
+        return placement_group_view(pg, PlacementOwner.CONTROLLER), requests
+    size = sum(model.total_num_gpus for model in models)
+    identity = f"preview/{role.value}/{'+'.join(model.name for model in models)}"
+    view = PlacementGroupView(tuple(range(size)), tuple(range(size)), PlacementOwner.MANAGER, identity=identity)
+    return view, requests
+
+
+# How often a scale-out replica whose engines could not be confirmed stopped is
+# retried in the background, and how long stopping waits for a retry in flight
+# (a rollback waits up to 40s per engine).
+STRANDED_RETRY_INTERVAL_S = 60.0
+STRANDED_RETRY_JOIN_TIMEOUT_S = 90.0
+
+# The teacher Router pins requests by their ``X-SMG-Routing-Key``.
+TEACHER_ROUTER_POLICY = "manual"
+
+
+def start_servers(
+    args,
+    models: list[InferenceModelSpec],
+    *,
+    planner: PlacementPlanner,
+    role: Role = Role.ROLLOUT,
+    pg: Any = None,
+    bundle_offset: int | None = None,
+    phase: str = PHASE_GENERATE,
+    base_port: int | None = None,
+    ray_num_gpus: float = 0.2,
+    leftovers: dict[str, RolloutServer] | None = None,
+) -> dict[str, RolloutServer]:
+    """Start one Router and its engine groups per model; the engine pool of
+    every inference role.
+
+    Each model gets its own router and set of engine groups; groups within a
+    model may use different ``num_gpus_per_engine`` (e.g. PD prefill/decode).
+    ``args`` is what the engines are built from. A static role (GenRM,
+    Teacher) runs the plain ``SGLangEngine`` with its model's role, weight
+    source and environment. Without ``pg`` a dedicated placement group is
+    created and owned here. ``bundle_offset`` and ``phase`` place the first
+    group in the placement ledger.
+
+    Returns a dict mapping model name → ``RolloutServer``. ``init_http_client``
+    must have been called before. If the startup fails and some engines cannot
+    be stopped, their groups are added to ``leftovers`` as servers by model,
+    still holding their reserved slices, so the caller can retry the shutdown.
+    """
+    static = role is not Role.ROLLOUT
+    placement_requests = _placement_requests(args, models, role=role, bundle_offset=bundle_offset, phase=phase)
+    pg_owner = PlacementOwner.CONTROLLER
+    if pg is None:
+        from relax.core.service import create_placement_group
+
+        pg = create_placement_group(
+            num_gpus=sum(model.total_num_gpus for model in models),
+            node_group_affinity=getattr(args, "enable_affinity", True),
+        )
+        pg_owner = PlacementOwner.MANAGER
     try:
-        stop_launched_routers()
-    finally:
-        _LAUNCHED_ROUTER_PROCESSES = previous + _LAUNCHED_ROUTER_PROCESSES
-
-
-def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
-    """Start the deployment atomically, retaining ownership on failure."""
-    groups: list[EngineGroup] = []
-    routers_before = tuple(_LAUNCHED_ROUTER_PROCESSES)
-    try:
-        servers = _start_rollout_servers_impl(args, pg, groups)
-        if getattr(args, "use_agentic_rollout", False):
-            from relax.agentic.rollout import bind_agentic_router
-
-            bind_agentic_router(args.sglang_router_ip, args.sglang_router_port)
-        return servers
+        pg_view = placement_group_view(pg, pg_owner)
+        planned_by_id = {planned.group_id: planned for planned in planner.plan(placement_requests, pg_view)}
     except Exception:
-        _rollback_rollout_startup(groups, routers_before)
+        # Nothing was reserved, but a group created here is still ours to remove.
+        if pg_owner.removable:
+            from ray.util.placement_group import remove_placement_group
+
+            remove_placement_group(pg[0])
         raise
 
-
-def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> dict[str, RolloutServer]:
-    """Start rollout servers: one per model, each with its own router.
-
-    Each model defined in the sglang config gets its own router and set
-    of engine groups.  Engine groups within a model may have different
-    ``num_gpus_per_engine`` (e.g. for PD disaggregation where prefill
-    and decode use different TP sizes).
-
-    Returns a dict mapping model name → ``RolloutServer``.
-
-    Note: ``init_http_client`` should be called separately before this,
-    as the HTTP client is shared across all servers.
-    """
-    config = _resolve_sglang_config(args)
-
     servers: dict[str, RolloutServer] = {}
-    gpu_offset = 0
+    # Every group whose engines may have been created, registered or not: a
+    # ``start_engines`` that raises can already have created some actors.
+    started_groups: list[EngineGroup] = []
+    # Routers this startup launched; one reused from ``args`` is not ours.
+    launched_routers: list[multiprocessing.Process] = []
+    router_endpoint = (args.sglang_router_ip, args.sglang_router_port)
     engine_offset = 0
+    try:
+        for model_idx, model_cfg in enumerate(models):
+            has_pd = model_cfg.has_pd_disaggregation
+            router_args = args
+            if static:
+                router_args = copy.copy(args)
+                router_args.use_slime_router = False
+            if role is Role.TEACHER:
+                # OPD sends every sample of a prompt group with the same routing
+                # key: pin the group to one replica so the shared prefix is
+                # prefilled once, and give each new group to the replica
+                # holding the fewest.
+                router_args.sglang_router_policy = TEACHER_ROUTER_POLICY
+                router_args.router_assignment_mode = "min_group"
+            # Managed static PD starts its Router only once the P/D engines are
+            # ready, seeded with them; the engines then adopt those entries.
+            defer_router = not static and _defers_pd_router(args, model_cfg, model_idx)
+            if defer_router:
+                router_ip, router_port = None, None
+            else:
+                router_ip, router_port = _start_router(
+                    router_args,
+                    has_pd_disaggregation=has_pd,
+                    force_new=static or model_idx > 0,
+                    launched=launched_routers,
+                )
 
-    for model_idx, model_cfg in enumerate(config.models):
-        model_cfg.resolve(args)
+            # Write back for backward compat (first rollout model only).
+            if model_idx == 0 and not static and not defer_router:
+                args.sglang_router_ip = router_ip
+                args.sglang_router_port = router_port
 
-        has_pd = model_cfg.has_pd_disaggregation
-        endpoint = (args.sglang_router_ip, args.sglang_router_port)
-        managed = (
-            model_idx > 0
-            or args.sglang_router_ip is None
-            or getattr(args, "_relax_managed_pd_router_endpoint", None) == endpoint
-        )
-        defer_router = (
-            has_pd
-            and managed
-            and not args.use_slime_router
-            and getattr(args, "router_decode_policy", None) == "power_of_two"
-            and not args.debug_train_only
-        )
-        if defer_router:
-            if args.rollout_external or getattr(args, "rollout_engine_class_path", None):
-                raise ValueError("Managed static PD startup requires native, framework-launched SGLang engines")
-            if getattr(args, "router_dp_aware", False):
-                raise ValueError("Managed static PD startup does not support DP-aware worker identities")
-            decode_count = sum(
-                group.num_gpus // group.num_gpus_per_engine
-                for group in model_cfg.engine_groups
-                if group.worker_type == "decode"
-            )
-            if decode_count < 2 or any(group.worker_type == "regular" for group in model_cfg.engine_groups):
-                raise ValueError("Managed power-of-two startup requires at least two D engines and only PD groups")
-            if any(
-                group.overrides.get("dp_size", getattr(args, "sglang_dp_size", 1)) != 1
-                for group in model_cfg.engine_groups
-                if group.worker_type != "placeholder"
-            ):
-                raise ValueError("Managed static PD startup currently requires dp_size=1")
-            router_ip, router_port = None, None
-        else:
-            router_ip, router_port = _start_router(args, has_pd_disaggregation=has_pd, force_new=(model_idx > 0))
+            engine_groups: list[EngineGroup] = []
+            all_init_handles: list = []
+            port_cursors: dict[int, int] = {}
 
-        # Write back for backward compat (first model only).
-        if model_idx == 0 and not defer_router:
-            args.sglang_router_ip = router_ip
-            args.sglang_router_port = router_port
+            for group_index, group_cfg in enumerate(model_cfg.engine_groups):
+                gpus_per_engine = group_cfg.num_gpus_per_engine
+                num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
+                num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+                planned = planned_by_id[_group_id(role, model_cfg.name, group_index)]
+                # The topology resolved with the model is what the engines are
+                # created from; a mismatch means the two were derived from
+                # different configurations and the identities would not line up.
+                topology = group_cfg.topology
+                if topology is not None and group_cfg.worker_type != "placeholder":
+                    spec_engines = sum(len(replica.node_ranks) for replica in topology.replicas)
+                    if spec_engines != num_engines:
+                        raise ValueError(
+                            f"Engine group {model_cfg.name}/group-{group_index} resolves to {num_engines} engines "
+                            f"but its topology describes {spec_engines}"
+                        )
+                    num_engines = spec_engines
 
-        engine_groups: list[EngineGroup] = []
-        all_init_handles: list = []
-        port_cursors: dict[int, int] = {}
+                group = EngineGroup(
+                    args=args,
+                    pg=pg,
+                    all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
+                    num_gpus_per_engine=gpus_per_engine,
+                    num_new_engines=0,
+                    worker_type=group_cfg.worker_type,
+                    rank_offset=engine_offset,
+                    gpu_offset=planned.reserved_offset,
+                    sglang_overrides=dict(group_cfg.overrides),
+                    router_ip=router_ip,
+                    router_port=router_port,
+                    model_id=model_cfg.name,
+                    spec=group_cfg.topology,
+                    placement=planned,
+                    pg_owner=pg_owner,
+                    # Policy engines join the Router only after their first
+                    # weight sync; static engines serve as soon as they start.
+                    skip_router_registration=model_cfg.needs_weight_update or defer_router,
+                    require_router_registration=defer_router,
+                    engine_cls=SGLangEngine if static else None,
+                    engine_kwargs={"role": role, "weight_source": model_cfg.weight_source} if static else {},
+                    env_vars=dict(model_cfg.env_vars) if static else None,
+                    base_port=base_port,
+                    ray_num_gpus=ray_num_gpus,
+                )
+                started_groups.append(group)
+                handles, port_cursors = group.start_engines(port_cursors)
+                all_init_handles.extend(handles)
+                engine_groups.append(group)
 
-        for group_cfg in model_cfg.engine_groups:
-            gpus_per_engine = group_cfg.num_gpus_per_engine
-            num_gpu_per_engine_local = min(gpus_per_engine, args.num_gpus_per_node)
-            num_engines = group_cfg.num_gpus // num_gpu_per_engine_local
+                engine_offset += num_engines
 
-            group = EngineGroup(
-                args=args,
-                pg=pg,
-                all_engines=[None] * num_engines if group_cfg.worker_type != "placeholder" else [],
-                num_gpus_per_engine=gpus_per_engine,
-                num_new_engines=0,
-                worker_type=group_cfg.worker_type,
-                rank_offset=engine_offset,
-                gpu_offset=gpu_offset,
-                sglang_overrides=group_cfg.overrides,
+            if all_init_handles:
+                _wait_engine_init_with_progress(
+                    all_init_handles,
+                    model_name=model_cfg.name,
+                    timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
+                    log_interval=60.0,
+                )
+            if defer_router:
+                router_ip, router_port = _start_managed_pd_router(
+                    args, engine_groups, force_new=model_idx > 0, launched=launched_routers
+                )
+                # The initial engines are seeded into the Router; replacements
+                # created later still join only after their first weight sync.
+                for group in engine_groups:
+                    group.skip_router_registration = model_cfg.needs_weight_update
+                if model_idx == 0:
+                    args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
+
+            servers[model_cfg.name] = RolloutServer(
+                engine_groups=engine_groups,
                 router_ip=router_ip,
                 router_port=router_port,
-                skip_router_registration=defer_router,
-                require_router_registration=defer_router,
-            )
-            started_groups.append(group)
-            handles, port_cursors = group.start_engines(port_cursors)
-            all_init_handles.extend(handles)
-            engine_groups.append(group)
-
-            engine_offset += num_engines
-            gpu_offset += group_cfg.num_gpus
-
-        if all_init_handles:
-            _wait_engine_init_with_progress(
-                all_init_handles,
                 model_name=model_cfg.name,
-                timeout=getattr(args, "rollout_engine_init_timeout", 3600.0),
-                log_interval=60.0,
+                model_spec=model_cfg,
+                static=static,
             )
 
-        if defer_router:
-            router_ip, router_port = _start_managed_pd_router(args, engine_groups, force_new=(model_idx > 0))
-            if model_idx == 0:
-                args.sglang_router_ip, args.sglang_router_port = router_ip, router_port
+    except Exception:
+        # A startup that does not finish stops what it started and gives its
+        # reserved slices back; only a group created here is removed. A slice
+        # is released only once its engines are confirmed stopped: one whose
+        # engines may still hold GPU memory stays reserved, and with it the
+        # placement group.
+        held: set[str] = set()
+        specs = {model.name: model for model in models}
+        for group in started_groups:
+            try:
+                group.shutdown_engines(set(range(len(group.all_engines))), strict=True)
+            except Exception as exc:
+                held.add(group.placement.group_id)
+                if leftovers is not None:
+                    leftovers.setdefault(
+                        group.model_id,
+                        RolloutServer(
+                            engine_groups=[],
+                            router_ip=group.router_ip,
+                            router_port=group.router_port,
+                            model_name=group.model_id,
+                            model_spec=specs[group.model_id],
+                            static=static,
+                        ),
+                    ).engine_groups.append(group)
+                logger.error(
+                    f"Engines of {group.placement.group_id} may still hold GPU memory after a failed startup; "
+                    f"keeping its reservation: {exc}"
+                )
+        # Engines are stopped first, so none is left pointing at a stopped Router.
+        # A retry must not reuse the endpoint of a Router stopped here.
+        if launched_routers:
+            stop_router_processes(launched_routers)
+            args.sglang_router_ip, args.sglang_router_port = router_endpoint
+        releases = [planner.release(pg_view, group_id) for group_id in planned_by_id if group_id not in held]
+        if any(release.remove_placement_group for release in releases):
+            from ray.util.placement_group import remove_placement_group
 
-        servers[model_cfg.name] = RolloutServer(
-            engine_groups=engine_groups,
-            router_ip=router_ip,
-            router_port=router_port,
-            model_name=model_cfg.name,
-        )
+            remove_placement_group(pg[0])
+        raise
 
     return servers
 
@@ -5068,9 +5423,9 @@ def _resolve_sglang_config(args) -> SglangConfig:
     # Default: single regular group.
     return SglangConfig(
         models=[
-            ModelConfig(
+            InferenceModelSpec(
                 name="default",
-                engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
+                engine_groups=[EngineGroupSpec(worker_type="regular", num_gpus=args.rollout_num_gpus)],
             )
         ]
     )
