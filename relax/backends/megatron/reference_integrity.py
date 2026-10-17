@@ -5,7 +5,7 @@
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,7 @@ import torch
 
 
 REFERENCE_IDENTITY_FILENAME = "relax_dpo_reference.json"
+REFERENCE_IDENTITY_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,27 @@ def canonical_tensor_sha256(named_tensors: Iterable[tuple[str, torch.Tensor]]) -
     return digest.hexdigest()
 
 
+def canonical_shard_manifest_sha256(shards: Iterable[tuple[Sequence[int], str]]) -> str:
+    """Hash unique model-parallel shards and validate their replicas."""
+    unique: dict[tuple[int, ...], str] = {}
+    for coordinate, shard_sha256 in shards:
+        key = tuple(int(rank) for rank in coordinate)
+        normalized_digest = str(shard_sha256)
+        existing = unique.setdefault(key, normalized_digest)
+        if existing != normalized_digest:
+            raise ValueError(f"reference shard replicas differ at model-parallel coordinate {key}")
+    if not unique:
+        raise ValueError("reference shard manifest requires at least one shard")
+    if len(unique) == 1:
+        return next(iter(unique.values()))
+
+    digest = hashlib.sha256()
+    for coordinate, shard_sha256 in sorted(unique.items()):
+        _update_field(digest, json.dumps(coordinate, separators=(",", ":")).encode())
+        _update_field(digest, shard_sha256.encode())
+    return digest.hexdigest()
+
+
 def reference_identity_path(checkpoint_root: str | os.PathLike[str], iteration: int) -> Path:
     root = Path(checkpoint_root)
     iteration_dir = root if root.name == f"iter_{iteration:07d}" else root / f"iter_{iteration:07d}"
@@ -69,7 +91,6 @@ def write_reference_identity(path: Path, identity: DPOReferenceIdentity) -> None
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}")
     payload = identity.to_dict()
-    payload["schema_version"] = 2
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
@@ -78,7 +99,7 @@ def read_reference_identity(path: Path) -> DPOReferenceIdentity:
     if not path.is_file():
         raise FileNotFoundError(f"DPO reference identity sidecar is missing: {path}")
     identity = DPOReferenceIdentity.from_dict(json.loads(path.read_text(encoding="utf-8")))
-    if identity.schema_version not in (1, 2):
+    if identity.schema_version not in (1, 2, REFERENCE_IDENTITY_SCHEMA_VERSION):
         raise ValueError(f"unsupported DPO reference identity schema: {identity.schema_version}")
     return identity
 
@@ -86,6 +107,8 @@ def read_reference_identity(path: Path) -> DPOReferenceIdentity:
 __all__ = [
     "DPOReferenceIdentity",
     "REFERENCE_IDENTITY_FILENAME",
+    "REFERENCE_IDENTITY_SCHEMA_VERSION",
+    "canonical_shard_manifest_sha256",
     "canonical_tensor_sha256",
     "read_reference_identity",
     "reference_identity_path",

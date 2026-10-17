@@ -732,6 +732,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--no-dataset-shuffle",
+                action="store_true",
+                help=(
+                    "Consume offline (SFT / DPO / RM) training samples in dataset row order instead of "
+                    "shuffling them. Disables both the persistent dataset shuffle and the per-epoch sampler "
+                    "permutation. Intended for cross-framework alignment runs, where the other framework's "
+                    "permutation cannot be reproduced — e.g. against ms-swift `--dataset_shuffle false "
+                    "--train_dataloader_shuffle false`."
+                ),
+            )
+            parser.add_argument(
                 "--sft-loss-last-turn-only",
                 action="store_true",
                 default=False,

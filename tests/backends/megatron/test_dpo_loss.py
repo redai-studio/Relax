@@ -3,9 +3,11 @@
 """Production DPO loss regression tests."""
 
 from argparse import Namespace
+from datetime import timedelta
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from relax.engine.sft.eval.preference import finalize_pair_metrics, pair_metric_sums
@@ -69,6 +71,44 @@ def _run(
     monkeypatch.setattr(loss_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
     loss, _, log = loss_module.loss_function(args, batch, num_microbatches=1, logits=logits)
     return loss, dict(zip(log["keys"], log["values"][1:], strict=True))
+
+
+def _cp_forward_only_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=15),
+    )
+    try:
+        local = torch.tensor([-1.0 - rank, -0.5 * rank], requires_grad=True)
+        full = loss_module._all_reduce_forward_only(local, dist.group.WORLD)
+        loss = -F.logsigmoid(0.2 * (full[0] - full[1]))
+        loss.backward()
+
+        baseline = torch.tensor([-3.0, -0.5], requires_grad=True)
+        baseline_loss = -F.logsigmoid(0.2 * (baseline[0] - baseline[1]))
+        baseline_loss.backward()
+        torch.testing.assert_close(full, baseline.detach())
+        torch.testing.assert_close(local.grad, baseline.grad)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
+    reason="Gloo is required",
+)
+def test_cp_forward_sum_has_identity_backward(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _cp_forward_only_worker,
+        args=(2, f"file://{tmp_path / 'dpo-cp-gloo'}"),
+        nprocs=2,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("pair_ids", [[10, 10, 20, 20], [10, 10, 10, 10]])
@@ -189,3 +229,51 @@ def test_production_dpo_rejects_empty_completion_mask(monkeypatch):
     }
     with pytest.raises(ValueError, match="at least one supervised token"):
         loss_module.dpo_loss_function(_args(), batch, torch.ones(1), lambda value: value)
+
+
+@pytest.mark.parametrize("reference_free", [False, True])
+def test_cp_dpo_empty_local_branches_keep_zero_logits_gradient(monkeypatch, reference_free):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 16)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_rank", lambda: 15)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None)
+    logits = torch.ones(1, 4, 8, requires_grad=True)
+    empty_log_probs = [logits.new_zeros((0,)) for _ in range(2)]
+    monkeypatch.setattr(
+        loss_module, "get_log_probs_and_entropy", lambda *args, **kwargs: (None, {"log_probs": empty_log_probs})
+    )
+
+    def all_reduce(tensor, **_kwargs):
+        torch.testing.assert_close(tensor, torch.zeros_like(tensor))
+        # Other ranks provide supervision and the global branch sums.
+        tensor.copy_(torch.ones_like(tensor) if tensor.dtype == torch.int32 else torch.tensor([-2.0, -3.0]))
+
+    monkeypatch.setattr(loss_module.dist, "all_reduce", all_reduce)
+    batch = {
+        "response_lengths": [8, 8],
+        "total_lengths": [8, 8],
+        "unconcat_tokens": [torch.zeros(8, dtype=torch.long)] * 2,
+        "loss_masks": [torch.ones(8)] * 2,
+        "preference_branch_pair_ids": [1, 1],
+        "preference_is_chosen": [True, False],
+        "ref_log_probs": empty_log_probs,
+    }
+    loss, _ = loss_module.dpo_loss_function(_args(reference_free=reference_free), batch, logits, lambda value: value)
+    expected_margin = torch.tensor(0.2 if reference_free else 0.0)
+    torch.testing.assert_close(loss, -F.logsigmoid(expected_margin))
+    assert loss.requires_grad
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
+def test_cp_dpo_rejects_globally_empty_completion_mask(monkeypatch):
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: object())
+    monkeypatch.setattr(loss_module, "_slice_loss_mask_with_cp", lambda *_args, **_kwargs: torch.zeros(1))
+    monkeypatch.setattr(loss_module.dist, "all_reduce", lambda tensor, **_kwargs: tensor)
+    batch = {
+        "loss_masks": [torch.ones(1)],
+        "total_lengths": [2],
+        "response_lengths": [1],
+    }
+    with pytest.raises(ValueError, match="at least one supervised token"):
+        loss_module._preference_branch_sums(_args(), batch, [torch.zeros(1)], torch.device("cpu"))

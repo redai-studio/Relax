@@ -62,8 +62,7 @@ def test_preference_mode_uses_loss_type():
         ({"task_type": "seq_cls"}, "task-type causal_lm"),
         ({"mtp_only_training": True}, "MTP-only"),
         ({"n_samples_per_prompt": 2}, "n-samples-per-prompt"),
-        ({"tensor_model_parallel_size": 2}, "TP=CP=PP=1"),
-        ({"context_parallel_size": 2}, "TP=CP=PP=1"),
+        ({"tensor_model_parallel_size": 2}, "parallelism"),
         ({"dynamic_context_parallel": True}, "dynamic context"),
         ({"qkv_format": "bshd"}, "qkv-format thd"),
         ({"use_gloo_process_groups": False}, "use-gloo-process-groups"),
@@ -80,6 +79,17 @@ def test_preference_mode_uses_loss_type():
 def test_preference_validation_rejects_unsupported_configs(overrides: dict, match: str):
     with pytest.raises(ValueError, match=match):
         validate_preference_args(_args(**overrides))
+
+
+@pytest.mark.parametrize("parallelism", [{"context_parallel_size": 2}, {"pipeline_model_parallel_size": 2}])
+def test_dpo_accepts_context_and_pipeline_parallelism(parallelism: dict):
+    validate_preference_args(_args(**parallelism))
+
+
+@pytest.mark.parametrize("parallelism", [{"context_parallel_size": 2}, {"pipeline_model_parallel_size": 2}])
+def test_reward_model_rejects_context_and_pipeline_parallelism(parallelism: dict):
+    with pytest.raises(ValueError, match="parallelism"):
+        validate_preference_args(_args(loss_type="rm", **parallelism))
 
 
 @pytest.mark.parametrize("loss_type", ["dpo", "rm"])

@@ -441,6 +441,7 @@ class SFTStreamingDataset:
         source_name: str = "prompt_data",
         require_response: bool = True,
         seed: int = 42,
+        dataset_shuffle: bool = True,
         prefetch_max_cached: int = 256,
         prefetch_chunk_size: int = 32,
         prefetch_num_workers: int = 4,
@@ -553,7 +554,7 @@ class SFTStreamingDataset:
         self._error_lock = threading.Lock()
 
         self.reader = _build_reader(path)
-        self.index_manager = IndexManager(len(self.reader), seed=seed)
+        self.index_manager = IndexManager(len(self.reader), seed=seed, shuffle_enabled=dataset_shuffle)
 
         self._prefetch: PrefetchBuffer | None = None
         if prefetch_max_cached > 0:
@@ -604,6 +605,7 @@ class SFTStreamingDataset:
             seed=self.index_manager.seed,
             index_pool=index_pool,
             dataset_seed_offset=dataset_seed_offset,
+            shuffle_enabled=self.index_manager.shuffle_enabled,
         )
 
     def shuffle(self, epoch_id: int, position: int = 0) -> None:

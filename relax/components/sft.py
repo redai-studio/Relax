@@ -121,10 +121,14 @@ def _resolve_sft_dataset_options(config: Any, logger: Any | None = None) -> dict
         logger.info(f"SFT oversize strategy: {oversize_strategy}")
     if logger is not None:
         logger.info(f"SFT invalid multimodal strategy: {invalid_multimodal_strategy}")
+    dataset_shuffle = not getattr(config, "no_dataset_shuffle", False)
+    if logger is not None and not dataset_shuffle:
+        logger.info("Dataset shuffle disabled (--no-dataset-shuffle); samples are consumed in row order.")
     return {
         "oversize_strategy": oversize_strategy,
         "invalid_multimodal_strategy": invalid_multimodal_strategy,
         "oversize_custom_fn": oversize_custom_fn,
+        "dataset_shuffle": dataset_shuffle,
     }
 
 
@@ -143,6 +147,7 @@ def _create_sft_train_dataset(
     invalid_multimodal_strategy: str,
     task_type: str,
     classification_sentinel_token_id: int | None,
+    dataset_shuffle: bool = True,
     image_preprocess_on_rank: bool = False,
 ) -> Any:
     if is_preference_mode(config):
@@ -159,6 +164,7 @@ def _create_sft_train_dataset(
             oversize_strategy=oversize_strategy,
             oversize_custom_fn=oversize_custom_fn,
             seed=getattr(config, "seed", 42),
+            dataset_shuffle=dataset_shuffle,
             prefetch_max_cached=prefetch_buffer_size,
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,
@@ -179,6 +185,7 @@ def _create_sft_train_dataset(
             tool_key=config.tool_key,
             system_prompt=config.system_prompt,
             seed=getattr(config, "seed", 42),
+            dataset_shuffle=dataset_shuffle,
             prefetch_max_cached=prefetch_buffer_size,
             prefetch_chunk_size=prefetch_chunk_size,
             prefetch_num_workers=prefetch_num_workers,

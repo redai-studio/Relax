@@ -217,6 +217,7 @@ class PreferenceStreamingDataset:
         oversize_strategy: str = "keep",
         oversize_custom_fn: Callable[..., tuple[torch.Tensor, torch.Tensor] | None] | None = None,
         seed: int = 42,
+        dataset_shuffle: bool = True,
         prefetch_max_cached: int = 256,
         prefetch_chunk_size: int = 32,
         prefetch_num_workers: int = 4,
@@ -231,7 +232,7 @@ class PreferenceStreamingDataset:
         self.oversize_strategy = oversize_strategy
         self.oversize_custom_fn = oversize_custom_fn
         self.reader = _build_reader(path)
-        self.index_manager = IndexManager(len(self.reader), seed=seed)
+        self.index_manager = IndexManager(len(self.reader), seed=seed, shuffle_enabled=dataset_shuffle)
         self.tokenizer = tokenizer
         self.prompt_key = prompt_key
         self.chosen_key = chosen_key
@@ -272,6 +273,7 @@ class PreferenceStreamingDataset:
             seed=self.index_manager.seed,
             index_pool=index_pool,
             dataset_seed_offset=dataset_seed_offset,
+            shuffle_enabled=self.index_manager.shuffle_enabled,
         )
 
     def get_batch_by_indices(self, indices: Iterable[int]) -> list[ProcessedPreferencePair]:

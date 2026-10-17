@@ -14,6 +14,8 @@ import ``relax.engine.sft`` safely.
 
 import re
 import time
+from argparse import Namespace
+from collections.abc import Sequence
 
 import torch
 import torch.distributed as dist
@@ -220,6 +222,37 @@ def run_sft_eval(actor, rollout_id: int) -> None:
         logger.info(f"SFT eval @ rollout_id={rollout_id}: {metrics}")
 
 
+def _preference_eval_branch_sums(
+    args: Namespace,
+    rollout_data: dict,
+    token_values: Sequence[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Reconstruct full branch sums before computing nonlinear DPO metrics."""
+    from relax.utils.sft_utils import align_loss_mask_for_sft
+    from relax.utils.training.preference_utils import masked_sequence_sums
+
+    batch = dict(rollout_data)
+    batch["loss_masks"] = [
+        align_loss_mask_for_sft(torch.as_tensor(mask, device=device)) for mask in rollout_data["loss_masks"]
+    ]
+    # Dynamic CP forward outputs have already been merged into full sequences.
+    if mpu.get_context_parallel_world_size() == 1 or getattr(args, "dynamic_context_parallel", False):
+        return masked_sequence_sums(token_values, batch["loss_masks"], device)
+
+    from relax.backends.megatron.cp_utils import maybe_padded_total_lengths
+    from relax.backends.megatron.loss import _preference_branch_sums
+
+    batch["padded_total_lengths"] = maybe_padded_total_lengths(
+        batch["total_lengths"],
+        args.qkv_format,
+        getattr(args, "is_vl_model", False)
+        or batch.get("multimodal_train_inputs") is not None
+        or getattr(args, "uses_unsplit_forward", False),
+    )
+    return _preference_branch_sums(args, batch, token_values, device)
+
+
 def _run_preference_eval(actor, rollout_id: int) -> None:
     """Evaluate DPO or RM on pair rows using the same TQ packing as
     training."""
@@ -233,12 +266,10 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
         preference_eval_chunk_sizes,
         preference_eval_local_batch_sizes,
     )
-    from relax.utils.sft_utils import align_loss_mask_for_sft
     from relax.utils.training.data_fields import build_data_fields
     from relax.utils.training.preference_utils import (
         dpo_pair_loss,
         dpo_rewards,
-        masked_sequence_sums,
         reward_model_pair_loss,
     )
 
@@ -270,23 +301,22 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                 rollout_data["dynamic_global_batch_size"] = global_chunk_size
                 data_iterator, num_microbatches = get_data_iterator(args, actor.model, rollout_data)
                 if is_dpo_mode(args):
-                    # Returned log-probabilities predict the next token; the
-                    # rollout masks still mark the tokens at their input positions.
-                    aligned_loss_masks = [
-                        align_loss_mask_for_sft(torch.as_tensor(mask, device=local.device))
-                        for mask in rollout_data["loss_masks"]
-                    ]
-                    if args.dpo_reference_free:
-                        reference_sums = None
-                    else:
+                    reference = None
+                    if not args.dpo_reference_free:
                         actor._switch_model("ref")
-                        reference = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")[
-                            "ref_log_probs"
-                        ]
-                        reference_sums = masked_sequence_sums(reference, aligned_loss_masks, local.device)
+                        reference = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="ref_")
                     actor._switch_model("actor")
-                    policy = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="")["log_probs"]
-                    policy_sums = masked_sequence_sums(policy, aligned_loss_masks, local.device)
+                    policy = actor.compute_log_prob(data_iterator, num_microbatches, store_prefix="")
+                    # All PP stages must run both forwards, but only the last
+                    # stage owns log-probabilities and participates in CP sums.
+                    if not mpu.is_pipeline_last_stage():
+                        break
+                    reference_sums = (
+                        None
+                        if reference is None
+                        else _preference_eval_branch_sums(args, rollout_data, reference["ref_log_probs"], local.device)
+                    )
+                    policy_sums = _preference_eval_branch_sums(args, rollout_data, policy["log_probs"], local.device)
                     policy_chosen, policy_rejected = policy_sums[0::2], policy_sums[1::2]
                     if reference_sums is None:
                         reference_chosen = reference_rejected = None
@@ -302,7 +332,10 @@ def _run_preference_eval(actor, rollout_id: int) -> None:
                     )
                     chosen_values = dpo_rewards(policy_chosen, reference_chosen, beta=args.dpo_beta)
                     rejected_values = dpo_rewards(policy_rejected, reference_rejected, beta=args.dpo_beta)
-                    local += pair_metric_sums(chosen_values, rejected_values, losses)
+                    # Branch sums are replicated across CP. Count each pair
+                    # once in the final DP+CP metric reduction below.
+                    if mpu.get_context_parallel_rank() == 0:
+                        local += pair_metric_sums(chosen_values, rejected_values, losses)
                 else:
                     outputs = forward_only(
                         compute_reward_model_eval_step,

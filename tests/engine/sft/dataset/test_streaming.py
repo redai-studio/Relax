@@ -68,6 +68,23 @@ def test_restrict_training_indices_shuffles_only_physical_row_ids_and_resumes(tm
     assert set(actual).issubset(train_indices)
 
 
+def test_restrict_training_indices_without_shuffle_preserves_row_order_after_eval_split(tmp_path):
+    from relax.engine.sft.runtime import resolve_sft_split_indices
+
+    path = tmp_path / "rows.jsonl"
+    _write_jsonl(path, [{"messages": []} for _ in range(10)])
+    train_indices, eval_indices = resolve_sft_split_indices(10, 0.2, 42)
+    dataset = SFTStreamingDataset(path=str(path), prefetch_max_cached=0, seed=42, dataset_shuffle=False)
+    dataset.restrict_training_indices(train_indices, dataset_seed_offset=1)
+
+    indices, crossed_epoch = dataset.index_manager.get_next_indices(16)
+
+    assert indices == [1, 2, 3, 4, 5, 6, 7, 9] * 2
+    assert crossed_epoch is True
+    assert set(indices) == set(train_indices)
+    assert set(indices).isdisjoint(eval_indices)
+
+
 def test_restrict_training_indices_prefetches_physical_row_ids(tmp_path):
     path = tmp_path / "rows.jsonl"
     _write_jsonl(path, [{"messages": []} for _ in range(10)])

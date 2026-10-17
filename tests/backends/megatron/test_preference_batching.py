@@ -43,6 +43,7 @@ def test_preference_iterator_validates_step_global_pair_denominator(monkeypatch)
     flat = expand_preference_rollout_data(_pair_rows())
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1)
 
     def all_gather_object(output, value, **_kwargs):
         output[:] = [value]
@@ -60,6 +61,26 @@ def test_preference_iterator_validates_step_global_pair_denominator(monkeypatch)
     invalid["dynamic_global_batch_size"] = 4
     with pytest.raises(ValueError, match="step-global preference pair count"):
         data_module._get_preference_data_iterator(args, invalid, None)
+
+
+def test_preference_iterator_scales_token_capacity_with_cp(monkeypatch):
+    flat = expand_preference_rollout_data(_pair_rows())
+    flat["dynamic_global_batch_size"] = 2
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 1)
+    monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 2)
+
+    def all_gather_object(output, value, **_kwargs):
+        output[:] = [value]
+
+    monkeypatch.setattr(data_module.dist, "all_gather_object", all_gather_object)
+
+    _, counts = data_module._get_preference_data_iterator(
+        Namespace(global_batch_size=2, max_tokens_per_gpu=4, allgather_cp=False),
+        flat,
+        None,
+    )
+    assert counts == [1]
 
 
 @pytest.mark.parametrize("pair_ids", [[100, 101], [100, 100]])
@@ -140,6 +161,7 @@ def test_preference_iterator_rejects_unequal_dp_pair_rows_via_gloo(monkeypatch):
     flat = expand_preference_rollout_data(_pair_rows())
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_world_size", lambda **kwargs: 2)
     monkeypatch.setattr(data_module.mpu, "get_data_parallel_group_gloo", lambda **kwargs: object())
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: 1)
 
     def all_gather_object(output, value, **_kwargs):
         output[:] = [value, (value[0] + 1, value[1], value[2])]
