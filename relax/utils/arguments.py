@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
@@ -853,6 +854,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
+            )
+            parser.add_argument(
+                "--rollout-top-logprobs-num",
+                type=_positive_int,
+                default=128,
+                help="Number of behavior-policy candidates recorded for score centering; does not change sampling.",
             )
             parser.add_argument(
                 "--rollout-max-context-len",
@@ -1958,10 +1965,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Advantage estimator to use. The choices come from the algorithm registry in "
                     "relax/algorithms/spec.py. Note: on-policy distillation (OPD) is orthogonal "
-                    "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator. "
+                    "to most advantage estimators; score_centering cannot be combined with OPD. "
                     "'rloo' uses a leave-one-out baseline with an unclipped REINFORCE loss (sync only)."
                 ),
             )
+            parser.add_argument(
+                "--score-centering-is",
+                choices=["none", "tis", "mis"],
+                default="none",
+                help="Importance weighting applied inside both score-centering terms.",
+            )
+            parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
+            parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
+            parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
             parser.add_argument(
                 "--sapo-tau-pos",
                 type=float,
@@ -3574,6 +3590,47 @@ def _assert_spec_implementations_resolve(spec) -> None:
             )
 
 
+def _validate_score_centering_args(args: argparse.Namespace) -> None:
+    if args.advantage_estimator != "score_centering":
+        return
+    if args.loss_type != "policy_loss":
+        raise ValueError("score_centering requires --loss-type policy_loss.")
+    if getattr(args, "multimodal_keys", None):
+        raise ValueError("score_centering currently accepts text-only training inputs.")
+    if getattr(args, "train_backend", None) == "fsdp":
+        raise ValueError(
+            "score_centering requires a text token policy-loss backend; the current FSDP backend trains diffusion."
+        )
+    if getattr(args, "use_opd", False) or getattr(args, "opd_fkl_entropy_gate", False):
+        raise ValueError(
+            "score_centering and OPD cannot be enabled together: centering the advantage-injected distillation "
+            "signal can cancel its update. This release also excludes standalone OPD loss and EOPD."
+        )
+    for flag in (
+        "use_tis",
+        "custom_tis_function_path",
+        "use_opsm",
+        "use_unbiased_kl",
+        "custom_pg_loss_reducer_function_path",
+    ):
+        if getattr(args, flag, False):
+            raise ValueError(f"score_centering is incompatible with --{flag.replace('_', '-')}.")
+    if not math.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0:
+        raise ValueError("score_centering requires a finite positive --rollout-temperature.")
+    if not isinstance(args.rollout_top_logprobs_num, int) or args.rollout_top_logprobs_num < 1:
+        raise ValueError("--rollout-top-logprobs-num must be a positive integer.")
+    if args.score_centering_is not in ("none", "tis", "mis"):
+        raise ValueError("--score-centering-is must be none, tis, or mis.")
+    if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:
+        raise ValueError("--score-centering-tis-clip must be finite and positive.")
+    if not (
+        math.isfinite(args.score_centering_mis_low)
+        and math.isfinite(args.score_centering_mis_high)
+        and 0 < args.score_centering_mis_low <= args.score_centering_mis_high
+    ):
+        raise ValueError("Score-centering MIS bounds must be finite and satisfy 0 < low <= high.")
+
+
 def validate_algorithm_args(args) -> None:
     """Apply the constraints the algorithm registry declares for this run.
 
@@ -3595,6 +3652,7 @@ def validate_algorithm_args(args) -> None:
     _assert_spec_implementations_resolve(spec)
 
     args.use_critic = spec.needs_critic
+    _validate_score_centering_args(args)
 
     if not spec.supports_context_parallel and (
         getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "dynamic_context_parallel", False)
@@ -4185,7 +4243,7 @@ def slime_validate_args(args):
         if args.use_rollout_logprobs:
             assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
-        if args.get_mismatch_metrics:
+        if args.get_mismatch_metrics and args.advantage_estimator != "score_centering":
             assert args.custom_tis_function_path is not None, (
                 "custom_tis_function_path must be set when get_mismatch_metrics is set"
             )

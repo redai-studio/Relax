@@ -1153,6 +1153,8 @@ def train_one_step(
                     "advantages",
                     "returns",
                     "rollout_log_probs",
+                    "rollout_topk_token_ids",
+                    "rollout_topk_log_probs",
                     "max_seq_lens",
                     "sample_index_mask_sums",
                     *_opd_keys,

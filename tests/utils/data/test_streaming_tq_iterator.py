@@ -530,3 +530,51 @@ def test_sft_token_lengths_leave_rl_batch_unchanged(monkeypatch):
     stream_module._add_sft_token_lengths(Namespace(loss_type="policy_loss"), batch)
     assert "learn_lengths" not in batch
     assert "non_learn_lengths" not in batch
+
+
+@pytest.mark.parametrize(
+    "dynamic_cp, allgather_cp, cp_rank, expected_rows",
+    [
+        (False, False, 0, [6, 7]),
+        (False, False, 1, [0, 1, 2, 3, 4, 5]),
+        (False, True, 1, [0, 1, 2, 3, 4, 5]),
+        (True, False, 0, list(range(8))),
+    ],
+)
+def test_score_centering_head_ingestion_preserves_dtype_and_cp_alignment(
+    monkeypatch, dynamic_cp, allgather_cp, cp_rank, expected_rows
+):
+    stream_module = _load_stream_module(monkeypatch)
+    from relax.backends.megatron import cp_utils
+
+    monkeypatch.setattr(cp_utils, "mpu", stream_module.mpu)
+    monkeypatch.setattr(stream_module.mpu, "get_context_parallel_world_size", lambda: 2, raising=False)
+    monkeypatch.setattr(stream_module.mpu, "get_context_parallel_rank", lambda: cp_rank)
+    monkeypatch.setattr(stream_module.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+    token_ids = torch.arange(16).reshape(8, 2) + 2**24
+    log_probs = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    rollout_data = {
+        "tokens": [list(range(12))],
+        "total_lengths": [12],
+        "response_lengths": [8],
+        "loss_masks": [[1] * 8],
+        "rollout_log_probs": [list(range(8))],
+        "rollout_topk_token_ids": [token_ids.flatten().tolist()],
+        "rollout_topk_log_probs": [log_probs.flatten().tolist()],
+    }
+    args = Namespace(
+        loss_type="policy_loss",
+        qkv_format="thd",
+        use_opd=False,
+        dynamic_context_parallel=dynamic_cp,
+        allgather_cp=allgather_cp,
+        rollout_top_logprobs_num=2,
+    )
+
+    stream_module.post_process_rollout_data(args, rollout_data)
+
+    assert rollout_data["rollout_topk_token_ids"][0].dtype == torch.long
+    assert rollout_data["rollout_topk_log_probs"][0].dtype == torch.float32
+    torch.testing.assert_close(rollout_data["rollout_topk_token_ids"][0], token_ids[expected_rows])
+    torch.testing.assert_close(rollout_data["rollout_topk_log_probs"][0], log_probs[expected_rows])
+    assert rollout_data["rollout_log_probs"][0].tolist() == expected_rows

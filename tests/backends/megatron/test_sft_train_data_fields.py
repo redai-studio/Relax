@@ -120,6 +120,19 @@ def test_rl_data_fields_include_replay_metadata():
         assert required in fields
 
 
+@pytest.mark.parametrize("algorithm", ["grpo", "score_centering"])
+def test_score_centering_requests_rollout_head_fields(algorithm):
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="policy_loss")
+    args.advantage_estimator = algorithm
+
+    fields = build_data_fields(args)
+
+    for field in ("rollout_topk_token_ids", "rollout_topk_log_probs"):
+        assert (field in fields) == (algorithm == "score_centering")
+
+
 def test_sft_partition_naming_uses_sft_prefix():
     """SFT mode → 'sft_{step}' / 'sft_train'; RL mode → 'train_{step}' /
     'train'."""
