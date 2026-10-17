@@ -15,6 +15,7 @@ from typing import Any, List, Optional, Tuple, cast
 
 from relax.agentic.pipeline import GroupExport
 from relax.agentic.profile import mark_sample_agentic_event, mark_sample_agentic_event_once
+from relax.inference.defer import capture_deferred_transfer
 from relax.utils.types import Sample
 
 
@@ -32,6 +33,9 @@ async def _transfer_batch_to_data_system(
     """Convert complete Samples and cross the TQ boundary."""
 
     from relax.utils.utils import build_rollout_custom_meta, convert_samples_to_train_data
+
+    if capture_deferred_transfer(args, batch_samples, rollout_id):
+        return
 
     samples = [sample for group in batch_samples for sample in group]
     for sample in samples:

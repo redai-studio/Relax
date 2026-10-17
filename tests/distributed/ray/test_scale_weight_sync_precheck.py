@@ -423,6 +423,11 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
         patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        # Reward-test collection can initialize a CPU-only Ray runtime.
+        patch(
+            "relax.backends.sglang.sglang_engine.device_utils.get_visible_devices_env_var",
+            return_value="CUDA_VISIBLE_DEVICES",
+        ),
         patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
     ):
         result = engine.run_scale_weight_sync_precheck(
@@ -568,7 +573,55 @@ def test_actor_probe_unreapable_child_does_not_block_actor():
 
     assert result["success"] is False
     assert result["category"] == "timeout"
+    assert result["cleanup_confirmed"] is False
     assert len(created) == 2
+    assert engine.get_scale_weight_sync_probe_cleanup(["unreapable", "unknown"]) == []
+    created[0].returncode = -9
+    assert engine.get_scale_weight_sync_probe_cleanup(["unreapable"]) == []
+    created[1].returncode = -9
+    # Evidence remains available if the first query response was lost.
+    assert engine.get_scale_weight_sync_probe_cleanup(["unreapable", "unknown"]) == ["unreapable"]
+    assert engine.get_scale_weight_sync_probe_cleanup(["unreapable"]) == ["unreapable"]
+
+
+def test_actor_probe_partial_launch_failure_retains_cleanup_evidence():
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 0
+    engine.base_gpu_id = 0
+    engine.num_gpus_per_engine = 2
+    engine.args = SimpleNamespace(num_gpus_per_node=8)
+    created = []
+
+    def popen(command, **kwargs):
+        if created:
+            raise OSError("second rank failed to launch")
+        process = _HangingProcess(command, **kwargs)
+        created.append(process)
+        return process
+
+    with (
+        patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=popen),
+        patch("relax.utils.scale_utils._terminate_probe_process"),
+        patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1"}),
+    ):
+        result = engine.run_scale_weight_sync_precheck("10.0.0.1", "18000,18001", 0, "partial", 2, 10)
+
+    assert result["category"] == "launch_transient"
+    assert result["cleanup_confirmed"] is False
+    assert engine.get_scale_weight_sync_probe_cleanup(["partial"]) == []
+    with pytest.raises(ValueError, match="token already used"):
+        engine.run_scale_weight_sync_precheck("10.0.0.1", "18000,18001", 0, "partial", 2, 10)
+    created[0].returncode = -9
+    assert engine.get_scale_weight_sync_probe_cleanup(["partial"]) == ["partial"]
+
+
+def test_actor_probe_early_return_can_confirm_cleanup():
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 1
+    result = engine.run_scale_weight_sync_precheck("10.0.0.1", "18000", 0, "skip", 1, 10)
+    assert result["cleanup_confirmed"] is True
+    assert engine.get_scale_weight_sync_probe_cleanup(["skip", "unknown"]) == ["skip"]
 
 
 @pytest.mark.asyncio

@@ -3,8 +3,13 @@
 import threading
 
 import ray
-from ray.exceptions import RayActorError
+from ray.exceptions import ActorUnavailableError, RayActorError
 
+from relax.distributed.ray.inference_manager import (
+    InferenceCleanupError,
+    InferenceRecoveryRequired,
+    get_engine_shutdown_guard,
+)
 from relax.utils.logging_utils import get_logger
 
 
@@ -173,37 +178,52 @@ class RolloutHealthMonitor:
         if engine is None:
             logger.info(f"Skipping health check for engine {rollout_engine_id} (None)")
             return
+        guard = get_engine_shutdown_guard(self._engine_group)
+        try:
+            guard.check(engine)
+        except InferenceRecoveryRequired:
+            return
 
         try:
             ray.get(engine.health_generate.remote(timeout=self._check_timeout))
+        except ActorUnavailableError as e:
+            logger.warning(f"Rollout engine {rollout_engine_id} is temporarily unavailable: {e}")
         except RayActorError as e:
-            # Hard death: the whole rollout actor (or its node) is gone. The
-            # consecutive-failure counter can never recover from this, so bypass
-            # it and kill/rebuild immediately.
-            logger.error(
-                f"Health check failed for rollout engine {rollout_engine_id} "
-                f"(actor is dead). Killing actor immediately. Exception: {e}"
-            )
-            self._kill_engine(rollout_engine_id=rollout_engine_id)
-        except Exception as e:
-            # Soft failure: the actor is alive but the sglang subprocess is
-            # unreachable (RayTaskError wrapping ConnectionError/Timeout, etc.).
-            # Accumulate across resume windows until the threshold is hit.
-            self._consecutive_failures[rollout_engine_id] = self._consecutive_failures.get(rollout_engine_id, 0) + 1
-            failure_count = self._consecutive_failures[rollout_engine_id]
-            if failure_count >= self._max_consecutive_failures:
+            with guard.lock:
+                slot = rollout_engine_id * self._engine_group.nodes_per_engine
+                if slot >= len(self._engine_group.all_engines) or self._engine_group.all_engines[slot] is not engine:
+                    return
+                guard.failed(engine, e)
                 logger.error(
                     f"Health check failed for rollout engine {rollout_engine_id} "
-                    f"({failure_count} consecutive failures, threshold={self._max_consecutive_failures}). "
-                    f"Killing actor. Exception: {e}"
+                    f"(actor is dead). Backend exit confirmation is required. Exception: {e}"
                 )
                 self._kill_engine(rollout_engine_id=rollout_engine_id)
-            else:
-                logger.warning(
-                    f"Health check failed for rollout engine {rollout_engine_id} "
-                    f"({failure_count}/{self._max_consecutive_failures} consecutive failures, "
-                    f"will retry). Exception: {e}"
+        except Exception as e:
+            with guard.lock:
+                slot = rollout_engine_id * self._engine_group.nodes_per_engine
+                if slot >= len(self._engine_group.all_engines) or self._engine_group.all_engines[slot] is not engine:
+                    return
+                # Soft failure: the actor is alive but the sglang subprocess is
+                # unreachable (RayTaskError wrapping ConnectionError/Timeout, etc.).
+                # Accumulate across resume windows until the threshold is hit.
+                self._consecutive_failures[rollout_engine_id] = (
+                    self._consecutive_failures.get(rollout_engine_id, 0) + 1
                 )
+                failure_count = self._consecutive_failures[rollout_engine_id]
+                if failure_count >= self._max_consecutive_failures:
+                    logger.error(
+                        f"Health check failed for rollout engine {rollout_engine_id} "
+                        f"({failure_count} consecutive failures, threshold={self._max_consecutive_failures}). "
+                        f"Killing actor. Exception: {e}"
+                    )
+                    self._kill_engine(rollout_engine_id=rollout_engine_id)
+                else:
+                    logger.warning(
+                        f"Health check failed for rollout engine {rollout_engine_id} "
+                        f"({failure_count}/{self._max_consecutive_failures} consecutive failures, "
+                        f"will retry). Exception: {e}"
+                    )
         else:
             # Only a successful check clears the counter. This keeps "consecutive"
             # literal (a single success rescues an intermittently slow engine) and
@@ -221,23 +241,17 @@ class RolloutHealthMonitor:
             logger.debug(f"Skipping kill for engine {rollout_engine_id} (intentionally removed)")
             return
         logger.info(f"Killing engine group {rollout_engine_id}...")
-        for i in range(
-            rollout_engine_id * self._engine_group.nodes_per_engine,
-            (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,
-        ):
-            engine = self._engine_group.all_engines[i]
-            if engine:
-                logger.info(f"Shutting down and killing engine at index {i}")
-                try:
-                    ray.get(engine.shutdown.remote())
-                    ray.get(engine.unregister_dcs.remote())
-                    ray.kill(engine)
-                    logger.info(f"Successfully killed engine at index {i}")
-                except Exception as e:
-                    logger.warning(f"Fail to kill engine at index {i} (e: {e})")
-            else:
-                logger.info(f"Engine at index {i} is already None")
-            self._engine_group.all_engines[i] = None
+        indices = set(
+            range(
+                rollout_engine_id * self._engine_group.nodes_per_engine,
+                (rollout_engine_id + 1) * self._engine_group.nodes_per_engine,
+            )
+        )
+        try:
+            self._engine_group.shutdown_engines(indices)
+        except InferenceCleanupError as exc:
+            logger.error(f"Rollout cleanup remains fenced: {exc}")
+            return
         # Drop any stale failure count so a rebuilt engine reusing this slot
         # starts from a clean slate instead of inheriting a near-threshold count.
         self._consecutive_failures.pop(rollout_engine_id, None)

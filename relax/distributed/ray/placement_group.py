@@ -1,11 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import math
 import os
 import socket
 import time
+from typing import Any
 
 import ray
-from ray.util.placement_group import PlacementGroup, placement_group
+from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import (
@@ -108,11 +110,30 @@ def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: 
     )
 
 
+def get_placement_group_topology(pgs: tuple) -> tuple[dict[str, Any], ...]:
+    topology = getattr(pgs[0], "_relax_bundle_topology", None)
+    if not isinstance(topology, tuple):
+        raise ValueError("Placement group has no verified physical bundle topology")
+    return tuple(dict(bundle) for bundle in topology)
+
+
 def create_placement_group(
-    num_gpus: int, node_group_affinity: bool = True
+    num_gpus: int, node_group_affinity: bool = True, *, timeout_s: float = 900.0
 ) -> tuple[PlacementGroup, list[int], list[int]]:
     """Create a packed GPU placement group with optional node-group
     affinity."""
+    if isinstance(num_gpus, bool) or not isinstance(num_gpus, int) or num_gpus <= 0:
+        raise ValueError("Placement group GPU count must be a positive integer")
+    if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError("Placement group timeout must be finite and positive")
+    deadline = time.monotonic() + timeout_s
+
+    def remaining() -> float:
+        duration = deadline - time.monotonic()
+        if duration <= 0:
+            raise TimeoutError(f"Placement group allocation exceeded {timeout_s}s")
+        return duration
+
     accel_resource = device_utils.get_ray_accelerator_name()
     base_bundle = {accel_resource: 1, "CPU": 1}
     node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
@@ -122,38 +143,67 @@ def create_placement_group(
     bundles = [dict(base_bundle) for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
-    ray.get(pg.ready())
-    # use info actor to get the GPU id
     info_actors = []
-    accelerator_kwargs = get_ray_accelerator_kwargs(1)
-    for i in range(num_bundles):
-        info_actors.append(
-            InfoActor.options(
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-                **accelerator_kwargs,
-            ).remote()
-        )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
-
-    bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-    pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-    # Map from logical index -> physical GPU ID
-    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-
-    for i in range(num_bundles):
-        actual_bundle_index = pg_reordered_bundle_indices[i]
-        logger.info(
-            f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
-            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
-        )
-
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+    try:
+        ray.get(pg.ready(), timeout=remaining())
+        accelerator_kwargs = get_ray_accelerator_kwargs(1)
+        for i in range(num_bundles):
+            info_actors.append(
+                InfoActor.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=i,
+                    ),
+                    **accelerator_kwargs,
+                ).remote()
+            )
+        gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors], timeout=remaining())
+        if len(gpu_ids) != num_bundles:
+            raise ValueError("Placement group probe returned an incomplete bundle topology")
+        node_ids: dict[str, list[str]] = {}
+        for node in ray.nodes():
+            if node.get("Alive") and node.get("NodeID") and node.get("NodeManagerAddress"):
+                node_ids.setdefault(node["NodeManagerAddress"], []).append(node["NodeID"])
+        bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
+        sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
+        topology = []
+        seen = set()
+        for bundle_index, node_ip, gpu_id in sorted_bundle_infos:
+            matches = node_ids.get(node_ip, [])
+            if len(matches) != 1:
+                raise ValueError(f"Cannot resolve a unique live Ray node for GPU bundle {bundle_index}")
+            device_id = int(gpu_id)
+            identity = matches[0], device_id
+            if device_id < 0 or identity in seen:
+                raise ValueError("Placement group contains duplicate or invalid physical GPU identities")
+            seen.add(identity)
+            topology.append(
+                {"bundle_index": bundle_index, "node_id": matches[0], "node_ip": node_ip, "gpu_id": device_id}
+            )
+        remaining()
+        pg._relax_bundle_topology = tuple(topology)
+        for actor in list(info_actors):
+            ray.kill(actor)
+            info_actors.remove(actor)
+        reordered_indices = [item["bundle_index"] for item in topology]
+        reordered_gpu_ids = [item["gpu_id"] for item in topology]
+        return pg, reordered_indices, reordered_gpu_ids
+    except Exception as allocation_error:
+        cleanup_errors = []
+        for actor in info_actors:
+            try:
+                ray.kill(actor)
+            except Exception as exc:
+                cleanup_errors.append(str(exc))
+        try:
+            remove_placement_group(pg)
+        except Exception as exc:
+            cleanup_errors.append(str(exc))
+        if cleanup_errors:
+            raise RuntimeError(
+                "Placement allocation failed and cleanup is unconfirmed: " + "; ".join(cleanup_errors)
+            ) from allocation_error
+        raise
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
@@ -302,6 +352,7 @@ def create_genrm_managers(args, pg, runtime_env=None):
 
     def _build_genrm_manager_args(base_args, key, spec):
         instance_args = copy.copy(base_args)
+        instance_args._inference_model_id = key
         instance_args.genrm_model_path = spec["model_path"]
         instance_args.genrm_num_gpus = spec["num_gpus"]
         instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]

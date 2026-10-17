@@ -27,7 +27,7 @@ Relax 中 GenRM 有两种顶层部署模式：
 | :--------------------------- | :------------------ | :-------------------------------- | :------------ | :---------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
 | **Split**                    | 不相交 bundle       | 并行（各自独占分片）              | ✅ per sample | 自动 —— `rollout_num_gpus + genrm_num_gpus == actor_total`                                                        | 小 GenRM；长尾明显（agentic、response 长度方差大）                                    |
 | **Shared / Co-resident**     | 同一批 bundle       | 并行（按 mem_fraction 切分显存）  | ✅ per sample | 自动 —— `rollout_num_gpus == genrm_num_gpus == actor_total`                                                       | 中等大小 GenRM，需要全集群 TP，但显存还能塞下 rollout                                 |
-| **Shared / Defer-swap**      | 同一批 bundle       | 串行（sleep-wake 编排）           | ❌ 延迟到批后 | 显式开启 —— Shared bundles + `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` | GenRM 显著大于 policy；短 response RLVR / math（rollout 无长尾可藏 GenRM 延迟）        |
+| **Shared / Defer-swap**      | 同一批 bundle       | 串行（sleep-wake 编排）           | ❌ 延迟到批后 | 显式开启 —— Shared bundles + `--inference-defer-roles genrm` + `--rm-type dapo-genrm` | GenRM 显著大于 policy；短 response RLVR / math（rollout 无长尾可藏 GenRM 延迟）        |
 
 ```
                  8-GPU Colocate (Split)
@@ -75,10 +75,10 @@ Relax 中 GenRM 有两种顶层部署模式：
  │  ┌─────────────────────────────────────────┐    │
  │  │  Rollout awake  (mem_fraction ≈ 0.85)   │    │
  │  │  GenRM asleep   (release_memory_occ.)   │    │
- │  │  --rm-type dummy  → inline reward = 0   │    │
+ │  │  Framework collects a closed batch      │    │
  │  └─────────────────────────────────────────┘    │
  │                    │                            │
- │        post_process_genrm_swap.py               │
+ │        Framework deferred scoring               │
  │  offload rollout ─►│─► onload GenRM             │
  │                    ▼                            │
  │  Phase B — score（独占 16 GPU）:                │
@@ -92,13 +92,13 @@ Relax 中 GenRM 有两种顶层部署模式：
  │  Phase C — train（独占 16 GPU）:                │
  │  ┌─────────────────────────────────────────┐    │
  │  │        Actor  (Megatron Training)       │    │
- │  │  GenRM 保持 offload，由                 │    │
- │  │  --defer-reward-to-post-process 守护    │    │
+ │  │  Actor waits for the committed batch    │    │
+ │  │  while GenRM stays offloaded            │    │
  │  └─────────────────────────────────────────┘    │
  └─────────────────────────────────────────────────┘
 ```
 
-三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 由框架收齐并封闭 rollout batch，再将 Rollout 切换为 GenRM，通过注册的 `dapo-genrm` adapter 打分，校验 reward 后提交 batch。该模式当前要求固定 batch，并且不能在同一训练任务中执行 model eval；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 
 ## 脚本
 
@@ -106,7 +106,7 @@ Relax 中 GenRM 有两种顶层部署模式：
 | :---------------------------------------------- | :---------------------- | :-------------------------------------------------------------------------------- |
 | `run-qwen3-4B-8xgpu-colocated.sh`               | Split（小 GenRM）       | Qwen3-4B policy + 小 GenRM 共 8 GPU；不相交 bundle，inline reward                 |
 | `run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh` | Split（大 GenRM）       | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；8+8 不相交分片，inline reward          |
-| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap     | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；共享 bundle，两阶段 sleep-wake 切换，批量 reward，实现见 [`post_process_genrm_swap.py`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/post_process_genrm_swap.py) |
+| `run-qwen35-35B-A3B-16xgpu-genrm-397B-defer.sh` | Shared / Defer-swap     | 35B-A3B policy + 397B FP8 GenRM 共 16 GPU；共享 bundle，由框架管理 deferred scoring |
 | `run-qwen3-4B-8xgpu-async.sh`                   | （Fully Async）         | 每个角色独占 GPU 池；rollout 与训练完全并行                                       |
 
 ### 资源分配
@@ -267,7 +267,7 @@ python3 relax/entrypoints/train.py \
 | `rollout_num_gpus == genrm_num_gpus == actor_total`   | **Shared**（同一批 bundle）             |
 | 其他                                                  | 启动时报错拒绝                          |
 
-Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。加上 `--inference-defer-roles genrm --rm-type dapo-genrm` 后切换为框架管理的 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。Deferred scoring 当前要求固定 batch，并且不能在同一训练任务中执行 model eval。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 :::
 
 ::: warning Shared / Co-resident 必须设置 `mem_fraction_static`
@@ -605,7 +605,6 @@ reward 函数（或直接发 HTTP 请求的调用方）传入的 `route_key` 没
 ```
 examples/generate_reward_model/
 ├── README.md                                              # 示例概述 + split-vs-defer 选择指南
-├── post_process_genrm_swap.py                             # defer 脚本使用的 custom hook（sleep-wake swap + 批量打分）
 ├── run-qwen3-4B-8xgpu-colocated.sh                        # 4B colocate 模式
 ├── run-qwen3-4B-8xgpu-async.sh                            # 4B fully async 模式
 ├── run-qwen35-35B-A3B-16xgpu-genrm-397B-split.sh          # 35B + 397B，split-bundle inline reward

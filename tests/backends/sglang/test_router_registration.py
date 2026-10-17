@@ -1,7 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import importlib
-import logging
 import sys
 import threading
 from types import ModuleType, SimpleNamespace
@@ -10,75 +8,43 @@ import pytest
 from requests import ConnectTimeout, ReadTimeout
 
 from relax.utils.http_utils import router_worker_base_url
+from tests.backends.sglang.engine_module_stub import stubbed_sglang_engine_module
 
 
 @pytest.fixture()
 def sglang_engine_module(monkeypatch):
-    ray = ModuleType("ray")
-    ray.get_runtime_context = lambda: SimpleNamespace(get_actor_id=lambda: "replacement-actor")
-    monkeypatch.setitem(sys.modules, "ray", ray)
-
-    sglang_router = ModuleType("sglang_router")
-    sglang_router.__version__ = "0.3.2"
-    monkeypatch.setitem(sys.modules, "sglang_router", sglang_router)
-
-    sglang = ModuleType("sglang")
-    sglang_srt = ModuleType("sglang.srt")
     server_args = ModuleType("sglang.srt.server_args")
     server_args.ServerArgs = object
-    sglang_utils = ModuleType("sglang.srt.utils")
-    sglang_utils.kill_process_tree = lambda _pid: None
-    monkeypatch.setitem(sys.modules, "sglang", sglang)
-    monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
-    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
-    monkeypatch.setitem(sys.modules, "sglang.srt.utils", sglang_utils)
+    with stubbed_sglang_engine_module(
+        monkeypatch, server_args=server_args, router_worker_base_url=router_worker_base_url
+    ) as module:
+        yield module
 
-    checkpoint_client = ModuleType("relax.distributed.checkpoint_service.client.engine")
-    checkpoint_client.create_client = lambda **_kwargs: None
-    monkeypatch.setitem(sys.modules, "relax.distributed.checkpoint_service.client.engine", checkpoint_client)
 
-    ray_actor = ModuleType("relax.distributed.ray.ray_actor")
-    ray_actor.RayActor = object
-    monkeypatch.setitem(sys.modules, "relax.distributed.ray.ray_actor", ray_actor)
+@pytest.mark.parametrize("cached", [False, True])
+def test_engine_fixture_restores_import_cache(monkeypatch, cached):
+    from relax.backends import sglang as parent
 
-    device = ModuleType("relax.utils.device")
-    device.get_visible_devices_env_var = lambda: "CUDA_VISIBLE_DEVICES"
-    monkeypatch.setitem(sys.modules, "relax.utils.device", device)
-
-    async_utils = ModuleType("relax.utils.async_utils")
-    async_utils.run = lambda value: value
-    monkeypatch.setitem(sys.modules, "relax.utils.async_utils", async_utils)
-
-    env = ModuleType("relax.utils.env")
-    env.Envs = SimpleNamespace(
-        RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
-        RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
-        RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
-    )
-    monkeypatch.setitem(sys.modules, "relax.utils.env", env)
-
-    http_utils = ModuleType("relax.utils.http_utils")
-    http_utils.get_host_info = lambda: ("worker", "127.0.0.1")
-    http_utils.router_worker_base_url = router_worker_base_url
-    monkeypatch.setitem(sys.modules, "relax.utils.http_utils", http_utils)
-
-    logging_utils = ModuleType("relax.utils.logging_utils")
-    logging_utils.get_logger = logging.getLogger
-    monkeypatch.setitem(sys.modules, "relax.utils.logging_utils", logging_utils)
-
-    megatron_peft_utils = ModuleType("relax.utils.megatron_peft_utils")
-    megatron_peft_utils.convert_megatron_to_sglang_target_modules = lambda value: value
-    megatron_peft_utils.is_lora_enabled = lambda _args: False
-    monkeypatch.setitem(sys.modules, "relax.utils.megatron_peft_utils", megatron_peft_utils)
-
-    # Track both import caches before re-importing with the test dependencies.
-    # monkeypatch restores their original presence and objects at teardown.
     module_name = "relax.backends.sglang.sglang_engine"
-    parent = importlib.import_module("relax.backends.sglang")
-    monkeypatch.setattr(parent, "sglang_engine", getattr(parent, "sglang_engine", None), raising=False)
-    monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
-    del sys.modules[module_name]
-    yield importlib.import_module(module_name)
+    original = ModuleType(module_name)
+    if cached:
+        monkeypatch.setitem(sys.modules, module_name, original)
+        monkeypatch.setattr(parent, "sglang_engine", original, raising=False)
+    else:
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.delattr(parent, "sglang_engine", raising=False)
+    server_args = ModuleType("sglang.srt.server_args")
+    server_args.ServerArgs = object
+    with stubbed_sglang_engine_module(
+        monkeypatch, server_args=server_args, router_worker_base_url=router_worker_base_url
+    ) as module:
+        assert sys.modules[module_name] is parent.sglang_engine is module
+        assert module is not original
+    if cached:
+        assert sys.modules[module_name] is parent.sglang_engine is original
+    else:
+        assert module_name not in sys.modules
+        assert not hasattr(parent, "sglang_engine")
 
 
 class _Response:
@@ -492,15 +458,23 @@ def _pd_worker(engine, **changes):
 
 
 @pytest.mark.parametrize("registered", [False, True])
-def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_engine_module, registered):
+@pytest.mark.parametrize("strict_admission", [False, True])
+def test_pd_init_requires_successful_router_registration(
+    monkeypatch, sglang_engine_module, registered, strict_admission
+):
     from unittest.mock import Mock
 
     engine = _pd_engine(sglang_engine_module)
+    engine._strict_admission = strict_admission
+    engine._ingress_host, engine._ingress_port = "ingress", 8001
     engine._skip_router_registration = False
-    engine.register_to_router = Mock(return_value=registered)
+    events = []
+    engine.register_to_router = Mock(side_effect=lambda **_kwargs: events.append("register") or registered)
     process = SimpleNamespace(pid=123, is_alive=lambda: False)
-    launch = Mock(return_value=process)
+    launch = Mock(side_effect=lambda _args: events.append("launch") or process)
+    admission = Mock(side_effect=lambda *_args: events.append("admission") or SimpleNamespace())
     monkeypatch.setattr(sglang_engine_module, "launch_server_process", launch)
+    monkeypatch.setattr(sglang_engine_module, "AdmissionServer", admission)
     monkeypatch.setattr(sglang_engine_module, "ServerArgs", SimpleNamespace)
     monkeypatch.setattr(sglang_engine_module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
     server_args = {"host": "worker", "disaggregation_bootstrap_port": 9000, "dp_size": 1}
@@ -514,6 +488,9 @@ def test_pd_init_requires_successful_router_registration(monkeypatch, sglang_eng
     assert engine.process is process
     launch.assert_called_once()
     engine.register_to_router.assert_called_once_with(bootstrap_port=9000)
+    assert events == (["launch", "admission", "register"] if strict_admission else ["launch", "register"])
+    if strict_admission:
+        admission.assert_called_once_with("http://worker:8000", "ingress", 8001)
 
 
 @pytest.mark.parametrize("worker_type", ["prefill", "decode"])
@@ -626,7 +603,8 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
 
     engine = _pd_engine(sglang_engine_module)
     engine.args.rollout_external = False
-    engine.process = SimpleNamespace(pid=123)
+    process = SimpleNamespace(pid=123, join=Mock(), is_alive=lambda: False)
+    engine.process = process
     unregister = Mock(side_effect=RuntimeError("router is unavailable"))
     killed = Mock()
     monkeypatch.setattr(engine, "unregister_from_router", unregister)
@@ -635,7 +613,8 @@ def test_pd_shutdown_kills_owned_server_even_if_unregister_raises(monkeypatch, s
         engine.shutdown()
     unregister.assert_called_once_with(timeout=5.0)
     killed.assert_called_once_with(123)
-    engine.process = None  # Do not exercise the destructor with the fake pid.
+    process.join.assert_called_once_with(timeout=sglang_engine_module._SGLANG_HTTP_ATTEMPT_TIMEOUT_S)
+    assert engine.process is None
 
 
 @pytest.mark.parametrize(

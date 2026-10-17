@@ -39,6 +39,7 @@ from relax.agentic.profile import TRACE_KEY
 from relax.distributed.ray.rollout import _log_rollout_data
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from relax.inference.defer import register_deferred_rollout_finalize
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import finalize_rollout_explicit_metric_values
 from relax.utils.profile_utils import start_sglang_profile, stop_sglang_profile
@@ -105,7 +106,7 @@ async def _run_group(
         if scored_group is None:
             reward_domain.discard_group_progress(stream)
             return None
-        if opd_manager is None:
+        if opd_manager is None or "teacher" in (getattr(opd_manager.args, "inference_defer_roles", None) or []):
             return scored_group
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
@@ -203,22 +204,21 @@ class AgenticResidentPipeline:
             await stop_sglang_profile(self.args, rollout_id)
             profile_stopped = True
             rollout_time = time.monotonic() - started_at
-            if samples:
-                last_sample = samples[-1]
-                logger.info(
-                    "Finish rollout: %s, label: %s, reward: %s",
-                    [str(last_sample.prompt) + last_sample.response],
-                    str(last_sample.label)[:100],
-                    last_sample.reward,
-                )
-                _save_train_debug_rollout_data(self.args, rollout_id, samples)
-            _log_rollout_data(
-                rollout_id,
-                self.args,
-                samples,
-                metrics,
-                rollout_time,
-            )
+
+            def finalize_rollout(scored_samples):
+                if scored_samples:
+                    last_sample = scored_samples[-1]
+                    logger.info(
+                        "Finish rollout: %s, label: %s, reward: %s",
+                        [str(last_sample.prompt) + last_sample.response],
+                        str(last_sample.label)[:100],
+                        last_sample.reward,
+                    )
+                    _save_train_debug_rollout_data(self.args, rollout_id, scored_samples)
+                _log_rollout_data(rollout_id, self.args, scored_samples, metrics, rollout_time)
+
+            if not register_deferred_rollout_finalize(self.args, rollout_id, finalize_rollout):
+                finalize_rollout(samples)
             if self.args.debug_rollout_only:
                 if self._data_system_client is None:
                     raise RuntimeError("Agentic debug rollout cleanup requires a data system client.")

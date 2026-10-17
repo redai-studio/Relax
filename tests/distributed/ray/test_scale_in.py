@@ -575,6 +575,136 @@ class TestScaleInExecution:
         kept.shutdown.remote.assert_not_called()
         monitor.mark_intentionally_removed.assert_called_once_with(0)
 
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_keeps_group_draining(self):
+        engine = make_mock_engine()
+        group = make_engine_group(engines=[engine], is_scaled_out=True)
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        request = ScaleInRequest(request_id="cleanup-failed", status=ScaleInStatus.PENDING, num_replicas=0)
+
+        with (
+            patch.object(manager, "_select_engines_for_removal", return_value=[(group, 0)]),
+            patch.object(
+                manager,
+                "_remove_live_engines",
+                new_callable=AsyncMock,
+                return_value=([], ["group_0_engine_0"]),
+            ),
+        ):
+            await manager._scale_in(request)
+
+        assert request.status is ScaleInStatus.FAILED
+        assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
+        assert group.all_engines == [engine]
+
+    @pytest.mark.asyncio
+    async def test_multi_node_partial_shutdown_can_retry_from_surviving_follower(self, patch_ray_get):
+        args = type("A", (), {"num_gpus_per_node": 4})()
+        head = make_mock_engine(url="http://elastic:1")
+        follower = make_mock_engine(url="http://elastic:1")
+        follower.shutdown.remote.side_effect = RuntimeError("follower temporarily unavailable")
+        group = make_engine_group(
+            args=args,
+            engines=[head, follower],
+            num_gpus_per_engine=8,
+            is_scaled_out=True,
+        )
+        initial = make_engine_group(args=args, engines=[make_mock_engine()])
+        server = make_rollout_server(engine_groups=[initial, group])
+        manager = create_test_manager(servers={"default": server})
+
+        first = ScaleInRequest(
+            request_id="partial-cleanup",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            force=True,
+        )
+        with patch("ray.kill") as kill:
+            await manager._scale_in(first)
+
+            assert first.status is ScaleInStatus.FAILED
+            assert group.lifecycle_status is EngineGroupLifecycle.DRAINING
+            assert group.all_engines == [None, follower]
+            kill.assert_called_once_with(head)
+
+            follower.shutdown.remote.side_effect = None
+            retry_result = manager.create_scale_in_request(num_replicas=1, force=True)
+            assert retry_result["status"] == ScaleInStatus.PENDING
+            retry = manager._scale_in_requests[retry_result["request_id"]]
+            await manager._scale_in(retry)
+
+        assert retry.status is ScaleInStatus.COMPLETED
+        assert retry.selected_engines == ["group_0_engine_0"]
+        assert group.all_engines == [None, None]
+        assert group not in server.engine_groups
+        head.shutdown.remote.assert_called_once()
+        assert follower.shutdown.remote.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_multi_node_partial_shutdown_can_retry_same_url(self, patch_ray_get):
+        args = type("A", (), {"num_gpus_per_node": 4})()
+        head = make_mock_engine(url="http://elastic:1")
+        follower = make_mock_engine(url=None)
+        follower.shutdown.remote.side_effect = RuntimeError("follower temporarily unavailable")
+        group = make_engine_group(
+            args=args,
+            engines=[head, follower],
+            num_gpus_per_engine=8,
+            is_scaled_out=True,
+        )
+        initial = make_engine_group(args=args, engines=[make_mock_engine()])
+        server = make_rollout_server(engine_groups=[initial, group])
+        manager = create_test_manager(servers={"default": server})
+
+        first = ScaleInRequest(
+            request_id="partial-cleanup-url",
+            status=ScaleInStatus.PENDING,
+            engine_urls=["http://elastic:1"],
+            force=True,
+        )
+        with patch("ray.kill") as kill:
+            await manager._scale_in(first)
+
+            assert first.status is ScaleInStatus.FAILED
+            assert group.all_engines == [None, follower]
+            kill.assert_called_once_with(head)
+
+            follower.shutdown.remote.side_effect = None
+            retry_result = manager.create_scale_in_request(engine_urls=["http://elastic:1"], force=True)
+            assert retry_result["status"] == ScaleInStatus.PENDING
+            retry = manager._scale_in_requests[retry_result["request_id"]]
+            await manager._scale_in(retry)
+
+        assert retry.status is ScaleInStatus.COMPLETED, retry.error_message
+        assert retry.selected_engines == ["group_0_engine_0"]
+        assert group.all_engines == [None, None]
+        assert group not in server.engine_groups
+        follower.get_url.remote.assert_not_called()
+        head.get_url.remote.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_url_resolution_uses_registered_replica_url_for_residual_follower(self, patch_ray_get):
+        args = type("A", (), {"num_gpus_per_node": 4})()
+        follower = make_mock_engine(url=None)
+        group = make_engine_group(args=args, engines=[None, follower], num_gpus_per_engine=8, is_scaled_out=True)
+        group.replica_urls[0] = "elastic:1"
+        other = make_engine_group(
+            args=args,
+            engines=[None, make_mock_engine(url=None)],
+            num_gpus_per_engine=8,
+            is_scaled_out=True,
+            rank_offset=2,
+        )
+        server = make_rollout_server(engine_groups=[group, other])
+        manager = create_test_manager(servers={"default": server})
+        request = ScaleInRequest(request_id="url", status=ScaleInStatus.PENDING, engine_urls=["http://elastic:1"])
+
+        candidates = await manager._resolve_scale_in_url_candidates(request, server)
+
+        assert candidates == [(group, 0, follower)]
+        assert manager._select_engines_for_removal(request, server, url_candidates=candidates) == [(group, 0)]
+
 
 @pytest.mark.asyncio
 async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_get):
@@ -587,6 +717,7 @@ async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_ge
     engine.shutdown.remote.side_effect = lambda: events.append("shutdown") or AwaitableValue(None)
     group = make_engine_group(engines=[engine], is_scaled_out=True)
     group.pg = (MagicMock(), [], [])
+    group.pg_owned = True
     server = make_rollout_server(engine_groups=[group])
     manager = create_test_manager(servers={"default": server})
 
@@ -596,7 +727,7 @@ async def test_live_removal_orders_router_drain_dcs_shutdown_and_pg(patch_ray_ge
     with (
         patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=_sleep),
         patch(
-            "relax.distributed.ray.rollout.ray.util.remove_placement_group",
+            "relax.distributed.ray.inference_manager.remove_placement_group",
             side_effect=lambda _pg: events.append("pg"),
         ),
     ):
@@ -644,6 +775,7 @@ async def test_batch_live_removal_runs_each_phase_concurrently_and_drains_once(p
         engine.shutdown.remote.side_effect = lambda: shutdown_phase()
         group = make_engine_group(engines=[engine], is_scaled_out=True, rank_offset=rank_offset)
         group.pg = (MagicMock(), [], [])
+        group.pg_owned = True
         groups.append(group)
 
     server = make_rollout_server(engine_groups=groups)
@@ -654,7 +786,7 @@ async def test_batch_live_removal_runs_each_phase_concurrently_and_drains_once(p
 
     with (
         patch("relax.distributed.ray.rollout.asyncio.sleep", side_effect=drain_once) as sleep,
-        patch("relax.distributed.ray.rollout.ray.util.remove_placement_group") as remove_pg,
+        patch("relax.distributed.ray.inference_manager.remove_placement_group") as remove_pg,
     ):
         removed, failed = await manager._remove_live_engines(
             server,
@@ -675,6 +807,32 @@ async def test_batch_live_removal_runs_each_phase_concurrently_and_drains_once(p
     assert events.index("shutdown_start_2") < events.index("shutdown_end")
     assert remove_pg.call_count == 2
     assert server.engine_groups == []
+
+
+@pytest.mark.asyncio
+async def test_batch_cleanup_preserves_success_when_another_target_fails(patch_ray_get):
+    healthy = make_mock_engine()
+    failing = make_mock_engine()
+    failing.shutdown.remote.side_effect = RuntimeError("shutdown failed")
+    healthy_group = make_engine_group(engines=[healthy], is_scaled_out=True, rank_offset=1)
+    failing_group = make_engine_group(engines=[failing], is_scaled_out=True, rank_offset=2)
+    server = make_rollout_server(engine_groups=[healthy_group, failing_group])
+    manager = create_test_manager(servers={"default": server})
+
+    removed, failed = await manager._remove_live_engines(
+        server,
+        [(healthy_group, 0), (failing_group, 0)],
+        drain_timeout=0,
+        shutdown_timeout=1,
+        force=True,
+    )
+
+    assert removed == ["group_1_engine_0"]
+    assert failed == ["group_2_engine_0"]
+    assert healthy_group not in server.engine_groups
+    assert healthy_group.all_engines == [None]
+    assert failing_group in server.engine_groups
+    assert failing_group.all_engines == [failing]
 
 
 @pytest.mark.asyncio
@@ -723,9 +881,10 @@ class TestRemoveEngine:
 
         with patch("ray.kill") as mock_kill, patch("ray.get", side_effect=mock_ray_get):
             manager = create_test_manager()
-            await manager._remove_engine(g, 0, shutdown_timeout=1)
-            mock_kill.assert_called_once_with(e1)
-        assert g.all_engines[0] is None
+            with pytest.raises(RuntimeError, match="unconfirmed"):
+                await manager._remove_engine(g, 0, shutdown_timeout=1)
+            mock_kill.assert_not_called()
+        assert g.all_engines[0] is e1
 
     @pytest.mark.asyncio
     async def test_dcs_failure_still_shuts_down_engine(self):
@@ -739,7 +898,7 @@ class TestRemoveEngine:
 
         assert group.all_engines[0] is None
         engine.shutdown.remote.assert_called_once()
-        kill.assert_not_called()
+        kill.assert_called_once_with(engine)
 
     @pytest.mark.asyncio
     async def test_multi_node_engine_removal(self, patch_ray_get):
@@ -808,10 +967,11 @@ class TestCleanupEngineGroups:
         mock_pg = MagicMock()
         g_empty = make_engine_group(engines=[None], is_scaled_out=True)
         g_empty.pg = (mock_pg, [], [])
+        g_empty.pg_owned = True
         srv = make_rollout_server(engine_groups=[g_empty])
         manager = create_test_manager(servers={"default": srv})
 
-        with patch("ray.util.remove_placement_group") as mock_remove:
+        with patch("relax.distributed.ray.inference_manager.remove_placement_group") as mock_remove:
             manager._cleanup_engine_groups(srv)
             mock_remove.assert_called_once_with(mock_pg)
 

@@ -518,6 +518,29 @@ class TestHandleEvictions:
         engine.unregister_dcs.remote.assert_called_once()
         engine.shutdown.remote.assert_called_once()
 
+    def test_eviction_retries_surviving_follower_after_head_cleanup(self, patch_ray_get):
+        args = type("A", (), {"num_gpus_per_node": 4})()
+        follower = make_mock_engine()
+        group = make_engine_group(
+            args=args,
+            engines=[None, follower],
+            num_gpus_per_engine=8,
+            is_scaled_out=True,
+        )
+        group.pg = (MagicMock(), [], [])
+        group.lifecycle_status = EngineGroupLifecycle.DRAINING
+        server = make_rollout_server(engine_groups=[group])
+        manager = create_test_manager(servers={"default": server})
+        manager.args.scale_in_drain_timeout = 0
+
+        with patch("ray.kill") as kill:
+            manager._handle_evictions([("default", group, 0)])
+
+        assert group.lifecycle_status is EngineGroupLifecycle.REMOVED
+        assert group.all_engines == [None, None]
+        follower.shutdown.remote.assert_called_once()
+        kill.assert_called_once_with(follower)
+
     def test_marks_intentionally_removed(self, patch_ray_get):
         e = make_mock_engine()
         g = make_engine_group(engines=[e], is_scaled_out=True)

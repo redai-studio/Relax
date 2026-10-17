@@ -214,11 +214,18 @@ def test_dcs_registration_carries_exact_engine_generation(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_initial_scaleout_success_clears_pending_without_changing_recovery_flag():
-    manager, group, engine, record = make_recovery()
-    from relax.distributed.ray import rollout
+    rollout = pytest.importorskip("relax.distributed.ray.rollout", exc_type=ModuleNotFoundError)
 
+    engine = make_mock_engine(url="http://engine-b:30000")
+    group = make_engine_group(engines=[engine], rank_offset=4, is_scaled_out=True)
+    group.pg = (object(), [0, 1], [0, 1])
+    record = rollout._EngineInitRecord(
+        {"url": "http://engine-b:30000", "pid": 42, "node_id": "node"}, pending_router_registration=True
+    )
+    group.engine_init_records = {0: record}
     group.skip_router_registration = True
     server = make_rollout_server(engine_groups=[])
+    manager = create_test_manager(servers={"default": server})
     request = rollout.ScaleOutRequest(request_id="scale", status=rollout.ScaleOutStatus.CREATING)
     manager._health_check_engines = AsyncMock(return_value=True)
     manager._sync_weights_from_seed_engine = AsyncMock(return_value=True)
@@ -226,5 +233,8 @@ async def test_initial_scaleout_success_clears_pending_without_changing_recovery
         request=request, srv=server, engines=[engine], engine_group=group
     )
     assert result.success
+    assert server.engine_groups == [group]
+    assert group.pg_owned
+    assert group.engine_init_records[0] is record
     assert not record.pending_router_registration
     assert group.skip_router_registration

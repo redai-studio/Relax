@@ -14,12 +14,14 @@ from relax.core.node_group_affinity import with_control_plane_affinity
 from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
+    get_placement_group_topology,
 )
+from relax.inference.placement import validate_bound_placement
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
 
-__all__ = ["Service", "_require_node_group_markers", "create_placement_group"]
+__all__ = ["Service", "_require_node_group_markers", "create_placement_group", "get_placement_group_topology"]
 
 
 logger = get_logger(__name__)
@@ -86,6 +88,7 @@ class Service:
         """Deploy a prepared service exactly once."""
         if self._deployed:
             raise RuntimeError(f"[{self.role}] Service has already been deployed")
+        self._validate_inference_binding()
         try:
             self._deploy(self.pgs)
         except Exception:
@@ -112,6 +115,25 @@ class Service:
         else:
             self.pgs = None
 
+    def _validate_inference_binding(self) -> None:
+        plan = getattr(self.config, "_inference_placement_plan", None)
+        if not isinstance(plan, dict) or self.pgs is None:
+            return
+        pool = "actor" if self._is_shared_pgs else str(self.role)
+        placements = [placement for placement in plan.get("placements", []) if placement["pool"] == pool]
+        if not placements:
+            return
+
+        try:
+            topology = get_placement_group_topology(self.pgs)
+            for placement in placements:
+                validate_bound_placement(placement, topology, bundle_indices=self.pgs[1])
+        except Exception:
+            if not self._is_shared_pgs:
+                remove_placement_group(self.pgs[0])
+                self.pgs = None
+            raise
+
     def _deploy(self, pgs: Optional[Any] = None) -> None:
         """Bind and deploy the Ray Serve deployment with the given placement
         group.
@@ -123,6 +145,8 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        if str(self.role) in {"rollout", "genrm"}:
+            ray_actor_options.update(num_gpus=0)
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
                 self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
@@ -281,6 +305,7 @@ class Service:
         pgs = self._ensure_placement_group()
 
         recovery_load_path(self.config)  # Ensure config has the correct checkpoint paths after restart
+        self._validate_inference_binding()
         self._deploy(pgs)
         logger.info(f"[{self.role}] Service redeployed successfully")
 

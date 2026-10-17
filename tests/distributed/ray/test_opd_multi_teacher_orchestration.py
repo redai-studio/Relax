@@ -91,7 +91,7 @@ def test_multi_teacher_bundle_offsets_are_prefix_sums_not_index_times_size(monke
         lambda **kwargs: full_pg,
     )
     checkpoint_to_source = {"/ckpt/math": "math", "/ckpt/code": "code"}
-    monkeypatch.setattr(ray, "get", lambda ref: [f"http://{checkpoint_to_source[ref[0]]}/generate"])
+    monkeypatch.setattr(ray, "get", lambda ref, timeout=None: [f"http://{checkpoint_to_source[ref[0]]}/generate"])
 
     args = _base_args()
     routes_json = json.dumps({"math": "/ckpt/math", "code": "/ckpt/code"})

@@ -691,7 +691,8 @@ async def test_generate_preserves_history_routing_and_session_lifecycle(monkeypa
     adapter._worker_urls.assert_not_awaited()
 
 
-async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
+@pytest.mark.parametrize("managed", [False, True])
+async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch, managed) -> None:
     async def fake_post(*_args, **_kwargs):
         request = httpx.Request("POST", "http://test/generate")
         response = httpx.Response(
@@ -701,8 +702,14 @@ async def test_generate_maps_sglang_499_to_empty_abort(monkeypatch) -> None:
         )
         raise httpx.HTTPStatusError("aborted", request=request, response=response)
 
-    monkeypatch.setattr(runtime_mod, "post", fake_post)
-    result = await _backend_adapter(lifecycle_enabled=True).generate(
+    monkeypatch.setattr(runtime_mod, "generate_with_discovery" if managed else "post", fake_post)
+    adapter = _backend_adapter(lifecycle_enabled=True)
+    if managed:
+        adapter._args._inference_rollout_discovery_url = "http://discovery"
+        adapter._args.sglang_server_concurrency = 2
+        adapter._args.rollout_num_gpus = 1
+        adapter._args.rollout_num_gpus_per_engine = 1
+    result = await adapter.generate(
         input_ids=[1, 2, 3],
         sampling_params={"max_new_tokens": 4},
         session_id="session-9",

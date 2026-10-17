@@ -26,6 +26,8 @@ from relax.engine.rewards import async_rm, batched_async_rm
 from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.inference.client import generate_with_discovery
+from relax.inference.defer import register_deferred_rollout_finalize
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -346,6 +348,18 @@ async def _post_generation(
         if attempt and state.abort_event.is_set():
             raise GenerationAborted
         try:
+            discovery_url = getattr(args, "_inference_rollout_discovery_url", None)
+            if discovery_url:
+                return await generate_with_discovery(
+                    discovery_url,
+                    payload,
+                    model=getattr(args, "_inference_rollout_model", None),
+                    headers=headers,
+                    timeout=args.rollout_http_timeout,
+                    max_connections=(
+                        args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+                    ),
+                )
             return await post(url, payload, headers=headers, fail_fast_no_workers=router_recovery_enabled)
         except httpx.HTTPStatusError as error:
             if not evaluation and is_expected_sglang_499(error):
@@ -705,7 +719,11 @@ async def generate_and_rm(
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and "teacher" not in (getattr(args, "inference_defer_roles", None) or [])
+        ):
             await state.opd_manager.prefill(samples, _encode_multimodal_inputs)
 
         return samples
@@ -716,7 +734,11 @@ async def generate_and_rm(
         if sample.reward is None:
             sample.reward = await async_rm(args, sample)
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and "teacher" not in (getattr(args, "inference_defer_roles", None) or [])
+        ):
             await state.opd_manager.prefill(sample, _encode_multimodal_inputs)
 
     return sample
@@ -801,7 +823,11 @@ async def generate_and_rm_group(
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
-        if state.opd_manager and not evaluation:
+        if (
+            state.opd_manager
+            and not evaluation
+            and "teacher" not in (getattr(args, "inference_defer_roles", None) or [])
+        ):
             await state.opd_manager.prefill(group, _encode_multimodal_inputs)
 
     return group
@@ -1279,16 +1305,21 @@ async def generate_rollout_async(
 
     global CURRENT_ROLLOUT_BATCH
     filter_metrics = metric_gatherer.collect()
-    if CURRENT_ROLLOUT_BATCH:
+
+    def finalize_rollout(scored_samples):
         save_debug_rollout_data(
-            args, CURRENT_ROLLOUT_BATCH, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
+            args, scored_samples, rollout_id=rollout_id, evaluation=False, tokenizer=state.tokenizer
         )
         rollout_metrics = {**timing_metrics, **filter_metrics}
         if args.partial_rollout and not args.fully_async:
-            assert len(CURRENT_ROLLOUT_BATCH) == len(data) * args.n_samples_per_prompt, (
-                f"len(CURRENT_ROLLOUT_BATCH)={len(CURRENT_ROLLOUT_BATCH)}, len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
+            assert len(scored_samples) == len(data) * args.n_samples_per_prompt, (
+                f"len(scored_samples)={len(scored_samples)}, "
+                f"len(data) * args.n_samples_per_prompt={len(data) * args.n_samples_per_prompt}"
             )
-        _log_rollout_data(rollout_id, args, CURRENT_ROLLOUT_BATCH, rollout_metrics, rollout_time)
+        _log_rollout_data(rollout_id, args, scored_samples, rollout_metrics, rollout_time)
+
+    if not register_deferred_rollout_finalize(args, rollout_id, finalize_rollout) and CURRENT_ROLLOUT_BATCH:
+        finalize_rollout(CURRENT_ROLLOUT_BATCH)
         if args.debug_rollout_only:
             logger.info("Debug rollout only mode - data system cleanup")
             await data_system_client.async_clear_partition(partition_id=f"train_{rollout_id}")

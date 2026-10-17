@@ -70,11 +70,14 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, wit
     controller = Namespace(
         config=Namespace(
             colocate=True,
+            use_agentic_rollout=False,
             resource={role: (1, 1) for role in algo},
             data_source_path="test.data_source",
         ),
         runtime_env=None,
         _health_manager=Mock(),
+        _preflight_inference_placement=Mock(),
+        _deploy_teacher_gateway=Mock(),
         _maybe_resolve_num_rollout=Mock(),
         _validate_gpu_resources=Mock(side_effect=ReachedResourceValidation),
     )
