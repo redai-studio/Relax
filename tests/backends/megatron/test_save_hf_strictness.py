@@ -13,6 +13,7 @@ the tower leaves nothing missing, so those exports keep strict on.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +79,41 @@ def _model(*, vision: bool):
     """
     config = SimpleNamespace(vision_config=object()) if vision else SimpleNamespace()
     return [SimpleNamespace(config=config)]
+
+
+@pytest.mark.parametrize("save_dtype,quantized_reference", [("bf16", False), ("bf16", True), ("fp8", False)])
+def test_export_reference_preserves_quantized_rollout_config(tmp_path, save_dtype, quantized_reference):
+    rollout = tmp_path / "rollout"
+    original = tmp_path / "original"
+    rollout.mkdir()
+    original.mkdir()
+    quantized = {"quantization_config": {"quant_method": "fp8"}}
+    (rollout / "config.json").write_text(json.dumps(quantized))
+    (original / "config.json").write_text(json.dumps(quantized if quantized_reference else {}))
+    args = SimpleNamespace(hf_checkpoint=str(rollout), ref_load=str(original), save_hf_dtype=save_dtype)
+    expected = original if save_dtype == "bf16" and not quantized_reference else rollout
+    assert model_mod._hf_export_reference(args) == str(expected)
+    assert args.hf_checkpoint == str(rollout)
+    assert json.loads((rollout / "config.json").read_text()) == quantized
+
+
+def test_bf16_export_uses_original_reference_and_keeps_strict(monkeypatch, tmp_path):
+    recorded = {}
+    _install_fakes(monkeypatch, recorded)
+    from megatron.bridge import AutoBridge
+
+    factory = AutoBridge.from_hf_pretrained
+
+    def record_reference(path, **kwargs):
+        recorded["reference"] = path
+        return factory(path, **kwargs)
+
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", record_reference)
+    monkeypatch.setattr(model_mod, "_hf_export_reference", lambda args: "/original-bf16")
+    monkeypatch.setattr(hf_export, "reference_expects_mtp", lambda path: False)
+    monkeypatch.setattr(hf_export, "reference_expects_vision", lambda path: False)
+    model_mod.save_hf_model(_args(tmp_path), rollout_id=1, model=_model(vision=False))
+    assert recorded == {"reference": "/original-bf16", "strict": True}
 
 
 def test_vision_reference_with_text_only_model_keeps_strict(monkeypatch, tmp_path):

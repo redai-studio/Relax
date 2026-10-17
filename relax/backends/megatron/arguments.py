@@ -306,8 +306,8 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    # Megatron DistributedOptimizer supports Adam, but not SGD.
+    args.use_distributed_optimizer = getattr(args, "optimizer", "adam") != "sgd"
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     _resolve_optimizer_precision_args(args)
