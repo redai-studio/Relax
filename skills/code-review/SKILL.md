@@ -44,6 +44,14 @@ ______________________________________________________________________
 - Establish authoritative requirements from the official task and maintainer-confirmed decisions. Contributor expansions, bot suggestions, and tests do not by themselves establish requirements; check their provenance and keep unresolved conflicts explicit.
 - Use `rg` and the actual call path to identify producers, consumers, ownership, and critical paths, including training, evaluation, and recovery. Resolve an empty or ambiguous scope before drawing conclusions.
 
+## Mandatory Minimal-Change Checks
+
+Apply these checks to every review and to all suggested fixes:
+
+- [ ] **Minimal scope**: Every changed line must directly serve the requested behavior. Prefer local fixes; flag unrelated refactoring, renaming, code movement, or formatting.
+- [ ] **Minimal arguments**: Each new CLI argument must address a concrete user need. Prefer reusing existing configuration or deriving values when sufficient; flag duplicate switches, speculative options, and exposed implementation details.
+- [ ] **Minimal edits to existing files**: Reuse existing interfaces and extension points, and keep changes localized. Do not reduce the diff by adding unnecessary abstractions, duplicated code, or compatibility branches.
+
 ## Review Lenses
 
 Load [development checks](references/development-checklist.md) first to establish necessity and user contracts, then the separate, unchanged [SOLID checklist](references/solid-checklist.md) for architecture prompts. A proposed refactor needs a concrete benefit and a minimal safe change; use an incremental plan when needed.
