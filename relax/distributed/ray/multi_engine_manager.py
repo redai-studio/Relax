@@ -164,70 +164,62 @@ class MultiEngineManager:
     # ------------------------------------------------------------------
 
     def _init_engines(self, ranks: list[int]) -> int:
-        """Create actors for the given slot ranks, fire init.remote() for all
-        of them without blocking, then await everything in one ray.get so a
-        large engine doesn't pay N x cold-load latency.
+        """Create actors for uninitialized or retired slot ranks, fire
+        init.remote() for all of them, then await everything in one ray.get so
+        a large engine doesn't pay N x cold-load latency.
 
         On failure, kill any newly created engines and leave their slots None
         so the caller sees them as still-dead rather than silently healthy.
         """
+        if not ranks:
+            return 0
+
         EngineActor = ray.remote(self.engine_actor_cls)
         new_engines: list[tuple[int, Any]] = []
-        for rank in ranks:
-            if self.all_engines[rank] is not None:
-                continue
-
-            pg_tuple, owns_pg, gpu_index = self._resolve_placement(rank)
-            pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
-
-            engine = EngineActor.options(
-                **self._ray_resource_kwargs(rank),
-                scheduling_strategy=scheduling_strategy,
-                runtime_env={"env_vars": self._build_engine_env_vars()},
-            ).remote(
-                self._engine_ctor_args(rank),
-                rank=rank,
-                worker_type="regular",
-                base_gpu_id=base_gpu_id,
-                **self._build_engine_ctor_kwargs(rank),
-            )
-            new_engines.append((rank, engine))
-            self.all_engines[rank] = engine
-            self._engine_placements[rank] = (pg_tuple, owns_pg)
-
-        num_new_engines = len(new_engines)
-        if num_new_engines == 0:
-            return num_new_engines
-
-        addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
-        for rank, _ in new_engines:
-            self._engine_addr_and_ports[rank] = addr_and_ports[rank]
-
-        init_handles = [
-            engine.init.remote(**self._build_engine_init_kwargs(rank, addr_and_ports[rank]))
-            for rank, engine in new_engines
-        ]
         try:
+            for rank in ranks:
+                pg_tuple, owns_pg, gpu_index = self._resolve_placement(rank)
+                # Record ownership before actor creation, which can fail after
+                # the placement group has already reserved resources.
+                self._engine_placements[rank] = (pg_tuple, owns_pg)
+                pg, reordered_bundle_indices, reordered_gpu_ids = pg_tuple
+                base_gpu_id = int(reordered_gpu_ids[gpu_index])
+                scheduling_strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                )
+
+                engine = EngineActor.options(
+                    **self._ray_resource_kwargs(rank),
+                    scheduling_strategy=scheduling_strategy,
+                    runtime_env={"env_vars": self._build_engine_env_vars()},
+                ).remote(
+                    self._engine_ctor_args(rank),
+                    rank=rank,
+                    worker_type="regular",
+                    base_gpu_id=base_gpu_id,
+                    **self._build_engine_ctor_kwargs(rank),
+                )
+                new_engines.append((rank, engine))
+                self.all_engines[rank] = engine
+
+            addr_and_ports = self._allocate_engine_addr_and_ports(new_engines=new_engines)
+            for rank, _ in new_engines:
+                self._engine_addr_and_ports[rank] = addr_and_ports[rank]
+
+            init_handles = [
+                engine.init.remote(**self._build_engine_init_kwargs(rank, addr_and_ports[rank]))
+                for rank, engine in new_engines
+            ]
             # Bounded: a bundle on a dead node never schedules, and an unbounded
             # ray.get would block the training step forever.
             ray.get(init_handles, timeout=_ENGINE_REBUILD_TIMEOUT_S)
         except Exception:
-            for rank, engine in new_engines:
-                try:
-                    ray.kill(engine)
-                except Exception:
-                    pass
-                self.all_engines[rank] = None
-                self._remove_owned_pg(rank)
+            self._retire_engines(ranks)
             raise
 
-        return num_new_engines
+        return len(new_engines)
 
     def _remove_owned_pg(self, rank: int) -> None:
         placement = self._engine_placements.pop(rank, None)
@@ -331,9 +323,9 @@ class MultiEngineManager:
         return dead
 
     def _retire_engines(self, ranks: list[int]) -> None:
-        """Tear down dead engines and null their slots so recover() rebuilds
-        them."""
-        for rank in ranks:
+        """Retire the whole logical engine containing each given slot."""
+        heads = sorted({rank // self.nodes_per_engine * self.nodes_per_engine for rank in ranks})
+        for rank in heads:
             for i in range(rank, rank + self.nodes_per_engine):
                 engine = self.all_engines[i]
                 if engine is None:
@@ -350,16 +342,17 @@ class MultiEngineManager:
                 except Exception as exc:
                     logger.warning(f"{self._log_prefix} engine rank={i} ray.kill failed: {exc}")
                 self.all_engines[i] = None
-                self._remove_owned_pg(i)
                 logger.info(f"{self._log_prefix} engine rank={i} retired")
+            # Followers share the head's owned PG. Stop every local process
+            # before releasing it, even if one actor was never created.
+            for i in range(rank, rank + self.nodes_per_engine):
+                self._remove_owned_pg(i)
 
     def recover(self) -> set:
-        """Rebuild engines whose slot is None. Returns the ranks rebuilt.
+        """Rebuild engines with missing slots. Returns all slot ranks rebuilt.
 
-        ``_init_engines`` already skips non-None slots, so it rebuilds exactly
-        the holes, reusing the same placement-group bundles (or creating fresh
-        dedicated ones) and probing fresh ports (surviving engines' ports are
-        bound, so they're skipped).
+        Retirement clears every slot in a logical engine, so recovery rebuilds
+        its whole TP group.
         """
         dead = [i for i, engine in enumerate(self.all_engines) if engine is None]
         if not dead:
@@ -391,17 +384,5 @@ class MultiEngineManager:
     def shutdown(self) -> None:
         """Tear down every engine and remove any placement group this manager
         created for it."""
-        for rank in range(0, len(self.all_engines), self.nodes_per_engine):
-            engine = self.all_engines[rank]
-            if engine is not None:
-                try:
-                    ray.get(engine.shutdown.remote(), timeout=_ENGINE_SHUTDOWN_TIMEOUT_S)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={rank} shutdown failed (killing anyway): {exc}")
-                try:
-                    ray.kill(engine)
-                except Exception as exc:
-                    logger.warning(f"{self._log_prefix} engine rank={rank} ray.kill failed: {exc}")
-                self.all_engines[rank] = None
-            self._remove_owned_pg(rank)
+        self._retire_engines(list(range(0, len(self.all_engines), self.nodes_per_engine)))
         logger.info(f"{self._log_prefix} shutdown complete.")

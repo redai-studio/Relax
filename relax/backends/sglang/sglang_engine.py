@@ -332,7 +332,7 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
-def _launch_server_with_patches(server_args: ServerArgs):
+def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int):
     """Top-level picklable ``multiprocessing.Process`` target that applies the
     SGLang patches, each gated by its own env flag so any combination is valid:
 
@@ -341,6 +341,13 @@ def _launch_server_with_patches(server_args: ServerArgs):
       routing-replay patch unconditionally.
     """
     from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.utils import kill_itself_when_parent_died
+
+    # A wedged actor cannot run shutdown(). Keep its server tied to its lifetime,
+    # including when the actor exits before the child installs this guard.
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        return
 
     if Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
         launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
@@ -392,11 +399,11 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
         f"routing_replay={optimize}, per_pos_token_ids={per_pos}"
     )
 
-    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_patches, args=(server_args, os.getpid()))
     p.start()
 
     if server_args.node_rank != 0:
-        return
+        return p
 
     _wait_server_healthy(
         base_url=server_args.url(),
