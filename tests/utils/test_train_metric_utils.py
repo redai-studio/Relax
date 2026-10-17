@@ -1,8 +1,13 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import itertools
 import math
+import sys
 from argparse import Namespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
+
+import pytest
 
 from relax.utils.training import train_metric_utils
 
@@ -59,8 +64,41 @@ def test_log_perf_data_raw_omits_non_finite_peak_metrics(monkeypatch):
     assert all(math.isfinite(value) for value in logged_metrics.values() if isinstance(value, float))
 
 
+def test_log_perf_data_raw_sends_extra_metrics_in_the_same_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(train_metric_utils, "Timer", FakeTimer)
+    monkeypatch.setattr(
+        train_metric_utils.tracking_utils, "log", lambda _args, metrics, step_key: calls.append(dict(metrics))
+    )
+
+    train_metric_utils.log_perf_data_raw(
+        rollout_id=3,
+        args=Namespace(wandb_always_use_train_step=False),
+        is_primary_rank=True,
+        extra_metrics={"straggler/self/median_ms": 700.0},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["straggler/self/median_ms"] == 700.0
+    assert calls[0]["perf/step_time"] == 3.0
+
+
 def test_log_perf_data_raw_reports_mfu_for_known_peak(monkeypatch):
     logged_metrics = _collect_perf_metrics(monkeypatch, 100.0)
 
     assert logged_metrics["perf/device_peak_tflops"] == 100.0
     assert logged_metrics["perf/mfu/actor_train"] == 0.75
+
+
+@pytest.mark.parametrize(("tp", "last_pp", "dp"), list(itertools.product([0, 1], [True, False], [0, 1])))
+def test_is_metrics_primary_rank_is_tp0_last_pp_stage_dp0(monkeypatch, tp, last_pp, dp):
+    core = ModuleType("megatron.core")
+    core.mpu = SimpleNamespace(
+        get_tensor_model_parallel_rank=lambda: tp,
+        is_pipeline_last_stage=lambda: last_pp,
+        get_data_parallel_rank=lambda with_context_parallel=False: dp if with_context_parallel else 0,
+    )
+    monkeypatch.setitem(sys.modules, "megatron", ModuleType("megatron"))
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+
+    assert train_metric_utils.is_metrics_primary_rank() is (tp == 0 and last_pp and dp == 0)

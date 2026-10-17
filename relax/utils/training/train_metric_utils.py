@@ -20,12 +20,25 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+def is_metrics_primary_rank() -> bool:
+    """The one Megatron rank that logs perf metrics: TP 0, last PP stage, DP
+    (with CP) 0."""
+    from megatron.core import mpu
+
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    )
+
+
 def log_perf_data_raw(
     rollout_id: int,
     args: Namespace,
     is_primary_rank: bool,
     flops_counter: FlopsCounter | None = None,
     world_size: int = 1,
+    extra_metrics: dict[str, float] | None = None,
 ) -> None:
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
@@ -105,6 +118,11 @@ def log_perf_data_raw(
                 log_dict["perf/step_resp_token_per_s"] = sum(response_lens) / total_time
 
     logger.info(f"perf {rollout_id}: {log_dict}")
+
+    if extra_metrics:
+        # Same call on purpose: with --use-metrics-service every tracking_utils.log is a synchronous
+        # HTTP request on the training thread, so extra scalars must not add a request of their own.
+        log_dict.update(extra_metrics)
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step

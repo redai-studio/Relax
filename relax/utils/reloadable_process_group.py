@@ -295,6 +295,26 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def alltoall(self, *a, **kw):
         return self._fwd("alltoall", *a, **kw)
 
+    # torch>=2.13 renamed the single-tensor collectives on ProcessGroup and
+    # ``distributed_c10d`` now calls the new names (``group.reduce_scatter_single(...)``
+    # instead of ``group._reduce_scatter_base(...)`` etc.). Without these overrides
+    # the call falls through to the C++ trampoline default, which returns a
+    # ``PyWorkHolder`` whose ``wait()`` segfaults. Harmless on older torch (never called).
+    def reduce_scatter_single(self, *a, **kw):
+        return self._fwd("reduce_scatter_single", *a, **kw)
+
+    def reduce_scatter_single_coalesced(self, *a, **kw):
+        return self._fwd("reduce_scatter_single_coalesced", *a, **kw)
+
+    def all_gather_single(self, *a, **kw):
+        return self._fwd("all_gather_single", *a, **kw)
+
+    def all_gather_single_coalesced(self, *a, **kw):
+        return self._fwd("all_gather_single_coalesced", *a, **kw)
+
+    def all_to_all_single(self, *a, **kw):
+        return self._fwd("all_to_all_single", *a, **kw)
+
     def send(self, *a, **kw):
         return self._fwd("send", *a, **kw)
 
