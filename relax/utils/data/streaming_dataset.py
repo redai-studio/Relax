@@ -1022,9 +1022,9 @@ class StreamingDataset(BaseDataset):
         that ``IndexManager.position`` stays exactly in sync with the index
         sequence given to ``PrefetchBuffer.set_index_order()``.
 
-        Without prefetch, indices are fetched in small batches for
-        efficiency (acceptable since there is no ordering contract to
-        honour with a background thread).
+        Without prefetch, indices are fetched in small batches bounded by
+        the remaining sample count, so every fetched index is processed.
+        Filtered samples are replaced in subsequent iterations.
 
         Args:
             n: Number of samples to get
@@ -1094,7 +1094,8 @@ class StreamingDataset(BaseDataset):
 
         while len(samples) < n and attempts < max_attempts:
             need = n - len(samples)
-            fetch_size = min(need * 2, 100)
+            # Every fetched index advances the cursor, so do not over-fetch.
+            fetch_size = min(need, 100)
 
             indices, epoch_crossed = self.index_manager.get_next_indices(fetch_size)
             crossed_epoch = crossed_epoch or epoch_crossed

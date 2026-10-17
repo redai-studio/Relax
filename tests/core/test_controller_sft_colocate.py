@@ -5,8 +5,10 @@ services."""
 
 import ast
 import builtins
+import sys
 from argparse import Namespace
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
@@ -36,7 +38,9 @@ def registry_roles(request):
 
 
 @pytest.mark.parametrize("with_rollout, expected_colocate", [(True, True), (False, False)])
-def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, with_rollout, expected_colocate):
+def test_register_all_serve_sft_colocate_uses_optional_roles(
+    monkeypatch, registry_roles, with_rollout, expected_colocate
+):
     # Execute the actual method; only its external collaborators are replaced.
     # Stop at resource validation, before placement groups/services are created.
     path = Path(__file__).resolve().parents[2] / "relax/core/controller.py"
@@ -47,6 +51,9 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, wit
     )
     ROLES, ROLES_SFT_ONLY = registry_roles
     algo = {role: object() for role in [*ROLES_SFT_ONLY, ROLES.rollout]}
+    registry = ModuleType("relax.core.registry")
+    registry.resolve_algorithm = Mock(return_value=algo)
+    monkeypatch.setitem(sys.modules, registry.__name__, registry)
     namespace = {
         "validate_ppo_config": Mock(),
         "maybe_start_managed_opd_teacher": Mock(return_value=(None, None)),
@@ -82,6 +89,7 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, wit
         namespace["register_all_serve"](controller)
 
     roles, colocate, pg_roles = controller._validate_gpu_resources.call_args.args
+    registry.resolve_algorithm.assert_called_once_with(controller.config)
     namespace["_actor_rollout_pg_roles"].assert_called_once_with(controller.config)
     assert pg_roles == ["actor", "rollout"]
     assert colocate is expected_colocate
