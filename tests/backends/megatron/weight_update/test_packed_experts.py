@@ -3,8 +3,6 @@
 """Expert IDs, gate/up order, changed weights and replacement process
 groups."""
 
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +11,9 @@ import torch
 
 @pytest.fixture
 def module():
-    path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/qwen35_packed_experts.py"
-    spec = importlib.util.spec_from_file_location("qwen35_packed_experts_test_target", path)
-    result = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(result)
-    return result
+    from relax.backends.megatron.weight_update import expert_gather
+
+    return expert_gather
 
 
 def sources():
@@ -36,7 +32,7 @@ def sources():
 
 def test_numeric_expert_order_and_group_rank_order(module):
     infos = sorted(sources(), key=lambda info: info.name)
-    buckets = module.bucket_qwen35_experts(infos, 24, [7, 2])
+    buckets = module.bucket_expert_projections(infos, 24, [7, 2])
     assert len(buckets) == 6
     assert [bucket[0].name.split("layers.")[1].split(".")[0] for bucket in buckets] == ["0", "0", "2", "2", "10", "10"]
     for bucket in buckets:
@@ -62,7 +58,7 @@ def test_invalid_source_layout_fails_before_payload_collectives(module, mutation
     else:
         infos = [info for info in infos if ".linear_fc2." not in info.name]
     with pytest.raises(ValueError):
-        module.bucket_qwen35_experts(infos, 24, [7, 2])
+        module.bucket_expert_projections(infos, 24, [7, 2])
 
 
 def peers(projection):
@@ -114,7 +110,7 @@ def test_packed_values_lifetime_and_fresh_group(module, monkeypatch, projection,
 
     monkeypatch.setattr(module.dist, "all_gather_object", metadata)
     monkeypatch.setattr(module.dist, "all_gather_into_tensor", gather)
-    plan = module.Qwen35PackedExpertGather(24)
+    plan = module.PackedExpertGather(24)
     first_group = SimpleNamespace(ranks=[7, 2], rank=rank)
     [(name, value)] = plan(inputs[rank], group=first_group, device="cpu")
     assert name == f"model.language_model.layers.2.mlp.experts.{projection}_proj"
@@ -150,6 +146,28 @@ def test_invalid_converted_layout(module, mutation):
         inputs[0][0] = (name.replace("layers.2", "layers.3"), tensor)
     else:
         inputs[1] = peers("down")[1]
-    plan = module.Qwen35PackedExpertGather(24)
+    plan = module.PackedExpertGather(24)
     with pytest.raises(ValueError):
         plan._prepare([module._layout(peer) for peer in inputs], (7, 2))
+
+
+@pytest.mark.parametrize(
+    "source_prefix,hf_prefix",
+    [
+        ("module.module.decoder.layers", "model.layers"),
+        ("module.module.language_model.decoder.layers", "model.language_model.layers"),
+    ],
+)
+def test_deepseek_and_multimodal_names_use_same_projection_packing(module, source_prefix, hf_prefix):
+    infos = sources()
+    for info in infos:
+        info.name = info.name.replace("module.module.language_model.decoder.layers", source_prefix)
+    assert len(module.bucket_expert_projections(infos, 24, [7, 2])) == 6
+    inputs = peers("gate_up")
+    inputs = [
+        [(name.replace("model.language_model.layers", hf_prefix), tensor) for name, tensor in peer] for peer in inputs
+    ]
+    plan = module.PackedExpertGather(24)
+    plan._prepare([module._layout(peer) for peer in inputs], (7, 2))
+    assert plan._name == f"{hf_prefix}.2.mlp.experts.gate_up_proj"
+    assert plan._shape == (24, 8, 6)

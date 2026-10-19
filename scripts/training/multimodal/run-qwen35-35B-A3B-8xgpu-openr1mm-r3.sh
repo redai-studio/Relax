@@ -140,13 +140,8 @@ runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 # Vision embeddings must be recomputed after each weight update.
 runtime_env.setdefault("env_vars", {})["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
 # The backend validates single-update, zero-KL GRPO before reusing log-probs.
-runtime_env["env_vars"]["RELAX_COLOCATE_INLINE_LOG_PROBS"] = "1"
 runtime_env["env_vars"]["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1"
 # Export BF16 experts in bulk, then send each receiver its TP-local shard.
-runtime_env["env_vars"]["RELAX_BF16_EXPERT_GATHER"] = "1"
-runtime_env["env_vars"]["RELAX_ASYNC_WEIGHT_GATHER"] = "1"
-runtime_env["env_vars"]["RELAX_QWEN35_PACKED_EXPERTS"] = "1"
-runtime_env["env_vars"]["RELAX_QWEN35_DIRECT_EXPERTS"] = "1"
 # Preserve the platform Trial identity and its collector path in Ray workers.
 # These are public variable names; their values are inherited at launch.
 for key in (

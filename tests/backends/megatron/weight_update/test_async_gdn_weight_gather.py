@@ -2,8 +2,6 @@
 
 """Reconstruct known global GDN tensors from real TP-local component shards."""
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,12 +10,10 @@ import torch
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("wrapped", [False, True])
-def test_async_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped):
-    path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/common.py"
-    tree = ast.parse(path.read_text())
-    function = next(
-        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "all_gather_params_async"
-    )
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped, async_mode, monkeypatch):
+    from relax.backends.megatron.weight_update import common
+
     inputs, sources, expected, split_sizes = [], {}, [], {}
     specs = [
         ("self_attention.conv1d.weight", (2, 2, 4), (1, 4)),
@@ -51,31 +47,38 @@ def test_async_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped):
     pending, waited = [], []
 
     def all_gather(outputs, param, *, group, async_op):
-        assert group == "tp" and async_op
+        assert group == "tp" and async_op == async_mode
         shards = sources[param.data_ptr()]
         pending.append(outputs)
 
         def wait():
-            assert len(pending) == 3, "Every gather must launch before waiting"
+            if async_mode:
+                assert len(pending) == 3, "Every gather must launch before waiting"
             for out, source in zip(outputs, shards, strict=True):
                 out.copy_(source)
             waited.append(True)
 
-        return SimpleNamespace(wait=wait)
+        if async_mode:
+            return SimpleNamespace(wait=wait)
+        wait()
+        return None
 
-    namespace = {
-        "torch": torch,
-        "dist": SimpleNamespace(all_gather=all_gather),
-        "mpu": SimpleNamespace(
-            get_tensor_model_parallel_world_size=lambda: tp, get_tensor_model_parallel_group=lambda: "tp"
-        ),
-    }
-    module = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
-        type_ignores=[],
+    monkeypatch.setattr(common.dist, "all_gather", all_gather)
+    monkeypatch.setattr(
+        common,
+        "mpu",
+        SimpleNamespace(get_tensor_model_parallel_world_size=lambda: tp, get_tensor_model_parallel_group=lambda: "tp"),
     )
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    result = namespace["all_gather_params_async"](inputs, gdn_split_sizes=split_sizes)
+    if async_mode:
+        result = common.all_gather_params_async(inputs, gdn_split_sizes=split_sizes)
+    else:
+        config = SimpleNamespace(
+            linear_key_head_dim=2, linear_value_head_dim=4, linear_num_key_heads=tp, linear_num_value_heads=tp
+        )
+        monkeypatch.setattr(common, "get_hf_config", lambda path: SimpleNamespace(text_config=config))
+        result = [
+            common.all_gather_param(SimpleNamespace(hf_checkpoint="test"), info.name, param) for info, param in inputs
+        ]
     assert len(waited) == 3
     assert len(result) == len(expected)
     assert all(
@@ -83,3 +86,16 @@ def test_async_gather_preserves_gdn_glu_and_replicated_layouts(tp, wrapped):
         for actual, target in zip(result, expected, strict=True)
     )
     assert result[-1].data_ptr() == replicated.data_ptr()
+
+
+@pytest.mark.parametrize("kind", ["replicated", "duplicated", "buffer"])
+def test_non_sharded_gdn_named_tensor_needs_no_gdn_config(monkeypatch, kind):
+    from relax.backends.megatron.weight_update import common
+
+    tensor = torch.ones(4)
+    if kind != "buffer":
+        tensor.tensor_model_parallel = kind == "duplicated"
+        tensor.parallel_mode = "duplicated" if kind == "duplicated" else None
+    monkeypatch.setattr(common, "get_hf_config", lambda *a: pytest.fail("unneeded config lookup"))
+    actual = common.all_gather_param(SimpleNamespace(), "decoder.layers.0.self_attention.in_proj.weight", tensor)
+    assert actual.data_ptr() == tensor.data_ptr()

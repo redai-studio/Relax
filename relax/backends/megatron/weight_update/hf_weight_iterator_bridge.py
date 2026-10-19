@@ -1,7 +1,6 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
-import os
 import re
 import time
 from collections import OrderedDict
@@ -31,12 +30,12 @@ from relax.utils.megatron_peft_utils import (
 from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
-from .bf16_expert_gather import Bf16ExpertGather, bucket_experts_by_owner
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, all_gather_params_async, named_params_and_buffers
+from .common import all_gather_param, all_gather_params_async, gdn_component_sizes, named_params_and_buffers
+from .expert_gather import Bf16ExpertGather, PackedExpertGather, bucket_expert_projections, bucket_experts_by_owner
+from .expert_layout import DirectExpertLayout
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
-from .qwen35_packed_experts import Qwen35PackedExpertGather, bucket_qwen35_experts
 
 
 logger = get_logger(__name__)
@@ -108,8 +107,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
         self._expert_router: ExpertRouter | None = None
         self._async_weight_gather = (
-            os.environ.get("RELAX_ASYNC_WEIGHT_GATHER", "0") == "1"
-            and torch.cuda.is_available()
+            torch.cuda.is_available()
             and not self.quantization_config
             and not self.lora_merge_mode
             and not self.lora_adapter_mode
@@ -120,29 +118,27 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 info.name.replace(".to_wrap.", ".")
                 for bucket in self._non_expert_buckets
                 for info in bucket
-                if "self_attention.conv1d.weight" in info.name or "self_attention.in_proj.weight" in info.name
+                if info.attrs.get("tensor_model_parallel")
+                and info.attrs.get("parallel_mode") != "duplicated"
+                and ("self_attention.conv1d.weight" in info.name or "self_attention.in_proj.weight" in info.name)
             }
             if names:
-                config = get_hf_config(self.args.hf_checkpoint).text_config
+                config = get_hf_config(self.args.hf_checkpoint)
                 tp_size = mpu.get_tensor_model_parallel_world_size()
-                qk = config.linear_key_head_dim * (config.linear_num_key_heads // tp_size)
-                value = config.linear_value_head_dim * (config.linear_num_value_heads // tp_size)
-                heads = config.linear_num_value_heads // tp_size
-                self._gdn_split_sizes = {
-                    name: (qk, qk, value) if "conv1d" in name else (qk, qk, value, value, heads, heads)
-                    for name in names
-                }
+                self._gdn_split_sizes = {name: gdn_component_sizes(config, tp_size, name) for name in names}
         self._bf16_expert_buckets = None
         self._bf16_expert_gathers = []
-        # Opt in only for the validated, unquantized ETP1/PP1 export. Other
-        # layouts retain the existing Bridge path, including LoRA and routing.
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        # Complete BF16 experts are owned locally at ETP1/PP1. Other layouts
+        # continue through Bridge's existing PP/TP/quantization/LoRA path.
         if (
-            os.environ.get("RELAX_BF16_EXPERT_GATHER", "0") == "1"
-            and torch.cuda.is_available()
+            torch.cuda.is_available()
             and not self.quantization_config
             and not self.lora_merge_mode
             and not self.lora_adapter_mode
             and mpu.get_pipeline_model_parallel_world_size() == 1
+            and mpu.get_virtual_pipeline_model_parallel_world_size() in (None, 1)
             and mpu.get_expert_tensor_parallel_world_size() == 1
             and mpu.get_expert_model_parallel_world_size() > 1
             and self._expert_buckets
@@ -154,15 +150,6 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             if all(info.src_rank in ranks and 0 < info.size <= budget for info in infos):
                 self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
                 self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
-                if (
-                    os.environ.get("RELAX_QWEN35_PACKED_EXPERTS", "0") == "1"
-                    and mpu.get_virtual_pipeline_model_parallel_world_size() in (None, 1)
-                    and get_hf_config(self.args.hf_checkpoint).model_type == "qwen3_5_moe"
-                ):
-                    self._bf16_expert_buckets = bucket_qwen35_experts(infos, self.args.num_experts, ranks)
-                    self._bf16_expert_gathers = [
-                        Qwen35PackedExpertGather(self.args.num_experts) for _ in self._bf16_expert_buckets
-                    ]
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
             self.lora_dim = self.args.lora_rank
@@ -178,6 +165,49 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 "so colocate adapter mode is unaffected by ETP. (Fully-async off-policy adapter mode "
                 "DOES fold expert deltas for actor_fwd and so also needs ETP=1.)"
             )
+
+    def configure_direct_experts(self, layout: DirectExpertLayout | None) -> bool:
+        """Select packed export only after the colocated receiver layout is
+        known."""
+        if self._packed_expert_sync and layout == self._direct_expert_layout:
+            return True
+        if not self._packed_expert_sync and layout is None:
+            return False
+        self._packed_expert_sync = False
+        self._direct_expert_layout = None
+        if self._bf16_expert_buckets is None:
+            return False
+        infos = [info for bucket in self._bf16_expert_buckets for info in bucket]
+        ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+        # Reconnect may disable a previous direct plan. Restore standard HF export.
+        self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+        self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
+        if layout is None or layout.num_experts != self.args.num_experts:
+            return False
+        if not self._bridge_converter.supports_packed_experts([info.name for info in infos]):
+            return False
+        try:
+            buckets = bucket_expert_projections(infos, layout.num_experts, ranks)
+        except ValueError:
+            return False
+        for bucket in buckets:
+            # A fused projection is indivisible. Permit at most two ordinary
+            # sync buffers (the existing overlap budget), then fall back to
+            # bounded per-expert HF export for larger MoE geometries.
+            if sum(info.size for info in bucket) > 2 * self.args.update_weight_buffer_size:
+                return False
+            expected = (
+                (2 * layout.intermediate_size, layout.hidden_size)
+                if ".linear_fc1." in bucket[0].name
+                else (layout.hidden_size, layout.intermediate_size)
+            )
+            if tuple(bucket[0].shape) != expected:
+                return False
+        self._bf16_expert_buckets = buckets
+        self._bf16_expert_gathers = [PackedExpertGather(layout.num_experts) for _ in buckets]
+        self._packed_expert_sync = True
+        self._direct_expert_layout = layout
+        return True
 
     def configure_expert_routing(
         self, layout: ExpertLayout, *, payload_group: dist.ProcessGroup, metadata_group: dist.ProcessGroup
@@ -277,7 +307,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
 
     def get_hf_weight_chunks(self, megatron_local_weights):
         if self._bf16_expert_buckets is not None:
-            if isinstance(self._bf16_expert_gathers[0], Qwen35PackedExpertGather):
+            if self._packed_expert_sync:
                 yield from _chunk_with_mla_pairing(
                     self._iter_hf_params(megatron_local_weights, include_experts=False),
                     chunk_size=self.args.update_weight_buffer_size,

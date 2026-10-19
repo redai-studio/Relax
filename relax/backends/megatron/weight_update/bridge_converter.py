@@ -428,6 +428,30 @@ class BridgeConverter:
 
         return global_name, None
 
+    def supports_packed_experts(self, names: Collection[str]) -> bool:
+        """Whether mappings export canonical gated experts accepted by
+        FusedMoE."""
+        for name in names:
+            global_name = _normalize_global_name(name)
+            task = self._bridge_task_map.get(global_name)
+            mapping = task.mapping if task is not None else self._lookup_mapping(global_name)[1]
+            hf_param = getattr(mapping, "hf_param", None)
+            outputs = list(hf_param.values()) if isinstance(hf_param, dict) else [hf_param]
+            projections = set()
+            for output in outputs:
+                match = re.fullmatch(
+                    r"model\.(?:language_model\.)?layers\.\d+\.mlp\.experts\.(?:\d+\.)?"
+                    r"(gate|up|down|gate_up)_proj(?:\.weight)?",
+                    str(output),
+                )
+                if match is None:
+                    return False
+                projections.add(match[1])
+            expected = ({"gate", "up"}, {"gate_up"}) if ".linear_fc1." in name else ({"down"},)
+            if projections not in expected:
+                return False
+        return True
+
     def _lookup_mapping(self, global_name: str) -> tuple[str, Any]:
         """Resolve ``global_name`` straight from the mapping registry.
 

@@ -771,8 +771,8 @@ class SGLangEngine(RayActor):
         )
 
     def get_expert_weight_sync_layout(self) -> dict:
-        """Return resolved layout settings for opt-in colocated expert
-        routing."""
+        """Return resolved layout settings for opt-in colocated expert routing
+        and direct BF16 loading."""
         from relax.utils.misc import get_hf_config
 
         if self.node_rank != 0 or self.worker_type != "regular":
@@ -792,11 +792,21 @@ class SGLangEngine(RayActor):
             "speculative_algorithm",
             "moe_runner_backend",
             "json_model_override_args",
+            "dtype",
+            "quantization",
+            "enable_lora",
+            "disable_shared_experts_fusion",
+            "enforce_shared_experts_fusion",
+            "kt_weight_path",
         )
         layout = {key: info[key] for key in keys if key in info}
         config = get_hf_config(info["model_path"])
         text_config = getattr(config, "text_config", None) or config
-        layout["num_experts"] = getattr(text_config, "num_experts", None)
+        layout["num_experts"] = getattr(text_config, "num_experts", None) or getattr(
+            text_config, "n_routed_experts", None
+        )
+        for key in ("hidden_size", "moe_intermediate_size", "quantization_config"):
+            layout[key] = getattr(text_config, key, None)
         return layout
 
     def load_lora_adapter_from_tensors(

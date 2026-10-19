@@ -2,27 +2,11 @@
 
 """Safety gates and zero-KL inputs for single-update colocate GRPO."""
 
-import ast
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[3]
-
-
-def load_function(path, name, namespace, class_name=None):
-    tree = ast.parse(path.read_text())
-    body = tree.body
-    if class_name is not None:
-        body = next(node for node in body if isinstance(node, ast.ClassDef) and node.name == class_name).body
-    function = next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == name)
-    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, function], type_ignores=[]))
-    exec(compile(module, str(path), "exec"), namespace)
-    return namespace[name]
+from relax.utils.training.inline_log_probs import can_reuse_colocate_log_probs
 
 
 @pytest.fixture
@@ -89,13 +73,12 @@ def actor():
 
 
 @pytest.fixture
-def inline_guard(monkeypatch):
-    monkeypatch.setenv("RELAX_COLOCATE_INLINE_LOG_PROBS", "1")
-    return load_function(
-        ROOT / "relax/backends/megatron/actor.py",
-        "_inline_colocate_old_log_probs",
-        {"os": os},
-        "MegatronTrainRayActor",
+def inline_guard():
+    return lambda actor, batches: can_reuse_colocate_log_probs(
+        actor.args,
+        batches,
+        backup_tags=actor.weights_backuper.backup_tags,
+        rollout_data_postprocess=actor.rollout_data_postprocess,
     )
 
 
@@ -143,27 +126,22 @@ def test_single_fresh_grpo_update_is_eligible(actor, inline_guard):
 )
 def test_unsafe_algorithm_or_state_is_rejected(actor, inline_guard, name, value):
     setattr(actor.args, name, value)
-    with pytest.raises(ValueError, match="Unsupported colocate true-on-policy"):
-        inline_guard(actor, [22])
+    assert not inline_guard(actor, [22])
 
 
 def test_actual_multiple_updates_are_rejected(actor, inline_guard):
-    with pytest.raises(ValueError, match="exactly one optimizer step"):
-        inline_guard(actor, [11, 11])
+    assert not inline_guard(actor, [11, 11])
 
 
 def test_extra_model_and_data_mutation_are_rejected(actor, inline_guard):
     actor.weights_backuper.backup_tags.append("ref")
-    with pytest.raises(ValueError, match="reference"):
-        inline_guard(actor, [22])
+    assert not inline_guard(actor, [22])
     actor.weights_backuper.backup_tags = ["actor"]
     actor.rollout_data_postprocess = lambda args: None
-    with pytest.raises(ValueError, match="rollout_data_postprocess"):
-        inline_guard(actor, [22])
+    assert not inline_guard(actor, [22])
 
 
-def test_existing_modes_do_not_enter_colocate_optimization(actor, inline_guard, monkeypatch):
-    monkeypatch.delenv("RELAX_COLOCATE_INLINE_LOG_PROBS")
+def test_existing_modes_do_not_enter_colocate_optimization(actor, inline_guard):
     assert not inline_guard(actor, [11, 11])
     actor.args.true_on_policy_mode = False
     assert not inline_guard(actor, [11, 11])
@@ -173,7 +151,7 @@ def test_existing_modes_do_not_enter_colocate_optimization(actor, inline_guard, 
     assert not inline_guard(actor, [11, 11])
 
 
-def test_zero_kl_uses_sampling_shape_without_sampling_values():
+def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
     torch = pytest.importorskip("torch")
     calls = []
 
@@ -181,15 +159,13 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values():
         calls.append(kwargs["kl"])
         return kwargs["kl"], kwargs["kl"]
 
-    namespace = {
-        "torch": torch,
-        "mpu": SimpleNamespace(is_pipeline_last_stage=lambda: True),
-        "maybe_padded_total_lengths": lambda *args: None,
-        "compute_advantages_and_returns_impl": compute_impl,
-    }
-    compute = load_function(ROOT / "relax/backends/megatron/loss.py", "compute_advantages_and_returns", namespace)
+    from relax.backends.megatron import loss
+
+    monkeypatch.setattr(loss.mpu, "is_pipeline_last_stage", lambda: True)
+    monkeypatch.setattr(loss, "maybe_padded_total_lengths", lambda *args: None)
+    monkeypatch.setattr(loss, "compute_advantages_and_returns_impl", compute_impl)
+    compute = loss.compute_advantages_and_returns
     args = SimpleNamespace(
-        _colocate_inline_log_probs=True,
         advantage_estimator="grpo",
         kl_coef=0,
         use_rollout_logprobs=False,
@@ -205,10 +181,19 @@ def test_zero_kl_uses_sampling_shape_without_sampling_values():
             "total_lengths": [5, 7],
             "loss_masks": [torch.ones(3), torch.ones(2)],
         }
-        compute(args, data)
+        compute(args, data, inline_log_probs=True)
         assert "log_probs" not in data
         assert [tuple(x.shape) for x in data["advantages"]] == [(3,), (2,)]
         assert all(x.dtype == torch.float32 and torch.count_nonzero(x) == 0 for x in data["advantages"])
     assert all(torch.equal(a, b) for a, b in zip(*calls, strict=True))
     with pytest.raises(ValueError, match="requires rollout log-probs"):
-        compute(args, {"response_lengths": [3], "total_lengths": [5]})
+        compute(args, {"response_lengths": [3], "total_lengths": [5]}, inline_log_probs=True)
+
+
+@pytest.mark.parametrize("batch", [256, 512])
+def test_auto_selection_uses_actual_batch_and_does_not_mutate_arguments(actor, inline_guard, batch):
+    actor.args.global_batch_size = batch
+    actor.args.rollout_batch_size = batch // 8
+    before = vars(actor.args).copy()
+    assert inline_guard(actor, [33])
+    assert vars(actor.args) == before

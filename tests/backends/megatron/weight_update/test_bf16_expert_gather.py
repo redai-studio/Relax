@@ -2,8 +2,6 @@
 
 """Packing, tensor lifetime and metadata reuse across replacement groups."""
 
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,11 +10,9 @@ import torch
 
 @pytest.fixture
 def module():
-    path = Path(__file__).resolve().parents[4] / "relax/backends/megatron/weight_update/bf16_expert_gather.py"
-    spec = importlib.util.spec_from_file_location("bf16_expert_gather_test_target", path)
-    result = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(result)
-    return result
+    from relax.backends.megatron.weight_update import expert_gather
+
+    return expert_gather
 
 
 def simulate_collectives(monkeypatch, module, peers):
