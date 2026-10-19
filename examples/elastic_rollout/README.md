@@ -57,6 +57,11 @@ A successful run trains continuously, adds an external node or Pod, reaches
 Ray placement-group readiness, scales above four Relax `ACTIVE` engines, and
 later returns to four without stopping.
 
+Hybrid-mode variant: `run-qwen3-4B-8xgpu-elastic-hybrid.sh` runs the same
+recipe with `--hybrid` — scaled-out engines
+register with DCS and receive weights on every per-step broadcast, just like
+the fully-async baseline.
+
 Relax does not create nodes or install `preStop`; the platform must provide
 capacity and deliver graceful `SIGTERM` eviction with enough time to drain.
 See the [full recipe walkthrough](../../docs/en/examples/elastic-rollout.md) or
@@ -113,6 +118,10 @@ bash scripts/entrypoint/ray-job.sh \
 
 成功时训练持续推进，外部节点或 Pod ready，Ray Placement Group ready，Relax
 `ACTIVE` 引擎数扩到 4 以上，随后缩回 4 且任务不中断。
+
+Hybrid 模式变体：`run-qwen3-4B-8xgpu-elastic-hybrid.sh` 以
+`--hybrid` 运行同一 recipe——扩出的引擎注册到
+DCS 后，随每步广播获得最新权重，与 fully-async 基线行为一致。
 
 Relax 不创建节点，也不安装 `preStop`；外围平台需要提供资源，并用有足够排空
 时间的 `SIGTERM` 实现优雅抢占。继续阅读[完整 recipe 说明](../../docs/zh/examples/elastic-rollout.md)
