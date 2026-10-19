@@ -8,6 +8,9 @@ import pytest
 import torch
 
 
+pytest.importorskip("megatron.core", reason="TP gather tests require Megatron Core", exc_type=ImportError)
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("async_mode", [False, True])

@@ -6,9 +6,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from relax.backends.megatron.weight_update import update_weight_from_tensor as sync
-from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayout
-from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge
+
+pytest.importorskip("megatron.core", reason="Weight sync tests require Megatron Core", exc_type=ImportError)
+pytest.importorskip("megatron.bridge", reason="Weight sync tests require Megatron Bridge", exc_type=ImportError)
+pytest.importorskip("sglang.srt.utils", reason="Weight sync tests require SGLang serialization", exc_type=ImportError)
+
+from relax.backends.megatron.weight_update import update_weight_from_tensor as sync  # noqa: E402
+from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayout  # noqa: E402
+from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge  # noqa: E402
 
 
 def receiver():

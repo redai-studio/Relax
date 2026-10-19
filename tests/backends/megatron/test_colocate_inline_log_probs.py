@@ -153,6 +153,7 @@ def test_existing_modes_do_not_enter_colocate_optimization(actor, inline_guard):
 
 def test_zero_kl_uses_sampling_shape_without_sampling_values(monkeypatch):
     torch = pytest.importorskip("torch")
+    pytest.importorskip("megatron.core", reason="Loss tests require Megatron Core", exc_type=ImportError)
     calls = []
 
     def compute_impl(args, **kwargs):

@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter
+
+pytest.importorskip("megatron.core", reason="Bridge capability tests require Megatron Core", exc_type=ImportError)
+
+from relax.backends.megatron.weight_update.bridge_converter import BridgeConverter  # noqa: E402
 
 
 @pytest.mark.parametrize("prefix", ["model.layers.2", "model.language_model.layers.2"])
