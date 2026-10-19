@@ -183,6 +183,8 @@ def _check_bridge_chunk_rounds(rank: int, layout: ExpertLayout, *, interleaved: 
     iterator._vanilla_key_map = {info.name: info.name for i, info in enumerate(infos) if i % 3 == rank}
     iterator._non_expert_buckets = []
     iterator._expert_broadcast_caches = []
+    iterator._bf16_expert_buckets = None
+    iterator._async_weight_gather = False
     iterator.lora_merge_mode = False
     iterator._bridge_converter = SimpleNamespace(
         init_tasks=lambda: None,

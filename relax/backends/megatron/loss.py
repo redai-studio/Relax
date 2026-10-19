@@ -611,6 +611,11 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
         xs = log_probs if log_probs is not None else values
+        if xs is None and getattr(args, "_colocate_inline_log_probs", False) and args.kl_coef == 0:
+            # Only shape/device are used. Sampling probabilities are never PPO old log-probs.
+            xs = rollout_data.get("rollout_log_probs")
+            if xs is None:
+                raise ValueError("Colocate true-on-policy GRPO requires rollout log-probs for zero-KL shapes.")
         kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
     else:
         kl = [

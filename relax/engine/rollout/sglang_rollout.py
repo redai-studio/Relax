@@ -581,7 +581,7 @@ async def generate(
 
     if "routed_experts" in output["meta_info"]:
         sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+            pybase64.b64decode(output["meta_info"]["routed_experts"], validate=True),
             dtype=np.int32,
         ).reshape(
             len(sample.tokens) - 1,

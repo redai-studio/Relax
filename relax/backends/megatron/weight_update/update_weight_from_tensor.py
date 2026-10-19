@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+import json
+import os
+import urllib.request
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
@@ -26,11 +29,13 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.misc import get_hf_config
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
 from .expert_routing import ExpertLayout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .lora_adapter_sync import LoraAdapterSync
+from .qwen35_direct_experts import direct_expert_chunk, dispatch_typed_buckets, validate_direct_receiver
 from .update_weight_from_distributed import (
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
@@ -95,6 +100,26 @@ class UpdateWeightFromTensor:
         self._hf_weight_iterator = HfWeightIteratorBase.create(
             args=args, model=model, model_name=model_name, quantization_config=quantization_config
         )
+
+        self._direct_qwen35_experts = os.environ.get("RELAX_QWEN35_DIRECT_EXPERTS", "0") == "1"
+        if self._direct_qwen35_experts:
+            config = get_hf_config(args.hf_checkpoint)
+            text_config = getattr(config, "text_config", None)
+            if (
+                not args.colocate
+                or self.lora_enabled
+                or quantization_config
+                or self._route_experts
+                or config.model_type != "qwen3_5_moe"
+                or text_config is None
+                or (text_config.hidden_size, text_config.moe_intermediate_size, text_config.num_experts)
+                != (2048, 512, 256)
+                or os.environ.get("RELAX_QWEN35_PACKED_EXPERTS", "0") != "1"
+                or not getattr(self._hf_weight_iterator, "_bf16_expert_buckets", None)
+                or mpu.get_pipeline_model_parallel_world_size() != 1
+                or mpu.get_expert_tensor_parallel_world_size() != 1
+            ):
+                raise ValueError("Direct expert IPC is limited to packed BF16 Qwen3.5-35B with PP1/ETP1")
 
         self._ipc_gather_group = None
         self._ipc_gather_src = None
@@ -212,6 +237,23 @@ class UpdateWeightFromTensor:
                 layout, payload_group=self._expert_routing_group, metadata_group=get_gloo_group()
             )
             self._expert_routing_placement = placement
+
+        if getattr(self, "_direct_qwen35_experts", False):
+            if self.use_distribute or any(count != 2 for count in colocate_gpu_counts):
+                raise ValueError("Direct Qwen3.5 experts require colocated two-GPU engines")
+            status = [None]
+            if dist.get_rank(get_gloo_group()) == 0:
+                try:
+                    urls = ray.get([engine.get_url.remote() for engine in self.rollout_engines])
+                    for url in urls:
+                        with urllib.request.urlopen(url.rstrip("/") + "/server_info", timeout=30) as response:
+                            validate_direct_receiver(json.load(response))
+                    status[0] = (True, None)
+                except Exception as error:
+                    status[0] = (False, str(error))
+            dist.broadcast_object_list(status, src=0, group=get_gloo_group())
+            if not status[0][0]:
+                raise RuntimeError(f"Direct Qwen3.5 receiver validation failed: {status[0][1]}")
 
         # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
@@ -665,6 +707,7 @@ class UpdateWeightFromTensor:
                 ipc_gather_group=self._ipc_gather_group,
                 weight_version=None if self._route_experts else self.weight_version,
                 dispatch_errors=dispatch_errors,
+                direct_experts=getattr(self, "_direct_qwen35_experts", False),
             )
             all_refs.extend(refs_colocated)
 
@@ -690,6 +733,7 @@ def _send_to_colocated_engine(
     ipc_gather_group,
     weight_version,
     dispatch_errors: list[str] | None = None,
+    direct_experts: bool = False,
 ) -> tuple[list[ObjectRef], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -710,7 +754,14 @@ def _send_to_colocated_engine(
         (name, tensor.to(cur_device) if tensor.device != cur_device else tensor) for name, tensor in hf_named_tensors
     ]
 
-    if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+    direct_chunk = None
+    if direct_experts:
+        if dist.get_world_size(ipc_gather_group) != 2:
+            raise ValueError("Direct Qwen3.5 IPC requires a two-rank receiver group")
+        direct_chunk = direct_expert_chunk(hf_named_tensors, dist.get_rank(group=ipc_gather_group))
+    if direct_chunk is not None:
+        converted_named_tensors_by_dtypes = {"direct": direct_chunk}
+    elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
         # An empty local chunk contributes no bucket; FlattenedTensorBucket
         # rejects an empty named_tensors list, so skip building one.
         converted_named_tensors_by_dtypes = {"dtype": hf_named_tensors} if hf_named_tensors else {}
@@ -724,14 +775,18 @@ def _send_to_colocated_engine(
 
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        metadata = flattened_tensor_bucket.get_metadata()
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": metadata,
-        }
-        long_live_tensors.append(flattened_tensor_data)
-        serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
+        if direct_chunk is not None:
+            payload, load_format = named_tensors, "direct"
+        else:
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            payload = {
+                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "metadata": flattened_tensor_bucket.get_metadata(),
+            }
+            load_format = "flattened_bucket"
+        long_live_tensors.append(payload)
+        serialized = MultiprocessingSerializer.serialize(payload, output_str=True)
+        serialized_tensors.append((load_format, serialized) if direct_experts else serialized)
 
     serialized_named_tensors = (
         [None] * dist.get_world_size(ipc_gather_group) if ipc_gather_src == dist.get_rank() else None
@@ -744,6 +799,18 @@ def _send_to_colocated_engine(
     )
 
     refs = []
+    if direct_experts:
+        if dist.get_rank() == ipc_gather_src:
+            refs = dispatch_typed_buckets(
+                serialized_named_tensors,
+                engine=ipc_engine,
+                version=weight_version,
+                serializer=MultiprocessingSerializer,
+                empty_flattened=lambda: _empty_flattened_tensor_data(cur_device),
+                held=long_live_tensors,
+                dispatch_errors=dispatch_errors,
+            )
+        return refs, long_live_tensors
     if dist.get_rank() == ipc_gather_src:
         # Ranks can contribute uneven bucket counts: under PP/EP/MoE layouts a TP
         # rank may legitimately hold no HF tensors for a chunk. Pad short ranks

@@ -3,7 +3,7 @@
 import inspect
 import re
 from argparse import Namespace
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -133,6 +133,8 @@ def all_gather_param(args, name: str, param: torch.Tensor) -> torch.Tensor:
 
 def all_gather_params_async(
     param_infos_and_params: list[tuple[ParamInfo, torch.Tensor]],
+    *,
+    gdn_split_sizes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> list[torch.Tensor]:
     """Parallel TP all-gather for multiple params.
 
@@ -185,6 +187,17 @@ def all_gather_params_async(
             # Process the gathered partitions (same logic as original all_gather_param)
             assert partition_dim is not None, "partition_dim must be set for TP-sharded params"
             name = info.name.replace(".to_wrap.", ".")
+            if gdn_split_sizes is not None and name in gdn_split_sizes:
+                # Each rank holds [Q_local,K_local,V_local,(Z_local,B_local,A_local)].
+                # Gather the complete shard once, then restore component-major HF
+                # order. Plain concatenation would interleave Q/K/V across ranks.
+                assert partition_dim == 0, "GDN components must be sharded along rows"
+                components = [p.split(gdn_split_sizes[name], dim=0) for p in param_partitions]
+                param = torch.cat(
+                    [parts[index] for index in range(len(gdn_split_sizes[name])) for parts in components], dim=0
+                )
+                gathered_params.append(param)
+                continue
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
             if "linear_fc1.weight" in name and "vision_model" not in name:

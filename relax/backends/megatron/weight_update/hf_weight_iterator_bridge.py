@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 import dataclasses
+import os
 import re
 import time
 from collections import OrderedDict
@@ -27,12 +28,15 @@ from relax.utils.megatron_peft_utils import (
     is_lora_enabled,
     is_lora_merge_mode,
 )
+from relax.utils.misc import get_hf_config
 from relax.utils.types import ParamInfo
 
+from .bf16_expert_gather import Bf16ExpertGather, bucket_experts_by_owner
 from .bridge_converter import BridgeConverter
-from .common import all_gather_param, named_params_and_buffers
+from .common import all_gather_param, all_gather_params_async, named_params_and_buffers
 from .expert_routing import ExpertLayout, ExpertRouter
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .qwen35_packed_experts import Qwen35PackedExpertGather, bucket_qwen35_experts
 
 
 logger = get_logger(__name__)
@@ -103,6 +107,62 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         self._expert_buckets, self._non_expert_buckets, self._vanilla_key_map, self._adapter_map = buckets_result
         self._expert_broadcast_caches = [({}, {}) for _ in self._expert_buckets]
         self._expert_router: ExpertRouter | None = None
+        self._async_weight_gather = (
+            os.environ.get("RELAX_ASYNC_WEIGHT_GATHER", "0") == "1"
+            and torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+        )
+        self._gdn_split_sizes = {}
+        if self._async_weight_gather:
+            names = {
+                info.name.replace(".to_wrap.", ".")
+                for bucket in self._non_expert_buckets
+                for info in bucket
+                if "self_attention.conv1d.weight" in info.name or "self_attention.in_proj.weight" in info.name
+            }
+            if names:
+                config = get_hf_config(self.args.hf_checkpoint).text_config
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                qk = config.linear_key_head_dim * (config.linear_num_key_heads // tp_size)
+                value = config.linear_value_head_dim * (config.linear_num_value_heads // tp_size)
+                heads = config.linear_num_value_heads // tp_size
+                self._gdn_split_sizes = {
+                    name: (qk, qk, value) if "conv1d" in name else (qk, qk, value, value, heads, heads)
+                    for name in names
+                }
+        self._bf16_expert_buckets = None
+        self._bf16_expert_gathers = []
+        # Opt in only for the validated, unquantized ETP1/PP1 export. Other
+        # layouts retain the existing Bridge path, including LoRA and routing.
+        if (
+            os.environ.get("RELAX_BF16_EXPERT_GATHER", "0") == "1"
+            and torch.cuda.is_available()
+            and not self.quantization_config
+            and not self.lora_merge_mode
+            and not self.lora_adapter_mode
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+            and mpu.get_expert_tensor_parallel_world_size() == 1
+            and mpu.get_expert_model_parallel_world_size() > 1
+            and self._expert_buckets
+            and all(info.dtype == torch.bfloat16 for bucket in self._expert_buckets for info in bucket)
+        ):
+            infos = [info for bucket in self._expert_buckets for info in bucket]
+            ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
+            budget = self.args.update_weight_buffer_size // len(ranks)
+            if all(info.src_rank in ranks and 0 < info.size <= budget for info in infos):
+                self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
+                self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
+                if (
+                    os.environ.get("RELAX_QWEN35_PACKED_EXPERTS", "0") == "1"
+                    and mpu.get_virtual_pipeline_model_parallel_world_size() in (None, 1)
+                    and get_hf_config(self.args.hf_checkpoint).model_type == "qwen3_5_moe"
+                ):
+                    self._bf16_expert_buckets = bucket_qwen35_experts(infos, self.args.num_experts, ranks)
+                    self._bf16_expert_gathers = [
+                        Qwen35PackedExpertGather(self.args.num_experts) for _ in self._bf16_expert_buckets
+                    ]
         if self.lora_merge_mode:
             self.lora_alpha = self.args.lora_alpha
             self.lora_dim = self.args.lora_rank
@@ -216,12 +276,50 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             )
 
     def get_hf_weight_chunks(self, megatron_local_weights):
+        if self._bf16_expert_buckets is not None:
+            if isinstance(self._bf16_expert_gathers[0], Qwen35PackedExpertGather):
+                yield from _chunk_with_mla_pairing(
+                    self._iter_hf_params(megatron_local_weights, include_experts=False),
+                    chunk_size=self.args.update_weight_buffer_size,
+                )
+                # Each native projection is indivisible. Yield it immediately
+                # instead of materializing the next layer through chunk lookahead.
+                for item in self._iter_bf16_expert_params(megatron_local_weights, include_non_experts=False):
+                    yield [item]
+                return
+            yield from _chunk_with_mla_pairing(
+                self._iter_bf16_expert_params(megatron_local_weights), chunk_size=self.args.update_weight_buffer_size
+            )
+            return
         if self._expert_router is not None:
             yield from self._iter_routed_expert_chunks(megatron_local_weights)
         yield from _chunk_with_mla_pairing(
             self._iter_hf_params(megatron_local_weights, include_experts=self._expert_router is None),
             chunk_size=self.args.update_weight_buffer_size,
         )
+
+    def _iter_bf16_expert_params(self, megatron_local_weights, *, include_non_experts=True):
+        # Preserve the current GDN and vision conversion; only expert ownership
+        # and transport differ. ETP1 owners already hold complete expert tensors.
+        if include_non_experts:
+            yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
+        group = mpu.get_expert_model_parallel_group()
+        rank = dist.get_rank(group=dist.group.WORLD)
+        device = device_utils.make_current_torch_device()
+        for infos, gather in zip(self._bf16_expert_buckets, self._bf16_expert_gathers, strict=True):
+            converted = []
+            for info in infos:
+                if info.src_rank == rank:
+                    tensor = (
+                        megatron_local_weights[self._vanilla_key_map[info.name]]
+                        .detach()
+                        .to(device=device, non_blocking=_NON_BLOCKING)
+                    )
+                    converted.extend(self._bridge_converter.convert(info.name, tensor))
+                    del tensor
+            gathered = gather(converted, group=group, device=device)
+            yield from gathered
+            del converted, gathered
 
     def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.
@@ -282,9 +380,20 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_b1 = time.monotonic()
             t_bcast_total += t_b1 - t_b0
 
-            for info, param in zip(bucket_infos, params, strict=True):
+            gathered_params = None
+            if self._async_weight_gather:
                 t_g0 = time.monotonic()
-                gathered = all_gather_param(self.args, info.name, param)
+                gathered_params = all_gather_params_async(
+                    list(zip(bucket_infos, params, strict=True)), gdn_split_sizes=self._gdn_split_sizes
+                )
+                t_gather_total += time.monotonic() - t_g0
+            for index, (info, param) in enumerate(zip(bucket_infos, params, strict=True)):
+                t_g0 = time.monotonic()
+                gathered = (
+                    all_gather_param(self.args, info.name, param)
+                    if gathered_params is None
+                    else gathered_params[index]
+                )
                 t_g1 = time.monotonic()
                 t_gather_total += t_g1 - t_g0
 
@@ -295,7 +404,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                 yield from converted
                 del gathered, converted
 
-            del params
+            del params, gathered_params
 
         if rank == 0:
             logger.info(

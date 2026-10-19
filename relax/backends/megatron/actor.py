@@ -1920,6 +1920,84 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._per_step_rollout and self.args.offload_train:
             self.sleep()
 
+    def _inline_colocate_old_log_probs(self, num_microbatches: list[int]) -> bool:
+        """Validate the single-update GRPO path before deriving old log-probs
+        inline."""
+        args = self.args
+        if os.environ.get("RELAX_COLOCATE_INLINE_LOG_PROBS") != "1":
+            return False
+
+        # A second update, stale rollout, or mutable forward would invalidate old=current.
+        # Fail closed: running the old forward cannot undo true_on_policy_mode in the loss.
+        required = {
+            "colocate": True,
+            "true_on_policy_mode": True,
+            "fully_async": False,
+            "hybrid": False,
+            "advantage_estimator": "grpo",
+            "loss_type": "policy_loss",
+            "compute_advantages_and_returns": True,
+            "num_iters_per_train_update": 1,
+            "max_staleness": 0,
+            "update_weights_interval": 1,
+            "partial_rollout": False,
+            "rl_partial_rollouts": False,
+            "use_dynamic_global_batch_size": False,
+            "context_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "dynamic_context_parallel": False,
+            "hidden_dropout": 0.0,
+            "attention_dropout": 0.0,
+            "bf16": True,
+            "fp16": False,
+            "fp8": None,
+            "fp4": None,
+            "fp8_param_gather": False,
+            "moe_input_jitter_eps": None,
+            "moe_router_enable_expert_bias": False,
+            "moe_router_force_load_balancing": False,
+            "moe_router_force_biased": None,
+            "moe_expert_capacity_factor": None,
+            "moe_aux_loss_coeff": 0.0,
+            "kl_coef": 0.0,
+            "use_kl_loss": False,
+            "use_opd": False,
+            "use_critic": False,
+            "keep_old_actor": False,
+            "use_rollout_logprobs": False,
+            "use_routing_replay": True,
+            "use_rollout_routing_replay": True,
+            "use_rollout_indexer_replay": False,
+            "enable_mtp_training": False,
+            "use_opsm": False,
+            "use_tis": True,
+            "calculate_per_token_loss": True,
+            "entropy_coef": 0.0,
+            "recompute_loss_function": False,
+            "custom_tis_function_path": None,
+            "custom_pg_loss_reducer_function_path": None,
+            "custom_loss_function_path": None,
+            "custom_model_provider_path": None,
+            "custom_megatron_before_log_prob_hook_path": None,
+            "custom_megatron_before_train_step_hook_path": None,
+        }
+        invalid = [name for name, expected in required.items() if getattr(args, name, None) != expected]
+        if args.rollout_batch_size * args.n_samples_per_prompt != args.global_batch_size:
+            invalid.append("rollout size must equal global_batch_size")
+        if len(num_microbatches) != 1:
+            invalid.append("exactly one optimizer step per rollout is required")
+        if getattr(args, "num_steps_per_rollout", None) not in (None, 1):
+            invalid.append("num_steps_per_rollout")
+        if args.moe_router_load_balancing_type not in ("none", ["none"]):
+            invalid.append("moe_router_load_balancing_type")
+        if set(self.weights_backuper.backup_tags) - {"actor"}:
+            invalid.append("reference, teacher, or old-actor weights")
+        if self.rollout_data_postprocess is not None:
+            invalid.append("rollout_data_postprocess")
+        if invalid:
+            raise ValueError("Unsupported colocate true-on-policy configuration: " + ", ".join(invalid))
+        return True
+
     def train_actor(
         self,
         rollout_id: int,
@@ -1954,6 +2032,10 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         else:
             data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
+        inline_old_log_probs = os.environ.get(
+            "RELAX_COLOCATE_INLINE_LOG_PROBS"
+        ) == "1" and self._inline_colocate_old_log_probs(num_microbatches)
+        self.args._colocate_inline_log_probs = inline_old_log_probs
         # Create a separate iterator with a larger token budget for ref/teacher log-probs
         if (
             not is_offline_mode(self.args)
@@ -2020,7 +2102,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
 
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not standard_dpo and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics):
+                if (
+                    not standard_dpo
+                    and not inline_old_log_probs
+                    and (not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics)
+                ):
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
