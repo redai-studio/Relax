@@ -30,9 +30,22 @@ def bucket_experts_by_owner(
     budget = buffer_size // len(ranks)
     owners: dict[int, list] = {rank: [] for rank in ranks}
     for info in infos:
-        if info.src_rank not in owners or not 0 < info.size <= budget:
+        if info.src_rank not in owners or not 0 < info.size <= buffer_size:
             raise ValueError(f"Unsupported expert owner or byte size: {info.name}")
         owners[info.src_rank].append(info)
+    # Large experts need not fit B / EP. Use fewer contributing owners per
+    # round when necessary; the total gathered storage still fits B.
+    if any(info.size > budget for info in infos):
+        batches, pending, size = [], [], 0
+        for info in infos:
+            if pending and size + info.size > buffer_size:
+                batches.append(pending)
+                pending, size = [], 0
+            pending.append(info)
+            size += info.size
+        if pending:
+            batches.append(pending)
+        return batches
     owner_batches = []
     for rank in ranks:
         batches, pending, size = [], [], 0
@@ -158,20 +171,53 @@ def bucket_expert_projections(
 
 
 class PackedExpertGather:
-    """Gather one native projection directly into global expert order."""
+    """Gather a whole projection or bounded expert ranges from its owners."""
 
-    def __init__(self, num_experts: int) -> None:
+    def __init__(
+        self,
+        num_experts: int,
+        expert_start: int = 0,
+        expert_end: int | None = None,
+        *,
+        expert_ranges: Sequence[tuple[int, int]] | None = None,
+    ) -> None:
         self.num_experts = num_experts
+        self.expert_start = expert_start
+        self.expert_end = num_experts if expert_end is None else expert_end
+        if not 0 <= self.expert_start < self.expert_end <= num_experts:
+            raise ValueError("Invalid packed expert range")
         self._layouts = None
         self._ranks = None
         self._orders = ()
         self._name = None
         self._shape = ()
+        self._sizes = ()
+        self._expert_ranges = tuple(expert_ranges) if expert_ranges is not None else None
+        self._parts = ()
 
     def _prepare(self, layouts: Sequence[tuple[TensorLayout, ...]], ranks: tuple[int, ...]) -> None:
         local_count = self.num_experts // len(ranks)
+        ranges = self._expert_ranges
+        if ranges is None:
+            ranges = tuple(
+                (
+                    max(self.expert_start, index * local_count),
+                    min(self.expert_end, (index + 1) * local_count),
+                )
+                for index in range(len(ranks))
+            )
+        elif len(ranges) != len(ranks) or any(
+            not index * local_count <= start <= end <= (index + 1) * local_count
+            for index, (start, end) in enumerate(ranges)
+        ):
+            raise ValueError("Expert ranges must belong to their source owners")
         orders, expected_prefix, expected_projections, expected_shape = [], None, None, None
-        for index, layout in enumerate(layouts):
+        for layout, (start, end) in zip(layouts, ranges, strict=True):
+            if start >= end:
+                if layout:
+                    raise ValueError("Packed expert output outside the requested range")
+                orders.append(())
+                continue
             entries = {}
             for position, (name, shape, _size) in enumerate(layout):
                 match = _TARGET.fullmatch(name)
@@ -192,18 +238,27 @@ class PackedExpertGather:
             if projections != expected_projections:
                 raise ValueError("Packed expert projection differs between owners")
             order = ("gate", "up") if "gate" in projections else ("down",)
-            keys = [
-                (expert, projection)
-                for expert in range(index * local_count, (index + 1) * local_count)
-                for projection in order
-            ]
+            keys = [(expert, projection) for expert in range(start, end) for projection in order]
             if set(keys) != set(entries):
                 raise ValueError("Packed expert IDs must follow contiguous process-group rank order")
             orders.append(tuple(entries[key] for key in keys))
+        if expected_shape is None:
+            raise ValueError("Packed expert ranges must contain at least one expert")
         rows, cols = expected_shape
         self._name = expected_prefix + (".gate_up_proj" if "gate" in expected_projections else ".down_proj")
-        self._shape = (self.num_experts, rows * len(expected_projections), cols)
+        if self._expert_ranges is None and (self.expert_start, self.expert_end) != (0, self.num_experts):
+            self._name += f"[{self.expert_start}:{self.expert_end}]"
+        count = sum(max(0, end - start) for start, end in ranges)
+        self._shape = (count, rows * len(expected_projections), cols)
+        if self._expert_ranges is not None:
+            offset, parts = 0, []
+            for start, end in ranges:
+                if end > start:
+                    parts.append((f"{self._name}[{start}:{end}]", offset, end - start))
+                    offset += end - start
+            self._parts = tuple(parts)
         self._orders = tuple(orders)
+        self._sizes = tuple(len(order) * rows * cols for order in orders)
         self._layouts, self._ranks = tuple(layouts), ranks
 
     def __call__(
@@ -221,8 +276,19 @@ class PackedExpertGather:
         elif ranks != self._ranks or layout != self._layouts[local_index]:
             raise ValueError("Expert ownership or tensor layout changed; rebuild the gather plan")
         output = torch.empty(self._shape, dtype=torch.bfloat16, device=device)
-        local = output.chunk(len(ranks), dim=0)[local_index].view(-1)
-        torch.cat([tensors[index][1].reshape(-1) for index in self._orders[local_index]], out=local)
-        handle = dist.all_gather_into_tensor(output.view(-1), local, group=group, async_op=True)
+        payloads = list(output.view(-1).split(self._sizes))
+        local = payloads[local_index]
+        if self._orders[local_index]:
+            torch.cat([tensors[index][1].reshape(-1) for index in self._orders[local_index]], out=local)
+        sources = [index for index, size in enumerate(self._sizes) if size]
+        if len(sources) == 1:
+            src = sources[0]
+            handle = dist.broadcast(payloads[src], src=ranks[src], group=group, async_op=True)
+        elif len(set(self._sizes)) == 1:
+            handle = dist.all_gather_into_tensor(output.view(-1), local, group=group, async_op=True)
+        else:
+            handle = dist.all_gather(payloads, local, group=group, async_op=True)
         handle.wait()
+        if self._parts:
+            return [(name, output.narrow(0, start, count)) for name, start, count in self._parts]
         return [(self._name, output)]

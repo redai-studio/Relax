@@ -3326,154 +3326,267 @@ index 599b981..829e800 100644
                  if (
                      req.prefill_attempt_count
                      < self.scheduler.server_args.optimistic_prefill_attempts
-diff --git a/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py b/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py
-new file mode 100644
-index 0000000..0dad90f
---- /dev/null
-+++ b/test/registered/unit/disaggregation/test_prefill_bootstrap_deadline.py
-@@ -0,0 +1,145 @@
-+"""CPU regressions for PD bootstrap deadlines and rank-consistent queue removal."""
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -593,6 +593,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+             self.waiting_queue.extend(
+                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+@@ -632,6 +633,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+             self.waiting_queue.extend(
+                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -978,6 +978,8 @@
+         self.skip_lock_node_ids: dict = {}
+         # The prefix length that is inserted into the tree cache
+         self.cache_protected_len: int = 0
++        # Protected chunked checkpoint whose write-through hit is deferred.
++        self._hicache_deferred_chunked_backup: Optional[tuple[int, int, int]] = None
+ 
+         # Whether or not if it is chunked. It increments whenever
+         # it is chunked, and decrement whenever chunked request is
+@@ -1611,6 +1613,7 @@
+         self.indexer_topk = None
+         self.last_node = None
+         self.cache_protected_len = 0
++        self._hicache_deferred_chunked_backup = None
+         self.num_matched_prefix_tokens = 0
+         self.swa_uuid_for_lock = None
+         self.swa_prefix_lock_released = False
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1704,6 +1704,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+ 
+             # Get the next batch to run
+@@ -1747,6 +1748,7 @@
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+             if self._engine_paused:
++                self._poll_paused_hicache()
+                 continue
+ 
+             # Get the next batch to run
+@@ -3979,6 +3981,11 @@
+         # sleep until next event
+         self.maybe_sleep_on_idle()
+ 
++    def _poll_paused_hicache(self) -> None:
++        # Pause stops generation, but in-flight GPU/CPU DMA must complete.
++        if self.enable_hierarchical_cache:
++            self.tree_cache.check_hicache_events()
 +
-+import ast
-+import logging
-+import os
-+import time
-+from pathlib import Path
-+from types import SimpleNamespace
-+from unittest.mock import Mock
+     def is_fully_idle(self, for_health_check=False) -> bool:
+         # Health check piggybacks on running requests in process_output.
+         # Only running_batch + waiting_queue guarantee active GPU processing;
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
+@@ -816,6 +816,23 @@
+             and node.hit_count >= self.write_through_threshold
+         )
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Account for one request's suppressed chunked write-through hit."""
++        node = self._node_arena.get(node_id)
++        if (
++            not self.enable_hicache
++            or node is None
++            or node is self.root_node
++            or node.backuped
++            or node.write_through_pending_id is not None
++            or node.component_data[ComponentType.FULL].lock_ref <= 0
++            or node.component_data[ComponentType.MAMBA].value is None
++        ):
++            return []
++        if self._inc_hit_count_and_check(node):
++            return [self._build_backup_kv_action(node)]
++        return []
 +
-+import pytest
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the insert, running to its first barrier or completion."""
+         # Insert walks are single-flight; a live walk means re-entrancy.
+diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+--- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
++++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
+@@ -318,6 +318,10 @@
+         """Concatenate FULL device values from from_node up to (exclusive) until_node."""
+         ...
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        """Optional completion hook for a protected chunked Mamba checkpoint."""
++        return []
 +
-+from sglang.srt.disaggregation.base import KVPoll
+     @abstractmethod
+     def begin_insert(self, params: InsertParams) -> InsertStepResult:
+         """Start the (single-flight) insert, running to its first barrier or completion."""
+diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -602,6 +602,9 @@
+         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
+             return
+ 
++        deferred_backup = req._hicache_deferred_chunked_backup
++        req._hicache_deferred_chunked_backup = None
 +
+         if self.disable:
+             kv_indices = self.req_to_token_pool.req_to_token[
+                 req.req_pool_idx, :kv_len_to_handle
+@@ -666,6 +669,30 @@
+                 kv_indices[req.cache_protected_len :],
+                 start_pos=req.cache_protected_len,
+             )
 +
-+def _load_queue():
-+    # Exercise the production queue method without importing GPU scheduler kernels.
-+    path = (
-+        Path(__file__).resolve().parents[4]
-+        / "python/sglang/srt/disaggregation/prefill.py"
-+    )
-+    tree = ast.parse(path.read_text())
-+    helper = next(
-+        node
-+        for node in tree.body
-+        if isinstance(node, ast.ClassDef) and node.name == "_BootstrapDeadlinePoller"
-+    )
-+    queue = next(
-+        node
-+        for node in tree.body
-+        if isinstance(node, ast.ClassDef) and node.name == "PrefillBootstrapQueue"
-+    )
-+    method = next(
-+        node
-+        for node in queue.body
-+        if isinstance(node, ast.FunctionDef) and node.name == "pop_bootstrapped"
-+    )
-+    queue.body = [method]
-+    module = ast.Module(
-+        body=[
-+            ast.ImportFrom(
-+                module="__future__", names=[ast.alias(name="annotations")], level=0
-+            ),
-+            helper,
-+            queue,
-+        ],
-+        type_ignores=[],
-+    )
-+    ast.fix_missing_locations(module)
-+    namespace = {
-+        "KVPoll": KVPoll,
-+        "os": os,
-+        "time": time,
-+        "logger": logging.getLogger(__name__),
-+        "should_force_retry": lambda req: False,
-+    }
-+    exec(compile(module, str(path), "exec"), namespace)
-+    return namespace
++        if (
++            deferred_backup is not None
++            and is_insert
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and result is not None
++            and result.last_device_node == self.tree_core.root_node.id
++            and req.cache_protected_len > 0
++            and deferred_backup
++            == (self.tree_core.root_node.id, req.last_node, req.cache_protected_len)
++        ):
++            from sglang.srt.managers.schedule_batch import FINISH_ABORT
 +
-+
-+def _request(status=KVPoll.Bootstrapping, entry=100.0):
-+    return SimpleNamespace(
-+        rid="request",
-+        disagg_kv_sender=SimpleNamespace(poll=lambda: status),
-+        time_stats=SimpleNamespace(
-+            prefill_bootstrap_queue_entry_time=entry, set_wait_queue_entry_time=Mock()
-+        ),
-+        prefill_attempt_count=0,
-+        is_retracted=False,
-+    )
-+
-+
-+@pytest.mark.parametrize(
-+    "status,entry,now,expected",
-+    [
-+        (KVPoll.Bootstrapping, 100.0, 701.0, KVPoll.Failed),
-+        (KVPoll.Bootstrapping, 100.0, 700.0, KVPoll.Bootstrapping),
-+        (KVPoll.Bootstrapping, 0.0, 1000.0, KVPoll.Bootstrapping),
-+        (KVPoll.WaitingForInput, 100.0, 1000.0, KVPoll.WaitingForInput),
-+        (KVPoll.Failed, 100.0, 101.0, KVPoll.Failed),
-+    ],
-+)
-+def test_deadline_preserves_ready_and_native_failure(status, entry, now, expected):
-+    namespace = _load_queue()
-+    poller = namespace["_BootstrapDeadlinePoller"](_request(status, entry), now, 600.0)
-+    assert poller.poll() == expected
-+
-+
-+@pytest.mark.parametrize("pp_size", [1, 2])
-+def test_one_rank_timeout_removes_request_on_all_ranks(monkeypatch, pp_size):
-+    namespace = _load_queue()
-+    monkeypatch.setenv("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
-+    monkeypatch.setattr(time, "perf_counter", lambda: 701.0)
-+    requests = [_request(entry=100.0), _request(entry=102.0)]
-+    # Only rank zero has expired; both must take the existing failure path.
-+    peer_polls = [
-+        namespace["_BootstrapDeadlinePoller"](req, 701.0, 600.0).poll()
-+        for req in requests
-+    ]
-+    local_observations = []
-+    for rank, req in enumerate(requests):
-+
-+        def reduce(pollers, cp_group, tp_group):
-+            local = [poller.poll() for poller in pollers]
-+            local_observations.append((rank, local))
-+            return [min(local[0], peer_polls[1 - rank])]
-+
-+        namespace["poll_and_all_reduce_attn_cp_tp_group"] = reduce
-+        namespace["poll_and_all_reduce_pp"] = lambda rids, state, good, bad: [
-+            None for _ in rids
-+        ]
-+        queue = namespace["PrefillBootstrapQueue"]()
-+        queue.queue = [req]
-+        queue.pp_size = pp_size
-+        queue.scheduler = SimpleNamespace(
-+            attn_cp_cpu_group="cp",
-+            attn_tp_cpu_group="tp",
-+            handle_bootstrap_failure=Mock(),
++            # The final short tail has no new Mamba checkpoint. Finish the
++            # suppressed chunked hit while the existing checkpoint is protected;
++            # never associate the request's current state with an older prefix.
++            finish_backup = getattr(self.tree_core, "finish_deferred_chunked_backup", None)
++            if (
++                finish_backup is not None
++                and req.finished_reason is not None
++                and not isinstance(req.finished_reason, FINISH_ABORT)
++            ):
++                self._apply_cache_actions(finish_backup(req.last_node))
+ 
+         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+ 
+@@ -789,6 +816,15 @@
+             req.prefix_indices = new_indices
+         req.cache_protected_len = len(new_indices)
+         req.last_node = new_last_node
++        req._hicache_deferred_chunked_backup = (
++            (self.tree_core.root_node.id, new_last_node, len(new_indices))
++            if chunked
++            and self.cache_controller is not None
++            and self.enable_mamba_extra_buffer
++            and len(new_indices) > 0
++            and new_last_node != self.tree_core.root_node.id
++            else None
 +        )
-+        ready, failed = queue.pop_bootstrapped(return_failed_reqs=True)
-+        assert ready == [] and failed == [req] and queue.queue == []
-+        queue.scheduler.handle_bootstrap_failure.assert_called_once_with(req)
-+    assert local_observations == [(0, [KVPoll.Failed]), (1, [KVPoll.Bootstrapping])]
-+
-+
-+def test_pp_consensus_ready_request_is_not_replaced_by_local_deadline(monkeypatch):
-+    namespace = _load_queue()
-+    monkeypatch.setattr(time, "perf_counter", lambda: 1000.0)
-+    req = _request(entry=100.0)
-+    namespace["poll_and_all_reduce_pp"] = lambda rids, state, good, bad: [
-+        KVPoll.WaitingForInput
-+    ]
-+    namespace["poll_and_all_reduce_attn_cp_tp_group"] = Mock(
-+        side_effect=AssertionError(
-+            "PP-covered request must not enter another collective"
-+        )
-+    )
-+    queue = namespace["PrefillBootstrapQueue"]()
-+    queue.queue = [req]
-+    queue.pp_size = 2
-+    queue.scheduler = SimpleNamespace(handle_bootstrap_failure=Mock())
-+    queue.finalize_bootstrap = lambda req: True
-+    assert queue.pop_bootstrapped() == [req]
-+    assert queue.queue == []
-+    queue.scheduler.handle_bootstrap_failure.assert_not_called()
+         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+         # carry the skip set so this node's dec releases only what we locked
+         req.skip_lock_node_ids = lock_result.skip_lock_node_ids
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -26,6 +26,7 @@
+ import logging
+ import pickle
+ import uuid
++import warnings
+ from array import array
+ from collections import Counter
+ from dataclasses import dataclass, field
+@@ -263,6 +264,8 @@
+ 
+     # For DP routing — external router assigns a specific DP worker
+     routed_dp_rank: Optional[int] = None
++    # Deprecated alias still emitted by older DP-aware routers.
++    data_parallel_rank: Optional[int] = None
+     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+     disagg_prefill_dp_rank: Optional[int] = None
+     # Routing key for routing-key schedule policy
+@@ -365,6 +368,15 @@
+             ValueError: If inputs are not properly specified (e.g., none or all of
+                        text, input_ids, input_embeds are provided)
+         """
++        if self.data_parallel_rank is not None:
++            warnings.warn(
++                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
++                DeprecationWarning,
++                stacklevel=2,
++            )
++            if self.routed_dp_rank is None:
++                self.routed_dp_rank = self.data_parallel_rank
++            self.data_parallel_rank = None
+         self._validate_inputs()
+         self._determine_batch_size()
+         if self.session_id is not None and self.session_params is not None:
+diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
+--- a/python/sglang/srt/layers/dp_attention.py
++++ b/python/sglang/srt/layers/dp_attention.py
+@@ -833,13 +833,29 @@
+         if sizes is not None:
+             get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+             return
++    # BF16 partial sums depend on the destination rank's reduction order.
++    # Accumulate in FP32, then keep the attention-TP all-gather in the original
++    # dtype: all-gather only copies values and needs no wider accumulator.
++    reduce_input = input
++    if input.dtype == torch.bfloat16:
++        with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
++            reduce_input = input.float()
+     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+-        get_tp_group().reduce_scatter_tensor(output, input)
++        reduce_output = output
++        if reduce_input.dtype != output.dtype:
++            with use_symmetric_memory(get_tp_group(), disabled=not is_dp_max_padding()):
++                reduce_output = torch.empty_like(output, dtype=reduce_input.dtype)
++        get_tp_group().reduce_scatter_tensor(reduce_output, reduce_input)
++        if reduce_output is not output:
++            output.copy_(reduce_output)
+     else:
+-        scattered_local_tokens = input.tensor_split(
++        scattered_local_tokens = reduce_input.tensor_split(
+             get_tensor_model_parallel_world_size()
+         )[get_tensor_model_parallel_rank()]
+-        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
++        get_tp_group().reduce_scatter_tensor(scattered_local_tokens, reduce_input)
++        if scattered_local_tokens.dtype != output.dtype:
++            with use_symmetric_memory(get_attn_tp_group(), disabled=not is_dp_max_padding()):
++                scattered_local_tokens = scattered_local_tokens.to(output.dtype)
+         get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+ 
+ 
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -1137,7 +1137,16 @@
+             else:
+                 assert output.shape == output_shape
+ 
+-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
++            # Variable-size MoE partial sums need FP32 accumulation just like
++            # the fixed-size DP combine. Write back into the original buffer.
++            reduce_input = input_
++            reduce_output = output
++            if input_.dtype == torch.bfloat16:
++                reduce_input = input_.float()
++                reduce_output = torch.empty_like(output, dtype=torch.float32)
++            pynccl_comm.reduce_scatter(reduce_output, reduce_input, sizes=sizes)
++            if reduce_output is not output:
++                output.copy_(reduce_output)
+             return output
+ 
+     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):

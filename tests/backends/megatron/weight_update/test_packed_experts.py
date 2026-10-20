@@ -171,3 +171,92 @@ def test_deepseek_and_multimodal_names_use_same_projection_packing(module, sourc
     plan._prepare([module._layout(peer) for peer in inputs], (7, 2))
     assert plan._name == f"{hf_prefix}.2.mlp.experts.gate_up_proj"
     assert plan._shape == (24, 8, 6)
+
+
+@pytest.mark.parametrize("projection", ["gate_up", "down"])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("start,end", [(0, 5), (9, 14), (9, 15), (12, 24), (22, 24)])
+def test_partial_projection_empty_owners_and_uneven_gather(module, monkeypatch, projection, rank, start, end):
+    inputs = [
+        [(name, tensor) for name, tensor in peer if start <= int(name.split(".experts.")[1].split(".")[0]) < end]
+        for peer in peers(projection)
+    ]
+    monkeypatch.setattr(module.dist, "get_process_group_ranks", lambda group: group.ranks)
+    monkeypatch.setattr(module.dist, "get_rank", lambda group: group.rank)
+    metadata_calls = []
+
+    def metadata(result, local, *, group):
+        result[:] = [module._layout(peer) for peer in inputs]
+        metadata_calls.append(group)
+
+    def flat(peer):
+        return flattened(peer, projection) if peer else torch.empty(0, dtype=torch.bfloat16)
+
+    def gather(outputs, local, *, group, async_op):
+        assert async_op and torch.equal(local, flat(inputs[rank]))
+        for output, peer in zip(outputs, inputs, strict=True):
+            output.copy_(flat(peer))
+        return SimpleNamespace(wait=lambda: None)
+
+    def broadcast(output, *, src, group, async_op):
+        assert async_op
+        output.copy_(flat(inputs[group.ranks.index(src)]))
+        return SimpleNamespace(wait=lambda: None)
+
+    def uniform(output, local, *, group, async_op):
+        assert async_op and torch.equal(local, flat(inputs[rank]))
+        output.copy_(torch.cat([flat(peer) for peer in inputs]))
+        return SimpleNamespace(wait=lambda: None)
+
+    monkeypatch.setattr(module.dist, "all_gather_object", metadata)
+    monkeypatch.setattr(module.dist, "all_gather", gather)
+    monkeypatch.setattr(module.dist, "all_gather_into_tensor", uniform)
+    monkeypatch.setattr(module.dist, "broadcast", broadcast)
+    plan = module.PackedExpertGather(24, start, end)
+    first = None
+    for step in range(3):
+        group = SimpleNamespace(ranks=[7, 2], rank=rank)
+        [(name, actual)] = plan(inputs[rank], group=group, device="cpu")
+        assert name == f"model.language_model.layers.2.mlp.experts.{projection}_proj[{start}:{end}]"
+        assert actual.shape[0] == end - start
+        assert torch.equal(actual.flatten(), torch.cat([flat(peer) for peer in inputs]))
+        if first is None:
+            first, frozen = actual, actual.clone()
+        assert torch.equal(first, frozen)
+        for peer in inputs:
+            for _, tensor in peer:
+                tensor.add_(16)
+    assert len(metadata_calls) == 1
+
+
+@pytest.mark.parametrize("projection", ["gate_up", "down"])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_owner_balanced_ranges_share_one_storage_and_one_collective(module, monkeypatch, projection, rank):
+    ranges = [(2, 5), (15, 18)]
+    inputs = [
+        [(name, tensor) for name, tensor in peer if start <= int(name.split(".experts.")[1].split(".")[0]) < end]
+        for peer, (start, end) in zip(peers(projection), ranges, strict=True)
+    ]
+    monkeypatch.setattr(module.dist, "get_process_group_ranks", lambda group: [7, 2])
+    monkeypatch.setattr(module.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(
+        module.dist,
+        "all_gather_object",
+        lambda result, local, **kw: result.__setitem__(slice(None), [module._layout(peer) for peer in inputs]),
+    )
+    calls = []
+
+    def gather(output, local, *, group, async_op):
+        assert async_op and torch.equal(local, flattened(inputs[rank], projection))
+        output.copy_(torch.cat([flattened(peer, projection) for peer in inputs]))
+        calls.append(group)
+        return SimpleNamespace(wait=lambda: None)
+
+    monkeypatch.setattr(module.dist, "all_gather_into_tensor", gather)
+    plan = module.PackedExpertGather(24, expert_ranges=ranges)
+    actual = plan(inputs[rank], group="current-ep", device="cpu")
+    assert calls == ["current-ep"] and len(actual) == 2
+    assert actual[0][1].untyped_storage().data_ptr() == actual[1][1].untyped_storage().data_ptr()
+    for (name, tensor), peer, (start, end) in zip(actual, inputs, ranges, strict=True):
+        assert name.endswith(f".{projection}_proj[{start}:{end}]")
+        assert torch.equal(tensor.flatten(), flattened(peer, projection))

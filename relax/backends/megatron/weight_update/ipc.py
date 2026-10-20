@@ -5,6 +5,8 @@
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
+
 
 def dispatch_typed_buckets(
     packets: Sequence[Sequence[tuple[str, str]]],
@@ -22,7 +24,7 @@ def dispatch_typed_buckets(
     Format tags ride in the existing Gloo gather. Producers retain GPU storage
     until all submitted readers complete, including partial dispatch failures.
     """
-    if any(fmt not in ("direct", "flattened_bucket") for packet in packets for fmt, _ in packet):
+    if any(fmt not in ("direct", "flattened_bucket", EXPERT_SLICE_LOADER) for packet in packets for fmt, _ in packet):
         raise ValueError("Unsupported weight IPC format")
     refs, empty = [], {}
     count = max((len(packet) for packet in packets), default=0)
@@ -36,7 +38,7 @@ def dispatch_typed_buckets(
                         serialized.append(packet[index][1])
                     else:
                         if load_format not in empty:
-                            payload = [] if load_format == "direct" else empty_flattened()
+                            payload = empty_flattened() if load_format == "flattened_bucket" else []
                             held.append(payload)
                             empty[load_format] = serializer.serialize(payload, output_str=True)
                         serialized.append(empty[load_format])

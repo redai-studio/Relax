@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tupl
 from uuid import uuid4
 
 import httpx
+import numpy as np
 import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -2436,6 +2437,7 @@ class AgenticSessionShard:
                                 audio_data=ir.history_backend_audio_data,
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
                         except httpx.HTTPStatusError as error:
@@ -2575,6 +2577,9 @@ class AgenticSessionShard:
 
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
+        if getattr(result, "new_topk_token_ids", None) is not None:
+            ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
+            ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
@@ -2617,6 +2622,12 @@ class AgenticSessionShard:
             messages_delta=response_messages,
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
+            topk_token_ids_delta=np.concatenate(ir.pending_topk_token_ids_delta)
+            if ir.pending_topk_token_ids_delta
+            else None,
+            topk_logprob_delta=np.concatenate(ir.pending_topk_logprob_delta)
+            if ir.pending_topk_logprob_delta
+            else None,
             weight_version_delta=ir.pending_weight_version_delta,
             spec_delta=ir.pending_spec_delta,
             prefix_cache_delta=ir.pending_prefix_cache_delta,

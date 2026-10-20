@@ -277,6 +277,7 @@ export default defineConfig({
               items: [
                 { text: 'Fully Async Training', link: '/en/guide/fully-async-training' },
                 { text: 'Prefill/Decode Disaggregation', link: '/en/guide/pd-disaggregation' },
+                { text: 'CPU Cache', link: '/en/guide/hierarchical-cache' },
                 { text: 'Agentic Rollout', link: '/en/guide/agentic-rollout' },
                 { text: 'Agentic KV Scheduling', link: '/en/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid Training Mode', link: '/en/guide/hybrid-training' },
@@ -409,6 +410,7 @@ export default defineConfig({
               items: [
                 { text: '全异步训练流水线', link: '/zh/guide/fully-async-training' },
                 { text: 'Prefill/Decode 分离', link: '/zh/guide/pd-disaggregation' },
+                { text: 'CPU 缓存', link: '/zh/guide/hierarchical-cache' },
                 { text: 'Agentic Rollout', link: '/zh/guide/agentic-rollout' },
                 { text: 'Agentic KV 调度', link: '/zh/guide/agentic-kv-scheduling' },
                 { text: 'Hybrid 混合训练模式', link: '/zh/guide/hybrid-training' },

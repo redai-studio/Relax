@@ -14,6 +14,7 @@ from ray import ObjectRef
 from ray.actor import ActorHandle
 
 from relax.backends.megatron.misc_utils import strip_param_name_prefix
+from relax.backends.sglang.weight_loader import EXPERT_SLICE_LOADER
 from relax.utils import device as device_utils
 from relax.utils import megatron_bridge_utils
 from relax.utils.device import make_current_torch_device
@@ -28,7 +29,7 @@ from relax.utils.megatron_peft_utils import (
 )
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .expert_layout import DirectExpertLayout, direct_expert_chunk
+from .expert_layout import DirectExpertLayout, direct_expert_chunk, expert_slice_chunk
 from .expert_routing import ExpertLayout, validate_server_layout
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .ipc import dispatch_typed_buckets
@@ -803,10 +804,14 @@ def _send_to_colocated_engine(
     ]
 
     direct_chunk = None
+    direct_format = "direct"
     if direct_layout is not None:
         if dist.get_world_size(ipc_gather_group) != direct_layout.tp_size:
             raise ValueError("Expert layout does not match the receiver TP group")
         direct_chunk = direct_expert_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
+        if direct_chunk is None and direct_layout.supports_expert_slices:
+            direct_chunk = expert_slice_chunk(hf_named_tensors, direct_layout, dist.get_rank(group=ipc_gather_group))
+            direct_format = EXPERT_SLICE_LOADER
     if direct_chunk is not None:
         converted_named_tensors_by_dtypes = {"direct": direct_chunk}
     elif getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
@@ -824,7 +829,7 @@ def _send_to_colocated_engine(
     serialized_tensors = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         if direct_chunk is not None:
-            payload, load_format = named_tensors, "direct"
+            payload, load_format = named_tensors, direct_format
         else:
             flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             payload = {

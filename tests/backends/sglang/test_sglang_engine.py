@@ -7,7 +7,81 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.backends.sglang.test_router_registration import sglang_engine_module as sglang_engine_module
+
+pytest_plugins = ["tests.backends.sglang.test_router_registration"]
+
+
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_launch_server_process_returns_owned_process_and_only_head_waits(monkeypatch, sglang_engine_module, node_rank):
+    module = sglang_engine_module
+    events = []
+
+    process = Mock()
+    process.start.side_effect = lambda: events.append("start")
+    process.is_alive.return_value = True
+    multiprocessing = SimpleNamespace(set_start_method=Mock(), Process=Mock(return_value=process))
+
+    wait = Mock(side_effect=lambda **_kwargs: events.append("wait"))
+    monkeypatch.setattr(module, "multiprocessing", multiprocessing)
+    monkeypatch.setattr(module, "_wait_server_healthy", wait)
+    monkeypatch.setattr(module.os, "getpid", lambda: 123)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", False, raising=False)
+    monkeypatch.setattr(module.Envs, "RELAX_OPD_PER_POS_TOKEN_IDS", False, raising=False)
+    server_args = SimpleNamespace(node_rank=node_rank, url=lambda: "http://worker:8000", api_key="api_key")
+
+    assert module.launch_server_process(server_args) is process
+
+    multiprocessing.set_start_method.assert_called_once_with("spawn", force=True)
+    multiprocessing.Process.assert_called_once_with(target=module._launch_server_with_patches, args=(server_args, 123))
+    process.start.assert_called_once_with()
+    if node_rank == 0:
+        assert events == ["start", "wait"]
+        wait.assert_called_once()
+        assert wait.call_args.kwargs["base_url"] == "http://worker:8000"
+        assert wait.call_args.kwargs["api_key"] == "api_key"
+        assert wait.call_args.kwargs["is_process_alive"]()
+        process.is_alive.assert_called_once_with()
+    else:
+        assert events == ["start"]
+        wait.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("routing_replay", "parent_alive"),
+    [(False, True), (True, True), (False, False)],
+    ids=["plain-launch", "patched-launch", "parent-exited"],
+)
+def test_server_child_installs_parent_guard_before_check_and_preserves_patches(
+    monkeypatch, sglang_engine_module, routing_replay, parent_alive
+):
+    module = sglang_engine_module
+    events = []
+    http_server = ModuleType("sglang.srt.entrypoints.http_server")
+    http_server.launch_server = Mock(side_effect=lambda *_args, **_kwargs: events.append("launch"))
+    monkeypatch.setitem(sys.modules, "sglang.srt.entrypoints.http_server", http_server)
+    monkeypatch.setattr(
+        sys.modules["sglang.srt.utils"],
+        "kill_itself_when_parent_died",
+        lambda: events.append("guard"),
+        raising=False,
+    )
+
+    def getppid():
+        events.append("parent_check")
+        return 123 if parent_alive else 1
+
+    monkeypatch.setattr(module.os, "getppid", getppid)
+    monkeypatch.setattr(module.Envs, "RELAX_OPTIMIZE_ROUTING_REPLAY", routing_replay, raising=False)
+    server_args = SimpleNamespace()
+    module._launch_server_with_patches(server_args, 123)
+
+    if parent_alive:
+        assert events == ["guard", "parent_check", "launch"]
+        kwargs = {"run_scheduler_process_func": module._patched_run_scheduler_process} if routing_replay else {}
+        http_server.launch_server.assert_called_once_with(server_args, **kwargs)
+    else:
+        assert events == ["guard", "parent_check"]
+        http_server.launch_server.assert_not_called()
 
 
 @pytest.fixture
@@ -63,6 +137,7 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
         "moe_dp_size": 1,
         "ignored_server_field": "ignored",
         "json_model_override_args": "{}",
+        "custom_weight_loader": ["relax.backends.sglang.weight_loader.load_expert_slices"],
     }
     get = Mock(return_value=response)
     config = Mock(return_value=SimpleNamespace(text_config=SimpleNamespace(num_experts=896)))
@@ -71,6 +146,7 @@ def test_expert_sync_layout_uses_runtime_overrides(monkeypatch, expert_sync_engi
     result = engine.get_expert_weight_sync_layout()
     assert result["enable_eplb"] is True
     assert result["num_experts"] == 896
+    assert result["custom_weight_loader"] == ["relax.backends.sglang.weight_loader.load_expert_slices"]
     assert "ignored_server_field" not in result
     config.assert_called_once_with("/test/runtime-model")
     get.assert_called_once_with("http://localhost:1234/server_info", timeout=30)
@@ -215,3 +291,37 @@ def test_policy_shared_experts_default_respects_explicit_overrides(
     )
 
     assert result["disable_shared_experts_fusion"] is expected_disabled
+
+
+@pytest.mark.parametrize(
+    "existing", [None, [], ["custom.loader"], ["relax.backends.sglang.weight_loader.load_expert_slices"]]
+)
+def test_expert_slice_loader_registration_preserves_user_loaders(monkeypatch, sglang_engine_module, existing):
+    module = sglang_engine_module
+    monkeypatch.setattr(module, "ServerArgs", make_dataclass("ServerArgs", [("custom_weight_loader", list, None)]))
+    monkeypatch.setattr(module, "_to_local_gpu_id", lambda value: value)
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=8,
+        hf_checkpoint="/test/model",
+        seed=42,
+        offload_rollout=True,
+        sglang_pp_size=1,
+        sglang_dp_size=1,
+        sglang_ep_size=1,
+        use_rollout_routing_replay=False,
+        fp16=False,
+    )
+    result, _ = module._compute_server_args(
+        args,
+        0,
+        "localhost:8000",
+        8001,
+        "localhost",
+        8002,
+        base_gpu_id=0,
+        sglang_overrides={"custom_weight_loader": existing},
+    )
+    expected = list(dict.fromkeys([*(existing or []), "relax.backends.sglang.weight_loader.load_expert_slices"]))
+    assert result["custom_weight_loader"] == expected
+    assert result["custom_weight_loader"] is not existing

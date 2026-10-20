@@ -71,7 +71,9 @@ The Makefile reads these variables from the environment or from command-line ass
 
 When a base override is unset, the corresponding Dockerfile selects its pinned base. `CU13_BASE_IMAGE` applies to both CUDA 13 variants independently of `BASE_IMAGE`. Each variant has a separate train image because its CUDA kernels target different architectures; there is no shared `CU13_TRAIN_IMAGE` variable.
 
-For dev builds, a nonempty train override is used directly without building the train stage. Without an override, the matching default train tag is checked and built if missing. For train targets, the same variable selects the output image tag. `DEV_IMAGE` can override the CUDA 12 dev output tag through a Make command-line assignment.
+For dev builds, a nonempty train override is used directly without building the train stage. Without an override, the matching default train tag is checked and built if missing. For train targets, the same variable selects the output image tag.
+
+`DEV_IMAGE` can override the CUDA 12 dev output tag through a Make command-line assignment. For CUDA 13, set `CU13_BLACKWELL_DEV_IMAGE` or `CU13_HOPPER_DEV_IMAGE` in the environment or on the Make command line; command-line values take precedence. An unset, empty, or whitespace-only CUDA 13 dev override keeps that variant's default tag. Each override applies only to its own variant, including when using `make docker-dev`, and does not change which train image is used.
 
 ```bash
 # Reuse an existing Blackwell train image; replace the date/hash placeholders.

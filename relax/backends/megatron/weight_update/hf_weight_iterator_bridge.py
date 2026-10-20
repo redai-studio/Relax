@@ -146,7 +146,7 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         ):
             infos = [info for bucket in self._expert_buckets for info in bucket]
             ranks = dist.get_process_group_ranks(mpu.get_expert_model_parallel_group())
-            budget = self.args.update_weight_buffer_size // len(ranks)
+            budget = self.args.update_weight_buffer_size
             if all(info.src_rank in ranks and 0 < info.size <= budget for info in infos):
                 self._bf16_expert_buckets = bucket_experts_by_owner(infos, self.args.update_weight_buffer_size, ranks)
                 self._bf16_expert_gathers = [Bf16ExpertGather() for _ in self._bf16_expert_buckets]
@@ -190,12 +190,8 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             buckets = bucket_expert_projections(infos, layout.num_experts, ranks)
         except ValueError:
             return False
+        packed_buckets, gathers = [], []
         for bucket in buckets:
-            # A fused projection is indivisible. Permit at most two ordinary
-            # sync buffers (the existing overlap budget), then fall back to
-            # bounded per-expert HF export for larger MoE geometries.
-            if sum(info.size for info in bucket) > 2 * self.args.update_weight_buffer_size:
-                return False
             expected = (
                 (2 * layout.intermediate_size, layout.hidden_size)
                 if ".linear_fc1." in bucket[0].name
@@ -203,8 +199,36 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             )
             if tuple(bucket[0].shape) != expected:
                 return False
-        self._bf16_expert_buckets = buckets
-        self._bf16_expert_gathers = [PackedExpertGather(layout.num_experts) for _ in buckets]
+            # Preserve the whole-projection fast path for small layers. Larger
+            # projections use bounded native slices, negotiated with SGLang.
+            if sum(info.size for info in bucket) <= 2 * self.args.update_weight_buffer_size:
+                packed_buckets.append(bucket)
+                gathers.append(PackedExpertGather(layout.num_experts))
+            else:
+                if not layout.supports_expert_slices:
+                    return False
+                # Keep owners loading/packing in parallel. A global contiguous
+                # slice would serialize CPU-to-GPU staging on just one owner.
+                local_count = layout.num_experts // len(ranks)
+                per_owner = max(1, self.args.update_weight_buffer_size // (len(ranks) * bucket[0].size))
+                active_owners = min(len(ranks), self.args.update_weight_buffer_size // (per_owner * bucket[0].size))
+                if not active_owners:
+                    return False
+                for offset in range(0, local_count, per_owner):
+                    for first_owner in range(0, len(ranks), active_owners):
+                        ranges = [
+                            (
+                                owner * local_count + offset,
+                                owner * local_count + min(offset + per_owner, local_count),
+                            )
+                            if first_owner <= owner < first_owner + active_owners
+                            else (owner * local_count, owner * local_count)
+                            for owner in range(len(ranks))
+                        ]
+                        packed_buckets.append([info for start, end in ranges for info in bucket[start:end]])
+                        gathers.append(PackedExpertGather(layout.num_experts, expert_ranges=ranges))
+        self._bf16_expert_buckets = packed_buckets
+        self._bf16_expert_gathers = gathers
         self._packed_expert_sync = True
         self._direct_expert_layout = layout
         return True
@@ -312,10 +336,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     self._iter_hf_params(megatron_local_weights, include_experts=False),
                     chunk_size=self.args.update_weight_buffer_size,
                 )
-                # Each native projection is indivisible. Yield it immediately
+                # Yield each native projection/range immediately
                 # instead of materializing the next layer through chunk lookahead.
-                for item in self._iter_bf16_expert_params(megatron_local_weights, include_non_experts=False):
-                    yield [item]
+                yield from self._iter_bf16_expert_chunks(megatron_local_weights)
                 return
             yield from _chunk_with_mla_pairing(
                 self._iter_bf16_expert_params(megatron_local_weights), chunk_size=self.args.update_weight_buffer_size
@@ -333,6 +356,10 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
         # and transport differ. ETP1 owners already hold complete expert tensors.
         if include_non_experts:
             yield from self._iter_hf_params(megatron_local_weights, include_experts=False)
+        for chunk in self._iter_bf16_expert_chunks(megatron_local_weights):
+            yield from chunk
+
+    def _iter_bf16_expert_chunks(self, megatron_local_weights):
         group = mpu.get_expert_model_parallel_group()
         rank = dist.get_rank(group=dist.group.WORLD)
         device = device_utils.make_current_torch_device()
@@ -348,8 +375,9 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
                     converted.extend(self._bridge_converter.convert(info.name, tensor))
                     del tensor
             gathered = gather(converted, group=group, device=device)
-            yield from gathered
-            del converted, gathered
+            del converted
+            yield gathered
+            del gathered
 
     def _iter_hf_params(self, megatron_local_weights, *, include_experts=True):
         """Yield individual (name, tensor) pairs for all params.

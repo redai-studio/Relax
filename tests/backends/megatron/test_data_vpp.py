@@ -94,6 +94,37 @@ def test_vpp_microbatch_rounding_uses_ceil_multiple(monkeypatch):
     assert rounded.tolist() == [4, 4, 4, 8]
 
 
+@pytest.mark.parametrize("cp_rank, expected_rows", [(0, [6, 7]), (1, [0, 1, 2, 3, 4, 5])])
+def test_dynamic_cp_microbatch_slices_score_centering_heads_with_sampled_probs(monkeypatch, cp_rank, expected_rows):
+    data_module = _load_data_module(monkeypatch)
+    args = Namespace(dynamic_context_parallel=True, max_tokens_per_gpu=6)
+    monkeypatch.setattr(data_module, "get_args", lambda: args)
+    monkeypatch.setattr(data_module, "dynamic_cp_split_data", lambda batch, budget: 2)
+    monkeypatch.setattr(data_module, "PackedSeqParams", types.SimpleNamespace)
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        data_module.mpu, "get_dynamic_data_context_parallel_groups", lambda group_size: object(), raising=False
+    )
+    monkeypatch.setattr(data_module.dist, "get_rank", lambda group: cp_rank)
+    token_ids = torch.arange(16).reshape(8, 2)
+    log_probs = -torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    batch = {
+        "tokens": [torch.arange(12)],
+        "total_lengths": [12],
+        "response_lengths": [8],
+        "loss_masks": [torch.ones(8, dtype=torch.int)],
+        "rollout_log_probs": [torch.arange(8, dtype=torch.float32)],
+        "rollout_topk_token_ids": [token_ids],
+        "rollout_topk_log_probs": [log_probs],
+    }
+
+    result = data_module.get_batch(iter([(batch, None)]), list(batch), pad_multiplier=1)
+
+    torch.testing.assert_close(result["rollout_topk_token_ids"][0], token_ids[expected_rows])
+    torch.testing.assert_close(result["rollout_topk_log_probs"][0], log_probs[expected_rows])
+    assert result["rollout_log_probs"][0].tolist() == expected_rows
+
+
 @pytest.mark.parametrize(
     "seqlens, capacity, num_partitions, first_fit_count, expect_fallback",
     [

@@ -51,6 +51,11 @@ from .cp_utils import (
     maybe_padded_total_lengths,
     slice_log_prob_with_cp,
 )
+from .score_centering import (
+    align_score_centering_candidate_ids,
+    build_score_centering_context,
+    get_score_centering_chunk,
+)
 
 
 def normalize_reduced_loss_metrics(keys: list[str], values: list[float]) -> dict[str, float]:
@@ -157,7 +162,7 @@ def get_responses(
             # DSA: global concat then contiguous CP split. Each rank owns logits for
             # global positions [chunk_start, chunk_end).
             logits_local_len = logits.size(0)
-            cp_rank = mpu.get_context_parallel_rank()
+            cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
             chunk_start = cp_rank * logits_local_len
             chunk_end = chunk_start + logits_local_len
 
@@ -230,6 +235,8 @@ def _allgather_cp_redistribute(
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
     padded_total_lengths: list[int] | None = None,
+    dynamic_cp_size: int | None = None,
+    dynamic_cp_rank: int | None = None,
 ) -> None:
     """Redistribute response tensors from allgather-CP layout to zigzag ring-
     attn layout.
@@ -250,8 +257,12 @@ def _allgather_cp_redistribute(
         response_lengths: Response segment lengths per sample.
         max_seq_lens: Optional padded max sequence lengths per sample.
     """
-    cp_group = mpu.get_context_parallel_group()
-    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = (
+        mpu.get_dynamic_data_context_parallel_groups(group_size=dynamic_cp_size)
+        if dynamic_cp_size is not None
+        else mpu.get_context_parallel_group()
+    )
+    cp_rank = dynamic_cp_rank if dynamic_cp_rank is not None else mpu.get_context_parallel_rank()
 
     logits_local_len = logits.size(1)  # logits shape: [1, T_local, ...]
     chunk_start = cp_rank * logits_local_len
@@ -278,7 +289,7 @@ def _allgather_cp_redistribute(
                 # below builds a backward graph on some CP ranks but not others and
                 # the collective deadlocks.
                 full_resp = torch.zeros(
-                    response_length,
+                    (response_length, *value.shape[1:]),
                     dtype=value.dtype,
                     device=value.device,
                     requires_grad=value.requires_grad,
@@ -286,7 +297,8 @@ def _allgather_cp_redistribute(
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start
-                full_resp = F.pad(value, (resp_start, response_length - resp_end))
+                padding = (0, 0) * (value.ndim - 1) + (resp_start, response_length - resp_end)
+                full_resp = F.pad(value, padding)
 
             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
             full_resps.append(full_resp)
@@ -311,6 +323,8 @@ def _allgather_cp_redistribute(
                     args.qkv_format,
                     max_seq_len,
                     padded_total_length,
+                    dynamic_cp_size=dynamic_cp_size,
+                    dynamic_cp_rank=dynamic_cp_rank,
                 )
             )
 
@@ -366,9 +380,9 @@ def get_log_probs_and_entropy(
             gather + cross-rank logsumexp, differentiable). The returned dict
             gains key ``"topk_log_probs"`` mapping to list of ``[R, K]``
             tensors with gradient flowing back to the policy.
-            Used by the OPD-as-loss top-K path; the K ids come from the
-            student's rollout-time top-K stored in
-            ``batch["student_topk_token_ids"]``.
+            Used by OPD-as-loss and score centering; IDs come from the saved
+            rollout candidates. SC also aligns candidate rows to contiguous
+            allgather-CP logits before scoring.
         non_loss_data: Unused; kept for API compatibility.
         lm_head_forward: If set, ``logits`` is actually hidden_states; we defer
             the lm_head into this loss path and chunk the matmul at
@@ -388,7 +402,27 @@ def get_log_probs_and_entropy(
     """
     assert non_loss_data
 
-    validate_opd_topk_gather(args, gather_topk_token_ids)
+    is_score_centering = (
+        getattr(args, "advantage_estimator", None) is not None
+        and get_algorithm(args.advantage_estimator).policy_loss_fn == "score_centering"
+    )
+    if not is_score_centering:
+        validate_opd_topk_gather(args, gather_topk_token_ids)
+    sc_cp_size = dynamic_cp_size
+    if is_score_centering and sc_cp_size is None:
+        sc_cp_size = mpu.get_context_parallel_world_size()
+    if is_score_centering:
+        gather_topk_token_ids = align_score_centering_candidate_ids(
+            gather_topk_token_ids,
+            logits=logits,
+            args=args,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            max_seq_lens=max_seq_lens,
+            padded_total_lengths=padded_total_lengths,
+            dynamic_cp_size=dynamic_cp_size,
+            dynamic_cp_rank=dynamic_cp_rank,
+        )
     if lm_head_forward is not None:
         assert not with_entropy and not with_topk, (
             "lm_head_forward chunked path doesn't materialize full vocab — entropy/topk unavailable."
@@ -418,6 +452,24 @@ def get_log_probs_and_entropy(
             dynamic_cp_rank=dynamic_cp_rank,
         )
     ):
+        if is_score_centering:
+            chunk = get_score_centering_chunk(
+                logits_chunk,
+                tokens_chunk,
+                tp_group,
+                args=args,
+                candidate_ids=gather_topk_token_ids[sample_idx] if gather_topk_token_ids is not None else None,
+                with_entropy=with_entropy,
+                with_topk=with_topk,
+                topk_k=resolved_topk_k,
+            )
+            log_probs_list.append(chunk["log_probs"])
+            entropy_list.append(chunk["entropy"])
+            if with_topk:
+                topk_token_ids_list.append(chunk["topk_token_ids"])
+            if gather_topk_token_ids is not None:
+                topk_log_probs_list.append(chunk["topk_log_probs"])
+            continue
         if lm_head_forward is not None:
             # SFT chunked: logits_chunk is per-sample hidden_states [R, H].
             # Run lm_head per sub-chunk so the full [R, V/TP] logits tensor
@@ -484,7 +536,7 @@ def get_log_probs_and_entropy(
     # log_probs of length response_length, so redistribution is a no-op — and
     # its prompt_length==0 (SFT) path would otherwise mis-pad the first sample
     # by +1 (logit_global_start=-1 at seq_start=0).
-    if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
+    if args.allgather_cp and (sc_cp_size if is_score_centering else mpu.get_context_parallel_world_size()) > 1:
         _allgather_cp_redistribute(
             res,
             logits=logits,
@@ -493,6 +545,8 @@ def get_log_probs_and_entropy(
             response_lengths=response_lengths,
             max_seq_lens=max_seq_lens,
             padded_total_lengths=padded_total_lengths,
+            dynamic_cp_size=dynamic_cp_size if is_score_centering else None,
+            dynamic_cp_rank=dynamic_cp_rank if is_score_centering else None,
         )
 
     return torch.empty((0,), device=logits.device), res
@@ -875,7 +929,9 @@ def policy_loss_function(
     # Same registry field as `compute_advantages_and_returns` reads: the
     # mask-safe reducer is the other half of token-global normalisation, not an
     # independent choice.
-    is_token_global = get_algorithm(args.advantage_estimator).advantage_normalization == "token_global"
+    algorithm = get_algorithm(args.advantage_estimator)
+    is_token_global = algorithm.advantage_normalization == "token_global"
+    is_score_centering = algorithm.policy_loss_fn == "score_centering"
 
     if is_token_global:
         sum_of_sample_mean = _get_reinforce_plus_plus_mask_safe_reducer(sum_of_sample_mean, batch["loss_masks"])
@@ -898,7 +954,9 @@ def policy_loss_function(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
-        gather_topk_token_ids=resolve_opd_gather_topk_token_ids(args, batch),
+        gather_topk_token_ids=(
+            batch["rollout_topk_token_ids"] if is_score_centering else resolve_opd_gather_topk_token_ids(args, batch)
+        ),
         max_seq_lens=max_seq_lens,
         padded_total_lengths=padded_total_lengths,
         dynamic_cp_size=batch.get("dynamic_cp_size", None),
@@ -915,7 +973,6 @@ def policy_loss_function(
         old_log_probs = [lp.detach() for lp in log_probs]
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    algorithm = get_algorithm(args.advantage_estimator)
     need_full_log_probs = args.use_opsm or algorithm.needs_full_log_probs
 
     full_log_probs = None
@@ -990,18 +1047,30 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
+    policy_kwargs: dict[str, dict[str, torch.Tensor]] = {}
+    if is_score_centering:
+        sc_context = build_score_centering_context(args, batch, log_probs_and_entropy)
+        sc_valid = sc_context["loss_mask"] != 0
+        # Observation and padding rows may contain -inf behavior placeholders.
+        # Sanitize before both the objective and ordinary diagnostic/reward math.
+        log_probs = torch.where(sc_valid, log_probs, 0)
+        old_log_probs = torch.where(sc_valid, old_log_probs, 0)
+        ppo_kl = old_log_probs - log_probs
+        policy_kwargs["score_centering_context"] = sc_context
+
     pg_loss, pg_clipfrac, policy_scalar_metrics = compute_policy_loss_for(
         args,
         log_probs=log_probs,
         ppo_kl=ppo_kl,
         advantages=advantages,
+        **policy_kwargs,
     )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
 
     # Apply off-policy correction using importance sampling if enabled
-    if args.get_mismatch_metrics or args.use_tis:
+    if not is_score_centering and (args.get_mismatch_metrics or args.use_tis):
         # NOTE:
         # `tis_func` may apply rejection-sampling style masking (RS) and return `modified_response_masks`.
         # We rebuild `sum_of_sample_mean` with those masks to correct denominators for loss/backprop.
@@ -1076,6 +1145,8 @@ def policy_loss_function(
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
+    if is_score_centering:
+        entropy = torch.where(sc_valid, entropy, 0)
 
     entropy_loss = sum_of_sample_mean(entropy)
 
@@ -1084,6 +1155,8 @@ def policy_loss_function(
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
         ref_log_probs = torch.cat(ref_log_probs, dim=0)
+        if is_score_centering:
+            ref_log_probs = torch.where(sc_valid, ref_log_probs, 0)
         importance_ratio = None
         if args.use_unbiased_kl:
             importance_ratio = torch.exp(log_probs - old_log_probs)
@@ -1127,6 +1200,9 @@ def policy_loss_function(
             train_side_log_probs = torch.cat(batch["log_probs"], dim=0)
         else:
             train_side_log_probs = log_probs.detach()
+        if is_score_centering:
+            rollout_log_probs = torch.where(sc_valid, rollout_log_probs, 0)
+            train_side_log_probs = torch.where(sc_valid, train_side_log_probs, 0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((train_side_log_probs - rollout_log_probs).abs())
         train_rollout_prob_abs_diff = sum_of_sample_mean(
             (torch.exp(train_side_log_probs) - torch.exp(rollout_log_probs)).abs()
@@ -1163,7 +1239,13 @@ def policy_loss_function(
 
     reported_loss.update(opd_reported_loss)
 
-    if args.get_mismatch_metrics or args.use_tis:
+    if is_score_centering and args.get_mismatch_metrics:
+        # Diagnostics only: the old TIS helper also multiplies pg_loss, which
+        # would incorrectly apply a sampled-token weight to the SC correction.
+        log_ratio = (train_side_log_probs - rollout_log_probs).detach()
+        reported_loss["mismatch_kl"] = sum_of_sample_mean(-log_ratio)
+        reported_loss["mismatch_k3_kl"] = sum_of_sample_mean(log_ratio.exp() - log_ratio - 1)
+    elif not is_score_centering and (args.get_mismatch_metrics or args.use_tis):
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
         reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()

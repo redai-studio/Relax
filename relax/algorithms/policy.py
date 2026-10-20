@@ -1,18 +1,19 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-"""Policy loss variants behind one uniform signature.
+"""Policy loss dispatch with shared sampled-token inputs.
 
 The kernels in :mod:`relax.utils.training.ppo_utils` take different argument
 lists. These adapters normalise them to ``fn(args, *, log_probs, ppo_kl,
 advantages)`` so the caller can look one up by name instead of branching on the
-algorithm. Adding a variant means adding an adapter and one registry entry; no
-call site changes.
+algorithm. Score centering additionally consumes generation-time candidates
+through its explicit optional context.
 """
 
 from typing import Any, Callable
 
 import torch
 
+from relax.algorithms.score_centering import compute_score_centering_loss
 from relax.algorithms.spec import get_algorithm
 from relax.utils.training.ppo_utils import (
     compute_cispo_loss,
@@ -102,12 +103,37 @@ def policy_loss_rloo(
     return compute_rloo_loss(log_probs=log_probs, advantages=advantages)
 
 
+def policy_loss_score_centering(
+    args: Any,
+    *,
+    log_probs: torch.Tensor,
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    score_centering_context: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    """Center the weighted score using the generation-time candidate
+    distribution."""
+    loss, metrics = compute_score_centering_loss(
+        log_probs=log_probs,
+        advantages=advantages,
+        **score_centering_context,
+        mode=args.score_centering_is,
+        tis_clip=args.score_centering_tis_clip,
+        mis_low=args.score_centering_mis_low,
+        mis_high=args.score_centering_mis_high,
+    )
+    mask = score_centering_context["loss_mask"].to(loss.dtype)
+    denominator = mask.sum().clamp_min(1)
+    return loss, torch.zeros_like(loss), *((value * mask).sum() / denominator for value in metrics.values())
+
+
 POLICY_LOSS_FNS: dict[str, Callable[..., tuple[Any, ...]]] = {
     "ppo_clip": policy_loss_ppo_clip,
     "sapo": policy_loss_sapo,
     "cispo": policy_loss_cispo,
     "m2po": policy_loss_m2po,
     "rloo": policy_loss_rloo,
+    "score_centering": policy_loss_score_centering,
 }
 
 
@@ -117,14 +143,21 @@ def compute_policy_loss_for(
     log_probs: torch.Tensor,
     ppo_kl: torch.Tensor,
     advantages: torch.Tensor,
+    score_centering_context: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Dispatch the registered policy loss and name its scalar diagnostics."""
     spec = get_algorithm(args.advantage_estimator)
+    extra = {}
+    if spec.policy_loss_fn == "score_centering":
+        if score_centering_context is None:
+            raise ValueError("Score centering requires rollout and current candidate log-probabilities")
+        extra["score_centering_context"] = score_centering_context
     pg_loss, pg_clipfrac, *scalar_metric_values = POLICY_LOSS_FNS[spec.policy_loss_fn](
         args,
         log_probs=log_probs,
         ppo_kl=ppo_kl,
         advantages=advantages,
+        **extra,
     )
     if len(scalar_metric_values) != len(spec.policy_scalar_metric_names):
         raise ValueError(

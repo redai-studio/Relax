@@ -1169,15 +1169,25 @@ def post_process_rollout_data(args, rollout_data):
         "values",
         *iter_opd_cp_float_fields(),
     ]
+    response_field_dtypes = dict.fromkeys(response_float_fields, torch.float32)
+    for key, dtype in (("rollout_topk_token_ids", torch.long), ("rollout_topk_log_probs", torch.float32)):
+        if key in rollout_data:
+            rollout_data[key] = [
+                torch.as_tensor(row, device=cuda_dev, dtype=dtype).reshape(
+                    response_length, args.rollout_top_logprobs_num
+                )
+                for row, response_length in zip(rollout_data[key], rollout_data["response_lengths"], strict=True)
+            ]
+            response_field_dtypes[key] = dtype
     rewards = rollout_data.get("rewards", [])
     if rewards and isinstance(rewards[0], list):
         rollout_data["rewards"] = [
             row * response_length if len(row) == 1 else row
             for row, response_length in zip(rewards, rollout_data["response_lengths"], strict=True)
         ]
-        response_float_fields.append("rewards")
+        response_field_dtypes["rewards"] = torch.float32
 
-    for key in response_float_fields:
+    for key, dtype in response_field_dtypes.items():
         if key not in rollout_data:
             continue
         # Dynamic CP: keep per-sample log-prob fields FULL-length at ingestion.
@@ -1189,7 +1199,7 @@ def post_process_rollout_data(args, rollout_data):
         # forward, but rollout_log_probs is not, so it would reach logging CP-split.
         if getattr(args, "dynamic_context_parallel", False):
             rollout_data[key] = [
-                torch.as_tensor(log_prob, device=cuda_dev, dtype=torch.float32) for log_prob in rollout_data[key]
+                torch.as_tensor(log_prob, device=cuda_dev, dtype=dtype) for log_prob in rollout_data[key]
             ]
             continue
         rollout_data[key] = [
@@ -1203,7 +1213,7 @@ def post_process_rollout_data(args, rollout_data):
                     padded_total_length=padded_total_lengths[i] if padded_total_lengths is not None else None,
                 ),
                 device=cuda_dev,
-                dtype=torch.float32,
+                dtype=dtype,
             )
             for i, (log_prob, total_length, response_length) in enumerate(
                 zip(

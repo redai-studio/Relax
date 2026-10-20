@@ -6,6 +6,8 @@ CU13_DOCKERFILE ?= docker/Dockerfile.cu13
 CU13_BASE_IMAGE ?=
 CU13_BLACKWELL_TRAIN_IMAGE ?=
 CU13_HOPPER_TRAIN_IMAGE ?=
+CU13_BLACKWELL_DEV_IMAGE ?=
+CU13_HOPPER_DEV_IMAGE ?=
 ASCEND_DOCKERFILE ?= docker/Dockerfile.npu
 SOC_VERSION ?= ascend910_9391
 ASCEND_DOCKER_BUILDKIT ?= 1
@@ -24,6 +26,8 @@ DEV_IMAGE := $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT
 # because their CUDA kernels are compiled for different architectures.
 CU13_EXTERNAL_TRAIN_IMAGE = $(strip $(if $(filter b300,$*),$(CU13_BLACKWELL_TRAIN_IMAGE),$(CU13_HOPPER_TRAIN_IMAGE)))
 CU13_DEFAULT_TRAIN_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):train-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$(patsubst b300,blackwell,$*)
+CU13_EXTERNAL_DEV_IMAGE = $(strip $(if $(filter b300,$*),$(CU13_BLACKWELL_DEV_IMAGE),$(CU13_HOPPER_DEV_IMAGE)))
+CU13_DEFAULT_DEV_IMAGE = $(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$(patsubst b300,blackwell,$*)
 
 # Ascend/NPU images share the same repository as GPU; the ascend- tag prefix keeps
 # aarch64 artifacts from ever overwriting the amd64 train-/dev- tags.
@@ -74,6 +78,7 @@ help:
 	@echo "  REGISTRY=... make docker-dev-cu13-hopper - Build and push only the CUDA 13 Hopper dev image"
 	@echo "  REGISTRY=... TRAIN_IMAGE=... make docker-dev-cu12 - Build cu12 dev from an existing train image"
 	@echo "  TRAIN_IMAGE and DEV_IMAGE overrides apply to the cu12 variant"
+	@echo "  CUDA 13 dev output tags accept CU13_BLACKWELL_DEV_IMAGE=... and CU13_HOPPER_DEV_IMAGE=..."
 	@echo "  REGISTRY=... make docker-ascend - Build and push the complete Ascend/NPU image"
 	@echo "  REGISTRY=... ASCEND_QS_DOCKERFILE=... make docker-qs-ascend - Wrap an Ascend dev image into a QS image (optional)"
 	@echo "  Ascend targets accept BASE_IMAGE=... and SOC_VERSION=... (default ascend910_9391)"
@@ -164,7 +169,7 @@ docker-dev-cu13-b300 docker-dev-cu13-hopper: docker-dev-cu13-%:
 	+$(MAKE) --no-print-directory docker-dev-image \
 		DOCKERFILE="$(CU13_DOCKERFILE)" \
 		TRAIN_IMAGE="$(or $(CU13_EXTERNAL_TRAIN_IMAGE),$(CU13_DEFAULT_TRAIN_IMAGE))" \
-		DEV_IMAGE="$(IMAGE_REGISTRY)/$(IMAGE_REPOSITORY):dev-$(BUILD_DATE)-$(GIT_SHORT_HASH)-cu13-$(patsubst b300,blackwell,$*)" \
+		DEV_IMAGE="$(or $(CU13_EXTERNAL_DEV_IMAGE),$(CU13_DEFAULT_DEV_IMAGE))" \
 		BUILD_DEFAULT_TRAIN=$(if $(CU13_EXTERNAL_TRAIN_IMAGE),0,1) \
 		BASE_IMAGE="$(CU13_BASE_IMAGE)" \
 		DOCKER_BUILD_ARGS="$(DOCKER_BUILD_ARGS) --build-arg GPU_ARCH=$*"

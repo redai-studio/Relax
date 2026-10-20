@@ -156,8 +156,10 @@ def test_reconnect_creates_groups_once_including_placeholder_ranks(monkeypatch, 
         updater.connect_rollout_engines([replacement], None, [2], [1])
 
 
-@pytest.mark.parametrize("geometry,enabled", [((256, 2048, 512), True), ((256, 7168, 2048), False)])
-def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometry, enabled):
+@pytest.mark.parametrize("geometry", [(256, 2048, 512), (256, 7168, 2048)])
+@pytest.mark.parametrize("slices", [False, True])
+@pytest.mark.parametrize("ep", [8, 16, 32])
+def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometry, slices, ep):
     from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
 
     e, h, i = geometry
@@ -170,7 +172,7 @@ def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometr
             name=f"decoder.layers.0.mlp.experts.linear_fc{fc}.weight{expert}",
             dtype=torch.bfloat16,
             shape=shape,
-            src_rank=expert // (e // 8),
+            src_rank=expert // (e // ep),
             size=shape[0] * shape[1] * 2,
         )
         for fc, shape in [(1, (2 * i, h)), (2, (h, i))]
@@ -179,12 +181,24 @@ def test_packed_projection_memory_budget_uses_metadata_only(monkeypatch, geometr
     iterator._bf16_expert_buckets = [infos]
     iterator._bridge_converter = SimpleNamespace(supports_packed_experts=lambda names: True)
     monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
-    monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(8)))
-    assert iterator.configure_direct_experts(DirectExpertLayout(e, h, i, 2)) is enabled
+    monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(ep)))
+    enabled = h == 2048 or slices
+    layout = DirectExpertLayout(e, h, i, 2, supports_expert_slices=slices)
+    assert iterator.configure_direct_experts(layout) is enabled
     assert iterator._packed_expert_sync is enabled
     if enabled:
         gathers = iterator._bf16_expert_gathers
-        assert iterator.configure_direct_experts(DirectExpertLayout(e, h, i, 2))
+        assert len(gathers) == (2 if h == 2048 else 48)
+        for bucket, gather in zip(iterator._bf16_expert_buckets, gathers, strict=True):
+            full = gather._expert_ranges is None
+            assert sum(info.size for info in bucket) <= iterator.args.update_weight_buffer_size * (2 if full else 1)
+            if h == 7168 and ep == 8:
+                assert {info.src_rank for info in bucket} == set(range(8))
+                assert sum(info.size for info in bucket) == 448 * 1024**2
+        assert sorted(info.name for bucket in iterator._bf16_expert_buckets for info in bucket) == sorted(
+            info.name for info in infos
+        )
+        assert iterator.configure_direct_experts(layout)
         assert iterator._bf16_expert_gathers is gathers
         assert not iterator.configure_direct_experts(None)
         assert not iterator._packed_expert_sync
@@ -291,3 +305,22 @@ def test_auto_async_plan_reads_gdn_config_only_for_sharded_parameters(monkeypatc
     else:
         config.assert_not_called()
         assert iterator._gdn_split_sizes == {}
+
+
+@pytest.mark.parametrize("size,enabled", [(56 * 1024**2, True), (513 * 1024**2, False)])
+def test_expert_eligibility_uses_full_buffer_instead_of_per_owner_quota(monkeypatch, size, enabled):
+    from relax.backends.megatron.weight_update import hf_weight_iterator_bridge as bridge
+
+    converter = SimpleNamespace(init_tasks=Mock(), can_convert=Mock())
+    info = SimpleNamespace(name="expert", src_rank=0, size=size, dtype=torch.bfloat16)
+    monkeypatch.setattr(bridge, "BridgeConverter", lambda **kwargs: converter)
+    monkeypatch.setattr(bridge, "_build_param_info_buckets", lambda *args, **kwargs: ([[info]], [], {}, {}))
+    monkeypatch.setattr(bridge.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(bridge.mpu, "get_pipeline_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None)
+    monkeypatch.setattr(bridge.mpu, "get_expert_tensor_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_world_size", lambda: 16)
+    monkeypatch.setattr(bridge.mpu, "get_expert_model_parallel_group", lambda: "ep")
+    monkeypatch.setattr(bridge.dist, "get_process_group_ranks", lambda group: list(range(16)))
+    iterator = HfWeightIteratorBridge(SimpleNamespace(update_weight_buffer_size=512 * 1024**2), [], "any-model", None)
+    assert (iterator._bf16_expert_buckets is not None) is enabled

@@ -118,7 +118,15 @@ def test_owner_rounds_cover_every_input_within_budget(module):
     assert module.bucket_experts_by_owner([], 20, [2, 7]) == []
     for invalid in [
         SimpleNamespace(name="bad", src_rank=9, size=1),
-        SimpleNamespace(name="large", src_rank=2, size=11),
+        SimpleNamespace(name="large", src_rank=2, size=21),
     ]:
         with pytest.raises(ValueError, match="Unsupported"):
             module.bucket_experts_by_owner([invalid], 20, [2, 7])
+
+
+def test_large_experts_can_use_an_entire_round_budget(module):
+    infos = [SimpleNamespace(name=str(rank), src_rank=rank, size=12) for rank in range(8)]
+    rounds = module.bucket_experts_by_owner(infos, 32, list(range(8)))
+    assert [len(bucket) for bucket in rounds] == [2, 2, 2, 2]
+    assert [info for bucket in rounds for info in bucket] == infos
+    assert all(sum(info.size for info in bucket) <= 32 for bucket in rounds)
