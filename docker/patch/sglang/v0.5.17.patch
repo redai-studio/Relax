@@ -1154,7 +1154,7 @@ index 6eb0ad1a..d27815f3 100644
          """Load a new LoRA adapter without re-launching the engine."""
  
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index ac38b466..ea54bac1 100644
+index ac38b46..abdc04f 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
 @@ -132,6 +132,7 @@ from sglang.srt.managers.io_struct import (
@@ -1208,6 +1208,15 @@ index ac38b466..ea54bac1 100644
  
      server_args = _global_state.tokenizer_manager.server_args
  
+@@ -946,7 +955,7 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
+ @app.api_route("/flush_cache", methods=["GET", "POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+-    """Flush the radix cache."""
++    """Flush runtime caches, including multimodal embeddings."""
+     ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+     if ret.success:
+         content = (
 @@ -1409,6 +1418,22 @@ async def update_weights_from_ipc(
          return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
  
@@ -1546,10 +1555,18 @@ index a45d122f..0334e353 100755
          ):
              # Even the last remaining request cannot fit in memory.
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a9615a14c5..aca7bd7061 100644
+index a9615a1..b2dfb92 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
+@@ -99,6 +99,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+ from sglang.srt.lora.lora_drainer import LoRADrainer
+ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
++from sglang.srt.managers import mm_utils
+ from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+ from sglang.srt.managers.io_struct import (
+@@ -141,6 +142,7 @@ from sglang.srt.managers.io_struct import (
      LoadLoRAAdapterReqOutput,
      OpenSessionReqInput,
      PauseGenerationReqInput,
@@ -1557,7 +1574,7 @@ index a9615a14c5..aca7bd7061 100644
      ProfileReq,
      ReleaseMemoryOccupationReqInput,
      RemoveExternalCorpusReqInput,
-@@ -161,6 +162,8 @@ from sglang.srt.managers.io_struct import (
+@@ -161,6 +163,8 @@ from sglang.srt.managers.io_struct import (
      TokenizedGenerateReqInput,
      UnloadLoRAAdapterReqInput,
      UnloadLoRAAdapterReqOutput,
@@ -1566,7 +1583,7 @@ index a9615a14c5..aca7bd7061 100644
      UpdateWeightFromDiskReqInput,
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
-@@ -280,6 +283,8 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+@@ -280,6 +284,8 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
  from sglang.srt.speculative.dflash_utils import validate_dflash_request
  from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
  from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1575,7 +1592,7 @@ index a9615a14c5..aca7bd7061 100644
  from sglang.srt.utils import (
      DynamicGradMode,
      configure_gc_logger,
-@@ -1539,6 +1544,10 @@ class Scheduler(
+@@ -1539,6 +1545,10 @@ class Scheduler(
                      UpdateWeightsFromIPCReqInput,
                      self.weight_updater.update_weights_from_ipc,
                  ),
@@ -1586,7 +1603,7 @@ index a9615a14c5..aca7bd7061 100644
                  (
                      GetWeightsByNameReqInput,
                      self.weight_updater.get_weights_by_name,
-@@ -1571,6 +1580,10 @@ class Scheduler(
+@@ -1571,6 +1581,10 @@ class Scheduler(
                      LoadLoRAAdapterFromTensorsReqInput,
                      self.load_lora_adapter_from_tensors,
                  ),
@@ -1597,7 +1614,7 @@ index a9615a14c5..aca7bd7061 100644
                  (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                  (PauseGenerationReqInput, self.pause_generation),
                  (ContinueGenerationReqInput, self.continue_generation),
-@@ -1627,6 +1640,8 @@ class Scheduler(
+@@ -1627,6 +1641,8 @@ class Scheduler(
          self.tree_cache.release_host_resources()
          if self.decode_offload_manager is not None:
              self.decode_offload_manager.release_host_resources()
@@ -1606,7 +1623,29 @@ index a9615a14c5..aca7bd7061 100644
  
      def run_event_loop(self) -> None:
          """Run the scheduler's event loop.
-@@ -4457,6 +4472,12 @@ class Scheduler(
+@@ -4133,7 +4149,7 @@ class Scheduler(
+         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+     def flush_cache(self, empty_cache: bool = True):
+-        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
++        """Flush runtime caches and optionally empty the device allocator cache."""
+         if self.is_fully_idle():
+             self.cur_batch_for_debug = None
+             self.last_batch = None
+@@ -4146,6 +4162,12 @@ class Scheduler(
+             if self.draft_worker:
+                 self.draft_worker.clear_cache_pool()
+
++            # Drop cached embeddings so weight updates cannot reuse stale encoder
++            # outputs. Do this before trimming the allocator so colocated workloads
++            # can reclaim the memory.
++            if mm_utils.embedding_cache is not None:
++                mm_utils.embedding_cache.clear()
++
+             if empty_cache:
+                 current_platform.empty_cache()
+             # Per-DP-group leader logs once: ranks within a DP group are
+@@ -4457,6 +4479,12 @@ class Scheduler(
                  # The request will still run one decode forward pass.
                  # Then we reuse all existing code to clean up the KV cache allocation.
                  logger.debug(f"Abort running request. {req.rid=}")
@@ -1619,7 +1658,7 @@ index a9615a14c5..aca7bd7061 100644
                  req.to_finish = FINISH_ABORT()
  
      def _pause_engine(self) -> Tuple[List[Req], int]:
-@@ -4669,6 +4690,14 @@ class Scheduler(
+@@ -4669,6 +4697,14 @@ class Scheduler(
          result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
          return result
  

@@ -9,6 +9,20 @@ from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayo
 from relax.backends.megatron.weight_update.ipc import dispatch_typed_buckets
 
 
+# Receiver-rank order from SGLang's [MoE DP, EP, MoE TP] process groups.
+# Each entry is (expert rank, expert tensor-parallel rank).
+TOPOLOGIES = [
+    pytest.param(1, 1, 1, [(0, 0)], id="single"),
+    pytest.param(2, 1, 1, [(0, 0), (0, 1)], id="tp2"),
+    pytest.param(2, 2, 1, [(0, 0), (1, 0)], id="ep2"),
+    pytest.param(4, 4, 1, [(0, 0), (1, 0), (2, 0), (3, 0)], id="ep4"),
+    pytest.param(4, 2, 1, [(0, 0), (0, 1), (1, 0), (1, 1)], id="ep2-tp2"),
+    pytest.param(4, 2, 2, [(0, 0), (1, 0), (0, 0), (1, 0)], id="ep2-dp2"),
+    pytest.param(4, 1, 2, [(0, 0), (0, 1), (0, 0), (0, 1)], id="tp2-dp2"),
+    pytest.param(8, 2, 2, [(0, 0), (0, 1), (1, 0), (1, 1), (0, 0), (0, 1), (1, 0), (1, 1)], id="ep2-tp2-dp2"),
+]
+
+
 def receiver(**overrides):
     return (
         dict(
@@ -17,6 +31,8 @@ def receiver(**overrides):
             pp_size=1,
             moe_dp_size=1,
             moe_runner_backend="triton",
+            moe_a2a_backend="none",
+            is_cuda=True,
             dtype="bfloat16",
             disable_shared_experts_fusion=True,
             num_experts=4,
@@ -27,19 +43,31 @@ def receiver(**overrides):
     )
 
 
-@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("tp,ep,dp,ranks", TOPOLOGIES)
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
 @pytest.mark.parametrize("prefix", ["model.layers", "model.language_model.layers"])
 @pytest.mark.parametrize("geometry", [(4, 6, 8), (8, 10, 12)])
-def test_direct_shards_preserve_expert_and_gate_up_order(tp, prefix, geometry):
+def test_direct_shards_preserve_expert_and_gate_up_order(tp, ep, dp, ranks, backend, prefix, geometry):
     e, h, i = geometry
-    layout = DirectExpertLayout(e, h, i, tp)
+    layout = DirectExpertLayout.from_receiver(
+        receiver(
+            tp_size=tp,
+            ep_size=ep,
+            moe_dp_size=dp,
+            num_experts=e,
+            hidden_size=h,
+            moe_intermediate_size=i,
+            moe_runner_backend=backend,
+        )
+    )
     gate = torch.arange(e * i * h).reshape(e, i, h).to(torch.bfloat16)
     up = gate + 512
     down = torch.arange(e * h * i).reshape(e, h, i).to(torch.bfloat16)
     packed = torch.cat((gate, up), dim=1)
-    for rank in range(tp):
+    for rank, (expert_rank, expert_tp_rank) in enumerate(ranks):
         [(name, actual)] = direct_expert_chunk([(f"{prefix}.9.mlp.experts.gate_up_proj", packed)], layout, rank)
-        expected = torch.cat((gate.chunk(tp, dim=1)[rank], up.chunk(tp, dim=1)[rank]), dim=1)
+        halves = tuple(t.chunk(ep)[expert_rank].chunk(tp // ep // dp, dim=1)[expert_tp_rank] for t in (gate, up))
+        expected = torch.cat(halves[::-1] if backend == "flashinfer_cutlass" else halves, dim=1)
         assert name == "model.layers.9.mlp.experts.w13_weight"
         assert torch.equal(actual, expected) and actual.is_contiguous()
         snapshot = actual.clone()
@@ -47,37 +75,52 @@ def test_direct_shards_preserve_expert_and_gate_up_order(tp, prefix, geometry):
         assert torch.equal(actual, snapshot)
         [(name, actual)] = direct_expert_chunk([(f"{prefix}.9.mlp.experts.down_proj", down)], layout, rank)
         assert name == "model.layers.9.mlp.experts.w2_weight"
-        assert torch.equal(actual, down.chunk(tp, dim=2)[rank]) and actual.is_contiguous()
+        expected = down.chunk(ep)[expert_rank].chunk(tp // ep // dp, dim=2)[expert_tp_rank]
+        assert torch.equal(actual, expected) and actual.is_contiguous()
     assert direct_expert_chunk([("model.norm.weight", gate)], layout, 0) is None
     assert direct_expert_chunk([], layout, 0) is None
 
 
-@pytest.mark.parametrize("tp", [1, 2, 4])
-def test_direct_matches_installed_sglang_fused_moe_loader(tp):
+@pytest.mark.parametrize("tp,ep,dp,ranks", TOPOLOGIES)
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
+def test_direct_matches_installed_sglang_fused_moe_loader(monkeypatch, tp, ep, dp, ranks, backend):
     """Use the receiver's real per-expert loaders as the independent oracle."""
-    layer_module = pytest.importorskip("sglang.srt.layers.moe.fused_moe_triton.layer")
+    layer_module = pytest.importorskip("sglang.srt.layers.moe.fused_moe_triton.layer", exc_type=ImportError)
+    unquant = pytest.importorskip("sglang.srt.layers.quantization.unquant", exc_type=ImportError)
+    moe = pytest.importorskip("sglang.srt.layers.moe.utils", exc_type=ImportError)
+    monkeypatch.setattr(unquant, "get_moe_runner_backend", lambda: moe.MoeRunnerBackend(backend))
+    quant_method = unquant.UnquantizedFusedMoEMethod(use_deep_gemm=backend == "deep_gemm")
     e, h, i = 4, 6, 8
-    layout = DirectExpertLayout(e, h, i, tp)
+    layout = DirectExpertLayout.from_receiver(
+        receiver(tp_size=tp, ep_size=ep, moe_dp_size=dp, moe_runner_backend=backend)
+    )
+    moe_tp = tp // ep // dp
     gate = torch.arange(e * i * h).reshape(e, i, h).to(torch.bfloat16)
     up, down = gate + 512, gate.transpose(1, 2).contiguous() + 1024
     receiver_layer = SimpleNamespace(
         moe_runner_config=SimpleNamespace(is_gated=True),
-        quant_method=SimpleNamespace(),
+        quant_method=quant_method,
         quant_config=None,
         use_padded_loading=False,
         use_presharded_weights=False,
         use_triton_kernels=False,
-        moe_tp_size=tp,
+        moe_tp_size=moe_tp,
+        _num_local_routed=e // ep,
+        _has_fused_shared=False,
     )
-    for rank in range(tp):
+    for rank, (expert_rank, expert_tp_rank) in enumerate(ranks):
+        receiver_layer._expert_storage_rank = expert_rank
         w13, w2 = (
-            torch.empty(e, 2 * i // tp, h, dtype=torch.bfloat16),
-            torch.empty(e, h, i // tp, dtype=torch.bfloat16),
+            torch.empty(e // ep, 2 * i // moe_tp, h, dtype=torch.bfloat16),
+            torch.empty(e // ep, h, i // moe_tp, dtype=torch.bfloat16),
         )
         for expert in range(e):
-            layer_module.FusedMoE._load_w13(receiver_layer, w13[expert], 0, "w1", gate[expert], rank)
-            layer_module.FusedMoE._load_w13(receiver_layer, w13[expert], 0, "w3", up[expert], rank)
-            layer_module.FusedMoE._load_w2(receiver_layer, w2[expert], 1, "w2", down[expert], rank)
+            local_expert = layer_module.FusedMoE._map_global_expert_id_to_local_expert_id(receiver_layer, expert)
+            if local_expert == -1:
+                continue
+            layer_module.FusedMoE._load_w13(receiver_layer, w13[local_expert], 0, "w1", gate[expert], expert_tp_rank)
+            layer_module.FusedMoE._load_w13(receiver_layer, w13[local_expert], 0, "w3", up[expert], expert_tp_rank)
+            layer_module.FusedMoE._load_w2(receiver_layer, w2[local_expert], 1, "w2", down[expert], expert_tp_rank)
         assert torch.equal(w13, layout.shard(torch.cat((gate, up), dim=1), "gate_up_proj", rank))
         assert torch.equal(w2, layout.shard(down, "down_proj", rank))
 
@@ -92,12 +135,19 @@ def test_resolved_receiver_geometry_has_no_model_family_requirement(tp):
     [
         dict(tp_size=3),
         dict(tp_size=0),
-        dict(ep_size=2),
+        dict(ep_size=3),
+        dict(ep_size=None),
+        dict(ep_size=0),
+        dict(tp_size=3, ep_size=3),
         dict(pp_size=2),
-        dict(moe_dp_size=2),
+        dict(moe_dp_size=3),
+        dict(moe_dp_size=None),
+        dict(moe_dp_size=False),
         dict(moe_runner_backend="auto"),
         dict(moe_runner_backend="triton_kernel"),
-        dict(moe_runner_backend="flashinfer_cutlass"),
+        dict(moe_runner_backend="flashinfer_trtllm"),
+        dict(moe_runner_backend="flashinfer_trtllm_routed"),
+        dict(moe_runner_backend="flashinfer_mxfp4"),
         dict(dtype="float16"),
         dict(dtype="auto"),
         dict(disable_shared_experts_fusion=False),
@@ -106,6 +156,8 @@ def test_resolved_receiver_geometry_has_no_model_family_requirement(tp):
         dict(ep_num_redundant_experts=1),
         dict(init_expert_location="random"),
         dict(ep_join_mode="scale"),
+        dict(elastic_ep_backend="mooncake"),
+        dict(dwdp_size=2),
         dict(quantization="fp8"),
         dict(quantization_config={"quant_method": "fp8"}),
         dict(enable_lora=True),
@@ -118,6 +170,42 @@ def test_resolved_receiver_geometry_has_no_model_family_requirement(tp):
 def test_unsupported_receiver_layout_is_rejected(override):
     with pytest.raises(ValueError):
         DirectExpertLayout.from_receiver(receiver(**override))
+
+
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
+@pytest.mark.parametrize("override", [dict(is_cuda=False), dict(is_cuda=None)])
+def test_direct_cuda_backends_reject_unknown_platform(backend, override):
+    with pytest.raises(ValueError):
+        DirectExpertLayout.from_receiver(receiver(moe_runner_backend=backend, **override))
+
+
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
+@pytest.mark.parametrize("a2a", ["none", "deepep", "flashinfer", "mooncake", "nixl", "mori", "pplx", "ascend_fuseep"])
+def test_weight_layout_is_independent_of_activation_dispatcher(backend, a2a):
+    # The running engine owns dispatcher/platform compatibility validation.
+    # Equal resident weight layouts must use the same weight transfer plan.
+    base = receiver(ep_size=2, moe_runner_backend=backend)
+    assert DirectExpertLayout.from_receiver(base | {"moe_a2a_backend": a2a}) == DirectExpertLayout.from_receiver(base)
+
+
+def test_unsharded_native_order_keeps_local_expert_storage():
+    layout = DirectExpertLayout.from_receiver(receiver(tp_size=4, ep_size=2, moe_dp_size=2))
+    tensor = torch.zeros(4, 16, 6, dtype=torch.bfloat16)
+    local = layout.shard(tensor, "gate_up_proj", 1)
+    assert layout.moe_tp_size == 1 and local.shape == (2, 16, 6)
+    assert local.data_ptr() == tensor[2:].data_ptr()
+    assert layout.shard(tensor, "gate_up_proj", 3).data_ptr() == local.data_ptr()
+
+
+def test_receiver_layout_agreement_includes_gate_up_order():
+    triton, deep_gemm, cutlass = [
+        DirectExpertLayout.from_receiver(receiver(moe_runner_backend=backend))
+        for backend in ("triton", "deep_gemm", "flashinfer_cutlass")
+    ]
+    assert triton == deep_gemm
+    assert cutlass != triton
+    assert triton != DirectExpertLayout.from_receiver(receiver(ep_size=2))
+    assert triton != DirectExpertLayout.from_receiver(receiver(moe_dp_size=2))
 
 
 @pytest.mark.parametrize(

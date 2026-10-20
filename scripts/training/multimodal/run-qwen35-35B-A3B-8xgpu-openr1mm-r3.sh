@@ -129,32 +129,6 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-# Match the native BF16 expert layout used by the guarded direct IPC loader.
-SGLANG_ARGS+=(--sglang-moe-runner-backend triton --sglang-disable-shared-experts-fusion --sglang-dtype bfloat16)
-
-RUNTIME_ENV_JSON=$(python3 - <<'PYENV'
-import json
-import os
-
-runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
-# Vision embeddings must be recomputed after each weight update.
-runtime_env.setdefault("env_vars", {})["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
-# The backend validates single-update, zero-KL GRPO before reusing log-probs.
-runtime_env["env_vars"]["NVTE_USE_CUTLASS_GROUPED_GEMM"] = "1"
-# Export BF16 experts in bulk, then send each receiver its TP-local shard.
-# Preserve the platform Trial identity and its collector path in Ray workers.
-# These are public variable names; their values are inherited at launch.
-for key in (
-    "QS_TRIAL_ID", "QS_JOB_ID", "QS_USER", "GPU_TYPE", "CLUSTER",  # gitleaks:allow
-    "ETTR_LOG_FILE", "ETTR_TRACE_LOG_DIR", "ETTR_FRAMEWORK",
-    "QS_INJECT_AUTOLOAD", "QS_INJECT_MODEL_PROFILE",  # gitleaks:allow
-):
-    if key in os.environ:
-        runtime_env["env_vars"][key] = os.environ[key]
-print(json.dumps(runtime_env))
-PYENV
-)
-
 mkdir -p log
 
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://127.0.0.1:8265" \

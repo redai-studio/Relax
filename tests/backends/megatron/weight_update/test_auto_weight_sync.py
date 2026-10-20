@@ -16,23 +16,42 @@ from relax.backends.megatron.weight_update.expert_layout import DirectExpertLayo
 from relax.backends.megatron.weight_update.hf_weight_iterator_bridge import HfWeightIteratorBridge  # noqa: E402
 
 
-def receiver():
-    return dict(
-        tp_size=2,
-        ep_size=1,
-        pp_size=1,
-        moe_dp_size=1,
-        moe_runner_backend="triton",
-        dtype="bfloat16",
-        disable_shared_experts_fusion=True,
-        num_experts=4,
-        hidden_size=6,
-        moe_intermediate_size=8,
+def receiver(backend="triton", **overrides):
+    return (
+        dict(
+            tp_size=2,
+            ep_size=1,
+            pp_size=1,
+            moe_dp_size=1,
+            moe_runner_backend=backend,
+            moe_a2a_backend="none",
+            is_cuda=True,
+            dtype="bfloat16",
+            disable_shared_experts_fusion=True,
+            num_experts=4,
+            hidden_size=6,
+            moe_intermediate_size=8,
+        )
+        | overrides
     )
 
 
-@pytest.mark.parametrize("failure", ["none", "local_not_ready", "peer_not_ready", "configure", "query", "peer_reject"])
-def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failure):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "local_not_ready",
+        "peer_not_ready",
+        "configure",
+        "query",
+        "peer_reject",
+        "unsupported_layout",
+        "mixed_layout",
+        "mixed_parallelism",
+    ],
+)
+@pytest.mark.parametrize("backend", ["triton", "deep_gemm", "flashinfer_cutlass"])
+def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failure, backend):
     updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
     updater.args = SimpleNamespace(colocate=True)
     updater.use_distribute = updater._route_experts = updater.lora_enabled = False
@@ -50,7 +69,16 @@ def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failur
     )
     engine = Mock()
     updater.rollout_engines = [engine]
-    get = Mock(side_effect=RuntimeError("query failed")) if failure == "query" else Mock(return_value=[receiver()])
+    receivers = [receiver(backend)]
+    if failure == "unsupported_layout":
+        receivers[0]["moe_runner_backend"] = "triton_kernel"
+    elif failure == "mixed_layout":
+        receivers.append(receiver("triton" if backend == "flashinfer_cutlass" else "flashinfer_cutlass"))
+        updater.rollout_engines.append(Mock())
+    elif failure == "mixed_parallelism":
+        receivers.append(receiver(backend, ep_size=2))
+        updater.rollout_engines.append(Mock())
+    get = Mock(side_effect=RuntimeError("query failed")) if failure == "query" else Mock(return_value=receivers)
     monkeypatch.setattr(sync.ray, "get", get)
     monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
     monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
@@ -63,7 +91,7 @@ def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failur
             tensor.zero_()
 
     monkeypatch.setattr(sync.dist, "all_reduce", reduce)
-    updater._configure_direct_experts([2])
+    updater._configure_direct_experts([2] * len(receivers))
     assert (updater._direct_expert_layout is not None) == (failure == "none")
     if failure in ("local_not_ready", "peer_not_ready"):
         assert len(reductions) == 1 and configured == [None]
@@ -72,6 +100,34 @@ def test_negotiation_agrees_before_selecting_or_falling_back(monkeypatch, failur
         assert len(reductions) == 2
         if failure != "none":
             assert configured[-1] is None
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        dict(tp_size=2, ep_size=2, moe_a2a_backend="deepep"),
+        dict(tp_size=4, ep_size=2),
+        dict(tp_size=4, ep_size=2, moe_dp_size=2),
+    ],
+)
+def test_negotiation_preserves_full_engine_placement_for_expert_parallelism(monkeypatch, topology):
+    updater = sync.UpdateWeightFromTensor.__new__(sync.UpdateWeightFromTensor)
+    updater.args = SimpleNamespace(colocate=True)
+    updater.use_distribute = updater._route_experts = updater.lora_enabled = False
+    updater.quantization_config = None
+    configure = Mock(side_effect=lambda layout: layout is not None)
+    updater._hf_weight_iterator = SimpleNamespace(configure_direct_experts=configure, _bf16_expert_buckets=[object()])
+    updater.rollout_engines = [Mock()]
+    config = receiver("deep_gemm", **topology)
+    monkeypatch.setattr(sync.ray, "get", lambda _: [config])
+    monkeypatch.setattr(sync, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(sync.dist, "get_rank", lambda **kwargs: 0)
+    monkeypatch.setattr(sync.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sync.dist, "all_reduce", lambda *args, **kwargs: None)
+    updater._configure_direct_experts([config["tp_size"]])
+    expected = DirectExpertLayout.from_receiver(config)
+    assert updater._direct_expert_layout == expected
+    configure.assert_called_once_with(expected)
 
 
 @pytest.mark.parametrize("rank", [0, 3])
