@@ -1,345 +1,195 @@
-# OSWorld agentic RL
+# OSWorld + Nex agentic 训练
 
-使用 OSWorld 桌面任务训练 Qwen3-VL-8B-Thinking，当前提供 8 GPU 的 GRPO outcome 配方。
-以下命令均在 Relax 仓库根目录执行。
+[English](README.en.md)
 
-## 0. 下载代码和准备目录
+本 recipe 使用 Qwen3-VL-8B-Thinking、Relax resident agentic rollout 和 Nex 桌面沙箱进行 GRPO 训练。它依赖外部 Nex 服务及可用的 OSWorld 桌面模板；只克隆仓库不能直接运行。
 
-如果还没有代码，先准备 OSWorld Nex fork 和包含本配方的 Relax 分支。MCP
-源码已经随 OSWorld fork 提供，不需要再下载 `toolcua_mcp_swap`。
-将 `<RELAX_REPO_URL>` 替换为有权限访问的 Relax Git 地址：
+## 目录与配置
 
-```bash
-mkdir -p /work
-cd /work
-git clone https://github.com/fxsc03/OSWorld-main-nex.git OSWorld-main-nex
-git clone <RELAX_REPO_URL> Relax
-cd Relax
-git checkout feat/fengxiaoshi/osworld
-cd /work
-```
+- `env.example.sh`：公开的部署配置模板，不包含实际服务地址或密钥。
+- `env.local.sh`：用户复制模板后填写的私有配置，Git 忽略，不能提交。
+- `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`：正式训练参数与提交入口；修改训练参数请改这里。
+- `run_qwen3vl_8B_osworld_outcome.sh`：兼容旧入口，转发到正式脚本。
+- `run_agent_app.sh`：Relax 为每个 session 调用的 agent 入口，不是独立训练入口。
+- `app/`：桌面环境、模型调用适配、奖励与监控；`app/osworld_config.yaml` 控制交互轮数等。
+- `scripts/prepare_data.py`、`train_tasks.txt`：数据转换与固定 12 任务清单。
+- `scripts/analyze_run.py`、`plot_training.py`：离线分析工具；`reward_osworld.py` 保留兼容 scorer，正式脚本使用 agent metadata 和自定义 advantage 回调。
 
-目录建议保持如下布局：
+训练脚本和 agent 入口直接读取同目录的 `env.local.sh`，无需额外配置文件。启动时传入的三个根目录优先。
 
-```text
-/work/
-├── OSWorld-main-nex/
-│   └── mcp/
-└── Relax/
-```
+## 准备环境
 
-先按 [Relax 安装说明](../../docs/zh/guide/installation.md) 准备含 PyTorch、
-Megatron 和 SGLang 的训练环境。下面的 pip 命令补充应用依赖，不会构建完整的
-GPU 训练环境。在所有 Ray 节点使用相同的训练环境安装：
+1. 按 [Relax 安装文档](../../docs/zh/guide/installation.md)准备训练镜像、Megatron、SGLang、Ray 和模型权重。脚本通过 `ray status` 检测现有集群，并用 Ray API 识别 8 或 16 张 GPU；没有集群时通过 `local.sh` 启动单机 Ray。显存需求随轨迹变化。脚本固定 `MEGATRON=/root/Megatron-LM`，其他镜像需修改该行。所有 worker 必须能访问相同路径、相同版本的代码与依赖。
 
-```bash
-python -m pip install -r /work/Relax/requirements.txt
-python -m pip install -r /work/OSWorld-main-nex/requirements.txt qwen-agent
-```
+2. 准备 OSWorld fork。下面固定到本 recipe 检查的版本：
 
-先确认 HybridAgentLocal 可以导入：
+   ```bash
+   git clone https://github.com/fxsc03/OSWorld-main-nex.git /data/OSWorld-main-nex
+   git -C /data/OSWorld-main-nex checkout 50b4a85778cfc13ce00e3bf63a3cd08bd260fb96
+   ```
 
-```bash
-cd /work/OSWorld-main-nex
-python -c "from mm_agents.hybrid_agent_local import HybridAgentLocal; print('HybridAgentLocal OK')"
-cd /work/Relax
-```
+   将 `DATA_DIR` 设置为所有节点同路径可访问的持久共享目录。首次运行训练脚本会在 `${DATA_DIR}/osworld-agent-venv` 创建 Agent 环境并安装依赖，完成后写入标记；后续启动不再安装。提交训练前，脚本将持久环境打包为可复用归档，避免跨节点逐个读取小文件，再解包到每个在线 Ray 节点的 `/tmp/relax-osworld-agent-envs/<版本>/`，所有节点准备完成后才提交任务；每个 Agent 使用节点本地 Python，不从共享盘加载 venv。环境未变化时复用本地副本，Pod 重启导致副本丢失时自动重新复制。手动更新共享环境依赖后，执行 `touch "${DATA_DIR}/osworld-agent-venv/.relax-agent-ready"`，使下次启动创建新版本副本。环境复用训练镜像已有的 PyTorch 包，其他依赖安装在 venv 中；各节点需使用兼容的 Python 和训练镜像。需要更换依赖时，准备新环境并用 `OSWORLD_AGENT_PYTHON` 显式指定其 Python。宿主环境安装不能替代沙箱内的依赖：Nex 模板仍需提供桌面应用、LibreOffice/UNO、MCP 工具及任务所需文件。请按该 fork 的 Nex 部署说明验证模板、网络和任务 reset/evaluator。
 
-## 1. 环境配置
+3. 在 recipe 目录复制配置，仅首次执行，不要覆盖已有私有文件：
 
-先准备好 Relax 训练环境、Megatron 和可用的 Ray 集群。OSWorld 侧需要：
+   ```bash
+   cd examples/osworld_agentic
+   cp -n env.example.sh env.local.sh
+   chmod 600 env.local.sh
+   ```
 
-- **配套的外部 OSWorld 版本**：包含 Nex provider、MCP 支持和 `HybridAgentLocal`。
-  标准上游 OSWorld checkout 不能直接用于本配方。
-- OSWorld fork 内置的 MCP 源码，以及可用的 Nex workspace、桌面模板和 API key。
-- 按该外部版本的安装说明安装 OSWorld 依赖，并额外安装
-  `qwen-agent`（`HybridAgentLocal` 的 GUI 工具定义依赖它）。当前
-  [run_agent_app.sh](run_agent_app.sh) 直接使用运行环境中的 `python`，不会自动切换 conda 环境。
+   填写 `OSWORLD_REPO`、`NEX_API_BASE`、`NEX_WORKSPACE_ID`、`NEX_API_KEY` 和 `NEX_TEMPLATE`（或 `NEX_TEMPLATE_ID`）。`MCP_SRC_ROOT` 是包含 `mcp/` 的仓库根目录。外部 Nex client 含部署相关默认值，因此 agent 入口要求显式提供 Nex 配置，不依赖这些默认值。
 
-外部文件按以下布局准备，`OSWORLD_REPO` 指向其中的 `OSWorld-main-nex/`。
-`agents/`、`prompts/` 和 `tools/` 已经随 Nex fork 提供，不需要再从其他
-agent 仓库复制：
+   `OSWORLD_AGENT_PYTHON` 默认无需填写。若显式设置，脚本直接使用该已准备好的环境，不自动安装或复制；启动时传入的值优先于 `env.local.sh`。不要将需要跨任务复用的环境放在 `/tmp`。
 
-```text
-external_root/
-├── OSWorld-main-nex/
-│   ├── desktop_env/
-│   ├── mm_agents/hybrid_agent_local.py
-│   ├── agents/tool_retriever.py
-│   ├── prompts/policy_hybrid.py
-│   ├── tools/tools_registry.json
-│   ├── mcp/
-│   └── evaluation_examples/
-└── Relax/
-```
+   私有文件必须在所有 agent worker 的相同路径可读。若使用 Ray 上传代码，被忽略的文件不会随代码上传，需另外安全部署；也可预先在 worker 环境配置。不要通过 runtime-env JSON 或命令行传递密钥，相关参数可能进入 Jobs 元数据与日志。
 
-复制环境配置模板，已有 `env.local.sh` 时保留原文件：
+4. 正式脚本默认开启 ClearML。按自己的部署配置训练节点的 ClearML（例如 `clearml-init`）；模板不携带任何账户、密钥或内部端点。
+
+## 启动
+
+配置好 `env.local.sh` 后，在 Relax 根目录运行：
 
 ```bash
-printf '%s\n' '/examples/osworld_agentic/env.local.sh' >> "$(git rev-parse --git-path info/exclude)"
-cp -n examples/osworld_agentic/env.sh examples/osworld_agentic/env.local.sh
-chmod 600 examples/osworld_agentic/env.local.sh
+MODEL_DIR=/data/models \
+DATA_DIR=/data/rl_data \
+SAVE_DIR=/data/outputs \
+bash examples/osworld_agentic/scripts/run-qwen3vl-8B-osworld-8xgpu.sh
 ```
 
-编辑 `examples/osworld_agentic/env.local.sh`，将占位值替换为实际配置：
+- 模型应位于 `${MODEL_DIR}/Qwen3-VL-8B-Thinking`。
+- 数据读取 `${DATA_DIR}/osworld/train.parquet`；不存在时从外部仓库的 `evaluation_examples/examples` 和固定清单生成。清单包含未知任务或为空会报错。已有 parquet 会复用，修改清单后请明确重新生成，避免继续读旧数据。
+- 自动生成的 train/eval 使用同一清单；这不是独立验证集，默认也未配置周期评估。
+- 输出位于 `${SAVE_DIR}/qwen3vl-8b-osworld-8xgpu/`。
 
-- `MEGATRON`：Megatron-LM 源码目录。
-- `MODEL_DIR`：模型根目录，下面应有 `Qwen3-VL-8B-Thinking/`。
-- `DATA_DIR`：准备好的 parquet 的根目录，训练读取其下的 `osworld/train.parquet`。
-- `SAVE_DIR`：本次实验输出目录。从 base 模型开始训练时使用新目录。
-- `RAY_JOB_ADDRESS`：已有 Ray 集群的 Jobs 地址。
-- OSWorld 路径、Nex 连接信息：见第 3 节，准备数据前先填好。
+## 当前正式参数
 
-启动脚本先读取 `env.local.sh`，再用 [env.sh](env.sh) 补齐默认值。
-所有 Ray 节点需能访问相同路径下的 Relax、Megatron、OSWorld（含 `mcp/`）、模型、数据及本地配置。
+| 配置                           | 值                                                                               |
+| ------------------------------ | -------------------------------------------------------------------------------- |
+| 初始模型                       | Qwen3-VL-8B-Thinking                                                             |
+| 算法                           | GRPO，自定义轨迹级 advantage，TIS                                                |
+| 每轮采样                       | 12 组 × 每组 8 条 = 96 条轨迹                                                    |
+| 更新次数                       | 每 rollout 2 次，共 200 rollouts                                                 |
+| 学习率                         | 5e-6，constant                                                                   |
+| KL                             | k3，系数 0.001，ref 每 rollout 更新                                              |
+| PPO clip                       | 下/上界均 0.2                                                                    |
+| 训练并行                       | TP4 / PP1 / CP1，8 卡 DP2、16 卡 DP4                                             |
+| 单卡训练 / log-prob token 预算 | 均为 24576；不是模型上下文长度                                                   |
+| Rollout 上下文 / response 上限 | 16384 / 8192 tokens                                                              |
+| SGLang                         | 每引擎 2 GPU，static memory fraction 0.7，consistent hashing                     |
+| 显存策略                       | 冻结 vision trunk；selective recompute `core_attn`；optimizer CPU offload 未开启 |
+| 沙箱                           | prelaunch 开启；active 与预启动共享 12 个 group permits，最多 96 个 session      |
+| Dynamic filter                 | 关闭                                                                             |
+| Agent                          | 最多 30 轮，图像历史 2 张，session timeout 21600 秒                              |
+| Checkpoint                     | 关闭；每次启动从初始模型开始，不恢复优化器状态                                   |
 
-`MCP_SRC_ROOT` 默认等于 `OSWORLD_REPO`，代码会读取 `${MCP_SRC_ROOT}/mcp`。
-已有 `env.local.sh` 如果还指定旧的 MCP 路径，请在 `OSWORLD_REPO` 设置之后改为：
+Actor 与 rollout colocate，共用检测到的 8 或 16 张物理 GPU。session 并发限制不等于 Nex 服务端实例计数保证：创建重试、服务端回收延迟仍需结合 Nex 配额监控。
+
+## 奖励、轨迹与指标
+
+每条轨迹的 shaped reward 为：`(成功 ? 1 : -1) - 0.05 × T/30 - 0.2 × I(T>=30)`，其中成功判定为 evaluator outcome ≥ 0.5，T 为轨迹轮数。每组 8 条轨迹计算并标准化 advantage，再分配到该轨迹的训练导出记录；不是按导出记录数量组成 8 条一组。
+
+96 条逻辑轨迹可以导出远多于 96 条训练记录。`rollout/raw_reward` 为对齐交接实现的**按导出记录数加权的 shaped reward**，不是轨迹成功率。判断任务能力应同时看成功率、轮数、异常比例；不能将 raw reward 图标成 success rate。全成功/全失败组的策略 advantage 被置零，但启用的 KL 项仍可能产生梯度。
+
+`max_image_history_length=2` 限制单次模型上下文的图像历史，不表示一条轨迹只有两张截图。截图 dump 是额外诊断功能，磁盘图片数不能直接代表交互轮数。
+
+## 日志与隐私
+
+- 提交日志：`examples/osworld_agentic/log/<experiment>-<timestamp>.log`。
+- Agent 日志：`examples/osworld_agentic/log/agent/<run-tag>/`。
+- 训练导出：`${SAVE_DIR}/<experiment>/rollout_result/<run-tag>/train/`。
+- 轨迹奖励：同一 run 目录的 `reward_dump.jsonl`。
+- TensorBoard：`${SAVE_DIR}/<experiment>/tensorboard_log/<run-tag>/`；ClearML 实验名带启动时间。
 
 ```bash
-export MCP_SRC_ROOT="${OSWORLD_REPO}"
+python examples/osworld_agentic/scripts/analyze_run.py \
+  --dump /data/outputs/qwen3vl-8b-osworld-8xgpu/rollout_result/<run-tag>/reward_dump.jsonl \
+  --groups-per-rollout 12 --samples-per-group 8 --md
 ```
 
-这里填仓库根目录，不能填 `${OSWORLD_REPO}/mcp`，否则会多拼接一级 `mcp/`。
-沙箱镜像仍需预装 FastMCP、LibreOffice/UNO、桌面应用和工具所需依赖；源码注入不会
-自动安装这些软件。`pip install qwen-agent` 安装在 agent 所用 Python 环境中，
-也不会给远端沙箱安装 MCP server。完整目录和 guest 依赖见 OSWorld 的 `mcp/README.md`。
+该离线分组适用于当前未开启 dynamic filter 的固定批次配置；更换采样流程后需要重新核实其分组假设。
 
-## 2. 下载 / 准备数据集
+Git 忽略私有配置、常见日志/截图/缓存目录，但忽略规则不是数据脱敏机制。桌面截图、任务内容、agent 日志及导出 JSON 可能包含敏感信息，发布前应单独审查；不要强制添加私有文件。加载私有配置时禁用 shell tracing，仍不应把整个私有环境打印到日志。
 
-任务数据来自配套 OSWorld 版本中的 `evaluation_examples/`。获取外部 OSWorld 时，
-一并准备好这个目录中的任务 JSON。训练任务列表在
-[scripts/train_tasks.txt](scripts/train_tasks.txt)，每行一个任务 ID，当前共 12 个任务。
+本 recipe 的审查不代表外部 OSWorld fork、沙箱镜像或历史 Git 提交已完成隐私审计。尤其外部 fork 含部署相关默认端点，公开分发该依赖前应单独审查。
 
-填好 `env.local.sh` 后，将任务 JSON 转为训练用 parquet：
+## CHANGELOG
 
-```bash
-source examples/osworld_agentic/env.local.sh
-source examples/osworld_agentic/env.sh
+以下按实验启动时间升序记录，时区为 UTC+8。日期后的时间对应实验名中的启动时间；“更新”指优化器更新，编号从 0 开始。只记录可由保留的提交参数和日志确认的结果，脚本修改不算已验证实验。
 
-python3 examples/osworld_agentic/scripts/prepare_data.py \
-    --input-dir "${OSWORLD_REPO}/evaluation_examples" \
-    --output-dir "${DATA_DIR}/osworld" \
-    --train-manifest examples/osworld_agentic/scripts/train_tasks.txt \
-    --eval-manifest examples/osworld_agentic/scripts/train_tasks.txt
-```
+### 2026-10-11 18:33 — 初始集成实验
 
-产出 `${DATA_DIR}/osworld/train.parquet` 和 `${DATA_DIR}/osworld/eval.parquet`。
-当前启动脚本只读取 `train.parquet`，不运行独立 eval；任务执行结束后仍会由
-OSWorld evaluator 评分。上述命令的两个 parquet 使用同一份任务列表。
+- **配置**：Qwen3-VL-8B-Thinking，12 任务 × 8 条轨迹；`num_rollout=10`、每轮 3 次更新；LR `1e-6` / cosine；KL 系数 `0.02`；训练预算和 rollout context 均为 32K；full/uniform recompute，optimizer CPU offload 开启。
+- **结果**：日志记录 9 次更新，随后 SGLang engine 在 flush cache 时连接拒绝，任务失败，未完成计划。这里的 10 rollouts 最多对应 30 次更新；这个短配置不满足后续长期训练需求。
+- **后续**：延长至 200 rollouts，并调整 offload/recompute。Agent 按逻辑 session 管理沙箱、按模型可见上下文导出训练记录；96 条轨迹可以对应 1400 多条训练记录，不代表同等数量的沙箱。
 
-更换任务时，修改 `scripts/train_tasks.txt`，然后重新执行上述命令覆盖 parquet。
-修改源任务 JSON 后也要重新生成。启动脚本仅在 `train.parquet` 不存在或为空时自动准备数据，
-不会刷新已有文件。检查生成日志中的任务条数；出现 `unknown task_id` 时，说明列表中的
-ID 没有在输入目录找到，对应任务会被跳过。
+### 2026-10-11 22:58 — 200 rollouts，关闭 offload、减少重计算
 
-## 3. OSWorld 参数在哪里填
+- **相对上次**：`num_rollout: 10 → 200`；关闭 optimizer CPU offload；full recompute 改为 selective；训练预算与 rollout context 暂保留 32K。
+- **结果**：首次训练发生 CUDA OOM，没有完成优化器更新。
+- **后续**：降低单卡 token 预算，补齐长度配置之间的约束。
 
-### 路径与 Nex 连接：`env.local.sh`
+### 2026-10-12 01:15 — 训练预算降至 16K
 
-编辑 `examples/osworld_agentic/env.local.sh`：
+- **相对上次**：`max_tokens_per_gpu: 32768 → 16384`，rollout context 仍为 32768。
+- **结果**：启动参数校验失败：`max_tokens_per_gpu × CP` 小于 rollout context；没有进入训练。
 
-| 参数                | 填写内容                                                                |
-| ------------------- | ----------------------------------------------------------------------- |
-| `OSWORLD_REPO`      | 配套 OSWorld 源码目录，内含 `desktop_env/` 和 `evaluation_examples/`    |
-| `OSWORLD_CACHE_DIR` | OSWorld 缓存目录；默认 `${OSWORLD_REPO}/cache`，需可写                  |
-| `MCP_SRC_ROOT`      | MCP 根目录；默认填 `${OSWORLD_REPO}`（其下有 `mcp/`），可覆盖为兼容实现 |
-| `NEX_API_BASE`      | Nex 管理 API 根地址，包含 `/api/v1`，如 `https://<nex-host>/api/v1`     |
-| `NEX_WORKSPACE_ID`  | 可用的 Nex workspace ID                                                 |
-| `NEX_TEMPLATE`      | 该 workspace 可用的 OSWorld 桌面模板名称                                |
-| `NEX_API_KEY`       | Nex API key，需自行在本地配置中添加，或从私有凭据文件加载               |
-| `download_proxy`    | 可选，仅供 evaluator 下载资源使用的代理                                 |
+### 2026-10-12 01:16 — Rollout context 降至 16K
 
-`run_agent_app.sh` 使用 Ray worker 环境中的 `python`。只在提交端激活 venv
-不会改变已启动的远端 Ray worker 解释器；第 0 节的依赖检查须在 worker 环境也通过。
+- **相对上次**：`rollout_max_context_len: 32768 → 16384`。
+- **结果**：再次在参数校验阶段失败：prompt 上限仍为 16384，与 context 相等，未给生成 token 留空间；没有进入训练。
 
-例如，在本地配置中补上模板未提供的 key：
+### 2026-10-12 01:21 — 修正 prompt/context 约束
 
-```bash
-export NEX_API_KEY="<填写你的 Nex API key>"
-```
+- **相对上次**：prompt 上限改为 16383，保持 16K context 和 16K 单卡训练预算。
+- **结果**：完成 1 次更新后再次 OOM，尚不能稳定运行。
+- **后续**：增加 MLP 重计算以降低训练峰值显存。
 
-访问 Nex guest 的请求需要直连，不要让 `http_proxy` / `https_proxy` 等全局代理接管。
-密钥保存在已忽略的 `env.local.sh` 或私有凭据文件中。
+### 2026-10-12 02:01 — 增加 MLP 重计算
 
-`NEX_API_BASE` 用于 workspace、模板和沙箱生命周期管理，请向平台管理员取得地址。
-客户端以 `x-api-key` 请求头传递 `NEX_API_KEY`。它不是浏览器桌面地址，也不是
-LLM 的 `/v1/chat/completions` 地址；模型端点由 Relax 为每个 session 注入。
-如果平台提供模板 ID，也可以设置 `NEX_TEMPLATE_ID`，优先于 `NEX_TEMPLATE`。
-下面两个现有 smoke 脚本仍要求设置 `NEX_TEMPLATE`。
+- **相对上次**：selective recompute 显式使用 `core_attn mlp`。
+- **结果**：Actor 初始化阶段遇到 `uncorrectable ECC error`，没有进入训练。这次失败不是训练 loss 或奖励导致的。
 
-开始训练前，在可访问 Nex 的 worker 环境中检查桌面和 MCP。后两个命令会创建并销毁
-真实沙箱，使用 workspace 配额；它们不需要加载 LLM：
+### 2026-10-12 02:07 — ECC 报错后重新提交
 
-```bash
-source examples/osworld_agentic/env.local.sh
-source examples/osworld_agentic/env.sh
-cd "${OSWORLD_REPO}"
-python nex_env_check.py
-python nex_task_smoke.py
-python nex_mcp_smoke.py
-cd /work/Relax
-```
+- **相对上次**：保留 16K 预算、16K context、`core_attn mlp` selective recompute 和关闭 optimizer CPU offload 的组合。
+- **结果**：完成 57 次更新（19 rollouts），最大 grad norm 2.854678，之后主动停止以修正奖励逻辑；不是跑满 200 rollouts。
+- **问题**：当时的奖励口径尚未完整对齐交接版，不能将该曲线当成交接实验的复现结果。
 
-依次确认导入依赖通过、任务 setup/截图/evaluator 可用、MCP 工具列表非空且调用成功。
-桌面 smoke 没有让 agent 完成任务，所以 evaluator 得分为 `0` 不等于链路失败。
-MCP 启动失败时检查沙箱内 `/tmp/mcp_server.log` 和镜像依赖。
+### 2026-10-12 15:42 — 恢复交接版奖励口径
 
-### 任务执行配置：`app/osworld_config.yaml`
+- **相对上次**：恢复轨迹 outcome shaping、8 条轨迹组内 advantage 标准化，以及按导出记录数加权的 `rollout/raw_reward`。保留 LR `1e-6` / cosine、每轮 3 次更新、16K 训练预算。
+- **结果**：完成 21 次更新（7 rollouts），最大 grad norm 4.100425；随后主动停止，继续对齐学习率和训练配置。
+- **口径**：shaped reward 为 `(成功 ? 1 : -1) - 0.05 × T/30 - 0.2 × I(T>=30)`。成功率另按 session 去重统计，不能和 `rollout/raw_reward` 混用。
 
-直接编辑 [app/osworld_config.yaml](app/osworld_config.yaml)，后续启动的 session 会读取它：
+### 2026-10-12 21:02 — LR 5e-6 / constant，32K，冻结 vision
 
-| 参数                                              | 当前值               | 用途                             |
-| ------------------------------------------------- | -------------------- | -------------------------------- |
-| `max_turns`                                       | `30`                 | 每个任务最多执行的回合数         |
-| `max_image_history_length`                        | `2`                  | 保留的历史截图数量               |
-| `context_policy`                                  | `baseline`           | 对话上下文策略                   |
-| `temperature` / `top_p`                           | `1.0` / `1.0`        | agent 请求的采样参数             |
-| `max_tokens`                                      | `8192`               | 单次回复的 token 上限            |
-| `llm_call_timeout_s`                              | `600`                | 单次模型请求的超时秒数           |
-| `max_llm_call_retries` / `llm_call_backoff_s`     | `3` / `5`            | 请求尝试次数上限与重试等待秒数   |
-| `provider_name` / `snapshot_name`                 | `nex` / `init_state` | 桌面环境 provider 与默认快照名称 |
-| `screen_width` / `screen_height`                  | `1920` / `1080`      | 桌面分辨率                       |
-| `headless` / `require_a11y_tree`                  | `true` / `false`     | 无头模式与是否请求无障碍树       |
-| `tool_retriever_backend` / `tool_retriever_top_k` | `bm25` / `18`        | 工具检索方式与数量               |
+- **相对上次**：LR `1e-6 → 5e-6`，cosine → constant；训练 token 预算 16K → 32K；冻结 vision trunk。保留每轮 3 次更新、KL `0.02`、reference 每 rollout 更新、selective recompute；未开启 sandbox prelaunch。
+- **结果**：完成 147 次更新（49 rollouts）后主动停止，进入预启动实验。出现 4 次 `grad_norm > 10`：更新 11、35、71、110，均是所在 rollout 的第 3 次更新；最大 grad norm 491186.094，最大未乘系数的 `train/kl_loss` 14710.166。
+- **发现**：大梯度尖峰与重复更新后的 k3 KL 异常值相关。grad norm 是裁剪前值，`clip_grad=1.0` 不代表该指标必须小于 1。
 
-调整 `max_turns` 时，同步修改训练脚本中的 `OSWORLD_MAX_STEPS_REF`，保持奖励计算的
-步数基准一致；调整 `max_tokens` 时，同步检查脚本中的 `--rollout-max-response-len`。
+### 2026-10-13 22:15 — 开启 sandbox prelaunch
 
-## 4. 原本参数在哪里修改
+- **相对上次**：开启 `agentic-prelaunch`，active 和预启动共享 12 个 group permits，最多 96 个 session；其余保留 32K、每轮 3 次更新、KL `0.02`。
+- **结果**：停止前日志记录 14 次更新。第 3 次更新再次出现尖峰：grad norm 189.610、未乘系数的 KL loss 2.846，KL 项约占该点 total loss 的 96.5%。预启动没有消除这个训练稳定性问题。
+- **后续**：将 KL 系数降至 `0.001`，每轮更新次数减至 2。没有逐 token 或分离 PG/KL 梯度证据，暂不把 KL 异常归因到具体 token；也未得到控制其他变量后的 prelaunch 独立加速比。
 
-训练参数仍集中在 [run_qwen3vl_8B_osworld_outcome.sh](run_qwen3vl_8B_osworld_outcome.sh)。
-路径、Nex 凭据和运行时环境放在 `env.local.sh`；单个 session 的桌面和模型请求
-参数放在 [app/osworld_config.yaml](app/osworld_config.yaml)；训练任务列表放在
-[scripts/train_tasks.txt](scripts/train_tasks.txt)。
+### 2026-10-14 00:58 — KL 0.001、每轮 2 次更新、24K，开启 dynamic filter
 
-### 训练脚本参数
+- **相对上次**：KL `0.02 → 0.001`；每轮更新 `3 → 2`，每次更新的逻辑轨迹数 `32 → 48`；训练预算 `32K → 24K`；开启基于轨迹 outcome 的 dynamic filter。保留 LR `5e-6`、prelaunch、冻结 vision 和每 rollout 更新 reference。
+- **结果**：完成 2 次更新，最大 grad norm 1.159800，未出现大于 10 的尖峰；随后按要求主动停止并关闭 dynamic filter。窗口过短，不能据此判断长期稳定性或过滤收益。
 
-| 参数                          |         默认值 | 修改位置和作用                                                                           |
-| ----------------------------- | -------------: | ---------------------------------------------------------------------------------------- |
-| `ROLLOUT_BATCH_SIZE`          |           `12` | 直接修改 `run_qwen3vl_8B_osworld_outcome.sh`；每个 rollout 的任务组数。                  |
-| `N_SAMPLES_PER_PROMPT`        |            `8` | 直接修改启动脚本；每个任务组生成的 session 数。默认每轮为 `12 x 8 = 96` 个 session。     |
-| `OSWORLD_UPDATES_PER_ROLLOUT` |            `3` | 环境变量或启动脚本；每轮 rollout 切分的 optimizer update 数，只允许 `1`、`2`、`3`、`6`。 |
-| `OSWORLD_LEARNING_RATE`       |         `1e-6` | 环境变量或启动脚本；Adam 学习率。                                                        |
-| `NUM_ROLLOUT`                 |           `10` | 环境变量或启动脚本；rollout 总轮数。                                                     |
-| `OSWORLD_LR_DECAY_ITERS`      | `45 x updates` | 环境变量或启动脚本；cosine 学习率衰减的 optimizer update 总数。                          |
+### 2026-10-14 01:48 — 关闭 dynamic filter，开始持续训练
 
-`ROLLOUT_BATCH_SIZE` 和 `N_SAMPLES_PER_PROMPT` 当前是脚本中的固定值；其余四项
-支持环境变量覆盖。例如：
+- **相对上次**：仅关闭 dynamic filter；保留 KL `0.001`、每轮 2 次更新、24K、LR `5e-6` / constant、prelaunch 和冻结 vision。
+- **结果快照：2026-10-14 13:20:39**：完成 27 rollouts、54 次更新（0–53）；grad norm 最小/平均/最大为 **0.561670 / 0.954595 / 1.337857**，`grad_norm > 10` 为 **0 次**；最大未乘系数的 KL loss **0.003474**。该窗口内原来的大幅梯度尖峰未再出现。
+- **曲线**：rollout 0 → 26，raw reward `-0.403194 → 0.144336`，session 成功率 `48.96% → 80.21%`；最新 actor training MFU 约 `74.39%`。首尾两个点不代表单调上涨或独立评测成绩，actor MFU 也不代表整个 rollout 周期的利用率。
+- **结论范围**：KL 系数、更新次数和 token 预算共同变化，不能把稳定性改善单独归因于 KL 系数；实验仍在运行，尚未完成 200 rollouts。
 
-```bash
-OSWORLD_UPDATES_PER_ROLLOUT=1 \
-OSWORLD_LEARNING_RATE=5e-7 \
-NUM_ROLLOUT=20 \
-bash examples/osworld_agentic/run_qwen3vl_8B_osworld_outcome.sh
-```
+### 2026-10-14 — 当前实验期间的代码与文档整理，未重启
 
-默认配置下，`96` 个 session 分成 `3` 个 update，框架计算得到的全局 batch size
-为 `32`。`NUM_ROLLOUT` 增大不会自动改变默认的学习率衰减周期；要改变衰减周期，
-显式设置 `OSWORLD_LR_DECAY_ITERS`。修改 batch、采样数或 update 数时，要同时
-检查 Nex workspace 配额、`OSWORLD_MAX_CONCURRENT_GROUPS` 和 Ray GPU 资源。
-
-### 固定的训练和并行参数
-
-以下参数也在 `run_qwen3vl_8B_osworld_outcome.sh` 中，当前配方固定为 8 GPU：
-
-| 参数                             |                       当前值 | 说明                                       |
-| -------------------------------- | ---------------------------: | ------------------------------------------ |
-| `--resource`                     | `actor=[1,8], rollout=[1,8]` | Ray actor 和 rollout 资源。                |
-| `--tensor-model-parallel-size`   |                          `4` | Megatron TP。                              |
-| `--pipeline-model-parallel-size` |                          `1` | Megatron PP。                              |
-| `--rollout-num-gpus-per-engine`  |                          `2` | 每个 SGLang rollout engine 使用的 GPU 数。 |
-| `--rollout-max-context-len`      |                      `32768` | rollout 上下文长度。                       |
-| `--rollout-max-response-len`     |                       `8192` | 单次模型回复上限。                         |
-| `--rollout-max-prompt-len`       |                      `16384` | prompt 长度上限。                          |
-| `--micro-batch-size`             |                          `1` | 固定单样本 micro batch，控制训练显存峰值。 |
-| `--recompute-granularity`        |                       `full` | 全层重计算，降低训练激活显存。             |
-| `--sglang-mem-fraction-static`   |                        `0.7` | SGLang 静态显存比例。                      |
-| `--sglang-router-policy`         |         `consistent_hashing` | rollout 请求路由策略。                     |
-
-这些值涉及模型显存和 Ray 资源分配，修改后需要重新检查 TP、rollout engine
-数量以及每个节点的 GPU 数量。
-
-### Session 和桌面参数
-
-编辑 [app/osworld_config.yaml](app/osworld_config.yaml)：
-
-| 参数                                              |               当前值 | 作用                                                            |
-| ------------------------------------------------- | -------------------: | --------------------------------------------------------------- |
-| `max_turns`                                       |                 `30` | 每个任务最多执行的 agent 回合数。                               |
-| `max_image_history_length`                        |                  `2` | 模型请求保留的历史截图数量。                                    |
-| `context_policy`                                  |           `baseline` | 对话上下文策略。                                                |
-| `temperature` / `top_p`                           |        `1.0` / `1.0` | 模型采样参数。                                                  |
-| `max_tokens`                                      |               `8192` | 单次模型回复 token 上限。                                       |
-| `llm_call_timeout_s`                              |                `600` | 单次 Relax 模型请求超时。                                       |
-| `max_llm_call_retries` / `llm_call_backoff_s`     |            `3` / `5` | 请求重试次数和退避时间。                                        |
-| `provider_name` / `snapshot_name`                 | `nex` / `init_state` | OSWorld provider 和快照名；Nex 实际用 `NEX_TEMPLATE` 选择模板。 |
-| `screen_width` / `screen_height`                  |      `1920` / `1080` | 桌面分辨率。                                                    |
-| `tool_retriever_backend` / `tool_retriever_top_k` |        `bm25` / `18` | 本地工具检索方式和数量。                                        |
-
-调整 `max_turns` 时，需要同步检查启动脚本中的 `OSWORLD_MAX_STEPS_REF`；调整
-`max_tokens` 时，需要同步检查 `--rollout-max-response-len`。奖励和轨迹调试参数
-如 `OSWORLD_SHOT_DUMP_DIR`、`OSWORLD_SHOT_EVERY_N_TASKS` 可放在 `env.local.sh`。
-
-### 任务列表和数据
-
-编辑 [scripts/train_tasks.txt](scripts/train_tasks.txt) 可以更换训练任务。修改后
-重新运行 `scripts/prepare_data.py` 生成新的 `${DATA_DIR}/osworld/train.parquet`；
-启动脚本只会在 parquet 不存在或为空时自动生成，不会覆盖已有数据。
-
-## 5. 启动训练
-
-将 Qwen3-VL-8B-Thinking 模型文件准备到 `${MODEL_DIR}/Qwen3-VL-8B-Thinking/`，
-确认第 1～4 节的环境、数据和配置就绪后执行：
-
-```bash
-bash examples/osworld_agentic/run_qwen3vl_8B_osworld_outcome.sh
-```
-
-学习率、batch size、采样数、训练轮数、GPU 资源和并行配置等训练参数，直接在
-[run_qwen3vl_8B_osworld_outcome.sh](run_qwen3vl_8B_osworld_outcome.sh) 中修改。
-
-## 6. 运行产物与排查
-
-| 内容               | 路径                                                            |
-| ------------------ | --------------------------------------------------------------- |
-| 训练日志           | `${SAVE_DIR}/osworld-outcome-<时间戳>.log`                      |
-| Checkpoint         | `${SAVE_DIR}/Qwen3-VL-8B-osworld-outcome/`                      |
-| Session 日志       | `examples/osworld_agentic/log/agent/<run_tag>/<session_id>.log` |
-| 奖励明细           | `${SAVE_DIR}/reward_dump.jsonl`                                 |
-| 截图与动作（可选） | `${OSWORLD_SHOT_DUMP_DIR}/<task_id>/<时间戳>_<session标识>/`    |
-
-需要查看桌面截图和动作时，在 `env.local.sh` 中添加：
-
-```bash
-export OSWORLD_SHOT_DUMP_DIR="${SAVE_DIR}/screenshots"
-export OSWORLD_SHOT_EVERY_N_TASKS=1
-```
-
-将这两行放在 `SAVE_DIR` 设置之后。`OSWORLD_SHOT_EVERY_N_TASKS=1` 保存全部任务；
-默认值 `37` 按任务 ID 哈希抽样。每个被选中的 session 目录包含逐回合 PNG、
-`traj.jsonl` 和 `meta.json`。
-
-排查时优先看对应的 session 日志：
-
-- **导入失败或 session 提前退出**：检查 OSWorld / MCP 路径、外部目录布局和当前 Python 环境的依赖。
-- **沙箱创建失败**：检查 Nex 地址、workspace、API key、模板及配额，结合 session 日志中的错误定位。
-- **任务 setup 上传失败或返回 503**：检查全局 HTTP 代理是否影响了 Nex guest 的直连访问。
-- **奖励异常或任务总是到达回合上限**：查看奖励明细中的 `agent_turns`、`stop_reason`、
-  `advantage`、`group_std` 和 `group_kept`，再结合截图与动作记录定位。
-
-汇总奖励和成功率：
-
-```bash
-source examples/osworld_agentic/env.local.sh
-source examples/osworld_agentic/env.sh
-python3 examples/osworld_agentic/scripts/analyze_run.py \
-    --dump "${SAVE_DIR}/reward_dump.jsonl" \
-    --groups-per-step 12 \
-    --md
-```
-
-`--groups-per-step` 与训练脚本中的 `ROLLOUT_BATCH_SIZE` 保持一致。
-奖励明细里的 `step` 是后处理调用序号，分批传输时不等于 rollout 编号。
-统计脚本的 `cap` / “撞顶”列仍使用旧的 50-turn 阈值；当前 30-turn 配置请通过
-`stop_reason=max_turns` 判断是否达到上限。
+- **脚本修改，未实跑**：训练/log-prob token 上限改为 48K；当前运行仍是 24K。按 `create-training-script` 整理数组、直接启动和自动入口识别；固定 LR `5e-6`、200 rollouts、每轮 2 次更新，移除间接变量 `OSWORLD_UPDATES_PER_ROLLOUT`。保留默认阻塞提交、不保存 checkpoint 的要求。
+- **监控与 dump**：区分 session 与导出记录，补齐 session/task/turn/export 和解析重试标识；修正 raw reward 图的名称与纵轴；正常完成时关闭 metrics adapters。这些改动不构成一次新的对照实验。
+- **时间审计，12:15:20 快照**：24 个 `perf/step_time` 合计 10小时21分18.736秒，平均 **1553.281 秒/rollout**；加计时前初始化 3分57.812秒及尚未上报的尾段 1分27.839秒，与 Job 总时长 10小时26分44.387秒对齐。该指标每 rollout 一个点，包含两次更新；rollout 1–23 的累计时间与日志跨度仅差 0.458 秒。
+- **开源整理**：提供 `env.example.sh`，直接读取忽略的 `env.local.sh`，删除多余 `env.sh` 及其忽略例外；更新中英文文档，缺失/空任务清单明确报错。未公开内部端点、密钥或私有路径。
+- **验证结果**：提交前全部 pre-commit 通过，相关测试 61 passed、1 个 opt-in live Ray Serve 测试 skipped。隔离环境验证过脚本提交参数；48K 尚未完成真实 GPU 训练验证。共享前缀训练、广播和 GPU→CPU 拷贝仅做分析，没有实施新的优化算法。

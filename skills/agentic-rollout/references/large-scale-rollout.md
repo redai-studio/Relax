@@ -27,11 +27,9 @@ Read values from the exact checkout. Report only rows connected to the observed 
 | --- | --- |
 | `_DEFAULT_SESSION_SHARD_COUNT` | Controls both SessionShard actor count and Serve ingress replica count. Every ingress replica can route to every Shard. Increase only when group-affine per-Shard load needs redistribution, then validate the changed deployment topology. |
 | `_AGENTIC_CHAT_MAX_ONGOING_REQUESTS` | Per-ingress-replica ongoing request ceiling. Excess work queues because no separate Serve queue limit is configured. Increase only when ingress admission is the measured bottleneck. |
-| `_AGENTIC_SHARD_MAX_CONCURRENCY` | Default Ray actor lane used by long Chat and ordinary Session control methods. Increase when this lane delays first requests or lifecycle progress on a loaded Shard. |
-| `_SGLANG_PERMIT_CONCURRENCY` | Remote permit-acquire lane on the limiter hosted by Shard 0; Shard 0 local acquisition does not traverse this Ray lane. Increase when remote acquires queue before permit arbitration. |
-| `_SGLANG_PERMIT_CONTROL_CONCURRENCY` | Separate lane for remote permit release plus health, debug, trim, and Agentic KV metric RPCs. It does not own SGLang `close_session`. Increase only when this lane delays those operations. |
+| `_AGENTIC_SHARD_MAX_CONCURRENCY` | Ray actor width shared by all SessionShard methods. Increase when this lane delays first requests, lifecycle progress, or diagnostics on a loaded Shard. |
 | `_LAUNCHER_SERVER_BACKLOG` | Per-node launcher socket burst backlog, also subject to the host kernel limit. Inspect only when launch bursts produce socket accept failures. |
-| admission coordinator module `_MAX_CONCURRENCY` | Optional admission actor method width. Inspect only when program admission is enabled and the coordinator itself is demonstrably saturated. |
+| admission coordinator module `_MAX_CONCURRENCY` | Coordinator method width for fleet request permits and optional program admission. Inspect only when coordinator RPCs are demonstrably saturated. |
 
 The actual fleet generation-permit capacity is:
 

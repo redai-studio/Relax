@@ -231,9 +231,11 @@ def test_no_yaml_is_a_no_op(arguments_module):
     arguments_module.apply_custom_config_overrides(args)
 
 
-def test_sft_runs_skip_the_algorithm_recheck(arguments_module, tmp_path):
-    """SFT never selects an estimator, so a stale one must not block it."""
-    args = _overridable_args(tmp_path, "lr: 0.5\n", loss_type="sft", advantage_estimator="ppo")
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_offline_runs_skip_the_algorithm_recheck(arguments_module, tmp_path, loss_type):
+    """Offline training never selects an estimator, so a stale one must not
+    block it."""
+    args = _overridable_args(tmp_path, "lr: 0.5\n", loss_type=loss_type, advantage_estimator="ppo")
     arguments_module.apply_custom_config_overrides(args)
     assert args.lr == 0.5
 
@@ -382,3 +384,10 @@ def test_training_argument_entrypoint_revalidates_yaml_algorithm(arguments_modul
     args.custom_config_path = _write_yaml(tmp_path, "advantage_estimator: m2po\ncontext_parallel_size: 2\n")
     with pytest.raises(ValueError, match="context-parallel-size 1"):
         arguments_module.slime_validate_args(args)
+
+
+def test_yaml_rejects_removed_sft_objective(arguments_module, tmp_path):
+    args = _overridable_args(tmp_path, "sft_objective: dpo\n", loss_type="sft")
+
+    with pytest.raises(ValueError, match="sft_objective has been removed.*--loss-type"):
+        arguments_module.apply_custom_config_overrides(args)

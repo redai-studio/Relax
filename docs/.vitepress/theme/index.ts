@@ -35,7 +35,7 @@ export default {
     const initZoom = () => {
       mediumZoom('.main img:not(.VPImage)', {
         background: 'var(--vp-c-bg)',
-        margin: 24
+        margin: 24,
       })
     }
     onMounted(() => {
@@ -48,5 +48,5 @@ export default {
   },
   enhanceApp({ app, router, siteData }) {
     app.component('SwaggerUI', SwaggerUI)
-  }
+  },
 } satisfies Theme

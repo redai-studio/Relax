@@ -1,106 +1,135 @@
 #!/usr/bin/env python3
-"""Per-step readout for an OSWorld agentic run.
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+"""Summarize logical Sessions from reward_dump.jsonl by rollout, not optimizer
+step.
 
-Reads reward_dump.jsonl (written by app/reward_post_process.py when
-OSWORLD_REWARD_DUMP is set). Everything is derived from that one file:
-
-  step      = group_index // groups_per_step   (group_index is a global
-              monotonic counter, so this survives across the whole run)
-  accuracy  = sessions with outcome >= 0.5, over sessions in the step
-  group std = the per-group reward std the GRPO baseline divides by;
-              std == 0 means every attempt in that group scored the same,
-              so the group contributed no gradient
-  duration  = gap between consecutive steps' dump timestamps, i.e. one full
-              rollout + train cycle
-
-Usage:
-  python3 scripts/analyze_run.py --dump ../../reward_dump.jsonl --md
+The dump's one-based ``step`` identifies a completed prompt Group. Its
+``group_index`` is local to the custom advantage callback and can always be 0.
 """
 
 import argparse
 import json
-import statistics as st
+import statistics
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 
-p = argparse.ArgumentParser()
-p.add_argument("--dump", default="reward_dump.jsonl")
-p.add_argument("--groups-per-step", type=int, default=4, help="= rollout_batch_size")
-p.add_argument("--md", action="store_true", help="emit a markdown table")
-a = p.parse_args()
-
-rows = [json.loads(line) for line in open(a.dump, encoding="utf-8") if line.strip()]
-if not rows:
-    raise SystemExit("empty dump")
-
-steps: dict[int, list] = {}
-for r in rows:
-    steps.setdefault(r["group_index"] // a.groups_per_step, []).append(r)
-
-recs, prev = [], None
-for s in sorted(steps):
-    rs = steps[s]
-    stds = [v for _, v in sorted({(r["group_index"], r["group_std"]) for r in rs})]
-    turns = sorted(r["turns"] for r in rs)
-    succ = sum(1 for r in rs if r["outcome"] >= 0.5)
-    ts = datetime.fromisoformat(rs[0]["ts"])
-    recs.append(
-        {
-            "step": s,
-            "n": len(rs),
-            "succ": succ,
-            "acc": succ / len(rs),
-            "std_mean": st.mean(stds),
-            "std_min": min(stds),
-            "std_max": max(stds),
-            "dead": sum(1 for v in stds if v == 0),
-            "groups": len(stds),
-            "turn_med": st.median(turns),
-            "cap": sum(1 for t in turns if t >= 50),
-            "shaped": st.mean(r["shaped"] for r in rs),
-            "min": (ts - prev).total_seconds() / 60 if prev else None,
-            "ts": rs[0]["ts"][11:19],
+def summarize_run(
+    rows: list[dict[str, Any]],
+    *,
+    run_tag: str | None = None,
+    groups_per_rollout: int = 12,
+    samples_per_group: int = 8,
+    max_turns: int = 30,
+) -> list[dict[str, Any]]:
+    """Return Session-weighted metrics, rejecting ambiguous mixed-run input."""
+    if min(groups_per_rollout, samples_per_group, max_turns) <= 0:
+        raise ValueError("group sizes and max_turns must be positive")
+    tags = {row.get("run_tag", "") for row in rows}
+    if run_tag is None:
+        if len(tags) > 1:
+            raise ValueError("multiple run tags found; select one with --run-tag")
+        run_tag = next(iter(tags), "")
+    selected = [row for row in rows if row.get("run_tag", "") == run_tag]
+    if not selected:
+        raise ValueError(f"no reward records for run tag {run_tag!r}")
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in selected:
+        step = int(row["step"])
+        if step < 1:
+            raise ValueError("dump step must be a one-based Group counter")
+        groups[step].append(row)
+    rollouts: dict[int, list[int]] = defaultdict(list)
+    for step in groups:
+        rollouts[(step - 1) // groups_per_rollout].append(step)
+    results = []
+    previous_completion = None
+    for rollout_id, steps in sorted(rollouts.items()):
+        sessions = [row for step in sorted(steps) for row in groups[step]]
+        expected = set(range(rollout_id * groups_per_rollout + 1, (rollout_id + 1) * groups_per_rollout + 1))
+        complete = set(steps) == expected and all(len(groups[step]) == samples_per_group for step in steps)
+        for step in steps:
+            identities = [row["session"] for row in groups[step]]
+            if len(set(identities)) != len(identities):
+                raise ValueError(f"duplicate Session in dump Group {step}; possible concatenated/restarted run")
+            if len({row["group_kept"] for row in groups[step]}) != 1:
+                raise ValueError(f"inconsistent group_kept in dump Group {step}")
+        turns = [row["turns"] for row in sessions]
+        stds = [groups[step][0]["group_std"] for step in steps]
+        completion = max(datetime.fromisoformat(row["ts"]) for row in sessions)
+        explicit_caps = sum(row.get("stop_reason") == "max_turns" for row in sessions)
+        approximate_caps = sum(row.get("stop_reason") != "max_turns" and row["turns"] >= max_turns for row in sessions)
+        result = {
+            "run_tag": run_tag,
+            "rollout": rollout_id,
+            "complete": complete,
+            "groups": len(steps),
+            "sessions": len(sessions),
+            "successes": sum(row["outcome"] >= 0.5 for row in sessions),
+            "success_rate": statistics.mean(row["outcome"] >= 0.5 for row in sessions),
+            "turns": sum(turns),
+            "turn_mean": statistics.mean(turns),
+            "turn_median": statistics.median(turns),
+            "records": sum(row["records"] for row in sessions),
+            "extra_calls": sum(max(0, row["records"] - row["turns"]) for row in sessions),
+            "filtered_groups": sum(not groups[step][0]["group_kept"] for step in steps),
+            "std_mean": statistics.mean(stds),
+            "shaped_mean": statistics.mean(row["shaped"] for row in sessions),
+            "max_turns_explicit": explicit_caps,
+            "budget_hits_approximate": approximate_caps,
+            "completion_interval_min": (
+                (completion - previous_completion).total_seconds() / 60 if previous_completion else None
+            ),
         }
-    )
-    prev = ts
+        results.append(result)
+        previous_completion = completion
+    return results
 
-if a.md:
-    print("| step | 通过率 | shaped 均值 | group std (均值/最小/最大) | 无梯度组 | 轮数中位 | 撞顶 | 耗时(min) |")
-    print("|---:|---:|---:|:---|---:|---:|---:|---:|")
-    for r in recs:
-        d = f"{r['min']:.1f}" if r["min"] else "—"
-        print(
-            f"| {r['step']} | {r['succ']}/{r['n']} ({r['acc'] * 100:.0f}%) | {r['shaped']:+.3f} | "
-            f"{r['std_mean']:.3f} / {r['std_min']:.3f} / {r['std_max']:.3f} | "
-            f"{r['dead']}/{r['groups']} | {r['turn_med']:.0f} | {r['cap']}/{r['n']} | {d} |"
-        )
-else:
-    hdr = f"{'step':>4} {'acc':>9} {'shaped':>8} {'std_mean':>9} {'dead':>7} {'turn_med':>8} {'cap':>7} {'min':>6}"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in recs:
-        d = f"{r['min']:6.1f}" if r["min"] else "     —"
-        print(
-            f"{r['step']:>4} {r['succ']:>3}/{r['n']:<2}{r['acc'] * 100:>4.0f}% {r['shaped']:>+8.3f} "
-            f"{r['std_mean']:>9.3f} {r['dead']:>3}/{r['groups']:<3} {r['turn_med']:>8.0f} "
-            f"{r['cap']:>3}/{r['n']:<3} {d}"
-        )
 
-acc = [r["acc"] for r in recs]
-mins = [r["min"] for r in recs if r["min"]]
-print(
-    f"\n步数 {len(recs)} | 总通过率 {sum(r['succ'] for r in recs)}/{sum(r['n'] for r in recs)} "
-    f"= {sum(r['succ'] for r in recs) / sum(r['n'] for r in recs) * 100:.1f}%"
-)
-print(
-    f"通过率 前1/3 {st.mean(acc[: len(acc) // 3 or 1]) * 100:.1f}%  后1/3 {st.mean(acc[-(len(acc) // 3 or 1) :]) * 100:.1f}%"
-)
-print(
-    f"无梯度组 {sum(r['dead'] for r in recs)}/{sum(r['groups'] for r in recs)} "
-    f"= {sum(r['dead'] for r in recs) / sum(r['groups'] for r in recs) * 100:.0f}%"
-)
-if mins:
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dump", type=Path, default=Path("reward_dump.jsonl"))
+    parser.add_argument("--run-tag", help="required when dump contains multiple runs")
+    parser.add_argument("--groups-per-rollout", "--groups-per-step", type=int, default=12, dest="groups_per_rollout")
+    parser.add_argument("--samples-per-group", type=int, default=8)
+    parser.add_argument("--max-turns", type=int, default=30)
+    parser.add_argument("--md", action="store_true", help="emit a markdown table instead of JSON")
+    args = parser.parse_args()
+    try:
+        with args.dump.open(encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        results = summarize_run(
+            rows,
+            run_tag=args.run_tag,
+            groups_per_rollout=args.groups_per_rollout,
+            samples_per_group=args.samples_per_group,
+            max_turns=args.max_turns,
+        )
+    except (OSError, ValueError, KeyError) as exc:
+        parser.error(str(exc))
+    if not args.md:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+    print(f"Run: {results[0]['run_tag']}")
     print(
-        f"每步耗时 中位 {st.median(mins):.1f} min | 最快 {min(mins):.1f} | 最慢 {max(mins):.1f} "
-        f"| 剩余 150 步预计 {st.median(mins) * (150 - len(recs)) / 60:.1f} h"
+        "\n| rollout | 状态 | groups | Sessions | 成功率 | 环境步数 | 导出记录 | 额外调用 | 过滤组 | 明确耗尽/近似触顶 |"
     )
+    print("|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for row in results:
+        state = "完整" if row["complete"] else "不完整"
+        print(
+            f"| {row['rollout']} | {state} | {row['groups']} | {row['sessions']} | "
+            f"{row['successes']}/{row['sessions']} ({row['success_rate']:.2%}) | "
+            f"{row['turns']} | {row['records']} | {row['extra_calls']} | "
+            f"{row['filtered_groups']} | {row['max_turns_explicit']}/{row['budget_hits_approximate']} |"
+        )
+    print("\nrollout 不是 optimizer step。额外调用为 records−turns，不能仅据此判定重试原因。")
+    print("旧 dump 未区分 max_turns；turns≥预算仅计为近似触顶，也可能恰好在最后一步主动终止。")
+    print("过滤组按 group_kept 统计；其 policy advantage 为零，但 KL 项仍可能有梯度。")
+    print("completion_interval_min 为相邻轮末条 Group dump 的时间间隔，并非单独训练耗时。")
+
+
+if __name__ == "__main__":
+    main()

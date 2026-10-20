@@ -67,13 +67,11 @@ def test_capture_roundtrip_parity(tmp_path):
     record = make_capture_record("b-capture")
     bundle_path = build_bundle_from_record(record, tmp_path)
 
-    # The manifest must be derived from the frozen V1 capability matrix, not
+    # The manifest must be derived from the frozen V2 capability matrix, not
     # hard-coded by the capture layer.
     manifest = BundleReader(bundle_path).load().manifest
     for stage in (
         StageId.SAMPLE,
-        StageId.REWARD_RAW,
-        StageId.REWARD_POST_PROCESS,
         StageId.ADVANTAGE_KL,
         StageId.ADVANTAGE_ESTIMATE,
         StageId.LOSS_POLICY,
@@ -86,9 +84,8 @@ def test_capture_roundtrip_parity(tmp_path):
     assert report.first_divergent_stage is None
 
 
-def test_capture_manifest_reimplemented_marker():
+def test_capture_manifest_reuses_advantage_implementation():
     manifest = build_manifest_for_record(make_capture_record("b-marker"))
-    assert manifest.stage_contracts[StageId.REWARD_POST_PROCESS].implementation == "reimplemented"
     assert manifest.stage_contracts[StageId.ADVANTAGE_ESTIMATE].implementation == "reuse"
 
 
@@ -177,7 +174,7 @@ def _step_identity() -> Identity:
 
 
 def _step_config() -> RecomputeConfig:
-    return RecomputeConfig(advantage_estimator="grpo", n_samples_per_prompt=2)
+    return RecomputeConfig(advantage_estimator="grpo")
 
 
 def test_capture_enable_disable_active(tmp_path):
@@ -203,8 +200,6 @@ def test_capture_step_lifecycle(tmp_path):
     # stays None). The production hooks always set this; the test must too.
     step.stages = {
         StageId.SAMPLE,
-        StageId.REWARD_RAW,
-        StageId.REWARD_POST_PROCESS,
         StageId.ADVANTAGE_KL,
         StageId.ADVANTAGE_ESTIMATE,
         StageId.LOSS_POLICY,
@@ -290,11 +285,9 @@ def test_capture_rollout_roundtrip_parity(tmp_path):
     bundle_path = build_bundle_from_record(record, tmp_path)
 
     loaded = BundleReader(bundle_path).load()
-    # A rollout-level bundle declares only the reward → advantage chain; the
+    # A rollout-level bundle declares only the advantage chain; the
     # per-step loss stages are absent because their payloads are not captured.
     assert set(loaded.manifest.stage_contracts) == {
-        StageId.REWARD_RAW,
-        StageId.REWARD_POST_PROCESS,
         StageId.ADVANTAGE_KL,
         StageId.ADVANTAGE_ESTIMATE,
     }
@@ -306,6 +299,21 @@ def test_capture_rollout_roundtrip_parity(tmp_path):
     report = replay(bundle_path)
     assert report.passed
     assert report.first_divergent_stage is None
+
+
+def test_capture_rollout_preserves_per_token_rewards(tmp_path):
+    record = make_rollout_capture_record("b-rollout-dense")
+    record.rewards = [
+        torch.tensor([-1.0, -0.5]),
+        torch.tensor([1.0, 0.5]),
+        torch.tensor([-1.0, -0.5]),
+        torch.tensor([1.0, 0.5]),
+    ]
+    record.tensors["advantages"] = torch.cat(record.rewards)
+
+    bundle_path = build_bundle_from_record(record, tmp_path)
+
+    assert replay(bundle_path).passed
 
 
 def test_capture_rollout_lifecycle(tmp_path):
@@ -323,8 +331,7 @@ def test_capture_rollout_lifecycle(tmp_path):
     step.total_lengths = record.total_lengths
     step.loss_masks_tensor = record.loss_masks_tensor
     step.group_indices_tensor = record.group_indices_tensor
-    step.raw_rewards_tensor = record.raw_rewards_tensor
-    step.rewards_tensor = record.rewards_tensor
+    step.rewards = record.rewards
     end_rollout()
     disable()
 

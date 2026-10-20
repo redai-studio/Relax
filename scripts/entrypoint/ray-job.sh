@@ -76,9 +76,10 @@ echo "=== Reserving sglang port ranges on all GPU nodes ==="
 # Reserved ranges:
 #   15000-20000 — SGLang scheduler and bootstrap ports.
 #   30000-32768 — fallback range for SGLang port_base adjustments.
+#   41955 — monitoring scrape target; exclude from NCCL/Gloo ephemeral allocation.
 #   65001-65500 — exclude the upper ephemeral range to avoid bootstrap conflicts
 #                 on nodes whose ip_local_port_range extends above 65000.
-python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768,65001-65500" || echo "reserve_ports failed (non-fatal)"
+python ${DIR}/../tools/run_on_each_ray_node.py --timeout 30 "sysctl -w net.ipv4.ip_local_reserved_ports=15000-20000,30000-32768,41955,65001-65500" || echo "reserve_ports failed (non-fatal)"
 
 # Two run scenarios, distinguished by whether we are inside a ray job driver:
 #   A) Entry-point mode — `bash ray-job.sh <run-script>`: this script runs in the

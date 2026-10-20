@@ -10,6 +10,7 @@ from typing import Iterable, Tuple
 import torch
 
 from relax.utils.env import Envs, is_env_set
+from relax.utils.training.lora_grad_sync import inherit_lora_tp_grad_sync
 
 
 # Fixed name under which the trained policy LoRA adapter is registered on the rollout
@@ -659,6 +660,7 @@ __all__ = [
     "MEGATRON_TO_SGLANG_MODULES",
     "write_hf_peft_adapter",
     "extract_lora_delta",
+    "inherit_lora_tp_grad_sync",
     "install_gdn_gate_mask_hooks",
     "is_lora_enabled",
     "is_lora_merge_mode",

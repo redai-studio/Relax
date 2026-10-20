@@ -4,6 +4,8 @@
 
 from argparse import Namespace
 
+import pytest
+
 
 def _mk_actor_config(loss_type: str):
     return Namespace(
@@ -23,10 +25,11 @@ def _mk_actor_config(loss_type: str):
     )
 
 
-def test_actor_helpers_emit_sft_partition_under_sft_loss_type():
+@pytest.mark.parametrize("loss_type", ["sft", "dpo", "rm"])
+def test_actor_helpers_emit_sft_partition_for_offline_training(loss_type):
     from relax.engine.sft.runtime import sft_partition_id, sft_task_name
 
-    cfg = _mk_actor_config(loss_type="sft")
+    cfg = _mk_actor_config(loss_type=loss_type)
     cfg.start_rollout_id = 5
 
     assert sft_partition_id(cfg, 5) == "sft_5"

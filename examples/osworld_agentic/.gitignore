@@ -1,0 +1,9 @@
+/env.local.sh
+/env.local.sh.*
+/log/
+/cache/
+/.venv*/
+/screenshots/
+/rollout_result/
+/reward_dump*.jsonl
+/tensorboard_log/

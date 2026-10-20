@@ -33,6 +33,7 @@ from relax.utils.megatron_peft_utils import (
     build_lora_peft,
     count_adapter_parameters,
     exclude_frozen_lora_target_modules,
+    inherit_lora_tp_grad_sync,
     install_gdn_gate_mask_hooks,
     is_lora_adapter_mode,
     is_lora_adapter_param,
@@ -45,9 +46,11 @@ from relax.utils.misc import load_function
 from relax.utils.training.ppo_utils import (
     ensure_sequence_classification_head_trainable,
     install_critic_value_head_in_provider,
+    install_reward_model_head_in_provider,
     install_sequence_classification_head_in_provider,
 )
 
+from .arguments import _validate_linear_cp_mode
 from .conditional_branch_sync import install_conditional_branch_sync
 
 
@@ -246,6 +249,20 @@ def _install_cp_probe(model: torch.nn.Module) -> None:
     )
 
 
+def _call_model_provider(provider: Any, *args: Any, **kwargs: Any) -> GPTModel:
+    """Forward current MCore arguments while supporting older/custom
+    providers."""
+    parameters = inspect.signature(provider).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+            and parameters[key].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+    return provider(*args, **kwargs)
+
+
 def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -254,18 +271,24 @@ def get_model_provider_func(
     if getattr(args, "custom_model_provider_path", None):
 
         def wrapped_model_provider(
-            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None
+            pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None, **kwargs: Any
         ) -> GPTModel:
             custom_model_provider = load_function(args.custom_model_provider_path)
-            # Check if the custom provider supports vp_stage parameter
-            has_vp_stage = "vp_stage" in inspect.signature(custom_model_provider).parameters
-            if has_vp_stage:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-            else:
-                model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            model = _call_model_provider(
+                custom_model_provider,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=vp_stage,
+                **kwargs,
+            )
+            for module in model.modules():
+                if getattr(module, "config", None) is not None:
+                    _validate_linear_cp_mode(args, module.config)
             configure_mtp_detach_paths(args, model)
             # Apply critic output layer if needed
             install_critic_value_head_in_provider(model, role, post_process)
+            install_reward_model_head_in_provider(model, args, role, post_process)
+
             install_sequence_classification_head_in_provider(model, args, role, post_process)
             _maybe_mark_unsplit_forward(args, model)
             install_conditional_branch_sync(args, model)
@@ -281,6 +304,10 @@ def get_model_provider_func(
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
+        is_kimi_k3 = hasattr(provider, "kimi_kda_layers")
+        if is_kimi_k3:
+            from relax.models.kimi_k3.configuration import ARCHITECTURE_KEYS, configure_runtime
+
         # Override provider attributes with matching args values
         bridge_keys = [
             "attention_backend",
@@ -372,11 +399,14 @@ def get_model_provider_func(
             # "position_embedding_type", # Use default values of megatron-bridge, no need to pass
             # Dynamic CP related args
             "dynamic_context_parallel",
+            "linear_cp_mode",
         ]
 
         args_dict = vars(args)
         for attr in vars(provider):
             if attr in args_dict and attr in bridge_keys:
+                if is_kimi_k3 and attr in ARCHITECTURE_KEYS:
+                    continue
                 old_val = getattr(provider, attr)
                 new_val = args_dict[attr]
                 if getattr(args, "dynamic_context_parallel", False):
@@ -385,6 +415,14 @@ def get_model_provider_func(
                 if old_val != new_val:
                     logger.info(f"Override provider.{attr}: {old_val!r} -> {new_val!r}")
                 setattr(provider, attr, new_val)
+
+        if is_kimi_k3:
+            configure_runtime(provider, args)
+            # Fake-QAT aligns the training forward with the MXFP4 grid the
+            # rollout engine serves; gated by OPEN_TRAINING_MXFP4_FAKE_QAT_FLAG.
+            from relax.backends.megatron.fake_qat_mxfp4 import maybe_install_mxfp4_fake_qat
+
+            maybe_install_mxfp4_fake_qat()
 
         # Megatron-Bridge Qwen3.5-VL consumes ``vision_dp_when_cp`` to shard
         # the vision encoder input before its CP all-gather.  Relax's public
@@ -480,6 +518,7 @@ def get_model_provider_func(
                 )
                 provider.apply_dsa_kernel_fusion = want_fusion
 
+        _validate_linear_cp_mode(args, provider)
         provider.finalize()
 
         # Pickle provider for offline inspection / reproducibility (only on rank 0)
@@ -490,10 +529,19 @@ def get_model_provider_func(
         original_provide = provider.provide
 
         def provide_with_cp_probe(*p_args, **p_kwargs):
-            model = original_provide(*p_args, **p_kwargs)
+            # Bridge providers are their own TransformerConfig. MCore's config
+            # argument belongs to the raw/custom path; its process groups must
+            # still reach Bridge's GPTModel constructor.
+            p_kwargs.pop("config", None)
+            pg_collection = p_kwargs.pop("pg_collection", None)
+            if pg_collection is not None:
+                provider._pg_collection = pg_collection
+            model = _call_model_provider(original_provide, *p_args, **p_kwargs)
             configure_mtp_detach_paths(args, model)
             post_process = p_kwargs.get("post_process", p_args[1] if len(p_args) > 1 else True)
             install_critic_value_head_in_provider(model, role, post_process, stash_lm_head=True)
+            install_reward_model_head_in_provider(model, args, role, post_process, stash_lm_head=True)
+
             install_sequence_classification_head_in_provider(
                 model,
                 args,
@@ -511,7 +559,13 @@ def get_model_provider_func(
 
         return provide_with_cp_probe
 
-    def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
+    def model_provider(
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: int | None = None,
+        config: TransformerConfig | None = None,
+        pg_collection: Any = None,
+    ) -> GPTModel:
         """Builds the model.
 
         If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -527,7 +581,9 @@ def get_model_provider_func(
         use_te = args.transformer_impl == "transformer_engine"
 
         # Experimental loading arguments from yaml
-        config: TransformerConfig = core_transformer_config_from_args(args)
+        if config is None:
+            config = core_transformer_config_from_args(args)
+        _validate_linear_cp_mode(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -597,6 +653,8 @@ def get_model_provider_func(
 
         if vp_stage is not None:
             kwargs["vp_stage"] = vp_stage
+        if pg_collection is not None:
+            kwargs["pg_collection"] = pg_collection
 
         if args.mtp_num_layers:
             from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
@@ -615,6 +673,8 @@ def get_model_provider_func(
 
         configure_mtp_detach_paths(args, model)
         install_critic_value_head_in_provider(model, role, post_process)
+        install_reward_model_head_in_provider(model, args, role, post_process)
+
         install_sequence_classification_head_in_provider(model, args, role, post_process)
 
         _maybe_mark_unsplit_forward(args, model)
@@ -663,14 +723,13 @@ def wrap_model_provider_with_lora(original_provider, args):
         return original_provider
 
     def wrapped_provider(pre_process=True, post_process=True, vp_stage=None, **kwargs):
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         try:
             peft = build_lora_peft(args)
@@ -685,6 +744,7 @@ def wrap_model_provider_with_lora(original_provider, args):
                     model, list(peft.target_modules), args.freeze_params_name_list
                 )
             model = peft(model, training=True)
+            inherit_lora_tp_grad_sync(model)
             ensure_sequence_classification_head_trainable(model, args, "actor", post_process)
             gdn_gate_masked = install_gdn_gate_mask_hooks(model) if is_lora_adapter_mode(args) else 0
             adapter_names = [n for n, _ in model.named_parameters() if is_lora_adapter_param(n)]
@@ -739,14 +799,13 @@ def wrap_model_provider_with_freeze(original_provider, args):
         if vp_stage is None and mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
             vp_stage = mpu.get_virtual_pipeline_model_parallel_rank()
 
-        sig = inspect.signature(original_provider)
-        accepts_vp_stage = "vp_stage" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        model = _call_model_provider(
+            original_provider,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+            **kwargs,
         )
-        if accepts_vp_stage:
-            model = original_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-        else:
-            model = original_provider(pre_process=pre_process, post_process=post_process)
 
         freeze_model_params(model, args)
         ensure_sequence_classification_head_trainable(model, args, "actor", post_process)

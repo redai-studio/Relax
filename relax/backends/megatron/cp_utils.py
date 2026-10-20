@@ -5,7 +5,14 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from megatron.core import mpu
+
+
+try:
+    from megatron.core import mpu
+except ModuleNotFoundError as exc:
+    if exc.name not in {"megatron", "megatron.core"}:
+        raise
+    mpu = None
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.reloadable_process_group import ReloadableProcessGroup
@@ -366,8 +373,9 @@ def get_cp_local_num_tokens(
     ``* cp_size`` on the loss/metric — a coupling that only cancels when CP is
     uniform across the step.
 
-    For ``cp_size == 1`` this reduces to the total number of unmasked tokens
-    (preserving the historical per-sample ``clamp_min(., 1)``).
+    For ``cp_size == 1`` this is exactly the total number of unmasked tokens.
+    Empty responses contribute zero, rather than being counted as one token; this
+    matches the CP-partitioned path and the global-valid-token loss definition.
     """
     local_mask_sums = get_cp_local_mask_sums(
         total_lengths,
@@ -379,10 +387,7 @@ def get_cp_local_num_tokens(
         dynamic_cp_size,
         dynamic_cp_rank,
     )
-    cp_size = dynamic_cp_size if dynamic_cp_size is not None else mpu.get_context_parallel_world_size()
-    if cp_size == 1:
-        local_mask_sums = torch.clamp_min(local_mask_sums, 1)
-    return local_mask_sums.sum()
+    return local_mask_sums.sum().to(torch.int)
 
 
 def all_gather_with_cp(

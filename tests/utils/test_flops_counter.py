@@ -54,7 +54,7 @@ def test_get_device_peak_flops_defaults_to_cpu_when_device_properties_unavailabl
     def get_device_properties():
         raise AttributeError("module 'torch.cpu' has no attribute 'get_device_properties'")
 
-    device_module.get_device_properties = get_device_properties
+    device_module.device_module = types.SimpleNamespace(get_device_properties=get_device_properties)
     monkeypatch.setitem(sys.modules, "relax.utils.device", device_module)
 
     result = get_device_peak_flops(unit="T")

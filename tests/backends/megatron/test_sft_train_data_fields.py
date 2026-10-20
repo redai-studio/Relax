@@ -5,11 +5,14 @@ partition naming."""
 
 from argparse import Namespace
 
+import pytest
+import torch
+
 
 def _mk_actor_args(loss_type: str):
     return Namespace(
         loss_type=loss_type,
-        compute_advantages_and_returns=(loss_type != "sft"),
+        compute_advantages_and_returns=(loss_type not in {"sft", "dpo", "rm"}),
         debug_train_only=False,
         offload_train=False,
         offload_rollout=False,
@@ -41,6 +44,51 @@ def test_sft_data_fields_excludes_rl_only_keys():
         assert forbidden not in fields, f"SFT data_fields leaked RL key: {forbidden}"
 
 
+@pytest.mark.parametrize("loss_type", ["dpo", "rm"])
+def test_preference_data_fields_keep_pairs_atomic(loss_type):
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type=loss_type)
+
+    fields = build_data_fields(args)
+
+    assert fields == [
+        "pair_ids",
+        "chosen_tokens",
+        "rejected_tokens",
+        "chosen_loss_masks",
+        "rejected_loss_masks",
+        "chosen_total_lengths",
+        "rejected_total_lengths",
+    ]
+
+
+def test_preference_rows_expand_before_generic_rollout_post_processing(monkeypatch):
+    pytest.importorskip("megatron.core")
+    from relax.utils.data import stream_dataloader
+
+    rollout_data = {
+        "pair_ids": [17],
+        "chosen_tokens": [[1, 2, 3]],
+        "rejected_tokens": [[1, 4]],
+        "chosen_loss_masks": [[0, 1, 1]],
+        "rejected_loss_masks": [[0, 1]],
+        "chosen_total_lengths": [3],
+        "rejected_total_lengths": [2],
+    }
+    args = Namespace(qkv_format="thd", is_vl_model=False, uses_unsplit_forward=False, use_opd=False)
+    monkeypatch.setattr(stream_dataloader.device_utils, "make_current_torch_device", lambda: torch.device("cpu"))
+
+    stream_dataloader.post_process_rollout_data(args, rollout_data)
+
+    assert [tensor.tolist() for tensor in rollout_data["tokens"]] == [[1, 2, 3], [1, 4]]
+    assert [tensor.tolist() for tensor in rollout_data["loss_masks"]] == [[0, 1, 1], [0, 1]]
+    assert "pair_ids" not in rollout_data
+    assert rollout_data["preference_pair_ids"] == [17]
+    assert rollout_data["preference_branch_pair_ids"] == [17, 17]
+    assert rollout_data["preference_pair_costs"] == [5]
+
+
 def test_sequence_classification_sft_requests_classification_labels():
     from relax.utils.training.data_fields import build_data_fields
 
@@ -54,7 +102,7 @@ def test_sequence_classification_sft_requests_classification_labels():
 
 
 def test_rl_data_fields_include_replay_metadata():
-    """RL training exposes sample identity and reward metadata for replay."""
+    """RL training exposes sample and group identity for replay."""
     from relax.utils.training.data_fields import build_data_fields
 
     args = _mk_actor_args(loss_type="policy_loss")
@@ -67,7 +115,6 @@ def test_rl_data_fields_include_replay_metadata():
         "rewards",
         "sample_indices",
         "sample_index_mask_sums",
-        "raw_reward",
         "group_index",
     ):
         assert required in fields
@@ -85,3 +132,20 @@ def test_sft_partition_naming_uses_sft_prefix():
     rl_args = _mk_actor_args(loss_type="policy_loss")
     assert sft_partition_id(rl_args, 7) == "train_7"
     assert sft_task_name(rl_args, component="backend") == "train"
+
+
+def test_image_preprocess_on_rank_requests_descriptor_field():
+    """--sft-image-preprocess-on-rank swaps the pixel payload for image refs."""
+    from relax.utils.data.image_refs import SFT_IMAGE_REFS_FIELD
+    from relax.utils.training.data_fields import build_data_fields
+
+    args = _mk_actor_args(loss_type="sft")
+    args.multimodal_keys = {"image": "images"}
+
+    assert SFT_IMAGE_REFS_FIELD not in build_data_fields(args)
+
+    args.sft_image_preprocess_on_rank = True
+    fields = build_data_fields(args)
+
+    assert SFT_IMAGE_REFS_FIELD in fields
+    assert "multimodal_train_inputs" in fields  # the producer grid stays

@@ -1,0 +1,40 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
+# Qwen3.5-9B elastic rollout profile: start with two 1-GPU rollout engines
+# beside the 4-GPU actor on the initial 8-GPU node.  The first two scale-outs
+# can use that node's two remaining GPUs; additional workers can then grow
+# rollout to eight engines total.
+enabled: true
+
+min_engines: 2
+max_engines: 8
+
+# Deliberately responsive for elastic rollout validation.  Scale out one
+# engine at a time so each Ray transition remains observable.
+scale_out_cooldown_secs: 30.0
+scale_in_cooldown_secs: 300.0
+metrics_interval_secs: 5.0
+evaluation_interval_secs: 10.0
+condition_window_secs: 30.0
+
+min_coverage_scale_out: 0.5
+min_coverage_scale_in: 1.0
+
+rollout_service_url: "http://localhost:8000/rollout"
+
+scale_out_policy:
+  # H20 validation load observes about 22% usage before scaling.
+  token_usage_threshold: 0.15
+  queue_depth_per_engine: 1
+  queue_time_p95_threshold: 1.0
+  ttft_p95_threshold: 2.0
+  condition_duration_secs: 20.0
+  max_delta: 1
+
+scale_in_policy:
+  token_usage_threshold: 0.10
+  queue_depth_threshold: 0
+  throughput_variance_threshold: 0.05
+  condition_duration_secs: 300.0
+  max_delta: 1
+  projected_usage_max: 0.30

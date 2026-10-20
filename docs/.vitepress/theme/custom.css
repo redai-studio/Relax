@@ -43,7 +43,7 @@
  *   in custom container, badges, etc.
  * -------------------------------------------------------------------------- */
 
- :root {
+:root {
   --vp-c-default-1: var(--vp-c-gray-1);
   --vp-c-default-2: var(--vp-c-gray-2);
   --vp-c-default-3: var(--vp-c-gray-3);
@@ -73,10 +73,12 @@
   --vp-c-tertiary: #bda2ff;
 
   /* Typography — Space Grotesk for headlines, Manrope for body, Inter for labels */
-  --vp-font-family-base: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --vp-font-family-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", Consolas, monospace;
-  --vp-font-family-headline: "Space Grotesk", sans-serif;
-  --vp-font-family-label: "Inter", sans-serif;
+  --vp-font-family-base:
+    'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --vp-font-family-mono:
+    'JetBrains Mono', 'Fira Code', 'SF Mono', 'Cascadia Code', Consolas, monospace;
+  --vp-font-family-headline: 'Space Grotesk', sans-serif;
+  --vp-font-family-label: 'Inter', sans-serif;
 }
 
 /**
@@ -101,11 +103,7 @@
 
 :root {
   --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: -webkit-linear-gradient(
-    120deg,
-    #e8384a 30%,
-    #ef6471
-  );
+  --vp-home-hero-name-background: -webkit-linear-gradient(120deg, #e8384a 30%, #ef6471);
 }
 
 /**
@@ -248,7 +246,7 @@
 
 .VPHome .VPFeature .title {
   color: #f0edf1 !important;
-  font-family: var(--vp-font-family-headline, "Space Grotesk", sans-serif) !important;
+  font-family: var(--vp-font-family-headline, 'Space Grotesk', sans-serif) !important;
   font-weight: 700 !important;
   letter-spacing: -0.3px !important;
 }
@@ -257,7 +255,7 @@
   flex-basis: 100% !important;
   color: #acaaae !important;
   padding-top: 4px !important;
-  font-family: var(--vp-font-family-base, "Manrope", sans-serif) !important;
+  font-family: var(--vp-font-family-base, 'Manrope', sans-serif) !important;
 }
 
 /* Feature SVG icon — duotone colored icon containers */
@@ -390,11 +388,11 @@
 }
 
 /* Fallback for icons without color class */
-.VPHome .VPFeature .icon:not(:has([class^="icon-"])) {
+.VPHome .VPFeature .icon:not(:has([class^='icon-'])) {
   background: rgba(255, 255, 255, 0.08) !important;
   border: 1px solid rgba(255, 255, 255, 0.1) !important;
 }
-.VPHome .VPFeature .icon:not(:has([class^="icon-"])) svg {
+.VPHome .VPFeature .icon:not(:has([class^='icon-'])) svg {
   stroke: #e2e8f0 !important;
 }
 
@@ -444,33 +442,25 @@
   margin-top: 16px;
 }
 
-/* Nav bar: make it dark & translucent on home pages */
-.VPNav {
-  transition: background 0.3s ease;
-}
-
-.is-home ~ .VPNav,
-body:has(.VPContent.is-home) .VPNav {
+/* Nav bar: dark & translucent on home; keep blur off VPNav so the fixed
+   mobile menu stays viewport-relative. */
+body:has(.VPContent.is-home) .VPNavBar {
   background: rgba(14, 14, 17, 0.6) !important;
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-}
-
-body:has(.VPContent.is-home) .VPNavBar {
-  background: transparent !important;
   border-bottom-color: rgba(255, 255, 255, 0.04) !important;
 }
 
 /* Nav bar title: use headline font */
 .VPNavBarTitle .title {
-  font-family: var(--vp-font-family-headline, "Space Grotesk", sans-serif) !important;
+  font-family: var(--vp-font-family-headline, 'Space Grotesk', sans-serif) !important;
   font-weight: 700 !important;
   letter-spacing: -0.5px !important;
 }
 
 /* Nav links: use headline font with tracking */
 .VPNavBarMenu a {
-  font-family: var(--vp-font-family-headline, "Space Grotesk", sans-serif) !important;
+  font-family: var(--vp-font-family-headline, 'Space Grotesk', sans-serif) !important;
   letter-spacing: -0.2px !important;
 }
 
@@ -484,7 +474,15 @@ body:has(.VPContent.is-home) .VPNavBar {
 /* Dark body background & unified font for the home page */
 body:has(.VPContent.is-home) {
   background: #0e0e11;
-  font-family: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family:
+    'Manrope',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -504,7 +502,7 @@ body:has(.VPContent.is-home) {
 
 /* Brand button: ensure it pops on dark bg with neon glow */
 .VPHome .VPButton.brand {
-  font-family: var(--vp-font-family-headline, "Space Grotesk", sans-serif) !important;
+  font-family: var(--vp-font-family-headline, 'Space Grotesk', sans-serif) !important;
   font-weight: 600 !important;
   letter-spacing: -0.2px !important;
   box-shadow: 0 0 20px rgba(232, 56, 74, 0.25);
@@ -516,7 +514,7 @@ body:has(.VPContent.is-home) {
 }
 
 .VPHome .VPButton.alt {
-  font-family: var(--vp-font-family-headline, "Space Grotesk", sans-serif) !important;
+  font-family: var(--vp-font-family-headline, 'Space Grotesk', sans-serif) !important;
   font-weight: 500 !important;
   letter-spacing: -0.2px !important;
 }

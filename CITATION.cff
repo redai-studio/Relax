@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: 'If you find Relax useful in your research, please cite it as below.'
+type: software
+title: 'Relax: An Asynchronous Reinforcement Learning Engine for Omni-Modal Post-Training at Scale'
+authors:
+  - name: 'Relax Contributors'
+repository-code: 'https://github.com/redai-studio/Relax'
+url: 'https://arxiv.org/abs/2604.11554'
+preferred-citation:
+  type: software
+  title: 'Relax: An Asynchronous Reinforcement Learning Engine for Omni-Modal Post-Training at Scale'
+  authors:
+    - name: 'Relax Contributors'
+  url: 'https://arxiv.org/abs/2604.11554'
+  year: 2026

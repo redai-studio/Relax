@@ -155,6 +155,10 @@ def main(args):
         _ctrl = Controller.__new__(Controller)
         _ctrl.__init__(args, runtime_env)
         _ctrl.training_loop()
+        if getattr(args, "use_metrics_service", False):
+            # ClearML lives in the Serve replica; killing it without closing
+            # its Task makes a completed run appear non-responsive.
+            serve.get_app_handle("metrics").finish.remote().result(timeout_s=60)
     except Exception as e:
         logger.exception(f"Training startup or loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)

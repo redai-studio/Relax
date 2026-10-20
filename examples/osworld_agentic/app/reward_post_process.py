@@ -40,6 +40,15 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+from relax.engine.filters.base_types import DynamicFilterOutput
+
+
+if TYPE_CHECKING:
+    from argparse import Namespace
+
+    from relax.utils.types import Sample
 
 
 _DUMP_STEP = 0
@@ -81,10 +90,29 @@ def _turns(sample, n_records: int) -> int:
     return max(n_records, 1)
 
 
-def post_process_rewards(args, samples):
+def shape_outcome_reward(outcome: float, turns: int) -> float:
+    """Return the handoff recipe's trajectory reward before normalization."""
     coef = _f("OSWORLD_LENGTH_PENALTY_COEF", 0.05)
     cap = _f("OSWORLD_CAP_PENALTY", 0.2)
     max_steps_ref = max(1, int(_f("OSWORLD_MAX_STEPS_REF", 50)))
+    value = (1.0 if outcome >= 0.5 else -1.0) - coef * (turns / max_steps_ref)
+    return value - cap if turns >= max_steps_ref else value
+
+
+def compute_legacy_raw_reward(samples: list) -> float:
+    """Match the handoff training metric: shaped reward averaged over
+    exports."""
+    sessions: dict = {}
+    for position, sample in enumerate(samples):
+        sessions.setdefault(_session_key(sample, position), []).append(sample)
+    total = 0.0
+    for records in sessions.values():
+        first = records[0]
+        total += len(records) * shape_outcome_reward(float(first.metadata["outcome"]), _turns(first, len(records)))
+    return total / len(samples)
+
+
+def post_process_rewards(args, samples):
     per_traj_norm = _f("OSWORLD_PER_TRAJ_NORM", 1.0) != 0.0
     # upstream paper Table 6: group-level accuracy filter (acc_lo, acc_hi) = (0.05, 0.95)
     acc_lo = _f("OSWORLD_ACC_LO", 0.05)
@@ -110,10 +138,7 @@ def post_process_rewards(args, samples):
             turns = _turns(samples[positions[0]], len(positions))
             traj_turns[key] = turns
             raw = outcomes[positions[0]]
-            outcome = 1.0 if float(raw if raw is not None else 0.0) >= 0.5 else -1.0
-            value = outcome - coef * (turns / max_steps_ref)
-            if turns >= max_steps_ref:
-                value -= cap
+            value = shape_outcome_reward(float(raw if raw is not None else 0.0), turns)
             for position in positions:
                 shaped[position] = value
 
@@ -190,3 +215,54 @@ def post_process_rewards(args, samples):
             pass  # diagnostics must never break a training step
 
     return shaped, advantages
+
+
+def filter_outcome_group(args: Namespace, samples: list[Sample]) -> DynamicFilterOutput:
+    """Filter whole trajectories using outcome metadata, including reward-less
+    exports."""
+    del args
+    outcomes: dict[str, float] = {}
+    for position, sample in enumerate(samples):
+        key = _session_key(sample, position)
+        outcome = float(sample.metadata["outcome"])
+        if key in outcomes and outcomes[key] != outcome:
+            raise ValueError("OSWorld turn exports disagree on trajectory outcome")
+        outcomes[key] = outcome
+    if not outcomes:
+        return DynamicFilterOutput(keep=False, reason="empty_group")
+    accuracy = sum(outcome >= 0.5 for outcome in outcomes.values()) / len(outcomes)
+    keep = _f("OSWORLD_ACC_LO", 0.05) < accuracy < _f("OSWORLD_ACC_HI", 0.95)
+    return DynamicFilterOutput(keep=keep, reason=None if keep else f"outcome_accuracy_{accuracy:g}")
+
+
+def compute_advantages(sessions: list[dict[str, dict]]) -> list[dict[str, float]]:
+    """Apply the recipe's trajectory normalization to one complete resident
+    Group.
+
+    The compatibility adapter keeps the original outcome shaping and zeroes
+    all-pass/all-fail groups, without treating turn exports as new attempts.
+    """
+    from argparse import Namespace
+
+    from relax.utils.types import Sample
+
+    samples = []
+    for session_index, exports in enumerate(sessions):
+        if not exports:
+            raise ValueError("OSWorld sessions must export at least one committed turn")
+        outcomes = {float(metadata["outcome"]) for metadata in exports.values()}
+        if len(outcomes) != 1:
+            raise ValueError("OSWorld turn exports disagree on trajectory outcome")
+        for metadata in exports.values():
+            samples.append(
+                Sample(
+                    group_index=0,
+                    session_id=str(metadata.get("session_id") or session_index),
+                    reward=float(metadata["outcome"]),
+                    metadata=metadata,
+                )
+            )
+    args = Namespace(reward_key=None, advantage_estimator="grpo", rewards_normalization=True)
+    _, advantages = post_process_rewards(args, samples)
+    values = iter(advantages)
+    return [{name: next(values) for name in exports} for exports in sessions]

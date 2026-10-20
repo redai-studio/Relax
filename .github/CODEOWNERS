@@ -124,7 +124,7 @@ tests/                     @NINGBENZHE @lijiaxing @Yangruipis
 # =============================================================================
 # CI/CD & DevOps
 # =============================================================================
-.github/          @NINGBENZHE @Yangruipis
+.github/          @NINGBENZHE @Yangruipis @SigureMo
 .gitlab/          @NINGBENZHE @Yangruipis
 
 # =============================================================================

@@ -86,7 +86,13 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
-        ns["main"](SimpleNamespace())
+        ns["main"](SimpleNamespace(use_metrics_service=True))
+    finish = ns["serve"].get_app_handle.return_value.finish.remote
+    if fail_at is None:
+        finish.assert_called_once_with()
+        finish.return_value.result.assert_called_once_with(timeout_s=60)
+    else:
+        finish.assert_not_called()
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
     assert events == ["serve", "ray", ("exit", expected)]

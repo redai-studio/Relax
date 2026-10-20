@@ -14,7 +14,9 @@ from tensordict import TensorDict
 from transfer_queue.dataloader.streaming_dataloader import StreamingDataLoader
 from transfer_queue.dataloader.streaming_dataset import StreamingDataset
 
+from relax.engine.sft.runtime import is_sft_mode
 from relax.utils import device as device_utils
+from relax.utils.data.image_refs import MULTIMODAL_PAYLOAD_FIELDS
 from relax.utils.env import Envs
 from relax.utils.opd.opd_utils import iter_opd_cp_float_fields
 from relax.utils.timer import Timer, timer
@@ -1018,7 +1020,7 @@ def get_data_from_transfer_queue(
             # including NestedTensor values reconstructed by TransferQueue.
             if "lengths" in k or "reward" in k or k in ("sample_index_mask_sums", "sample_indices"):
                 new_rollout_data[k] = _tensor_to_python_values(v)
-            elif k == "multimodal_train_inputs":
+            elif k in MULTIMODAL_PAYLOAD_FIELDS:
                 # Only reached on the per_rank_fetch path (the broadcast path
                 # extracts and NCCL-streams these before broadcast). Stored as a
                 # list of tensordicts / dicts; some entries may be None for
@@ -1082,13 +1084,41 @@ def get_data_from_transfer_queue(
 
     if post_process:
         post_process_rollout_data(args, rollout_data)
+    else:
+        _add_sft_token_lengths(args, rollout_data)
 
     return rollout_data, batch_meta
 
 
+def _add_sft_token_lengths(args: Namespace, rollout_data: dict[str, Any]) -> None:
+    """Count raw SFT mask positions before moving the masks to the GPU."""
+    if not is_sft_mode(args) or "learn_lengths" in rollout_data:
+        return
+    learn_lengths = []
+    for mask in rollout_data["loss_masks"]:
+        mask = torch.as_tensor(mask)
+        if mask.device.type != "cpu":
+            raise ValueError("SFT token lengths must be recorded while loss masks are on CPU")
+        learn_lengths.append(int((mask == 1).sum().item()))
+    rollout_data["learn_lengths"] = learn_lengths
+    rollout_data["non_learn_lengths"] = [
+        total - learn for total, learn in zip(rollout_data["total_lengths"], learn_lengths, strict=True)
+    ]
+
+
 def post_process_rollout_data(args, rollout_data):
+    _add_sft_token_lengths(args, rollout_data)
     # move tokens/loss_masks to GPU in-place as a list of tensors (downstream
     # code in this module expects lists of sequence tensors for packing)
+    if "tokens" not in rollout_data and "chosen_tokens" in rollout_data:
+        # Preference rows stay pair-atomic in TransferQueue. Expand them only
+        # after sampling, before the generic sequence post-processing below.
+        from relax.backends.megatron.data import expand_preference_rollout_data
+
+        expanded = expand_preference_rollout_data(rollout_data)
+        rollout_data.clear()
+        rollout_data.update(expanded)
+
     from relax.backends.megatron.cp_utils import maybe_padded_total_lengths, slice_log_prob_with_cp
 
     cuda_dev = device_utils.make_current_torch_device()

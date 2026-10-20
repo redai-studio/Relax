@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 960 530" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="agentic-reward-advantage-en-title agentic-reward-advantage-en-desc" id="agentic-reward-advantage-en-root">
+      <title id="agentic-reward-advantage-en-title">Choosing Agentic Rewards and Advantages</title>
+      <desc id="agentic-reward-advantage-en-desc">Flowchart for choosing an environment-provided reward, a reward function, or custom advantage based on advantage granularity and context fanout.</desc>
+      <defs>
+      <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap');
+      #agentic-reward-advantage-en-root { --paper: #f5f5f5;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #7a8399;
+      --rule: rgba(45, 49, 66, 0.12);
+      --font-sans: 'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      --font-serif: 'Instrument Serif', 'Songti SC', serif;
+      --font-mono: 'Geist Mono', 'Noto Sans Mono CJK SC', monospace; }
+      #agentic-reward-advantage-en-root { color: var(--ink); font-family: var(--font-sans); }</style>
+        <marker id="agentic-reward-advantage-en-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+        </marker>
+      </defs>
+
+      <rect width="960" height="530" fill="#f5f5f5"/>
+
+      <!-- Connectors -->
+      <line x1="540" y1="104" x2="680" y2="104" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="420" y1="160" x2="420" y2="176" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+
+      <path d="M 300 232 H 266 Q 260 232 260 226 V 226 Q 260 220 254 220 H 240" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="420" y1="288" x2="420" y2="312" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="540" y1="368" x2="620" y2="368" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="420" y1="424" x2="420" y2="448" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="700" y1="400" x2="700" y2="448" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+      <line x1="520" y1="476" x2="660" y2="476" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#agentic-reward-advantage-en-arrow)"/>
+
+      <!-- Connector labels -->
+      <rect x="584" y="80" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="612" y="89" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">PER TURN</text>
+
+      <rect x="436" y="164" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="472" y="173" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">PER CONTEXT</text>
+
+      <rect x="266" y="200" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="292" y="209" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">MULTIPLE</text>
+
+      <rect x="436" y="292" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="456" y="301" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">ONE</text>
+
+      <rect x="548" y="344" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="580" y="353" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">ENVIRONMENT</text>
+
+      <rect x="436" y="432" width="92" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="482" y="441" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">REWARD FUNCTION</text>
+
+      <!-- Decisions and outcomes -->
+      <polygon points="420,48 540,104 420,160 300,104" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">At what granularity</text>
+      <text x="420" y="107" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">is advantage assigned?</text>
+      <text x="420" y="127" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">PER CONTEXT / PER TURN</text>
+
+      <rect x="680" y="68" width="220" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="790" y="96" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Use custom advantage</text>
+      <text x="790" y="116" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">One advantage list per context</text>
+      <text x="790" y="132" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">Length = assistant-turn count</text>
+
+      <polygon points="420,176 540,232 420,288 300,232" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="228" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">How many training contexts</text>
+      <text x="420" y="245" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">does one Session export?</text>
+
+      <rect x="40" y="188" width="200" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="140" y="216" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Use custom advantage</text>
+      <text x="140" y="236" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">One scalar advantage per context</text>
+
+      <polygon points="420,312 540,368 420,424 300,368" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="356" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Where does the score</text>
+      <text x="420" y="372" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">come from?</text>
+      <text x="420" y="393" fill="#4f5d75" font-size="7" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">ENVIRONMENT / REWARD FUNCTION</text>
+
+      <rect x="620" y="336" width="160" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="700" y="354" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Environment</text>
+      <text x="700" y="372" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">RELAX_OUTPUT_JSON</text>
+      <text x="700" y="387" fill="#4f5d75" font-size="8" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">reward field</text>
+
+      <rect x="320" y="448" width="200" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="420" y="472" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Use a reward function</text>
+      <text x="420" y="490" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">--custom-rm-path</text>
+
+      <rect x="660" y="448" width="220" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="770" y="472" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', 'PingFang SC', 'Microsoft YaHei', sans-serif" text-anchor="middle">Use --advantage-estimator</text>
+      <text x="770" y="490" fill="#4f5d75" font-size="9" font-family="'Geist Mono', 'Noto Sans Mono CJK SC', monospace" text-anchor="middle">post-process reward into advantage</text>
+
+    </svg>

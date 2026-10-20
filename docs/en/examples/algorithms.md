@@ -67,7 +67,7 @@ Each sample's scalar advantage is broadcast to its response tokens. Relax masks 
 
 $$L_{\mathrm{RLOO}} = -\frac{1}{N_{\mathrm{eff}}}\sum_i\sum_t m_{i,t}\operatorname{stopgrad}(A_i)\log\pi_{i,t}$$
 
-This global-token reduction does not apply a separate $1/T_i$ weight to each response. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
+This global-token reduction does not apply a separate $1/T_i$ weight to each response. The loss mask controls which tokens contribute to the policy loss; it does not exclude a sample's reward from the group baseline calculation. `train/pg_clipfrac` is always `0` because RLOO uses no clipping.
 
 ### Requirements and Parameters
 

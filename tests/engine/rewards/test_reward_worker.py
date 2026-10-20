@@ -154,7 +154,7 @@ class TestOpenR1MMEdgeCases:
         assert get_openr1mm_rule_based_reward("", "42") == 0.0
 
     def test_both_empty(self):
-        assert get_openr1mm_rule_based_reward("", "") == 1.0
+        assert get_openr1mm_rule_based_reward("", "") == 0.0
 
     def test_whitespace_in_answer_tags(self):
         response = "<answer>  42  </answer>"
@@ -237,6 +237,17 @@ class TestRewardWorkerDirect:
     def test_openr1mm_fraction(self):
         result = ray.get(self.worker.compute.remote("openr1mm", "\\frac{1}{2}", "0.5"))
         assert result == 1.0
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ("<answer>7</answer><|im_end|>", 1.0),
+            ("<answer>8</answer><|im_end|>", 0.0),
+        ],
+    )
+    def test_openr1mm_scores_answers_with_chat_end_token(self, response: str, expected: float) -> None:
+        result = ray.get(self.worker.compute.remote("openr1mm", response, "7"), timeout=60)
+        assert result == expected
 
     def test_unknown_rm_type_raises(self):
         with pytest.raises(ray.exceptions.RayTaskError):
@@ -519,3 +530,39 @@ class TestHighConcurrency:
         assert all(r == 1.0 for r in rewards)
         # worker_index should have advanced by n (each request picks one worker)
         assert executor._worker_index == initial_index + n
+
+    @pytest.mark.asyncio
+    async def test_worker_pool_requests_control_plane_affinity(self, monkeypatch):
+        options_seen = []
+
+        class FakeBoundWorker:
+            @staticmethod
+            def remote():
+                return object()
+
+        class FakeRewardWorker:
+            @classmethod
+            def options(cls, **options):
+                options_seen.append(options)
+                return FakeBoundWorker()
+
+        monkeypatch.setattr("relax.engine.rewards.RewardWorker", FakeRewardWorker)
+        args = _make_args()
+        args.enable_affinity = True
+        args._relax_control_plane_node_group = "stable"
+        executor = RewardExecutor(max_concurrency=2, num_workers=2)
+
+        await executor._ensure_workers(args)
+
+        assert options_seen == [
+            {
+                "name": "reward_worker_0",
+                "get_if_exists": True,
+                "resources": {"stable_cpu": 1},
+            },
+            {
+                "name": "reward_worker_1",
+                "get_if_exists": True,
+                "resources": {"stable_cpu": 1},
+            },
+        ]

@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -74,8 +75,16 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
                         "messages": record["messages"],
                         "tools": record.get("tools") or [],
                         "chat_template_kwargs": record.get("chat_template_kwargs") or {},
-                        "metadata": {**metadata, "turn_index": index},
-                        "reward": reward,
+                        "metadata": {
+                            **metadata,
+                            "turn_index": record.get("turn_index", index),
+                            "export_index": index,
+                            "parse_attempt": record.get("parse_attempt", 0),
+                            "accepted_for_execution": record.get("accepted_for_execution", False),
+                            "outcome": reward[_reward_key],
+                            "session_id": os.environ.get("RELAX_SESSION_ID"),
+                        },
+                        **({"reward": reward} if index == 0 else {}),
                     },
                     ensure_ascii=False,
                 )
@@ -135,18 +144,39 @@ async def _predict_one_step(
         "app_info": obs.app_info,
         "tool_list": obs.tool_list,
     }
-    return await asyncio.to_thread(
+    first_record = len(agent.turn_records)
+    result = await asyncio.to_thread(
         agent.predict,
         instruction,
         obs_dict,
         step_idx=step_idx,
     )
+    _, actions, info = result
+    records = agent.turn_records[first_record:]
+    parsed = not (info.get("parse_failed") or info.get("action_type") == "parse_failed")
+    forced_cap = (
+        step_idx + 1 >= agent.max_steps
+        and actions == ["FAIL"]
+        and parsed
+        and (info.get("parsed_action") or {}).get("action") not in ("DONE", "FAIL")
+    )
+    info["forced_max_turns"] = forced_cap
+    for attempt, record in enumerate(records):
+        record.update(
+            turn_index=step_idx,
+            parse_attempt=attempt,
+            accepted_for_execution=parsed and not forced_cap and attempt == len(records) - 1,
+        )
+    return result
 
 
 async def run_session(
     session_input: dict[str, Any],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
     config = _load_config()
     max_turns = int(config["max_turns"])
     task_config = _extract_task_config(session_input)
@@ -192,12 +222,18 @@ async def run_session(
     reward = 0.0
     last_error: str | None = None
 
+    timings = {name: 0.0 for name in ("reset", "predict", "execute", "evaluate", "close")}
+    execution_failures = 0
+    forced_max_turns = False
     session_start = time.monotonic()
     try:
+        phase_start = time.monotonic()
         obs = await env.reset()
+        timings["reset"] = time.monotonic() - phase_start
 
         for step_idx in range(max_turns):
             shotdump.shot(step_idx, getattr(obs, "screenshot_bytes", None))
+            phase_start = time.monotonic()
             try:
                 response, pyautogui_actions, info = await _predict_one_step(
                     agent,
@@ -217,7 +253,9 @@ async def run_session(
                 last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("predict raised at step %d", step_idx)
                 break
-
+            finally:
+                timings["predict"] += time.monotonic() - phase_start
+            forced_max_turns = info.get("forced_max_turns", False)
             action_type = info.get("action_type", "gui")
             action_types.append(action_type)
             if info.get("parse_failed") or action_type == "parse_failed":
@@ -225,11 +263,16 @@ async def run_session(
 
             # Terminate signals from the external agent
             if any(a in ("DONE", "FAIL") for a in pyautogui_actions):
-                stop_reason = "agent_done" if "DONE" in pyautogui_actions else "agent_fail"
+                if forced_max_turns:
+                    stop_reason = "max_turns"
+                else:
+                    stop_reason = "agent_done" if "DONE" in pyautogui_actions else "agent_fail"
                 # Still call env.step so DesktopEnv marks the final action
                 # in `action_history` (evaluate() checks the last entry).
                 terminal = "DONE" if "DONE" in pyautogui_actions else "FAIL"
+                phase_start = time.monotonic()
                 await env.exec_pyautogui(terminal)
+                timings["execute"] += time.monotonic() - phase_start
                 agent.record_exec_result(action_type, True, {"ok": True, "terminal": terminal})
                 break
 
@@ -238,6 +281,7 @@ async def run_session(
             step_ok = True
             step_result: dict[str, Any] = {}
             step_done = False
+            phase_start = time.monotonic()
             for action in pyautogui_actions:
                 mcp = parse_mcp_action(action)
                 if mcp is not None:
@@ -248,9 +292,12 @@ async def run_session(
                 else:
                     step_obs = await env.exec_pyautogui(action)
                     step_result = step_obs.exec_result
+                    step_ok = step_ok and step_obs.exec_ok
                 obs = step_obs
                 step_done = step_done or step_obs.done
 
+            timings["execute"] += time.monotonic() - phase_start
+            execution_failures += int(not step_ok)
             agent.record_exec_result(action_type, step_ok, step_result)
             shotdump.turn(
                 {
@@ -267,7 +314,9 @@ async def run_session(
                 break
 
         # Final scoring lives with the env (VM-side postconfig + metrics).
+        phase_start = time.monotonic()
         reward = await env.evaluate()
+        timings["evaluate"] = time.monotonic() - phase_start
         shotdump.finish(
             {
                 "reward": reward,
@@ -277,7 +326,9 @@ async def run_session(
             }
         )
     finally:
+        phase_start = time.monotonic()
         await env.close()
+        timings["close"] = time.monotonic() - phase_start
 
     elapsed = time.monotonic() - session_start
     return {
@@ -292,6 +343,20 @@ async def run_session(
             "data_source": metadata.get("data_source"),
             "session_wallclock_s": elapsed,
             "last_error": last_error,
+            "_session_metrics": {
+                "osworld/success_rate": float(reward >= 0.5),
+                "osworld/environment_steps": len(action_types),
+                "osworld/model_calls": len(agent.turn_records),
+                "osworld/model_request_s": agent.model_request_s,
+                "osworld/transport_retries": agent.transport_retries,
+                "osworld/session_error_rate": 0.0,
+                "osworld/parse_retries": sum(r.get("parse_attempt", 0) > 0 for r in agent.turn_records),
+                "osworld/parse_exhausted_steps": parse_failed_steps,
+                "osworld/execution_failures": execution_failures,
+                "osworld/forced_max_turns_rate": float(forced_max_turns),
+                "osworld/session_wallclock_s": elapsed,
+                **{f"osworld/{name}_s": value for name, value in timings.items()},
+            },
         },
     }
 
@@ -333,6 +398,7 @@ def main() -> None:
                 "data_source": metadata.get("data_source"),
                 "session_wallclock_s": 0.0,
                 "last_error": f"{type(exc).__name__}: {exc}",
+                "_session_metrics": {"osworld/success_rate": 0.0, "osworld/session_error_rate": 1.0},
             },
         }
     write_session_output(args.output_json, output)

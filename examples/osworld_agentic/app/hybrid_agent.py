@@ -13,6 +13,7 @@ retries — is inherited from the external OSWorld installation.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -64,6 +65,8 @@ class RelaxHybridAgent(HybridAgentLocal):
         # One entry per committed turn; app/agent.py turns these into the
         # explicit export records Relax needs (see README.md).
         self.turn_records: list[dict[str, Any]] = []
+        self.model_request_s = 0.0
+        self.transport_retries = 0
 
         base_url = os.environ.get("OPENAI_BASE_URL", "").rstrip("/")
         if not base_url:
@@ -90,6 +93,7 @@ class RelaxHybridAgent(HybridAgentLocal):
 
         last_error = None
         for attempt in range(self._max_llm_call_retries):
+            request_start = time.monotonic()
             try:
                 resp = httpx.post(
                     url,
@@ -98,6 +102,7 @@ class RelaxHybridAgent(HybridAgentLocal):
                     timeout=self._llm_call_timeout_s,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                self.transport_retries += 1
                 last_error = f"transport: {exc}"
                 logger.warning(
                     "call_llm attempt %d/%d transport error: %s",
@@ -107,6 +112,8 @@ class RelaxHybridAgent(HybridAgentLocal):
                 )
                 time.sleep(self._backoff_seconds)
                 continue
+            finally:
+                self.model_request_s += time.monotonic() - request_start
 
             if resp.status_code == 400:
                 # Distinguish context-length-exceeded (fatal, exit cleanly) from
@@ -148,10 +155,7 @@ class RelaxHybridAgent(HybridAgentLocal):
                     )
                 self.turn_records.append(
                     {
-                        "messages": [
-                            *payload["messages"],
-                            {"role": "assistant", "content": content},
-                        ],
+                        "messages": copy.deepcopy([*payload["messages"], {"role": "assistant", "content": content}]),
                         "tools": payload.get("tools") or [],
                         "chat_template_kwargs": payload.get("chat_template_kwargs") or {},
                     }

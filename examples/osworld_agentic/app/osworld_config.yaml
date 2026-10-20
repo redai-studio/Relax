@@ -9,10 +9,10 @@ temperature: 1.0
 top_p: 1.0
 max_tokens: 8192
 repetition_penalty: 1.0
-stop_token_ids: [248059, 248046]  # </tool_call>, <|im_end|>
+stop_token_ids: [151658, 151645]  # </tool_call>, <|im_end|>
 
 # Bounded retries for the per-session Relax endpoint.
-llm_call_timeout_s: 600
+llm_call_timeout_s: 21600
 max_llm_call_retries: 3
 llm_call_backoff_s: 5
 

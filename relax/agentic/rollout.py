@@ -53,7 +53,20 @@ _RESIDENT_ENTRY_LOCK = threading.Lock()
 _RESIDENT_ASYNC_LOCK = threading.Lock()
 _RESIDENT_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
 _RESIDENT_ASYNC_THREAD: threading.Thread | None = None
-_METADATA_METRIC_SKIP = {TRACE_KEY, "id", "index", "sample_index", "group_index", "start_rollout_id", "rollout_turns"}
+_METADATA_METRIC_SKIP = {
+    TRACE_KEY,
+    "id",
+    "index",
+    "sample_index",
+    "group_index",
+    "start_rollout_id",
+    "rollout_turns",
+    "turn_index",
+    "export_index",
+    "parse_attempt",
+    "accepted_for_execution",
+}
+_SESSION_METADATA_METRIC_KEYS = {"agent_turns", "outcome", "session_wallclock_s", "parse_failed_steps"}
 logger = get_logger(__name__)
 _IDLE_HEARTBEAT_INTERVAL_S = 30.0
 
@@ -407,9 +420,11 @@ class AgenticResidentPipeline:
             return True
 
         # Fully async may close with unfinished physical debt only when the
-        # same number of resident Groups is confirmed interrupted.
+        # same number of resident Groups is confirmed interrupted. Debt from
+        # the older partition must finish first: only two physical partitions
+        # can be active, so carrying it again would make the next open fail.
         if self.args.fully_async and not context.final_backfill:
-            return debt <= len(self.runtime_domain.interrupted_group_ids)
+            return self.transfer_domain.previous_debt == 0 and debt <= len(self.runtime_domain.interrupted_group_ids)
         return False
 
     async def _close_rollout_step(self, context: _StepContext) -> RolloutFnTrainOutput:
@@ -788,18 +803,44 @@ def _aggregate_agentic_timing(samples: list[Sample]) -> dict[str, float]:
 
 
 def _collect_agentic_metadata_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Aggregate export scalars and explicit session metrics at their own
+    granularity.
+
+    ``metadata['_session_metrics']`` maps final metric names to numeric values.
+    These values must be constant across exports of one session and are counted
+    once per session, so longer trajectories do not receive extra metric
+    weight.
+    """
     metric_values: dict[str, list[float]] = {}
+    session_values: dict[tuple[str, str], float] = {}
+    session_ids: set[str] = set()
     for sample in samples:
-        for key, value in sample.metadata.items():
+        metadata = sample.metadata or {}
+        session_id = sample.session_id or metadata.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            session_ids.add(session_id)
+        session_metrics = metadata.get("_session_metrics")
+        if isinstance(session_metrics, dict) and isinstance(session_id, str) and session_id:
+            for key, value in session_metrics.items():
+                if isinstance(key, str) and key and not key.startswith("_") and isinstance(value, (int, float)):
+                    session_values.setdefault((session_id, key), float(value))
+        for key, value in metadata.items():
             if (
                 isinstance(key, str)
                 and key
                 and not key.startswith("_")
                 and key not in _METADATA_METRIC_SKIP
+                and not (isinstance(session_metrics, dict) and key in _SESSION_METADATA_METRIC_KEYS)
                 and isinstance(value, (int, float))
             ):
                 metric_values.setdefault(key, []).append(float(value))
-    return finalize_rollout_explicit_metric_values(metric_values)
+    for (_, key), value in session_values.items():
+        metric_values.setdefault(key, []).append(value)
+    metrics = finalize_rollout_explicit_metric_values(metric_values)
+    metrics["agentic/exported_contexts"] = float(len(samples))
+    if session_ids:
+        metrics["agentic/sessions"] = float(len(session_ids))
+    return metrics
 
 
 def _save_train_debug_rollout_data(

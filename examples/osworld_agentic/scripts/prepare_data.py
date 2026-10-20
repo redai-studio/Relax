@@ -131,8 +131,9 @@ def _select(
             continue
         rows.append(_build_row(tid, entry[1]))
     if missing:
-        # Loud but non-fatal: recipes evolve and the manifest may lag.
-        logger.warning("manifest %s references %d unknown task_id(s): %s", manifest, len(missing), missing[:5])
+        raise ValueError(f"Manifest {manifest} references {len(missing)} unknown task_id(s): {missing[:5]}")
+    if not rows:
+        raise ValueError(f"Manifest {manifest} contains no tasks")
     return rows
 
 
