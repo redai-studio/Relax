@@ -174,8 +174,10 @@ def configure_recovery(config: Namespace) -> Any:
 
     config.inference_recovery = False
     config.inference_recovery_state = None
-    choice = os.environ.get("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY")
-    if choice not in (None, "1"):
+    choice = os.environ.get("RELAX_ENABLE_INFERENCE_RECOVERY")
+    if choice is not None:
+        choice = choice.strip().lower()
+    if choice not in (None, "1", "true"):
         return None
     hybrid = bool(getattr(config, "hybrid", False))
     fully_async = bool(getattr(config, "fully_async", False))
@@ -231,7 +233,7 @@ def configure_recovery(config: Namespace) -> Any:
             if not getattr(config, name, False)
         )
     if conflicts:
-        if choice == "1":
+        if choice in ("1", "true"):
             raise ValueError("Unsupported inference recovery configuration: " + "; ".join(conflicts))
         return None
     try:
