@@ -179,7 +179,7 @@ def _actor_rollout_pg_roles(config: Namespace) -> list[str]:
     return roles
 
 
-class _GlobalRestartRequired(RuntimeError):
+class GlobalRestartRequired(RuntimeError):
     def __init__(self, role: str, state: Any) -> None:
         super().__init__(f"Local recovery of {role} requires global restart")
         self.role, self.state = role, state
@@ -1424,7 +1424,7 @@ class Controller:
                     with self._restart_lock:
                         self._check_inference_recovery(state)
                         if self._local_recovery_thread is not None and self._local_recovery_thread.is_alive():
-                            raise _GlobalRestartRequired(role, state)
+                            raise GlobalRestartRequired(role, state)
                         result = concurrent.futures.Future()
                         worker = threading.Thread(
                             target=self._run_inference_recovery, args=(role, state, result), daemon=True
@@ -1434,7 +1434,7 @@ class Controller:
                     try:
                         replacement = await asyncio.shield(asyncio.wrap_future(result))
                     except Exception as exc:
-                        raise _GlobalRestartRequired(role, state) from exc
+                        raise GlobalRestartRequired(role, state) from exc
                     finally:
                         if result.done():
                             worker.join()
@@ -1558,7 +1558,7 @@ class Controller:
                     if not self._restarting:
                         raise
                     raise RuntimeError("Service task cancelled for recovery") from e
-                except _GlobalRestartRequired:
+                except GlobalRestartRequired:
                     raise
                 except Exception as e:
                     raise RuntimeError(f"Service task failed: {e}") from e
@@ -1582,7 +1582,7 @@ class Controller:
                 logger.info("All services running successfully")
                 return  # Normal completion, exit
             except Exception as e:
-                if isinstance(e, _GlobalRestartRequired):
+                if isinstance(e, GlobalRestartRequired):
                     self.restart_serve(e.role, expected_state=e.state)
                 if self._restarting:
                     # A restart is in progress (triggered by HealthChecker callback thread).
