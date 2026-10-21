@@ -208,9 +208,9 @@ def validate_args(args):
             "pipeline_model_parallel_size is 1."
         )
 
-    # Megatron-Bridge requires --calculate-per-token-loss when context parallelism is enabled.
-    # See https://github.com/NVIDIA-NeMo/Megatron-Bridge
-    if args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False):
+    from relax.engine.sft.runtime import is_dpo_mode
+
+    if (args.context_parallel_size > 1 or getattr(args, "dynamic_context_parallel", False)) and not is_dpo_mode(args):
         assert args.calculate_per_token_loss, (
             "--calculate-per-token-loss must be set when context_parallel_size > 1 or dynamic_context_parallel is enabled (required by Megatron-Bridge)."
         )

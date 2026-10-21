@@ -24,10 +24,13 @@ def _validate_same_shape(name: str, *values: torch.Tensor) -> None:
 
 
 def masked_sequence_sums(
-    values: Sequence[torch.Tensor], masks: Sequence[torch.Tensor], device: torch.device
+    values: Sequence[torch.Tensor],
+    masks: Sequence[torch.Tensor],
+    device: torch.device,
+    *,
+    require_supervised: bool = True,
 ) -> torch.Tensor:
-    """Sum each branch against its already aligned mask, preserving gradients
-    and dtype."""
+    """Sum each branch against its aligned mask while preserving gradients."""
     if len(values) != len(masks):
         raise ValueError("preference token values/masks are not branch aligned")
     sums = []
@@ -38,10 +41,11 @@ def masked_sequence_sums(
             raise ValueError(
                 f"preference branch value/mask shape mismatch: {tuple(value.shape)} vs {tuple(mask.shape)}"
             )
-        require_tensor_condition(
-            mask.to(dtype=torch.bool).any(),
-            "preference branch completion mask must contain at least one supervised token",
-        )
+        if require_supervised:
+            require_tensor_condition(
+                mask.to(dtype=torch.bool).any(),
+                "preference branch completion mask must contain at least one supervised token",
+            )
         sums.append((value * mask).sum())
     return torch.stack(sums)
 

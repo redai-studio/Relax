@@ -379,6 +379,7 @@ class IndexManager:
         seed: int = 42,
         index_pool: Iterable[int] | None = None,
         dataset_seed_offset: int = 0,
+        shuffle_enabled: bool = True,
     ):
         """Initialize the index manager.
 
@@ -389,10 +390,15 @@ class IndexManager:
                 ``range(total_size)``.
             dataset_seed_offset: Number of dataset RNG seeds consumed before
                 the persistent dataset shuffle.
+            shuffle_enabled: When ``False`` both shuffle stages are skipped and
+                samples are consumed in physical row order within ``index_pool``.
+                Used by cross-framework alignment runs, where a matching
+                permutation cannot be reproduced on the other side.
         """
         self.total_size = total_size
         self.seed = seed
         self.dataset_seed_offset = dataset_seed_offset
+        self.shuffle_enabled = shuffle_enabled
         self.index_pool = tuple(range(total_size)) if index_pool is None else tuple(index_pool)
         if len(self.index_pool) != total_size:
             raise ValueError(f"index_pool length {len(self.index_pool)} does not match total_size {total_size}")
@@ -407,6 +413,14 @@ class IndexManager:
             epoch_id: Epoch identifier (used with seed for reproducibility)
         """
         if epoch_id == self.current_epoch:
+            return
+
+        if not self.shuffle_enabled:
+            # Sequential consumption: every epoch replays the pool in row order.
+            self.indices = sorted(self.index_pool)
+            self.current_epoch = epoch_id
+            self.position = 0
+            logger.info(f"Dataset shuffle disabled; using row order for epoch {epoch_id}")
             return
 
         # Stage 1: a dataset shuffle whose seed is drawn from RandomState(seed),

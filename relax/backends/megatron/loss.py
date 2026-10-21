@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from functools import partial
 from typing import Any
 
@@ -38,12 +38,14 @@ from relax.utils.training.preference_utils import (
     dpo_rewards,
     masked_sequence_sums,
     preference_accuracy,
+    require_tensor_condition,
     reward_model_pair_loss,
     select_packed_sequence_scores,
 )
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
+    _slice_loss_mask_with_cp,
     all_gather_with_cp,
     get_cp_local_num_tokens,
     get_logits_and_tokens_offset_with_cp,
@@ -1371,6 +1373,54 @@ def sft_loss_function(
     )
 
 
+def _all_reduce_forward_only(value: torch.Tensor, group: Any) -> torch.Tensor:
+    reduced = value.detach().clone()
+    dist.all_reduce(reduced, group=group)
+    return reduced + (value - value.detach())
+
+
+def _preference_branch_sums(
+    args: Namespace,
+    batch: RolloutBatch,
+    token_values: Sequence[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Reconstruct differentiable full-sequence branch sums across CP ranks."""
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return masked_sequence_sums(token_values, batch["loss_masks"], device)
+
+    max_seq_lens = batch.get("max_seq_lens", None)
+    padded_total_lengths = batch.get("padded_total_lengths", None)
+    dynamic_cp_size = batch.get("dynamic_cp_size", None)
+    dynamic_cp_rank = batch.get("dynamic_cp_rank", None)
+    local_masks = [
+        _slice_loss_mask_with_cp(
+            loss_mask,
+            int(total_length),
+            int(response_length),
+            args.qkv_format,
+            max_seq_lens[index] if max_seq_lens is not None else None,
+            padded_total_lengths[index] if padded_total_lengths is not None else None,
+            dynamic_cp_size,
+            dynamic_cp_rank,
+        )
+        for index, (loss_mask, total_length, response_length) in enumerate(
+            zip(batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True)
+        )
+    ]
+    supervised = torch.stack(
+        [torch.as_tensor(mask, device=device).to(dtype=torch.bool).any().to(dtype=torch.int32) for mask in local_masks]
+    )
+    dist.all_reduce(supervised, group=mpu.get_context_parallel_group())
+    require_tensor_condition(
+        (supervised > 0).all(),
+        "preference branch completion mask must contain at least one supervised token",
+    )
+    local_sums = masked_sequence_sums(token_values, local_masks, device, require_supervised=False)
+    return _all_reduce_forward_only(local_sums, mpu.get_context_parallel_group())
+
+
 def dpo_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1402,7 +1452,7 @@ def dpo_loss_function(
     chosen_index = torch.as_tensor(chosen_indices, dtype=torch.long, device=logits.device)
     rejected_index = torch.as_tensor(rejected_indices, dtype=torch.long, device=logits.device)
 
-    policy_sums = masked_sequence_sums(policy_token_log_probs, batch["loss_masks"], logits.device)
+    policy_sums = _preference_branch_sums(args, batch, policy_token_log_probs, logits.device)
     policy_chosen = policy_sums.index_select(0, chosen_index)
     policy_rejected = policy_sums.index_select(0, rejected_index)
     reference_free = bool(args.dpo_reference_free)
@@ -1412,7 +1462,7 @@ def dpo_loss_function(
         reference_values = batch.get("ref_log_probs")
         if reference_values is None:
             raise ValueError("standard DPO batch is missing frozen-reference log-probabilities")
-        reference_sums = masked_sequence_sums(reference_values, batch["loss_masks"], logits.device)
+        reference_sums = _preference_branch_sums(args, batch, reference_values, logits.device)
         reference_chosen = reference_sums.index_select(0, chosen_index)
         reference_rejected = reference_sums.index_select(0, rejected_index)
     pair_losses = dpo_pair_loss(
@@ -1425,9 +1475,10 @@ def dpo_loss_function(
     )
     chosen_rewards = dpo_rewards(policy_chosen, reference_chosen, beta=args.dpo_beta)
     rejected_rewards = dpo_rewards(policy_rejected, reference_rejected, beta=args.dpo_beta)
-    # pair_losses is never empty: build_preference_pair_indices raises on an
-    # empty micro-batch, so no gradient-safety fallback is needed here.
     loss = pair_losses.sum()
+    # A CP shard can have no local response logits even with global supervision.
+    if all(value.numel() == 0 for value in policy_token_log_probs):
+        loss = loss + 0 * logits.sum()
     reward_margin = chosen_rewards - rejected_rewards
     strict, tie, tie_aware = preference_accuracy(reward_margin)
     metrics = {
@@ -1445,6 +1496,9 @@ def dpo_loss_function(
     if not reference_free:
         metrics["dpo/ref_logps_chosen"] = reference_chosen.detach().sum()
         metrics["dpo/ref_logps_rejected"] = reference_rejected.detach().sum()
+    cp_size = mpu.get_context_parallel_world_size()
+    if cp_size > 1:
+        metrics = {key: value / cp_size for key, value in metrics.items()}
     return loss, metrics
 
 

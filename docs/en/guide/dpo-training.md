@@ -124,7 +124,8 @@ Relax includes the final partial evaluation batch. With data parallelism, every 
 ## Supported configurations
 
 - Use synchronous training with text data.
-- Set TP, CP, and PP to 1. Data parallelism is supported.
+- DPO supports static context and pipeline parallelism with TP set to 1. Data parallelism is also supported; dynamic context parallelism is not.
+- Reward-model training requires TP, CP, and PP to be 1.
 - Keep `--task-type causal_lm` with the preference objective.
 - Use ordinary CPU data prefetch if needed. Asynchronous prepacking, MTP, chunked logits, and LoRA are not supported.
 
