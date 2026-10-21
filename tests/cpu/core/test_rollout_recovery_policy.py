@@ -38,7 +38,7 @@ def constructor(monkeypatch):
     return constructor
 
 
-@pytest.mark.parametrize("flag", [None, "0", "1"])
+@pytest.mark.parametrize("flag", [None, "0", "1", "true", "false", "TRUE", " FALSE "])
 @pytest.mark.parametrize(
     "fully_async,hybrid,colocate",
     [(True, False, False), (True, True, True), (False, True, True), (False, False, True)],
@@ -47,16 +47,16 @@ def test_recovery_mode_defaults_and_overrides_keep_original_roles(
     monkeypatch, constructor, flag, fully_async, hybrid, colocate
 ):
     if flag is None:
-        monkeypatch.delenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", raising=False)
+        monkeypatch.delenv("RELAX_ENABLE_INFERENCE_RECOVERY", raising=False)
     else:
-        monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", flag)
+        monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     config = role_config(hybrid=hybrid)
     config.fully_async, config.colocate = fully_async, colocate
     config.true_on_policy_mode = False
     if colocate and not hybrid:
         config.offload_train = config.offload_rollout = True
     roles_before = list(process_role(config))
-    enabled = flag == "1" or flag is None and (fully_async or hybrid)
+    enabled = flag.strip().lower() in ("1", "true") if flag is not None else fully_async or hybrid
 
     state = configure_recovery(config)
 
@@ -72,7 +72,7 @@ def test_recovery_mode_defaults_and_overrides_keep_original_roles(
 
 
 def test_default_true_on_policy_recovery_does_not_add_forward_receiver(monkeypatch, constructor):
-    monkeypatch.delenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", raising=False)
+    monkeypatch.delenv("RELAX_ENABLE_INFERENCE_RECOVERY", raising=False)
     config = role_config()
     config.fully_async = True
 
@@ -82,7 +82,7 @@ def test_default_true_on_policy_recovery_does_not_add_forward_receiver(monkeypat
 
 @pytest.mark.parametrize("budget", ["0", "1", "5"])
 def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", "1")
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
     config = role_config(hybrid=True)
 
@@ -93,7 +93,7 @@ def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget
 
 @pytest.mark.parametrize("budget", ["-1", "1.5", "bad", ""])
 def test_invalid_recovery_budget_fails_before_creating_state(monkeypatch, constructor, budget):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", "1")
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
     config = role_config(hybrid=True)
 
@@ -103,8 +103,9 @@ def test_invalid_recovery_budget_fails_before_creating_state(monkeypatch, constr
     constructor.options.assert_not_called()
 
 
-def test_disabled_recovery_ignores_budget_env(monkeypatch, constructor):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "0")
+@pytest.mark.parametrize("flag", ["0", "false"])
+def test_disabled_recovery_ignores_budget_env(monkeypatch, constructor, flag):
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", "bad")
 
     assert configure_recovery(role_config(hybrid=True)) is None
@@ -112,8 +113,9 @@ def test_disabled_recovery_ignores_budget_env(monkeypatch, constructor):
 
 
 @pytest.mark.parametrize("offload", ["offload_train", "offload_rollout"])
-def test_hybrid_recovery_rejects_offload_before_creating_state(monkeypatch, constructor, offload):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+@pytest.mark.parametrize("flag", ["1", "true"])
+def test_hybrid_recovery_rejects_offload_before_creating_state(monkeypatch, constructor, offload, flag):
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     config = role_config(hybrid=True)
     config.fully_async = True
     setattr(config, offload, True)
@@ -128,7 +130,7 @@ def test_hybrid_recovery_rejects_offload_before_creating_state(monkeypatch, cons
     "conflict,value", [("train_backend", "fsdp"), ("rollout_external", True), ("use_routing_replay", True)]
 )
 def test_default_unsupported_config_keeps_original_path(monkeypatch, constructor, conflict, value):
-    monkeypatch.delenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", raising=False)
+    monkeypatch.delenv("RELAX_ENABLE_INFERENCE_RECOVERY", raising=False)
     config = role_config()
     config.fully_async = True
     setattr(config, conflict, value)
@@ -139,8 +141,9 @@ def test_default_unsupported_config_keeps_original_path(monkeypatch, constructor
     constructor.options.assert_not_called()
 
 
-def test_explicit_recovery_reports_all_actual_conflicts_before_creating_state(monkeypatch, constructor):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+@pytest.mark.parametrize("flag", ["1", "true", " TRUE "])
+def test_explicit_recovery_reports_all_actual_conflicts_before_creating_state(monkeypatch, constructor, flag):
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     config = role_config()
     config.fully_async = True
     config.train_backend, config.kl_coef, config.use_opd = "fsdp", 0.1, True
@@ -163,7 +166,7 @@ def test_explicit_recovery_reports_all_actual_conflicts_before_creating_state(mo
 
 
 def test_explicit_colocate_recovery_reports_missing_offload_and_backup(monkeypatch, constructor):
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", "1")
     config = role_config()
     config.colocate, config.enable_weights_backuper = True, False
 

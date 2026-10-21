@@ -1,16 +1,16 @@
 # Local Inference Recovery
 
-During training, a Rollout or standalone ActorFwd run call can raise an exception. For supported configurations, Relax can pause new work, rebuild the failed inference service, synchronize weights from the surviving training Actor, and continue training. Successful local recovery preserves the training Actor, optimizer, and scheduler without a Controller global restart.
+Relax supports rebuilding a failed Rollout or standalone ActorFwd service after it raises an exception, then continuing training. During recovery, the framework pauses new data production and consumption, waits for old operations to finish, and synchronizes the original training Actor's current weights to the new instance. Successful local recovery preserves the training Actor, optimizer, and scheduler without a Controller global restart.
 
 This handles explicit exceptions that have returned, such as an HTTP error after request retries are exhausted. It adds no hang detection and does not make every inference failure locally recoverable. Unsafe recovery, recovery failure, or an exhausted budget falls back to the existing global restart path.
 
-## Controls and defaults
+## Configuration
 
 These settings are environment variables, not CLI arguments. Set them in the **training Job that runs the Controller**, before starting the training entrypoint. Setting them only in an SGLang subprocess has no effect.
 
 | Environment variable | Default | Meaning |
 |---|---|---|
-| `RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY` | Mode-dependent when unset | `1` explicitly enables recovery; `0` disables it. Despite the Rollout name, this also controls local recovery of standalone ActorFwd. |
+| `RELAX_ENABLE_INFERENCE_RECOVERY` | Depends on the training mode | `true` or `1` enables recovery; `false` or `0` disables it. Controls local recovery of both Rollout and standalone ActorFwd. |
 | `RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS` | `3` | Non-negative integer. A cumulative attempt budget shared by Rollout and ActorFwd; `0` sends the first failure to global restart. A negative or non-integer value raises an error when recovery is enabled. |
 | `RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT` | `180` | Positive number of seconds to wait for old operations to exit, also used during handoff to global restart. This is not a total recovery timeout. |
 
@@ -18,19 +18,21 @@ These settings are environment variables, not CLI arguments. Set them in the **t
 |---|---|---|
 | Full-async (`--fully-async`) | Enabled when configuration checks pass; otherwise keeps the existing behavior | Rollout and standalone ActorFwd when actually deployed |
 | Hybrid-async (`--hybrid`) | Enabled when configuration checks pass; otherwise keeps the existing behavior | Rollout. Forward computation runs inside the training Actor; there is no standalone ActorFwd service. |
-| Colocate without hybrid | Disabled; explicitly set `1` to enable | Rollout |
+| Colocate without hybrid | Disabled; explicitly set `true` or `1` to enable | Rollout |
 
-With an explicit `1`, incompatible settings cause startup to raise `Unsupported inference recovery configuration` and list the conflicting fields. When the switch is unset, incompatible configurations keep the existing path instead. An explicit `0` creates no local recovery state and does not reject a job through this feature's eligibility checks.
+Values are case-insensitive and ignore surrounding whitespace, so `TRUE` is equivalent to `true`. With an explicit `true` or `1`, unsupported settings cause startup to raise `Unsupported inference recovery configuration` and list the conflicting fields. When the switch is unset, unsupported configurations keep the existing behavior. Setting `false` or `0` disables the feature and skips its configuration checks.
 
-### Setting the environment
+### Enabling and disabling recovery
 
 In your training launcher, before running `python -m relax.entrypoints.train`, set:
 
 ```bash
-export RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY=1
+export RELAX_ENABLE_INFERENCE_RECOVERY=true
 export RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS=3
 export RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT=180
 ```
+
+To disable recovery, set `RELAX_ENABLE_INFERENCE_RECOVERY=false`. These settings are read at training startup; changing the environment outside a running process does not reconfigure the current job.
 
 For Ray Jobs, pass these variables to the remote training entrypoint. If your launcher already uses `RUNTIME_ENV_JSON`, merge the settings into its existing `env_vars` before submission, preserving the other runtime settings:
 
@@ -41,7 +43,7 @@ import os
 
 runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
 runtime_env.setdefault("env_vars", {}).update({
-    "RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY": "1",
+    "RELAX_ENABLE_INFERENCE_RECOVERY": "true",
     "RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS": "3",
     "RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT": "180",
 })
@@ -68,13 +70,13 @@ Recovery supports framework-managed static resources, the Megatron training back
 | Hybrid | Require `offload_train=False` and `offload_rollout=False`; do not combine with `--offload`, `--offload-train`, or `--offload-rollout`. |
 | Routing replay | Both full-async and hybrid local recovery reject `--use-routing-replay`. Hybrid argument validation automatically sets `fully_async=True`, so the same restriction applies. |
 
-These fields refer to the final parsed configuration. For example, if startup reports `enable_weights_backuper=False`, check whether the launcher disables weight backup rather than adding a CLI flag with that field name. See the [full-async](./fully-async-training.md) and [hybrid](./hybrid-training.md) guides for the complete mode configuration.
+These fields refer to the final parsed configuration. For example, if startup reports `enable_weights_backuper=False`, check the launcher for `--disable-weights-backuper`. See the [full-async](./fully-async-training.md) and [hybrid](./hybrid-training.md) guides for the complete mode configuration.
 
 `--partial-rollout` itself is not a conflict, but recovery may still discard partial and pending samples. It does not guarantee continuation of a response that was only partly generated before the failure.
 
-## What happens after a failure
+## Recovery flow
 
-1. The Controller waits for service run results. When Rollout or standalone ActorFwd raises an exception, it requests one recovery attempt and pauses new work.
+1. When Rollout or standalone ActorFwd raises a run exception, the Controller checks the remaining recovery budget and pauses new work.
 2. It waits for in-flight training and old inference operations to finish, so an old instance cannot keep writing data or be removed during an unfinished weight transfer.
 3. It uses the original training Actor's next training position to clear untrained data and discard pending generation samples. The input read cursor does not move backward.
 4. It confirms that old inference children have exited, then rebuilds the failed inference service on the same resource group. The healthy training Actor and other services remain.
@@ -83,7 +85,7 @@ These fields refer to the final parsed configuration. For example, if startup re
 The budget counts attempts, and successful recovery does not reset it. With a budget of `3`, one Rollout recovery, one ActorFwd recovery, and another Rollout recovery use the entire budget; the next exception falls back to global restart. A failed recovery attempt also falls back immediately rather than repeatedly rebuilding until the remaining budget is consumed. Global restart creates a fresh recovery state and resets the local budget.
 
 ::: warning Data and policy behavior
-Recovery may discard partially generated samples and batches that have finished generation but have not been trained. It does not promise zero data loss. Data order, batches, and policy versions can change after recovery; strict on-policy behavior and step-by-step equivalence to a fault-free run are not guaranteed. This is why recovery is disabled by default for pure colocate. Jobs sensitive to these changes should set `RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY=0`.
+Recovery may discard partially generated samples and batches that have finished generation but have not been trained. It does not promise zero data loss. Data order, batches, and policy versions can change after recovery; strict on-policy behavior and step-by-step equivalence to a fault-free run are not guaranteed. This is why recovery is disabled by default for pure colocate. Jobs sensitive to these changes should set `RELAX_ENABLE_INFERENCE_RECOVERY=false`.
 :::
 
 ## Health checks and global restart

@@ -191,12 +191,13 @@ def test_disabled_gate_has_no_state_or_tq_side_effects():
     gate.fail(ValueError("legacy behavior"))
 
 
-@pytest.mark.parametrize("flag,hybrid", [("", False), ("0", False), ("", True), ("0", True)])
+@pytest.mark.parametrize("flag", ["", "0", "false", "FALSE", " false "])
+@pytest.mark.parametrize("hybrid", [False, True])
 def test_explicit_disable_skips_eligibility_checks(monkeypatch, flag, hybrid):
     import sys
 
     module = _source()
-    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", flag)
+    monkeypatch.setenv("RELAX_ENABLE_INFERENCE_RECOVERY", flag)
     affinity = Mock()
     monkeypatch.setitem(
         sys.modules, "relax.core.node_group_affinity", SimpleNamespace(with_control_plane_affinity=affinity)
