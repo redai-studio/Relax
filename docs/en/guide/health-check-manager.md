@@ -11,6 +11,8 @@ The health management system monitors all deployed services (Actor, Rollout, Cri
 
 ## Quick Start
 
+Rollout and standalone ActorFwd also have a separate explicit-error recovery path that can preserve the training Actor. See [Local Inference Recovery](./inference-recovery.md) for its defaults, supported configurations, and interaction with health checks.
+
 Enable health checking by adding `--use-health-check` to your training command:
 
 ```bash
