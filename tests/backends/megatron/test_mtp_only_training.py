@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
 from argparse import Namespace
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -188,6 +191,54 @@ def _actor_args(**overrides) -> Namespace:
 
 def test_pure_mtp_only_sft_skips_weight_management():
     assert should_skip_mtp_only_weight_management(_actor_args()) is True
+
+
+@pytest.mark.parametrize("prepacked", [False, True])
+def test_mtp_only_sft_reaches_train_without_weight_backuper(monkeypatch, prepacked):
+    actor_module = pytest.importorskip("relax.backends.megatron.actor", exc_type=ImportError)
+
+    class ReachedTrain(BaseException):
+        pass
+
+    actor = object.__new__(actor_module.MegatronTrainRayActor)
+    actor.args = _actor_args(
+        advantage_estimator="grpo",
+        compute_advantages_and_returns=False,
+        use_routing_replay=False,
+        use_rollout_routing_replay=False,
+    )
+    actor.model = []
+    actor.optimizer = object()
+    actor.opt_param_scheduler = object()
+    actor.rollout_data_postprocess = None
+    assert should_skip_mtp_only_weight_management(actor.args)
+    assert not hasattr(actor, "weights_backuper")
+
+    iterator = SimpleNamespace(close=Mock())
+    data_iterator, num_microbatches = [iterator], [1]
+    make_iterator = Mock(return_value=(data_iterator, num_microbatches))
+    train = Mock(side_effect=ReachedTrain)
+    monkeypatch.setattr(actor_module, "get_data_iterator", make_iterator)
+    monkeypatch.setattr(actor_module, "timer", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(actor_module, "inverse_timer", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(actor_module, "log_rollout_data", lambda *_args: None)
+    monkeypatch.setattr(actor_module, "train", train)
+
+    kwargs = (
+        {"prepared_data_iterator": data_iterator, "prepared_num_microbatches": num_microbatches} if prepacked else {}
+    )
+    rollout_data = {}
+    with pytest.raises(ReachedTrain):
+        actor.train_actor(0, rollout_data, **kwargs)
+
+    train.assert_called_once_with(
+        0, actor.model, actor.optimizer, actor.opt_param_scheduler, data_iterator, num_microbatches
+    )
+    iterator.close.assert_called_once()
+    if prepacked:
+        make_iterator.assert_not_called()
+    else:
+        make_iterator.assert_called_once_with(actor.args, actor.model, rollout_data)
 
 
 @pytest.mark.parametrize(

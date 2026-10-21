@@ -29,7 +29,6 @@ def can_reuse_colocate_log_probs(
         "max_staleness": 0,
         "update_weights_interval": 1,
         "partial_rollout": False,
-        "rl_partial_rollouts": False,
         "use_dynamic_global_batch_size": False,
         "context_parallel_size": 1,
         "pipeline_model_parallel_size": 1,

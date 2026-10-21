@@ -1958,7 +1958,7 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         else:
             data_iterator, num_microbatches = prepared_data_iterator, prepared_num_microbatches
-        inline_old_log_probs = can_reuse_colocate_log_probs(
+        inline_old_log_probs = hasattr(self, "weights_backuper") and can_reuse_colocate_log_probs(
             self.args,
             num_microbatches,
             backup_tags=self.weights_backuper.backup_tags,
