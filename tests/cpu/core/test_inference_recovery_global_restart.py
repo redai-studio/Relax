@@ -364,6 +364,104 @@ def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
     assert controller._restart_consumed_event.is_set()
 
 
+@pytest.mark.parametrize(
+    "rollout_step,advance_tail,needs_global", [(3, True, False), (4, False, True), (4, True, True), (5, False, True)]
+)
+def test_forward_recovery_falls_back_before_clearing_a_final_rollout(
+    monkeypatch, rollout_step, advance_tail, needs_global
+):
+    from relax.engine.rollout import recovery_storage
+
+    controller = _controller_shell()
+    _patch_restart_entry(monkeypatch, controller)
+    monkeypatch.setattr("relax.core.registry.resolve_algorithm", lambda config: {"actor_fwd": object()})
+    controller.config = SimpleNamespace(
+        num_rollout=5, fully_async=True, hybrid=False, debug_train_only=False, debug_rollout_only=False
+    )
+    controller._teacher_manager = None
+    controller._cleanup_s3_model_weights_after_init = Mock()
+    controller._report_error_to_metrics_service = Mock()
+    monkeypatch.setattr(controller_module, "set_managed_opd_teacher_on_actor_service", AsyncMock())
+    monkeypatch.setattr(controller_module, "_needs_rollout_manager_setup", lambda services: False)
+    monkeypatch.setattr(controller_module.ray, "get", lambda result, **kwargs: result)
+    state = controller._inference_recovery = SimpleNamespace(
+        request_recovery=SimpleNamespace(remote=Mock(return_value=1)),
+        snapshot=SimpleNamespace(
+            remote=Mock(
+                return_value=dict(paused=True, unsafe=False, sync=False, failures={"actor_fwd": "error"}, active={})
+            )
+        ),
+        begin_sync=SimpleNamespace(remote=Mock(return_value=True)),
+        end_sync=SimpleNamespace(remote=Mock()),
+    )
+    client = SimpleNamespace(
+        async_get_partition_list=AsyncMock(return_value=["train_2"]),
+        _get_partition_meta=AsyncMock(return_value=SimpleNamespace(global_indexes=[1, 2])),
+    )
+    monkeypatch.setattr(controller_module.tq, "get_client", lambda: client)
+    monkeypatch.setattr(recovery_storage, "require_strict_clear_contract", Mock())
+    clear = AsyncMock()
+    monkeypatch.setattr(recovery_storage, "strict_clear_partition", clear)
+    discard, reset = AsyncMock(), AsyncMock()
+
+    async def completed():
+        return None
+
+    async def failed():
+        raise ValueError("explicit forward error")
+
+    def service(role):
+        return SimpleNamespace(role=role, run=lambda: asyncio.create_task(completed()), set_step=AsyncMock())
+
+    actor, rollout, forward = [service(role) for role in ("actor", "rollout", "actor_fwd")]
+    actor.get_step = AsyncMock(return_value=2)
+    # Initial wrappers return responses, just as Service's async wrappers do.
+    actor.update_weights_fully_async = AsyncMock(side_effect=lambda: completed())
+    forward.recv_weight_fully_async = AsyncMock(side_effect=lambda: completed())
+    rollout.step = rollout_step
+
+    async def observe_rollout_step():
+        observed = rollout.step
+        # The old post-generate tail can finish after the step snapshot, even
+        # though admission is paused and no generation operation remains active.
+        if advance_tail:
+            rollout.step += 1
+        return observed
+
+    rollout.get_step = observe_rollout_step
+    rollout.data_source = SimpleNamespace(discard_pending=SimpleNamespace(remote=discard))
+    rollout.get_rollout_manager = AsyncMock(
+        return_value=SimpleNamespace(reset_data_window=SimpleNamespace(remote=reset))
+    )
+    forward.run = lambda: asyncio.create_task(failed())
+    forward.rebuild_for_recovery = Mock()
+    controller.serve_dict = {service.role: service for service in (actor, rollout, forward)}
+    controller._activate_inference_recovery = AsyncMock(side_effect=lambda *args: asyncio.create_task(completed()))
+
+    def global_restart():
+        controller._restart_error = RuntimeError("test reached original global restart")
+        controller._restart_done_event.set()
+
+    controller._global_restart = Mock(side_effect=global_restart)
+    if needs_global:
+        with pytest.raises(RuntimeError, match="test reached original global restart"):
+            controller.training_loop()
+        controller._global_restart.assert_called_once_with()
+        clear.assert_not_awaited()
+        discard.assert_not_awaited()
+        reset.assert_not_awaited()
+        forward.rebuild_for_recovery.assert_not_called()
+        controller._activate_inference_recovery.assert_not_awaited()
+    else:
+        controller.training_loop()
+        controller._global_restart.assert_not_called()
+        clear.assert_awaited_once_with(client, "train_2", [1, 2])
+        discard.assert_awaited_once_with()
+        reset.assert_awaited_once_with()
+        forward.rebuild_for_recovery.assert_called_once()
+        assert controller._activate_inference_recovery.await_args.args[:3] == ("actor_fwd", state, 2)
+
+
 def test_old_global_owner_does_not_publish_completion_into_next_cycle(monkeypatch):
     controller = _controller_shell()
     _patch_restart_entry(monkeypatch, controller)
