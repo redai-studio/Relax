@@ -38,8 +38,9 @@ def wait_all(refs: list, timeout: float = 600) -> list:
 class InferenceRecoveryState:
     """One serialized admission gate shared by the existing components."""
 
-    def __init__(self, has_actor_fwd: bool) -> None:
+    def __init__(self, has_actor_fwd: bool, max_attempts: int = 3) -> None:
         self.has_actor_fwd = has_actor_fwd
+        self.max_attempts = max_attempts
         self.paused = False
         self.failures: dict[str, str] = {}
         self.active: dict[str, int] = {}
@@ -83,8 +84,8 @@ class InferenceRecoveryState:
         self.attempts += 1
         if self.unsafe or self.sync or set(self.failures) != {role}:
             raise RuntimeError("Concurrent failure or weight synchronization requires global restart")
-        if self.attempts > 3:
-            raise RuntimeError("Three local recoveries exhausted; require global restart")
+        if self.attempts > self.max_attempts:
+            raise RuntimeError(f"Local recovery budget ({self.max_attempts}) exhausted; require global restart")
         return self.attempts
 
     def set_fwd_ready(self, ready: bool) -> None:
@@ -233,8 +234,14 @@ def configure_recovery(config: Namespace) -> Any:
         if choice == "1":
             raise ValueError("Unsupported inference recovery configuration: " + "; ".join(conflicts))
         return None
+    try:
+        max_attempts = int(os.environ.get("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", "3"))
+    except ValueError as exc:
+        raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer") from exc
+    if max_attempts < 0:
+        raise ValueError("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer")
     config.inference_recovery_state = InferenceRecoveryState.options(**with_control_plane_affinity(config)).remote(
-        fully_async and not hybrid and not getattr(config, "true_on_policy_mode", False)
+        fully_async and not hybrid and not getattr(config, "true_on_policy_mode", False), max_attempts=max_attempts
     )
     config.inference_recovery = True
     return config.inference_recovery_state
