@@ -45,6 +45,7 @@ from relax.engine.sft.runtime import (
     should_run_sft_eval,
     should_run_sft_predict,
     should_skip_mtp_only_weight_management,
+    should_skip_sft_weight_management,
 )
 from relax.utils import device as device_utils
 from relax.utils import tracking_utils
@@ -522,6 +523,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.args,
             with_ref=with_ref,
             with_opd_teacher=with_opd_teacher,
+        ) or should_skip_sft_weight_management(
+            self.args,
+            with_ref=with_ref,
+            with_opd_teacher=with_opd_teacher,
         )
         use_tensor_backuper = not skip_weight_management and (not self.args.fully_async or self.args.hybrid)
         if use_tensor_backuper:
@@ -631,7 +636,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             )
         else:
-            logger.info("MTP-only SFT: skipping weight snapshots, rollout updater, and DCS client")
+            logger.info("Offline SFT: skipping weight snapshots, rollout updater, and DCS client")
         # empty cache after initialization
         clear_memory()
 
