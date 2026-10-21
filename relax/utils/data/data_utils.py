@@ -305,7 +305,10 @@ def build_messages(
                 )
 
     if system_prompt is not None:
-        final_message = [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
+        # Text-only chat templates may concatenate content directly as a string.
+        structured = multimodal_keys or any(isinstance(message.get("content"), list) for message in prompt)
+        content = [{"type": "text", "text": system_prompt}] if structured else system_prompt
+        final_message = [{"role": "system", "content": content}]
         final_message.extend(prompt)
         return final_message
 
@@ -357,7 +360,7 @@ def process_raw_sample(
     metadata = data.get(metadata_key) or {}
 
     # MOPD: surface top-level ``data_source`` column into metadata so the
-    # per-sample teacher router (``_pick_teacher_url``) can look it up via
+    # Teacher Gateway route key (``_teacher_route_key``) can look it up via
     # ``sample.metadata["data_source"]``.  Only injected when the column
     # exists and the metadata dict does not already carry it.
     if "data_source" not in metadata and "data_source" in data:

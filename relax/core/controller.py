@@ -28,9 +28,12 @@ from relax.algorithms import algorithm_needs_critic
 from relax.core.node_group_affinity import require_control_plane_resource, with_control_plane_affinity
 from relax.core.optional_roles import GENRM_ROLE, register_extra_roles
 from relax.core.registry import ALGOS, ROLES, process_role
-from relax.core.service import Service, create_placement_group
+from relax.core.service import Service, create_placement_group, serve_app_names
 from relax.distributed.checkpoint_service.coordinator.service import create_dcs_deployment
 from relax.distributed.coordination import PeerStepBarrier, RolloutOffloadBarrier
+from relax.distributed.ray.inference_manager import WEIGHT_UPDATE_BACKEND, create_inference_manager
+from relax.engine.inference.placement import PlacementBinding
+from relax.engine.inference.types import LifecycleState, Role
 from relax.engine.sft.bootstrap import resolve_sft_algo_key, resolve_sft_num_rollout, validate_sft_resource
 from relax.utils import device as device_utils
 from relax.utils.async_utils import run, shutdown_async_loop
@@ -60,8 +63,8 @@ def create_data_source_actor(config: Namespace, data_source_cls: Any) -> Any:
     return actor_cls.options(**with_control_plane_affinity(config)).remote(config)
 
 
-def _needs_rollout_manager_setup(serve_dict: dict) -> bool:
-    """Skip rollout_manager wiring in SFT-only mode (no rollout role)."""
+def _needs_rollout_worker_setup(serve_dict: dict) -> bool:
+    """Skip rollout_worker wiring in SFT-only mode (no rollout role)."""
     return ROLES.rollout in serve_dict
 
 
@@ -73,6 +76,13 @@ def _is_colocate(config: Namespace) -> bool:
 logger = get_logger(__name__)
 
 ACTOR_ROLLOUT_PG_ROLES = ["actor", "rollout", GENRM_ROLE]
+# Bounds the inference manager's engine and Router cleanup so it finishes
+# before the driver's 60s signal-exit watchdog.
+INFERENCE_SHUTDOWN_TIMEOUT_S = 35.0
+# How long the initial fully-async weight sync may take to show every rollout
+# model READY, re-observing unready models every poll.
+INITIAL_ROLLOUT_READY_TIMEOUT_S = 120.0
+INITIAL_ROLLOUT_READY_POLL_S = 2.0
 # ``auto`` may resolve to a node-local full checkpoint on a single-node engine,
 # while ``runai_streamer`` keeps the model source on raw S3.  Be conservative:
 # cleanup is enabled only when the configured plan cannot retain SHM weights.
@@ -167,6 +177,7 @@ class Controller:
         self.config = config
         self.serve_dict = {}
         self._teacher_manager = None
+        self._inference_manager_handle = None
         # Initialize health management system
         self.runtime_env = runtime_env
         self._health_check_enabled = getattr(config, "use_health_check", False)
@@ -515,6 +526,7 @@ class Controller:
                 actor_rollout_pgs=actor_rollout_pgs if actor_rollout_pgs and role in actor_rollout_pg_roles else None,
                 defer_deploy=True,
                 runtime_env=self.runtime_env,
+                inference_manager_handle=self._inference_manager_handle,
             )
             if self._startup_abort_event.is_set():
                 self._cleanup_aborted_service(role, service, deploy=False)
@@ -600,12 +612,15 @@ class Controller:
                         else:
                             pending_future.cancel()
                             if phase == ServiceStartupPhase.DEPLOY:
-                                try:
-                                    serve.delete(pending_role)
-                                except Exception as exc:
-                                    logger.warning(
-                                        f"[{pending_role}] Failed to cancel deployment during phase abort: {exc}"
-                                    )
+                                for app_name in serve_app_names(str(pending_role)):
+                                    if app_name is None:
+                                        continue
+                                    try:
+                                        serve.delete(app_name)
+                                    except Exception as exc:
+                                        logger.warning(
+                                            f"[{pending_role}] Failed to cancel '{app_name}' during phase abort: {exc}"
+                                        )
                     self._abort_service_phase(phase, services, failed_services)
                     raise RuntimeError(f"Failed to {phase.value} service {role}: {error}")
                 services[role] = service
@@ -662,16 +677,11 @@ class Controller:
                 service._stop_heartbeat_thread()
             except Exception as e:
                 logger.warning(f"[{role}] Failed to stop heartbeat during phase abort: {e}")
-            if str(role) == "rollout" and getattr(service, "_deployed", False):
-                try:
-                    rollout_manager = run(service.get_rollout_manager())
-                    ray.get(rollout_manager.dispose.remote(), timeout=30)
-                except Exception as e:
-                    logger.warning(f"[{role}] Failed to dispose rollout manager during phase abort: {e}")
-            try:
-                serve.delete(role)
-            except Exception as e:
-                logger.warning(f"[{role}] Failed to delete deployment during phase abort: {e}")
+            service._delete_applications()
+            # The inference manager owns the role's engines and their monitors;
+            # the placement group goes only once they are confirmed stopped.
+            if not service._shutdown_inference_engines():
+                return
         if getattr(service, "_is_shared_pgs", False):
             return
         pgs = getattr(service, "pgs", None)
@@ -761,7 +771,8 @@ class Controller:
             if pgs is None:
                 role_nodes[role] = set()
                 continue
-            pg, bundle_indices, _gpu_ids = pgs
+            binding = PlacementBinding.require(pgs)
+            pg, bundle_indices = binding.pg, binding.bundle_indices
             if id(pg) not in seen_pgs:
                 refs = [
                     probe.options(
@@ -882,9 +893,11 @@ class Controller:
     def register_all_serve(self):
         validate_ppo_config(self.config)
 
+        # The task's one inference manager exists before any engine starts.
+        self._inference_manager_handle = create_inference_manager(self.config, self.runtime_env)
         actor_rollout_pgs, self._teacher_manager = maybe_start_managed_opd_teacher(
             self.config,
-            runtime_env=self.runtime_env,
+            inference_manager_handle=self._inference_manager_handle,
         )
 
         algo_key = resolve_sft_algo_key(self.config)
@@ -1025,11 +1038,13 @@ class Controller:
                     self.config,
                 )
 
-                # Always set rollout_manager for both sync and async modes
+                # Always set rollout_worker for both sync and async modes
                 # (needed for scaled-out engine weight sync in fully_async mode)
-                if _needs_rollout_manager_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
-                    rollout_manager = await self.serve_dict[ROLES.rollout].get_rollout_manager()
-                    await self.serve_dict[ROLES.actor].set_rollout_manager(rollout_manager)
+                if _needs_rollout_worker_setup(self.serve_dict) and ROLES.actor in self.serve_dict:
+                    rollout_worker = await self.serve_dict[ROLES.rollout].get_rollout_worker()
+                    await self.serve_dict[ROLES.actor].set_rollout_handles(
+                        rollout_worker, self._inference_manager_handle
+                    )
 
                     # Colocate wiring topology:
                     #   - actor.rollout_barrier: always, so wake_up doesn't
@@ -1040,7 +1055,7 @@ class Controller:
                     # In fully_async / hybrid nothing is wired and every
                     # barrier-guarded site short-circuits.
                     if _is_colocate(self.config):
-                        rollout_barrier = RolloutOffloadBarrier(rollout_manager, logger=logger)
+                        rollout_barrier = RolloutOffloadBarrier(self._inference_manager_handle, logger=logger)
                         actor_set_kwargs: dict[str, Any] = {"rollout": rollout_barrier}
                         if ROLES.critic in self.serve_dict:
                             critic_handle = self.serve_dict[ROLES.critic].handle
@@ -1069,7 +1084,13 @@ class Controller:
                         handles.append(self.serve_dict[ROLES.actor_fwd].recv_weight_fully_async())
                     if ROLES.reference in self.serve_dict:
                         handles.append(self.serve_dict[ROLES.reference].recv_weight_fully_async())
-                    [await handle for handle in handles]
+                    update_refs = await asyncio.gather(*handles)
+                    await asyncio.gather(*(ref for ref in update_refs if ref is not None))
+                    if ROLES.rollout in self.serve_dict:
+                        await self._inference_manager_handle.end_weight_update.remote(
+                            Role.ROLLOUT, WEIGHT_UPDATE_BACKEND
+                        )
+                        await self._await_rollout_ready_after_initial_sync()
                 if ROLES.actor in self.serve_dict:
                     step = await self.serve_dict[ROLES.actor].get_step()
                     for service in self.serve_dict.values():
@@ -1137,20 +1158,55 @@ class Controller:
                 self._report_error_to_metrics_service(e)
                 raise
 
-    def _dispose_rollout_manager(self, lookup_timeout: float = 5.0, dispose_timeout: float = 35.0) -> bool:
-        """Ask the owning actor to release engines and routers before deleting
-        its deployment."""
-        service = self.serve_dict.get(ROLES.rollout)
-        if service is None:
-            return True
+    async def _await_rollout_ready_after_initial_sync(self) -> None:
+        """Wait, bounded, until every rollout model is READY after the initial
+        weight sync.
+
+        One observation can miss a replica whose probe was briefly slow, which
+        would fail the whole startup, so unready models are observed again.
+        ``INITIAL_ROLLOUT_READY_TIMEOUT_S`` bounds the whole wait, including
+        each snapshot and refresh: one refresh probes every replica in turn and
+        can itself outlast the limit.
+        """
+        manager = self._inference_manager_handle
+        unready: list[Any] | None = None
+
+        async def poll() -> None:
+            nonlocal unready
+            while True:
+                snapshot = await manager.snapshot.remote(Role.ROLLOUT)
+                unready = [
+                    model for model in snapshot.models if model.state != LifecycleState.READY or not model.admission
+                ]
+                if not unready:
+                    return
+                await asyncio.sleep(INITIAL_ROLLOUT_READY_POLL_S)
+                await asyncio.gather(*(manager.refresh.remote(Role.ROLLOUT, model.model_id) for model in unready))
+
         try:
-            rollout_manager = run(asyncio.wait_for(service.get_rollout_manager(), timeout=lookup_timeout))
-            ray.get(rollout_manager.dispose.remote(), timeout=dispose_timeout)
-            logger.info("RolloutManager disposal completed in its owning actor.")
-            return True
-        except Exception as e:
-            logger.warning(f"RolloutManager disposal did not complete; resource cleanup is unverified: {e}")
-            return False
+            await asyncio.wait_for(poll(), INITIAL_ROLLOUT_READY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            # The last snapshot that arrived in time explains the failure.
+            details = (
+                "no rollout snapshot arrived in time"
+                if unready is None
+                else [
+                    {
+                        "model": model.model_id,
+                        "state": model.state.value,
+                        "admission": model.admission,
+                        "versions": [
+                            (replica.engine_id, replica.weight_version, replica.state.value)
+                            for replica in model.replicas
+                        ],
+                        "issues": list(model.issues),
+                    }
+                    for model in unready
+                ]
+            )
+            raise RuntimeError(
+                f"Rollout is not ready {INITIAL_ROLLOUT_READY_TIMEOUT_S:.0f}s after initial weight sync: {details}"
+            ) from None
 
     def shutdown(self) -> None:
         """Gracefully shut down all services, cleaning up SGLang engine
@@ -1164,9 +1220,14 @@ class Controller:
         if hasattr(self, "_health_manager"):
             self.stop_health_check()
 
-        self._dispose_rollout_manager()
-
         shutdown_managed_opd_teacher(self._teacher_manager)
+        # The inference manager owns every remaining engine and the Routers it
+        # started in its own process.
+        if self._inference_manager_handle is not None:
+            try:
+                ray.get(self._inference_manager_handle.shutdown_all.remote(), timeout=INFERENCE_SHUTDOWN_TIMEOUT_S)
+            except Exception as e:
+                logger.warning(f"Failed to shut down the inference manager: {e}")
 
         self._shutdown_agentic_rollout_services()
 
@@ -1363,8 +1424,7 @@ class Controller:
 
         # Save the old HealthChecker's stop event. Since _global_restart is
         # called FROM the old HealthChecker thread (via on_unhealthy callback),
-        # _health_manager.stop() cannot actually stop the thread (join times
-        # out because the thread is running this very function). We must
+        # _health_manager.stop() cannot join the calling checker thread. We must
         # explicitly set the stop event so that when control returns to the
         # old _check_loop after _global_restart finishes, the loop exits
         # immediately instead of trying to use stale Ray actor handles from
@@ -1391,9 +1451,6 @@ class Controller:
         # ObjectRef streams and ray.shutdown() triggers a fatal C++ crash.
         self._cancel_pending_tasks()
 
-        # The rollout actor owns router subprocesses; dispose before deleting its handle.
-        self._dispose_rollout_manager()
-
         # --- 1.3 Tear down all service deployments ---
         for svc_role, service in self.serve_dict.items():
             try:
@@ -1402,11 +1459,23 @@ class Controller:
             except Exception as e:
                 logger.warning(f"[Global Restart] Failed to stop heartbeat for '{svc_role}': {e}")
 
+            for app_name in (service._gateway_name, service._backend_name):
+                if app_name is None:
+                    continue
+                try:
+                    serve.delete(app_name)
+                    logger.info(f"[Global Restart] Deleted Ray Serve application '{app_name}'")
+                except Exception as e:
+                    logger.warning(f"[Global Restart] Failed to delete application '{app_name}': {e}")
+
+        if self._inference_manager_handle is not None:
+            # A failed stop (stuck engine, dead manager) must not abort recovery:
+            # ray.shutdown() below still reclaims the GPUs.
             try:
-                serve.delete(svc_role)
-                logger.info(f"[Global Restart] Deleted Ray Serve deployment '{svc_role}'")
+                ray.get(self._inference_manager_handle.shutdown_all.remote(), timeout=INFERENCE_SHUTDOWN_TIMEOUT_S)
+                logger.info("[Global Restart] Inference engines and owned routers shut down")
             except Exception as e:
-                logger.warning(f"[Global Restart] Failed to delete deployment '{svc_role}': {e}")
+                logger.warning(f"[Global Restart] Failed to shut down the inference manager: {e}")
 
         self.serve_dict.clear()
         logger.info("[Global Restart] All service references cleared")

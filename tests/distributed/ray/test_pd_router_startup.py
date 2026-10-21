@@ -1,6 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -212,65 +211,26 @@ def test_managed_pd_adopts_registry_before_publishing_groups(monkeypatch, rollou
     assert all(group.skip_router_registration for group in groups)
 
 
-@pytest.mark.parametrize("fail_at", ["engines", "publication", None])
-def test_startup_publishes_ready_router_or_rolls_back_owned_resources(monkeypatch, rollout_module, fail_at):
-    existing, created = Mock(), Mock()
-    existing.is_alive.return_value = created.is_alive.return_value = True
-    created.join.side_effect = lambda **kwargs: setattr(created.is_alive, "return_value", False)
-    rollout_module._LAUNCHED_ROUTER_PROCESSES.append(existing)
-    group = make_engine_group(engines=[make_mock_engine()])
-    shutdown = Mock()
-    monkeypatch.setattr(group, "shutdown_engines", shutdown)
-
-    def start(args, pg, groups):
-        groups.append(group)
-        rollout_module._LAUNCHED_ROUTER_PROCESSES.append(created)
-        if fail_at == "engines":
-            raise RuntimeError("startup failed")
-        args.sglang_router_ip, args.sglang_router_port = "ready-router", 3000
-        return {"default": group}
-
-    publish = Mock(side_effect=RuntimeError("startup failed") if fail_at == "publication" else None)
-    monkeypatch.setitem(sys.modules, "relax.agentic.rollout", SimpleNamespace(bind_agentic_router=publish))
-    monkeypatch.setattr(rollout_module, "_start_rollout_servers_impl", start)
-    args = _router_args(use_agentic_rollout=True)
-    if fail_at is None:
-        assert rollout_module.start_rollout_servers(args, None) == {"default": group}
-        shutdown.assert_not_called()
-        created.terminate.assert_not_called()
-        assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [existing, created]
-    else:
-        with pytest.raises(RuntimeError, match="startup failed"):
-            rollout_module.start_rollout_servers(args, None)
-        shutdown.assert_called_once_with({0})
-        created.terminate.assert_called_once()
-        assert rollout_module._LAUNCHED_ROUTER_PROCESSES == [existing]
-    existing.terminate.assert_not_called()
-    if fail_at == "engines":
-        publish.assert_not_called()
-    else:
-        publish.assert_called_once_with("ready-router", 3000)
-
-
 @pytest.mark.parametrize("defer_router", [False, True])
-def test_start_rollout_servers_initializes_models_before_publishing_router(monkeypatch, rollout_module, defer_router):
-    args = _router_args(use_agentic_rollout=True, sglang_hf_checkpoint=None)
+def test_start_servers_initializes_models_before_publishing_router(monkeypatch, rollout_module, defer_router):
+    from relax.engine.inference.config import EngineGroupSpec, InferenceModelSpec, SglangConfig
+    from relax.engine.inference.placement import PlacementBinding, PlacementPlanner
+
+    args = _router_args(sglang_hf_checkpoint=None, rollout_num_gpus_per_engine=2, num_gpus_per_node=8)
     args.router_decode_policy = "power_of_two" if defer_router else "consistent_hashing"
     models = [
-        rollout_module.ModelConfig(
+        InferenceModelSpec(
             name=name,
-            engine_groups=[
-                rollout_module.EngineGroupConfig("prefill", 2),
-                rollout_module.EngineGroupConfig("decode", 4),
-            ],
+            engine_groups=[EngineGroupSpec("prefill", 2), EngineGroupSpec("decode", 4)],
         )
         for name in ("actor", "other")
     ]
-    monkeypatch.setattr(rollout_module, "_resolve_sglang_config", lambda _: rollout_module.SglangConfig(models))
+    monkeypatch.setattr(rollout_module, "_resolve_sglang_config", lambda _: SglangConfig(models))
     events = []
 
     def start_engines(group, cursors):
-        assert group.skip_router_registration is defer_router
+        # Policy engines join the Router only after their first weight sync.
+        assert group.skip_router_registration is True
         assert group.require_router_registration is defer_router
         events.append("engines")
         return [object()], cursors
@@ -284,15 +244,13 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
         events.append(f"router-{name}")
         return f"router-{name}", 3001 if force_new else 3000
 
-    def start_managed(args, groups, *, force_new):
+    def start_managed(args, groups, *, force_new, launched):
         assert [group.worker_type for group in groups] == ["prefill", "decode"]
         name = "other" if force_new else "actor"
         assert events[-1] == f"ready-{name}"
+        for group in groups:
+            group.skip_router_registration = False
         return start_router(args, force_new=force_new)
-
-    def publish(host, port):
-        assert (host, port) == (args.sglang_router_ip, args.sglang_router_port) == ("router-actor", 3000)
-        events.append("publish")
 
     monkeypatch.setattr(rollout_module.EngineGroup, "start_engines", start_engines)
     monkeypatch.setattr(rollout_module, "_wait_engine_init_with_progress", wait)
@@ -300,14 +258,17 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
     managed = Mock(side_effect=start_managed)
     monkeypatch.setattr(rollout_module, "_start_router", dynamic)
     monkeypatch.setattr(rollout_module, "_start_managed_pd_router", managed)
-    monkeypatch.setitem(sys.modules, "relax.agentic.rollout", SimpleNamespace(bind_agentic_router=publish))
+    pg = PlacementBinding(Mock(), tuple(range(12)), tuple(range(8)) + tuple(range(4)), ("n0",) * 8 + ("n1",) * 4)
 
-    servers = rollout_module.start_rollout_servers(args, object())
+    servers = rollout_module.start_rollout_servers(args, pg, planner=PlacementPlanner())
 
+    assert (args.sglang_router_ip, args.sglang_router_port) == ("router-actor", 3000)
     assert [(server.router_ip, server.router_port) for server in servers.values()] == [
         ("router-actor", 3000),
         ("router-other", 3001),
     ]
+    # Replacements created after startup still wait for their weights.
+    assert all(group.skip_router_registration for server in servers.values() for group in server.engine_groups)
     if defer_router:
         dynamic.assert_not_called()
         assert managed.call_count == 2
@@ -320,7 +281,6 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
             "engines",
             "ready-other",
             "router-other",
-            "publish",
         ]
     else:
         managed.assert_not_called()
@@ -334,7 +294,6 @@ def test_start_rollout_servers_initializes_models_before_publishing_router(monke
             "engines",
             "engines",
             "ready-other",
-            "publish",
         ]
 
 
@@ -348,40 +307,6 @@ def test_router_cleanup_retains_failed_process_for_retry(rollout_module):
     process.terminate.side_effect = lambda: setattr(process.is_alive, "return_value", False)
     assert rollout_module.stop_launched_routers() == 1
     assert rollout_module._LAUNCHED_ROUTER_PROCESSES == []
-
-
-def test_rollout_owner_stops_router_even_when_engine_disposal_fails(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
-    manager = object.__new__(cls)
-    manager._stop_eviction_monitor = Mock()
-    manager._health_monitors = [Mock()]
-    manager._shutdown_all_engines = Mock(side_effect=RuntimeError("engine shutdown failed"))
-    stop = Mock()
-    monkeypatch.setattr(rollout_module, "stop_launched_routers", stop)
-    with pytest.raises(RuntimeError, match="engine shutdown failed"):
-        manager.dispose()
-    stop.assert_called_once()
-
-
-def test_engine_shutdown_uses_one_deadline_for_all_pd_workers(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
-    manager = object.__new__(cls)
-    engines = [make_mock_engine() for _ in range(4)]
-    manager.servers = {"default": SimpleNamespace(engine_groups=[SimpleNamespace(all_engines=engines)])}
-    timeouts = []
-
-    def get(ref, timeout):
-        timeouts.append(timeout)
-        rollout_module.time.sleep(timeout)
-        raise TimeoutError("engine unavailable")
-
-    killed = Mock()
-    monkeypatch.setattr(rollout_module.ray, "get", get)
-    monkeypatch.setattr(rollout_module.ray, "kill", killed)
-    manager._shutdown_all_engines(timeout=15.0)
-    assert timeouts == [15.0, 0.0, 0.0, 0.0]
-    assert rollout_module.time.now == 15.0
-    assert killed.call_count == 4
 
 
 @pytest.mark.parametrize("removed", [False, True])
@@ -510,22 +435,18 @@ def test_pd_recovery_rolls_back_failed_replacements_and_retries(monkeypatch, rol
     ]
 
 
-def test_owner_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
-    cls = rollout_module.RolloutManager.__ray_metadata__.modified_class
-    manager = object.__new__(cls)
+def test_pool_signals_all_monitors_before_bounded_join(monkeypatch, rollout_module):
+    pool = object.__new__(rollout_module.RolloutEnginePool)
     events = []
 
     def stop(name, timeout):
         events.append((name, timeout))
         rollout_module.time.sleep(timeout)
 
-    manager._stop_eviction_monitor = lambda timeout: stop("eviction", timeout)
-    manager._health_monitors = [
-        SimpleNamespace(stop=lambda timeout, i=i: stop(f"health-{i}", timeout)) for i in range(4)
-    ]
-    manager._shutdown_all_engines = lambda: events.append(("engines", None))
-    monkeypatch.setattr(rollout_module, "stop_launched_routers", lambda: events.append(("routers", None)))
-    manager.dispose()
+    pool._stop_eviction_monitor = lambda timeout: stop("eviction", timeout)
+    pool._stop_stranded_retry = lambda: events.append(("stranded", None))
+    pool._health_monitors = [SimpleNamespace(stop=lambda timeout, i=i: stop(f"health-{i}", timeout)) for i in range(4)]
+    pool.stop_monitors()
     assert events[:5] == [("eviction", 0.0)] + [(f"health-{i}", 0.0) for i in range(4)]
     assert rollout_module.time.now == 5.0
-    assert events[-2:] == [("engines", None), ("routers", None)]
+    assert ("stranded", None) in events

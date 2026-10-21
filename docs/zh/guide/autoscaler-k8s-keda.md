@@ -55,7 +55,7 @@ ______________________________________________________________________
 │  ┌──────────────────────────────────────┐                       │
 │  │  Relax Training Cluster (Ray)        │                       │
 │  │  ┌─────────────────────────────┐     │                       │
-│  │  │ Rollout Service (FastAPI)   │     │                       │
+│  │  │ Rollout Gateway (/rollout)  │     │                       │
 │  │  │ POST /rollout/scale_out     │     │                       │
 │  │  │ POST /rollout/scale_in      │     │                       │
 │  │  │ GET  /rollout/engines       │     │                       │
@@ -381,7 +381,7 @@ K8s 创建 Pod
   → postStart hook 并行启动，轮询等待 /health 就绪
   → SGLang ready
   → postStart 调用 POST /rollout/scale_out {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
+  → Relax InferenceManager（RolloutEnginePool）执行:
       CONNECTING → HEALTH_CHECKING → WEIGHT_SYNCING → READY → ACTIVE
   → 引擎接入流量
 ```
@@ -392,7 +392,7 @@ K8s 创建 Pod
 K8s 发送 SIGTERM
   → preStop hook 拦截
   → 调用 POST /rollout/scale_in {"engine_urls": ["http://<pod-ip>:30000"]}
-  → Relax RolloutManager 执行:
+  → Relax InferenceManager（RolloutEnginePool）执行:
       PENDING → DRAINING (停止新流量，等待在途请求)
              → REMOVING (注销引擎)
              → COMPLETED
@@ -531,7 +531,7 @@ ______________________________________________________________________
 | KEDA 扩缩事件 | `kubectl describe scaledobject sglang-engine-scaler` |
 | HPA 当前指标 | `kubectl get hpa -n relax-training -o wide` |
 | Pod 扩缩历史 | `kubectl get events -n relax-training --field-selector reason=SuccessfulRescale` |
-| Relax 引擎列表 | `GET /rollout/engines` |
+| Relax 引擎列表 | `GET /rollout/engines`（v2 格式；旧格式加 `?schema_version=1`） |
 | Relax scale_out 请求 | `GET /rollout/scale_out` |
 | Relax scale_in 请求 | `GET /rollout/scale_in` |
 

@@ -175,13 +175,16 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- GenRM -------------
     GENRM_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("GENRM_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     GENRM_ENGINE_RETRY_ATTEMPTS = EnvProperty("GENRM_ENGINE_RETRY_ATTEMPTS", int, 3)
-    GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S = EnvProperty("GENRM_ENGINE_CACHE_REFRESH_COOLDOWN_S", float, 5.0)
 
     # ------------- Rollout -------------
     ROLLOUT_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("ROLLOUT_SERVE_MAX_ONGOING_REQUESTS", int, 256)
     ROLLOUT_IMAGE_FETCH_ATTEMPTS = EnvProperty("ROLLOUT_IMAGE_FETCH_ATTEMPTS", int, 3)
     ROLLOUT_IMAGE_FETCH_TIMEOUT_S = EnvProperty("ROLLOUT_IMAGE_FETCH_TIMEOUT_S", float, 10.0)
     ROLLOUT_IMAGE_FETCH_BACKOFF_S = EnvProperty("ROLLOUT_IMAGE_FETCH_BACKOFF_S", float, 0.5)
+
+    # ------------- Teacher -------------
+    # Matches the OPD client's default --opd-teacher-connector-limit.
+    TEACHER_GATEWAY_MAX_ONGOING_REQUESTS = EnvProperty("TEACHER_GATEWAY_MAX_ONGOING_REQUESTS", int, 256)
 
     # ------------- DCS -------------
     DCS_SERVE_MAX_ONGOING_REQUESTS = EnvProperty("DCS_SERVE_MAX_ONGOING_REQUESTS", int, 100)

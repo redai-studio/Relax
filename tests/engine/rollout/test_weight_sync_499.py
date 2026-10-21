@@ -233,6 +233,7 @@ class _RolloutState:
         self.tokenizer = None
         self.pendings = set()
         self.protected_pendings = set()
+        self.opd_manager = None
 
     def submit_generate_tasks(self, samples):
         self.remaining_batch_size += len(samples)

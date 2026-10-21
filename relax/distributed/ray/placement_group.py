@@ -5,22 +5,24 @@ import socket
 import time
 
 import ray
-from ray.util.placement_group import PlacementGroup, placement_group
+from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from relax.core.node_group_affinity import (
     require_control_plane_resource_on_node,
     with_control_plane_affinity,
 )
+from relax.engine.inference.placement import PlacementBinding
 from relax.engine.sft.runtime import is_offline_mode
 from relax.utils import device as device_utils
-from relax.utils.device import ray_get_device_ids
+from relax.utils.device import ray_get_device_ids, visible_device_index
 from relax.utils.env import Envs
 from relax.utils.http_utils import get_host_info
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_ray_accelerator_kwargs
 
 from .actor_group import RayTrainGroup
+from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 
 logger = get_logger(__name__)
@@ -58,6 +60,23 @@ class InfoActor:
     def get_ip_and_gpu_id(self):
         return ray.util.get_node_ip_address(), ray_get_device_ids()[0]
 
+    def get_ip_gpu_and_node_id(self):
+        """Where this bundle landed: node IP (for ordering), GPU id, Ray node
+        id (for identity), and the local device index an engine on this node
+        addresses that GPU by.
+
+        Run with :data:`INFO_ACTOR_RUNTIME_ENV`, this actor sees the visible
+        devices an engine inherits, so the index is the engine's own mapping.
+        """
+        gpu_id = ray_get_device_ids()[0]
+        node_id = ray.get_runtime_context().get_node_id()
+        return ray.util.get_node_ip_address(), gpu_id, node_id, visible_device_index(int(gpu_id))
+
+
+# Engines keep the node's visible devices (Ray does not narrow them); the probe
+# must see the same ones to report the indices they address.
+INFO_ACTOR_RUNTIME_ENV = {"env_vars": dict.fromkeys(NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, "1")}
+
 
 def sort_key(x):
     index, node_identifier, gpu_id = x
@@ -78,6 +97,28 @@ def sort_key(x):
             node_ip_parts = [ord(c) for c in node_identifier]
 
     return (node_ip_parts, int(gpu_id))
+
+
+def build_placement_binding(pg, probes, sort_key=sort_key) -> PlacementBinding:
+    """Order a placement group's bundles by node and GPU from per-bundle
+    probes.
+
+    ``probes[i]`` is ``InfoActor.get_ip_gpu_and_node_id()`` run on bundle
+    ``i``. The IP only decides the order; node identity is the Ray node id. A
+    probe without the local device index leaves ``local_gpu_ids`` unknown.
+    """
+    ordered = sorted(
+        ((index, probe[0], probe[1]) for index, probe in enumerate(probes)),
+        key=sort_key,
+    )
+    local_known = all(len(probe) > 3 for probe in probes)
+    return PlacementBinding(
+        pg,
+        tuple(index for index, _, _ in ordered),
+        tuple(probes[index][1] for index, _, _ in ordered),
+        tuple(probes[index][2] for index, _, _ in ordered),
+        tuple(int(probes[index][3]) for index, _, _ in ordered) if local_known else None,
+    )
 
 
 def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: float = 2.0) -> None:
@@ -108,11 +149,9 @@ def _require_node_group_markers(node_group: str, retries: int = 3, retry_delay: 
     )
 
 
-def create_placement_group(
-    num_gpus: int, node_group_affinity: bool = True
-) -> tuple[PlacementGroup, list[int], list[int]]:
-    """Create a packed GPU placement group with optional node-group
-    affinity."""
+def create_placement_group(num_gpus: int, node_group_affinity: bool = True) -> PlacementBinding:
+    """Create a packed GPU placement group with optional node-group affinity,
+    returned as a :class:`PlacementBinding` probed per bundle."""
     accel_resource = device_utils.get_ray_accelerator_name()
     base_bundle = {accel_resource: 1, "CPU": 1}
     node_group = os.environ.get("RELAX_INITIAL_NODE_GROUP", "").strip()
@@ -133,27 +172,24 @@ def create_placement_group(
                     placement_group=pg,
                     placement_group_bundle_index=i,
                 ),
+                runtime_env=INFO_ACTOR_RUNTIME_ENV,
                 **accelerator_kwargs,
             ).remote()
         )
-    gpu_ids = ray.get([actor.get_ip_and_gpu_id.remote() for actor in info_actors])
+    probes = ray.get([actor.get_ip_gpu_and_node_id.remote() for actor in info_actors])
     for actor in info_actors:
         ray.kill(actor)
 
-    bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
-    sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
-    pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
-    # Map from logical index -> physical GPU ID
-    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-
-    for i in range(num_bundles):
-        actual_bundle_index = pg_reordered_bundle_indices[i]
+    binding = build_placement_binding(pg, probes)
+    for i, (actual_bundle_index, gpu_id, node_id) in enumerate(
+        zip(binding.bundle_indices, binding.gpu_ids, binding.node_ids, strict=True)
+    ):
         logger.info(
             f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
-            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
+            f"node: {probes[actual_bundle_index][0]} ({node_id}), gpu: {gpu_id}"
         )
 
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+    return binding
 
 
 def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
@@ -167,17 +203,22 @@ def allocate_train_group(args, num_gpus, pg, runtime_env=None, role="actor"):
     )
 
 
-def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
-    from .rollout import RolloutManager
+def create_rollout_worker(args, pg, data_source=None, runtime_env=None, inference_manager_handle=None):
+    from .rollout_worker import RolloutWorker
 
-    # Get the head node ID to ensure RolloutManager runs on the head node
-    # This is critical because the Router binds to the SLIME_HOST_IP address,
-    # and other components expect the router to be accessible at the head node's IP
+    if inference_manager_handle is None:
+        raise ValueError("RolloutWorker requires the task inference manager handle")
+    # Validate the CPU host before starting any rollout engines.
     head_node_id = _get_head_node_id()
-    logger.info(f"Scheduling RolloutManager on head node: {head_node_id}")
+    logger.info(f"Scheduling RolloutWorker on head node: {head_node_id}")
     require_control_plane_resource_on_node(args, head_node_id)
 
-    rollout_manager = RolloutManager.options(
+    router = ray.get(inference_manager_handle.create_rollout_role.remote(args, pg))
+    if router["router_ip"] is not None:
+        args.sglang_router_ip = router["router_ip"]
+        args.sglang_router_port = router["router_port"]
+
+    rollout_worker = RolloutWorker.options(
         **with_control_plane_affinity(
             args,
             {
@@ -190,10 +231,7 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
                 ),
             },
         )
-    ).remote(args, pg, data_source=data_source)
-
-    # Add timeout protection to prevent indefinite blocking during initialization
-    # The timeout is set to 120 seconds to allow sufficient time for:
+    ).remote(args, data_source=data_source, inference_manager_handle=inference_manager_handle)
 
     # Resolve num_rollout. Semantics:
     #   - both set         -> min(num_rollout, num_epoch * rollout_per_epoch)
@@ -206,14 +244,14 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
     if is_offline_mode(args):
         num_rollout_per_epoch = getattr(args, "num_rollout_per_epoch", None)
         logger.info(
-            f"RolloutManager initialized successfully (offline mode). "
+            f"RolloutWorker initialized successfully (offline mode). "
             f"num_rollout_per_epoch={num_rollout_per_epoch} (pre-resolved by controller)."
         )
     else:
         num_rollout_per_epoch = ray.get(
-            rollout_manager.get_num_rollout_per_epoch.remote(),
+            rollout_worker.get_num_rollout_per_epoch.remote(),
         )
-        logger.info(f"RolloutManager initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
+        logger.info(f"RolloutWorker initialized successfully. num_rollout_per_epoch: {num_rollout_per_epoch}")
 
         args.num_rollout_per_epoch = num_rollout_per_epoch
         if args.num_epoch is not None:
@@ -225,114 +263,30 @@ def create_rollout_manager(args, pg, data_source=None, runtime_env=None):
         )
 
     if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="snapshot"))
-        ray.get(rollout_manager.check_weights.remote(action="reset_tensors"))
+        ray.get(inference_manager_handle.rollout_operation.remote("check_weights", action="snapshot"))
+        ray.get(inference_manager_handle.rollout_operation.remote("check_weights", action="reset_tensors"))
 
     if args.offload_rollout:
-        ray.get(rollout_manager.offload.remote())
+        from relax.engine.inference.types import Role
 
-    return rollout_manager, num_rollout_per_epoch
+        ray.get(inference_manager_handle.deactivate.remote(Role.ROLLOUT))
+
+    return rollout_worker, num_rollout_per_epoch
 
 
-def create_genrm_manager(args, pg, runtime_env=None):
-    """Create and initialize a single GenRM manager (legacy single-instance
-    path).
-
-    Args:
-        args: Argument namespace containing genRM configuration
-        pg: Placement group for resource allocation
-        runtime_env: Optional runtime environment configuration
+def create_genrm_role(args, pg, inference_manager_handle) -> tuple[str, ...]:
+    """Start every GenRM instance declared by
+    ``args._genrm_instances_resolved`` as one model of the GenRM role on the
+    task's inference manager.
 
     Returns:
-        Initialized GenRM manager
+        The GenRM model IDs (route keys), in configuration order.
     """
-    from .genrm import GenRMManager
+    from relax.engine.inference.config_adapters import genrm_role_models
+    from relax.engine.inference.types import Role
 
-    # `name` (with no explicit namespace) lets user code inside other actors of
-    # the same Ray job look this up via ray.get_actor("relax_genrm_manager").
-    # Used by custom_reward_post_process_path when GenRM lifecycle is managed
-    # from userland. Only safe as a fixed, well-known name because this path
-    # is exclusively for the single-instance case (see create_genrm_managers).
-    genrm_manager = GenRMManager.options(
-        **with_control_plane_affinity(
-            args,
-            {
-                "name": "relax_genrm_manager",
-                "num_cpus": 1,
-                "num_gpus": 0,
-                "runtime_env": runtime_env,
-            },
-        )
-    ).remote(args, pg)
-
-    logger.info("GenRMManager initialized successfully")
-
-    # Offload if requested (for colocated mode)
-    if args.offload_rollout:
-        logger.info("Offloading GenRM engines (colocated mode)")
-        ray.get(genrm_manager.offload.remote())
-
-    return genrm_manager
-
-
-def create_genrm_managers(args, pg, runtime_env=None):
-    """Create and initialize the GenRM manager(s) declared by
-    ``args._genrm_instances_resolved``.
-
-    Single-instance configs (the legacy --genrm-model-path path, normalized to
-    the sentinel key "__default__") go through ``create_genrm_manager`` so the
-    well-known Ray actor name "relax_genrm_manager" keeps working for userland
-    lookups. Multi-instance configs (--genrm-instances) launch one manager per
-    route key, sharing ``pg`` at non-overlapping GPU offsets, named
-    "relax_genrm_manager_{key}" -- there is no single well-known name to
-    preserve once more than one instance exists.
-
-    Returns:
-        ``{route_key: manager_handle}``.
-    """
-    import copy
-
-    from .genrm import GenRMManager
-    from .multi_instance_orchestrator import start_multi_instance_managers
-
-    instance_specs = args._genrm_instances_resolved
-    if list(instance_specs.keys()) == ["__default__"]:
-        return {"__default__": create_genrm_manager(args, pg, runtime_env=runtime_env)}
-    port_window_indices = {key: index for index, key in enumerate(instance_specs)}
-
-    def _build_genrm_manager_args(base_args, key, spec):
-        instance_args = copy.copy(base_args)
-        instance_args.genrm_model_path = spec["model_path"]
-        instance_args.genrm_num_gpus = spec["num_gpus"]
-        instance_args.genrm_num_gpus_per_engine = spec["num_gpus_per_engine"]
-        instance_args.genrm_engine_config = spec["engine_config"]
-        instance_args.genrm_sampling_config = spec["sampling_config"]
-        return instance_args
-
-    def _spawn_genrm_manager(key, instance_args, bundle_offset, spec):
-        return GenRMManager.options(
-            **with_control_plane_affinity(
-                instance_args,
-                {
-                    "name": f"relax_genrm_manager_{key}",
-                    "num_cpus": 1,
-                    "num_gpus": 0,
-                    "runtime_env": runtime_env,
-                },
-            )
-        ).remote(
-            instance_args,
-            pg,
-            bundle_offset=bundle_offset,
-            port_window_index=port_window_indices[key],
-        )
-
-    managers = start_multi_instance_managers(
-        args=args,
-        instance_specs=instance_specs,
-        build_manager_args=_build_genrm_manager_args,
-        spawn_manager=_spawn_genrm_manager,
-        region_offset=0,
-    )
-    logger.info(f"GenRM managers initialized successfully: instances={list(managers.keys())}")
-    return managers
+    model_ids = tuple(ray.get(inference_manager_handle.create_role.remote(Role.GENRM, genrm_role_models(args, pg))))
+    if getattr(args, "offload_rollout", False):
+        ray.get([inference_manager_handle.call.remote(Role.GENRM, key, "deactivate") for key in model_ids])
+    logger.info(f"GenRM models initialized successfully: instances={list(model_ids)}")
+    return model_ids

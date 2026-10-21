@@ -308,6 +308,9 @@ def test_controller_prepares_then_deploys_service(monkeypatch):
     instance.config = SimpleNamespace()
     instance.runtime_env = None
     instance._health_manager = SimpleNamespace(status=object())
+    # Services are handed the task-level inference owner; register_all_serve
+    # creates it before any service, and __init__ seeds it as None.
+    instance._inference_manager_handle = None
     monkeypatch.setattr(controller, "Service", FakeService)
 
     role, service, error = instance._create_service_task(
@@ -424,19 +427,23 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         def __init__(self, role):
             self.role = role
 
-        async def get_rollout_manager(self):
+        async def get_rollout_worker(self):
             return object()
 
-        async def set_rollout_manager(self, _manager):
-            events.append("set_rollout_manager")
+        async def set_rollout_handles(self, _worker, _manager):
+            events.append("set_rollout_handles")
 
-        def update_weights_fully_async(self):
+        async def update_weights_fully_async(self):
+            events.append("schedule_update_weights")
+
             async def update():
                 events.append("update_weights")
 
             return update()
 
-        def recv_weight_fully_async(self):
+        async def recv_weight_fully_async(self):
+            events.append(f"schedule_receive_{self.role.value}")
+
             async def receive():
                 events.append(f"receive_{self.role.value}")
 
@@ -466,6 +473,21 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
         ROLES.reference: Service(ROLES.reference),
     }
     instance._teacher_manager = None
+
+    # Hand-assembled Controller: keep the fields training_loop reads in step.
+    async def publish_rollout(role, source):
+        assert (role, source) == (controller.Role.ROLLOUT, controller.WEIGHT_UPDATE_BACKEND)
+        events.append("publish_rollout")
+
+    async def snapshot(_role):
+        events.append("snapshot_rollout")
+        return SimpleNamespace(
+            models=[SimpleNamespace(model_id="default", state=controller.LifecycleState.READY, admission=True)]
+        )
+
+    instance._inference_manager_handle = SimpleNamespace(
+        end_weight_update=SimpleNamespace(remote=publish_rollout), snapshot=SimpleNamespace(remote=snapshot)
+    )
     instance._pending_task_refs = []
     instance._pending_task_refs_lock = threading.Lock()
     instance._restarting = False
@@ -475,6 +497,10 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
     instance.training_loop()
 
     cleanup_index = events.index("cleanup")
+    assert events.index("update_weights") < events.index("publish_rollout") < cleanup_index
+    assert events.index("publish_rollout") < events.index("snapshot_rollout") < cleanup_index
+    assert events.index("receive_actor_fwd") < events.index("publish_rollout")
+    assert events.index("receive_reference") < events.index("publish_rollout")
     assert events.index("update_weights") < cleanup_index
     assert events.index("set_step_actor") < cleanup_index
     assert cleanup_index < events.index("run_actor")
@@ -482,3 +508,116 @@ def test_controller_s3_cleanup_runs_after_initial_sync_before_service_run(monkey
 
 async def _async_noop():
     return None
+
+
+def test_controller_aborted_rollout_shuts_down_rollout_engines(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    shutdowns = []
+    instance._inference_manager_handle = SimpleNamespace(
+        shutdown=SimpleNamespace(remote=lambda role: shutdowns.append(role) or "shutdown_ref")
+    )
+    events = []
+    service = SimpleNamespace(
+        _deployed=True,
+        _stop_heartbeat_thread=lambda: None,
+        _delete_applications=lambda: events.append("delete_apps"),
+        _shutdown_inference_engines=lambda: events.append("engines") or True,
+        _is_shared_pgs=False,
+        pgs=("pg", [0], [0]),
+    )
+    monkeypatch.setattr(controller, "remove_placement_group", lambda pg: events.append(("release", pg)))
+
+    instance._cleanup_aborted_service("rollout", service, deploy=True)
+
+    # The real application names and engine stop are Service's; the PG goes last.
+    assert events == ["delete_apps", "engines", ("release", "pg")]
+    assert shutdowns == []
+
+
+def test_controller_aborted_service_keeps_the_pg_while_engines_may_hold_gpus(monkeypatch):
+    instance = controller.Controller.__new__(controller.Controller)
+    released = []
+    service = SimpleNamespace(
+        _stop_heartbeat_thread=lambda: None,
+        _delete_applications=lambda: None,
+        _shutdown_inference_engines=lambda: False,
+        _is_shared_pgs=False,
+        pgs=("pg", [0], [0]),
+    )
+    monkeypatch.setattr(controller, "remove_placement_group", released.append)
+
+    instance._cleanup_aborted_service("rollout", service, deploy=True)
+
+    assert released == []
+
+
+def _rollout_snapshots(states):
+    """A Manager stub whose rollout snapshot walks through ``states``."""
+    seen = {"snapshots": 0, "refreshed": []}
+
+    async def snapshot(_role):
+        state = states[min(seen["snapshots"], len(states) - 1)]
+        seen["snapshots"] += 1
+        model = SimpleNamespace(
+            model_id="default", state=state, admission=state == controller.LifecycleState.READY, replicas=(), issues=()
+        )
+        return SimpleNamespace(models=[model])
+
+    async def refresh(role, model_id):
+        seen["refreshed"].append((role, model_id))
+
+    handle = SimpleNamespace(snapshot=SimpleNamespace(remote=snapshot), refresh=SimpleNamespace(remote=refresh))
+    return handle, seen
+
+
+def test_controller_re_observes_rollout_until_ready_after_initial_sync(monkeypatch):
+    import asyncio
+
+    instance = controller.Controller.__new__(controller.Controller)
+    starting, ready = controller.LifecycleState.STARTING, controller.LifecycleState.READY
+    instance._inference_manager_handle, seen = _rollout_snapshots([starting, starting, ready])
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+
+    # One slow probe must not fail the startup: unready models are observed again.
+    asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+    assert seen["snapshots"] == 3
+    assert seen["refreshed"] == [(controller.Role.ROLLOUT, "default")] * 2
+
+
+def test_controller_fails_startup_when_rollout_stays_unready(monkeypatch):
+    import asyncio
+
+    instance = controller.Controller.__new__(controller.Controller)
+    instance._inference_manager_handle, _ = _rollout_snapshots([controller.LifecycleState.STARTING])
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_TIMEOUT_S", 0.0)
+
+    with pytest.raises(RuntimeError, match="Rollout is not ready"):
+        asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+
+def test_controller_bounds_the_ready_wait_by_a_hanging_refresh(monkeypatch):
+    import asyncio
+    import time
+
+    instance = controller.Controller.__new__(controller.Controller)
+    handle, _ = _rollout_snapshots([controller.LifecycleState.STARTING, controller.LifecycleState.READY])
+
+    async def hanging_refresh(role, model_id):
+        # One refresh probes every replica in turn; unresponsive engines can
+        # keep it busy far beyond the startup limit.
+        await asyncio.sleep(60)
+
+    handle.refresh = SimpleNamespace(remote=hanging_refresh)
+    instance._inference_manager_handle = handle
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_POLL_S", 0.0)
+    monkeypatch.setattr(controller, "INITIAL_ROLLOUT_READY_TIMEOUT_S", 0.2)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Rollout is not ready") as error:
+        asyncio.run(instance._await_rollout_ready_after_initial_sync())
+
+    # The limit holds even mid-refresh, and the late READY is never accepted.
+    assert time.monotonic() - started < 5
+    assert "'state': 'starting'" in str(error.value)

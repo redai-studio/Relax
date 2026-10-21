@@ -369,9 +369,11 @@ class AutoscalerService(Base):
     async def _fetch_engines(self) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
         """Fetch active candidates and this call's discovery completeness.
 
-        Only engines with ``status == "active"`` and a usable URL are returned.
-        Missing/invalid observation pauses scaling, including during upgrades
-        from an older Rollout producer. Upgrade the consumer first or together.
+        Reads either discovery schema: v2 (``schema_version == 2``) returns
+        every non-dead engine with a usable ``base_url``; v1 returns engines
+        with ``status == "active"`` and a usable ``url``. Missing/invalid
+        observation pauses scaling, including during upgrades from an older
+        Rollout producer. Upgrade the consumer first or together.
         """
 
         def incomplete(reason: str) -> Dict[str, Any]:
@@ -380,7 +382,7 @@ class AutoscalerService(Base):
         if self._http_session is None:
             return [], incomplete("discovery_error")
 
-        url = f"{self.config.rollout_service_url}/engines"
+        url = f"{self.config.rollout_service_url}/engines?schema_version=2"
 
         try:
             async with self._http_session.get(url) as response:
@@ -398,25 +400,11 @@ class AutoscalerService(Base):
         try:
             if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
                 raise ValueError("models must be a dict")
+            parse = self._v2_engines if data.get("schema_version") == 2 else self._v1_engines
             for model_name, model_info in data["models"].items():
-                if not isinstance(model_info, dict) or not isinstance(model_info.get("engine_groups"), list):
-                    raise ValueError("engine_groups must be a list")
-                for group in model_info["engine_groups"]:
-                    if not isinstance(group, dict) or not isinstance(group.get("engines"), list):
-                        raise ValueError("engines must be a list")
-                    for engine in group["engines"]:
-                        if not isinstance(engine, dict):
-                            raise ValueError("engine must be a dict")
-                        engine_url = engine.get("url")
-                        if engine.get("status") == "active" and isinstance(engine_url, str) and engine_url:
-                            engines.append(
-                                {
-                                    "id": f"engine_{engine.get('rank', 'unknown')}",
-                                    "url": engine_url,
-                                    "model_name": model_name,
-                                    "status": "active",
-                                }
-                            )
+                if not isinstance(model_info, dict):
+                    raise ValueError("model must be a dict")
+                engines.extend(parse(model_name, model_info))
 
             if "observation" not in data:
                 return engines, incomplete("observation_protocol_missing")
@@ -439,6 +427,51 @@ class AutoscalerService(Base):
         except ValueError as e:
             logger.warning(f"Invalid engine observation: {e}")
             return engines, incomplete("observation_protocol_invalid")
+
+    @staticmethod
+    def _v1_engines(model_name: str, model_info: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Active engines of one model in the v1 ``engine_groups`` schema."""
+        if not isinstance(model_info.get("engine_groups"), list):
+            raise ValueError("engine_groups must be a list")
+        engines = []
+        for group in model_info["engine_groups"]:
+            if not isinstance(group, dict) or not isinstance(group.get("engines"), list):
+                raise ValueError("engines must be a list")
+            for engine in group["engines"]:
+                if not isinstance(engine, dict):
+                    raise ValueError("engine must be a dict")
+                engine_url = engine.get("url")
+                if engine.get("status") == "active" and isinstance(engine_url, str) and engine_url:
+                    engines.append(
+                        {
+                            "id": f"engine_{engine.get('rank', 'unknown')}",
+                            "url": engine_url,
+                            "model_name": model_name,
+                            "status": "active",
+                        }
+                    )
+        return engines
+
+    @staticmethod
+    def _v2_engines(model_name: str, model_info: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Non-dead engines of one model in the v2 common discovery schema."""
+        if not isinstance(model_info.get("engines"), list):
+            raise ValueError("engines must be a list")
+        engines = []
+        for engine in model_info["engines"]:
+            if not isinstance(engine, dict) or not isinstance(engine.get("engine_id"), str):
+                raise ValueError("engine must be a dict with an engine_id")
+            base_url = engine.get("base_url")
+            if engine.get("state") != "dead" and isinstance(base_url, str) and base_url:
+                engines.append(
+                    {
+                        "id": engine["engine_id"],
+                        "url": base_url,
+                        "model_name": model_name,
+                        "status": engine.get("state", "unknown"),
+                    }
+                )
+        return engines
 
     async def _execute_scale_out(self, decision: ScalingDecision, current_engines: int) -> None:
         if self._http_session is None:

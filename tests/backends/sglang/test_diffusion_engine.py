@@ -410,6 +410,72 @@ def test_offload_passes_through_a_successful_reply():
     assert eng.resume_memory_occupation() == {"success": True}
 
 
+def test_inference_observation_reports_a_direct_routed_replica():
+    eng = SGLangNativeGenerationEngine(args=None, rank=0)
+    eng._url = "http://127.0.0.1:21000"
+    eng.commit_weight_version(3, "a" * 64)
+    with _fake_requests(_FakeResponse(200)):
+        observation = eng.get_inference_observation(ensure_router=True)
+    # It never joins a Router, whatever the pool asks.
+    assert observation == {
+        "base_url": "http://127.0.0.1:21000",
+        "healthy": True,
+        "router_registered": False,
+        "weight_version": "3",
+    }
+    assert SGLangNativeGenerationEngine.route_mode == de.RouteMode.DIRECT
+
+
+def test_inference_observation_never_probes_released_memory(monkeypatch):
+    # The engine reads the weights tag from SGLang; CPU CI runs without it.
+    weights_tag = "weights"
+    for name in ("sglang", "sglang.srt"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    constants = types.ModuleType("sglang.srt.constants")
+    constants.GPU_MEMORY_TYPE_WEIGHTS = weights_tag
+    monkeypatch.setitem(sys.modules, "sglang.srt.constants", constants)
+
+    eng = SGLangNativeGenerationEngine(args=None, rank=0)
+    eng._url = "http://127.0.0.1:21000"
+    eng._post = lambda path, body: {"success": True}
+    eng.health_generate = lambda timeout=5.0: pytest.fail("a released engine must not be probed")
+
+    eng.release_memory_occupation()
+    assert eng.get_inference_observation()["healthy"] is False
+    # A weights-only resume leaves the rest of the pipeline released.
+    eng.resume_memory_occupation(tags=[weights_tag])
+    assert eng.get_inference_observation()["healthy"] is False
+
+    eng.health_generate = lambda timeout=5.0: True
+    eng.resume_memory_occupation()
+    assert eng.get_inference_observation()["healthy"] is True
+
+
+def test_inference_observation_reports_a_failed_probe_as_unhealthy():
+    eng = SGLangNativeGenerationEngine(args=None, rank=0)
+    eng._url = "http://127.0.0.1:21000"
+    with _fake_requests(TimeoutError("hung server")):
+        assert eng.get_inference_observation()["healthy"] is False
+
+
+def test_init_reports_the_pool_metadata(monkeypatch):
+    eng = SGLangNativeGenerationEngine(args=None, rank=2)
+    monkeypatch.setattr(eng, "_launch_server", lambda host, port, engine_args: "http://10.0.0.1:21000")
+    monkeypatch.setattr(eng, "_wait_healthy", lambda timeout: None)
+    monkeypatch.setattr(eng, "get_pid_and_node_id", lambda: {"pid": 42, "node_id": "node-a"})
+
+    metadata = eng.init(host="10.0.0.1", port=21000)
+
+    # url/pid/node_id are what the engine pool validates init metadata by.
+    assert metadata == {
+        "rank": 2,
+        "url": "http://10.0.0.1:21000",
+        "active_version": 0,
+        "pid": 42,
+        "node_id": "node-a",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Engine: server args
 # ---------------------------------------------------------------------------

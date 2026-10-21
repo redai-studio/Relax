@@ -244,6 +244,11 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
+        path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(self._state_dict(), path)
+
+    def _state_dict(self) -> dict:
         state_dict = {
             "sample_offset": self.sample_offset,
             "epoch_id": self.epoch_id,
@@ -257,9 +262,7 @@ class RolloutDataSource(DataSource):
         if self._use_streaming and self.dataset is not None:
             state_dict["streaming_state"] = self.dataset.get_state()
 
-        path = os.path.join(self.args.save, f"dataset/global_dataset_state_dict_{rollout_id}.pt")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        return state_dict
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -283,7 +286,10 @@ class RolloutDataSource(DataSource):
                 return
 
         logger.info(f"load metadata from {path}")
-        state_dict = torch.load(path)
+        # Dataset checkpoints may include buffered Sample objects.
+        self._load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+
+    def _load_state_dict(self, state_dict: dict) -> None:
         self.sample_offset = state_dict.get("sample_offset", 0)
         self.epoch_id = state_dict.get("epoch_id", 0)
         self.sample_group_index = state_dict.get("sample_group_index", 0)
@@ -314,6 +320,15 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             self.buffer_filter = pop_first
         else:
             self.buffer_filter = load_function(self.args.buffer_filter_path)
+
+    def _state_dict(self) -> dict:
+        state_dict = super()._state_dict()
+        state_dict["buffer"] = self.buffer
+        return state_dict
+
+    def _load_state_dict(self, state_dict: dict) -> None:
+        super()._load_state_dict(state_dict)
+        self.buffer = state_dict.get("buffer", [])
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         """Return exactly num_samples groups, buffer-first then dataset top-

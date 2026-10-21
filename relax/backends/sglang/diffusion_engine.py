@@ -31,6 +31,7 @@ from dataclasses import fields
 from typing import Any, Dict, List, Mapping, Optional
 
 from relax.distributed.ray.ray_actor import RayActor
+from relax.engine.inference.types import RouteMode
 from relax.utils.logging_utils import get_logger
 
 
@@ -267,6 +268,9 @@ class SGLangNativeGenerationEngine(RayActor):
     """Ray actor driving SGLang's diffusion rollout + weight-update HTTP
     API."""
 
+    # Generation calls these engines directly; they never join a Router.
+    route_mode = RouteMode.DIRECT
+
     def __init__(
         self,
         args,
@@ -289,6 +293,9 @@ class SGLangNativeGenerationEngine(RayActor):
         self._active_version = 0
         self._active_weight_manifest_sha256 = ""
         self._weight_updating = False
+        # Whether any pipeline memory is released; a released engine is not
+        # probed, since generating against it is not a valid state.
+        self._memory_released = False
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -301,7 +308,13 @@ class SGLangNativeGenerationEngine(RayActor):
         """
         self._url = self._launch_server(host, port, engine_args)
         self._wait_healthy(timeout=_HEALTH_TIMEOUT_S)
-        return {"rank": self.rank, "url": self._url, "active_version": self._active_version}
+        # url/pid/node_id are the init metadata every pool engine reports.
+        return {
+            "rank": self.rank,
+            "url": self._url,
+            "active_version": self._active_version,
+            **self.get_pid_and_node_id(),
+        }
 
     def get_base_gpu_id(self) -> Optional[int]:
         """Physical GPU this engine is pinned to (``CUDA_VISIBLE_DEVICES``
@@ -508,8 +521,8 @@ class SGLangNativeGenerationEngine(RayActor):
         sources.
 
         The colocate framework injects ``sglang_overrides["model_path"]`` from
-        ``args.hf_checkpoint`` (ModelConfig.resolve), which is None for a
-        diffusion run — the DiT path uses ``args.model_path``, not
+        ``args.hf_checkpoint`` (InferenceModelSpec.resolve), which is None for
+        a diffusion run — the DiT path uses ``args.model_path``, not
         hf_checkpoint. Fall through a precedence chain so a None override never
         clobbers the real path.
         """
@@ -718,6 +731,7 @@ class SGLangNativeGenerationEngine(RayActor):
         full pipeline resident and the colocated FSDP actor OOMs many steps
         later with nothing pointing back here.
         """
+        self._memory_released = True
         result = self._post("/release_memory_occupation", {})
         self._raise_on_failure("release_memory_occupation", result)
         return result
@@ -740,6 +754,8 @@ class SGLangNativeGenerationEngine(RayActor):
                 weights_only = False
         result = self._post("/resume_memory_occupation", {"weights_only": weights_only})
         self._raise_on_failure("resume_memory_occupation", result)
+        if not weights_only:
+            self._memory_released = False
         return result
 
     def _raise_on_failure(self, what: str, result: Mapping[str, Any]) -> None:
@@ -766,6 +782,27 @@ class SGLangNativeGenerationEngine(RayActor):
         response = requests.get(f"{self._url}/health_generate", timeout=timeout)
         response.raise_for_status()
         return True
+
+    def get_inference_observation(self, ensure_router: bool = False) -> Dict[str, Any]:
+        """Report the evidence the engine pool publishes this replica from.
+
+        The diffusion engine is direct-routed and never joins a Router, so
+        ``ensure_router`` is ignored and ``router_registered`` is always false.
+        An engine with released memory reports unhealthy without a probe.
+        """
+        del ensure_router
+        healthy = False
+        if not self._memory_released and self._url:
+            try:
+                healthy = self.health_generate(timeout=5.0)
+            except Exception as exc:
+                logger.warning(f"engine[{self.rank}] health probe failed: {exc}")
+        return {
+            "base_url": self._url,
+            "healthy": healthy,
+            "router_registered": False,
+            "weight_version": str(self._active_version),
+        }
 
     # -- engine-pool contract -------------------------------------------------
     #

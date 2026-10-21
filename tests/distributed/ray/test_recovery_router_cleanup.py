@@ -93,7 +93,6 @@ def test_recovery_retries_after_replacement_dies_during_init(monkeypatch):
     failed_init_ref = object()
     group.engine_init_records[0] = rollout._EngineInitRecord(
         failed_init_ref,
-        pending_router_registration=True,
         router_url="http://worker:15000",
         router_cleanup=rollout.RouterWorkerCleanup("B"),
     )

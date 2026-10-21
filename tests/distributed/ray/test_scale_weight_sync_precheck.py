@@ -407,7 +407,45 @@ class _HangingProcess(_CompletedProcess):
         return self.returncode
 
 
-def test_actor_probe_explicitly_limits_child_visible_devices():
+@pytest.mark.parametrize("has_result", [True, False])
+def test_actor_probe_parses_json_after_interleaved_nccl_log(has_result):
+    engine = object.__new__(SGLangEngine)
+    engine.node_rank = 0
+    engine.base_gpu_id = 0
+    engine.num_gpus_per_engine = 1
+    engine.args = SimpleNamespace(num_gpus_per_node=8)
+
+    class _InterleavedProcess(_CompletedProcess):
+        def __init__(self, command, **kwargs):
+            super().__init__(command, **kwargs)
+            log_file = kwargs["stdout"]
+            log_file.seek(0)
+            log_file.truncate()
+            log_file.write("NCCL INFO Connected")
+            if has_result:
+                log_file.write(json.dumps({"device_id": 0, "success": True}))
+            log_file.flush()
+
+    with (
+        patch("relax.backends.sglang.sglang_engine.subprocess.Popen", _InterleavedProcess),
+        patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0"}),
+    ):
+        result = engine.run_scale_weight_sync_precheck("10.0.0.1", "18000", 0, "interleaved", 1, 10)
+
+    assert result["success"] is has_result
+    assert result["results"][0]["category"] is (None if has_result else "launch_transient")
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        ("0,1,2,3,4,5,6,7", "4,5"),
+        # The engine drives local devices 0 and 1 here, physical GPUs 4 and 7.
+        ("4,7", "4,7"),
+    ],
+)
+def test_actor_probe_explicitly_limits_child_visible_devices(inherited, expected):
     engine = object.__new__(SGLangEngine)
     engine.node_rank = 0
     engine.base_gpu_id = 4
@@ -423,7 +461,13 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
     with (
         patch("relax.backends.sglang.sglang_engine.subprocess.Popen", side_effect=_popen),
         patch("torch.cuda.mem_get_info", return_value=(4 * 1024**3, 80 * 1024**3)),
-        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}),
+        patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": inherited}),
+        # The env var name follows the accelerator, which a CPU-only Ray
+        # cluster left up by another test would report as none.
+        patch(
+            "relax.backends.sglang.sglang_engine.device_utils.get_visible_devices_env_var",
+            return_value="CUDA_VISIBLE_DEVICES",
+        ),
     ):
         result = engine.run_scale_weight_sync_precheck(
             master_address="10.0.0.1",
@@ -439,7 +483,7 @@ def test_actor_probe_explicitly_limits_child_visible_devices():
         process.command[:3] == [sys.executable, "-m", "relax.backends.sglang._scale_weight_sync_precheck"]
         for process in created
     )
-    assert [process.kwargs["env"]["CUDA_VISIBLE_DEVICES"] for process in created] == ["4,5", "4,5"]
+    assert [process.kwargs["env"]["CUDA_VISIBLE_DEVICES"] for process in created] == [expected, expected]
     device_ids = [process.command[process.command.index("--device-id") + 1] for process in created]
     assert device_ids == ["0", "1"]
     assert all(process.kwargs["start_new_session"] is True for process in created)

@@ -237,8 +237,15 @@ def post_process_rewards(args: Any, samples: list[Sample] | list[list[Sample]]):
     # (raw_rewards, post_processed_rewards); it now intentionally returns only
     # post_processed_rewards.
     if args.custom_reward_post_process_path is not None:
+        from relax.engine.inference.phase_plans import PHASE_GENRM
+        from relax.engine.rollout.scoring_phase import scoring_phase
+
         custom_reward_post_process_func = load_function(args.custom_reward_post_process_path)
-        return custom_reward_post_process_func(args, samples)
+        # Deferred GenRM scoring runs in its own activation phase, so the hook
+        # only has to score: the framework offloads generation, wakes the judge
+        # and puts it back to sleep with a confirmed release.
+        with scoring_phase(args, PHASE_GENRM):
+            return custom_reward_post_process_func(args, samples)
 
     if getattr(args, "agentic_custom_advantage_path", None) is not None:
         return [sample.custom_advantage for sample in samples]

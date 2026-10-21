@@ -73,14 +73,14 @@ ______________________________________________________________________
 
 Relax 采用**面向服务的六层架构**，每个角色均作为独立的 [Ray Serve](https://docs.ray.io/en/latest/serve/index.html) 部署，将编排、组件、引擎、后端与分布式能力彻底解耦：
 
-| 层级                        | 职责                                                                                                           |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------- |
-| **Entrypoints（入口层）**   | `train.py` — 信号处理、CLI 解析、Ray 集群连接、Controller 启动                                                 |
-| **Orchestration（编排层）** | `Controller`（训练循环、全局重启）、`Service`（Placement Group、生命周期管理）、`Registry`（角色与算法注册）   |
-| **Components（组件层）**    | Ray Serve 部署：**Actor**、**Rollout**、**Critic**、**ActorFwd**、**Advantages**、**GenRM**                    |
-| **Engine（引擎层）**        | SGLang Rollout 引擎、可插拔奖励函数、请求路由、数据过滤                                                        |
-| **Backends（后端层）**      | **Megatron-LM** 训练后端（TP/PP/CP/EP）与 **SGLang** 推理引擎                                                  |
-| **Distributed（分布式层）** | Ray Actor Groups（RolloutManager / GenRMManager）与 **DCS**（分布式 Checkpoint 服务，支持 NCCL/GLOO 权重同步） |
+| 层级                        | 职责                                                                                                                                      |
+| :-------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------- |
+| **Entrypoints（入口层）**   | `train.py` — 信号处理、CLI 解析、Ray 集群连接、Controller 启动                                                                            |
+| **Orchestration（编排层）** | `Controller`（训练循环、全局重启）、`Service`（Placement Group、生命周期管理）、`Registry`（角色与算法注册）                              |
+| **Components（组件层）**    | Ray Serve 部署：**Actor**、**Rollout**、**Critic**、**ActorFwd**、**Advantages**、**GenRM**                                               |
+| **Engine（引擎层）**        | SGLang Rollout 引擎、可插拔奖励函数、请求路由、数据过滤                                                                                   |
+| **Backends（后端层）**      | **Megatron-LM** 训练后端（TP/PP/CP/EP）与 **SGLang** 推理引擎                                                                             |
+| **Distributed（分布式层）** | **InferenceManager**（Rollout / GenRM / Teacher 引擎池）、**RolloutWorker** 与 **DCS**（分布式 Checkpoint 服务，支持 NCCL/GLOO 权重同步） |
 
 支持**三种执行模式**：
 

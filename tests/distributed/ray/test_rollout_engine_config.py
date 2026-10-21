@@ -7,7 +7,7 @@ import pytest
 
 
 try:
-    from relax.distributed.ray.rollout import EngineGroupConfig, ModelConfig
+    from relax.distributed.ray.rollout import EngineGroupSpec, InferenceModelSpec
 
     HAS_DEPS = True
 except ImportError:
@@ -16,34 +16,34 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_DEPS, reason="Missing ray/sglang dependencies")
 
 
-# ========================== EngineGroupConfig ===============================
+# ========================== EngineGroupSpec ===============================
 
 
-class TestEngineGroupConfig:
+class TestEngineGroupSpec:
     @pytest.mark.parametrize("wt", ["regular", "prefill", "decode", "placeholder"])
     def test_valid_worker_types(self, wt):
-        cfg = EngineGroupConfig(worker_type=wt, num_gpus=4)
+        cfg = EngineGroupSpec(worker_type=wt, num_gpus=4)
         assert cfg.worker_type == wt
 
     def test_invalid_worker_type(self):
         with pytest.raises(AssertionError, match="Invalid worker_type"):
-            EngineGroupConfig(worker_type="bad", num_gpus=4)
+            EngineGroupSpec(worker_type="bad", num_gpus=4)
 
     def test_zero_gpus(self):
         with pytest.raises(AssertionError, match="num_gpus must be > 0"):
-            EngineGroupConfig(worker_type="regular", num_gpus=0)
+            EngineGroupSpec(worker_type="regular", num_gpus=0)
 
     def test_negative_gpus(self):
         with pytest.raises(AssertionError, match="num_gpus must be > 0"):
-            EngineGroupConfig(worker_type="regular", num_gpus=-1)
+            EngineGroupSpec(worker_type="regular", num_gpus=-1)
 
     def test_optional_fields_defaults(self):
-        cfg = EngineGroupConfig(worker_type="regular", num_gpus=4)
+        cfg = EngineGroupSpec(worker_type="regular", num_gpus=4)
         assert cfg.num_gpus_per_engine is None
         assert cfg.overrides == {}
 
     def test_optional_fields_set(self):
-        cfg = EngineGroupConfig(
+        cfg = EngineGroupSpec(
             worker_type="regular",
             num_gpus=4,
             num_gpus_per_engine=2,
@@ -53,10 +53,10 @@ class TestEngineGroupConfig:
         assert cfg.overrides == {"model_path": "/m"}
 
 
-# ============================= ModelConfig ==================================
+# ============================= InferenceModelSpec ==================================
 
 
-class TestModelConfig:
+class TestInferenceModelSpec:
     def test_resolve_defaults(self):
         args = type(
             "Args",
@@ -67,10 +67,10 @@ class TestModelConfig:
                 "sglang_hf_checkpoint": None,
             },
         )()
-        cfg = ModelConfig(
+        cfg = InferenceModelSpec(
             name="actor",
             engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=8),
+                EngineGroupSpec(worker_type="regular", num_gpus=8),
             ],
         )
         cfg.resolve(args)
@@ -87,11 +87,11 @@ class TestModelConfig:
                 "sglang_hf_checkpoint": None,
             },
         )()
-        cfg = ModelConfig(
+        cfg = InferenceModelSpec(
             name="actor",
             num_gpus_per_engine=2,
             engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=4, num_gpus_per_engine=8),
+                EngineGroupSpec(worker_type="regular", num_gpus=4, num_gpus_per_engine=8),
             ],
         )
         cfg.resolve(args)
@@ -99,27 +99,27 @@ class TestModelConfig:
         assert cfg.engine_groups[0].num_gpus_per_engine == 8
 
     def test_has_pd_disaggregation(self):
-        cfg_no = ModelConfig(
+        cfg_no = InferenceModelSpec(
             name="m",
-            engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=4)],
+            engine_groups=[EngineGroupSpec(worker_type="regular", num_gpus=4)],
         )
         assert cfg_no.has_pd_disaggregation is False
 
-        cfg_yes = ModelConfig(
+        cfg_yes = InferenceModelSpec(
             name="m",
             engine_groups=[
-                EngineGroupConfig(worker_type="prefill", num_gpus=4),
-                EngineGroupConfig(worker_type="decode", num_gpus=4),
+                EngineGroupSpec(worker_type="prefill", num_gpus=4),
+                EngineGroupSpec(worker_type="decode", num_gpus=4),
             ],
         )
         assert cfg_yes.has_pd_disaggregation is True
 
     def test_total_num_gpus(self):
-        cfg = ModelConfig(
+        cfg = InferenceModelSpec(
             name="m",
             engine_groups=[
-                EngineGroupConfig(worker_type="regular", num_gpus=4),
-                EngineGroupConfig(worker_type="regular", num_gpus=8),
+                EngineGroupSpec(worker_type="regular", num_gpus=4),
+                EngineGroupSpec(worker_type="regular", num_gpus=8),
             ],
         )
         assert cfg.total_num_gpus == 12

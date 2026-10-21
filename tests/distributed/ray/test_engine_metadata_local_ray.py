@@ -164,7 +164,7 @@ def make_manager(engine, init_ref=None):
         num_new_engines=0,
         engine_init_records=records,
     )
-    manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
+    manager = object.__new__(rollout.RolloutEnginePool)
     manager.servers = {"actor": rollout.RolloutServer(engine_groups=[group], model_name="actor")}
     manager._engine_actor_states = rollout._get_engine_actor_states()
     assert manager._engine_actor_states is not None, f"Local actor state API missing in Ray {ray.__version__}"

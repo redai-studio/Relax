@@ -35,7 +35,7 @@ When colocated with the Actor (sharing GPU resources), GenRM supports offload/on
 Two colocate sub-modes are auto-detected from the GPU allocation:
 
 - **Split** (`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy disjoint bundles.
-- **Shared** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`): GenRM and Rollout occupy the same bundles, splitting each GPU's memory via SGLang `mem_fraction_static`. GenRM reads its `mem_fraction_static` from `--genrm-engine-config`. GenRM never sources weights from the Actor; onload only resumes its KV cache and CUDA graphs.
+- **Shared** (`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`, with `--defer-reward-to-post-process`): GenRM and Rollout occupy the same bundles and take turns on them; each engine is resident only in its own phase. Shared bundles without deferring are refused at startup. GenRM reads its `mem_fraction_static` from `--genrm-engine-config`. GenRM never sources weights from the Actor; onload only resumes its KV cache and CUDA graphs.
 
 See [GenRM example](/en/examples/generative-reward-model) for full configuration.
 

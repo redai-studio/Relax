@@ -49,6 +49,7 @@ def test_register_all_serve_sft_colocate_uses_optional_roles(registry_roles, wit
     algo = {role: object() for role in [*ROLES_SFT_ONLY, ROLES.rollout]}
     namespace = {
         "validate_ppo_config": Mock(),
+        "create_inference_manager": Mock(return_value=object()),
         "maybe_start_managed_opd_teacher": Mock(return_value=(None, None)),
         "resolve_sft_algo_key": Mock(return_value="sft"),
         "ALGOS": {"sft": algo},

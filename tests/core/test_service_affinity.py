@@ -49,10 +49,10 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         return MagicMock(name="pg")
 
     def _fake_ray_get(arg):
-        # Second call passes a list of get_ip_and_gpu_id futures -> return one
-        # (ip, gpu_id) tuple per bundle. First call is pg.ready() (unused).
+        # Second call passes a list of get_ip_gpu_and_node_id futures -> return
+        # one (ip, gpu_id, node_id) tuple per bundle. First call is pg.ready().
         if isinstance(arg, list):
-            return [("10.0.0.1", i) for i in range(len(arg))]
+            return [("10.0.0.1", i, "node-0") for i in range(len(arg))]
         return None
 
     cr_mock = MagicMock(return_value=cluster_resources or {"GPU": 8.0, "CPU": 64.0})
@@ -68,9 +68,8 @@ def _run_create_placement_group(num_gpus=2, node_group_affinity=True, cluster_re
         patch("relax.distributed.ray.placement_group.ray.cluster_resources", cr_mock),
         patch("relax.distributed.ray.placement_group.time.sleep"),
     ):
-        pg, reordered_indices, reordered_gpu_ids = create_placement_group(
-            num_gpus, node_group_affinity=node_group_affinity
-        )
+        binding = create_placement_group(num_gpus, node_group_affinity=node_group_affinity)
+    assert binding.node_ids == ("node-0",) * num_gpus
     return captured, cr_mock
 
 
@@ -183,6 +182,9 @@ def test_service_deploy_pins_both_bind_branches_for_enabled_autoscaler(tmp_path,
     service.num_gpus = 0
     service.role = "rollout" if has_data_source else "actor"
     service.data_source = MagicMock() if has_data_source else None
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
@@ -204,6 +206,9 @@ def test_service_deploy_is_unconstrained_without_autoscaler():
     service.num_gpus = 0
     service.role = "actor"
     service.data_source = None
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
 
     with patch("relax.core.service.serve.run", return_value=MagicMock()):
         service._deploy(None)
@@ -249,7 +254,7 @@ def test_placement_sorts_nodes_numerically_then_gpu_and_releases_only_info_actor
     monkeypatch.delenv("RELAX_INITIAL_NODE_GROUP", raising=False)
     pg = MagicMock()
     info_actors = [MagicMock() for _ in range(4)]
-    coordinates = [("192.0.2.10", 0), ("192.0.2.2", 3), ("192.0.2.2", 1), ("192.0.2.10", 2)]
+    coordinates = [("192.0.2.10", 0, "n10"), ("192.0.2.2", 3, "n2"), ("192.0.2.2", 1, "n2"), ("192.0.2.10", 2, "n10")]
     with (
         patch.object(placement.device_utils, "get_ray_accelerator_name", return_value="GPU"),
         patch.object(placement, "get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
@@ -262,7 +267,7 @@ def test_placement_sorts_nodes_numerically_then_gpu_and_releases_only_info_actor
         info.options.return_value.remote.side_effect = info_actors
         result = create_placement_group(4)
 
-    assert result == (pg, [2, 1, 0, 3], [1, 3, 0, 2])
+    assert result == (pg, (2, 1, 0, 3), (1, 3, 0, 2), ("n2", "n2", "n10", "n10"), None)
     factory.assert_called_once_with([{"GPU": 1, "CPU": 1}] * 4, strategy="PACK")
     assert [entry.kwargs["placement_group_bundle_index"] for entry in strategy.call_args_list] == [0, 1, 2, 3]
     assert all(entry.kwargs["placement_group"] is pg for entry in strategy.call_args_list)
@@ -287,3 +292,34 @@ def test_service_reuses_shared_pg_without_factory_or_cleanup():
         assert service._ensure_placement_group() is shared_pg
     factory.assert_not_called()
     remove.assert_not_called()
+
+
+@pytest.mark.parametrize(("visible", "gpu", "index"), [(None, 5, 5), ("4,7", 7, 1), ("4,7", 4, 0)])
+def test_visible_device_index_matches_the_engine_mapping(monkeypatch, visible, gpu, index):
+    from relax.utils import device as device_utils
+
+    monkeypatch.setattr(device_utils, "get_visible_devices", lambda: visible)
+    assert device_utils.visible_device_index(gpu) == index
+
+
+def test_placement_binding_keeps_visible_indices_in_bundle_order(monkeypatch):
+    from relax.distributed.ray import placement_group as placement
+
+    monkeypatch.delenv("RELAX_INITIAL_NODE_GROUP", raising=False)
+    pg = MagicMock()
+    # CUDA_VISIBLE_DEVICES=4,7 on the node: GPU 7 is local 1, GPU 4 local 0.
+    probes = [("192.0.2.2", 7, "n2", 1), ("192.0.2.2", 4, "n2", 0)]
+    with (
+        patch.object(placement.device_utils, "get_ray_accelerator_name", return_value="GPU"),
+        patch.object(placement, "get_ray_accelerator_kwargs", return_value={"num_gpus": 1}),
+        patch.object(placement, "placement_group", return_value=pg),
+        patch.object(placement, "InfoActor") as info,
+        patch.object(placement, "PlacementGroupSchedulingStrategy"),
+        patch.object(placement.ray, "get", side_effect=[None, probes]),
+        patch.object(placement.ray, "kill"),
+    ):
+        binding = create_placement_group(2)
+
+    assert binding == (pg, (1, 0), (4, 7), ("n2", "n2"), (0, 1))
+    # The probe sees the visible devices an engine inherits.
+    assert all(call.kwargs["runtime_env"] is placement.INFO_ACTOR_RUNTIME_ENV for call in info.options.call_args_list)

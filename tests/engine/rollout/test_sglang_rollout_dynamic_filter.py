@@ -85,6 +85,7 @@ def run_rollout(monkeypatch: pytest.MonkeyPatch) -> Callable:
             pendings=set(),
             protected_pendings=set(),
             tokenizer=None,
+            opd_manager=None,
             reset=Mock(),
         )
 

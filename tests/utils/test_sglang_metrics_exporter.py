@@ -30,14 +30,14 @@ process_cpu_seconds_total 99
 
 def _pool(*urls: str, complete: bool = True) -> dict:
     return {
+        "schema_version": 2,
         "models": {
             "default": {
-                "engine_groups": [
-                    {
-                        "worker_type": "regular",
-                        "engines": [{"rank": i, "status": "active", "url": url} for i, url in enumerate(urls)],
-                    }
-                ]
+                "engines": [
+                    {"engine_id": f"default/replica-{i}", "state": "ready", "base_url": url}
+                    for i, url in enumerate(urls)
+                ],
+                "pd_workers": [],
             }
         },
         "observation": {
@@ -109,9 +109,9 @@ async def test_sglang_metrics_deduplicate_urls_and_skip_non_http_ranks(upstream)
 
     upstream(respond)
     data = _pool("http://engine-a", "http://engine-a/")
-    data["models"]["default"]["engine_groups"][0]["engines"] += [
-        {"rank": 2, "status": "active"},
-        {"rank": 3, "status": "dead", "url": "http://dead"},
+    data["models"]["default"]["engines"] += [
+        {"engine_id": "default/replica-2", "state": "starting", "base_url": None},
+        {"engine_id": "default/replica-3", "state": "dead", "base_url": "http://dead"},
     ]
     body = await SGLangMetricsExporter(AsyncMock(return_value=data)).scrape()
     assert urls == ["http://engine-a/metrics"]
@@ -150,11 +150,42 @@ async def test_sglang_metrics_partial_failure_preserves_successful_engines(upstr
             assert all(s.labels["relax_engine"] == "http://good" for s in family.samples)
 
 
-@pytest.mark.parametrize("data", [None, {}, {"models": {}}, _pool("file:///tmp/metrics"), _pool("http://user@host")])
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {},
+        {"models": {}},
+        {key: value for key, value in _pool("http://a").items() if key != "schema_version"},
+        _pool("file:///tmp/metrics"),
+        _pool("http://user@host"),
+    ],
+)
 async def test_sglang_metrics_invalid_discovery_is_not_a_healthy_empty_pool(data):
     body = await SGLangMetricsExporter(AsyncMock(return_value=data)).scrape()
     assert _value(body, "relax_sglang_discovery_success") == 0
     assert _value(body, "relax_sglang_scrape_success") == 0
+
+
+async def test_sglang_metrics_scrape_pd_workers_instead_of_the_router(upstream):
+    urls = []
+
+    def respond(request):
+        urls.append(str(request.url))
+        return httpx.Response(200, text=METRICS)
+
+    upstream(respond)
+    data = _pool()
+    model = data["models"]["default"]
+    model["router_url"] = "http://router"
+    model["engines"] = [{"engine_id": "default/pd-service", "state": "ready", "base_url": "http://router"}]
+    model["pd_workers"] = [
+        {"worker_type": "prefill", "engine_id": "default/replica-0", "state": "ready", "base_url": "http://p"},
+        {"worker_type": "decode", "engine_id": "default/replica-1", "state": "ready", "base_url": "http://d"},
+    ]
+    body = await SGLangMetricsExporter(AsyncMock(return_value=data)).scrape()
+    assert sorted(urls) == ["http://d/metrics", "http://p/metrics"]
+    assert {s.labels["relax_worker_type"] for s in _samples(body, "relax_sglang_engine_up")} == {"prefill", "decode"}
 
 
 async def test_sglang_metrics_empty_pool_and_incomplete_discovery(upstream):

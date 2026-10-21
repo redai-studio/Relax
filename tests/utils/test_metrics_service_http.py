@@ -32,8 +32,9 @@ async def test_metrics_service_discovery_cancels_timed_out_serve_request(monkeyp
             return asyncio.Event().wait().__await__()
 
     response = PendingResponse()
-    handle = SimpleNamespace(get_engines=SimpleNamespace(remote=Mock(return_value=response)))
-    monkeypatch.setattr("relax.utils.metrics.service.serve.get_app_handle", Mock(return_value=handle))
+    handle = SimpleNamespace(engines=SimpleNamespace(remote=Mock(return_value=response)))
+    get_app_handle = Mock(return_value=handle)
+    monkeypatch.setattr("relax.utils.metrics.service.serve.get_app_handle", get_app_handle)
     instance = SimpleNamespace(_rollout_handle_task=None)
     discover = asyncio.create_task(MetricsService.func_or_class._discover_sglang_engines(instance))
     await asyncio.wait_for(started.wait(), 2)
@@ -41,6 +42,8 @@ async def test_metrics_service_discovery_cancels_timed_out_serve_request(monkeyp
     with pytest.raises(asyncio.CancelledError):
         await discover
     response.cancel.assert_called_once()
+    get_app_handle.assert_called_once_with("rollout_gateway")
+    handle.engines.remote.assert_called_once_with(schema_version=2)
 
 
 @pytest.mark.skipif(os.environ.get("RUN_METRICS_SERVE_SMOKE") != "1", reason="Opt-in local CPU Ray Serve smoke test")
@@ -90,14 +93,15 @@ def _run_serve_smoke() -> None:
     engine_url = f"http://127.0.0.1:{upstream.server_port}"
 
     @serve.deployment(ray_actor_options={"num_cpus": 0.1})
-    class Rollout:
-        async def get_engines(self) -> dict:
+    class RolloutGateway:
+        async def engines(self, schema_version: int | None = None) -> dict:
+            assert schema_version == 2
             return {
+                "schema_version": 2,
                 "models": {
                     "default": {
-                        "engine_groups": [
-                            {"worker_type": "regular", "engines": [{"status": "active", "url": engine_url, "rank": 0}]}
-                        ]
+                        "engines": [{"engine_id": "default/replica-0", "state": "ready", "base_url": engine_url}],
+                        "pd_workers": [],
                     }
                 },
                 "observation": {"complete": True, "issues": []},
@@ -131,7 +135,7 @@ def _run_serve_smoke() -> None:
             assert response.status_code == 200, response.text
             assert metric_value(response, "relax_sglang_discovery_success") == 0
 
-            serve.run(Rollout.bind(), name="rollout", route_prefix=None)
+            serve.run(RolloutGateway.bind(), name="rollout_gateway", route_prefix=None)
             for path in ("/metrics", "/metrics/"):
                 response = client.get(path)
                 assert response.status_code == 200, response.text

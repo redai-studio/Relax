@@ -1,6 +1,6 @@
 # GenRM 部署模式架构图 —— 图像生成 Prompt
 
-单张 4 格图，覆盖 [`README.md`](./README.md) 里的四种 GenRM 部署模式（角色 ×
+单张 3 格图，覆盖 [`README.md`](./README.md) 里的三种 GenRM 部署模式（角色 ×
 阶段 × 装载/卸载状态）。给 Nano Banana / Gemini 2.5 Flash Image 之类图像
 模型直接使用。
 
@@ -11,7 +11,7 @@
 标题「Relax GenRM Deployment Modes」，白底，扁平化 whitepaper 风格，
 无 3D、无渐变、无阴影。
 
-画布分成 2×2 四格，四格共用同一套视觉语言。每一格用泳道图（swim-lane）
+画布横向分成 1×3 三格，三格共用同一套视觉语言。每一格用泳道图（swim-lane）
 表达：
 
 - 纵向 3 行泳道，从上到下：Actor / Rollout / GenRM（行左侧写角色名）
@@ -24,9 +24,9 @@
   箭头上方写事件（例：「offload Rollout → onload GenRM」）
 - 同一 phase 内部的 HTTP 数据流用细灰色单向箭头 + 小字（例：「HTTP score」）
 
-四格分别绘制以下四个模式，位置和内容严格按下面来：
+三格分别绘制以下三个模式，位置和内容严格按下面来：
 
-──────── 左上 —— Colocate / Split (8 GPU) ────────
+──────── 左 —— Colocate / Split (8 GPU) ────────
 两个 phase：Inference | Training
 
 Inference 阶段：
@@ -43,23 +43,7 @@ Training 阶段：
 Phase 之间不需要蓝箭头。
 说明文字：Rollout 与 GenRM 分片并行，inline reward。
 
-──────── 右上 —— Colocate / Shared Co-resident (8 GPU) ────────
-两个 phase：Inference | Training
-
-Inference 阶段：
-  Actor   行：灰虚线框「asleep」
-  Rollout 行：绿实色块（占行高上 60%）「GPU 0..7, mem_fraction=0.6」
-  GenRM   行：绿实色块（占行高上 30%）「GPU 0..7, mem_fraction=0.3」
-  Rollout 与 GenRM 中间细灰双向箭头「inline HTTP score」
-
-Training 阶段：
-  Actor   行：绿实色块「GPU 0..7」
-  Rollout 行：灰虚线框「offloaded」
-  GenRM   行：灰虚线框「offloaded」
-
-说明文字：同 GPU 共处，按显存比例切分。
-
-──────── 左下 —— Colocate / Shared Defer-swap (16 GPU) ────────
+──────── 中 —— Colocate / Shared Defer-swap (16 GPU) ────────
 三个 phase：Phase A "Rollout" | Phase B "Score" | Phase C "Train"
 
 Phase A：
@@ -89,7 +73,7 @@ Phase C：
 视觉上形成三阶段「接力式」传递。
 说明文字：串行 sleep-wake，独占全 16 GPU。
 
-──────── 右下 —— Fully Async (dedicated pools) ────────
+──────── 右 —— Fully Async (dedicated pools) ────────
 只有一列「always-on」，不分 phase。
 
   Actor   行：绿实色块「pool A: 2 GPU (dedicated)」
@@ -111,7 +95,7 @@ Phase C：
   [细灰箭头] HTTP / Data flow
 
 ──────── 全局样式约束 ────────
-- 四格大小相同、内边距一致、泳道行高一致，视觉上完全对齐
+- 三格大小相同、内边距一致、泳道行高一致，视觉上完全对齐
 - 字体：无衬线（Inter / Helvetica），层级 标题 > phase 名 > 角色名 >
   GPU 编号 > 箭头说明
 - 只用四种颜色：绿 #22c55e、灰 #94a3b8、蓝 #2563eb、文字 #0f172a，白底
@@ -121,7 +105,7 @@ Phase C：
 
 ## 使用要点
 
-- **一次生成即可拿到完整对比图**，不用跑 4 次。
+- **一次生成即可拿到完整对比图**，不用跑 3 次。
 - 若模型仍然把某一格画糊，只挑那一格的描述块另起 prompt 单独重画，然后
   用图像编辑工具替换到主图对应位置。
 - 关键失败模式：

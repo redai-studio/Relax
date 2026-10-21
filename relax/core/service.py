@@ -4,25 +4,42 @@ import threading
 import time
 from argparse import Namespace
 from typing import Any, Optional
+from uuid import uuid4
 
 import ray
 import requests
 from ray import serve
 from ray.util.placement_group import remove_placement_group
 
+from relax.components.inference_gateway import deploy_gateway, gateway_deployment_name
 from relax.core.node_group_affinity import with_control_plane_affinity
+from relax.distributed.ray.inference_manager import DeploymentManagerHandle
 from relax.distributed.ray.placement_group import (
     _require_node_group_markers,
     create_placement_group,
 )
+from relax.engine.inference.types import Role
 from relax.utils.logging_utils import get_logger
 from relax.utils.utils import get_serve_url, recovery_load_path
 
 
-__all__ = ["Service", "_require_node_group_markers", "create_placement_group"]
+__all__ = ["Service", "_require_node_group_markers", "create_placement_group", "serve_app_names"]
 
 
 logger = get_logger(__name__)
+
+_ENGINE_SHUTDOWN_TIMEOUT_S = 60.0
+
+
+def serve_app_names(role: str) -> tuple[str | None, str]:
+    """``(gateway, backend)`` Serve application names of a service role.
+
+    Every inference role is fronted by its Gateway; ``gateway`` is ``None`` for
+    any other role, whose backend keeps the bare role name.
+    """
+    if role in {item.value for item in Role}:
+        return gateway_deployment_name(role), f"{role}_backend"
+    return None, role
 
 
 class Service:
@@ -36,6 +53,7 @@ class Service:
         data_source: Optional[Any] = None,
         actor_rollout_pgs: Optional[Any] = None,
         runtime_env=None,
+        inference_manager_handle: Optional[Any] = None,
         *,
         defer_deploy: bool = False,
     ) -> None:
@@ -50,6 +68,7 @@ class Service:
             data_source: Optional data source actor or factory used by rollout.
             actor_rollout_pgs: Optional placement group for colocated actor-rollout.
             runtime_env: Optional Ray runtime environment dict for the service.
+            inference_manager_handle: Task-scoped CPU inference control-plane handle.
             defer_deploy: Allocate resources without deploying until ``deploy`` is called.
         """
         logger.info(
@@ -62,11 +81,16 @@ class Service:
         self.cls = cls
         self.data_source = data_source
         self.runtime_env = runtime_env
+        self.inference_manager_handle = inference_manager_handle
         self._is_shared_pgs = actor_rollout_pgs is not None
         self._deployed = False
         self._task_ref: Optional[Any] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._stop_heartbeat = threading.Event()
+        # Every inference role is fronted by its Gateway; the Teacher has no
+        # Service backend and deploys the same Gateway on its own.
+        self._gateway_enabled = role in {item.value for item in Role}
+        self._gateway_name, self._backend_name = serve_app_names(role)
         if actor_rollout_pgs is not None:
             pgs = actor_rollout_pgs
         elif num_gpus == 0:
@@ -90,15 +114,44 @@ class Service:
             self._deploy(self.pgs)
         except Exception:
             # A failed Serve deployment can leave the PG allocated even though
-            # this wrapper never becomes visible to the Controller.
-            try:
-                serve.delete(self.role)
-            except Exception as exc:
-                logger.warning(f"[{self.role}] Failed to delete deployment after deploy error: {exc}")
-            self._release_placement_group()
+            # this wrapper never becomes visible to the Controller. The backend
+            # may have started Manager-owned engines on it, which go first.
+            self._delete_applications()
+            if self._shutdown_inference_engines():
+                self._release_placement_group()
             raise
         self._deployed = True
         logger.info(f"[{self.role}] Service deployed successfully")
+
+    def _delete_applications(self) -> None:
+        """Delete this service's Serve applications, each on its own."""
+        for name in serve_app_names(self.role):
+            if name is None:
+                continue
+            try:
+                serve.delete(name)
+            except Exception as exc:
+                logger.warning(f"[{self.role}] Failed to delete Ray Serve application '{name}': {exc}")
+
+    def _shutdown_inference_engines(self) -> bool:
+        """Stop the engines the Manager started for this role.
+
+        Returns False if they may still hold GPU memory, in which case the
+        placement group must be kept.
+        """
+        if not self._gateway_enabled or self.inference_manager_handle is None:
+            return True
+        try:
+            # Closing starts also refuses a backend start that reaches the
+            # Manager only after this shutdown.
+            ray.get(
+                self.inference_manager_handle.shutdown.remote(Role(self.role), None, True),
+                timeout=_ENGINE_SHUTDOWN_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.error(f"[{self.role}] Engines may still hold GPUs; keeping the placement group: {exc}")
+            return False
+        return True
 
     def _release_placement_group(self) -> None:
         """Release this service's owned placement group, if any."""
@@ -123,16 +176,38 @@ class Service:
             self.config,
             {"runtime_env": self.runtime_env},
         )
+        manager_handle = self.inference_manager_handle
+        if self._gateway_enabled and manager_handle is not None:
+            # Only this deployment's backend may start the role's engines; a
+            # start from an earlier or rolled-back one is refused.
+            start_token = uuid4().hex
+            ray.get(manager_handle.open_starts.remote(Role(self.role), start_token))
+            manager_handle = DeploymentManagerHandle(manager_handle, start_token)
         if self.data_source is not None:
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
-                self.healthy, pgs, self.config, data_source=self.data_source, runtime_env=self.runtime_env
+                self.healthy,
+                pgs,
+                self.config,
+                data_source=self.data_source,
+                runtime_env=self.runtime_env,
+                inference_manager_handle=manager_handle,
             )
         else:
+            role_kwargs = {"inference_manager_handle": manager_handle} if self.role == "genrm" else {}
             self.service = self.cls.options(ray_actor_options=ray_actor_options, max_constructor_retry_count=1).bind(
-                self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env
+                self.healthy, pgs, self.num_gpus, self.config, self.role, runtime_env=self.runtime_env, **role_kwargs
             )
         logger.info(f"[{self.role}] Deploying service...")
-        self.handle = serve.run(self.service, name=self.role, route_prefix=f"/{self.role}")
+        backend_prefix = f"/{self.role}/backend" if self._gateway_enabled else f"/{self.role}"
+        self.handle = serve.run(self.service, name=self._backend_name, route_prefix=backend_prefix)
+        if self._gateway_enabled:
+            deploy_gateway(
+                self.role,
+                manager_handle=self.inference_manager_handle,
+                upstream_url=get_serve_url(backend_prefix),
+                genrm_backend_handle=self.handle if self.role == "genrm" else None,
+            )
+            logger.info(f"[{self.role}] CPU InferenceGateway deployed at /{self.role}; backend={backend_prefix}")
 
     def _start_heartbeat(self) -> None:
         """Start background heartbeat thread to report health status."""
@@ -204,11 +279,11 @@ class Service:
         self._task_ref = self.handle.run.remote()
         return self._task_ref
 
-    async def set_rollout_manager(self, rollout_manager: Any) -> None:
-        await self.handle.set_rollout_manager.remote(rollout_manager)
+    async def set_rollout_handles(self, rollout_worker: Any, inference_manager: Any) -> None:
+        await self.handle.set_rollout_handles.remote(rollout_worker, inference_manager)
 
-    async def get_rollout_manager(self) -> Any:
-        return await self.handle.get_rollout_manager.remote()
+    async def get_rollout_worker(self) -> Any:
+        return await self.handle.get_rollout_worker.remote()
 
     async def set_barriers(self, *, rollout: Any = None, peers: Any = None) -> None:
         await self.handle.set_barriers.remote(rollout=rollout, peers=peers)
@@ -268,11 +343,8 @@ class Service:
             logger.info(f"[{self.role}] Old deployment stopped gracefully")
         except Exception as e:
             logger.warning(f"[{self.role}] Failed to gracefully stop old deployment: {e}")
-        try:
-            serve.delete(self.role)
-            logger.info(f"[{self.role}] Ray Serve deployment deleted")
-        except Exception as e:
-            logger.warning(f"[{self.role}] Failed to delete Ray Serve deployment: {e}")
+        self._delete_applications()
+        logger.info(f"[{self.role}] Ray Serve deployment(s) deleted")
 
         # Wait for old deployment resources to be fully released
         time.sleep(3)

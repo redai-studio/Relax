@@ -33,6 +33,14 @@ def _load_definitions(path, names, namespace):
     return namespace
 
 
+def _service_names_namespace(**namespace):
+    """The real ``serve_app_names`` with the names it needs."""
+    from relax.engine.inference.types import Role
+
+    namespace.update(Role=Role, gateway_deployment_name=lambda role: f"{Role(role).value}_gateway")
+    return _load_definitions("relax/core/service.py", {"serve_app_names"}, namespace)
+
+
 def _train_namespace():
     namespace = {
         "os": os,
@@ -162,6 +170,7 @@ def _service_phase(fully_async, *, phase=_FakePhase.DEPLOY, serve_dict=None, rem
         "Optional": Optional,
         "Service": object,
     }
+    namespace["serve_app_names"] = _service_names_namespace()["serve_app_names"]
     exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), namespace)
     controller = SimpleNamespace(
         config=SimpleNamespace(fully_async=fully_async),
@@ -216,7 +225,10 @@ def test_controller_parallel_startup_does_not_wait_for_blocked_sibling():
     try:
         assert finished.wait(3), "failure waited for the blocked sibling"
         assert errors == ["Failed to deploy service actor: Gloo failed"]
-        controller._serve.delete.assert_called_once_with("rollout")
+        assert [call.args for call in controller._serve.delete.call_args_list] == [
+            ("rollout_gateway",),
+            ("rollout_backend",),
+        ]
     finally:
         release.set()
         thread.join(3)
@@ -298,6 +310,7 @@ def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
         "with_control_plane_affinity": lambda config, options: options,
         "serve": Mock(),
     }
+    ns = _service_names_namespace(ray=Mock(), _ENGINE_SHUTDOWN_TIMEOUT_S=60.0, **ns)
     service_cls = _load_definitions("relax/core/service.py", {"Service"}, ns)["Service"]
     service = object.__new__(service_cls)
     service.cls = Mock()
@@ -309,6 +322,10 @@ def test_service_constructor_failure_is_bounded_and_propagated(has_data_source):
     service.data_source = object() if has_data_source else None
     service.pgs = None
     service._deployed = False
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
+    service._gateway_name = None
     ns["serve"].run.side_effect = RuntimeError("constructor failed")
     with pytest.raises(RuntimeError, match="constructor failed"):
         service.deploy()
@@ -327,6 +344,7 @@ def test_service_deploy_failure_releases_owned_pg():
         "remove_placement_group": remove_pg,
         "serve": Mock(),
     }
+    ns = _service_names_namespace(ray=Mock(), _ENGINE_SHUTDOWN_TIMEOUT_S=60.0, **ns)
     service_cls = _load_definitions("relax/core/service.py", {"Service"}, ns)["Service"]
     service = object.__new__(service_cls)
     service.cls = Mock()
@@ -340,6 +358,10 @@ def test_service_deploy_failure_releases_owned_pg():
     service.pgs = (pg, [0], ["gpu-0"])
     service._is_shared_pgs = False
     service._deployed = False
+    service.inference_manager_handle = None
+    service._gateway_enabled = False
+    service._backend_name = service.role
+    service._gateway_name = None
     ns["serve"].run.side_effect = RuntimeError("deploy failed")
 
     with pytest.raises(RuntimeError, match="deploy failed"):
@@ -348,6 +370,73 @@ def test_service_deploy_failure_releases_owned_pg():
     ns["serve"].delete.assert_called_once_with("actor")
     remove_pg.assert_called_once_with(pg)
     assert service.pgs is None
+
+
+@pytest.mark.parametrize("engines_stopped", [True, False])
+def test_inference_service_gateway_failure_cleans_its_apps_and_engines_before_the_pg(engines_stopped):
+    """The backend deployed and may have started engines; the Gateway
+    failed."""
+    events = []
+    ns = {
+        "Any": object,
+        "Optional": Optional,
+        "Namespace": SimpleNamespace,
+        "logger": Mock(),
+        "with_control_plane_affinity": lambda config, options: options,
+        "remove_placement_group": lambda pg: events.append("release_pg"),
+        "serve": Mock(),
+        "get_serve_url": lambda prefix: f"http://serve{prefix}",
+        "deploy_gateway": Mock(side_effect=RuntimeError("gateway failed")),
+    }
+    ns["serve"].delete.side_effect = lambda name: events.append(("delete", name))
+    ns = _service_names_namespace(
+        ray=Mock(),
+        _ENGINE_SHUTDOWN_TIMEOUT_S=60.0,
+        uuid4=lambda: SimpleNamespace(hex="token"),
+        DeploymentManagerHandle=lambda manager, token: ("scoped", token),
+        **ns,
+    )
+
+    def get(ref, timeout=None):
+        events.append(("engines", ref))
+        if ref.startswith("shutdown") and not engines_stopped:
+            raise TimeoutError("engines still stopping")
+
+    ns["ray"].get.side_effect = get
+    service_cls = _load_definitions("relax/core/service.py", {"Service"}, ns)["Service"]
+    service = object.__new__(service_cls)
+    service.cls = Mock()
+    service.config = SimpleNamespace()
+    service.runtime_env = None
+    service.healthy = Mock()
+    service.role = "rollout"
+    service.num_gpus = 1
+    service.data_source = object()
+    pg = object()
+    service.pgs = (pg, [0], ["gpu-0"])
+    service._is_shared_pgs = False
+    service._deployed = False
+    service.inference_manager_handle = SimpleNamespace(
+        open_starts=SimpleNamespace(remote=lambda role, token: f"open-{role.value}-{token}"),
+        shutdown=SimpleNamespace(remote=lambda role, model_id, close: f"shutdown-{role.value}-{model_id}-{close}"),
+    )
+    service._gateway_enabled = True
+    service._gateway_name, service._backend_name = ns["serve_app_names"]("rollout")
+
+    with pytest.raises(RuntimeError, match="gateway failed"):
+        service.deploy()
+
+    # The backend starts with this deployment's token; the rollback closes the
+    # role's starts, so a late start from it is refused.
+    assert service.cls.options.return_value.bind.call_args.kwargs["inference_manager_handle"] == ("scoped", "token")
+    expected = [
+        ("engines", "open-rollout-token"),
+        ("delete", "rollout_gateway"),
+        ("delete", "rollout_backend"),
+        ("engines", "shutdown-rollout-None-True"),
+    ]
+    assert events == expected + (["release_pg"] if engines_stopped else [])
+    assert (service.pgs is None) is engines_stopped
 
 
 def test_train_normal_shutdown_arms_long_watchdog_and_cancels_it():
@@ -384,26 +473,22 @@ def test_train_failure_shutdown_uses_short_watchdog_budget():
 def test_controller_partial_startup_cleans_teacher_and_routers(monkeypatch):
     tree = ast.parse((ROOT / "relax/core/controller.py").read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Controller")
-    methods = [
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name in {"shutdown", "_dispose_rollout_manager"}
-    ]
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "shutdown")
     stop_routers = Mock(return_value=1)
     monkeypatch.setitem(
         sys.modules, "relax.distributed.ray.rollout", SimpleNamespace(stop_launched_routers=stop_routers)
     )
     stop_teacher = Mock()
     ns = {"logger": Mock(), "ROLES": SimpleNamespace(rollout="rollout"), "shutdown_managed_opd_teacher": stop_teacher}
-    exec(compile(ast.Module(body=methods, type_ignores=[]), "controller.py", "exec"), ns)
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "controller.py", "exec"), ns)
     teacher = object()
     partial_controller = SimpleNamespace(
         serve_dict={},
         _teacher_manager=teacher,
+        _inference_manager_handle=None,
         _shutdown_agentic_rollout_services=Mock(),
         _cleanup_s3_model_weights_after_init=Mock(),
     )
-    partial_controller._dispose_rollout_manager = ns["_dispose_rollout_manager"].__get__(partial_controller)
     ns["shutdown"](partial_controller)
     stop_teacher.assert_called_once_with(teacher)
     stop_routers.assert_called_once()

@@ -63,23 +63,32 @@ ______________________________________________________________________
                                        │ HTTP REST API
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│              Rollout Service (relax/components/rollout.py)          │
-│                    Ray Serve Ingress + FastAPI                      │
+│     Rollout Gateway (relax/components/inference_gateway.py)         │
+│                    Ray Serve Ingress, route /rollout                │
 │                                                                     │
-│    POST /scale_out        GET /engines       POST /scale_in         │
-│    GET  /scale_out/{id}                      GET  /scale_in/{id}    │
-│    POST /scale_out/{id}/cancel                                      │
+│    GET /engines (v2 discovery)     other paths → Rollout Service    │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │
+                               │ /rollout/backend/...
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│      RolloutManager (relax/distributed/ray/rollout.py)              │
-│                  Ray Actor                                          │
+│              Rollout Service (relax/components/rollout.py)          │
+│                    Ray Serve Deployment + FastAPI                   │
 │                                                                     │
-│    scale_out()          scale_in()          get_engines_info()      │
+│    POST /scale_out                            POST /scale_in        │
+│    GET  /scale_out/{id}                       GET  /scale_in/{id}   │
+│    POST /scale_out/{id}/cancel                                      │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ InferenceManager.rollout_operation()
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│   InferenceManager (relax/distributed/ray/inference_manager.py)     │
+│     └─ RolloutEnginePool (relax/distributed/ray/rollout.py)         │
+│                  CPU Ray Actor on the head node                     │
+│                                                                     │
+│    scale_out()          scale_in()          observe()               │
 │    ┌──────────┐         ┌──────────┐        ┌──────────────┐        │
-│    │Create    │         │Select    │        │Query engine  │        │
-│    │EngineGrp │         │targets   │        │status        │        │
+│    │Create    │         │Select    │        │Replica state │        │
+│    │EngineGrp │         │targets   │        │→ discovery   │        │
 │    │Health chk│         │Drain     │        └──────────────┘        │
 │    │DCS reg   │         │Remove    │                                │
 │    │Router reg│         │Cleanup   │                                │
@@ -97,10 +106,12 @@ ______________________________________________________________________
 
 **Key Component Responsibilities:**
 
-| Component           | Responsibility                                                                                |
-|---------------------|-----------------------------------------------------------------------------------------------|
-| **Rollout Service** | FastAPI layer — receives HTTP requests and forwards to RolloutManager                         |
-| **RolloutManager**  | Core execution layer — manages engine lifecycle, weight sync, and state machine               |
+| Component             | Responsibility                                                                                                        |
+|-----------------------|-----------------------------------------------------------------------------------------------------------------------|
+| **Rollout Gateway**   | Public `/rollout` ingress — serves `GET /engines` discovery and forwards the scaling API to the Rollout Service       |
+| **Rollout Service**   | FastAPI layer — validates scaling requests and forwards them through `InferenceManager.rollout_operation()`            |
+| **InferenceManager**  | Task-level control plane — owns the Rollout/GenRM/Teacher engine pools, discovery snapshots and request admission     |
+| **RolloutEnginePool** | Rollout engine pool inside the InferenceManager — manages engine lifecycle, weight sync, and the scaling state machine |
 | **SGLang Router**   | Request routing layer — distributes inference requests to engines (cache-aware policy)        |
 | **SGLang Engine**   | Inference engine — executes LLM generation tasks                                              |
 | **DCS Coordinator** | Weight distribution service — manages topology and weight broadcasts for initial engines only |
@@ -267,7 +278,7 @@ New engines must sync the latest model weights before they can receive inference
 
 1. **Skip DCS registration on startup**: Scaled-out engines set `skip_dcs_registration=True` and do not register with the DCS Coordinator
 2. **Immediate Router registration**: After health check passes, engines immediately register with the SGLang Router and can start receiving requests (with old weights)
-3. **Actor triggers weight sync**: After Actor's `update_weights_fully_async()` completes, it calls `RolloutManager.sync_weights_for_scaled_out_engines()`
+3. **Actor triggers weight sync**: After Actor's `update_weights_fully_async()` completes, it calls `RolloutEnginePool.sync_weights_for_scaled_out_engines()`
 4. **Weight sync**: Weights are transferred directly from a seed engine (initial engine) via NCCL Broadcast
 
 **Prerequisites**:
@@ -434,27 +445,46 @@ curl http://<rollout-host>/rollout/engines
 
 ```json
 {
+  "schema_version": 2,
+  "role": "rollout",
+  "manager_epoch": "5b0c3f0e9d2a4e1f8a6b7c9d0e1f2a3b",
+  "topology_revision": 1,
+  "phase": "inference",
+  "routing": {"default_model": "default", "route_key_to_model": {}, "config_version": 0},
   "models": {
     "default": {
+      "state": "ready",
+      "admission": true,
+      "router_url": "http://198.51.100.1:30010",
+      "required_weight_version": "12",
       "engines": [
         {
-          "engine_id": "engine_0",
-          "url": "http://198.51.100.10:30000",
-          "status": "ACTIVE",
-          "is_healthy": true
+          "engine_id": "default/replica-0",
+          "base_url": "http://198.51.100.10:30000",
+          "state": "ready",
+          "weight_version": "12",
+          "direct_eligible": false
         },
         {
-          "engine_id": "engine_1",
-          "url": "http://198.51.100.11:30000",
-          "status": "ACTIVE",
-          "is_healthy": true
+          "engine_id": "default/replica-1",
+          "base_url": "http://198.51.100.11:30000",
+          "state": "ready",
+          "weight_version": "12",
+          "direct_eligible": false
         }
-      ]
+      ],
+      "pd_workers": []
     }
-  },
-  "total_engines": 2
+  }
 }
 ```
+
+The response uses the v2 discovery schema by default. Each engine's `state` is one of
+`starting` / `ready` / `draining` / `sleeping` / `onloading` / `dead`; only a `ready` model
+with `admission: true` accepts requests. `status_filter=active|dead` keeps the non-`dead` or
+`dead` engines. Older clients that parse `engine_groups` / `total_engines` must request
+`GET /rollout/engines?schema_version=1`, which returns the legacy projection (liveness only;
+`active` there does not imply `ready`).
 
 ______________________________________________________________________
 
@@ -496,8 +526,8 @@ ______________________________________________________________________
 
 ```bash
 # 1. Check current engine status
-curl http://localhost:8000/rollout/engines
-# Returns: total_engines = 4
+curl -s http://localhost:8000/rollout/engines | jq '[.models[].engines[]] | length'
+# Returns: 4
 
 # 2. Scale out to 8 engines
 curl -X POST http://localhost:8000/rollout/scale_out \
@@ -510,8 +540,8 @@ curl http://localhost:8000/rollout/scale_out/abc-123
 # State transitions: PENDING → CREATING → HEALTH_CHECKING → WEIGHT_SYNCING → READY
 
 # 4. Confirm scale-out completed
-curl http://localhost:8000/rollout/engines
-# Returns: total_engines = 8
+curl -s http://localhost:8000/rollout/engines | jq '[.models[].engines[]] | length'
+# Returns: 8
 ```
 
 ### Scenario 2: Connect Cross-Cluster Engines

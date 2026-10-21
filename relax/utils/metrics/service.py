@@ -343,12 +343,17 @@ class MetricsService:
     async def _discover_sglang_engines(self) -> Dict[str, Any]:
         # MetricsService starts before Rollout. Resolve lazily and retry on
         # later scrapes if the application is not available yet.
+        from relax.components.inference_gateway import gateway_deployment_name
+        from relax.engine.inference.types import Role
+
         task = self._rollout_handle_task
         if task is None or (task.done() and task.exception() is not None):
-            task = self._rollout_handle_task = asyncio.create_task(asyncio.to_thread(serve.get_app_handle, "rollout"))
+            task = self._rollout_handle_task = asyncio.create_task(
+                asyncio.to_thread(serve.get_app_handle, gateway_deployment_name(Role.ROLLOUT))
+            )
         # A scrape timeout must not spawn more threads while a lookup is stuck.
         handle = await asyncio.shield(task)
-        response = handle.get_engines.remote()
+        response = handle.engines.remote(schema_version=2)
         try:
             return await response
         except asyncio.CancelledError:

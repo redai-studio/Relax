@@ -77,17 +77,31 @@ def zero_wait_get(monkeypatch):
 
 
 def make_manager(engines, refs):
+    from relax.engine.inference.placement import (
+        PlacementGroupView,
+        PlacementOwner,
+        PlacementPlanner,
+        PlacementRequest,
+    )
+
+    # Engines start only on a slice the planner resolved.
+    view = PlacementGroupView(tuple(range(8)), tuple(range(8)), PlacementOwner.MANAGER, identity="pg")
+    [planned] = PlacementPlanner().plan(
+        [PlacementRequest("rollout/actor/group-0", "regular", max(1, len(engines)), 1, 8)], view
+    )
     group = rollout.EngineGroup(
         args=SimpleNamespace(num_gpus_per_node=8),
         pg=None,
         all_engines=engines,
         num_gpus_per_engine=1,
         num_new_engines=0,
+        placement=planned,
     )
     group.engine_init_records = {slot: SimpleNamespace(value=ref) for slot, ref in enumerate(refs)}
     server = rollout.RolloutServer(engine_groups=[group], router_ip="127.0.0.1", router_port=3000, model_name="actor")
-    manager = object.__new__(rollout.RolloutManager.__ray_metadata__.modified_class)
+    manager = object.__new__(rollout.RolloutEnginePool)
     manager._engine_actor_states = ActorState
+    manager._events = MagicMock()
     manager.servers = {"actor": server}
     manager.args = SimpleNamespace(
         num_gpus_per_node=8,
@@ -535,7 +549,7 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     group.require_router_registration = mode.startswith("managed_pd")
     if mode == "native_recover":
         group.sglang_overrides = {"host": "::1", "port": 32000}
-    group.pg = (object(), list(range(8)), list(range(8)))
+    group.pg = rollout.PlacementBinding(object(), tuple(range(8)), tuple(range(8)), ("node-0",) * 8)
     group.args = SimpleNamespace(
         num_gpus_per_node=8,
         rollout_num_gpus=8,
@@ -583,8 +597,6 @@ def test_start_engines_records_original_refs_and_preserves_live_slots(monkeypatc
     assert group.engine_init_records[1].value is first_ref
     assert group.engine_init_records[2].value is second_ref
     assert isinstance(group.engine_init_records[1], rollout._EngineInitRecord)
-    assert group.engine_init_records[1].pending_router_registration == group.is_scaled_out
-    assert group.engine_init_records[2].pending_router_registration == group.is_scaled_out
     assert group.engine_init_records[1].router_url == (
         "http://[::1]:32000" if mode == "native_recover" else "http://worker:30006"
     )
@@ -615,7 +627,7 @@ def test_start_engines_preserves_submitted_record_on_later_synchronous_failure(m
         rollout_external=True,
         hf_checkpoint="/test/model",
     )
-    group.pg = (object(), list(range(8)), list(range(8)))
+    group.pg = rollout.PlacementBinding(object(), tuple(range(8)), tuple(range(8)), ("node-0",) * 8)
     first_ref = InitResult(pending=True)
     first.init.remote.return_value = first_ref
     second.init.remote.side_effect = RuntimeError("second init submission failed")

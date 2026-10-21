@@ -21,12 +21,11 @@ Relax 中 GenRM 有两种顶层部署模式：
 - **Colocate**（`--colocate`，推荐）——所有角色（Actor / Rollout / GenRM）共用同一个 placement group。训练阶段 Actor 收回全部 GPU，因此 GenRM GPU 从不空跑。
 - **Fully Async**（`--fully-async`）——每个角色独占一份 GPU。Rollout 与训练完全并行；GenRM GPU 训练时空闲。
 
-在 `--colocate` 下，Rollout 与 GenRM 如何共用 bundle 又分三种子模式——按 GenRM 大小与 rollout 长尾情况选：
+在 `--colocate` 下，Rollout 与 GenRM 如何共用 bundle 分两种子模式——按 GenRM 大小与 rollout 长尾情况选：
 
 | 子模式                       | Bundle 分布          | 推理期并发方式                    | Inline reward | 触发条件                                                                                                          | 适用场景                                                                             |
 | :--------------------------- | :------------------ | :-------------------------------- | :------------ | :---------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------- |
 | **Split**                    | 不相交 bundle       | 并行（各自独占分片）              | ✅ per sample | 自动 —— `rollout_num_gpus + genrm_num_gpus == actor_total`                                                        | 小 GenRM；长尾明显（agentic、response 长度方差大）                                    |
-| **Shared / Co-resident**     | 同一批 bundle       | 并行（按 mem_fraction 切分显存）  | ✅ per sample | 自动 —— `rollout_num_gpus == genrm_num_gpus == actor_total`                                                       | 中等大小 GenRM，需要全集群 TP，但显存还能塞下 rollout                                 |
 | **Shared / Defer-swap**      | 同一批 bundle       | 串行（sleep-wake 编排）           | ❌ 延迟到批后 | 显式开启 —— Shared bundles + `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` | GenRM 显著大于 policy；短 response RLVR / math（rollout 无长尾可藏 GenRM 延迟）        |
 
 ```
@@ -39,25 +38,6 @@ Relax 中 GenRM 有两种顶层部署模式：
  │  │  Rollout  (4 GPU) │──►│  GenRM   (4 GPU)  │  │
  │  │  bundles 0..3     │◄──│  bundles 4..7     │  │
  │  └───────────────────┘   └───────────────────┘  │
- │                                                 │
- │  Training phase (offload inference weights):    │
- │  ┌─────────────────────────────────────────┐    │
- │  │         Actor  (8 GPU)                  │    │
- │  │         Megatron Training               │    │
- │  └─────────────────────────────────────────┘    │
- └─────────────────────────────────────────────────┘
-
-
-         8-GPU Colocate (Shared / Co-resident)
-
- ┌──────────── Placement Group (8 GPU) ────────────┐
- │                                                 │
- │  Inference phase (same bundles 0..7):           │
- │  ┌─────────────────────────────────────────┐    │
- │  │  Rollout: mem_fraction_static = 0.6     │    │
- │  │  GenRM  : mem_fraction_static = 0.3     │    │
- │  │  ~0.1 reserved for cuda / activations   │    │
- │  └─────────────────────────────────────────┘    │
  │                                                 │
  │  Training phase (offload inference weights):    │
  │  ┌─────────────────────────────────────────┐    │
@@ -98,7 +78,7 @@ Relax 中 GenRM 有两种顶层部署模式：
  └─────────────────────────────────────────────────┘
 ```
 
-三种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 与 Shared / Co-resident 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+两种 colocate 子模式在训练阶段都把全部 GPU 归还给 Actor。Split 走 inline reward：Rollout 每生成一个候选就通过 HTTP 单发给 GenRM。Shared / Defer-swap 把 HTTP 调用改成每轮 rollout 后由 userland `custom_reward_post_process` 一次性批量发出；split 与 defer-swap 的完整取舍见 [`examples/generate_reward_model/README.md`](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 
 ## 脚本
 
@@ -111,7 +91,7 @@ Relax 中 GenRM 有两种顶层部署模式：
 
 ### 资源分配
 
-`--colocate` 下三种子模式训练阶段都归还所有 GPU 给 Actor；差异仅在推理阶段 Rollout / GenRM 如何共处：
+`--colocate` 下两种子模式训练阶段都归还所有 GPU 给 Actor；差异仅在推理阶段 Rollout / GenRM 如何共处：
 
 **Split**（不相交 bundle）：
 
@@ -119,15 +99,6 @@ Relax 中 GenRM 有两种顶层部署模式：
 Actor:      8 GPU（全部）
 Rollout:    4 GPU（bundles 0..3，mem_fraction 默认）
 GenRM:      4 GPU（bundles 4..7，mem_fraction 默认）
-```
-
-**Shared / Co-resident**（同一批 bundle，两者常驻，按 mem_fraction 切分显存）：
-
-```
-Actor:      8 GPU（全部）
-Rollout:    8 GPU（bundles 0..7，mem_fraction_static = 0.6）
-GenRM:      8 GPU（bundles 0..7，mem_fraction_static = 0.3）
-                    └── 总和 ≤ 0.9；余量留给 cuda / activations
 ```
 
 **Shared / Defer-swap**（同一批 bundle，串行切换）：
@@ -243,19 +214,21 @@ python3 relax/entrypoints/train.py \
     --rm-type dapo-genrm
 ```
 
-**Colocated / Shared**（大 GenRM，新增）：把 rollout 和 genrm 都设为 actor 的全部 GPU；框架自动识别为 shared 模式，让两个引擎通过 `mem_fraction_static` 切分每张 GPU 的显存：
+**Colocated / Shared**（大 GenRM）：把 rollout 和 genrm 都设为 actor 的全部 GPU，并延迟 reward，让两个引擎在每张 GPU 上轮流使用（Defer-swap）：
 
 ```bash
 python3 relax/entrypoints/train.py \
     --genrm-model-path /path/to/genrm/model \
     --genrm-num-gpus-per-engine 8 \
-    --genrm-engine-config '{"max_context_len": 10240, "mem_fraction_static": 0.3}' \
+    --genrm-engine-config '{"max_context_len": 10240, "mem_fraction_static": 0.85}' \
     --genrm-sampling-config '{"temperature": 0.1, "top_p": 1.0, "top_k": -1, "max_response_len": 1024}' \
     --rollout-num-gpus-per-engine 1 \
-    --sglang-mem-fraction-static 0.6 \
+    --sglang-mem-fraction-static 0.85 \
     --resource '{"actor": [1, 8], "rollout": [1, 8], "genrm": [1, 8]}' \
     --colocate \
-    --rm-type dapo-genrm
+    --rm-type dummy \
+    --defer-reward-to-post-process \
+    --custom-reward-post-process-path examples.generate_reward_model.post_process_genrm_swap.custom_reward_post_process
 ```
 
 ::: tip 自动识别 colocate 子模式
@@ -264,14 +237,14 @@ python3 relax/entrypoints/train.py \
 | 分配                                                  | 子模式                                  |
 | :---------------------------------------------------- | :-------------------------------------- |
 | `rollout_num_gpus + genrm_num_gpus == actor_total`    | **Split**（不相交 bundle）              |
-| `rollout_num_gpus == genrm_num_gpus == actor_total`   | **Shared**（同一批 bundle）             |
+| `rollout_num_gpus == genrm_num_gpus == actor_total`   | **Shared**（同一批 bundle），需要 `--defer-reward-to-post-process` |
 | 其他                                                  | 启动时报错拒绝                          |
 
-Shared 内部默认是 **Co-resident**（两个引擎按 `mem_fraction_static` 同时驻留）。再加上 `--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path` 就切成 **Defer-swap**——sleep-wake 串行，每次只有一个引擎占显存。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
+Shared 以 **Defer-swap** 运行——`--rm-type dummy` + `--defer-reward-to-post-process` + `--custom-reward-post-process-path`，sleep-wake 串行，每次只有一个引擎占显存。共享 bundle 但未设置 `--defer-reward-to-post-process` 会在启动时被拒绝。何时优先 defer-swap 见 [示例 README](https://github.com/redai-studio/Relax/blob/main/examples/generate_reward_model/README.md)。
 :::
 
-::: warning Shared / Co-resident 必须设置 `mem_fraction_static`
-Shared / Co-resident 模式下两个 SGLang 引擎同时驻留在同一组 GPU，必须设置各自的 `mem_fraction_static`，使**单卡之和 < 1.0**（建议 ≤ 0.9，剩余给 cuda graph + activations）。Rollout 通过 `--sglang-mem-fraction-static`（或 `--sglang-config` YAML overrides）配置；GenRM 通过 `--genrm-engine-config` 中的 `mem_fraction_static` 配置。Shared / Defer-swap 无需切分——两者永不共存，各自可取 ≈ 0.85。
+::: tip 共享 bundle 无需切分 `mem_fraction_static`
+Defer-swap 下两个引擎永不同时驻留，各自可取 ≈ 0.85 的显存。
 :::
 
 **Fully-Async 模式**：
@@ -552,12 +525,12 @@ print(response)  # "1" 或 "0"
 1. **优先使用 colocate 模式**：在 colocate 模式下，GenRM 的 GPU 在不进行评估时会卸载回训练，全部 GPU 都参与梯度计算。比 async 模式的 GPU 利用率更高（async 模式下 GenRM 的 GPU 在训练阶段处于闲置）。
 2. **选对 colocate 子模式**：
    - GenRM 较小、能放在部分 GPU 上时（如 4B reward model 用 4 GPU），用 **Split**。
-   - GenRM 较大、需要全集群 TP 时（如 30B MoE 用 TP=8），用 **Shared**。Shared 模式还能避免「GenRM 太大装不下 4 GPU、Rollout 又被挤压」的两难。
-3. **Shared 模式下谨慎设置 `mem_fraction_static`**：单卡上各引擎之和 ≤ 0.9。常用起点：rollout 0.6、genrm 0.3。
+   - GenRM 较大、需要全集群 TP 时（如 30B MoE 用 TP=8），用 **Shared**（Defer-swap）。Shared 模式还能避免「GenRM 太大装不下 4 GPU、Rollout 又被挤压」的两难。
+3. **Shared 模式下延迟 reward**：共享 bundle 必须设置 `--defer-reward-to-post-process`；两个引擎轮流占用 GPU，各自可取 ≈ 0.85 的显存。
 4. **设置合适的上下文长度**：引擎配置中的 `max_context_len` 应能容纳最长的 prompt + 响应组合。
 5. **使用低采样温度**：温度 0.1 可产生确定性的评估结果；仅在需要评估多样性时提高。
 6. **监控健康状态**：定期检查 `/health` 端点，确保 GenRM 引擎正常运行。
-7. **按模型大小分配 GPU**：大型 GenRM 模型（如 30B）建议 shared 模式 + `--genrm-num-gpus-per-engine` 设为整个集群规模。
+7. **按模型大小分配 GPU**：大型 GenRM 模型（如 30B）建议 shared（Defer-swap）模式 + `--genrm-num-gpus-per-engine` 设为整个集群规模。
 8. **`--genrm-instances` 中每个实例都要显式写 `num_gpus`**：不存在跨实例的自动均分，实例大小配错了是配置问题，不是框架默认行为——按各自要跑的评判模型来定量。
 9. **需要简洁作答的评判模型记得关闭「思考」模式**：推理增强模型默认往往会先输出一段较长的思考过程再给结论；如果你的解析逻辑期望拿到干净的 `1`/`0`，在该实例的 `sampling_config` 里设置 `"chat_template_kwargs": {"enable_thinking": false}`。
 
@@ -572,13 +545,13 @@ print(response)  # "1" 或 "0"
 在启用 GenRM 的 colocated 模式下，GPU 分配必须**恰好**满足以下两种之一：
 
 - **Split**：`rollout_num_gpus + genrm_num_gpus == actor_total_gpus`
-- **Shared**：`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`
+- **Shared**：`rollout_num_gpus == genrm_num_gpus == actor_total_gpus`，并设置 `--defer-reward-to-post-process`
 
 其它组合（例如 `rollout + genrm < actor_total`，或 `rollout < actor_total < rollout + genrm`）会在启动阶段被拒绝。请把 `--resource` 中的 `rollout` / `genrm` 调整到这两种合法布局之一。
 
 ### Shared 模式 OOM 或引擎初始化失败
 
-如果 shared 模式启动时 OOM 或 cuda graph capture 失败，降低一个或两个引擎的 `mem_fraction_static`，让单卡之和 ≤ 0.9。对大 MoE GenRM，可能还需要禁用 cuda graph 或减小 `max_context_len`。
+如果 shared（Defer-swap）模式启动时 OOM 或 cuda graph capture 失败，降低出错引擎的 `mem_fraction_static`。对大 MoE GenRM，可能还需要禁用 cuda graph 或减小 `max_context_len`。
 
 ### 引擎初始化超时
 
