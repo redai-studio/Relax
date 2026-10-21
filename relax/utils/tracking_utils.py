@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from collections.abc import Callable
+
 import wandb
 
 from relax.utils.metrics.adapters.apprise import _AppriseAdapter
@@ -7,6 +9,26 @@ from relax.utils.metrics.adapters.clearml import _ClearMLAdapter
 from relax.utils.metrics.adapters.tensorboard import _TensorboardAdapter
 from relax.utils.metrics.adapters.wandb import init_wandb_primary, init_wandb_secondary
 from relax.utils.metrics.metrics_service_adapter import get_metrics_service_adapter, init_metrics_service_adapter
+
+
+# Explicitly registered observers only; ordinary training has no callbacks.
+_observer_finalizers: list[Callable[[], None]] = []
+
+
+def register_observer_finalizer(callback: Callable[[], None]) -> None:
+    """Register a bounded, best-effort flush before metrics writers close."""
+    _observer_finalizers.append(callback)
+
+
+def finish_observers() -> None:
+    from relax.utils.logging_utils import get_logger
+
+    while _observer_finalizers:
+        callback = _observer_finalizers.pop()
+        try:
+            callback()
+        except Exception:
+            get_logger(__name__).warning("Observer finalization failed", exc_info=True)
 
 
 def init_tracking(args, primary: bool = True, **kwargs):

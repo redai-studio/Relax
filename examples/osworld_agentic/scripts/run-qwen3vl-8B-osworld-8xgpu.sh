@@ -107,7 +107,12 @@ source "${RELAX}/scripts/models/qwen3-vl-8B.sh"
 export EXP_NAME="${EXP_NAME:-qwen3vl-8b-osworld-${CLUSTER_GPUS}xgpu}"
 PROJECT_NAME="${PROJECT_NAME:-Relax/osworld-agentic}"
 now=$(date "+%Y%m%d-%H%M%S")
-export OSWORLD_RUN_TAG="osworld-outcome-${now}"
+export OSWORLD_RUN_TAG="osworld-outcome-${now}-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
+# Only this recipe opts in; all other entrypoints leave health monitoring off.
+export OSWORLD_SANDBOX_HEALTH="${OSWORLD_SANDBOX_HEALTH:-1}"
+export OSWORLD_HEALTH_DIR="${SAVE_DIR}/${EXP_NAME}/sandbox_health/${OSWORLD_RUN_TAG}"
+export OSWORLD_HEALTH_INTERVAL="${OSWORLD_HEALTH_INTERVAL:-30}"
+export OSWORLD_HEALTH_CLEANUP_GRACE="${OSWORLD_HEALTH_CLEANUP_GRACE:-120}"
 TRAIN_DATA="${DATA_DIR}/osworld/train.parquet"
 if [ ! -s "${TRAIN_DATA}" ]; then
     python3 "${SCRIPT_DIR}/scripts/prepare_data.py" \
@@ -130,6 +135,7 @@ runtime = json.loads(os.environ.get("RUNTIME_ENV_JSON") or "{}")
 env = runtime.setdefault("env_vars", {})
 for name in (
     "PYTHONPATH", "MASTER_ADDR", "MASTER_PORT", "RAY_ADDRESS",
+    "OSWORLD_SANDBOX_HEALTH", "OSWORLD_HEALTH_DIR", "OSWORLD_HEALTH_INTERVAL", "OSWORLD_HEALTH_CLEANUP_GRACE",
     "OSWORLD_AGENT_PYTHON", "OSWORLD_REPO", "OSWORLD_CACHE_DIR", "MCP_SRC_ROOT", "OSWORLD_RUN_TAG", "TENSORBOARD_DIR",
 ):
     env[name] = os.environ[name]
@@ -171,7 +177,7 @@ ROLLOUT_ARGS=(
     --use-agentic-rollout
     --multimodal-keys '{}'
     --rollout-result-dir "${SAVE_DIR}/${EXP_NAME}/rollout_result/${OSWORLD_RUN_TAG}"
-    --agent-command "bash \"${SCRIPT_DIR}/run_agent_app.sh\""
+    --agent-command "python3 -m examples.osworld_agentic.app.health_runner --agent bash \"${SCRIPT_DIR}/run_agent_app.sh\""
     --agent-cwd "${SCRIPT_DIR}"
     --agent-env "OPENAI_MODEL=Qwen3-VL-8B-Thinking"
         "AGENT_DEBUG_LOG_DIR=${SCRIPT_DIR}/log/agent/${OSWORLD_RUN_TAG}"
@@ -262,7 +268,7 @@ mkdir -p "${SCRIPT_DIR}/log" "${SAVE_DIR}/${EXP_NAME}/rollout_result/${OSWORLD_R
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS:-${RAY_JOB_ADDRESS:-http://127.0.0.1:8265}}" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python3 -m relax.entrypoints.train \
+    -- python3 -m examples.osworld_agentic.app.health_runner \
     "${RESOURCE_ARGS[@]}" \
     "${MODEL_ARGS[@]}" \
     "${CKPT_ARGS[@]}" \

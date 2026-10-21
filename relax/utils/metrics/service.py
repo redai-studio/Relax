@@ -57,6 +57,10 @@ class LogMetricsBatchRequest(BaseModel):
     tags: Optional[Dict[str, str]] = None
 
 
+class ReportBackendRequest(LogMetricsBatchRequest):
+    backend: str
+
+
 class ReportStepRequest(BaseModel):
     step: int
 
@@ -264,6 +268,20 @@ class MetricsService:
         except Exception as e:
             logger.error(f"Failed to log batch metrics: {e}")
             return {"status": "error", "message": str(e)}
+
+    @app.post("/report_backend")
+    async def report_backend(self, request: ReportBackendRequest) -> Dict[str, Any]:
+        """Report independent observations to an existing writer without step
+        buffering."""
+        adapter = self._adapters.get(request.backend)
+        if self._finished or adapter is None:
+            return {"status": "error", "message": "Requested metrics writer is unavailable"}
+        try:
+            adapter.log(data=request.metrics, step=request.step)
+            return {"status": "success"}
+        except Exception as exc:
+            logger.warning("Independent metrics report failed", exc_info=True)
+            return {"status": "error", "message": str(exc)}
 
     @app.post("/report_step")
     async def report_step(self, request: ReportStepRequest) -> Dict[str, Any]:

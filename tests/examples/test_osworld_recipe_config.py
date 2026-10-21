@@ -138,12 +138,14 @@ def test_launcher_builds_submission_without_touching_cluster(tmp_path, no_wait, 
     assert ("--no-wait" in argv) == no_wait
     assert argv[argv.index("--working-dir") + 1] == str(repo)
     runtime = json.loads(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--runtime-env-json=")))
+    assert runtime["env_vars"]["OSWORLD_SANDBOX_HEALTH"] == "1"
+    assert runtime["env_vars"]["OSWORLD_HEALTH_DIR"].endswith(runtime["env_vars"]["OSWORLD_RUN_TAG"])
     assert runtime["working_dir"] == "kept"
     assert runtime["env_vars"]["ENTRY_SENTINEL"] == "kept"
     assert runtime["env_vars"]["OSWORLD_AGENT_PYTHON"] == "/tmp/test-local-agent-env/bin/python"
     assert secret not in json.dumps(argv) + result.stdout + result.stderr
     train = argv[argv.index("--") + 1 :]
-    assert train[:3] == ["python3", "-m", "relax.entrypoints.train"]
+    assert train[:3] == ["python3", "-m", "examples.osworld_agentic.app.health_runner"]
     for flag, expected in {
         "--lr": "5e-6",
         "--num-rollout": "200",

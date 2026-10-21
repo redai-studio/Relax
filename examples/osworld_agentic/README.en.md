@@ -193,3 +193,66 @@ Experiments are listed in ascending launch-time order (UTC+8). Heading times cor
 - **Time audit at 12:15:20:** The first 24 step times totaled 10h 21m 18.736s, averaging **1553.281s per rollout**. Adding 3m 57.812s before timing began and 1m 27.839s pending the next report reconciled with Job runtime of 10h 26m 44.387s. Each point covers a rollout with two updates; cumulative timing for rollouts 1–23 differed from log intervals by only 0.458s.
 - **Public recipe:** Provide `env.example.sh`, directly load ignored `env.local.sh`, remove redundant `env.sh` and its ignore exception. Update bilingual instructions and reject missing/empty task manifests. Keep internal endpoints, credentials and private paths out of documentation.
 - **Validation:** All pre-commit hooks passed before commit; relevant tests: 61 passed, one opt-in live Ray Serve test skipped. Submission arguments were verified with isolated stubs; the latest 48K script has not completed real GPU validation. Shared-prefix training, broadcasts and GPU-to-CPU copies were analyzed without implementing new optimization algorithms.
+
+## Sandbox health monitoring
+
+The OSWorld launcher explicitly enables `OSWORLD_SANDBOX_HEALTH=1`; set it to `0` to disable it.
+Other training entrypoints do not enable monitoring. `OSWORLD_HEALTH_INTERVAL` defaults to 30 seconds;
+`OSWORLD_HEALTH_CLEANUP_GRACE` defaults to 120 seconds. Each launch gets a unique run ID.
+All statistics are cumulative within that run, not per rollout.
+
+Lifecycle journals live under `${SAVE_DIR}/${EXP_NAME}/sandbox_health/${OSWORLD_RUN_TAG}/`.
+All nodes must share this writable path. Each process writes its own JSONL file; the collector deduplicates
+by event ID and logical Session, independently of training exports or rollout completion.
+`snapshot.json` contains the latest local summary; retained journals can be replayed.
+Monitoring errors produce warnings without changing initialization retries, rebuilding, rewards or training samples.
+The monitor updates local snapshots periodically. Each rollout logging callback reports the latest snapshot
+to the existing ClearML writer in MetricsService, using the same step as rollout metrics. Elapsed time is
+recorded separately as `sandbox/elapsed_seconds`; the snapshot may lag by about one collection interval.
+Before any rollout completes, monitoring remains local. W&B/TensorBoard receive no health metrics and their training steps remain unaffected.
+Before metrics shutdown, training requests a final local snapshot and waits at most 6 seconds;
+failures only produce logs. Hard exits, storage or network failures may still lose final events;
+consult retained journals and local snapshots.
+
+ClearML shows the following `sandbox` metrics, a `sandbox/summary` table with numerators, denominators,
+sample counts and availability, and a `sandbox/instances` table for unfinished or anomalous instances. The table shows the 200 oldest
+stages, with total/displayed counts in the summary; the local snapshot retains the complete list.
+Missing values are omitted from scalar reporting and displayed as unavailable in the table, never as fabricated zeros.
+
+| Metric                 | Cumulative definition                                                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `first_ready_rate`     | Sessions ready on their first initialization / Sessions with completed initialization                                                                               |
+| `retry_recovery_rate`  | Sessions recovered after their first failure / first-failed Sessions whose initialization finished                                                                  |
+| `init_failure_rate`    | Sessions exhausting all three attempts / Sessions with completed initialization                                                                                     |
+| `ready_seconds_p95`    | Nearest-rank P95 across successful Session durations; requires at least two observations                                                                            |
+| `runtime_failure_rate` | Ended ready Sessions with confirmed environment failure / ended ready Sessions                                                                                      |
+| `cleanup_unconfirmed`  | Known instances requested for release but unconfirmed after the grace period; incomplete identity makes the total unavailable, retaining a lower bound in the table |
+
+Readiness requires successful reset and a decodable original screenshot. The fallback PNG is not evidence.
+No desktop/MCP probes are added. Timing begins after acquiring a concurrency permit and includes retries,
+old-instance cleanup and backoff, but excludes permit waiting. A reset returning an invalid screenshot is
+counted separately as `unhealthy_reset`: initialization completed, but neither ready nor retry-exhausted.
+Monitoring does not initiate extra retries. Cancellation or process exit before initialization completes
+is excluded from initialization/retry completion denominators. Observed initialization `TimeoutError`s are
+counted as `init_timeout`; external termination without timeout evidence remains cancelled/unknown.
+A ready Session enters the runtime denominator when process completion is observed. Parsing failures,
+task failure, LLM errors and ambiguous exceptions are not confirmed sandbox failures; unknown errors and
+`partial_unknown` coverage remain visible in the summary.
+
+The instance table contains run/session/sandbox IDs, attempt, stage, stage age, error category and cleanup status.
+Instances replaced inside provider reset or by the outer retries remain separate. A heartbeat older than
+`max(90 seconds, 3 × reporting interval)` is unknown, not proof of process exit or resource release.
+SIGKILL of the entire process group can lose the last queued events; already-written history survives.
+
+Cleanup confirmation defaults to `confirmation_unavailable`; close returning is never release evidence.
+The inspected reference Nex client supports lookup by ID, but its deletion waiter swallows lookup failures.
+The monitor does not trust that result. An optional `health_runner.monitor(stop, query=...)` callback can supply
+deployment-verified, read-only lookup: query only the supplied owned ID, return `released`, `exists` or `unknown`,
+and enforce strict network timeouts. Without it, no Nex queries occur. Nonzero known unconfirmed counts remain
+visible; unavailable confirmation with no outstanding count is not displayed as a healthy zero.
+
+Observation wraps create/delete calls only in the dedicated Agent process, without editing the provider or
+adding deletion/restart behavior. If allocation succeeds but its response is lost, identity may be unavailable;
+that creation remains visible as `identity_unavailable`. The provider has no verified run-label discovery API,
+so the monitor never lists the workspace and cannot recover these unknown IDs. Mock tests do not verify remote
+Nex release semantics; shared storage, the deployed provider version and remote confirmation need deployment validation.

@@ -123,6 +123,9 @@ class _ClearMLAdapter(metaclass=SingletonMeta):
         for k, v in data.items():
             title, series = k.split("/", 1)
 
+            if isinstance(v, dict) and set(v) == {"__relax_table__"}:
+                v = pd.DataFrame(v["__relax_table__"])
+
             if isinstance(v, int | float | np.floating | np.integer):
                 _logger.report_scalar(
                     title=title,

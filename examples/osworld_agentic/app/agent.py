@@ -32,6 +32,7 @@ from app.hybrid_agent import (
     RelaxHybridAgent,
     SessionDiscardedError,
 )
+from app.sandbox_health import emit, journal
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("osworld_config.yaml")
@@ -325,6 +326,12 @@ async def run_session(
                 "parse_failed_steps": parse_failed_steps,
             }
         )
+    except asyncio.CancelledError:
+        emit("cancel_requested", error_category="cancelled")
+        raise
+    except Exception:
+        emit("session_error", error_category="unknown")
+        raise
     finally:
         phase_start = time.monotonic()
         await env.close()
@@ -381,6 +388,7 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         # Never die silently: Relax waits for this file, and a session that
         # never reports back blocks its whole rollout group forever.
+        emit("session_error", error_category="unknown")
         logger.exception("run_session failed; reporting a zero-reward session")
         task_config = {}
         try:
@@ -402,6 +410,9 @@ def main() -> None:
             },
         }
     write_session_output(args.output_json, output)
+    writer = journal()
+    if writer is not None:
+        writer.flush()
 
 
 if __name__ == "__main__":

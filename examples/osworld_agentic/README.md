@@ -193,3 +193,55 @@ Git 忽略私有配置、常见日志/截图/缓存目录，但忽略规则不�
 - **时间审计，12:15:20 快照**：24 个 `perf/step_time` 合计 10小时21分18.736秒，平均 **1553.281 秒/rollout**；加计时前初始化 3分57.812秒及尚未上报的尾段 1分27.839秒，与 Job 总时长 10小时26分44.387秒对齐。该指标每 rollout 一个点，包含两次更新；rollout 1–23 的累计时间与日志跨度仅差 0.458 秒。
 - **开源整理**：提供 `env.example.sh`，直接读取忽略的 `env.local.sh`，删除多余 `env.sh` 及其忽略例外；更新中英文文档，缺失/空任务清单明确报错。未公开内部端点、密钥或私有路径。
 - **验证结果**：提交前全部 pre-commit 通过，相关测试 61 passed、1 个 opt-in live Ray Serve 测试 skipped。隔离环境验证过脚本提交参数；48K 尚未完成真实 GPU 训练验证。共享前缀训练、广播和 GPU→CPU 拷贝仅做分析，没有实施新的优化算法。
+
+## 沙箱健康监控
+
+正式 OSWorld 入口显式开启 `OSWORLD_SANDBOX_HEALTH=1`，可设为 `0` 关闭。其他训练入口不启用。
+`OSWORLD_HEALTH_INTERVAL` 默认 30 秒，`OSWORLD_HEALTH_CLEANUP_GRACE` 默认 120 秒。
+每次启动生成唯一 run ID，统计在该 run 内累计；不是最近一轮 rollout 的统计。
+
+Agent 的独立生命周期日志写入 `${SAVE_DIR}/${EXP_NAME}/sandbox_health/${OSWORLD_RUN_TAG}/`。
+该目录必须在所有节点同路径共享、可写。每个进程写自己的 JSONL；汇总器按事件 ID 和逻辑 Session 去重，
+不依赖训练导出或 rollout 完成。`snapshot.json` 保存最近的本地汇总，事件日志可以重新读取。
+监控失败会警告并保留已写入的日志，不改变三次初始化尝试、失败重建、reward 或训练样本。
+后台按监控周期更新本地快照；每轮 rollout 日志回调向现有 MetricsService 的 ClearML writer 上报一次最新快照，
+横轴使用与 rollout 指标相同的 step，耗时单独记录为 `sandbox/elapsed_seconds`。快照可能滞后约一个采集周期；
+尚未完成 rollout 时只保留本地监控，结束时的最终汇总也只更新本地快照。
+同时启用 W&B/TensorBoard 不会向它们写入健康指标或推进训练 step。
+训练关闭指标服务前会请求最后一次汇总，最多等待 6 秒；异常或超时只记录日志。
+强制退出、共享存储或网络故障仍可能使最后事件未上传，应以保留的日志和本地汇总排查。
+
+ClearML 的 `sandbox` 图表包含以下指标；`sandbox/summary` 表同时显示分子、分母、样本数及状态，
+`sandbox/instances` 表显示未完成或异常实例（按阶段等待时间取前 200 条，汇总表显示总数；完整列表保留在 snapshot 中）。无数据的指标不发送伪造的零值，表中显示空值和原因。
+
+| 指标                   | run 内累计口径                                                                     |
+| ---------------------- | ---------------------------------------------------------------------------------- |
+| `first_ready_rate`     | 第一次初始化即就绪的 Session / 已完成初始化流程的 Session                          |
+| `retry_recovery_rate`  | 首次失败后重试就绪的 Session / 首次失败且初始化流程已结束的 Session                |
+| `init_failure_rate`    | 三次尝试耗尽仍失败的 Session / 已完成初始化流程的 Session                          |
+| `ready_seconds_p95`    | 全部成功就绪 Session 的耗时，使用 nearest-rank P95；至少两条数据才报告             |
+| `runtime_failure_rate` | 已结束的就绪 Session 中，有明确环境故障证据的比例                                  |
+| `cleanup_unconfirmed`  | 请求释放后超过宽限期、尚未确认释放的已知实例数；身份不完整时总数为空，表中保留下界 |
+
+就绪需要 reset 返回及原始截图可解码；缺图后生成的占位 PNG 不算证据。不增加桌面/MCP 探测。
+耗时从获得并发名额后的第一次初始化开始，包含重试、关闭旧实例及退避，不含名额排队。
+reset 返回但截图无效的情况单列 `unhealthy_reset`：计入已完成初始化，但既不算 ready，也不冒充三次耗尽；
+监控不会为此新增重试。初始化尚未完成时取消或异常退出，不进入初始化完成、重试完成的分母。
+`init_timeout` 单列已观察到的初始化 `TimeoutError`；外部终止但没有超时证据时保留 cancelled/unknown。
+就绪之后已观察到进程结束的 Session 进入运行期分母；解析失败、任务失败、LLM 错误及来源不明的异常
+不进入环境故障分子，未知错误数量和 `partial_unknown` 状态在汇总表中保留。
+
+异常表列出 run/session/sandbox ID、attempt、stage、stage age、error category 和 cleanup status。
+内部 reset 重建及外层三次重试产生的旧实例都保留。心跳超过 `max(90 秒, 3 × 上报周期)` 未更新时标为 unknown，
+不据此推断进程已经结束或实例已经释放。整个进程组被 SIGKILL 时最后的内存队列事件可能丢失；已落盘历史仍保留。
+
+回收确认默认显示 `confirmation_unavailable`，绝不把 close 返回当作释放证据。
+本地参考 Nex provider 有按 ID 查询，但其删除等待会吞掉查询异常；当前实现不使用这个返回值判定释放。
+可向 `health_runner.monitor(stop, query=...)` 注入经过部署验证的只读查询函数：仅查询传入的本 run 实例 ID，
+返回 `released`、`exists` 或 `unknown`，并自行设置严格网络超时。没有配置该接口时不会请求 Nex。
+已知待确认数量非零时仍可显示；无法查询且没有待确认计数时也不会展示“正常的 0”。
+
+provider 观测只包装专属 Agent 进程的 create/delete 调用，不修改外部源码或增加回收操作。
+创建请求成功但响应丢失时，可能无法取得 ID，表中保留 `identity_unavailable`。
+现有 provider 没有已验证的 run 标签发现接口，因此不扫描 workspace，也无法找回这种未知 ID。
+本地 mock 测试不代表远端 Nex 删除语义已验证；跨节点共享目录、实际 provider 版本与远端回收确认仍需部署验证。

@@ -4,6 +4,7 @@
 from argparse import Namespace
 from typing import Any
 
+from examples.osworld_agentic.app.health_runner import report_rollout
 from examples.osworld_agentic.app.reward_post_process import compute_legacy_raw_reward
 from relax.utils.logging_utils import get_logger
 from relax.utils.types import Sample
@@ -36,4 +37,5 @@ def log_rollout_data(
     metrics["rollout/step"] = step
     tracking_utils.log(args, metrics, step_key="rollout/step")
     tracking_utils.flush_metrics(args, step)
+    report_rollout(step)
     return True

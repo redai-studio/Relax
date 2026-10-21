@@ -48,6 +48,7 @@ def _train_namespace():
         "Controller": Mock(),
         "post_process_env": lambda args, env: env,
         "init_tracking": Mock(),
+        "finish_observers": Mock(),
         "maybe_pin_baseline_to_stable": Mock(),
         "_ctrl": None,
         "_shutdown_done": False,
@@ -83,6 +84,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
     ns["_hard_exit"] = hard_exit
     if fail_at == "training":
         controller.training_loop.side_effect = RuntimeError("training failed")
+    ns["finish_observers"].side_effect = lambda: events.append("observers")
     ns["serve"].shutdown.side_effect = lambda: events.append("serve")
     ns["ray"].shutdown.side_effect = lambda: events.append("ray")
     with pytest.raises(SystemExit) as exc:
@@ -95,7 +97,7 @@ def test_train_cleans_up_startup_and_training(fail_at, monkeypatch):
         finish.assert_not_called()
     expected = 1 if fail_at else 0
     assert exc.value.code == expected
-    assert events == ["serve", "ray", ("exit", expected)]
+    assert events == (["observers"] if fail_at is None else []) + ["observers", "serve", "ray", ("exit", expected)]
     controller.shutdown.assert_called_once()
 
 

@@ -22,7 +22,7 @@ from relax.core.controller import Controller  # noqa: E402
 from relax.core.node_group_affinity import maybe_pin_baseline_to_stable  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
-from relax.utils.tracking_utils import init_tracking  # noqa: E402
+from relax.utils.tracking_utils import finish_observers, init_tracking  # noqa: E402
 from relax.utils.utils import post_process_env  # noqa: E402
 
 
@@ -90,6 +90,7 @@ def _graceful_shutdown(sig=None, frame=None, exit_code: int | None = None):
             except Exception as e:
                 logger.warning(f"Controller shutdown error during {sig_name}: {e}")
 
+        finish_observers()
         if ray.is_initialized():
             try:
                 serve.shutdown()
@@ -155,6 +156,7 @@ def main(args):
         _ctrl = Controller.__new__(Controller)
         _ctrl.__init__(args, runtime_env)
         _ctrl.training_loop()
+        finish_observers()
         if getattr(args, "use_metrics_service", False):
             # ClearML lives in the Serve replica; killing it without closing
             # its Task makes a completed run appear non-responsive.
