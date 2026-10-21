@@ -571,11 +571,13 @@ SFT 还会用到通用的[数据配置](#数据配置)参数，特别是 `--inpu
 
 ## 容错配置
 
+Rollout 和 ActorFwd 的局部恢复、模式默认行为、环境变量及冲突配置，见[推理服务局部自愈](./inference-recovery.md)。它与 `--use-fault-tolerance` 是不同功能。
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `--use-fault-tolerance` | flag | False | 是否启用 Rollout 期间的容错功能 |
 | `--use-health-check` | flag | False | 是否启用全局健康检查系统。Controller 的 HealthManager 监控所有服务，故障时触发自动重启 |
-| `--max-global-restart` | int | 3 | 允许的最大全局重启次数。超过后训练终止。仅在 `--use-health-check` 启用时生效 |
+| `--max-global-restart` | int | 3 | 允许的最大全局重启次数，包括健康检查触发及局部推理恢复升级的全局重启。超过后训练终止 |
 | `--rollout-health-check-interval` | float | 30.0 | Rollout 引擎健康检查间隔（秒） |
 | `--rollout-health-check-timeout` | float | 30.0 | Rollout 引擎健康检查超时时间（秒） |
 | `--rollout-health-check-first-wait` | float | 0 | 开始健康检查前的初始等待时间（秒）。使用 deepgemm 时需要增大此值 |
