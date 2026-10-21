@@ -43,6 +43,19 @@ def test_budget_shared_between_both_inference_roles_and_fourth_requires_global()
         state.request_recovery("actor_fwd")
 
 
+@pytest.mark.parametrize("max_attempts", [0, 1, 5])
+def test_configured_budget_is_shared_and_not_reset_after_success(max_attempts):
+    state = _source()["InferenceRecoveryState"](True, max_attempts=max_attempts)
+    for index in range(1, max_attempts + 1):
+        role = "rollout" if index % 2 else "actor_fwd"
+        state.report_error(role, "explicit error")
+        assert state.request_recovery(role) == index
+        state.resume(index)
+    state.report_error("rollout", "explicit error")
+    with pytest.raises(RuntimeError, match=rf"budget \({max_attempts}\) exhausted"):
+        state.request_recovery("rollout")
+
+
 def test_failed_producer_closes_admission_before_any_reset():
     state = _source()["InferenceRecoveryState"](False)
     assert state.enter("actor", 4, 0)
