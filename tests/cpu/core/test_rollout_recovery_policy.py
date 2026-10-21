@@ -33,6 +33,7 @@ def role_config(*, hybrid=False):
 @pytest.fixture
 def constructor(monkeypatch):
     constructor = Mock()
+    monkeypatch.delenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", raising=False)
     monkeypatch.setattr(inference_recovery, "InferenceRecoveryState", constructor)
     return constructor
 
@@ -63,7 +64,7 @@ def test_recovery_mode_defaults_and_overrides_keep_original_roles(
     assert state is config.inference_recovery_state
     if enabled:
         assert state is constructor.options.return_value.remote.return_value
-        constructor.options.return_value.remote.assert_called_once_with(fully_async and not hybrid)
+        constructor.options.return_value.remote.assert_called_once_with(fully_async and not hybrid, max_attempts=3)
     else:
         assert state is None
         constructor.options.assert_not_called()
@@ -76,7 +77,38 @@ def test_default_true_on_policy_recovery_does_not_add_forward_receiver(monkeypat
     config.fully_async = True
 
     assert configure_recovery(config) is constructor.options.return_value.remote.return_value
-    constructor.options.return_value.remote.assert_called_once_with(False)
+    constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=3)
+
+
+@pytest.mark.parametrize("budget", ["0", "1", "5"])
+def test_recovery_budget_env_is_passed_to_state(monkeypatch, constructor, budget):
+    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+    monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
+    config = role_config(hybrid=True)
+
+    configure_recovery(config)
+
+    constructor.options.return_value.remote.assert_called_once_with(False, max_attempts=int(budget))
+
+
+@pytest.mark.parametrize("budget", ["-1", "1.5", "bad", ""])
+def test_invalid_recovery_budget_fails_before_creating_state(monkeypatch, constructor, budget):
+    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "1")
+    monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", budget)
+    config = role_config(hybrid=True)
+
+    with pytest.raises(ValueError, match="RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS must be a non-negative integer"):
+        configure_recovery(config)
+
+    constructor.options.assert_not_called()
+
+
+def test_disabled_recovery_ignores_budget_env(monkeypatch, constructor):
+    monkeypatch.setenv("RELAX_EXPERIMENTAL_ROLLOUT_RECOVERY", "0")
+    monkeypatch.setenv("RELAX_INFERENCE_RECOVERY_MAX_ATTEMPTS", "bad")
+
+    assert configure_recovery(role_config(hybrid=True)) is None
+    constructor.options.assert_not_called()
 
 
 @pytest.mark.parametrize("offload", ["offload_train", "offload_rollout"])
