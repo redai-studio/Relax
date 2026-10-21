@@ -575,7 +575,7 @@ Rollout 和 ActorFwd 的局部恢复、模式默认行为、环境变量及冲�
 |------|------|--------|------|
 | `--use-fault-tolerance` | flag | False | 是否启用 Rollout 期间的容错功能 |
 | `--use-health-check` | flag | False | 是否启用全局健康检查系统。Controller 的 HealthManager 监控所有服务，故障时触发自动重启 |
-| `--max-global-restart` | int | 3 | 允许的最大全局重启次数，包括健康检查触发及局部推理恢复升级的全局重启。超过后训练终止 |
+| `--max-global-restart` | int | 3 | 允许的最大全局重启次数。超过后训练终止。仅在 `--use-health-check` 启用时生效 |
 | `--rollout-health-check-interval` | float | 30.0 | Rollout 引擎健康检查间隔（秒） |
 | `--rollout-health-check-timeout` | float | 30.0 | Rollout 引擎健康检查超时时间（秒） |
 | `--rollout-health-check-first-wait` | float | 0 | 开始健康检查前的初始等待时间（秒）。使用 deepgemm 时需要增大此值 |
