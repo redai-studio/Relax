@@ -577,7 +577,7 @@ For local Rollout and ActorFwd recovery, including mode defaults, environment va
 |-----------|------|---------|-------------|
 | `--use-fault-tolerance` | flag | False | Whether to enable fault tolerance during Rollout |
 | `--use-health-check` | flag | False | Whether to enable global health check system. Controller's HealthManager monitors all services and triggers automatic restart on failure |
-| `--max-global-restart` | int | 3 | Maximum global restarts, including health-check restarts and escalation from local inference recovery. Training terminates after exceeding |
+| `--max-global-restart` | int | 3 | Maximum number of global restarts allowed. Training terminates after exceeding. Only effective when `--use-health-check` is enabled |
 | `--rollout-health-check-interval` | float | 30.0 | Rollout engine health check interval in seconds |
 | `--rollout-health-check-timeout` | float | 30.0 | Rollout engine health check timeout in seconds |
 | `--rollout-health-check-first-wait` | float | 0 | Initial wait time before starting health check in seconds. Increase this value when using deepgemm |

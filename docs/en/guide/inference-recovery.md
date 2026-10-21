@@ -1,5 +1,7 @@
 # Local Inference Recovery
 
+**Local recovery discards samples that have been read but not yet trained, as well as partially generated Rollout samples. Batches and policy versions may change after recovery, so this feature is intended for off-policy training and does not guarantee strict on-policy behavior. If your job is sensitive to on-policy behavior, do not enable recovery; explicitly set `RELAX_ENABLE_INFERENCE_RECOVERY=false` (or `0`).**
+
 Relax supports rebuilding a failed Rollout or standalone ActorFwd service after it raises an exception, then continuing training. During recovery, the framework pauses new data production and consumption, waits for old operations to finish, and synchronizes the original training Actor's current weights to the new instance. Successful local recovery preserves the training Actor, optimizer, and scheduler without a Controller global restart.
 
 This handles explicit exceptions that have returned, such as an HTTP error after request retries are exhausted. It adds no hang detection and does not make every inference failure locally recoverable. Unsafe recovery, recovery failure, or an exhausted budget falls back to the existing global restart path.
