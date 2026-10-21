@@ -325,7 +325,7 @@ async def test_supervisor_failure_requests_global_outside_async_loop():
     async def failed_response():
         raise ValueError("inference failed")
 
-    with pytest.raises(controller_module._GlobalRestartRequired) as raised:
+    with pytest.raises(controller_module.GlobalRestartRequired) as raised:
         await controller._supervise_inference("rollout", failed_response(), asyncio.Lock())
 
     assert raised.value.role == "rollout"
@@ -344,7 +344,7 @@ def test_training_loop_requests_global_after_service_wait_returns(monkeypatch):
         coroutine.close()
         stages.append("wait")
         if len(stages) == 1:
-            raise controller_module._GlobalRestartRequired("rollout", state)
+            raise controller_module.GlobalRestartRequired("rollout", state)
 
     def restart(role, *, expected_state):
         assert controller._training_wait_done.is_set()
