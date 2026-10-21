@@ -4808,8 +4808,8 @@ def _start_managed_pd_router(args, engine_groups: list[EngineGroup], *, force_ne
     return router_ip, router_port
 
 
-# Router processes launched via `_start_router`. Retained so
-# `Controller._global_restart` can terminate them before re-initializing —
+# Router processes launched via `_start_router`, tracked per calling process.
+# Retained so RolloutManager can terminate its Routers before re-initializing —
 # otherwise the daemon router survives with stale pre-restart engine URLs and
 # spams "Connection refused" health-check WARNs against dead ports forever.
 _LAUNCHED_ROUTER_PROCESSES: list[multiprocessing.Process] = []

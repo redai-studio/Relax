@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import faulthandler
 import multiprocessing as mp
-import os
-import socket
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -191,15 +189,9 @@ def test_adapter_transaction_requires_every_engine_layer_before_commit(monkeypat
         assert not any(event[0] == "commit" for event in events)
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _failure_worker_entry(
     rank: int,
-    port: int,
+    rendezvous: str,
     queue: Queue,
     ready: Event,
     start: Event,
@@ -215,13 +207,14 @@ def _failure_worker_entry(
         raise TimeoutError(f"rank {rank} did not receive the test start signal")
     faulthandler.dump_traceback_later(max(run_timeout - 5, run_timeout / 2))
     try:
-        worker(rank, port, *worker_args, queue)
+        worker(rank, rendezvous, *worker_args, queue)
     finally:
         faulthandler.cancel_dump_traceback_later()
 
 
 def _run_failure_workers(
     worker: Callable[..., None],
+    rendezvous: str,
     *worker_args: str,
     startup_timeout: float = 120,
     run_timeout: float = 20,
@@ -230,11 +223,10 @@ def _run_failure_workers(
     queue = ctx.Queue()
     start = ctx.Event()
     ready = [ctx.Event() for _ in range(2)]
-    port = _free_port()
     processes = [
         ctx.Process(
             target=_failure_worker_entry,
-            args=(rank, port, queue, ready[rank], start, worker, worker_args, startup_timeout, run_timeout),
+            args=(rank, rendezvous, queue, ready[rank], start, worker, worker_args, startup_timeout, run_timeout),
         )
         for rank in range(2)
     ]
@@ -281,10 +273,8 @@ def _run_failure_workers(
         queue.join_thread()
 
 
-def _serialization_failure_worker(rank: int, port: int, queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=10))
+def _serialization_failure_worker(rank: int, rendezvous: str, queue) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=10))
     from relax.utils import distributed_utils
 
     distributed_utils.GLOO_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=10))
@@ -300,15 +290,15 @@ def _serialization_failure_worker(rank: int, port: int, queue) -> None:
         dist.destroy_process_group()
 
 
-def test_non_src_serialization_failure_exits_all_ranks_without_hang():
-    results = _run_failure_workers(_serialization_failure_worker)
+def test_non_src_serialization_failure_exits_all_ranks_without_hang(tmp_path):
+    # A fresh file store avoids reserving and then releasing a TCP port before
+    # spawned workers finish importing their dependencies.
+    results = _run_failure_workers(_serialization_failure_worker, (tmp_path / "rendezvous").as_uri())
     assert all("injected serializer failure" in message for _, message in results)
 
 
-def _local_phase_failure_worker(rank: int, port: int, phase: str, queue) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=10))
+def _local_phase_failure_worker(rank: int, rendezvous: str, phase: str, queue) -> None:
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=10))
     from relax.utils import distributed_utils
 
     distributed_utils.GLOO_GROUP = dist.new_group(backend="gloo", timeout=timedelta(seconds=10))
@@ -342,6 +332,6 @@ def _local_phase_failure_worker(rank: int, port: int, phase: str, queue) -> None
 
 
 @pytest.mark.parametrize("phase, message", [("model_load", "model load failure"), ("tq_read", "TQ read failure")])
-def test_rank_local_precollective_failure_exits_all_ranks_without_hang(phase, message):
-    results = _run_failure_workers(_local_phase_failure_worker, phase)
+def test_rank_local_precollective_failure_exits_all_ranks_without_hang(phase, message, tmp_path):
+    results = _run_failure_workers(_local_phase_failure_worker, (tmp_path / "rendezvous").as_uri(), phase)
     assert all(message in result for _, result in results)
