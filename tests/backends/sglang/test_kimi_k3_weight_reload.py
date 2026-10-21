@@ -27,8 +27,17 @@ def _function(tree: ast.AST, name: str, namespace: dict):
 
 @pytest.fixture
 def hooks(kimi_source):
-    ns = {"torch": torch, "ReplicatedLinear": object, "RMSNorm": object}
+    ns = {
+        "torch": torch,
+        "nn": torch.nn,
+        "ReplicatedLinear": object,
+        "RMSNorm": object,
+        "_is_npu": False,
+        "_is_hip": False,
+    }
     _function(ast.parse(sglang_source_path("srt/layers/attn_residual.py").read_text()), "get_cw", ns)
+    if any(isinstance(node, ast.FunctionDef) and node.name == "_get_k3_dense_weight" for node in kimi_source.body):
+        _function(kimi_source, "_get_k3_dense_weight", ns)
     for name in ("PPMissingLayer", "KimiK3MoE", "KimiK3DeltaAttention"):
         ns[name] = type(name, (), {})
     return kimi_source, ns

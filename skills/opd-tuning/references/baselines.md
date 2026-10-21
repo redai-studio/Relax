@@ -7,7 +7,7 @@
 # 刷新：列出所有 OPD 脚本实际用的 teacher flag 与 env
 grep -rn -- "--teacher-sglang\|--teacher-num-gpus-per-engine\|--opd-teacher-routes\|--teacher-hf-checkpoint" \
   examples/on_policy_distillation/
-grep -rn "SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK\|SGLANG_LOGITS_PROCESSER_CHUNK_SIZE\|SGLANG_VLM_CACHE_SIZE_MB\|RELAX_PROPAGATE_ENV_VARS" \
+grep -rn "SGLANG_ENABLE_LOGPROB_CHUNK\|SGLANG_LOGPROB_CHUNK_SIZE\|SGLANG_VLM_CACHE_SIZE_MB\|RELAX_PROPAGATE_ENV_VARS" \
   examples/on_policy_distillation/
 # 拓扑：resource / rollout / teacher 三者
 grep -rn "RESOURCE_JSON=\|--resource\|ACTOR_GPUS=\|ROLLOUT_GPUS=\|TEACHER_GPUS=" \

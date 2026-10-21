@@ -1,6 +1,7 @@
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY
+# Keep CUDA 12 on SGLang v0.5.17; future SGLang upgrades belong in Dockerfile.cu13.
 ARG BASE_IMAGE=mirror.ccs.tencentyun.com/lmsysorg/sglang:v0.5.17-cu129
 ARG TRAIN_IMAGE=train
 FROM ${BASE_IMAGE} as base
@@ -190,8 +191,8 @@ RUN cd Megatron-LM && \
     apt update && apt install -y jq && ln -s /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu12.abi3.so \
     /usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload.abi3.so
 
-COPY docker/patch/${PATCH_VERSION}/sglang.patch /sgl-workspace/sglang/
-COPY docker/patch/latest/sglang_per_pos_topk.patch /sgl-workspace/sglang/
+COPY docker/patch/sglang/v0.5.17.patch /sgl-workspace/sglang/sglang.patch
+COPY docker/patch/sglang/v0.5.17_per_pos_topk.patch /sgl-workspace/sglang/sglang_per_pos_topk.patch
 RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     cd /sgl-workspace/sglang && git add . && \
     git update-index --refresh && \

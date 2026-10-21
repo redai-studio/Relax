@@ -34,10 +34,10 @@ because an external HTTP scorer cannot resolve process-local memory.
 
 For LoRA, Relax supports two rollout sync modes:
 
-| Mode    | Flag                  | Per-step sync                                           | SGLang requirement                 |
-| ------- | --------------------- | ------------------------------------------------------- | ---------------------------------- |
-| Merge   | `--lora-merge-mode`   | Full transformer, with `B @ A` folded into base weights | `docker/patch/latest/sglang.patch` |
-| Adapter | `--lora-adapter-mode` | Adapter tensors only                                    | `docker/patch/latest/sglang.patch` |
+| Mode    | Flag                  | Per-step sync                                           | SGLang requirement                  |
+| ------- | --------------------- | ------------------------------------------------------- | ----------------------------------- |
+| Merge   | `--lora-merge-mode`   | Full transformer, with `B @ A` folded into base weights | `docker/patch/sglang/v0.5.17.patch` |
+| Adapter | `--lora-adapter-mode` | Adapter tensors only                                    | `docker/patch/sglang/v0.5.17.patch` |
 
 Adapter mode is the default in `run-qwen-image-t2i-lora-8xgpu.sh` and is the
 validated Qwen-Image parity path. It sends only the trained LoRA adapter every
@@ -47,11 +47,13 @@ Set `ADAPTER_MODE=0` only when validating merge-mode sync itself.
 
 ## SGLang Patch Layout
 
-Relax uses one SGLang baseline and one combined SGLang patch:
+These diffusion examples use the SGLang v0.5.17 baseline and its combined patch:
 
-- `docker/Dockerfile` starts from `lmsysorg/sglang:v0.5.17-cu129`.
-- `docker/patch/latest/sglang.patch` points to the canonical patch for that image
-  (`docker/patch/sglang/v0.5.17.patch`).
+- `docker/Dockerfile` stays on the frozen CUDA 12 / SGLang v0.5.17 baseline
+  (`lmsysorg/sglang:v0.5.17-cu129`).
+- `docker/patch/sglang/v0.5.17.patch` is the canonical patch for that image.
+- `docker/patch/latest/sglang.patch` points to v0.5.21; use the explicit
+  versioned patch when working with this v0.5.17 baseline.
 - The same patch carries the standard text-RL SRT changes and the
   `multimodal_gen` diffusion deltas.
 
@@ -89,7 +91,7 @@ export SGLANG_SRC=/sgl-workspace/sglang
 
 cd "${SGLANG_SRC}"
 git checkout v0.5.17
-git apply "${RELAX}/docker/patch/latest/sglang.patch"
+git apply "${RELAX}/docker/patch/sglang/v0.5.17.patch"
 ```
 
 Verify the patched source tree:

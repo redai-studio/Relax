@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
-"""Keep or rebuild the bundled SGLang kernel with SM103 support."""
+"""Keep or rebuild the bundled SGLang kernel with SM103-compatible code."""
 
 import importlib.metadata as md
 import os
@@ -29,19 +29,23 @@ def main() -> None:
         return libs
 
     def has_sm103(libs: list[Path]) -> bool:
+        # Generic SM100 and family SM100f cubins also run on SM103. SM100a
+        # is architecture-specific and must not count as SM103 support.
         return any(
             re.search(
-                r"sm_103(?:a|f)?(?:[^0-9]|$)",
+                r"sm_(?:103[af]?|100f?)(?:[^0-9a-z]|$)",
                 subprocess.check_output(["/usr/local/cuda/bin/cuobjdump", "--list-elf", str(lib)], text=True),
             )
             for lib in libs
         )
 
     if has_sm103(common_ops()):
-        sys.stdout.write("sgl-kernel already carries SM103; keeping base build\n")
+        sys.stdout.write("sgl-kernel already carries SM103-compatible code; keeping base build\n")
     else:
         before = md.version("sglang-kernel")
-        source = Path("/sgl-workspace/sglang/sgl-kernel")
+        source = Path("/sgl-workspace/sglang/python/sglang/kernels/aot")
+        if not (source / "CMakeLists.txt").is_file():
+            source = Path("/sgl-workspace/sglang/sgl-kernel")
         cmake = source / "CMakeLists.txt"
         content = cmake.read_text()
         if "compute_103" not in content:

@@ -1,0 +1,190 @@
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -123,6 +123,8 @@
+                 vals.append([])
+                 idxs.append([])
+             else:
++                if token_ids and isinstance(token_ids[0], list):
++                    token_ids = token_ids[-1]
+                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                     logprobs.device, non_blocking=True
+                 )
+@@ -147,9 +149,15 @@
+             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                 logprobs.device, non_blocking=True
+             )
+-            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
++            if token_ids_tensor.ndim == 2:
++                assert token_ids_tensor.shape[0] == pruned_len
++                pos_logprobs = torch.gather(logprobs[pt : pt + pruned_len], 1, token_ids_tensor)
++                row_ids = token_ids
++            else:
++                pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
++                row_ids = [token_ids for _ in range(pruned_len)]
+             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
+-            idxs.append([token_ids for _ in range(pruned_len)])
++            idxs.append(row_ids)
+             pt += pruned_len
+     return vals, idxs
+ 
+@@ -279,14 +287,24 @@
+         # Get the token ids logprobs
+         val = []
+         idx = []
+-        for j in range(pruned_len):
+-            # Handle remaining tokens in next chunk if any
+-            if pt + j >= logprobs.shape[0]:
+-                next_split_pruned_len = split_pruned_len + j
+-                break
+-            if token_ids is not None:
+-                val.append(logprobs[pt + j, token_ids].tolist())
+-                idx.append(token_ids)
++        if token_ids and isinstance(token_ids[0], list):
++            assert len(token_ids) == pruned_len + split_pruned_len
++            take = min(pruned_len, max(logprobs.shape[0] - pt, 0))
++            idx = token_ids[split_pruned_len : split_pruned_len + take]
++            if take:
++                query = torch.tensor(idx, dtype=torch.long, device=logprobs.device)
++                val = torch.gather(logprobs[pt : pt + take], 1, query).tolist()
++            if take < pruned_len:
++                next_split_pruned_len = split_pruned_len + take
++        else:
++            for j in range(pruned_len):
++                # Handle remaining tokens in next chunk if any
++                if pt + j >= logprobs.shape[0]:
++                    next_split_pruned_len = split_pruned_len + j
++                    break
++                if token_ids is not None:
++                    val.append(logprobs[pt + j, token_ids].tolist())
++                    idx.append(token_ids)
+ 
+         # Split-sequence continuations extend; everyone else owns a fresh
+         # (possibly empty) entry.
+@@ -597,6 +615,9 @@
+         # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+         # indices = [[1, 3], [2], [0, 2, 4]]
+     """
++    # Prefill-only requests still score a final sampling position. Nested
++    # queries describe the prefill rows; only the final dummy row belongs here.
++    token_ids_logprobs = [ids[-1] if ids and isinstance(ids[0], list) else ids for ids in token_ids_logprobs]
+     batch_size = len(token_ids_logprobs)
+     device = logprobs.device
+ 
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -2517,7 +2517,24 @@
+ 
+         if self.return_logprob:
+             self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
++            self.token_ids_logprobs = []
++            for i, req in enumerate(reqs):
++                ids = req.logprob.token_ids_logprob
++                opd_k = (req.sampling_params.custom_params or {}).get("relax_opd_token_ids_logprob_k")
++                if opd_k is None:
++                    self.token_ids_logprobs.append(ids)
++                    continue
++                rows = req.extend_range.length - extend_logprob_start_lens[i]
++                if rows == 0:
++                    self.token_ids_logprobs.append([])
++                    continue
++                first = len(req.prefix_indices) + extend_logprob_start_lens[i] - req.logprob_start_len
++                assert 0 <= first and (first + rows) * opd_k <= len(ids)
++                # A nested query is unambiguously per-position, including K=1.
++                # Keep the complete request query intact for subsequent chunks.
++                self.token_ids_logprobs.append(
++                    [ids[j * opd_k : (j + 1) * opd_k] for j in range(first, first + rows)]
++                )
+ 
+         self.extend_logprob_start_lens = extend_logprob_start_lens
+         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1340,6 +1340,35 @@
+         sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
+ 
++        # Relax OPD queries K different token IDs at each prefill position.
++        # Validate after multimodal expansion and before scheduler admission.
++        opd_k = (sampling_params.custom_params or {}).get("relax_opd_token_ids_logprob_k")
++        if opd_k is not None:
++            if isinstance(opd_k, bool) or not isinstance(opd_k, int) or opd_k <= 0:
++                raise ValueError("relax_opd_token_ids_logprob_k must be a positive integer")
++            if (
++                not isinstance(obj, GenerateReqInput)
++                or not obj.return_logprob
++                or sampling_params.max_new_tokens != 0
++                or input_ids is None
++                or obj.logprob_start_len is None
++                or not 0 <= obj.logprob_start_len < len(input_ids)
++            ):
++                raise ValueError("Per-position OPD queries require prefill-only input logprobs with a valid start")
++            query_ids = obj.token_ids_logprob
++            expected = (len(input_ids) - obj.logprob_start_len) * opd_k
++            if (
++                not isinstance(query_ids, list)
++                or len(query_ids) != expected
++                or any(
++                    isinstance(token, bool)
++                    or not isinstance(token, int)
++                    or not 0 <= token < self.model_config.vocab_size
++                    for token in query_ids
++                )
++            ):
++                raise ValueError(f"Per-position OPD query must contain exactly {expected} valid token IDs")
++
+         # Build return object
+         if isinstance(obj, GenerateReqInput):
+             session_params = (
+@@ -2486,6 +2515,9 @@
+         token_ids_logprob: List[int],
+         return_text_in_logprobs: bool,
+     ):
++        if os.environ.get("RELAX_FORCE_LOGPROBS_BASE64", "0") == "1" and not return_text_in_logprobs:
++            self._add_relax_logprob_base64(meta_info, state, top_logprobs_num, token_ids_logprob)
++            return
+         # 1. Handle regular logprobs
+         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
+             state.input_token_logprobs.extend(
+@@ -2619,6 +2651,38 @@
+             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
+             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+ 
++    @staticmethod
++    def _add_relax_logprob_base64(meta_info, state, top_k, query_ids):
++        """Compact OPD transport, retaining IDs needed for alignment checks."""
++        def encode(values, dtype):
++            return pybase64.b64encode(np.asarray(values, dtype=dtype).tobytes()).decode("ascii")
++
++        def pack_rows(prefix, values, ids, length_suffix):
++            lengths = [len(row) if row else 0 for row in values]
++            flat_values = [value for row in values if row for value in row]
++            flat_ids = [token for row in ids if row for token in row]
++            meta_info[f"{prefix}_val_b64"] = encode(flat_values, "float32")
++            meta_info[f"{prefix}_idx_b64"] = encode(flat_ids, "int32")
++            meta_info[f"{prefix}_{length_suffix}"] = lengths
++
++        for side in ("input", "output"):
++            prefix = f"{side}_token_logprobs"
++            meta_info[f"{prefix}_val_b64"] = encode(getattr(state, f"{prefix}_val"), "float32")
++            meta_info[f"{prefix}_idx_b64"] = encode(getattr(state, f"{prefix}_idx"), "int32")
++            if top_k > 0:
++                prefix = f"{side}_top_logprobs"
++                if side == "input" and state.input_top_logprobs_scheduler_flat is not None:
++                    values, ids, null_prefix = state.input_top_logprobs_scheduler_flat
++                    meta_info[f"{prefix}_val_b64"] = encode(values, "float32")
++                    meta_info[f"{prefix}_idx_b64"] = encode(ids, "int32")
++                    meta_info[f"{prefix}_k"] = [0] * null_prefix + [top_k] * len(values)
++                else:
++                    pack_rows(prefix, getattr(state, f"{prefix}_val"), getattr(state, f"{prefix}_idx"), "k")
++            if query_ids is not None:
++                prefix = f"{side}_token_ids_logprobs"
++                pack_rows(prefix, getattr(state, f"{prefix}_val"), getattr(state, f"{prefix}_idx"), "len")
++        meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs_val)
++
+     def convert_logprob_style(
+         self,
+         meta_info: dict,

@@ -31,11 +31,11 @@ export SGLANG_MM_AVOID_RETOKENIZE=true
 # N reaches tens of thousands, i.e. an 8-16 GiB single allocation -- exactly where
 # the teacher OOM'd. Enabling this routes through
 # process_input_logprobs_by_chunk(), capping the peak at
-# SGLANG_LOGITS_PROCESSER_CHUNK_SIZE (default 2048, ~1 GiB at TP=2) and thereby
+# SGLANG_LOGPROB_CHUNK_SIZE (default 2048, ~1 GiB at TP=2) and thereby
 # decoupling logits memory from the prefill chunk size.
-export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
-export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
-export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}SGLANG_MM_AVOID_RETOKENIZE,SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK,SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
+export SGLANG_ENABLE_LOGPROB_CHUNK=1
+export SGLANG_LOGPROB_CHUNK_SIZE=8192
+export RELAX_PROPAGATE_ENV_VARS="${RELAX_PROPAGATE_ENV_VARS:+${RELAX_PROPAGATE_ENV_VARS},}SGLANG_MM_AVOID_RETOKENIZE,SGLANG_ENABLE_LOGPROB_CHUNK,SGLANG_LOGPROB_CHUNK_SIZE"
 
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 
@@ -121,7 +121,7 @@ OPD_ARGS=(
    # out immediately. 4096 is too small -- ~11 passes per request, each too small
    # a matmul for a 9B. 16384 is merely the max_prefill_tokens default; raising
    # both to 32768 cuts it to ~2 passes. This relies on
-   # SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK above having decoupled the logits peak
+   # SGLANG_ENABLE_LOGPROB_CHUNK above having decoupled the logits peak
    # from the chunk size.
    --teacher-sglang-chunked-prefill-size "${TEACHER_CHUNKED_PREFILL_SIZE:-32768}"
    --teacher-sglang-max-prefill-tokens "${TEACHER_MAX_PREFILL_TOKENS:-32768}"

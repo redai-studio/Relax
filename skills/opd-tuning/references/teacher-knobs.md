@@ -121,7 +121,7 @@ teacher 请求是 `max_new_tokens=0` 的**纯 prefill**
 
 ## R-T03 — logits chunking 没开
 
-- **Trigger**：脚本 env 块里没有 `SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1`，
+- **Trigger**：脚本 env 块里没有 `SGLANG_ENABLE_LOGPROB_CHUNK=1`，
   **且** 计划把 chunk 拉到让 R-T02 的峰值超出预算
 - **Why**：它把 R-T02 的一次性 materialize 换成分块处理
   （sglang `srt/layers/logits_processor.py` 的 `process_input_logprobs_by_chunk`），
@@ -130,8 +130,8 @@ teacher 请求是 `max_new_tokens=0` 的**纯 prefill**
 - **Fix**：
 
   ```bash
-  export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=1
-  export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=8192
+  export SGLANG_ENABLE_LOGPROB_CHUNK=1
+  export SGLANG_LOGPROB_CHUNK_SIZE=8192
   ```
 
   ⚠ **拼写是 `PROCESSER` 不是 `PROCESSOR`**（sglang 上游拼错了；写对反而无效）。
