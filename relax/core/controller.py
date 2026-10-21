@@ -1365,6 +1365,11 @@ class Controller:
 
     async def _prepare_inference_recovery(self, role: str, state: Any) -> int:
         self._check_inference_recovery(state)
+        rollout = self.serve_dict[ROLES.rollout]
+        # Admission is paused and generation drained, but its final loop tail
+        # may still exit. Do not discard data whose producer cannot resume.
+        if str(role) == "actor_fwd" and await rollout.get_step() >= self.config.num_rollout - 1:
+            raise RuntimeError("Rollout reached its final generation; require global restart")
         actor = self.serve_dict[ROLES.actor]
         step = await actor.get_step()
         client = tq.get_client()
@@ -1375,7 +1380,6 @@ class Controller:
             if partition_id.startswith("train_") and int(partition_id.rsplit("_", 1)[1]) >= step:
                 meta = await client._get_partition_meta(partition_id)
                 await strict_clear_partition(client, partition_id, list(meta.global_indexes))
-        rollout = self.serve_dict[ROLES.rollout]
         await rollout.data_source.discard_pending.remote()
         manager = await rollout.get_rollout_manager()
         await manager.reset_data_window.remote()
