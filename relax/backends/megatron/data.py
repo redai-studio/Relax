@@ -1521,18 +1521,11 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
 
 
 def log_perf_data_fwd(args, rollout_id):
-    from megatron.core import mpu
-
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
     timer_instance.reset()
-    is_primary_rank = (
-        mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.is_pipeline_last_stage()
-        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-    )
 
-    if not is_primary_rank:
+    if not train_metric_utils.is_metrics_primary_rank():
         return
 
     log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
@@ -1541,17 +1534,19 @@ def log_perf_data_fwd(args, rollout_id):
     tracking_utils.log(args, log_dict, step_key="actor_fwd/step")
 
 
-def log_perf_data(rollout_id: int, args: Namespace, flops_counter: FlopsCounter | None = None) -> None:
+def log_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    flops_counter: FlopsCounter | None = None,
+    extra_metrics: dict[str, float] | None = None,
+) -> None:
     train_metric_utils.log_perf_data_raw(
         rollout_id=rollout_id,
         args=args,
-        is_primary_rank=(
-            mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.is_pipeline_last_stage()
-            and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-        ),
+        is_primary_rank=train_metric_utils.is_metrics_primary_rank(),
         flops_counter=flops_counter,
         world_size=dist.get_world_size(),
+        extra_metrics=extra_metrics,
     )
 
 
