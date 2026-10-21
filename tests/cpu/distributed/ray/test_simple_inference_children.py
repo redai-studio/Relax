@@ -162,6 +162,54 @@ def test_cancelled_generate_await_does_not_claim_thread_idle():
     assert not manager._recovery_generate_active
 
 
+@pytest.mark.parametrize("node_rank", [0, 1])
+def test_server_launch_preserves_process_handle_for_recovery(monkeypatch, node_rank):
+    path = Path(__file__).parents[3] / "relax/backends/sglang/sglang_engine.py"
+    launch = next(
+        node for node in ast.parse(path.read_text()).body if getattr(node, "name", None) == "launch_server_process"
+    )
+    process = Mock(pid=100)
+    health_check = Mock()
+    namespace = {
+        "ServerArgs": SimpleNamespace,
+        "multiprocessing": SimpleNamespace(Process=Mock(return_value=process), set_start_method=Mock()),
+        "Envs": SimpleNamespace(
+            RELAX_OPTIMIZE_ROUTING_REPLAY=False, RELAX_OPD_PREEXPANDED_PATCH=False, RELAX_OPD_PER_POS_TOKEN_IDS=False
+        ),
+        "logger": Mock(),
+        "_launch_server_with_patches": Mock(),
+        "_wait_server_healthy": health_check,
+    }
+    exec(compile(ast.Module(body=[launch], type_ignores=[]), str(path), "exec"), namespace)
+    args = SimpleNamespace(node_rank=node_rank, url=Mock(return_value="http://engine"), api_key=None)
+    handle = namespace["launch_server_process"](args)
+    assert handle is process
+    process.start.assert_called_once_with()
+    assert health_check.call_count == (node_rank == 0)
+
+    shutdown = _method("relax/backends/sglang/sglang_engine.py", "SGLangEngine", "shutdown")
+    kill = Mock()
+    shutdown.__globals__.update(logger=Mock(), kill_process_tree=kill)
+    engine = SimpleNamespace(
+        args=SimpleNamespace(rollout_external=False),
+        process=handle,
+        server_host="engine",
+        server_port=1,
+        unregister_from_router=Mock(),
+    )
+    engine.shutdown = lambda: shutdown(engine)
+    root, child = Mock(), Mock()
+    root.children.return_value = [child]
+    wait = Mock(return_value=([root, child], []))
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=Mock(return_value=root), wait_procs=wait))
+
+    _method("relax/backends/sglang/sglang_engine.py", "SGLangEngine", "shutdown_for_recovery")(engine, timeout=7)
+
+    engine.unregister_from_router.assert_called_once_with()
+    kill.assert_called_once_with(process.pid)
+    wait.assert_called_once_with([root, child], timeout=7)
+
+
 def test_engine_shutdown_confirms_entire_captured_process_tree(monkeypatch):
     import psutil
 
