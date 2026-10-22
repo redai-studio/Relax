@@ -1,5 +1,5 @@
 diff --git a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py b/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
-index c99622e3..7a6093c2 100644
+index c99622e3578fdd2cab3f0c3605d458f50d7bc120..7a6093c2f2b8e5435b09bb2ebce7cfda7e1936ef 100644
 --- a/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
 +++ b/python/sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py
 @@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
@@ -79,7 +79,7 @@ index c99622e3..7a6093c2 100644
          return tokenizer(prompts, **tok_kwargs)
  
 diff --git a/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py b/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
-index 57c08888..e4389d38 100644
+index 57c088883a30d74e92053fd242ef876130b6cbfb..e4389d384fbf23866c829e31ac9e5d177feb69b0 100644
 --- a/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
 +++ b/python/sglang/multimodal_gen/configs/post_training/rl_rollout.py
 @@ -11,7 +11,7 @@ from typing import Any, Callable
@@ -92,7 +92,7 @@ index 57c08888..e4389d38 100644
  
  @dataclass
 diff --git a/python/sglang/multimodal_gen/configs/sample/sampling_params.py b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
-index 01dc5a9c..4aa1dfe9 100644
+index 01dc5a9c99de4e40c06c58f28a69d7d887d43f2a..4aa1dfe96fd1d45bfc3074355aa7fa43a3a51e1a 100644
 --- a/python/sglang/multimodal_gen/configs/sample/sampling_params.py
 +++ b/python/sglang/multimodal_gen/configs/sample/sampling_params.py
 @@ -362,6 +362,16 @@ class SamplingParams:
@@ -113,7 +113,7 @@ index 01dc5a9c..4aa1dfe9 100644
      no_override_protected_fields: bool = field(
          default=False, metadata={"batch_sig_exclude": True}
 diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
-index b558be3e..47c1594e 100644
+index b558be3e4a218c16cb1e51d3fd8fba577cf4019c..47c1594e638e7fb98846bf3cab06a052c03cc30d 100644
 --- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
 +++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/io_struct.py
 @@ -39,6 +39,17 @@ class UpdateWeightFromTensorCheckerReqInput:
@@ -135,7 +135,7 @@ index b558be3e..47c1594e 100644
  class GetWeightsChecksumReqInput:
      """Compute SHA-256 checksum of loaded module weights for verification."""
 diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
-index 2e9a0956..b1dcf19f 100644
+index 2e9a0956998e9501badd2e983a42973d0a99584d..b1dcf19fdf57bb1ec53a01809f8023122a15f32f 100644
 --- a/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
 +++ b/python/sglang/multimodal_gen/runtime/entrypoints/post_training/weights_api.py
 @@ -6,6 +6,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -199,7 +199,7 @@ index 2e9a0956..b1dcf19f 100644
  async def get_weights_checksum(request: Request):
      """Return SHA-256 checksum of each requested module's weights."""
 diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/utils.py b/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
-index 5ef6f609..5ded0a3c 100644
+index 5ef6f60960ebb77ccaf9496a6f94e9e0d5e81694..5ded0a3ce065b88ca9138b3fc8065433e342b11c 100644
 --- a/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
 +++ b/python/sglang/multimodal_gen/runtime/entrypoints/utils.py
 @@ -777,6 +777,19 @@ def prepare_request(
@@ -223,7 +223,7 @@ index 5ef6f609..5ded0a3c 100644
          req.max_sequence_length = sampling_params.max_sequence_length
  
 diff --git a/python/sglang/multimodal_gen/runtime/managers/scheduler.py b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
-index f2eb77b0..3b87319a 100644
+index f2eb77b07cb448e6b2bf4dbf63039b4f1cf0b5d3..3b87319a856cf54a2a35124615588cbc9839da66 100644
 --- a/python/sglang/multimodal_gen/runtime/managers/scheduler.py
 +++ b/python/sglang/multimodal_gen/runtime/managers/scheduler.py
 @@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -243,7 +243,7 @@ index f2eb77b0..3b87319a 100644
              UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
              UpdateWeightFromTensorCheckerReqInput: (
 diff --git a/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py b/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
-index e38d4d79..4d66b3ab 100644
+index e38d4d792eb5c2fa6babf117ae2ca514662393eb..4d66b3ab35734e53a829e3d6116ec8696c021432 100644
 --- a/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
 +++ b/python/sglang/multimodal_gen/runtime/models/schedulers/scheduling_flow_match_euler_discrete.py
 @@ -350,21 +350,23 @@ class FlowMatchEulerDiscreteScheduler(
@@ -285,7 +285,7 @@ index e38d4d79..4d66b3ab 100644
          # 4. If required, convert sigmas to one of karras, exponential, or beta sigma schedules
          if self.config.use_karras_sigmas:
 diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/lora/pipeline.py b/python/sglang/multimodal_gen/runtime/pipelines_core/lora/pipeline.py
-index 9a12ef07..5d43d31e 100644
+index 9a12ef0799e7e587050f48294a7953c3dcc5e72b..5d43d31e850353f9eb1554a464b5dce64f924be1 100644
 --- a/python/sglang/multimodal_gen/runtime/pipelines_core/lora/pipeline.py
 +++ b/python/sglang/multimodal_gen/runtime/pipelines_core/lora/pipeline.py
 @@ -976,6 +976,21 @@ class LoRAPipeline(ComposedPipelineBase):
@@ -401,7 +401,7 @@ index 9a12ef07..5d43d31e 100644
      def _invalidate_lora_conditioning(self):
          # LoRA targets DiTs; unrelated text and VAE weights remain unchanged
 diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
-index bd6a0886..7250c218 100644
+index bd6a0886ce2f051de1b71d4637250dacc75d8c69..7250c21817f2d2775a0aea4d3f44cff403769981 100644
 --- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
 +++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py
 @@ -6,6 +6,7 @@ Denoising stage for diffusion pipelines.
@@ -460,7 +460,7 @@ index bd6a0886..7250c218 100644
          latent_model_input = ctx.latents.to(ctx.target_dtype)
          if batch.image_latent is not None:
 diff --git a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
-index 6664bf01..665c7702 100644
+index 6664bf01a5f4dbaf1eef7618ec456eec385ae5a1..665c7702e928d012ae8b9ad80c757ac032e216f5 100644
 --- a/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
 +++ b/python/sglang/multimodal_gen/runtime/pipelines_core/stages/latent_preparation.py
 @@ -5,6 +5,7 @@
@@ -556,7 +556,7 @@ index 6664bf01..665c7702 100644
                  for index, batch in indexed_batches:
                      results[index] = self(batch, server_args)
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
-index e93cb3ae..883a1a34 100644
+index e93cb3ae7f191106d0cb50bf86f8d918a0b76152..883a1a345f5cd61e6e2e17c5b655cc7b9f262962 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
 +++ b/python/sglang/multimodal_gen/runtime/post_training/gpu_worker_post_training_mixin.py
 @@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_ch
@@ -658,7 +658,7 @@ index e93cb3ae..883a1a34 100644
      def _select_own_gpu_payload(
          self,
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
-index 025643b0..8dfe997d 100644
+index 025643b09cc08dcc6db6d08a9f46dbcb436929ed..8dfe997d3198e2968569b8f6e3daa0925e76db69 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
 +++ b/python/sglang/multimodal_gen/runtime/post_training/scheduler_post_training_mixin.py
 @@ -6,6 +6,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
@@ -673,7 +673,7 @@ index 025643b0..8dfe997d 100644
          req = reqs[0]
          success, message = self.worker.update_weights_from_disk(
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py b/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
-index aa52a25e..a157de70 100644
+index aa52a25e65423fbda69e2cd1303f0b7b883e02ea..a157de7095fda7ba85ce7a9e7b8d8e5c725a3f49 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
 +++ b/python/sglang/multimodal_gen/runtime/post_training/scheduler_rl_mixin.py
 @@ -1,7 +1,9 @@
@@ -793,7 +793,7 @@ index aa52a25e..a157de70 100644
              raise ValueError(f"Unsupported sde_type: {sde_type}")
  
 diff --git a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
-index e6ef5094..33be05fb 100644
+index e6ef5094ce199943c94b4324fee0b0a760886117..33be05fb3b0e7ac642dad328f46dc960b760994b 100644
 --- a/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
 +++ b/python/sglang/multimodal_gen/runtime/post_training/weights_updater.py
 @@ -545,6 +545,13 @@ class WeightsUpdater:
@@ -811,7 +811,7 @@ index e6ef5094..33be05fb 100644
              target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
          try:
 diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
-index 21afe7f0..e73fce32 100644
+index 21afe7f02b3c5de7263a9d747706312f3bee998f..e73fce329abab330a5d3ca08e2d9b40501f41b0e 100644
 --- a/python/sglang/srt/arg_groups/fields/exec_.py
 +++ b/python/sglang/srt/arg_groups/fields/exec_.py
 @@ -211,6 +211,7 @@ class ExecKernel(msgspec.Struct):
@@ -892,7 +892,7 @@ index 21afe7f0..e73fce32 100644
      disable_prefill_cuda_graph: A[
          bool,
 diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
-index b7d31afa..511e6dea 100644
+index b7d31afaef777fc70a0672fbada11d7d1232fde4..511e6dea9658a90ca890a2564711857ad2cbafa8 100644
 --- a/python/sglang/srt/configs/model_config.py
 +++ b/python/sglang/srt/configs/model_config.py
 @@ -427,7 +427,10 @@ def get_num_indexer_layers(config) -> int:
@@ -908,7 +908,7 @@ index b7d31afa..511e6dea 100644
  
  
 diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
-index 2ee23a97..62f167bb 100644
+index 2ee23a9730112bc93d8d69511ea5b09d0e6a2303..62f167bbafd453f39e28d49fa6b18e50c75419ac 100644
 --- a/python/sglang/srt/disaggregation/decode.py
 +++ b/python/sglang/srt/disaggregation/decode.py
 @@ -22,6 +22,7 @@ from __future__ import annotations
@@ -1011,7 +1011,7 @@ index 2ee23a97..62f167bb 100644
              return
  
 diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
-index 0f0edd88..f1c34629 100644
+index 0f0edd888b7073fa49c4c77c4a1adfd70e583950..f1c34629114143780cee6372dc25dc91f6d74308 100644
 --- a/python/sglang/srt/disaggregation/mooncake/conn.py
 +++ b/python/sglang/srt/disaggregation/mooncake/conn.py
 @@ -1491,7 +1491,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
@@ -1037,7 +1037,7 @@ index 0f0edd88..f1c34629 100644
                                  bootstrap_room=kv_chunk.room,
                                  failure_reason=(
 diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
-index 37c67327..805e36e9 100644
+index 37c6732744d876e3b6a79aac8f534b1b8f7c6dce..805e36e99f50bb9b5116e74857afcec42bf736fa 100644
 --- a/python/sglang/srt/distributed/parallel_state.py
 +++ b/python/sglang/srt/distributed/parallel_state.py
 @@ -1286,7 +1286,16 @@ class GroupCoordinator:
@@ -1059,7 +1059,7 @@ index 37c67327..805e36e9 100644
  
      def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
-index 4df81823..57eaa1a5 100644
+index 4df81823346ead476b9e6c3512951498981d610b..57eaa1a55bd963b459ee614c25d376e075fbdbf3 100644
 --- a/python/sglang/srt/entrypoints/engine.py
 +++ b/python/sglang/srt/entrypoints/engine.py
 @@ -81,6 +81,7 @@ from sglang.srt.managers.io_struct import (
@@ -1137,10 +1137,10 @@ index 4df81823..57eaa1a5 100644
          """Load a new LoRA adapter without re-launching the engine."""
  
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 3258cfb9..d0e6c690 100644
+index 3258cfb9e9746daf86cb886c445e1d015fe2526d..ebaf3862fc274d395b523db67282405c77aebd8b 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
+@@ -141,6 +141,7 @@
      ParseFunctionCallReq,
      PauseGenerationReqInput,
      PdRoleSwitchReqInput,
@@ -1148,7 +1148,7 @@ index 3258cfb9..d0e6c690 100644
      ProfileReq,
      ReleaseMemoryOccupationReqInput,
      ResumeMemoryOccupationReqInput,
-@@ -149,6 +150,7 @@ from sglang.srt.managers.io_struct import (
+@@ -149,6 +150,7 @@
      SetInternalStateReq,
      SlowDownReqInput,
      UnloadLoRAAdapterReqInput,
@@ -1156,7 +1156,7 @@ index 3258cfb9..d0e6c690 100644
      UpdateWeightFromDiskReqInput,
      UpdateWeightsFromDistributedReqInput,
      UpdateWeightsFromIPCReqInput,
-@@ -828,6 +830,14 @@ async def model_info():
+@@ -828,6 +830,14 @@
      return msgspec_to_builtins(result)
  
  
@@ -1171,7 +1171,7 @@ index 3258cfb9..d0e6c690 100644
  @app.get("/get_server_info")
  async def get_server_info():
      """Get the server information (deprecated - use /server_info instead)."""
-@@ -851,9 +861,18 @@ async def server_info():
+@@ -851,9 +861,18 @@
      HiCache mirror by `GET /hicache/storage-backend`.
      """
      # Returns internal states per DP.
@@ -1193,7 +1193,7 @@ index 3258cfb9..d0e6c690 100644
  
      server_args = _global_state.tokenizer_manager.server_args
  
-@@ -1466,6 +1485,22 @@ async def update_weights_from_ipc(
+@@ -1466,6 +1485,22 @@
          return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
  
  
@@ -1216,10 +1216,16 @@ index 3258cfb9..d0e6c690 100644
  @app.post("/update_weight_version")
  @auth_level(AuthLevel.ADMIN_OPTIONAL)
  async def update_weight_version(
-@@ -1614,6 +1649,19 @@ async def load_lora_adapter_from_tensors(
-     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
- 
- 
+@@ -1608,6 +1643,19 @@
+ ):
+     """Load a new LoRA adapter from tensors without re-launching the server."""
+     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
++        obj, request
++    )
++    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
++    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
++
++
 +@app.api_route("/update_lora_from_distributed", methods=["POST"])
 +@auth_level(AuthLevel.ADMIN_OPTIONAL)
 +async def update_lora_from_distributed(
@@ -1227,17 +1233,23 @@ index 3258cfb9..d0e6c690 100644
 +):
 +    """Load/refresh a LoRA adapter whose tensors arrive over an NCCL group."""
 +    result = await _global_state.tokenizer_manager.update_lora_from_distributed(
-+        obj, request
-+    )
-+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
-+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
-+
-+
- @app.api_route("/unload_lora_adapter", methods=["POST"])
- @auth_level(AuthLevel.ADMIN_OPTIONAL)
- async def unload_lora_adapter(
+         obj, request
+     )
+     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+@@ -2470,7 +2518,10 @@
+     else:
+         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+ 
+-    _freeze_gc_after_server_warmup(server_args)
++    # Relax loads and warms colocated engines after startup. Preserve the
++    # skipped-warmup path without freezing GC before HTTP is listening.
++    if not get_serving().skip_server_warmup:
++        _freeze_gc_after_server_warmup(server_args)
+ 
+     # The server is ready for requests
+     logger.info("The server is fired up and ready to roll!")
 diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
-index f4e23f74..6c259b5b 100644
+index f4e23f74b6a7b3305ddca22eaccbe91143a8c31d..6c259b5bb5576f48fcd89604e80adada299a9ab6 100644
 --- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
 +++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
 @@ -2,6 +2,7 @@ from __future__ import annotations
@@ -1317,7 +1329,7 @@ index f4e23f74..6c259b5b 100644
              if enable_dual_stream:
                  current_stream = torch.cuda.current_stream()
 diff --git a/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py b/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
-index 92a661a1..8b728b78 100644
+index 92a661a186bfa7fdf3dcdeb74d4267caef73a3d8..8b728b785cbcd8844e7a2a38b5be825e83d2de51 100644
 --- a/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
 +++ b/python/sglang/srt/layers/attention/dsa/dsa_prefill_cuda_graph.py
 @@ -3,6 +3,7 @@ from __future__ import annotations
@@ -1346,7 +1358,7 @@ index 92a661a1..8b728b78 100644
          return weights
  
 diff --git a/python/sglang/srt/layers/attention/dsa/utils.py b/python/sglang/srt/layers/attention/dsa/utils.py
-index 2ae70ec7..979e011d 100644
+index 2ae70ec78e58f492da1e3749da8f5e02396d3891..979e011dcdbf71eb410da3dbad328be118c6852a 100644
 --- a/python/sglang/srt/layers/attention/dsa/utils.py
 +++ b/python/sglang/srt/layers/attention/dsa/utils.py
 @@ -22,6 +22,16 @@ from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
@@ -1367,7 +1379,7 @@ index 2ae70ec7..979e011d 100644
  def aiter_can_use_preshuffle_paged_mqa() -> bool:
      """Whether aiter's preshuffle paged MQA / cache kernels can be used on this runtime.
 diff --git a/python/sglang/srt/layers/dp_attention.py b/python/sglang/srt/layers/dp_attention.py
-index bf6c1e8f..630898f6 100644
+index bf6c1e8f67431f80fd69a7cc180e1fc25eafb1dc..630898f69a09069943133111779876a42f7e39e6 100644
 --- a/python/sglang/srt/layers/dp_attention.py
 +++ b/python/sglang/srt/layers/dp_attention.py
 @@ -1017,16 +1017,30 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -1410,7 +1422,7 @@ index bf6c1e8f..630898f6 100644
  
  # ---------------------------------------------------------------------------
 diff --git a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py b/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
-index 5895f2c7..506c1226 100644
+index 5895f2c786dc749dfaf0318a8cb7818291a12b75..506c12260e0716328343549d72521a0499c86c7e 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
 +++ b/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
 @@ -1524,6 +1524,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
@@ -1471,7 +1483,7 @@ index 5895f2c7..506c1226 100644
      return StandardCombineInput(hidden_states=final_hidden_states)
  
 diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
-index e1214b46..2ce48da3 100644
+index e1214b466e04e47678780d82d751c26de789eea1..2ce48da3e31853f79361246c273bb006e8592832 100644
 --- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
 +++ b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
 @@ -1205,6 +1205,10 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
@@ -1496,7 +1508,7 @@ index e1214b46..2ce48da3 100644
      def create_weights(
          self,
 diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
-index c29e01ef..1e3409a0 100644
+index c29e01efecba033ae8a5bd67b90bdccaaace93a4..1e3409a07956d62bd415b910065db9b8437979a3 100644
 --- a/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
 +++ b/python/sglang/srt/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxint4_moe.py
 @@ -15,7 +15,6 @@ from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backen
@@ -1685,7 +1697,7 @@ index c29e01ef..1e3409a0 100644
  
          return StandardCombineInput(hidden_states=symm_output)
 diff --git a/python/sglang/srt/layers/quantization/mxfp4.py b/python/sglang/srt/layers/quantization/mxfp4.py
-index 1d25a81f..5f3470ac 100644
+index 1d25a81febc6dc550df4c7716090c3b4ea94f84f..5f3470acaac8d019019c2c4e1f2d0dad91dd3c17 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4.py
 @@ -618,7 +618,133 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -1823,7 +1835,7 @@ index 1d25a81f..5f3470ac 100644
              from sglang.srt.layers.quantization.marlin_utils import (
                  check_moe_marlin_supports_layer,
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
-index 8edd7e72..5ffab8f8 100644
+index 8edd7e72405ffd06f26a49b82949367a72d1334d..5ffab8f8751e3c82105d4016ca29b99324000d78 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
 +++ b/python/sglang/srt/layers/quantization/unquant.py
 @@ -851,6 +851,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
@@ -1853,7 +1865,7 @@ index 8edd7e72..5ffab8f8 100644
      def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
          # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
 diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
-index 6ce0205d..e5cbbd32 100644
+index 6ce0205d4c9e471ed2d0e0bb09683a791d718554..e5cbbd3263d37c64ff9d0bbc847de2d9a811b9bb 100644
 --- a/python/sglang/srt/lora/layers.py
 +++ b/python/sglang/srt/lora/layers.py
 @@ -986,6 +986,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
@@ -1878,7 +1890,7 @@ index 6ce0205d..e5cbbd32 100644
  
          self.experts_shared_outer_loras: bool = False
 diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
-index 9629b7aa..d1f593a4 100644
+index 9629b7aab6219c21f330937a1657f836e675ee9d..d1f593a433913faf3719b3486b049394b655f8b5 100644
 --- a/python/sglang/srt/managers/io_struct.py
 +++ b/python/sglang/srt/managers/io_struct.py
 @@ -22,6 +22,7 @@ instead, such as sglang.srt.utils.common.
@@ -1995,7 +2007,7 @@ index 9629b7aa..d1f593a4 100644
      success: bool
  
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 52c72a0e..4c24d88f 100755
+index 52c72a0e24b2658576e3a3cb786ec1d52a4a55c7..4c24d88f776a27c2093ede47b22981f45631abb8 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -1175,6 +1175,7 @@ class Req(ReqDllmMixin):
@@ -2015,7 +2027,7 @@ index 52c72a0e..4c24d88f 100755
          self.kv_rotation_base = None
          self.num_matched_prefix_tokens = 0
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index a7d8baee..a76ed6a3 100644
+index a7d8baeecc37b09a6d09ffb0493526b993f3ac43..a76ed6a333b73c546130472ca742e85390c57fe1 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -162,6 +162,7 @@ from sglang.srt.managers.io_struct import (
@@ -2091,7 +2103,7 @@ index a7d8baee..a76ed6a3 100644
          self, recv_req: UnloadLoRAAdapterReqInput
      ) -> UnloadLoRAAdapterReqOutput:
 diff --git a/python/sglang/srt/managers/scheduler_components/profiler_manager.py b/python/sglang/srt/managers/scheduler_components/profiler_manager.py
-index 2791c3a4..3bb77b04 100644
+index 2791c3a4b4ab7814f4e5be3509dd8a13475b82e3..3bb77b04df94fed5b16b9e18f9d85f09131881c8 100644
 --- a/python/sglang/srt/managers/scheduler_components/profiler_manager.py
 +++ b/python/sglang/srt/managers/scheduler_components/profiler_manager.py
 @@ -419,7 +419,7 @@ class SchedulerProfilerManager:
@@ -2104,7 +2116,7 @@ index 2791c3a4..3bb77b04 100644
                      if self.profile_in_progress:
                          # force trace flush (a prefill capture must not absorb decode steps)
 diff --git a/python/sglang/srt/managers/scheduler_components/weight_updater.py b/python/sglang/srt/managers/scheduler_components/weight_updater.py
-index d9a11737..7d482976 100644
+index d9a11737328e0a757e85f21581823d235d33035c..7d4829769569bbf563856f5d2d0d01c6f2eb80bb 100644
 --- a/python/sglang/srt/managers/scheduler_components/weight_updater.py
 +++ b/python/sglang/srt/managers/scheduler_components/weight_updater.py
 @@ -31,6 +31,8 @@ from sglang.srt.managers.io_struct import (
@@ -2234,7 +2246,7 @@ index d9a11737..7d482976 100644
          scheduler = self.scheduler
          assert self.is_fully_idle(
 diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
-index f5051295..3033f528 100644
+index f5051295bd33862aa5e9651634d32f9b98bb04cd..3033f52867428644970ce7d8d21236d5bede00a9 100644
 --- a/python/sglang/srt/managers/tokenizer_control_mixin.py
 +++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
 @@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
@@ -2385,7 +2397,7 @@ index f5051295..3033f528 100644
          self: TokenizerManager,
          obj: CheckWeightsReqInput,
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index eb74ca02..f4407df8 100644
+index eb74ca0223168cf4a1c69a61f8c40f2610ec7f89..f4407df8007e0d606e26bd5e300d74f3f3996fef 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -3043,27 +3043,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -2426,7 +2438,7 @@ index eb74ca02..f4407df8 100644
          if state.finished:
              # Get detailed cache breakdown if available
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
-index 6adfbe04..61684681 100644
+index 6adfbe0437929d767cf4c53a722dcd337bf48a0f..61684681dc39c51f06da049904653411ce19137a 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
 @@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
@@ -2477,7 +2489,7 @@ index 6adfbe04..61684681 100644
          forward_batch = ForwardBatch.init_new(
              batch,
 diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
-index aa8a3b44..415bcf97 100644
+index aa8a3b44bf0ff24b52779dc107a58dae897bc209..415bcf97e5745b623d94e706389c9ea849111f92 100644
 --- a/python/sglang/srt/mem_cache/memory_pool.py
 +++ b/python/sglang/srt/mem_cache/memory_pool.py
 @@ -4996,9 +4996,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
@@ -2497,7 +2509,7 @@ index aa8a3b44..415bcf97 100644
              self._compress_tail_k: Optional[List[torch.Tensor]] = [
                  torch.zeros(
 diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
-index fa5f9df2..d012ab54 100644
+index fa5f9df2e61abe78b18efcdac5e7bd677666c94f..d012ab544f558129328bd2915bb0eadad05e032c 100644
 --- a/python/sglang/srt/mem_cache/radix_cache.py
 +++ b/python/sglang/srt/mem_cache/radix_cache.py
 @@ -505,7 +505,7 @@ class RadixCache(BasePrefixCache):
@@ -2520,8 +2532,24 @@ index fa5f9df2..d012ab54 100644
              node = node.parent
          return DecLockRefResult(delta=delta)
  
+diff --git a/python/sglang/srt/mem_cache/rust_tree_core/adapter.py b/python/sglang/srt/mem_cache/rust_tree_core/adapter.py
+index 22671f7dbd4aa0462d4c8da320073ca7c69873f2..10fad84c609f0b38ae8932500851a4e4a07d4b11 100644
+--- a/python/sglang/srt/mem_cache/rust_tree_core/adapter.py
++++ b/python/sglang/srt/mem_cache/rust_tree_core/adapter.py
+@@ -1028,6 +1028,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
+     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+         return self._binding.root_node_handle(extra_key)
+ 
++    def finish_deferred_chunked_backup(self, node_id: NodeId) -> list[CacheAction]:
++        return _cache_actions_from_tagged(
++            self._binding.finish_deferred_chunked_backup(node_id)
++        )
++
+     def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
+         return self._binding.rotation_base_of(node_id)
+ 
 diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
-index 70482bf8..7520e8f3 100644
+index 70482bf8798ff39aff80fe3236c1bd8ce087a830..7520e8f3266a07cf4db8827563a8e1b385574917 100644
 --- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
 +++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py
 @@ -1080,6 +1080,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -2549,7 +2577,7 @@ index 70482bf8..7520e8f3 100644
          """Start the insert, running to its first barrier or completion."""
          # Insert walks are single-flight; a live walk means re-entrancy.
 diff --git a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
-index 4698fc10..214195d3 100644
+index 4698fc105e9e42de40d1ac191c18298972b85656..214195d313d17a9463b9a264b69a335ca28a7c2d 100644
 --- a/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
 +++ b/python/sglang/srt/mem_cache/unified_cache/unified_tree_core_interface.py
 @@ -465,6 +465,10 @@ class UnifiedTreeCoreInterface(ABC):
@@ -2564,7 +2592,7 @@ index 4698fc10..214195d3 100644
      def begin_insert(self, params: InsertParams) -> InsertStepResult:
          """Start the (single-flight) insert, running to its first barrier or completion."""
 diff --git a/python/sglang/srt/mem_cache/unified_radix_cache.py b/python/sglang/srt/mem_cache/unified_radix_cache.py
-index 421a2157..c415f523 100644
+index 421a2157228489da4c251c8ac26ef8135451b5b2..a9a71dd176041088d80648471dae0ec2746d55b5 100644
 --- a/python/sglang/srt/mem_cache/unified_radix_cache.py
 +++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
 @@ -997,6 +997,7 @@ class UnifiedRadixCache(BasePrefixCache):
@@ -2584,7 +2612,7 @@ index 421a2157..c415f523 100644
          if self.disable:
              for comp in self._components_tuple:
                  comp.cleanup_after_caching_req(req, is_finished=True)
-@@ -1055,6 +1058,26 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1055,6 +1058,30 @@ class UnifiedRadixCache(BasePrefixCache):
          insert_params.value = values
          result = self.insert(insert_params)
  
@@ -2592,10 +2620,14 @@ index 421a2157..c415f523 100644
 +            deferred_backup is not None
 +            and self.cache_controller is not None
 +            and self.enable_mamba_extra_buffer
-+            and result.last_device_node == self.tree_core.root_node.id
++            and self.tree_core.is_root(result.last_device_node)
 +            and req.kv.cache_protected_len > 0
 +            and deferred_backup
-+            == (self.tree_core.root_node.id, req.last_node, req.kv.cache_protected_len)
++            == (
++                self.tree_core.root_node_handle(req.extra_key),
++                req.last_node,
++                req.kv.cache_protected_len,
++            )
 +        ):
 +            from sglang.srt.managers.schedule_batch import FINISH_ABORT
 +
@@ -2611,24 +2643,28 @@ index 421a2157..c415f523 100644
          # Split the leaf at the prompt boundary so eviction can drop the output
          # KV without the prompt. prev_prefix_len keeps the overlapping indices
          # from being freed as duplicates; skipped after a declined rotation,
-@@ -1290,6 +1313,15 @@ class UnifiedRadixCache(BasePrefixCache):
+@@ -1290,6 +1317,19 @@ class UnifiedRadixCache(BasePrefixCache):
              req.prefix_indices = new_indices
          req.kv.cache_protected_len = len(new_indices)
          req.last_node = new_last_node
 +        req._hicache_deferred_chunked_backup = (
-+            (self.tree_core.root_node.id, new_last_node, len(new_indices))
++            (
++                self.tree_core.root_node_handle(req.extra_key),
++                new_last_node,
++                len(new_indices),
++            )
 +            if chunked
 +            and self.cache_controller is not None
 +            and self.enable_mamba_extra_buffer
 +            and len(new_indices) > 0
-+            and new_last_node != self.tree_core.root_node.id
++            and not self.tree_core.is_root(new_last_node)
 +            else None
 +        )
          # Carry the receipt so this node's dec releases only what we locked.
          req.lock_receipt = lock_result.to_dec_params()
          # The rematch acquired a new SWA prefix lock.
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 604a72f4..3b2cbd6f 100644
+index 604a72f4ed7f1eddbe1088aabfb604ac808a47d5..3b2cbd6f6392c8f1842db74905b79ae848bd3e86 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -437,7 +437,8 @@ class ModelRunner:
@@ -2812,7 +2848,7 @@ index 604a72f4..3b2cbd6f 100644
          if self.tp_rank != 0 or get_exec().moe.is_ep_scale_joiner:
              return
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index c28eb599..e29d2396 100644
+index c28eb599fe0402ce8de0c5c4a4f89e65b66b7a8d..e29d2396f7e847b11141155eff1bcba315dcd7d2 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -1005,6 +1005,17 @@ class MqaAttentionBase(nn.Module):
@@ -2858,7 +2894,7 @@ index c28eb599..e29d2396 100644
  
          self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 diff --git a/python/sglang/srt/models/kimi_k3.py b/python/sglang/srt/models/kimi_k3.py
-index b04ac8b4..dfacab22 100644
+index b04ac8b40cac8758244c36f3ff0cfc304b3bfbbb..dfacab22bcd7c69489f902f126d49d8787edd3f0 100644
 --- a/python/sglang/srt/models/kimi_k3.py
 +++ b/python/sglang/srt/models/kimi_k3.py
 @@ -222,7 +222,7 @@ def _k3_bf16_gemm(
@@ -3015,7 +3051,7 @@ index b04ac8b4..dfacab22 100644
          # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
          if self.language_model is not None:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index fac16f30..805e47ad 100644
+index fac16f30a38a5e9ba234e04b6c75803001ace90a..805e47adf2e8661f131a1937928151e23d49c049 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -1475,12 +1475,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
@@ -3034,7 +3070,7 @@ index fac16f30..805e47ad 100644
                  positions=positions,
                  hidden_states=hidden_states,
 diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
-index 7b9e979f..cad03306 100644
+index 7b9e979f5ff26b42c875980b6d12e83236d498ec..cad03306beaf324a7c2a4ef6b6ff3f72e9d6f1ba 100644
 --- a/python/sglang/srt/multimodal/processors/base_processor.py
 +++ b/python/sglang/srt/multimodal/processors/base_processor.py
 @@ -1395,6 +1395,20 @@ class BaseMultimodalProcessor(ABC):
@@ -3059,7 +3095,7 @@ index 7b9e979f..cad03306 100644
              images=images,
              audios=audios,
 diff --git a/python/sglang/srt/multimodal/processors/executor.py b/python/sglang/srt/multimodal/processors/executor.py
-index a94f7dbb..ea9c2eb4 100644
+index a94f7dbb6a853c86fe4413cf224d7ac6957be6f2..ea9c2eb4b2f9ce54b9bc602a63638e677bef710b 100644
 --- a/python/sglang/srt/multimodal/processors/executor.py
 +++ b/python/sglang/srt/multimodal/processors/executor.py
 @@ -49,7 +49,12 @@ class MultimodalProcessorExecutor:
@@ -3077,7 +3113,7 @@ index a94f7dbb..ea9c2eb4 100644
      def shutdown(self) -> None:
          self._executor.shutdown()
 diff --git a/python/sglang/srt/multimodal/processors/glm4v.py b/python/sglang/srt/multimodal/processors/glm4v.py
-index 105814e2..91ab21bc 100644
+index 105814e25a58809895fa22e2879e33f6fc187e6d..91ab21bccbf749b5f29938f5e1606252e990e415 100644
 --- a/python/sglang/srt/multimodal/processors/glm4v.py
 +++ b/python/sglang/srt/multimodal/processors/glm4v.py
 @@ -7,7 +7,11 @@ import numpy as np
@@ -3134,7 +3170,7 @@ index 105814e2..91ab21bc 100644
          image_grid_thw = None
          video_grid_thw = None
 diff --git a/python/sglang/srt/observability/req_time_stats.py b/python/sglang/srt/observability/req_time_stats.py
-index 5af9cbc4..b766bb0b 100644
+index 5af9cbc404bb2a36681e504bcb14af34d9e4241a..b766bb0b953d8526c989ef8ae516ad8f59053b32 100644
 --- a/python/sglang/srt/observability/req_time_stats.py
 +++ b/python/sglang/srt/observability/req_time_stats.py
 @@ -363,7 +363,7 @@ class ReqTimeStatsBase:
@@ -3250,7 +3286,7 @@ index 5af9cbc4..b766bb0b 100644
  
      def format_duration(self, duration: float) -> str:
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index a49b2300..12cb0f29 100644
+index a49b2300990cc49737a560963cd7a06fa3300519..12cb0f29b84d87791877bed7b480495bc2456cc6 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -34,6 +34,8 @@ from sglang.srt.arg_groups.arg_utils import (
@@ -3290,7 +3326,7 @@ index a49b2300..12cb0f29 100644
          # its only command-line entry point.
          parser.add_argument(
 diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-index 543690c1..648c5914 100644
+index 543690c11321d76aa00914c26bd641c25ce4dba2..648c59144145ac93a21c00183efacd09623dbf5f 100644
 --- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
 +++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
 @@ -594,8 +594,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -3307,7 +3343,7 @@ index 543690c1..648c5914 100644
          ]
          if self.model_runner.model_config.model_is_mrope:
 diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
-index fab5c4d9..98a7f65a 100644
+index fab5c4d9207e4e95a43818a869bd83876d17fd4f..98a7f65aebd565a7da5462d4bde78f64ac3b9fbe 100644
 --- a/python/sglang/srt/state_capturer/routed_experts.py
 +++ b/python/sglang/srt/state_capturer/routed_experts.py
 @@ -1,3 +1,5 @@
@@ -3349,3 +3385,72 @@ index fab5c4d9..98a7f65a 100644
  def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
  
      get_resources().experts_capturer = capturer
+diff --git a/rust/sglang-radix-tree/src/python_bindings.rs b/rust/sglang-radix-tree/src/python_bindings.rs
+index 3b9308569b677ed2d21581765917d879a1276ab2..698971b28e8f1fb17209acf9598a235887c74918 100644
+--- a/rust/sglang-radix-tree/src/python_bindings.rs
++++ b/rust/sglang-radix-tree/src/python_bindings.rs
+@@ -1254,6 +1254,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
+         cache_actions_to_py(py, actions)
+     }
+ 
++    fn finish_deferred_chunked_backup(
++        &self,
++        py: Python<'_>,
++        node_id: NodeId,
++    ) -> PyResult<Py<PyList>> {
++        let actions = py.allow_threads(|| self.core().finish_deferred_chunked_backup(node_id));
++        cache_actions_to_py(py, actions)
++    }
++
+     /// Bump the reference count on a node's component locks; the listed
+     /// components are left untaken and recorded in the receipt.
+     fn inc_lock_ref(
+@@ -2768,6 +2777,14 @@ macro_rules! tree_core_binding {
+                 catch_native_panic(|| self.inner.end_insert(py))
+             }
+ 
++            fn finish_deferred_chunked_backup(
++                &self,
++                py: Python<'_>,
++                node_id: NodeId,
++            ) -> PyResult<Py<PyList>> {
++                catch_native_panic(|| self.inner.finish_deferred_chunked_backup(py, node_id))
++            }
++
+             /// Bump the reference count on a node's component locks.
+             #[pyo3(signature = (node_id, skip_lock_components = Vec::new()))]
+             fn inc_lock_ref(
+diff --git a/rust/sglang-radix-tree/src/unified_tree_core.rs b/rust/sglang-radix-tree/src/unified_tree_core.rs
+index e39fd3743acd1b7ca765f4b41250142f1382f0bd..14d6d0b38d66a98768df2bcb5bd19ef545c89527 100644
+--- a/rust/sglang-radix-tree/src/unified_tree_core.rs
++++ b/rust/sglang-radix-tree/src/unified_tree_core.rs
+@@ -1508,6 +1508,29 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
+         self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
+     }
+ 
++    /// Account for a final short tail while its chunked Mamba checkpoint is pinned.
++    pub fn finish_deferred_chunked_backup(&mut self, node_id: NodeId) -> Vec<CacheAction> {
++        let Ok(node_id) = self.arena.resolve(node_id) else {
++            return Vec::new();
++        };
++        let node = self.arena.node(node_id);
++        if !self.enable_hicache
++            || node.is_root()
++            || node.backuped()
++            || node.write_through_pending_id.is_some()
++            || node.device_lock_ref(FULL) == 0
++            || !node.has_device_value(MAMBA)
++        {
++            return Vec::new();
++        }
++        if !self.inc_hit_count_and_check_(node_id, false) {
++            return Vec::new();
++        }
++        vec![CacheAction::BackupKV(
++            self.build_backup_kv_action_(self.arena.node(node_id), false),
++        )]
++    }
++
+     /// Insert device values to the tree per the provided key.
+     pub fn insert(&mut self, params: &InsertParams<'_, K>) -> InsertResult {
+         self.try_insert(params)

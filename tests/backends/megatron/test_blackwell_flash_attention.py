@@ -129,3 +129,30 @@ def test_kimi_context_parallel_keeps_native_fa2_selection(attention_runtime, rec
     use_flash, version, _, _, _, _ = utils.get_attention_backend(params)
     assert use_flash and version.major == 2, version
     record_property("flash_attention_version", str(version))
+
+
+@pytest.mark.parametrize("training", [False, True], ids=["log-prob", "training"])
+def test_qwen_context_parallel_keeps_native_fa2_selection(attention_runtime, record_property, training):
+    _, _, _ = attention_runtime
+    utils = importlib.import_module("transformer_engine.pytorch.attention.dot_product_attention.utils")
+    params = utils.AttentionParams(
+        qkv_layout="thd_thd_thd",
+        num_heads=8,
+        num_gqa_groups=1,
+        head_dim_qk=256,
+        head_dim_v=256,
+        max_seqlen_q=32752,
+        max_seqlen_kv=32752,
+        attn_mask_type="padding_causal",
+        window_size=(-1, 0),
+        core_attention_bias_shape=None,
+        core_attention_bias_requires_grad=False,
+        context_parallel=True,
+        cp_comm_type="p2p",
+        cp_size=4,
+        pad_between_seqs=False,
+        is_training=training,
+    )
+    use_flash, version, use_fused, _, use_unfused, _ = utils.get_attention_backend(params)
+    assert use_flash and version.major == 2 and not use_fused and not use_unfused, version
+    record_property("flash_attention_version", str(version))

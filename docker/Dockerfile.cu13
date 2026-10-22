@@ -138,6 +138,19 @@ COPY docker/patch/sglang-router /tmp/router-patch
 COPY docker/scripts/build_sglang_router.sh /tmp/build_sglang_router.sh
 RUN bash /tmp/build_sglang_router.sh /tmp/router-patch /opt/router-wheels
 
+# The radix tree is native Rust: rebuild it against the final image's Torch ABI.
+FROM router_builder as tree_core_builder
+ARG SGLANG_PATCH_VERSION=v0.5.21
+ARG ENABLE_SGLANG_PATCH=1
+COPY docker/patch/sglang/${SGLANG_PATCH_VERSION}.patch /tmp/tree-core.patch
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN mkdir -p /opt/relax-tree-core && \
+    if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+        cd /sgl-workspace/sglang && git apply --check /tmp/tree-core.patch && \
+        git apply /tmp/tree-core.patch && \
+        python /tmp/build_sglang_tree_core.py build /sgl-workspace/sglang /opt/relax-tree-core; \
+    fi
+
 FROM ${TRAIN_IMAGE} as relax_build
 
 WORKDIR /root
@@ -148,7 +161,8 @@ ARG SGLANG_PATCH_VERSION=v0.5.21
 ARG ENABLE_SGLANG_PATCH=1
 
 ENV RELAX_GPU_ARCH=${GPU_ARCH} \
-    RELAX_SGLANG_VERSION=0.5.21
+    RELAX_SGLANG_VERSION=0.5.21 \
+    SGLANG_RUST_BUILD_MODE=never
 
 # CUTLASS DSL and gRPC require protobuf 6, including when reusing an older TRAIN_IMAGE.
 RUN sed -i '/^protobuf[<=>!~]/d' "$PIP_CONSTRAINT" && \
@@ -167,7 +181,7 @@ COPY docker/patch/transformer_engine/2.18.0-cp-padding-no-host-sync.patch /tmp/t
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-cp-padding-no-host-sync.patch
 
-# Keep FA4 for supported language heads; padded visual heads use TE's native FA2 fallback.
+# Keep supported FA4 heads and allow native FA2 for padded visual heads and SM103 CP.
 COPY docker/patch/transformer_engine/2.18.0-blackwell-fa4-head-dim.patch /tmp/te-blackwell-fa4-head-dim.patch
 RUN cd "$(python -c 'import importlib.util; from pathlib import Path; print(Path(importlib.util.find_spec("transformer_engine").origin).parent.parent)')" && \
     patch --batch --forward --fuzz=0 -p1 < /tmp/te-blackwell-fa4-head-dim.patch
@@ -277,6 +291,12 @@ RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
     git apply --check sglang_per_pos_topk.patch && \
     git apply sglang_per_pos_topk.patch && \
     rm sglang.patch sglang_per_pos_topk.patch; \
+fi
+
+COPY --from=tree_core_builder /opt/relax-tree-core /opt/relax-tree-core
+COPY docker/scripts/build_sglang_tree_core.py /tmp/build_sglang_tree_core.py
+RUN if [ "$ENABLE_SGLANG_PATCH" = "1" ]; then \
+    python /tmp/build_sglang_tree_core.py install /opt/relax-tree-core; \
 fi
 
 # Complete --no-deps installs, match Energon's fsspec, and retain audioread for multimodal imports.

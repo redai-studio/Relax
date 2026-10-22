@@ -361,7 +361,10 @@ def test_final_short_tail_finishes_backup_before_component_cleanup(condition):
         page_size=1,
         req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(10).reshape(1, 10)),
         tree_core=SimpleNamespace(
-            root_node=SimpleNamespace(id=0), is_eagle=False, finish_deferred_chunked_backup=finish
+            root_node_handle=lambda extra_key: 0,
+            is_root=lambda node_id: node_id == 0,
+            is_eagle=False,
+            finish_deferred_chunked_backup=finish,
         ),
         _components_tuple=[
             SimpleNamespace(
@@ -399,6 +402,236 @@ def test_hicache_release_clears_marker_even_if_insert_was_skipped(inserted):
     operation(cache, request, inserted=inserted)
     assert request._hicache_deferred_chunked_backup is None
     assert cleanup.call_count == (0 if inserted else 1)
+
+
+def _deferred_tree(backend, *, enabled=True):
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components import (
+        FullComponent,
+        MambaComponent,
+    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+    from sglang.srt.runtime_context import get_context
+
+    with get_context().override_server_args(_mamba_cache_chunk_size=256, mamba_max_states_per_path=-1):
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=Mock(spec=HybridReqToTokenPool),
+            token_to_kv_pool_allocator=None,
+            page_size=64,
+            enable_mamba_extra_buffer=True,
+            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        )
+        if backend == "rust":
+            core = RustUnifiedTreeCore(params)
+        else:
+            cache = SimpleNamespace(enable_session_radix_cache=False, token_to_kv_pool_allocator=None)
+            components = {
+                ComponentType.FULL: FullComponent(cache, params),
+                ComponentType.MAMBA: MambaComponent(cache, params),
+            }
+            core = UnifiedTreeCore(params, components)
+            cache.tree_core = core
+    if enabled:
+        core.set_hicache_enabled()
+    core.write_through_threshold = 2
+    return core
+
+
+def _chunked_checkpoint(core, length=256, *, prefix_len=0, tokens=None, mamba_slot=None, value_offset=1000):
+    from array import array
+
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    key = RadixKey(array("q", range(length) if tokens is None else tokens), extra_key="adapter", cache_salt="tenant")
+    step = core.begin_insert(
+        InsertParams(
+            key=key,
+            value=torch.arange(value_offset, value_offset + length, dtype=torch.int64),
+            mamba_value=torch.tensor([length if mamba_slot is None else mamba_slot], dtype=torch.int64),
+            prev_prefix_len=prefix_len,
+            chunked=True,
+        )
+    )
+    actions = list(step.actions)
+    while step.result is None:
+        step = core.resume_insert()
+        actions.extend(step.actions)
+    actions.extend(core.end_insert())
+    assert actions == []
+    return core.match_full_device_prefix(key)[1]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_real_deferred_checkpoint_respects_namespace_and_cache_salt(backend):
+    from array import array
+
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    core = _deferred_tree(backend)
+    node = _chunked_checkpoint(core)
+    assert not core.is_root(node)
+    for extra_key, cache_salt, expected in [
+        ("adapter", "tenant", 256),
+        ("other-adapter", "tenant", 0),
+        ("adapter", "other-tenant", 0),
+    ]:
+        key = RadixKey(array("q", range(256)), extra_key=extra_key, cache_salt=cache_salt)
+        assert core.match_full_device_prefix(key)[0] == expected
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_real_deferred_backup_keeps_threshold_and_ancestor_hit_counts(backend):
+    from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
+
+    core = _deferred_tree(backend)
+    parent = _chunked_checkpoint(core)
+    leaf = _chunked_checkpoint(core, 512, prefix_len=256)
+    receipt = core.inc_lock_ref(leaf).to_dec_params()
+    try:
+        assert core.finish_deferred_chunked_backup(leaf) == []
+        # Finishing the child must not add a hit to its ancestor.
+        assert core.finish_deferred_chunked_backup(parent) == []
+        actions = core.finish_deferred_chunked_backup(leaf)
+        assert len(actions) == 1 and isinstance(actions[0], BackupKV)
+        assert actions[0].node_ids == [parent, leaf]
+        core.mark_write_through_pending(actions[0].node_ids, leaf)
+        assert core.finish_deferred_chunked_backup(leaf) == []
+    finally:
+        core.dec_lock_ref(leaf, receipt)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("condition", ["disabled", "root", "stale", "unlocked", "no_mamba", "backed", "write_back"])
+def test_real_deferred_backup_rejects_unprotected_or_invalid_checkpoints(backend, condition):
+    core = _deferred_tree(backend, enabled=condition != "disabled")
+    core.write_through_threshold = 1
+    node = _chunked_checkpoint(core)
+    if condition == "no_mamba":
+        from array import array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        # A real aligned split has FULL KV but no Mamba checkpoint of its own.
+        _chunked_checkpoint(
+            core,
+            prefix_len=128,
+            tokens=list(range(128)) + list(range(10000, 10128)),
+            mamba_slot=257,
+            value_offset=2000,
+        )
+        common = RadixKey(array("q", range(128)), extra_key="adapter", cache_salt="tenant")
+        node = core.match_full_device_prefix(common)[1]
+        assert not core.is_root(node)
+        assert core.get_component_device_value(node, ComponentType.MAMBA) is None
+    receipt = core.inc_lock_ref(node).to_dec_params()
+    if condition == "root":
+        target = core.root_node_handle("adapter")
+    else:
+        target = node
+    if condition == "backed":
+        core.commit_backup(node, torch.arange(2000, 2256, dtype=torch.int64), {})
+    elif condition == "write_back":
+        core.is_write_back = True
+    elif condition == "unlocked":
+        core.dec_lock_ref(node, receipt)
+    elif condition == "stale":
+        previous_root = core.root_node_handle("adapter")
+        core.reset()
+        assert core.root_node_handle("adapter") != previous_root
+    try:
+        assert core.finish_deferred_chunked_backup(target) == []
+    finally:
+        if condition not in ("stale", "unlocked"):
+            core.dec_lock_ref(node, receipt)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("condition", ["finished", "abort", "unfinished", "stale_root", "stale_node", "stale_length"])
+def test_real_tree_final_short_tail_uses_backend_neutral_identity_and_clears_once(backend, condition):
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
+
+    core = _deferred_tree(backend)
+    core.write_through_threshold = 1
+    node = _chunked_checkpoint(core)
+    receipt = core.inc_lock_ref(node).to_dec_params()
+    root = core.root_node_handle("adapter")
+    marker = (root, node, 256)
+    if condition == "stale_root":
+        core.reset()
+        node = _chunked_checkpoint(core)
+        receipt = core.inc_lock_ref(node).to_dec_params()
+    elif condition == "stale_node":
+        marker = (root, root, 256)
+    elif condition == "stale_length":
+        marker = (root, node, 192)
+    request = SimpleNamespace(
+        _hicache_deferred_chunked_backup=marker,
+        origin_input_ids=list(range(256)),
+        output_ids=[1],
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=256),
+        last_node=node,
+        priority=0,
+        session_id=None,
+        kv_rotation_base=None,
+        extra_key="adapter",
+        cache_salt="tenant",
+        finished_reason=FINISH_ABORT() if condition == "abort" else None if condition == "unfinished" else object(),
+    )
+    actions = []
+    events = []
+
+    def apply_actions(pending):
+        assert not events and request.kv.cache_protected_len == 256
+        actions.extend(pending)
+
+    cache = SimpleNamespace(
+        disable=False,
+        cache_controller=object(),
+        enable_mamba_extra_buffer=True,
+        enable_session_radix_cache=False,
+        page_size=64,
+        req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(512).reshape(1, 512)),
+        tree_core=core,
+        _components_tuple=[
+            SimpleNamespace(
+                component_type="mamba",
+                prepare_for_caching_req=lambda **kwargs: 0,
+                floor_cache_len=lambda size: size,
+                cleanup_after_caching_req=lambda *args, **kwargs: events.append("cleanup"),
+            )
+        ],
+        insert=lambda params: InsertResult(prefix_len=0, last_device_node=core.root_node_handle("adapter")),
+        _apply_cache_actions=apply_actions,
+    )
+    operation = _load(
+        "srt/mem_cache/unified_radix_cache.py",
+        "UnifiedRadixCache",
+        "insert_req",
+        RadixKey=RadixKey,
+        InsertParams=InsertParams,
+        BASE_COMPONENT_TYPE="full",
+        torch=torch,
+    )
+    try:
+        operation(cache, request, up_to=257)
+        assert request._hicache_deferred_chunked_backup is None
+        assert len(actions) == (1 if condition == "finished" else 0)
+        if actions:
+            assert isinstance(actions[0], BackupKV) and actions[0].node_ids == [node]
+        operation(cache, request, up_to=257)
+        assert len(actions) == (1 if condition == "finished" else 0)
+        assert events == ["cleanup", "cleanup"]
+    finally:
+        core.dec_lock_ref(node, receipt)
 
 
 def test_glm_image_epd_accepts_native_receiver_metadata():
@@ -483,3 +716,94 @@ def test_relax_weight_payloads_use_native_safe_pickle_types(monkeypatch, record_
     for (_, actual), (_, original_tensor) in zip(restored, expected, strict=True):
         assert actual.dtype == original_tensor.dtype and actual.shape == original_tensor.shape
         torch.testing.assert_close(actual, original_tensor, rtol=0, atol=0)
+
+
+def _run_gc_startup(*, skip, elastic=False, warmup_ok=True, wait_weights=False, with_callback=True):
+    calls = []
+    state = SimpleNamespace(ready=False, tokenizer_manager=SimpleNamespace(server_status="Initial"))
+
+    class RequestException(Exception):
+        pass
+
+    def post(url, **kwargs):
+        calls.append(("freeze_gc", url, kwargs))
+        if not state.ready:
+            raise RequestException("HTTP listener is not bound during skipped warmup")
+        return SimpleNamespace(raise_for_status=lambda: calls.append("HTTP200"))
+
+    def warmup(server_args):
+        calls.append("warmup")
+        state.ready = warmup_ok
+        if warmup_ok:
+            state.tokenizer_manager.server_status = "Up"
+        return warmup_ok
+
+    namespace = {
+        "get_serving": lambda: SimpleNamespace(skip_server_warmup=skip, admin_api_key="test-admin", api_key=None),
+        "get_model": lambda: SimpleNamespace(
+            checkpoint_engine_wait_weights_before_ready=wait_weights, delete_ckpt_after_loading=False
+        ),
+        "get_exec": lambda: SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=elastic, ep_join_mode="joiner")),
+        "get_observability": lambda: SimpleNamespace(debug_tensor_dump_input_file=False),
+        "_global_state": state,
+        "ServerStatus": SimpleNamespace(Up="Up"),
+        "_execute_server_warmup": warmup,
+        "_wait_weights_ready": lambda: calls.append("wait_weights"),
+        "requests": SimpleNamespace(post=post, exceptions=SimpleNamespace(RequestException=RequestException)),
+        "ssl_verify_of": lambda _: True,
+        "logger": SimpleNamespace(
+            warning=lambda *args, **kwargs: calls.append("GC_warning"),
+            info=lambda *args, **kwargs: calls.append("ready"),
+            debug=lambda *args, **kwargs: None,
+        ),
+    }
+    path = "srt/entrypoints/http_server.py"
+    namespace["_freeze_gc_after_server_warmup"] = _load(path, None, "_freeze_gc_after_server_warmup", **namespace)
+    operation = _load(path, None, "_wait_and_warmup", **namespace)
+    callback = (lambda: calls.append("callback")) if with_callback else None
+    operation(SimpleNamespace(url=lambda: "http://server.invalid"), callback, warmup)
+    return calls, state.tokenizer_manager.server_status
+
+
+@pytest.mark.parametrize("elastic", [False, True])
+def test_skip_server_warmup_never_freezes_gc_before_http_bind(elastic):
+    assert _run_gc_startup(skip=True, elastic=elastic) == (["ready", "callback"], "Up")
+
+
+def test_normal_server_warmup_freezes_gc_before_launch_callback():
+    calls, status = _run_gc_startup(skip=False)
+    assert calls == [
+        "warmup",
+        (
+            "freeze_gc",
+            "http://server.invalid/freeze_gc",
+            {"headers": {"Authorization": "Bearer test-admin"}, "timeout": 10, "verify": True},
+        ),
+        "HTTP200",
+        "ready",
+        "callback",
+    ]
+    assert status == "Up"
+
+
+def test_failed_server_warmup_never_freezes_gc_or_announces_ready():
+    assert _run_gc_startup(skip=False, warmup_ok=False) == (["warmup"], "Initial")
+
+
+def test_elastic_joiner_without_skip_keeps_upstream_freeze_attempt():
+    calls, status = _run_gc_startup(skip=False, elastic=True)
+    assert [call[0] if isinstance(call, tuple) else call for call in calls] == [
+        "freeze_gc",
+        "GC_warning",
+        "ready",
+        "callback",
+    ]
+    assert status == "Up"
+
+
+def test_skipped_warmup_waits_for_checkpoint_weights_before_ready():
+    assert _run_gc_startup(skip=True, wait_weights=True) == (["wait_weights", "ready", "callback"], "Up")
+
+
+def test_skipped_warmup_does_not_require_launch_callback():
+    assert _run_gc_startup(skip=True, with_callback=False) == (["ready"], "Up")
