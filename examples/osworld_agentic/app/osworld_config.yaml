@@ -3,6 +3,10 @@ max_turns: 30
 max_image_history_length: 2
 max_reward_image_history_length: 1
 context_policy: baseline
+# Optional request-time visual segmentation. Baseline remains the default.
+context_mode: baseline  # baseline | vcs
+vcs_keep_images: 2
+vcs_prune_images: 2
 
 # Sampling; max_tokens matches the rollout response limit.
 temperature: 1.0

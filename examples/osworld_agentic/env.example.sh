@@ -22,3 +22,9 @@ export NEX_API_KEY="${NEX_API_KEY:-}"
 # export download_proxy="http://your-proxy:port"
 # Configure ClearML on all training nodes (clearml-init or your secret manager).
 # Do not add its credentials to the committed template or runtime-env JSON.
+
+# Optional CUA archive. Start the standalone writer on local disk first.
+# Every Agent reads these settings from env.local.sh; disabled when unset.
+# export CUA_ARCHIVE_ENABLE=1
+# export CUA_ARCHIVE_URL="http://archive-host:port"
+# export CUA_ARCHIVE_TOKEN="${CUA_ARCHIVE_TOKEN:-}"

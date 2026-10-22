@@ -2,10 +2,13 @@
 
 [中文](README.md)
 
+Optional [Visual Context Segmentation](VCS.en.md) uses append-only context and batch screenshot pruning to train consecutive answers in segments. It is disabled by default; legacy raw reward keeps its original call-count weighting.
+
 This recipe trains Qwen3-VL-8B-Thinking with GRPO, Relax resident agentic rollout, and Nex desktop sandboxes. It requires access to a Nex deployment and a working OSWorld desktop template; cloning the repository alone is insufficient.
 
 ## Files and configuration
 
+- [CUA success archive](ARCHIVE.en.md): optional bounded storage and offline full-trajectory/multimodal SFT export, disabled by default.
 - `env.example.sh`: public deployment template without real endpoints or credentials.
 - `env.local.sh`: private copy of the template, ignored by Git; never commit it.
 - `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`: authoritative training configuration and submission script.
@@ -13,7 +16,7 @@ This recipe trains Qwen3-VL-8B-Thinking with GRPO, Relax resident agentic rollou
 - `run_agent_app.sh`: per-session entry called by Relax, not a standalone training launcher.
 - `app/`: desktop environment, model adapter, rewards and metrics; `app/osworld_config.yaml` controls interaction settings.
 - `scripts/prepare_data.py` and `train_tasks.txt`: dataset conversion and the fixed 12-task manifest.
-- `scripts/analyze_run.py` and `plot_training.py`: offline analysis. `reward_osworld.py` is a compatibility scorer; the training script uses agent metadata and a custom advantage callback.
+- `scripts/analyze_run.py` and `plot_training.py`: offline analysis. The training script uses agent metadata and a custom advantage callback.
 
 The training and agent entry scripts read `env.local.sh` directly. No additional configuration file is needed. Launch-time model/data/output roots take precedence.
 

@@ -6,6 +6,8 @@
 
 ## 目录与配置
 
+- [Visual Context Segmentation](VCS.md)：可选的追加式上下文与批量截图裁剪，连续多轮回答按片段训练，默认关闭。
+- [CUA 成功轨迹库](ARCHIVE.md)：可选归档、容量管理、完整轨迹与多模态 SFT 离线导出，默认关闭。
 - `env.example.sh`：公开的部署配置模板，不包含实际服务地址或密钥。
 - `env.local.sh`：用户复制模板后填写的私有配置，Git 忽略，不能提交。
 - `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`：正式训练参数与提交入口；修改训练参数请改这里。
@@ -13,7 +15,7 @@
 - `run_agent_app.sh`：Relax 为每个 session 调用的 agent 入口，不是独立训练入口。
 - `app/`：桌面环境、模型调用适配、奖励与监控；`app/osworld_config.yaml` 控制交互轮数等。
 - `scripts/prepare_data.py`、`train_tasks.txt`：数据转换与固定 12 任务清单。
-- `scripts/analyze_run.py`、`plot_training.py`：离线分析工具；`reward_osworld.py` 保留兼容 scorer，正式脚本使用 agent metadata 和自定义 advantage 回调。
+- `scripts/analyze_run.py`、`plot_training.py`：离线分析工具；正式脚本使用 agent metadata 和自定义 advantage 回调。
 
 训练脚本和 agent 入口直接读取同目录的 `env.local.sh`，无需额外配置文件。启动时传入的三个根目录优先。
 
@@ -91,7 +93,7 @@ Actor 与 rollout colocate，共用检测到的 8 或 16 张物理 GPU。session
 
 96 条逻辑轨迹可以导出远多于 96 条训练记录。`rollout/raw_reward` 为对齐交接实现的**按导出记录数加权的 shaped reward**，不是轨迹成功率。判断任务能力应同时看成功率、轮数、异常比例；不能将 raw reward 图标成 success rate。全成功/全失败组的策略 advantage 被置零，但启用的 KL 项仍可能产生梯度。
 
-`max_image_history_length=2` 限制单次模型上下文的图像历史，不表示一条轨迹只有两张截图。截图 dump 是额外诊断功能，磁盘图片数不能直接代表交互轮数。
+baseline 的 `max_image_history_length=2` 限制单次模型上下文的图像历史，不表示一条轨迹只有两张截图。VCS 模式改用独立的 K/Δ 窗口，raw reward 仍按原始调用数加权。截图 dump 是额外诊断功能，磁盘图片数不能直接代表交互轮数。
 
 ## 日志与隐私
 

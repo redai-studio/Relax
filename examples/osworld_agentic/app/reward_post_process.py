@@ -106,10 +106,24 @@ def compute_legacy_raw_reward(samples: list) -> float:
     for position, sample in enumerate(samples):
         sessions.setdefault(_session_key(sample, position), []).append(sample)
     total = 0.0
+    count = 0
     for records in sessions.values():
         first = records[0]
-        total += len(records) * shape_outcome_reward(float(first.metadata["outcome"]), _turns(first, len(records)))
-    return total / len(samples)
+        calls = _normalization_count(first, len(records))
+        total += calls * shape_outcome_reward(float(first.metadata["outcome"]), _turns(first, len(records)))
+        count += calls
+    return total / count
+
+
+def _normalization_count(sample: Sample, n_records: int) -> int:
+    """VCS must not change legacy call-weighting just by emitting fewer
+    rows."""
+    if sample.metadata.get("context_mode") == "vcs":
+        calls = int(sample.metadata["model_calls"])
+        if calls < 1:
+            raise ValueError("VCS model_calls must be positive")
+        return calls
+    return max(n_records, 1)
 
 
 def post_process_rewards(args, samples):
@@ -169,7 +183,7 @@ def post_process_rewards(args, samples):
                 adv = max(-adv_clip, min(adv_clip, adv))
             t_i = max(len(sessions[key]), 1)
             if per_traj_norm:
-                adv = adv / t_i
+                adv = adv / _normalization_count(samples[sessions[key][0]], t_i)
             for position in sessions[key]:
                 advantages[position] = adv
             _md = getattr(samples[sessions[key][0]], "metadata", None) or {}

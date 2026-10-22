@@ -22,6 +22,8 @@ from typing import Any
 import httpx
 from mm_agents.hybrid_agent_local import HybridAgentLocal
 
+from .visual_context import VisualContext
+
 
 logger = logging.getLogger("osworld_agentic.hybrid_agent")
 
@@ -55,8 +57,16 @@ class RelaxHybridAgent(HybridAgentLocal):
         max_llm_call_retries: int = 3,
         backoff_seconds: float = 5.0,
         stop_token_ids: list[int] | None = None,
+        context_mode: str = "baseline",
+        vcs_keep_images: int = 2,
+        vcs_prune_images: int = 2,
         **kwargs: Any,
     ) -> None:
+        if context_mode not in ("baseline", "vcs"):
+            raise ValueError(f"Unknown OSWorld context_mode: {context_mode}")
+        if context_mode == "vcs" and kwargs.get("context_policy", "baseline") != "baseline":
+            raise ValueError("VCS requires context_policy=baseline (no screenshot skipping)")
+        self.visual_context = VisualContext(vcs_keep_images, vcs_prune_images) if context_mode == "vcs" else None
         super().__init__(**kwargs)
         self._llm_call_timeout_s = float(llm_call_timeout_s)
         self._max_llm_call_retries = int(max_llm_call_retries)
@@ -73,6 +83,11 @@ class RelaxHybridAgent(HybridAgentLocal):
             raise RuntimeError("OPENAI_BASE_URL is not set. run_agent_app.sh should export it from RELAX_BASE_URL.")
         self._base_url = base_url
         self._api_key = os.environ.get("OPENAI_API_KEY", "")
+
+    def predict(self, instruction: str, obs: dict[str, Any], **kwargs: Any) -> Any:
+        if self.visual_context is not None:
+            self.visual_context.begin_turn(int(kwargs.get("step_idx", len(self.actions))))
+        return super().predict(instruction, obs, **kwargs)
 
     def call_llm(self, payload: dict[str, Any], model: str) -> str:  # noqa: D401
         """Send `payload` to Relax's chat completions endpoint and return
@@ -91,8 +106,13 @@ class RelaxHybridAgent(HybridAgentLocal):
             payload = dict(payload)
             payload["stop_token_ids"] = list(self._stop_token_ids)
 
+        visual_context = getattr(self, "visual_context", None)
+        if visual_context is not None:
+            payload = visual_context.prepare(payload)
+        archive = getattr(self, "archive", None)
         last_error = None
         for attempt in range(self._max_llm_call_retries):
+            call_id = archive.model_start(payload, model, attempt) if archive else None
             request_start = time.monotonic()
             try:
                 resp = httpx.post(
@@ -102,6 +122,8 @@ class RelaxHybridAgent(HybridAgentLocal):
                     timeout=self._llm_call_timeout_s,
                 )
             except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if archive:
+                    archive.model_result(call_id, None, None, f"{type(exc).__name__}: {exc}")
                 self.transport_retries += 1
                 last_error = f"transport: {exc}"
                 logger.warning(
@@ -114,6 +136,9 @@ class RelaxHybridAgent(HybridAgentLocal):
                 continue
             finally:
                 self.model_request_s += time.monotonic() - request_start
+
+            if archive:
+                archive.model_result(call_id, resp.text, resp.status_code)
 
             if resp.status_code == 400:
                 # Distinguish context-length-exceeded (fatal, exit cleanly) from
@@ -160,6 +185,20 @@ class RelaxHybridAgent(HybridAgentLocal):
                         "chat_template_kwargs": payload.get("chat_template_kwargs") or {},
                     }
                 )
+                if visual_context is not None:
+                    # Preserve the service's canonical assistant fields, including
+                    # reasoning/tool calls if a parser is explicitly configured.
+                    message = choice["message"]
+                    self.turn_records[-1]["messages"][-1] = {
+                        "role": "assistant",
+                        "content": content,
+                        **{
+                            key: copy.deepcopy(message[key])
+                            for key in ("reasoning_content", "tool_calls")
+                            if key in message
+                        },
+                    }
+                    visual_context.commit(self.turn_records[-1], usage)
                 return content
 
             last_error = f"empty content (finish_reason={finish_reason})"

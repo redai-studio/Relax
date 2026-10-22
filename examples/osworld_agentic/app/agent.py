@@ -54,10 +54,13 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
     The hybrid agent rebuilds its prompt every step, so the session forest ends
     up with one leaf per turn and Relax's implicit export (which insists on a
     single committed leaf) drops the whole session. We therefore use the
-    explicit path: one JSONL record per turn, each carrying the exact
-    conversation state that turn committed. See README.md.
+    explicit path: one JSONL record per call in baseline, or per committed
+    segment in VCS. See VCS.md for the loss ownership contract.
     """
     records = payload.pop("_turn_records", []) or []
+    segments = payload.pop("_segment_records", None)
+    if segments is not None:
+        records = segments
     metadata = payload.get("metadata", {})
     reward = payload.get("reward")
     # The launcher passes --reward-key score, and Relax then does
@@ -72,16 +75,22 @@ def write_session_output(path: str | Path, payload: dict[str, Any]) -> None:
             lines = [
                 json.dumps(
                     {
-                        "name": f"turn_{index:03d}",
+                        "name": f"{'segment' if segments is not None else 'turn'}_{index:03d}",
                         "messages": record["messages"],
                         "tools": record.get("tools") or [],
                         "chat_template_kwargs": record.get("chat_template_kwargs") or {},
                         "metadata": {
                             **metadata,
-                            "turn_index": record.get("turn_index", index),
                             "export_index": index,
-                            "parse_attempt": record.get("parse_attempt", 0),
-                            "accepted_for_execution": record.get("accepted_for_execution", False),
+                            **(
+                                {"vcs_segment": record["vcs_segment"]}
+                                if segments is not None
+                                else {
+                                    "turn_index": record.get("turn_index", index),
+                                    "parse_attempt": record.get("parse_attempt", 0),
+                                    "accepted_for_execution": record.get("accepted_for_execution", False),
+                                }
+                            ),
                             "outcome": reward[_reward_key],
                             "session_id": os.environ.get("RELAX_SESSION_ID"),
                         },
@@ -168,6 +177,8 @@ async def _predict_one_step(
             parse_attempt=attempt,
             accepted_for_execution=parsed and not forced_cap and attempt == len(records) - 1,
         )
+    if getattr(agent, "archive", None):
+        agent.archive.parsed(records)
     return result
 
 
@@ -214,8 +225,20 @@ async def run_session(
         max_llm_call_retries=int(config.get("max_llm_call_retries", 3)),
         backoff_seconds=float(config.get("llm_call_backoff_s", 5.0)),
         stop_token_ids=list(config.get("stop_token_ids") or []),
+        context_mode=str(config.get("context_mode", "baseline")),
+        vcs_keep_images=int(config.get("vcs_keep_images", 2)),
+        vcs_prune_images=int(config.get("vcs_prune_images", 2)),
     )
     agent.reset(logging.getLogger("osworld_agentic.hybrid_agent"))
+    archive = None
+    if os.environ.get("CUA_ARCHIVE_ENABLE") == "1":
+        try:
+            from app.archive import create_capture
+
+            archive = create_capture(task_config, config, metadata)
+            agent.archive = archive
+        except Exception:
+            logger.warning("Archive initialization failed; training continues", exc_info=True)
 
     stop_reason = "max_turns"
     action_types: list[str] = []
@@ -231,8 +254,12 @@ async def run_session(
         phase_start = time.monotonic()
         obs = await env.reset()
         timings["reset"] = time.monotonic() - phase_start
+        if archive:
+            archive.observe(obs, 0)
 
         for step_idx in range(max_turns):
+            if archive:
+                archive.before_predict(step_idx)
             shotdump.shot(step_idx, getattr(obs, "screenshot_bytes", None))
             phase_start = time.monotonic()
             try:
@@ -272,7 +299,10 @@ async def run_session(
                 # in `action_history` (evaluate() checks the last entry).
                 terminal = "DONE" if "DONE" in pyautogui_actions else "FAIL"
                 phase_start = time.monotonic()
-                await env.exec_pyautogui(terminal)
+                action_id = archive.action_start(terminal, terminal=True) if archive else None
+                terminal_obs = await env.exec_pyautogui(terminal)
+                if archive:
+                    archive.action_result(action_id, terminal_obs)
                 timings["execute"] += time.monotonic() - phase_start
                 agent.record_exec_result(action_type, True, {"ok": True, "terminal": terminal})
                 break
@@ -284,6 +314,7 @@ async def run_session(
             step_done = False
             phase_start = time.monotonic()
             for action in pyautogui_actions:
+                action_id = archive.action_start(action) if archive else None
                 mcp = parse_mcp_action(action)
                 if mcp is not None:
                     tool_name, params = mcp
@@ -294,6 +325,8 @@ async def run_session(
                     step_obs = await env.exec_pyautogui(action)
                     step_result = step_obs.exec_result
                     step_ok = step_ok and step_obs.exec_ok
+                if archive:
+                    archive.action_result(action_id, step_obs)
                 obs = step_obs
                 step_done = step_done or step_obs.done
 
@@ -318,6 +351,9 @@ async def run_session(
         phase_start = time.monotonic()
         reward = await env.evaluate()
         timings["evaluate"] = time.monotonic() - phase_start
+        if archive:
+            evidence = getattr(env, "archive_evaluation", {})
+            archive.finish(evidence.get("raw"), evidence.get("error", "missing evaluator evidence"), stop_reason)
         shotdump.finish(
             {
                 "reward": reward,
@@ -333,15 +369,22 @@ async def run_session(
         emit("session_error", error_category="unknown")
         raise
     finally:
+        if archive:
+            archive.abort()
         phase_start = time.monotonic()
         await env.close()
         timings["close"] = time.monotonic() - phase_start
 
     elapsed = time.monotonic() - session_start
+    visual_context = getattr(agent, "visual_context", None)
+    if visual_context is not None:
+        visual_context.finish(stop_reason)
     return {
         "reward": float(reward),
         "_turn_records": list(getattr(agent, "turn_records", [])),
+        **({"_segment_records": visual_context.records} if visual_context is not None else {}),
         "metadata": {
+            **({"context_mode": "vcs", "model_calls": len(agent.turn_records)} if visual_context is not None else {}),
             "stop_reason": stop_reason,
             "agent_turns": len(action_types),
             "action_types": action_types,
@@ -363,6 +406,7 @@ async def run_session(
                 "osworld/forced_max_turns_rate": float(forced_max_turns),
                 "osworld/session_wallclock_s": elapsed,
                 **{f"osworld/{name}_s": value for name, value in timings.items()},
+                **(visual_context.metrics() if visual_context is not None else {}),
             },
         },
     }

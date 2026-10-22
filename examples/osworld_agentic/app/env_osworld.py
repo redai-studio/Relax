@@ -52,6 +52,8 @@ class StepObs:
     done: bool = False
     exec_ok: bool = True
     exec_result: dict[str, Any] = field(default_factory=dict)
+    screenshot_valid: bool = False
+    archive_fields: dict[str, Any] = field(default_factory=dict)
 
 
 class OSWorldEnv:
@@ -78,6 +80,8 @@ class OSWorldEnv:
         self.headless = headless
         self.require_a11y_tree = require_a11y_tree
         self.cache_dir = cache_dir or os.environ.get("OSWORLD_CACHE_DIR", "/tmp/osworld_cache")
+        self._archive_enabled = os.environ.get("CUA_ARCHIVE_ENABLE") == "1"
+        self.archive_evaluation: dict[str, Any] = {}
         self._env: Optional[DesktopEnv] = None
         self._lock = asyncio.Lock()
         self._health = journal()
@@ -174,7 +178,9 @@ class OSWorldEnv:
                     sandbox_id=getattr(self._env, "path_to_vm", None),
                     error_category="missing_or_invalid_screenshot",
                 )
-        return self._pack_obs(obs, done=False, exec_ok=True, exec_result={})
+        return self._pack_obs(
+            obs, done=False, exec_ok=True, exec_result={}, capture=getattr(self, "_archive_enabled", False)
+        )
 
     async def close(self) -> None:
         async with self._lock:
@@ -218,7 +224,9 @@ class OSWorldEnv:
                     "runtime_error", sandbox_id=getattr(self._env, "path_to_vm", None), error_category="unknown"
                 )
             raise
-        return self._pack_obs(obs, done=done, exec_ok=True, exec_result={"info": info})
+        return self._pack_obs(
+            obs, done=done, exec_ok=True, exec_result={"info": info}, capture=getattr(self, "_archive_enabled", False)
+        )
 
     async def exec_mcp(self, tool_name: str, params: dict[str, Any]) -> StepObs:
         async with self._lock:
@@ -251,7 +259,9 @@ class OSWorldEnv:
         # MCP tools don't advance the VM step counter; re-fetch a fresh obs so
         # the model sees any visual side effects (or their absence).
         obs = self._env._get_obs()  # noqa: SLF001 (verbatim upstream API)
-        return self._pack_obs(obs, done=False, exec_ok=exec_ok, exec_result=exec_result)
+        return self._pack_obs(
+            obs, done=False, exec_ok=exec_ok, exec_result=exec_result, capture=getattr(self, "_archive_enabled", False)
+        )
 
     async def evaluate(self) -> float:
         async with self._lock:
@@ -260,8 +270,13 @@ class OSWorldEnv:
     def _evaluate_sync(self) -> float:
         assert self._env is not None, "reset() must be called before evaluate()"
         try:
-            return float(self._env.evaluate())
-        except Exception:
+            raw = self._env.evaluate()
+            if getattr(self, "_archive_enabled", False):
+                self.archive_evaluation = {"raw": raw, "error": None}
+            return float(raw)
+        except Exception as exc:
+            if getattr(self, "_archive_enabled", False):
+                self.archive_evaluation = {"raw": None, "error": f"{type(exc).__name__}: {exc}"}
             if self._health:
                 self._health.emit(
                     "runtime_error", sandbox_id=getattr(self._env, "path_to_vm", None), error_category="unknown"
@@ -278,6 +293,7 @@ class OSWorldEnv:
         done: bool,
         exec_ok: bool,
         exec_result: dict[str, Any],
+        capture: bool = False,
     ) -> StepObs:
         screenshot = obs.get("screenshot")
         if not isinstance(screenshot, (bytes, bytearray)):
@@ -291,6 +307,8 @@ class OSWorldEnv:
                 screenshot = buf.getvalue()
         return StepObs(
             screenshot_bytes=bytes(screenshot),
+            screenshot_valid=_real_screenshot(obs.get("screenshot")) if capture else False,
+            archive_fields={k: v for k, v in obs.items() if k != "screenshot"} if capture else {},
             cur_app=obs.get("cur_app"),
             app_info=obs.get("app_info"),
             tool_list=obs.get("tool_list") or [],
