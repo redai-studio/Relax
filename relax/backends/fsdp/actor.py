@@ -1401,7 +1401,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+                if self._rank == 0:
+                    ray.get(self.rollout_manager.onload.remote(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
@@ -1486,7 +1487,8 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.barrier(group=get_gloo_group())
             onload_error = None
             try:
-                ray.get(self.rollout_manager.onload.remote())
+                if self._rank == 0:
+                    ray.get(self.rollout_manager.onload.remote())
             except Exception as exc:
                 onload_error = f"{type(exc).__name__}: {exc}"
             _raise_weight_sync_errors(
