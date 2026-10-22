@@ -24,6 +24,13 @@ from sglang.srt.utils import kill_process_tree
 
 
 try:
+    # SGLang 0.5.21 uses msgspec records; this also accepts older dataclasses.
+    from sglang.srt.arg_groups.arg_utils import record_fields as _server_args_fields
+except ImportError:
+    _server_args_fields = dataclasses.fields
+
+
+try:
     from sglang.srt.server_args import LOAD_FORMAT_CHOICES as _SGLANG_LOAD_FORMAT_CHOICES
 except ImportError:
     # Older SGLang releases do not expose the supported load formats. Keep
@@ -1935,7 +1942,7 @@ def _compute_genrm_server_args(
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
     unused_keys = set(kwargs.keys())
-    for attr in dataclasses.fields(ServerArgs):
+    for attr in _server_args_fields(ServerArgs):
         if worker_type == "decode" and attr.name == "enable_hierarchical_cache":
             continue
         if hasattr(args, f"sglang_{attr.name}") and attr.name not in kwargs:
@@ -1946,7 +1953,7 @@ def _compute_genrm_server_args(
     # and sglang_* defaults so user-supplied keys take highest priority. Keys
     # not recognized by the installed SGLang ServerArgs are dropped with a
     # warning rather than causing a TypeError at ServerArgs(**kwargs).
-    server_arg_fields = {f.name for f in dataclasses.fields(ServerArgs)}
+    server_arg_fields = {f.name for f in _server_args_fields(ServerArgs)}
     for key, value in (args.genrm_engine_config or {}).items():
         if key not in server_arg_fields:
             logger.info(
@@ -2054,7 +2061,7 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
+    server_arg_fields = _server_args_fields(ServerArgs)
     server_arg_field_names = {attr.name for attr in server_arg_fields}
     unused_keys = set(kwargs.keys())
     for attr in server_arg_fields:

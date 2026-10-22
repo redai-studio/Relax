@@ -37,19 +37,21 @@ For top-K modes (`student_topk`, `teacher_topk`, `union`), `--opd-norm-mode` con
 
 ## SGLang Patch
 
-The Relax v0.5.17 training images include the independent per-position top-K patch. Cross-model top-K queries (`student_topk`, `union`, and `teacher_topk` advantage mode) require this patch; stock SGLang queries the same token set at every position. The patch preserves returned query IDs and supports scheduler and logits chunking.
+The Relax SGLang v0.5.21 CUDA 13 training image includes the independent per-position top-K patch. Cross-model top-K queries (`student_topk`, `union`, and `teacher_topk` advantage mode) require this patch; stock SGLang queries the same token set at every position. The patch preserves returned query IDs and supports scheduler and logits chunking.
 
-For an existing v0.5.17 environment that does not have the patch, apply it once after the main Relax SGLang patch:
+For an existing v0.5.21 environment that does not have the patch, apply it once after the matching main Relax SGLang patch (`docker/patch/sglang/v0.5.21.patch`):
 
 ```bash
 cd /sgl-workspace/sglang
-git apply --check /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
-git apply /path/to/Relax/docker/patch/latest/sglang_per_pos_topk.patch
+git apply --check /path/to/Relax/docker/patch/sglang/v0.5.21_per_pos_topk.patch
+git apply /path/to/Relax/docker/patch/sglang/v0.5.21_per_pos_topk.patch
 ```
+
+The CUDA 12 image built with `docker/Dockerfile` is frozen at SGLang v0.5.17. For this legacy image, use `docker/patch/sglang/v0.5.17.patch` and `docker/patch/sglang/v0.5.17_per_pos_topk.patch` together.
 
 ## Native Image OPD
 
-Image OPD, OPSD, and MOPD use SGLang v0.5.17 native processing: each request sends collapsed prompt IDs, the original sampled response IDs, and standard base64 images. The client processor still determines the expanded prompt length for logprob alignment. Teacher and student must use compatible tokenizers and image processors, including image resizing settings; audio and video requests are not supported by this path.
+Image OPD, OPSD, and MOPD use SGLang v0.5.21 native multimodal processing: each request sends collapsed prompt IDs, the original sampled response IDs, and standard base64 images. The client processor still determines the expanded prompt length for logprob alignment. Teacher and student must use compatible tokenizers and image processors, including image resizing settings; audio and video requests are not supported by this path.
 
 When OPSD changes the teacher prompt but supplies no teacher media override, it reuses student images. An explicit empty teacher media mapping selects text-only teacher input. Student cross-top-K prefill always uses student images.
 
@@ -59,10 +61,12 @@ Both direct teacher endpoints and the student router must preserve `return_promp
 
 | Variable                      | Description                                                                                                                                                                                                              |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SGLANG_MM_AVOID_RETOKENIZE`  | Set to `true` on native image teacher and student engines. This is the SGLang v0.5.17 default; Relax-managed teachers set it explicitly. External endpoints need the same processor behavior.                            |
+| `SGLANG_MM_AVOID_RETOKENIZE`  | Set to `true` on native image teacher and student engines. Relax-managed teachers set it explicitly. External endpoints need the same processor behavior.                                                                |
 | `RELAX_OPD_PER_POS_TOKEN_IDS` | Set to `1` for compact base64 logprob transport in top-K runs. Requires the independent patch above. Per-position query width is sent in each request, and returned IDs are retained for alignment checks. Default: `0`. |
 
 ## Performance Benchmark
+
+The measurements below predate the SGLang v0.5.21 upgrade.
 
 SGLang per-position top-K log-prob transfer optimization (Qwen3-4B, simulated data batch=128, prompt_len=1024, resp_len=7168, top_k=64, concurrency=128):
 

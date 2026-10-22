@@ -275,6 +275,14 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def _allgather_base(self, *a, **kw):
         return self._fwd("_allgather_base", *a, **kw)
 
+    # Torch 2.13's public collectives dispatch through these new PG methods.
+    # Imported aliases can bypass the module-level wrappers above.
+    def all_gather_single(self, *a, **kw):
+        return self._fwd("all_gather_single", *a, **kw)
+
+    def all_gather_single_coalesced(self, *a, **kw):
+        return self._fwd("all_gather_single_coalesced", *a, **kw)
+
     def allgather_coalesced(self, *a, **kw):
         return self._fwd("allgather_coalesced", *a, **kw)
 
@@ -293,11 +301,20 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def _reduce_scatter_base(self, *a, **kw):
         return self._fwd("_reduce_scatter_base", *a, **kw)
 
+    def reduce_scatter_single(self, *a, **kw):
+        return self._fwd("reduce_scatter_single", *a, **kw)
+
+    def reduce_scatter_single_coalesced(self, *a, **kw):
+        return self._fwd("reduce_scatter_single_coalesced", *a, **kw)
+
     def reduce_scatter_tensor_coalesced(self, *a, **kw):
         return self._fwd("reduce_scatter_tensor_coalesced", *a, **kw)
 
     def alltoall_base(self, *a, **kw):
         return self._fwd("alltoall_base", *a, **kw)
+
+    def all_to_all_single(self, *a, **kw):
+        return self._fwd("all_to_all_single", *a, **kw)
 
     def alltoall(self, *a, **kw):
         return self._fwd("alltoall", *a, **kw)
