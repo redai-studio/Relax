@@ -53,6 +53,7 @@ from relax.engine.sft.runtime import (
     should_run_sft_eval,
 )
 from relax.utils.data.processor_pool import ProcessorPool
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import load_function
 from relax.utils.multimodal.config import MultimodalConfig
@@ -69,7 +70,9 @@ _PAD_TOKEN_ID_KEYS = ("image_token_id", "video_token_id", "audio_token_id")
 # each carrying up to ~20 images, so the pool size sets the producer's cadence.
 # ``ProcessorPool``'s own default caps at 16 workers ("min(16, cpu_count)"),
 # which can leave the consumer waiting whenever the producer is the pacer.
-_PRODUCER_POOL_SIZE = min(64, os.cpu_count() or 16)
+_PRODUCER_POOL_SIZE = Envs.RELAX_PROCESSOR_POOL_SIZE
+if _PRODUCER_POOL_SIZE is None:
+    _PRODUCER_POOL_SIZE = min(64, os.cpu_count() or 16)
 
 
 def _load_custom_dataset_class(path: str | None) -> type | None:

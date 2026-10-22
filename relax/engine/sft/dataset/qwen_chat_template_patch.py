@@ -125,16 +125,25 @@ def split_qwen38_leading_thinking(content: str) -> tuple[str, str] | None:
     """Move an already rendered Qwen3.8 think block into message fields.
 
     The model template supplies this scaffold itself. Keep the answer bytes
-    intact and reject unknown leading formats so they cannot be trained twice.
+    intact. Also accept complete compact blocks and think-only tool-call turns,
+    whose source data may omit the template's boundary newlines.
     """
     if not content.startswith("<think>"):
         if content.lstrip().startswith("<think>"):
             raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
         return None
     match = _QWEN38_LEADING_THINK_RE.fullmatch(content)
-    if match is None or "<think>" in match.group(1) or match.group(2).lstrip().startswith("<think>"):
+    if match is not None:
+        reasoning, answer = match.groups()
+    else:
+        reasoning, separator, answer = content[len("<think>") :].partition("</think>")
+        if not separator:
+            raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
+        reasoning = reasoning.removeprefix("\n").removesuffix("\n")
+        answer = answer.removeprefix("\n\n")
+    if "<think>" in reasoning or answer.lstrip().startswith("<think>"):
         raise ValueError("Qwen3.8 assistant content has an unrecognized leading <think> block")
-    return match.group(1), match.group(2)
+    return reasoning, answer
 
 
 def _content_as_text(content: str | list[dict] | None) -> str:

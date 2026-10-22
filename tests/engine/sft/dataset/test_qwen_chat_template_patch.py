@@ -636,6 +636,10 @@ class _FakeQwen38Tokenizer(_FakeQwenHistoryTokenizer):
         ("answer", None),
         ("<think>\n\n</think>\n\nanswer", ("", "answer")),
         ("<think>\nreason\n</think>\n\nanswer", ("reason", "answer")),
+        ("<think>\nreason\n</think>", ("reason", "")),
+        ("<think>reason</think>answer", ("reason", "answer")),
+        ("<think>\nreason\n</think>answer", ("reason", "answer")),
+        ("<think>\nreason\n</think>\nanswer", ("reason", "\nanswer")),
         ("<think>\nfirst\nsecond\n</think>\n\nanswer", ("first\nsecond", "answer")),
         ("<think>\nreason\n</think>\n\nThe token </think> closes it.", ("reason", "The token </think> closes it.")),
     ],
@@ -649,8 +653,6 @@ def test_qwen38_split_leading_think_preserves_answer(content, expected):
     [
         "<think>unfinished",
         " \n<think>\n\n</think>\n\nanswer",
-        "<think>reason</think>answer",
-        "<think>\nreason\n</think>answer",
         "<think>\n<think>nested\n</think>\n\nanswer",
         "<think>\n\n</think>\n\n<think>\n\n</think>\n\nanswer",
     ],
@@ -658,6 +660,36 @@ def test_qwen38_split_leading_think_preserves_answer(content, expected):
 def test_qwen38_split_leading_think_rejects_unknown_format(content):
     with pytest.raises(ValueError, match="unrecognized leading"):
         split_qwen38_leading_thinking(content)
+
+
+@pytest.mark.parametrize("answer", ["", "answer"])
+def test_qwen38_compact_thinking_matches_canonical_tokens_and_mask(answer):
+    tokenizer_dir = os.environ.get("QWEN38_TEST_TOKENIZER_DIR")
+    if not tokenizer_dir:
+        pytest.skip("set QWEN38_TEST_TOKENIZER_DIR for the real tokenizer regression")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True, local_files_only=True)
+    results = []
+    for content in (f"<think>\nreason\n</think>{answer}", f"<think>\nreason\n</think>\n\n{answer}"):
+        sample = CanonicalSample(
+            messages=[
+                CanonicalMessage("user", "query", False),
+                CanonicalMessage(
+                    "assistant",
+                    content,
+                    True,
+                    tool_calls=[{"type": "function", "function": {"name": "lookup", "arguments": {}}}],
+                ),
+            ],
+            metadata={"source_dataset": "compact-thinking-regression", "row_index": 0},
+        )
+        results.append(
+            render_with_loss_mask(sample, tokenizer=tokenizer, apply_chat_template_kwargs={"preserve_thinking": True})
+        )
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+    assert results[0][1].sum() > 0
 
 
 @pytest.mark.parametrize(

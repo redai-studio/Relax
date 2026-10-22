@@ -808,6 +808,15 @@ diff --git a/megatron/core/fusions/linear_cross_entropy/blackwell/bwd_partial_dl
                  if cutlass.const_expr(self.REDUCTION == 2):
                      # mean reduction
                      num_valid_tokens = cute.make_tensor(scalarNumValidTokens, layout=(1,))
+@@ -425,7 +425,7 @@
+                 # ------ Partial output ------ #
+                 # [tileM, tileN]
+                 gDlogits_partial = cute.local_tile(
+-                    mDlogits_partial, (self.epi_tile[0], self.epi_tile[1]), (pidm, pidn)
++                    mDlogits_partial, (self.epi_tile[0], self.epi_tile[1]), (cutlass.Int64(pidm), cutlass.Int64(pidn))
+                 )
+                 # blackwell supports STG.256
+                 copy_atom_r2g = cute.make_copy_atom(
 @@ -440,7 +440,7 @@
  
                  # [CPY, loopM, loopN]

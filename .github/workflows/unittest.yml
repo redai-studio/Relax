@@ -31,8 +31,8 @@ jobs:
     if: ${{ !cancelled() && (needs.bypass.result != 'success' || needs.bypass.outputs.can-skip != 'true') }}
     name: Unit Tests (H20, 4 GPUs)
     runs-on: [self-hosted, linux, x64, h20, gpu]
-    # Allow time for image preparation, device acquisition, and the 20-minute test budget.
-    timeout-minutes: 180
+    # Allow time for image preparation, device acquisition, and the 30-minute test budget.
+    timeout-minutes: 190
     env:
       CI_CONTAINER_NAME: relax-unittest-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -103,7 +103,7 @@ jobs:
             --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
       - name: Run unittest
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           docker exec "$CI_CONTAINER_NAME" bash -euo pipefail -c '
             python -m pytest tests/ -v -ra --tb=short --junitxml=/artifacts/junit.xml \

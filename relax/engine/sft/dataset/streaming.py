@@ -61,10 +61,7 @@ def _resolve_learn_flag(raw: dict, role: str) -> bool:
       3. ``step_loss_mask == 0`` — exclude original Slime trajectory turns.
       4. Role default. A nonzero step mask does not make user/tool turns learnable.
 
-    Ignoring ``loss`` silently trains on turns the dataset explicitly excluded. On the
-    pevek mix-0820 agentic rows that meant ~41% more loss tokens than ms-swift counted
-    (e.g. one 24-turn trajectory marks 21 turns ``loss: false``), which alone accounted
-    for the reported per-token loss sitting ~10% below the ms-swift baseline.
+    Ignoring ``loss`` silently trains on turns the dataset explicitly excluded.
     """
     if "learn" in raw:
         return bool(raw["learn"])

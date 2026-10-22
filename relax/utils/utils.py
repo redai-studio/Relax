@@ -476,6 +476,10 @@ def post_process_env(args, env):
     # name is copied from the driver's os.environ; missing names are
     # silently skipped.
     propagate_list = Envs.RELAX_PROPAGATE_ENV_VARS
+    # Training scripts may replace the generic passthrough list. Preserve the
+    # explicitly selected numerical-failure policy across detached Ray actors.
+    if (value := os.environ.get("RELAX_SKIP_NONFINITE_GRAD")) is not None:
+        env["env_vars"].setdefault("RELAX_SKIP_NONFINITE_GRAD", value)
     for var in propagate_list.split(","):
         var = var.strip()
         if not var or var in env["env_vars"]:
@@ -483,6 +487,10 @@ def post_process_env(args, env):
         val = os.environ.get(var)
         if val is not None:
             env["env_vars"][var] = val
+
+    # Apply the default after passthrough so preprocessing pools can disable
+    # tokenizer threads without overriding an explicit runtime configuration.
+    env["env_vars"].setdefault("TOKENIZERS_PARALLELISM", "true")
 
     logger.info(f"Ray runtime env: {env['env_vars']}")
 

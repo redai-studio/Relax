@@ -50,6 +50,7 @@ def test_shutdown_cleans_pool_created_by_finishing_fetch(helper):
     executor.shutdown.side_effect = finish_fetch
     actor = SimpleNamespace(
         _sft_train_prefetch=future,
+        _sft_train_prefetch_cancel=None,
         _sft_train_prefetch_rollout_id=7,
         _sft_train_prefetch_executor=executor,
         _sft_image_prefetch=helper,

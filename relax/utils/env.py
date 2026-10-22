@@ -262,6 +262,7 @@ class Envs(metaclass=_EnvsMeta):
     RELAX_FETCH_SPLIT_MAX_RETRIES = EnvProperty("RELAX_FETCH_SPLIT_MAX_RETRIES", int, 20)
     RELAX_SFT_TQ_SHARDS = EnvProperty("RELAX_SFT_TQ_SHARDS", int, 1)
     RELAX_JSONL_INDEX_WORKERS = EnvProperty("RELAX_JSONL_INDEX_WORKERS", int, 16)
+    RELAX_PROCESSOR_POOL_SIZE = EnvProperty("RELAX_PROCESSOR_POOL_SIZE", int, None)
     RELAX_LORA_A_INIT_METHOD = EnvProperty("RELAX_LORA_A_INIT_METHOD", str, "")
     RELAX_LORA_EXCLUDE_FROZEN_MODULES = EnvProperty("RELAX_LORA_EXCLUDE_FROZEN_MODULES", bool, False)
     RELAX_LORA_SHARE_EXPERT_ADAPTERS = EnvProperty("RELAX_LORA_SHARE_EXPERT_ADAPTERS", bool, None)
@@ -308,6 +309,7 @@ class Envs(metaclass=_EnvsMeta):
     # ------------- Extra Modules -------------
     RELAX_EXTRA_MODULES = EnvProperty("RELAX_EXTRA_MODULES", str, "")
     RELAX_PROPAGATE_ENV_VARS = EnvProperty("RELAX_PROPAGATE_ENV_VARS", str, "")
+    RELAX_SKIP_NONFINITE_GRAD = EnvProperty("RELAX_SKIP_NONFINITE_GRAD", bool, False)
 
     # ------------- Env validation -------------
     RELAX_STRICT_ENV = EnvProperty("RELAX_STRICT_ENV", bool, False)

@@ -534,6 +534,38 @@ def test_wrapper_passes_vp_stage_through_bridge_provider(monkeypatch):
     assert provider.calls == [{"pre_process": True, "post_process": False, "vp_stage": 1}]
 
 
+@pytest.mark.parametrize("cp_comm_type", ["p2p", "a2a", ["p2p"], ["a2a"], ["p2p", "a2a"] * 30])
+def test_bridge_provider_preserves_requested_cp_communication_after_finalize(monkeypatch, cp_comm_type):
+    provider = _FakeProvider()
+    provider.cp_comm_type = "p2p"
+    provider.num_layers = 60
+    original_finalize = provider.finalize
+
+    def validate_and_finalize():
+        if isinstance(provider.cp_comm_type, list):
+            assert len(provider.cp_comm_type) == provider.num_layers
+        original_finalize()
+
+    provider.finalize = validate_and_finalize
+    module, provider = _load_model_provider(monkeypatch, provider)
+    build_model = module.get_model_provider_func(
+        _bridge_args(cp_comm_type=cp_comm_type, context_parallel_size=4, num_layers=60), role="actor"
+    )
+    build_model(pre_process=True, post_process=True)
+    assert provider.finalized
+    expected = cp_comm_type[0] if isinstance(cp_comm_type, list) and len(cp_comm_type) == 1 else cp_comm_type
+    assert provider.cp_comm_type == expected
+
+
+def test_bridge_provider_keeps_cp_communication_default_when_argument_absent(monkeypatch):
+    provider = _FakeProvider()
+    provider.cp_comm_type = "p2p"
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(), role="actor")
+    assert provider.finalized
+    assert provider.cp_comm_type == "p2p"
+
+
 @pytest.mark.parametrize("wrapper", ["freeze", "lora", "freeze_lora"])
 @pytest.mark.parametrize("signature", ["modern", "kwargs", "legacy"])
 def test_provider_wrappers_forward_supported_mcore_arguments(monkeypatch, wrapper, signature):
@@ -655,3 +687,19 @@ def test_raw_provider_uses_supplied_config_and_process_groups(monkeypatch, expli
     assert constructed[0]["config"] is config
     assert constructed[0]["pg_collection"] is pg_collection
     assert constructed[0]["vp_stage"] == 2
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("moe_hybridep_pad_variable_tokens", True),
+        ("gdn_pre_gated_delta_rule_fusion", True),
+        ("gdn_conv_pad_alignment", 8192),
+    ],
+)
+def test_bridge_forwards_b300_runtime_configuration(monkeypatch, name, value):
+    provider = _FakeProvider()
+    setattr(provider, name, None)
+    module, provider = _load_model_provider(monkeypatch, provider)
+    module.get_model_provider_func(_bridge_args(**{name: value}))(pre_process=True, post_process=True)
+    assert getattr(provider, name) == value

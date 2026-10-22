@@ -3,7 +3,7 @@
 import dataclasses
 import re
 from argparse import Namespace
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 from typing import Any
@@ -529,6 +529,38 @@ class BridgeConverter:
                 # schema (and SGLang's loader) store it as uint8.
                 named_tensors.append((hf_name + "_packed", tensor.view(torch.uint8)))
         return named_tensors
+
+    def iter_ple_shards(self, name: str, local_rows: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+        """Export a TP-sharded Qwen4Exp PLE table one HF shard at a time.
+
+        The Bridge mapping owns the TP all-reduce for each shard. All TP ranks
+        must consume this iterator in the same order.
+        """
+        from megatron.bridge.models.qwen.qwen4_exp_bridge import PLENGramEmbeddingMapping
+
+        self.init_tasks()
+        global_name, task = self._lookup_task(_normalize_global_name(name))
+        if task is None:
+            # Non-owning PP ranks receive the TP-local rows from Relax's
+            # broadcast, but have no local Bridge task for the PLE layer.
+            global_name, mapping = self._lookup_mapping(global_name)
+        else:
+            mapping = task.mapping
+        if not isinstance(mapping, PLENGramEmbeddingMapping):
+            raise ValueError(f"No Qwen4Exp PLE shard mapping for {global_name}")
+
+        # Relax has already broadcast this TP-local tensor over PP/EP. Preserve
+        # Bridge's TP group so _PLEShardExport.gather_shard can all-reduce rows.
+        pp_group = mapping.pp_group
+        mapping.pp_group = None
+        try:
+            shards = mapping.megatron_to_hf(local_rows, task.megatron_module if task is not None else None)
+            for hf_name, shard in shards.items():
+                if self._hf_alias_checkpoint_keys is not None:
+                    hf_name = _resolve_hf_name_against_checkpoint(hf_name, self._hf_alias_checkpoint_keys)
+                yield from quantize_params(self._args, name, [(hf_name, shard)], self._quantization_config)
+        finally:
+            mapping.pp_group = pp_group
 
     def convert(self, name: str, param: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert a single TP/EP-gathered parameter to HF format.

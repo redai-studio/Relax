@@ -6,6 +6,7 @@ import inspect
 
 from relax.utils.logging_utils import get_logger
 from relax.utils.training.kimi_k3_flops import estimate_kimi_k3_flops
+from relax.utils.training.qwen38_flops import _estimate_qwen38_flops
 
 
 logger = get_logger(__name__)
@@ -529,6 +530,8 @@ _ESTIMATE_FUNC = {
     "qwen2_5_vl": _estimate_qwen2_flops,
     "qwen3_vl": _estimate_qwen3_vl_flops,
     "qwen3_vl_moe": _estimate_qwen3_vl_moe_flops,
+    "qwen4_exp": _estimate_qwen38_flops,
+    "qwen4_exp_text": _estimate_qwen38_flops,
 }
 
 

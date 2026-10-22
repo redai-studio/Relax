@@ -65,6 +65,68 @@ def test_explicit_balanced_matches_default(partitioner):
 
 
 @pytest.mark.parametrize("strategy", ["balanced", "binpack"])
+@pytest.mark.parametrize("unsplit", ["is_vl_model", "uses_unsplit_forward", "multimodal_train_inputs", None])
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_iterator_plans_physical_cp_lengths_without_changing_samples(partitioner, strategy, unsplit, cp_size):
+    from types import SimpleNamespace
+
+    import numpy as np
+    import torch
+
+    root = Path(__file__).resolve().parents[3]
+    namespace = partitioner.__globals__
+    names = {"get_data_iterator", "_get_micro_batch_token_capacity"}
+    nodes = [
+        node
+        for node in ast.parse((root / "relax/backends/megatron/data.py").read_text()).body
+        if getattr(node, "name", None) in names
+    ]
+    mpu = SimpleNamespace(
+        get_data_parallel_world_size=lambda **kwargs: 1,
+        get_data_parallel_group=lambda: "dp",
+        get_virtual_pipeline_model_parallel_world_size=lambda: None,
+        get_context_parallel_world_size=lambda: cp_size,
+        get_tensor_model_parallel_world_size=lambda: 2,
+    )
+    namespace.update(
+        torch=torch,
+        np=np,
+        mpu=mpu,
+        dist=SimpleNamespace(all_reduce=lambda *a, **kw: None, ReduceOp=torch.distributed.ReduceOp),
+        device_utils=SimpleNamespace(make_current_torch_device=lambda: torch.device("cpu")),
+        is_preference_mode=lambda args: False,
+        ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY="global_counts",
+        ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY="local_counts",
+        DataIterator=lambda data, micro_batch_size, indices, **kw: SimpleNamespace(indices=indices, **kw),
+    )
+    module = ast.Module(body=[ast.parse("from __future__ import annotations").body[0], *nodes], type_ignores=[])
+    exec(compile(module, "data.py", "exec"), namespace)
+    # With CP4, raw lengths fit one 48-token pack, but physical lengths are 32+32.
+    args = SimpleNamespace(
+        global_batch_size=2,
+        use_dynamic_batch_size=True,
+        max_tokens_per_gpu=12 if cp_size > 1 else 48,
+        sft_packing_strategy=strategy,
+        qkv_format="thd",
+        dynamic_context_parallel=True,
+    )
+    lengths = [17, 17]
+    data = {"total_lengths": lengths}
+    if unsplit == "multimodal_train_inputs":
+        data[unsplit] = [{}, {}]
+    elif unsplit is not None:
+        setattr(args, unsplit, True)
+    iterators, counts = namespace["get_data_iterator"](args, [], data)
+    padded = cp_size > 1 and unsplit is not None
+    assert counts == [2 if padded else 1]
+    assert sorted(i for pack in iterators[0].indices for i in pack) == [0, 1]
+    if padded:
+        assert all(len(pack) * 32 <= args.max_tokens_per_gpu * cp_size for pack in iterators[0].indices)
+    assert data["total_lengths"] is lengths
+    assert lengths == [17, 17]
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "binpack"])
 def test_iterator_uses_selected_packing_and_dp_aligned_count(partitioner, strategy):
     from types import SimpleNamespace
 
