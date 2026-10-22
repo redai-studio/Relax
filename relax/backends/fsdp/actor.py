@@ -93,7 +93,7 @@ class WeightSyncError(RuntimeError):
     INVALID.
 
     Raised by :meth:`FSDPTrainRayActor._run_weight_transaction` when any engine
-    drops a bucket, the commit fails, or the post-commit checksum mismatches.
+    rejects a bucket, the streamed counts mismatch, or the commit fails.
     :meth:`update_weights` catches it to trigger engine recovery + whole-round
     retry (fault tolerance) or to fail the job (design doc 10.3). No engine-side
     ``begin/abort`` staging is used — that is a planned SGLang-patch follow-up.
@@ -1803,7 +1803,7 @@ class FSDPTrainRayActor(TrainRayActor):
         per bucket keeps every rank's source tensors alive until the engine has
         opened them. ``tp==1`` degenerates to one blob per single-GPU engine.
 
-        Any engine drop / commit failure / checksum mismatch raises
+        Any engine RPC / streamed-count / commit failure raises
         :class:`WeightSyncError` so the caller can abort the version. Disk update is
         used only for resume, never here.
         """
@@ -1996,9 +1996,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
             # Validate the streamed snapshot against the manifest BEFORE committing —
             # every rank streams the identical full set, so every rank checks the
-            # same counts and raises uniformly. A mismatch means a truncated /
-            # mis-ordered / mis-named stream; fail the version rather than commit a
-            # partial weight set (design doc 10.2).
+            # same counts and raises uniformly. This detects a truncated stream;
+            # it does not compare the contents of engine replicas.
             count_error = None
             if sent_count != manifest.tensor_count or sent_bytes != manifest.total_bytes:
                 count_error = (
@@ -2012,11 +2011,11 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
             # Broadcasts rank 0's outcome and doubles as the barrier, so a
-            # failed verify/commit raises everywhere instead of hanging the
+            # failed commit raises everywhere instead of hanging the
             # other ranks on a barrier rank 0 already unwound past.
             self._rank0_then_agree(
-                lambda: self._verify_and_commit_engines(engines, manifest),
-                what=f"weight v{version} verify/commit",
+                lambda: self._commit_engines(engines, manifest),
+                what=f"weight v{version} commit",
             )
             self._synced_versions += 1
         except WeightSyncError:
@@ -2024,65 +2023,18 @@ class FSDPTrainRayActor(TrainRayActor):
         except Exception as exc:  # any transport / engine RPC failure invalidates the version
             raise WeightSyncError(version, str(exc)) from exc
 
-    def _verify_and_commit_engines(self, engines, manifest) -> None:
-        """Verify every engine replica before committing the policy version."""
+    def _commit_engines(self, engines, manifest) -> None:
+        """Commit the version after all bucket and manifest checks pass."""
         import ray
 
         version = manifest.policy_version
-        try:
-            checksums = ray.get(
-                [engine.get_weights_checksum.remote([self.args.fsdp_trainable_attr]) for engine in engines]
-            )
-        except Exception as exc:
-            raise WeightSyncError(version, f"checksum RPC failed: {exc}") from exc
-        reference = None
-        for index, checksum in enumerate(checksums):
-            if not isinstance(checksum, dict) or checksum.get("success") is False:
-                raise WeightSyncError(version, f"engine {index} returned an invalid checksum response: {checksum!r}")
-            try:
-                engine_count = int(checksum["tensor_count"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum response has no valid tensor_count: {checksum!r}",
-                ) from exc
-            if engine_count != manifest.tensor_count:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} has {engine_count} tensors != manifest {manifest.tensor_count}",
-                )
-            comparable = {
-                key: value for key, value in checksum.items() if key not in ("success", "message", "tensor_count")
-            }
-            if not comparable:
-                raise WeightSyncError(version, f"engine {index} checksum response contains no digest: {checksum!r}")
-            invalid_digests = {
-                key: value
-                for key, value in comparable.items()
-                if not isinstance(value, str)
-                or len(value) != 64
-                or any(char not in "0123456789abcdefABCDEF" for char in value)
-            }
-            if invalid_digests:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum response contains invalid digests: {invalid_digests!r}",
-                )
-            if reference is None:
-                reference = comparable
-            elif comparable != reference:
-                raise WeightSyncError(
-                    version,
-                    f"engine {index} checksum differs from engine 0: {comparable!r} != {reference!r}",
-                )
-
         manifest_digest = manifest.sha256()
         try:
             commit_results = ray.get(
                 [engine.commit_weight_version.remote(version, manifest_digest) for engine in engines]
             )
         except Exception as exc:
-            raise WeightSyncError(version, f"commit RPC failed after verification: {exc}") from exc
+            raise WeightSyncError(version, f"commit RPC failed: {exc}") from exc
         for index, result in enumerate(commit_results):
             if (
                 not isinstance(result, dict)
@@ -2091,8 +2043,7 @@ class FSDPTrainRayActor(TrainRayActor):
             ):
                 raise WeightSyncError(version, f"engine {index} failed to commit the version: {result!r}")
         logger.info(
-            f"weight v{version} committed on {len(engines)} engine(s); "
-            f"weight_manifest_sha256={manifest_digest} checksum={reference}"
+            f"weight v{version} committed on {len(engines)} engine(s); weight_manifest_sha256={manifest_digest}"
         )
 
     def _run_adapter_transaction(self, manifest, engines) -> None:

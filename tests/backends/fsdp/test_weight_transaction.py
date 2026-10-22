@@ -45,22 +45,20 @@ class _Remote:
 
 
 class _Engine:
-    def __init__(self, checksum, events, index, checksum_error=None):
-        self.checksum = checksum
+    def __init__(self, events, index, *, commit_error=None):
         self.events = events
         self.index = index
-        self.checksum_error = checksum_error
+        self.commit_error = commit_error
         self.get_weights_checksum = _Remote(self._checksum)
         self.commit_weight_version = _Remote(self._commit)
 
-    def _checksum(self, _modules):
-        self.events.append(("checksum", self.index))
-        if self.checksum_error is not None:
-            raise self.checksum_error
-        return self.checksum
+    def _checksum(self, *_args, **_kwargs):
+        raise AssertionError("Normal weight sync must not request a full-model checksum")
 
     def _commit(self, version, digest):
         self.events.append(("commit", self.index, version, digest))
+        if self.commit_error is not None:
+            raise self.commit_error
         return {"active_version": version, "weight_manifest_sha256": digest}
 
 
@@ -83,58 +81,62 @@ def _shell():
     return shell
 
 
-def test_all_engines_are_verified_before_any_commit(monkeypatch):
+def test_all_engines_commit_the_manifest_without_full_weight_checksums(monkeypatch):
     import ray
 
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     events = []
-    checksum = {"transformer": "a" * 64, "tensor_count": 2}
-    engines = [_Engine(checksum, events, index) for index in range(2)]
+    engines = [_Engine(events, index) for index in range(2)]
 
-    FSDPTrainRayActor._verify_and_commit_engines(_shell(), engines, _manifest())
+    FSDPTrainRayActor._commit_engines(_shell(), engines, _manifest())
 
-    assert events[:2] == [("checksum", 0), ("checksum", 1)]
-    assert [event[:2] for event in events[2:]] == [("commit", 0), ("commit", 1)]
-    assert all(event[3] == _manifest().sha256() for event in events[2:])
+    assert [event[:2] for event in events] == [("commit", 0), ("commit", 1)]
+    assert all(event[2:] == (_manifest().policy_version, _manifest().sha256()) for event in events)
 
 
 @pytest.mark.parametrize(
-    "second_checksum",
+    "second_ack",
     [
-        {"transformer": "a" * 64},
-        {"transformer": "a" * 64, "tensor_count": 1},
-        {"transformer": "b" * 64, "tensor_count": 2},
-        {"transformer": "not_found", "tensor_count": 2},
+        None,
+        {},
+        {"active_version": 2, "weight_manifest_sha256": _manifest().sha256()},
+        {"active_version": 3, "weight_manifest_sha256": "wrong-manifest"},
     ],
 )
-def test_secondary_engine_mismatch_prevents_all_commits(monkeypatch, second_checksum):
+def test_secondary_engine_commit_ack_must_match_version_and_manifest(monkeypatch, second_ack):
     import ray
 
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     events = []
-    engines = [
-        _Engine({"transformer": "a" * 64, "tensor_count": 2}, events, 0),
-        _Engine(second_checksum, events, 1),
-    ]
+    engines = [_Engine(events, index) for index in range(2)]
+    engines[1].commit_weight_version = _Remote(lambda *_: second_ack)
 
-    with pytest.raises(WeightSyncError):
-        FSDPTrainRayActor._verify_and_commit_engines(_shell(), engines, _manifest())
-    assert not any(event[0] == "commit" for event in events)
+    with pytest.raises(WeightSyncError, match="engine 1 failed to commit"):
+        FSDPTrainRayActor._commit_engines(_shell(), engines, _manifest())
 
 
-def test_secondary_engine_checksum_rpc_failure_prevents_all_commits(monkeypatch):
+def test_secondary_engine_commit_rpc_failure_rejects_publication(monkeypatch):
     import ray
 
     monkeypatch.setattr(ray, "get", _fake_ray_get)
     events = []
-    engines = [
-        _Engine({"transformer": "a" * 64, "tensor_count": 2}, events, 0),
-        _Engine({}, events, 1, checksum_error=RuntimeError("RPC failed")),
-    ]
+    engines = [_Engine(events, 0), _Engine(events, 1, commit_error=RuntimeError("RPC failed"))]
+    shell = _shell()
+    shell.device = torch.device("cpu")
+    shell._rank = 1
+    shell.policy_version = 2
+    shell._weight_sync_failures = 0
+    shell._build_manifest = _manifest
+    shell._build_weight_iterator = lambda: iter(())
+    shell._invalidate_ipc_topology = lambda: None
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *_: 0)
+    shell._run_weight_transaction = lambda manifest, _: shell._commit_engines(engines, manifest)
 
-    with pytest.raises(WeightSyncError, match="checksum RPC failed.*RPC failed"):
-        FSDPTrainRayActor._verify_and_commit_engines(_shell(), engines, _manifest())
-    assert not any(event[0] == "commit" for event in events)
+    with pytest.raises(WeightSyncError, match="commit RPC failed.*RPC failed"):
+        shell.update_weights(offload_after_sync=False)
+    assert shell.policy_version == 2
+    assert shell._weight_sync_failures == 1
 
 
 class _AdapterEngine:
