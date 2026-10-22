@@ -314,7 +314,11 @@ def _named_params_and_buffers_global(
 
                 # MTP layer indices start from 0
                 middle_path, layer_idx, rest = match.groups()
-                expert_pattern = r"transformer_layer.mlp.experts\.(.+)\.weight(\d+)"
+                # GPT MTP uses transformer_layer; hybrid MTP (e.g. Qwen3.8)
+                # nests its transformer layer inside mtp_model_layer.layers.
+                expert_pattern = (
+                    r"((?:transformer_layer|mtp_model_layer\.layers\.\d+)\.mlp\.experts\..+)\.weight(\d+)$"
+                )
                 match = re.match(expert_pattern, rest)
                 if not match:
                     yield name, param
@@ -327,7 +331,7 @@ def _named_params_and_buffers_global(
                 else:
                     middle_path += "."
                 yield (
-                    f"module.module.{middle_path}mtp.layers.{layer_idx}.transformer_layer.mlp.experts.{rest}.weight{expert_idx}",
+                    f"module.module.{middle_path}mtp.layers.{layer_idx}.{rest}.weight{expert_idx}",
                     param,
                 )
                 continue

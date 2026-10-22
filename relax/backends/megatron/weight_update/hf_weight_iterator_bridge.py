@@ -59,6 +59,7 @@ _FUSED_PAIR_FRAGMENTS = (
     (".compressor.wkv.", ".compressor.wgate."),
 )
 _PAIR_SENTINEL = "\x00"
+_QWEN4EXP_PLE_TABLE_SUFFIX = ".per_layer_embedding.ple_embedding.ngram_embedding.weight"
 
 
 def _fused_pair_key(name: str) -> str | None:
@@ -283,6 +284,22 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
             t_bcast_total += t_b1 - t_b0
 
             for info, param in zip(bucket_infos, params, strict=True):
+                if info.name.endswith(_QWEN4EXP_PLE_TABLE_SUFFIX):
+                    # Bridge's PLE mapping assembles one HF shard per TP collective.
+                    # A full TP gather here would materialize the entire n-gram
+                    # table (and convert() would retain all its shard views).
+                    shards = self._bridge_converter.iter_ple_shards(info.name, param)
+                    while True:
+                        t_g0 = time.monotonic()
+                        try:
+                            converted = next(shards)
+                        except StopIteration:
+                            break
+                        t_convert_total += time.monotonic() - t_g0
+                        param_count += 1
+                        yield converted
+                    continue
+
                 t_g0 = time.monotonic()
                 gathered = all_gather_param(self.args, info.name, param)
                 t_g1 = time.monotonic()

@@ -21,6 +21,7 @@ from relax.utils import tracking_utils
 from relax.utils.data.data import get_minimum_num_micro_batch_size
 from relax.utils.data.packing import get_binpack_partitions
 from relax.utils.data.seqlen_balancing import get_seqlen_balanced_partitions
+from relax.utils.env import Envs
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_utils import compute_rollout_step
 from relax.utils.multimodal.stats import count_images, get_multimodal_token_counts
@@ -39,6 +40,7 @@ from .cp_utils import (
     slice_log_prob_with_cp,
     slice_with_cp,
 )
+from .qsa_layout_metadata import bind_physical_layout, rebind_mapped_layout, valid_physical_layout
 
 
 logger = get_logger(__name__)
@@ -444,7 +446,9 @@ def get_batch(
 
     assert "tokens" in keys
     if isinstance(data_iterator, DataIterator):
-        batch = data_iterator.get_next(keys)
+        batch = data_iterator.get_next(
+            [*keys, "selective_loss_masks_cpu"] if Envs.RELAX_SFT_SELECTIVE_LOGITS else keys
+        )
 
         if getattr(get_args(), "partial_rollout", False) and getattr(
             get_args(), "use_dynamic_global_batch_size", False
@@ -464,7 +468,11 @@ def get_batch(
         return batch
 
     if pack_device is not None:
-        for key, dtype in (("tokens", torch.long), ("loss_masks", torch.int)):
+        for key, dtype in (
+            ("tokens", torch.long),
+            ("loss_masks", torch.int),
+            ("pre_shifted_labels", torch.long),
+        ):
             values = batch.get(key)
             if values is not None:
                 batch[key] = [torch.as_tensor(value, dtype=dtype, device=pack_device) for value in values]
@@ -493,11 +501,26 @@ def get_batch(
 
     tokens = batch["tokens"]
     batch_device = pack_device or tokens[0].device
+    qsa_stage2_enabled = (getattr(get_args(), "qsa_indexer_loss_coeff", 0.0) or 0.0) > 0
+    if qsa_stage2_enabled and allgather_cp and cp_size > 1:
+        raise NotImplementedError("QSA Stage-2 CP requires per-document zigzag packing, not allgather CP")
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
+    pre_shifted_labels = batch.get("pre_shifted_labels")
+    if pre_shifted_labels is not None:
+        args = get_args()
+        if args.loss_type != "sft":
+            raise ValueError("pre-shifted labels are only supported for SFT")
+        if cp_size != 1:
+            raise ValueError("pre-shifted SFT labels currently require context_parallel_size=1")
+        if getattr(args, "enable_mtp_training", False):
+            raise ValueError("pre-shifted SFT labels are incompatible with MTP")
+        if any(label.shape != token.shape for label, token in zip(pre_shifted_labels, tokens, strict=True)):
+            raise ValueError("pre-shifted labels and tokens must have identical per-sample shapes")
+        batch["unconcat_pre_shifted_labels"] = pre_shifted_labels
 
     if qkv_format == "bshd":
         max_seqlen = batch["max_seq_lens"][0]
@@ -559,16 +582,31 @@ def get_batch(
                 cu_seqlens_q_padded=cu_seqlens_padded,
                 cu_seqlens_kv_padded=cu_seqlens_padded,
             )
-            # Keep the physical boundaries on the host for VL input repacking;
-            # reading CUDA cu_seqlens in each model forward would synchronize.
-            vlm_cu_seqlens_cpu = [0]
-            for sequence_length in seqlens_padded:
-                vlm_cu_seqlens_cpu.append(vlm_cu_seqlens_cpu[-1] + sequence_length)
-            vlm_packed_seq_params.cu_seqlens_q_cpu = vlm_cu_seqlens_cpu
+            # Preserve producer-owned physical boundaries for QSA without device synchronization.
+            select_offsets = [0]
+            for length in seqlens_padded:
+                select_offsets.append(select_offsets[-1] + length)
+            vlm_packed_seq_params.cu_seqlens_q_cpu = select_offsets
+            vlm_packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
+            if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+                bind_physical_layout(vlm_packed_seq_params, tuple(select_offsets))
+            if qsa_stage2_enabled:
+                # Keep the attention/CP boundaries physical. Stage-2 QSA uses
+                # these original lengths to exclude trailing pad queries.
+                vlm_packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                    seqlens, dtype=torch.int32, device=device
+                )
+                physical_starts = [0]
+                for length in seqlens_padded:
+                    physical_starts.append(physical_starts[-1] + length)
+                vlm_packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(seqlens))
             if use_dynamic_context_parallel:
                 vlm_packed_seq_params.local_cp_size = cp_size
                 vlm_packed_seq_params.cp_group = cp_group
             batch["vlm_packed_seq_params"] = vlm_packed_seq_params
+            # Bridge returns per-document zigzag CP outputs even when attention
+            # uses allgather CP. Loss slicing must follow the output layout.
+            batch["cp_output_is_zigzag"] = True
             # Per-sample tp*cp*2-aligned lengths consumed by loss helpers so
             # their per-sample chunking matches bridge's preprocess_packed_seqs.
             batch["padded_total_lengths"] = seqlens_padded
@@ -630,11 +668,33 @@ def get_batch(
             max_seqlen_kv=max_seqlen,
             qkv_format="thd",
         )
-        # TODO: Pass pad_between_seqs to the constructor once the NPU Megatron pin supports it.
+        # The NPU Megatron pin does not accept this constructor keyword.
         packed_seq_params.pad_between_seqs = pad != 0 if allgather_cp else None
+        if qsa_stage2_enabled:
+            valid_lengths = [int(sample.size(0)) for sample in batch["unconcat_tokens"]]
+            physical_cu = cu_seqlens_padded if allgather_cp else cu_seqlens
+            extra_segments = physical_cu.numel() - 1 - len(valid_lengths)
+            if extra_segments not in (0, 1) or (extra_segments == 1 and pad == 0):
+                raise ValueError("QSA Stage-2 requires one physical segment per sample plus optional tail padding.")
+            valid_lengths.extend([0] * extra_segments)
+            packed_seq_params.qsa_stage2_valid_lengths = torch.tensor(
+                valid_lengths, dtype=torch.int32, device=batch_device
+            )
+            physical_starts = list(cu_seqlens_cpu)
+            if allgather_cp:
+                # The all-gather layout extends the last document's physical end
+                # instead of adding a padding-only segment.
+                physical_starts[-1] += pad
+            packed_seq_params.qsa_stage2_layout_cpu = (tuple(physical_starts), tuple(valid_lengths))
         # Python boundaries let attention implementations iterate packed
         # subsequences without synchronizing individual accelerator scalars.
         packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_cpu
+        select_offsets = list(cu_seqlens_cpu)
+        if allgather_cp:
+            select_offsets[-1] += pad
+        packed_seq_params.qsa_select_offsets_cpu = tuple(select_offsets)
+        if Envs.RELAX_QWEN38_QSA_CPU_LAYOUT:
+            bind_physical_layout(packed_seq_params, tuple(select_offsets))
         if use_dynamic_context_parallel:
             packed_seq_params.local_cp_size = cp_size
             packed_seq_params.cp_group = cp_group
@@ -668,7 +728,11 @@ def get_batch(
     for loss_mask, total_length, response_length in zip(
         batch["loss_masks"], batch["total_lengths"], batch["response_lengths"], strict=True
     ):
-        if response_length == total_length:
+        if pre_shifted_labels is not None:
+            if response_length != total_length:
+                raise ValueError("pre-shifted SFT labels require response_length == total_length")
+            per_sample_loss_masks.append(loss_mask)
+        elif response_length == total_length:
             loss_mask = align_loss_mask_for_sft(loss_mask)
             per_sample_loss_masks.append(loss_mask)
         else:
@@ -683,6 +747,10 @@ def get_batch(
                 loss_mask, 0, qkv_format, max_seqlen, dynamic_cp_size=cp_size, dynamic_cp_rank=cp_rank
             )
         loss_masks.append(loss_mask)
+    if pre_shifted_labels is not None:
+        for loss_mask, labels in zip(full_per_sample_loss_masks, pre_shifted_labels, strict=True):
+            if not torch.equal(loss_mask.bool(), labels.ne(-100)):
+                raise ValueError("pre-shifted SFT loss mask must equal labels != -100")
     batch["loss_masks"] = per_sample_loss_masks
 
     if qkv_format == "bshd":
@@ -718,6 +786,9 @@ def get_batch(
             pad_to = int(pad_to)
             t_padded = F.pad(sample_tokens, (0, pad_to - sample_tokens.size(0)), value=pad_token_id)
             m_padded = F.pad(sample_mask, (0, pad_to - sample_mask.size(0)), value=0)
+            if len(orig_tokens) == 1:
+                # Bridge slices this next-token mask only for packed singleton input.
+                batch["unsplit_full_mtp_loss_mask"] = m_padded.unsqueeze(0)
             # This VL/THD path bypasses MCore's default label construction, so
             # labels must be pre-shifted by one here (label[t] = x[t+1]); MCore's
             # per-depth roll advances label and mask together afterwards.
@@ -812,9 +883,42 @@ def get_batch(
                     )
                 ]
 
+    if (
+        Envs.RELAX_SFT_SELECTIVE_LOGITS
+        and cp_size == 1
+        and qkv_format == "thd"
+        and not has_mm_inputs
+        and "unsplit_tokens" not in batch
+        and "vlm_packed_seq_params" not in batch
+        and getattr(get_args(), "loss_type", None) == "sft"
+        and getattr(get_args(), "sft_chunked_logits", False)
+    ):
+        from .selective_logits import prepare_selective_logits, prepare_selective_logits_from_cpu_masks
+
+        if batch_device.type == "cpu":
+            prepare_selective_logits(batch, get_args())
+        elif batch.get("selective_loss_masks_cpu") is not None:
+            prepare_selective_logits_from_cpu_masks(batch, get_args())
+
+    if (
+        batch.get("selective_logit_rows") is not None
+        and batch.get("replay_micro_batch_index") == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_tensor_model_parallel_rank() == 0
+    ):
+        logger.info(
+            "Selective logits first microbatch: main selected/full=%s, MTP selected=%s",
+            [(rows.numel(), full) for full, rows in batch["selective_logit_rows"]],
+            [rows.numel() for rows in getattr(packed_seq_params, "relax_sft_selective_mtp_rows", ())],
+        )
+    batch.pop("selective_loss_masks_cpu", None)
     batch = move_tensors_to_device(batch, batch["tokens"].device)
     if pack_device is not None:
         batch = PrepackedBatch(batch)
+    if getattr(get_args(), "_relax_qwen35_optimized", False):
+        from relax.models.qwen3_5.recompute import attach_mask
+
+        attach_mask(get_args(), data_iterator, batch)
     return batch
 
 
@@ -1216,6 +1320,20 @@ def get_data_iterator(
             )
         return data_iterator
 
+    wholepack_plan = rollout_data.pop("_sft_wholepack_v1", None)
+    if wholepack_plan is not None:
+        from relax.utils.data.wholepack import enabled
+
+        if not enabled(args):
+            raise ValueError("Whole-pack metadata requires the optimized training recipe")
+        return _generate_data_iterator(
+            rollout_data,
+            None,
+            wholepack_plan["indices"],
+            max_tokens_per_gpu=args.max_tokens_per_gpu,
+            dummy_micro_batch_offsets=set(wholepack_plan["dummy"]),
+        ), [int(wholepack_plan["K"])]
+
     if not args.use_dynamic_batch_size:
         invalid_counts = [count for count in step_local_sample_counts if count % args.micro_batch_size != 0]
         if invalid_counts:
@@ -1230,9 +1348,19 @@ def get_data_iterator(
         assert _max_tokens is not None
         micro_batch_token_capacity = _get_micro_batch_token_capacity(args, _max_tokens, cp_size)
         # calculate the number of mirobatches for each step
-        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
         samples = rollout_data["total_lengths"]
+        packing_strategy = getattr(args, "sft_packing_strategy", "balanced")
         assert len(samples) == num_local_samples
+        # Bridge pads each THD document before CP splitting, including text-only
+        # batches of VL models. Plan with those physical lengths as well.
+        needs_unsplit_input = (
+            getattr(args, "is_vl_model", False)
+            or getattr(args, "uses_unsplit_forward", False)
+            or rollout_data.get("multimodal_train_inputs") is not None
+        )
+        if getattr(args, "qkv_format", "thd") == "thd" and cp_size > 1 and needs_unsplit_input:
+            alignment = mpu.get_tensor_model_parallel_world_size() * cp_size * 2
+            samples = [(length + alignment - 1) // alignment * alignment for length in samples]
         num_microbatches = []
         step_offsets = np.cumsum([0, *step_local_sample_counts]).tolist()
         for i in range(num_steps_per_rollout):
@@ -1268,7 +1396,10 @@ def get_data_iterator(
             end = step_offsets[i + 1]
             step_samples = samples[start:end]
             partitions, local_dummy_offsets = _get_seqlen_partitions_with_dummy_padding(
-                step_samples, num_mbs, micro_batch_token_capacity, packing_strategy=packing_strategy
+                step_samples,
+                num_mbs,
+                micro_batch_token_capacity,
+                packing_strategy=packing_strategy,
             )
             base_offset = len(micro_batch_indices)
             micro_batch_indices.extend([[idx + start for idx in partition] for partition in partitions])
@@ -1382,6 +1513,7 @@ def log_rollout_data(
                 "packed_seq_params",
                 "vlm_packed_seq_params",
                 "__loss_scale__",
+                "_sft_wholepack_v1",
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
@@ -1623,9 +1755,11 @@ def sync_actor_critic_data(
 
 
 def _map_packed_seq_params(data: PackedSeqParams, map_value: Callable[[Any], Any]) -> PackedSeqParams:
+    record = valid_physical_layout(data)
     mapped = copy(data)
     for name, value in vars(data).items():
         setattr(mapped, name, map_value(value))
+    rebind_mapped_layout(mapped, record)
     return mapped
 
 

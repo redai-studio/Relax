@@ -27,9 +27,7 @@ def test_learn_flag_honors_explicit_learn(value, expected):
 def test_learn_flag_honors_ms_swift_loss_field(value, expected):
     """``loss`` is ms-swift's spelling of the same flag.
 
-    Ignoring it silently trains on turns the dataset explicitly excluded — on
-    the pevek mix-0820 agentic rows that was ~41% more loss tokens than ms-
-    swift counted.
+    Ignoring it silently trains on turns the dataset explicitly excluded.
     """
     assert _resolve_learn_flag({"role": "assistant", "loss": value}, "assistant") is expected
 
