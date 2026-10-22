@@ -11,7 +11,6 @@
 - `env.example.sh`：公开的部署配置模板，不包含实际服务地址或密钥。
 - `env.local.sh`：用户复制模板后填写的私有配置，Git 忽略，不能提交。
 - `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`：正式训练参数与提交入口；修改训练参数请改这里。
-- `run_qwen3vl_8B_osworld_outcome.sh`：兼容旧入口，转发到正式脚本。
 - `run_agent_app.sh`：Relax 为每个 session 调用的 agent 入口，不是独立训练入口。
 - `app/`：桌面环境、模型调用适配、奖励与监控；`app/osworld_config.yaml` 控制交互轮数等。
 - `scripts/prepare_data.py`、`train_tasks.txt`：数据转换与固定 12 任务清单。

@@ -12,7 +12,6 @@ This recipe trains Qwen3-VL-8B-Thinking with GRPO, Relax resident agentic rollou
 - `env.example.sh`: public deployment template without real endpoints or credentials.
 - `env.local.sh`: private copy of the template, ignored by Git; never commit it.
 - `scripts/run-qwen3vl-8B-osworld-8xgpu.sh`: authoritative training configuration and submission script.
-- `run_qwen3vl_8B_osworld_outcome.sh`: compatibility wrapper forwarding to that script.
 - `run_agent_app.sh`: per-session entry called by Relax, not a standalone training launcher.
 - `app/`: desktop environment, model adapter, rewards and metrics; `app/osworld_config.yaml` controls interaction settings.
 - `scripts/prepare_data.py` and `train_tasks.txt`: dataset conversion and the fixed 12-task manifest.
